@@ -1,0 +1,68 @@
+# Upstream sync workflow
+
+drakeydb tracks `dragonflydb/dragonfly` continuously. Fork changes are kept **additive and
+flag-gated** so that with `--active_replica` off, behavior and journal bytes are identical to
+upstream — which keeps merges cheap.
+
+## Remotes
+
+```bash
+git remote -v
+# origin    git@github.com:darkspadez/drakeydb.git
+# upstream  https://github.com/dragonflydb/dragonfly
+```
+
+One-time per clone (activates the `.gitattributes` merge=ours entries):
+
+```bash
+git config merge.ours.driver true
+```
+
+## Merging upstream
+
+Cadence: monthly, plus after each upstream release.
+
+```bash
+git fetch upstream
+git checkout -b merge/upstream-$(date +%Y%m%d) main
+git merge upstream/main
+# resolve conflicts (see watchlist below), then:
+git submodule update --init --recursive
+```
+
+Verification gate before the merge PR lands:
+
+1. Build: `./helio/blaze.sh -DWITH_AWS=OFF -DWITH_GCP=OFF && cd build-dbg && ninja dragonfly`
+2. C++ tests: `ctest -L DFLY` (at minimum `journal_test`, `dragonfly_test`, `server_family_test`)
+3. Replication pytest subset: `python3 -m pytest tests/dragonfly/replication_test.py -x`
+4. Multi-master suite: `python3 -m pytest tests/dragonfly/multimaster_test.py -x` (once it exists)
+
+## Conflict watchlist
+
+Files where drakeydb carries real logic changes — review upstream's side carefully instead of
+taking either side blindly:
+
+| File | drakeydb change |
+|---|---|
+| `src/server/journal/serializer.cc` | journal v2 framing (origin/mvcc extension) |
+| `src/server/journal/types.h`, `journal_slice.cc`, `streamer.*`, `executor.*` | origin tagging + peer filtering |
+| `src/server/replica.cc` | peer-mode (writable, no-flush) sync path |
+| `src/server/dflycmd.cc` | peer version/UUID gating |
+| `src/server/server_family.cc` | REPLICAOF delegation + INFO additions (kept to additive lines) |
+| `src/server/transaction.cc`, `tx_base.cc` | journal origin context |
+| `src/server/version.h` | upstream protocol versions — **always take upstream**, fork uses 65 |
+| `src/server/dfly_main.cc` | banner/usage strings, `version_check` default |
+| `src/server/CMakeLists.txt` | `OUTPUT_NAME drakeydb` + symlink lines |
+
+Files under `merge=ours` (`.gitattributes`): `README.md`.
+Deleted-by-fork workflows (`release.yml`, `docker-release2.yml`, `generate-osrepo-site.yml`):
+on merge, git may resurrect them as add/delete conflicts — keep them deleted
+(`git rm` again).
+
+## Rules
+
+- Never rename `namespace dfly`, wire tokens, or metric names (see `BRANDING.md`).
+- Never edit `helio/` here — it is upstream's submodule; bump the pointer only via upstream merges.
+- New fork code goes in **new files** where possible (`multi_master.*`, `node_identity.*`).
+- `DflyVersion` in `version.h` belongs to upstream; the fork's replication capability constant
+  (`kDrakeydbReplVersion = 65`) lives in `node_identity.h` and must stay far above upstream's.
