@@ -84,8 +84,14 @@ async def test_uuid_exchange_master_and_replica_info(df_factory: DflyInstanceFac
     assert mi["slave0"]["node_uuid"] == ri["node_uuid"]  # redis-py parses the csv into a dict
 
 
-async def test_uuid_survives_master_restart(df_factory: DflyInstanceFactory, tmp_path):
-    master = df_factory.create(proactor_threads=2, dir=str(tmp_path / "m"))
+async def test_uuid_survives_master_restart(df_factory: DflyInstanceFactory, tmp_path, port_picker):
+    # Pin the master's port: df_factory.create() without an explicit port= uses a dynamic
+    # (--port -1) port that DflyInstance resets to None on stop(), so a restarted instance would
+    # otherwise come back listening on a different port and the replica's REPLICAOF target below
+    # would go stale forever. Same idiom as redis_replication_test.py / sentinel_test.py.
+    master = df_factory.create(
+        proactor_threads=2, dir=str(tmp_path / "m"), port=port_picker.get_available_port()
+    )
     replica = df_factory.create(proactor_threads=2, dir=str(tmp_path / "r"))
     df_factory.start_all([master, replica])
     c_replica = replica.client()
@@ -94,11 +100,17 @@ async def test_uuid_survives_master_restart(df_factory: DflyInstanceFactory, tmp
     uuid_before = (await c_replica.info("replication"))["master_node_uuid"]
     master.stop()
     master.start()
+    for _ in range(100):  # first wait for the link to actually drop
+        if (await c_replica.info("replication")).get("master_link_status") == "down":
+            break
+        await asyncio.sleep(0.2)
     for _ in range(100):  # replica auto-reconnects; poll until the link is up again
         ri = await c_replica.info("replication")
         if ri.get("master_link_status") == "up" and "master_node_uuid" in ri:
             break
         await asyncio.sleep(0.2)
+    else:
+        pytest.fail("replica did not reconnect after master restart")
     assert ri["master_node_uuid"] == uuid_before
 
 
@@ -111,10 +123,13 @@ async def test_replicaof_real_redis_tolerates_missing_uuid(
     import redis.asyncio as aioredis
 
     r = aioredis.Redis(port=redis_server.port, decode_responses=True)
-    await r.set("k", "v")
-    await c.execute_command(f"REPLICAOF localhost {redis_server.port}")
-    await wait_available_async(c)
-    assert await c.get("k") == "v"
-    info = await c.info("replication")
-    assert "node_uuid" in info
-    assert "master_node_uuid" not in info  # old master answered -ERR; tolerated
+    try:
+        await r.set("k", "v")
+        await c.execute_command(f"REPLICAOF localhost {redis_server.port}")
+        await wait_available_async(c)
+        assert await c.get("k") == "v"
+        info = await c.info("replication")
+        assert "node_uuid" in info
+        assert "master_node_uuid" not in info  # old master answered -ERR; tolerated
+    finally:
+        await r.aclose()
