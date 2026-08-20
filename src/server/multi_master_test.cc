@@ -294,9 +294,11 @@ class MultiMasterFamilyTest : public BaseFamilyTest {
 TEST_F(MultiMasterFamilyTest, InfoReplicationHasNodeUuid) {
   auto resp = Run({"info", "replication"});
   std::string info{ToSV(resp.GetBuf())};
-  size_t pos = info.find("node_uuid:");
+  // Must not match inside "master_node_uuid:" (which also contains "node_uuid:" as a substring) --
+  // anchor on the preceding newline so this only matches the standalone "node_uuid:" field.
+  size_t pos = info.find("\nnode_uuid:");
   ASSERT_NE(std::string::npos, pos);
-  std::string uuid = info.substr(pos + 10, 36);
+  std::string uuid = info.substr(pos + 11, 36);
   EXPECT_TRUE(IsValidNodeUuid(uuid)) << uuid;
 }
 

@@ -35,6 +35,7 @@ extern "C" {
 #include "server/journal/serializer.h"
 #include "server/main_service.h"
 #include "server/namespaces.h"
+#include "server/node_identity.h"
 #include "server/rdb_load.h"
 #include "strings/human_readable.h"
 
@@ -352,6 +353,22 @@ error_code Replica::Greet() {
   // Corresponds to server.repl_state == REPL_STATE_SEND_CAPA
   RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa eof capa psync2"));
   PC_RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
+
+  // drakeydb: node identity exchange (KeyDB-compatible; KeyDB sends uuid right after its capa
+  // batch). An error reply means the master predates the exchange - tolerated, like ip-address.
+  RETURN_ON_ERR(
+      SendCommandAndReadResponse(StrCat("REPLCONF UUID ", service_.server_family().node_uuid())));
+  if (!LastResponseArgs().empty() && LastResponseArgs()[0].type == RespExpr::ERROR) {
+    LOG_FIRST_N(WARNING, 1) << "Master does not support REPLCONF UUID";
+  } else {
+    string master_uuid;
+    uint64_t master_ms = 0;
+    PC_RETURN_ON_BAD_RESPONSE(
+        CheckRespFirstTypes({RespExpr::STRING}) &&
+        ParseReplconfUuidReply(ToSV(LastResponseArgs()[0].GetBuf()), &master_uuid, &master_ms));
+    master_context_.master_node_uuid = std::move(master_uuid);
+    master_context_.master_clock_ms = master_ms;
+  }
 
   // Announce that we are the dragonfly client.
   // Note that we currently do not support dragonfly->redis replication.
@@ -1406,6 +1423,7 @@ auto Replica::GetSummary() const -> Summary {
     }
 
     res.master_id = master_context_.master_repl_id;
+    res.master_node_uuid = master_context_.master_node_uuid;
     res.reconnect_count = reconnect_count_;
     if (HasDflyMaster()) {
       res.repl_offset_sum = 0;

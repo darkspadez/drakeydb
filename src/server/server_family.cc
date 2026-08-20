@@ -2981,9 +2981,15 @@ string ServerFamily::FormatInfoMetrics(
       if (show_managed_info) {
         for (size_t i = 0; i < replicas_info.size(); i++) {
           auto& r = replicas_info[i];
-          // e.g. slave0:ip=172.19.0.3,port=6379,state=full_sync
-          append(StrCat("slave", i), StrCat("ip=", r.address, ",port=", r.listening_port,
-                                            ",state=", r.state, ",lag=", r.lsn_lag));
+          // e.g. slave0:ip=172.19.0.3,port=6379,state=full_sync,lag=0
+          // node_uuid is inserted before lag (not appended last): tests/dragonfly/
+          // replication_test.py and cluster_test.py both parse lag via a "lag=(\d+)\r\n"
+          // regex that assumes lag is the trailing field.
+          string line = StrCat("ip=", r.address, ",port=", r.listening_port, ",state=", r.state);
+          if (!r.node_uuid.empty())
+            absl::StrAppend(&line, ",node_uuid=", r.node_uuid);
+          absl::StrAppend(&line, ",lag=", r.lsn_lag);
+          append(StrCat("slave", i), line);
         }
       }
       append("master_replid", master_replid_);
@@ -2999,6 +3005,8 @@ string ServerFamily::FormatInfoMetrics(
         append("master_last_io_seconds_ago", rinfo.master_last_io_sec);
         append("master_sync_in_progress", rinfo.full_sync_in_progress);
         append("master_replid", rinfo.master_id);
+        if (!rinfo.master_node_uuid.empty())
+          append("master_node_uuid", rinfo.master_node_uuid);
         if (rinfo.full_sync_done || (rinfo.passed_full_sync && !rinfo.master_link_established))
           append("slave_repl_offset", rinfo.repl_offset_sum);
         append("slave_priority", GetFlag(FLAGS_replica_priority));
@@ -3640,8 +3648,10 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
         return cmd_cntx->SendError("Invalid UUID");
       }
       string peer_uuid = NormalizeNodeUuid(arg);
+      // Registration into peer_registry_ happens later, in DflyCmd::CreateSyncSession, once this
+      // connection actually becomes a sync-session replica -- not here, where any unauthenticated
+      // client (REPLCONF is exempt from AUTH-gating) could otherwise grow the registry forever.
       cntx->conn_state.replication_info.repl_node_uuid = peer_uuid;
-      peer_registry_.AddOrGet(peer_uuid);
       return builder->SendSimpleString(absl::StrCat(node_uuid(), " ", GetCurrentTimeMs()));
     } else if (cmd == "ACK" && args.size() == 2) {
       // Don't send error/Ok back through the socket, because we don't want to interleave with

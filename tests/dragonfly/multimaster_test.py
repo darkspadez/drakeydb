@@ -1,5 +1,6 @@
 """Phase 1 multi-master identity tests: node uuid persistence + REPLCONF UUID exchange."""
 
+import asyncio
 import re
 import time
 
@@ -8,6 +9,7 @@ import pytest
 import redis
 
 from .instance import DflyInstanceFactory, DflyStartException
+from .utility import wait_available_async
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 FIXED_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -66,3 +68,53 @@ async def test_replconf_uuid_wire_reply(df_factory: DflyInstanceFactory, tmp_pat
     assert abs(int(token_ms) - time.time() * 1000) < 60_000
     with pytest.raises(redis.exceptions.ResponseError, match="Invalid UUID"):
         await c.execute_command("REPLCONF", "UUID", "not-a-uuid")
+
+
+async def test_uuid_exchange_master_and_replica_info(df_factory: DflyInstanceFactory, tmp_path):
+    master = df_factory.create(proactor_threads=2, dir=str(tmp_path / "m"))
+    replica = df_factory.create(proactor_threads=2, dir=str(tmp_path / "r"))
+    df_factory.start_all([master, replica])
+    c_master, c_replica = master.client(), replica.client()
+    await c_replica.execute_command(f"REPLICAOF localhost {master.port}")
+    await wait_available_async(c_replica)
+    mi = await c_master.info("replication")
+    ri = await c_replica.info("replication")
+    assert mi["node_uuid"] != ri["node_uuid"]
+    assert ri["master_node_uuid"] == mi["node_uuid"]
+    assert mi["slave0"]["node_uuid"] == ri["node_uuid"]  # redis-py parses the csv into a dict
+
+
+async def test_uuid_survives_master_restart(df_factory: DflyInstanceFactory, tmp_path):
+    master = df_factory.create(proactor_threads=2, dir=str(tmp_path / "m"))
+    replica = df_factory.create(proactor_threads=2, dir=str(tmp_path / "r"))
+    df_factory.start_all([master, replica])
+    c_replica = replica.client()
+    await c_replica.execute_command(f"REPLICAOF localhost {master.port}")
+    await wait_available_async(c_replica)
+    uuid_before = (await c_replica.info("replication"))["master_node_uuid"]
+    master.stop()
+    master.start()
+    for _ in range(100):  # replica auto-reconnects; poll until the link is up again
+        ri = await c_replica.info("replication")
+        if ri.get("master_link_status") == "up" and "master_node_uuid" in ri:
+            break
+        await asyncio.sleep(0.2)
+    assert ri["master_node_uuid"] == uuid_before
+
+
+async def test_replicaof_real_redis_tolerates_missing_uuid(
+    df_factory: DflyInstanceFactory, redis_server, tmp_path
+):
+    node = df_factory.create(proactor_threads=1, dir=str(tmp_path / "n1"))
+    node.start()
+    c = node.client()
+    import redis.asyncio as aioredis
+
+    r = aioredis.Redis(port=redis_server.port, decode_responses=True)
+    await r.set("k", "v")
+    await c.execute_command(f"REPLICAOF localhost {redis_server.port}")
+    await wait_available_async(c)
+    assert await c.get("k") == "v"
+    info = await c.info("replication")
+    assert "node_uuid" in info
+    assert "master_node_uuid" not in info  # old master answered -ERR; tolerated

@@ -115,11 +115,12 @@ class DflyCmd {
   class ABSL_LOCKABLE ReplicaInfo {
    public:
     ReplicaInfo(unsigned flow_count, std::string address, uint32_t listening_port,
-                ExecutionState::ErrHandler err_handler)
+                std::string node_uuid, ExecutionState::ErrHandler err_handler)
         : replica_state_{SyncState::PREPARATION},
           exec_st_{std::move(err_handler)},
           address_{std::move(address)},
           listening_port_(listening_port),
+          node_uuid_{std::move(node_uuid)},
           flows_{flow_count} {
     }
 
@@ -129,6 +130,10 @@ class DflyCmd {
     }
     uint32_t GetListeningPort() const {
       return listening_port_;
+    }
+    // Peer's uuid from REPLCONF UUID, or "" for a plain-redis replica that never sent one.
+    const std::string& GetNodeUuid() const {
+      return node_uuid_;
     }
 
     // Returns the replica ID, or an empty view if SetId has not been called.
@@ -222,6 +227,9 @@ class DflyCmd {
     std::atomic<bool> id_set_{false};
     std::string address_;
     uint32_t listening_port_;
+    // Immutable after construction, like address_; set from ConnectionState::ReplicationInfo at
+    // sync-session creation time (see CreateSyncSession).
+    const std::string node_uuid_;
 
     // We expect to update version_ during handshaking, for now we set it to
     // the oldest version to be safe.

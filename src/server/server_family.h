@@ -75,6 +75,7 @@ struct ReplicaRoleInfo {
   uint32_t listening_port;
   std::string_view state;
   uint64_t lsn_lag;
+  std::string node_uuid;
 };
 
 // Contains the state of the last save operation.

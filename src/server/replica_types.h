@@ -31,6 +31,7 @@ struct ReplicaSummary {
   // we use this variable to print the journal offsets in info command even
   // when the link is down. It's reset whenever a full sync is initiated again.
   bool passed_full_sync;
+  std::string master_node_uuid;
 };
 
 struct LastMasterSyncData {
