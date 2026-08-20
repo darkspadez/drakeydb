@@ -92,6 +92,7 @@ add_library(dragonfly_lib
             config_registry.cc conn_context.cc
             debugcmd.cc dflycmd.cc error.cc family_utils.cc metrics.cc string_stats.cc ${DF_SEARCH_SRCS}
             server_family.cc string_family.cc list_family.cc generic_family.cc
+            node_identity.cc multi_master.cc
             ${DF_FAMILY_SRCS}
             main_service.cc memory_cmd.cc rdb_load.cc rdb_load_context.cc rdb_save.cc replica.cc http_api.cc
             protocol_client.cc serializer_base.cc snapshot.cc script_mgr.cc
@@ -148,6 +149,7 @@ helio_cxx_test(generic_family_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(hset_family_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(list_family_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(server_family_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(multi_master_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(set_family_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(stream_family_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(string_family_test dfly_test_lib LABELS DFLY)
@@ -181,7 +183,7 @@ add_dependencies(check_dfly dragonfly_test json_family_test list_family_test
                  redis_parser_test stream_family_test string_family_test
                  bitops_family_test set_family_test zset_family_test geo_family_test
                  hll_family_test cluster_config_test cluster_family_test acl_family_test
-                 json_family_memory_test)
+                 json_family_memory_test multi_master_test)
 
 if (WITH_SEARCH)
   helio_cxx_test(search/search_family_test dfly_test_lib LABELS DFLY)

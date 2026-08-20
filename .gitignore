@@ -38,3 +38,5 @@ _codeql_build_dir/
 
 # drakeydb: local KeyDB reference checkout (not part of this repo)
 /KeyDB/
+# drakeydb: per-node identity file written into --dir at runtime (Phase 1)
+drakeydb.uuid
