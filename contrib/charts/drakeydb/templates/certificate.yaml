@@ -14,6 +14,13 @@ spec:
   - '{{ include "dragonfly.fullname" . }}.{{ .Release.Namespace }}.svc'
   - '{{ include "dragonfly.fullname" . }}.{{ .Release.Namespace }}'
   - '{{ include "dragonfly.fullname" . }}'
+  {{- if and .Values.storage.enabled (ne (include "dragonfly.serviceName" .) (include "dragonfly.fullname" .)) }}
+  - '*.{{ include "dragonfly.serviceName" . }}.{{ .Release.Namespace }}.svc.cluster.local'
+  - '{{ include "dragonfly.serviceName" . }}.{{ .Release.Namespace }}.svc.cluster.local'
+  - '{{ include "dragonfly.serviceName" . }}.{{ .Release.Namespace }}.svc'
+  - '{{ include "dragonfly.serviceName" . }}.{{ .Release.Namespace }}'
+  - '{{ include "dragonfly.serviceName" . }}'
+  {{- end }}
   {{- if ne (include "dragonfly.clientServiceName" .) (include "dragonfly.fullname" .) }}
   - '{{ include "dragonfly.clientServiceName" . }}.{{ .Release.Namespace }}.svc.cluster.local'
   - '{{ include "dragonfly.clientServiceName" . }}.{{ .Release.Namespace }}.svc'

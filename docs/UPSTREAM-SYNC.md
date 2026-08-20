@@ -32,7 +32,7 @@ git submodule update --init --recursive
 
 Verification gate before the merge PR lands:
 
-1. Build: `./helio/blaze.sh -DWITH_AWS=OFF -DWITH_GCP=OFF && ninja -C build-dbg dragonfly`
+1. Build: `./helio/blaze.sh -DWITH_AWS=OFF -DWITH_GCP=OFF && ninja -C build-dbg -j4 dragonfly`
 2. C++ tests: `(cd build-dbg && ctest -L DFLY)` (at minimum `journal_test`, `dragonfly_test`, `server_family_test`)
 3. Replication pytest subset: `(cd "$(git rev-parse --show-toplevel)" && python3 -m pytest tests/dragonfly/replication_test.py -x)`
 4. Multi-master suite: `(cd "$(git rev-parse --show-toplevel)" && python3 -m pytest tests/dragonfly/multimaster_test.py -x)` (once it exists)

@@ -42,7 +42,7 @@ helm upgrade --install drakeydb ./contrib/charts/drakeydb
 | podSecurityContext | object | `{}` | Set securityContext for pod itself |
 | securityContext | object | `{}` | Set securityContext for containers |
 | hostNetwork | bool | `false` | Set hostNetwork for pod |
-| service.type | string | `"ClusterIP"` | Service type to provision. Can be NodePort, ClusterIP or LoadBalancer |
+| service.type | string | `"ClusterIP"` | Accepted values are NodePort, ClusterIP, and LoadBalancer. |
 | service.loadBalancerIP | string | `""` | Load balancer static ip to use when service type is set to LoadBalancer |
 | service.clusterIP | string | `""` | Cluster IP address to assign to the service. Leave empty to auto-allocate |
 | service.port | int | `6379` | Dragonfly service port |

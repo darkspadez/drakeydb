@@ -56,7 +56,7 @@ securityContext: {}
 hostNetwork: false
 
 service:
-  # -- Service type to provision. Can be NodePort, ClusterIP or LoadBalancer
+  # -- Accepted values are NodePort, ClusterIP, and LoadBalancer.
   type: ClusterIP
   # -- Load balancer static ip to use when service type is set to LoadBalancer
   loadBalancerIP: ""

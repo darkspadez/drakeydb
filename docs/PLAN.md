@@ -1,9 +1,7 @@
 # drakeydb Master Plan
 
-> **Continue here.** This is the approved, living plan for the drakeydb fork. Update the status
-> block below as phases land. A local mirror of the originally approved plan lives at
-> `~/.claude/plans/this-folder-is-a-vast-puppy.md` on the original dev machine; **this file is
-> the canonical copy.**
+> **Continue here.** This is the approved, living plan and canonical copy for the drakeydb fork.
+> Update the status block below as phases land.
 
 ## Current status (last updated 2026-08-19)
 
@@ -60,10 +58,15 @@ untracked in `KeyDB/` (local reference only, gitignored). The goals:
 
 ### Licensing (flag, not blocker)
 
-- Dragonfly is **BSL 1.1** (`LICENSE.md`, change date Nov 1, 2030 → Apache 2.0). Additional Use
-  Grant excludes offering the work as an in-memory data-store product/service to third parties.
-  Publishing fork source on GitHub is fine; **selling/hosting drakeydb as a service is not, until
-  2030**. Lawyer question if commercialization is intended.
+- Dragonfly is **BSL 1.1**; see [LICENSE.md](../LICENSE.md) for the complete terms. The license
+  changes to Apache 2.0 on Nov 1, 2030, or on the fourth anniversary of the first public
+  distribution of a specific version, whichever comes first. Before that version's applicable
+  change date, the Additional Use Grant permits use only as part of your own product or service
+  when it is not an in-memory data store product or service, and prohibits using, providing,
+  distributing, or making the Licensed Work available as a Service. A Service is a commercial
+  offering, product, hosted, or managed service that lets third parties access the work or a
+  substantial set of its features through SaaS, PaaS, IaaS, or similar services that compete with
+  the Licensor's products or services. Obtain legal review before commercialization.
 - KeyDB is BSD-3 (`KeyDB/COPYING`) — ported logic is attributed in `NOTICE`.
 - Never touch the 468 per-file `// Copyright DragonflyDB authors` headers.
 
@@ -76,7 +79,7 @@ untracked in `KeyDB/` (local reference only, gitignored). The goals:
   → `Service::DispatchCommand`); re-journaling's only gate is `shard->journal()`
   (`transaction.cc:1635`). **The journal has no origin identity** (`journal/types.h:20-26`) —
   that's the A↔B echo hazard.
-- Journal COMMAND entries carry a **deprecated varint** written as `1`, parse-and-discarded by
+- Journal COMMAND entries carry a **deprecated varint** written as `1`, parsed and discarded by
   readers (`journal/serializer.cc:78`, `:228-230`) — a compatible extension slot.
 - Entries are **serialized once per shard**, same string broadcast to all consumers
   (`journal_slice.cc:120-147`); per-consumer filtering lives in `JournalStreamer::ShouldWrite`.
@@ -215,7 +218,7 @@ helm chart copied to `contrib/charts/drakeydb` (golden harness dropped from copy
 workflows removed; `--version_check=false` default; banner/usage/version strings rebranded.
 Tag scheme `drakey-X.Y.Z` (no `v` prefix) — first tag cut in P9.
 
-## Phase 1 — Identity foundations ⏭️ NEXT
+## Phase 1 — Identity foundations
 `node_identity` (persisted UUID at `<dir>/drakeydb.uuid`), `REPLCONF UUID` exchange (additive
 case in `ReplConf`), `PeerRegistry`, INFO `node_uuid`. No behavior change otherwise.
 **Verify:** C++ unit; pytest: two nodes exchange + report UUIDs; existing replication tests green.

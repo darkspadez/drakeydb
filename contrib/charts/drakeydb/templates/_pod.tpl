@@ -122,7 +122,12 @@ containers:
       {{- $effectiveVersion = $imageTag }}
     {{- end }}
     {{- $useRequirepass := true }}
-    {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+([+-].*)?$" $effectiveVersion }}
+    {{- $semverCore := "(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)" }}
+    {{- $semverIdentifier := "((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))" }}
+    {{- $semverPrerelease := printf "(-%s(\\.%s)*)?" $semverIdentifier $semverIdentifier }}
+    {{- $semverBuild := "(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?" }}
+    {{- $semverPattern := printf "^%s%s%s$" $semverCore $semverPrerelease $semverBuild }}
+    {{- if regexMatch $semverPattern $effectiveVersion }}
       {{- $useRequirepass = semverCompare ">=1.14.0" $effectiveVersion }}
     {{- end }}
     {{- if $useRequirepass }}
