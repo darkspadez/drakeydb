@@ -18,4 +18,13 @@ inline constexpr unsigned kDrakeydbReplVersion = 65;
 
 inline constexpr char kNodeUuidFileName[] = "drakeydb.uuid";
 
+// Returns a canonical lowercase RFC-4122 v4 uuid.
+std::string GenerateNodeUuid();
+
+// 36 chars, dashes at 8/13/18/23, hex elsewhere; case-insensitive (KeyDB uuid_parse parity).
+bool IsValidNodeUuid(std::string_view uuid);
+
+// Precondition: IsValidNodeUuid(uuid). Returns the lowercase canonical form.
+std::string NormalizeNodeUuid(std::string_view uuid);
+
 }  // namespace dfly
