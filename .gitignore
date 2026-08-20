@@ -35,3 +35,6 @@ tests/dragonfly/valkey_tcl/upstream/
 _codeql_build_dir/
 # CocoIndex Code (ccc)
 /.cocoindex_code/
+
+# drakeydb: local KeyDB reference checkout (not part of this repo)
+/KeyDB/

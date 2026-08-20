@@ -13,6 +13,12 @@ endif()
 add_executable(dragonfly dfly_main.cc version_monitor.cc)
 add_custom_target(check_dfly WORKING_DIRECTORY .. COMMAND ctest -L DFLY)
 cxx_link(dragonfly base dragonfly_lib)
+# drakeydb fork: ship the binary as "drakeydb" but keep the CMake target name intact
+# so upstream merges stay clean. The symlink keeps tooling that expects "dragonfly" working.
+set_target_properties(dragonfly PROPERTIES OUTPUT_NAME drakeydb)
+add_custom_command(TARGET dragonfly POST_BUILD
+                   COMMAND ${CMAKE_COMMAND} -E create_symlink drakeydb
+                           $<TARGET_FILE_DIR:dragonfly>/dragonfly)
 
 if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" AND CMAKE_BUILD_TYPE STREQUAL "Release")
   # Add core2 only to this file, thus avoiding instructions in this object file that

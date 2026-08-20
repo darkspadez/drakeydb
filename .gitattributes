@@ -1,0 +1,7 @@
+# drakeydb fork: files we permanently own. On upstream merges, keep our version.
+#
+# One-time setup per clone (the "ours" merge driver is not active by default):
+#   git config merge.ours.driver true
+#
+# See docs/UPSTREAM-SYNC.md for the full upstream merge workflow.
+README.md merge=ours

@@ -1,0 +1,44 @@
+{{- if and .Values.tls.enabled .Values.tls.createCerts }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "dragonfly.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dragonfly.labels" . | nindent 4 }}
+spec:
+  commonName: '{{ include "dragonfly.fullname" . }}'
+  dnsNames:
+  - '*.{{ include "dragonfly.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local'
+  - '{{ include "dragonfly.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local'
+  - '{{ include "dragonfly.fullname" . }}.{{ .Release.Namespace }}.svc'
+  - '{{ include "dragonfly.fullname" . }}.{{ .Release.Namespace }}'
+  - '{{ include "dragonfly.fullname" . }}'
+  {{- if and .Values.storage.enabled (ne (include "dragonfly.serviceName" .) (include "dragonfly.fullname" .)) }}
+  - '*.{{ include "dragonfly.serviceName" . }}.{{ .Release.Namespace }}.svc.cluster.local'
+  - '{{ include "dragonfly.serviceName" . }}.{{ .Release.Namespace }}.svc.cluster.local'
+  - '{{ include "dragonfly.serviceName" . }}.{{ .Release.Namespace }}.svc'
+  - '{{ include "dragonfly.serviceName" . }}.{{ .Release.Namespace }}'
+  - '{{ include "dragonfly.serviceName" . }}'
+  {{- end }}
+  {{- if ne (include "dragonfly.clientServiceName" .) (include "dragonfly.fullname" .) }}
+  - '{{ include "dragonfly.clientServiceName" . }}.{{ .Release.Namespace }}.svc.cluster.local'
+  - '{{ include "dragonfly.clientServiceName" . }}.{{ .Release.Namespace }}.svc'
+  {{- end }}
+  - '{{ include "dragonfly.fullname" . }}-metrics.{{ .Release.Namespace }}.svc.cluster.local'
+  - '{{ include "dragonfly.fullname" . }}-metrics.{{ .Release.Namespace }}.svc'
+  - localhost
+  duration: {{ required "tls.duration is required, if createCerts is enabled" .Values.tls.duration }}
+  ipAddresses:
+  - 127.0.0.1
+  issuerRef:
+    kind: {{ required "tls.issuer.kind is required, if createCerts is enabled" .Values.tls.issuer.kind }}
+    name: {{ required "tls.issuer.name is required, if createCerts is enabled" .Values.tls.issuer.name }}
+    group: {{ .Values.tls.issuer.group }}
+  secretName: '{{ include "dragonfly.fullname" . }}-server-tls'
+  usages:
+  - client auth
+  - server auth
+  - signing
+  - key encipherment
+{{- end }}

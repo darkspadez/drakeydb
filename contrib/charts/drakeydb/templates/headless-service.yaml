@@ -1,0 +1,13 @@
+{{- if .Values.storage.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dragonfly.serviceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dragonfly.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "dragonfly.selectorLabels" . | nindent 4 }}
+{{- end }}

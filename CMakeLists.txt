@@ -31,7 +31,7 @@ endif()
 
 # Set targets in folders
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
-project(DRAGONFLY C CXX)
+project(DRAKEYDB C CXX)
 set(CMAKE_CXX_STANDARD 20)
 
 # Use ccache as the compiler launcher when available (local and CI).

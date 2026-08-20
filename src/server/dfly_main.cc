@@ -105,8 +105,9 @@ ABSL_FLAG(
     string, allocation_tracker, "",
     "Logs stack trace of memory allocation within these ranges. Format is min:max,min:max,....");
 
-ABSL_FLAG(bool, version_check, true,
-          "If true, Will monitor for new releases on Dragonfly servers once a day.");
+ABSL_FLAG(bool, version_check, false,
+          "If true, Will monitor for new releases on Dragonfly servers once a day. "
+          "Disabled by default in drakeydb: fork versions do not match upstream releases.");
 
 ABSL_FLAG(uint16_t, tcp_backlog, 256, "TCP listen(2) backlog parameter.");
 #ifdef __linux__
@@ -1018,12 +1019,16 @@ void PrintBasicUsageInfo() {
 
   for (const auto& dir : base::GetLoggingDirectories()) {
     const string_view maybe_slash = absl::EndsWith(dir, "/") ? "" : "/";
-    absl::StrAppend(&output, dir, maybe_slash, "dragonfly.*\n");
+    absl::StrAppend(&output, dir, maybe_slash, "drakeydb.*\n");
+#ifndef USE_ABSL_LOG
+    absl::StrAppend(&output, dir, maybe_slash,
+                    "dragonfly.* (when launched via the compatibility symlink)\n");
+#endif
   }
 
   absl::StrAppend(&output,
-                  "* For the available flags type dragonfly [--help | --helpfull]\n"
-                  "* Documentation can be found at: https://www.dragonflydb.io/docs\n");
+                  "* For the available flags type drakeydb [--help | --helpfull]\n"
+                  "* Documentation can be found at: https://github.com/darkspadez/drakeydb\n");
 
   std::cout << output;
   std::cout.flush();
@@ -1067,7 +1072,7 @@ int main(int argc, char* argv[]) {
   absl::SetProgramUsageMessage(
       R"(a modern in-memory store.
 
-Usage: dragonfly [FLAGS]
+Usage: drakeydb [FLAGS]
 )");
 
   absl::FlagsUsageConfig config;
@@ -1076,7 +1081,7 @@ Usage: dragonfly [FLAGS]
   config.normalize_filename = dfly::NormalizePaths;
   config.version_string = [] {
     string version = StrCat(dfly::kGitTag, "-", dfly::kGitSha);
-    return StrCat("dragonfly ", ColoredStr(TermColor::kGreen, version),
+    return StrCat("drakeydb ", ColoredStr(TermColor::kGreen, version),
                   "\nbuild time: ", ColoredStr(TermColor::kYellow, dfly::kBuildTime), "\n");
   };
 
@@ -1103,7 +1108,7 @@ Usage: dragonfly [FLAGS]
     PrintBasicUsageInfo();
   }
 
-  LOG(INFO) << "Starting dragonfly " << GetVersion() << "-" << kGitSha;
+  LOG(INFO) << "Starting drakeydb " << GetVersion() << "-" << kGitSha;
 
   struct sigaction act;
   act.sa_handler = sigill_hdlr;
