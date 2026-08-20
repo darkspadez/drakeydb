@@ -34,4 +34,24 @@ std::string NormalizeNodeUuid(std::string_view uuid);
 // is 0 when the master sent no clock. On failure, neither out-param is modified.
 bool ParseReplconfUuidReply(std::string_view reply, std::string* master_uuid, uint64_t* master_ms);
 
+// The node's persistent identity, as loaded or created for this boot.
+struct NodeIdentity {
+  std::string uuid;
+  // True when `uuid` is not backed by the identity file: it came from a --node_uuid override,
+  // `dir` is a cloud path, or the file could not be persisted. An ephemeral identity does not
+  // survive a restart.
+  bool ephemeral = false;
+};
+
+// Loads the node's uuid from `<dir>/kNodeUuidFileName`, or generates and persists a new one on
+// first boot. `override_uuid`, when non-empty, must already be a valid uuid; it is normalized
+// and returned as an ephemeral identity without touching the file. Returns an error for an
+// invalid override, a corrupt identity file, or any file read error other than "missing".
+io::Result<NodeIdentity> LoadOrCreateNodeIdentity(std::string_view dir,
+                                                  std::string_view override_uuid);
+
+// Convenience wrapper for ServerFamily::Init(): resolves the --node_uuid override flag and
+// exits the process on failure.
+NodeIdentity InitNodeIdentityOrExit(std::string_view dir);
+
 }  // namespace dfly
