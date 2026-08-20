@@ -11,13 +11,19 @@
 
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <vector>
 
+#include "absl/flags/declare.h"
+#include "absl/flags/flag.h"
 #include "base/gtest.h"
 #include "io/file_util.h"
 #include "server/node_identity.h"
 #include "util/fibers/fibers.h"
+#include "util/fibers/pool.h"
+
+ABSL_DECLARE_FLAG(bool, force_epoll);
 
 namespace dfly {
 
@@ -211,24 +217,52 @@ TEST(PeerRegistry, SelfIsZeroAndAddOrGetIsMonotonicIdempotent) {
   EXPECT_EQ(3u, reg.Size());
 }
 
-TEST(PeerRegistry, ConcurrentAddersDontDuplicate) {
+// Launch::post-constructed fibers only get queued (AddReady) on the constructing thread's
+// scheduler; they don't start running until that thread yields (e.g. at Join()). And
+// util::fb2::Mutex::lock()'s uncontended fast path never suspends. So fibers built directly on
+// the bare gtest thread never actually interleave here: the first Join() runs fiber 0 to
+// completion (always uncontended), then fiber 1, etc. -- strictly sequential, not a test of
+// concurrent access. A real concurrency test needs fibers on distinct proactor threads, where
+// util::fb2::Mutex's base::SpinLock-guarded owner_ can genuinely be contended.
+class PeerRegistryFiberTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+#ifdef __linux__
+    if (absl::GetFlag(FLAGS_force_epoll)) {
+      pp_.reset(util::fb2::Pool::Epoll(2));
+    } else {
+      pp_.reset(util::fb2::Pool::IOUring(16, 2));
+    }
+#else
+    pp_.reset(util::fb2::Pool::Epoll(2));
+#endif
+    pp_->Run();
+  }
+  void TearDown() override {
+    pp_->Stop();
+    pp_.reset();
+  }
+  std::unique_ptr<util::ProactorPool> pp_;
+};
+
+TEST_F(PeerRegistryFiberTest, ConcurrentAddersDontDuplicate) {
   PeerRegistry reg;
   reg.Init(GenerateNodeUuid());
   std::vector<std::string> uuids;
   for (int i = 0; i < 16; ++i)
     uuids.push_back(GenerateNodeUuid());
   std::vector<util::fb2::Fiber> fibers;
-  for (int f = 0; f < 8; ++f) {
-    fibers.emplace_back([&] {
+  for (unsigned f = 0; f < 8; ++f) {
+    fibers.emplace_back(pp_->at(f % pp_->size())->LaunchFiber(util::fb2::Launch::post, [&] {
       for (const auto& u : uuids)
         reg.AddOrGet(u);
-    });
+    }));
   }
   for (auto& fb : fibers)
     fb.Join();
   EXPECT_EQ(1 + uuids.size(), reg.Size());
   for (const auto& u : uuids)
-    EXPECT_TRUE(reg.FindIdx(u).has_value());
+    EXPECT_EQ(u, reg.GetUuid(*reg.FindIdx(u)));  // round-trip: catches index aliasing too.
 }
 
 }  // namespace dfly

@@ -10,6 +10,7 @@ namespace dfly {
 void PeerRegistry::Init(std::string_view self_uuid) {
   util::fb2::LockGuard lk(mu_);
   CHECK(idx_to_uuid_.empty()) << "PeerRegistry::Init() must be called exactly once";
+  CHECK(uuid_to_idx_.empty()) << "PeerRegistry::Init() must be called exactly once";
   uuid_to_idx_.try_emplace(std::string(self_uuid), kSelfIdx);
   idx_to_uuid_.emplace_back(self_uuid);
 }
