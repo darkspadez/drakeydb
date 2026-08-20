@@ -34,7 +34,7 @@ TEST(NodeUuid, ValidateRejectsMalformed) {
   EXPECT_FALSE(IsValidNodeUuid(""));
   EXPECT_FALSE(IsValidNodeUuid("01234567-89ab-4cde-8f01-23456789abc"));    // 35
   EXPECT_FALSE(IsValidNodeUuid("01234567-89ab-4cde-8f01-23456789abcde"));  // 37
-  EXPECT_FALSE(IsValidNodeUuid("0123456789ab-4cde-8f01-23456789abcdef"));  // dash misplaced
+  EXPECT_FALSE(IsValidNodeUuid("012345678-9ab-4cde-8f01-23456789abcd"));   // dash misplaced
   EXPECT_FALSE(IsValidNodeUuid("0123456g-89ab-4cde-8f01-23456789abcd"));   // non-hex
   EXPECT_EQ("01234567-89ab-4cde-8f01-23456789abcd",
             NormalizeNodeUuid("01234567-89AB-4CDE-8F01-23456789ABCD"));
