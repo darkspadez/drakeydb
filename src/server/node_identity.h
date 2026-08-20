@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -29,7 +30,8 @@ std::string NormalizeNodeUuid(std::string_view uuid);
 
 // Parses the master's REPLCONF UUID success reply: "<uuid>" (KeyDB) or "<uuid> <ms>" (drakeydb).
 // Extra tokens are ignored for forward compatibility. Returns false on a malformed reply
-// (caller treats that as fatal). *master_ms is 0 when the master sent no clock.
+// (caller treats that as fatal). On success, *master_uuid is the normalized uuid and *master_ms
+// is 0 when the master sent no clock. On failure, neither out-param is modified.
 bool ParseReplconfUuidReply(std::string_view reply, std::string* master_uuid, uint64_t* master_ms);
 
 }  // namespace dfly

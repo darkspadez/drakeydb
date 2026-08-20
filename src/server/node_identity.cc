@@ -48,10 +48,11 @@ bool ParseReplconfUuidReply(std::string_view reply, std::string* master_uuid, ui
   std::vector<std::string_view> tokens = absl::StrSplit(reply, ' ', absl::SkipEmpty());
   if (tokens.empty() || !IsValidNodeUuid(tokens[0]))
     return false;
-  *master_ms = 0;
-  if (tokens.size() >= 2 && !absl::SimpleAtoi(tokens[1], master_ms))
+  uint64_t ms = 0;
+  if (tokens.size() >= 2 && !absl::SimpleAtoi(tokens[1], &ms))
     return false;
   *master_uuid = NormalizeNodeUuid(tokens[0]);
+  *master_ms = ms;
   return true;
 }
 

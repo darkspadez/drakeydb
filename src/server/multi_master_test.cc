@@ -59,7 +59,7 @@ TEST(ReplconfUuidReply, ParsesDrakeydbUuidWithMs) {
 
 TEST(ReplconfUuidReply, MalformedRejectedExtraTokensIgnored) {
   std::string uuid;
-  uint64_t ms;
+  uint64_t ms = 0;
   EXPECT_FALSE(ParseReplconfUuidReply("", &uuid, &ms));
   EXPECT_FALSE(ParseReplconfUuidReply("OK", &uuid, &ms));
   EXPECT_FALSE(ParseReplconfUuidReply("not-a-uuid 123", &uuid, &ms));
@@ -67,6 +67,19 @@ TEST(ReplconfUuidReply, MalformedRejectedExtraTokensIgnored) {
   // Forward compat: a third token from a future master is ignored.
   EXPECT_TRUE(ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd 5 future", &uuid, &ms));
   EXPECT_EQ(5u, ms);
+}
+
+TEST(ReplconfUuidReply, FailureLeavesOutParamsUntouched) {
+  std::string uuid = "sentinel";
+  uint64_t ms = 4242;
+  EXPECT_FALSE(ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd notanum", &uuid, &ms));
+  EXPECT_EQ("sentinel", uuid);
+  EXPECT_EQ(4242u, ms);
+  // Overflow used to write UINT64_MAX through the out-param before returning false.
+  EXPECT_FALSE(ParseReplconfUuidReply(
+      "01234567-89ab-4cde-8f01-23456789abcd 99999999999999999999999", &uuid, &ms));
+  EXPECT_EQ("sentinel", uuid);
+  EXPECT_EQ(4242u, ms);
 }
 
 }  // namespace dfly
