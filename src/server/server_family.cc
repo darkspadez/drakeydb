@@ -68,6 +68,7 @@ extern "C" {
 #include "server/memory_cmd.h"
 #include "server/multi_command_squasher.h"
 #include "server/namespaces.h"
+#include "server/node_identity.h"
 #include "server/rdb_load.h"
 #include "server/rdb_save.h"
 #include "server/replica.h"
@@ -3632,6 +3633,16 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
         return cmd_cntx->SendError(kInvalidIntErr);
       }
       dfly_cmd_->SetDflyClientVersion(&cntx->conn_state, DflyVersion(version));
+    } else if (cmd == "UUID" && args.size() == 2) {
+      // drakeydb identity exchange (KeyDB-compatible). Reply carries our uuid plus a ms clock
+      // sample - a drakeydb extension over KeyDB's bare-uuid reply.
+      if (!IsValidNodeUuid(arg)) {
+        return cmd_cntx->SendError("Invalid UUID");
+      }
+      string peer_uuid = NormalizeNodeUuid(arg);
+      cntx->conn_state.replication_info.repl_node_uuid = peer_uuid;
+      peer_registry_.AddOrGet(peer_uuid);
+      return builder->SendSimpleString(absl::StrCat(node_uuid(), " ", GetCurrentTimeMs()));
     } else if (cmd == "ACK" && args.size() == 2) {
       // Don't send error/Ok back through the socket, because we don't want to interleave with
       // the journal writes that we write into the same socket.

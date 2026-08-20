@@ -20,6 +20,7 @@
 #include "base/gtest.h"
 #include "facade/facade_test.h"
 #include "io/file_util.h"
+#include "server/engine_shard_set.h"
 #include "server/node_identity.h"
 #include "server/test_utils.h"
 #include "util/fibers/fibers.h"
@@ -278,6 +279,15 @@ class MultiMasterFamilyTest : public BaseFamilyTest {
     absl::SetFlag(&FLAGS_dir, base::GetTestTempPath("mm_family"));
   }
 
+  // Explicit TearDown (not a trailing assignment at the end of each test body) so a frozen
+  // TEST_current_time_ms is restored even if a test fails or throws mid-body. gtest runs the
+  // whole binary in one process, so a leaked frozen clock would silently corrupt every later
+  // BaseFamilyTest case that follows -- same leak shape saver_ already guards against for --dir.
+  void TearDown() override {
+    TEST_current_time_ms = 0;
+    BaseFamilyTest::TearDown();
+  }
+
   absl::FlagSaver saver_;
 };
 
@@ -288,6 +298,25 @@ TEST_F(MultiMasterFamilyTest, InfoReplicationHasNodeUuid) {
   ASSERT_NE(std::string::npos, pos);
   std::string uuid = info.substr(pos + 10, 36);
   EXPECT_TRUE(IsValidNodeUuid(uuid)) << uuid;
+}
+
+TEST_F(MultiMasterFamilyTest, ReplconfUuidRepliesOwnUuidAndMs) {
+  TEST_current_time_ms = 1755600000000;
+  auto resp = Run({"replconf", "uuid", "01234567-89AB-4cde-8f01-23456789abcd"});
+  std::string reply{ToSV(resp.GetBuf())};
+  std::string uuid;
+  uint64_t ms = 0;
+  ASSERT_TRUE(ParseReplconfUuidReply(reply, &uuid, &ms)) << reply;
+  EXPECT_TRUE(IsValidNodeUuid(uuid));
+  EXPECT_EQ(1755600000000u, ms);
+  // Second send with a different uuid also succeeds (idempotent handling).
+  auto resp2 = Run({"replconf", "uuid", "01234567-89ab-4cde-8f01-000000000002"});
+  ASSERT_TRUE(ParseReplconfUuidReply(std::string{ToSV(resp2.GetBuf())}, &uuid, &ms));
+}
+
+TEST_F(MultiMasterFamilyTest, ReplconfUuidInvalidRejected) {
+  auto resp = Run({"replconf", "uuid", "not-a-uuid"});
+  EXPECT_THAT(resp, ErrArg("Invalid UUID"));
 }
 
 }  // namespace dfly

@@ -1,8 +1,11 @@
 """Phase 1 multi-master identity tests: node uuid persistence + REPLCONF UUID exchange."""
 
 import re
+import time
 
 import pytest
+
+import redis
 
 from .instance import DflyInstanceFactory, DflyStartException
 
@@ -51,3 +54,15 @@ async def test_corrupt_uuid_file_fails_boot(df_factory: DflyInstanceFactory, tmp
     node = df_factory.create(proactor_threads=1, dir=str(d))
     with pytest.raises(DflyStartException):
         node.start()
+
+
+async def test_replconf_uuid_wire_reply(df_factory: DflyInstanceFactory, tmp_path):
+    node = df_factory.create(proactor_threads=1, dir=str(tmp_path / "n1"))
+    node.start()
+    c = node.client()
+    reply = await c.execute_command("REPLCONF", "UUID", "01234567-89ab-4cde-8f01-23456789abcd")
+    token_uuid, token_ms = reply.split(" ")
+    assert token_uuid == (await c.info("replication"))["node_uuid"]
+    assert abs(int(token_ms) - time.time() * 1000) < 60_000
+    with pytest.raises(redis.exceptions.ResponseError, match="Invalid UUID"):
+        await c.execute_command("REPLCONF", "UUID", "not-a-uuid")
