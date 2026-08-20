@@ -16,6 +16,8 @@
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/metrics.h"
+#include "server/multi_master.h"
+#include "server/node_identity.h"
 #include "server/replica_types.h"
 #include "server/server_state.h"
 #include "server/stats.h"
@@ -215,6 +217,14 @@ class ServerFamily {
     return master_replid_;
   }
 
+  const std::string& node_uuid() const {
+    return node_identity_.uuid;
+  }
+
+  PeerRegistry* peer_registry() {
+    return &peer_registry_;
+  }
+
   // The lineage root replication id of this node: its own replid if it is a true master, or the
   // ancestor id advertised by its master when it is itself a replica (cascaded replication).
   std::string GetLineageId() const ABSL_LOCKS_EXCLUDED(replicaof_mu_);
@@ -381,6 +391,9 @@ class ServerFamily {
 
   std::string master_replid_;
   std::optional<LastMasterSyncData> last_master_data_;
+
+  NodeIdentity node_identity_;
+  PeerRegistry peer_registry_;
 
   time_t start_time_ = 0;  // in seconds, epoch time.
 

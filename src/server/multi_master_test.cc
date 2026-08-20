@@ -18,12 +18,15 @@
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
 #include "base/gtest.h"
+#include "facade/facade_test.h"
 #include "io/file_util.h"
 #include "server/node_identity.h"
+#include "server/test_utils.h"
 #include "util/fibers/fibers.h"
 #include "util/fibers/pool.h"
 
 ABSL_DECLARE_FLAG(bool, force_epoll);
+ABSL_DECLARE_FLAG(std::string, dir);
 
 namespace dfly {
 
@@ -263,6 +266,28 @@ TEST_F(PeerRegistryFiberTest, ConcurrentAddersDontDuplicate) {
   EXPECT_EQ(1 + uuids.size(), reg.Size());
   for (const auto& u : uuids)
     EXPECT_EQ(u, reg.GetUuid(*reg.FindIdx(u)));  // round-trip: catches index aliasing too.
+}
+
+// Gives this fixture's boot its own private --dir so its identity file never collides with
+// another test's, and restores the global --dir flag on teardown (saver_ is the fixture's only
+// data member, so it is constructed -- capturing the pre-test value -- before the constructor
+// body below runs, and destroyed, restoring that value, after TearDown()).
+class MultiMasterFamilyTest : public BaseFamilyTest {
+ protected:
+  MultiMasterFamilyTest() {
+    absl::SetFlag(&FLAGS_dir, base::GetTestTempPath("mm_family"));
+  }
+
+  absl::FlagSaver saver_;
+};
+
+TEST_F(MultiMasterFamilyTest, InfoReplicationHasNodeUuid) {
+  auto resp = Run({"info", "replication"});
+  std::string info{ToSV(resp.GetBuf())};
+  size_t pos = info.find("node_uuid:");
+  ASSERT_NE(std::string::npos, pos);
+  std::string uuid = info.substr(pos + 10, 36);
+  EXPECT_TRUE(IsValidNodeUuid(uuid)) << uuid;
 }
 
 }  // namespace dfly

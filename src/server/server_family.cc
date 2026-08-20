@@ -1283,6 +1283,11 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
     snapshot_storage_ = std::make_shared<detail::FileSnapshotStorage>(nullptr);
   }
 
+  node_identity_ = InitNodeIdentityOrExit(flag_dir);
+  peer_registry_.Init(node_identity_.uuid);
+  LOG(INFO) << "Node uuid: " << node_identity_.uuid
+            << (node_identity_.ephemeral ? " (ephemeral)" : "");
+
   // check for '--replicaof' before loading anything
   if (ReplicaOfFlag flag = GetFlag(FLAGS_replicaof); flag.has_value()) {
     service_.proactor_pool().GetNextProactor()->Await(
@@ -2966,6 +2971,7 @@ string ServerFamily::FormatInfoMetrics(
   };
 
   auto add_repl_info = [&] {
+    append("node_uuid", node_uuid());
     if (!m.replica_side_info) {
       vector<ReplicaRoleInfo> replicas_info = dfly_cmd_->GetReplicasRoleInfo();
       append("role", "master");
