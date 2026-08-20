@@ -14,6 +14,12 @@ spec:
   - '{{ include "dragonfly.fullname" . }}.{{ .Release.Namespace }}.svc'
   - '{{ include "dragonfly.fullname" . }}.{{ .Release.Namespace }}'
   - '{{ include "dragonfly.fullname" . }}'
+  {{- if ne (include "dragonfly.clientServiceName" .) (include "dragonfly.fullname" .) }}
+  - '{{ include "dragonfly.clientServiceName" . }}.{{ .Release.Namespace }}.svc.cluster.local'
+  - '{{ include "dragonfly.clientServiceName" . }}.{{ .Release.Namespace }}.svc'
+  {{- end }}
+  - '{{ include "dragonfly.fullname" . }}-metrics.{{ .Release.Namespace }}.svc.cluster.local'
+  - '{{ include "dragonfly.fullname" . }}-metrics.{{ .Release.Namespace }}.svc'
   - localhost
   duration: {{ required "tls.duration is required, if createCerts is enabled" .Values.tls.duration }}
   ipAddresses:

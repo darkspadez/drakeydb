@@ -28,8 +28,10 @@ spec:
       path: /metrics
       {{- if .Values.tls.enabled }}
       scheme: https
+      {{- $tlsConfig := deepCopy (default (dict) .Values.serviceMonitor.tlsConfig) }}
+      {{- $_ := set $tlsConfig "serverName" (default (printf "%s-metrics.%s.svc" (include "dragonfly.fullname" .) .Release.Namespace) $tlsConfig.serverName) }}
       tlsConfig:
-        insecureSkipVerify: true
+        {{- toYaml $tlsConfig | nindent 8 }}
       {{- else }}
       scheme: http
       {{- end }}

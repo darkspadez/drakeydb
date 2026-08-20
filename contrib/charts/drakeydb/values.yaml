@@ -87,6 +87,10 @@ serviceMonitor:
   interval: 10s
   # -- scrape timeout
   scrapeTimeout: 10s
+  # -- TLS settings for scraping. serverName defaults to the metrics Service DNS name.
+  # Configure ca (for example, ca.secret.name and ca.secret.key) when TLS certificate
+  # validation should use a private CA.
+  tlsConfig: {}
 
 prometheusRule:
   # -- Deploy a PrometheusRule
@@ -145,12 +149,15 @@ tls:
   #   HLunol88AeTOcKfD6hBYGvcRfu5NV29jJxZCOBfbFQXjnNlnrhRCag==
   #   -----END RSA PRIVATE KEY-----
 
-# If enabled will set DFLY_PASSWORD environment variable with the specified existing secret value
-# Note that if enabled and the secret does not exist pods will not start
+# -- Set the password environment variable from the specified existing Secret. If enabled
+# and the Secret does not exist, pods will not start.
 passwordFromSecret:
   enable: false
+  # -- Existing Secret containing the password.
   existingSecret:
+    # -- Existing Secret name.
     name: ""
+    # -- Secret key containing the password.
     key: ""
 
 
@@ -183,13 +190,9 @@ command: []
 extraArgs: []
 
 cluster:
-  # -- Redis cluster protocol mode passed to Dragonfly as --cluster_mode.
-  # -- Accepts "emulated" or "yes". Unquoted `yes` (parsed as boolean by YAML)
-  # -- is also supported and treated as the string "yes".
-  # -- Leave empty to disable cluster mode.
+  # -- Redis cluster protocol mode passed to Dragonfly as --cluster_mode; accepts emulated or yes (including unquoted YAML yes). Leave empty to disable cluster mode.
   mode: ""
-  # -- When cluster mode is enabled, pass --experimental_cluster_shard_by_slot=true
-  # -- so sharding follows slots instead of hash tags.
+  # -- When cluster mode is enabled, pass --experimental_cluster_shard_by_slot=true so sharding follows slots instead of hash tags.
   experimentalShardBySlot: false
 
 # -- Extra volumes to mount into the pods

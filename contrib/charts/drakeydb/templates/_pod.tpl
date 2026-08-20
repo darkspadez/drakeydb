@@ -42,6 +42,7 @@ securityContext:
 {{- end }}
 {{- if and (eq (typeOf .Values.hostNetwork) "bool") .Values.hostNetwork }}
 hostNetwork: true
+dnsPolicy: ClusterFirstWithHostNet
 {{- end }}
 {{- with .Values.topologySpreadConstraints }}
 topologySpreadConstraints:
@@ -114,13 +115,17 @@ containers:
     {{- if or .Values.passwordFromSecret.enable .Values.env }}
     env:
     {{- if .Values.passwordFromSecret.enable }}
-    {{- $appVersion := .Chart.AppVersion | trimPrefix "v" }}
-    {{- $imageTag := .Values.image.tag | trimPrefix "v" }}
+    {{- $appVersion := .Chart.AppVersion | toString | trimPrefix "v" }}
+    {{- $imageTag := .Values.image.tag | toString | trimPrefix "v" }}
     {{- $effectiveVersion := $appVersion }}
     {{- if and $imageTag (ne $imageTag "") }}
       {{- $effectiveVersion = $imageTag }}
     {{- end }}
-    {{- if semverCompare ">=1.14.0" $effectiveVersion }}
+    {{- $useRequirepass := true }}
+    {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+([+-].*)?$" $effectiveVersion }}
+      {{- $useRequirepass = semverCompare ">=1.14.0" $effectiveVersion }}
+    {{- end }}
+    {{- if $useRequirepass }}
       - name: DFLY_requirepass
     {{- else }}
       - name: DFLY_PASSWORD

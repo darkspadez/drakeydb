@@ -39,6 +39,20 @@ avoids name collisions when this chart is installed as a subchart dependency.
 {{- end }}
 
 {{/*
+Client-facing Service name. Storage mode needs a separate client Service when
+the governing headless Service would otherwise have the chart's fullname.
+*/}}
+{{- define "dragonfly.clientServiceName" -}}
+{{- $fullname := include "dragonfly.fullname" . -}}
+{{- $serviceName := include "dragonfly.serviceName" . -}}
+{{- if and .Values.storage.enabled (eq $fullname $serviceName) -}}
+{{- printf "%s-client" ($fullname | trunc 56 | trimSuffix "-") -}}
+{{- else -}}
+{{- $fullname -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Data volume / PVC name. Defaults to "<release-name>-data", matching this
 chart's historical behavior so existing storage-enabled releases are
 unaffected on upgrade (Kubernetes does not allow renaming

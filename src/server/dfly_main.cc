@@ -1020,6 +1020,10 @@ void PrintBasicUsageInfo() {
   for (const auto& dir : base::GetLoggingDirectories()) {
     const string_view maybe_slash = absl::EndsWith(dir, "/") ? "" : "/";
     absl::StrAppend(&output, dir, maybe_slash, "drakeydb.*\n");
+#ifndef USE_ABSL_LOG
+    absl::StrAppend(&output, dir, maybe_slash,
+                    "dragonfly.* (when launched via the compatibility symlink)\n");
+#endif
   }
 
   absl::StrAppend(&output,

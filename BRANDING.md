@@ -11,7 +11,7 @@ compatibility, or existing tooling?** If yes, it keeps the Dragonfly name.
 | Binary | `drakeydb` (+ `dragonfly` symlink for tooling) | `src/server/CMakeLists.txt` `OUTPUT_NAME` |
 | CMake project | `DRAKEYDB` | `CMakeLists.txt` |
 | Startup banner / usage / `--version` text | drakeydb | `src/server/dfly_main.cc` |
-| Log file names | `drakeydb.*` (follows binary name) | glog program-name derived |
+| Log file names | `drakeydb.*` (or `dragonfly.*` via the compatibility symlink) | glog program-name derived |
 | README / fork docs | drakeydb | `README.md`, `docs/` |
 | Helm chart (new copy) | `contrib/charts/drakeydb/` | upstream chart left untouched |
 | Release tags | `drakey-X.Y.Z` (no `v` prefix) | avoids upstream update-check pings |

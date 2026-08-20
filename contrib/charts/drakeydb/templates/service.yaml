@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "dragonfly.fullname" . }}
+  name: {{ include "dragonfly.clientServiceName" . }}
   namespace: {{ .Release.Namespace }}
   {{- with .Values.service.annotations }}
   annotations:

@@ -13,7 +13,7 @@ support is being built in phases:
 
 | Phase | Feature | Status |
 |---|---|---|
-| 0 | Fork setup + rebrand (binary: `drakeydb`) | in progress |
+| 0 | Fork setup + rebrand (binary: `drakeydb`) | complete |
 | 1 | Persistent node identity (UUID) + handshake | planned |
 | 2 | Writable multi-source replica (fan-in) | planned |
 | 3 | Origin-tagged journal + active-active mesh | planned |
@@ -21,10 +21,14 @@ support is being built in phases:
 | 7 | One-way onboarding from live KeyDB masters | planned |
 | 8–9 | Mesh hardening, CI, first release | planned |
 
-Everything Dragonfly does today, drakeydb does identically: with multi-master flags off, behavior
-and wire formats are byte-compatible with upstream Dragonfly.
+With multi-master flags off, drakeydb retains wire protocol, on-disk format, metrics, and
+`INFO` compatibility with upstream Dragonfly. Runtime defaults and fork-specific surface
+behavior can differ; see [BRANDING.md](BRANDING.md) for the compatibility policy.
 
-## What multi-master will look like
+## Planned multi-master interface
+
+The multi-master interface is planned for Phase 2 and is not implemented yet. The following
+commands illustrate the intended interface:
 
 ```bash
 # Node A and node B, both writable, replicating from each other (full mesh):
@@ -64,10 +68,13 @@ policy and [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) for how upstream patch
 
 ## License
 
-drakeydb inherits Dragonfly's [Business Source License 1.1](LICENSE.md) (converts to Apache 2.0
-on the stated change date). Ported KeyDB logic is BSD-3-Clause; see [NOTICE](NOTICE) for
-attributions. The BSL restricts offering this software as a commercial in-memory datastore
-service — read the license before deploying commercially.
+drakeydb inherits Dragonfly's [Business Source License 1.1](LICENSE.md). It converts to Apache
+2.0 on Nov 1, 2030, or on the fourth anniversary of the first public distribution of a specific
+version, whichever comes first. The Additional Use Grant permits use only as part of your own
+product or service when it is not an in-memory data store product or service, and prohibits using,
+providing, distributing, or making the Licensed Work available as a Service to third parties.
+See [LICENSE.md](LICENSE.md) for the complete applicable terms. Ported KeyDB logic is
+BSD-3-Clause; see [NOTICE](NOTICE) for attributions.
 
 ## Credits
 
