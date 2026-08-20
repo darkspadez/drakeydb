@@ -89,17 +89,24 @@ std::error_code CreateDirs(fs::path dir_path) {
 
 // Writes `uuid` to `file` via a temp file plus atomic rename, creating `dir` first if needed.
 // The temp file name carries a pid suffix because parallel ctest/pytest processes can share a
-// cwd. Returns false on any failure (directory creation, open, write, or rename), in which case
-// it best-effort removes the temp file.
+// cwd. Returns false on any failure (directory creation, open, write, close, or rename), in
+// which case it best-effort removes the temp file and never renames it into place.
 //
 // Deliberately no fsync: the worst case after a crash or power loss is a *missing* file, never a
-// torn one, since rename(2) is atomic and the old file (if any) is never touched in place. A
-// missing file just falls back to the "generate a new identity" path on the next boot.
+// torn one, since rename(2) is atomic, the old file (if any) is never touched in place, and any
+// write or close failure aborts before the rename. A missing file just falls back to the
+// "generate a new identity" path on the next boot.
 bool PersistUuid(const fs::path& dir, const fs::path& file, std::string_view uuid) {
-  std::error_code ec = CreateDirs(dir);
-  if (ec) {
-    LOG(ERROR) << "Could not create directory " << dir << ": " << ec.message();
-    return false;
+  std::error_code ec;
+  // dir == "" means the identity file resolves cwd-relative (same as an unset --dir); mirror
+  // upstream's own guard (save_stages_controller.cc:399) rather than asking CreateDirs to
+  // create_directories(""), which fails with EINVAL.
+  if (!dir.empty()) {
+    ec = CreateDirs(dir);
+    if (ec) {
+      LOG(ERROR) << "Could not create directory " << dir << ": " << ec.message();
+      return false;
+    }
   }
 
   fs::path tmp_file{file};
@@ -123,7 +130,13 @@ bool PersistUuid(const fs::path& dir, const fs::path& file, std::string_view uui
 
   write_ec = wf->Close();
   if (write_ec) {
-    LOG(WARNING) << "Failed to close " << tmp_file << " with error: " << write_ec.message();
+    // A deferred write error (delayed writeback, NFS, ...) can surface here, meaning tmp_file
+    // may be short or truncated. Treat exactly like a write failure: never rename a possibly
+    // torn file into place, or a corrupt-file boot (row 5) could turn into a fatal exit even
+    // though this was meant to degrade to an ephemeral identity.
+    LOG(ERROR) << "Failed to close " << tmp_file << " with error: " << write_ec.message();
+    fs::remove(tmp_file, ec);
+    return false;
   }
 
   fs::rename(tmp_file, file, ec);

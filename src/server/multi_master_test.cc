@@ -125,6 +125,17 @@ TEST(NodeIdentityFile, CorruptFileFails) {
   EXPECT_FALSE(LoadOrCreateNodeIdentity(dir, ""));
 }
 
+TEST(NodeIdentityFile, ExistingFileWhitespaceAndMixedCaseNormalized) {
+  std::string dir = base::GetTestTempPath("nid_whitespace");
+  std::filesystem::create_directories(dir);
+  ASSERT_TRUE(WriteStringToFileForTest(dir + "/drakeydb.uuid",
+                                       "  01234567-89AB-4CDE-8F01-23456789ABCD \n"));
+  auto id = LoadOrCreateNodeIdentity(dir, "");
+  ASSERT_TRUE(id);
+  EXPECT_FALSE(id->ephemeral);
+  EXPECT_EQ("01234567-89ab-4cde-8f01-23456789abcd", id->uuid);
+}
+
 TEST(NodeIdentityFile, CloudDirIsEphemeral) {
   auto id = LoadOrCreateNodeIdentity("s3://bucket/prefix", "");
   ASSERT_TRUE(id);
@@ -163,6 +174,21 @@ TEST(NodeIdentityFile, CreatesMissingDir) {
   ASSERT_TRUE(id);
   EXPECT_FALSE(id->ephemeral);
   EXPECT_TRUE(std::filesystem::exists(sub + "/drakeydb.uuid"));
+}
+
+TEST(NodeIdentityFile, EmptyDirPersistsIntoCwd) {
+  namespace fs = std::filesystem;
+  std::string dir = base::GetTestTempPath("nid_cwd");
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  fs::path saved_cwd = fs::current_path();
+  fs::current_path(dir);
+  auto id = LoadOrCreateNodeIdentity("", "");
+  bool file_exists = fs::exists("drakeydb.uuid");
+  fs::current_path(saved_cwd);  // restore BEFORE asserting
+  ASSERT_TRUE(id);
+  EXPECT_FALSE(id->ephemeral);
+  EXPECT_TRUE(file_exists);
 }
 
 }  // namespace dfly
