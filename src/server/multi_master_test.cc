@@ -11,10 +11,13 @@
 
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <vector>
 
 #include "base/gtest.h"
 #include "io/file_util.h"
 #include "server/node_identity.h"
+#include "util/fibers/fibers.h"
 
 namespace dfly {
 
@@ -189,6 +192,43 @@ TEST(NodeIdentityFile, EmptyDirPersistsIntoCwd) {
   ASSERT_TRUE(id);
   EXPECT_FALSE(id->ephemeral);
   EXPECT_TRUE(file_exists);
+}
+
+TEST(PeerRegistry, SelfIsZeroAndAddOrGetIsMonotonicIdempotent) {
+  PeerRegistry reg;
+  reg.Init("01234567-89ab-4cde-8f01-000000000000");
+  EXPECT_EQ(PeerRegistry::kSelfIdx, reg.FindIdx("01234567-89ab-4cde-8f01-000000000000"));
+  EXPECT_EQ("01234567-89ab-4cde-8f01-000000000000", reg.GetUuid(0));
+  EXPECT_EQ(1u, reg.Size());
+  uint32_t a = reg.AddOrGet("01234567-89ab-4cde-8f01-000000000001");
+  uint32_t b = reg.AddOrGet("01234567-89ab-4cde-8f01-000000000002");
+  EXPECT_EQ(1u, a);
+  EXPECT_EQ(2u, b);
+  EXPECT_EQ(a, reg.AddOrGet("01234567-89ab-4cde-8f01-000000000001"));  // idempotent
+  EXPECT_EQ("01234567-89ab-4cde-8f01-000000000002", reg.GetUuid(b));
+  EXPECT_EQ(std::nullopt, reg.FindIdx("01234567-89ab-4cde-8f01-0000000000ff"));
+  EXPECT_EQ("", reg.GetUuid(99));
+  EXPECT_EQ(3u, reg.Size());
+}
+
+TEST(PeerRegistry, ConcurrentAddersDontDuplicate) {
+  PeerRegistry reg;
+  reg.Init(GenerateNodeUuid());
+  std::vector<std::string> uuids;
+  for (int i = 0; i < 16; ++i)
+    uuids.push_back(GenerateNodeUuid());
+  std::vector<util::fb2::Fiber> fibers;
+  for (int f = 0; f < 8; ++f) {
+    fibers.emplace_back([&] {
+      for (const auto& u : uuids)
+        reg.AddOrGet(u);
+    });
+  }
+  for (auto& fb : fibers)
+    fb.Join();
+  EXPECT_EQ(1 + uuids.size(), reg.Size());
+  for (const auto& u : uuids)
+    EXPECT_TRUE(reg.FindIdx(u).has_value());
 }
 
 }  // namespace dfly
