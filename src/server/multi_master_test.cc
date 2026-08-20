@@ -40,4 +40,33 @@ TEST(NodeUuid, ValidateRejectsMalformed) {
             NormalizeNodeUuid("01234567-89AB-4CDE-8F01-23456789ABCD"));
 }
 
+TEST(ReplconfUuidReply, ParsesKeydbBareUuid) {
+  std::string uuid;
+  uint64_t ms = 12345;
+  ASSERT_TRUE(ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd", &uuid, &ms));
+  EXPECT_EQ("01234567-89ab-4cde-8f01-23456789abcd", uuid);
+  EXPECT_EQ(0u, ms);  // KeyDB sends no clock
+}
+
+TEST(ReplconfUuidReply, ParsesDrakeydbUuidWithMs) {
+  std::string uuid;
+  uint64_t ms = 0;
+  ASSERT_TRUE(
+      ParseReplconfUuidReply("01234567-89AB-4cde-8f01-23456789abcd 1755600000000", &uuid, &ms));
+  EXPECT_EQ("01234567-89ab-4cde-8f01-23456789abcd", uuid);  // normalized
+  EXPECT_EQ(1755600000000u, ms);
+}
+
+TEST(ReplconfUuidReply, MalformedRejectedExtraTokensIgnored) {
+  std::string uuid;
+  uint64_t ms;
+  EXPECT_FALSE(ParseReplconfUuidReply("", &uuid, &ms));
+  EXPECT_FALSE(ParseReplconfUuidReply("OK", &uuid, &ms));
+  EXPECT_FALSE(ParseReplconfUuidReply("not-a-uuid 123", &uuid, &ms));
+  EXPECT_FALSE(ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd notanum", &uuid, &ms));
+  // Forward compat: a third token from a future master is ignored.
+  EXPECT_TRUE(ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd 5 future", &uuid, &ms));
+  EXPECT_EQ(5u, ms);
+}
+
 }  // namespace dfly

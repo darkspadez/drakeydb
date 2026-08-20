@@ -27,4 +27,9 @@ bool IsValidNodeUuid(std::string_view uuid);
 // Precondition: IsValidNodeUuid(uuid). Returns the lowercase canonical form.
 std::string NormalizeNodeUuid(std::string_view uuid);
 
+// Parses the master's REPLCONF UUID success reply: "<uuid>" (KeyDB) or "<uuid> <ms>" (drakeydb).
+// Extra tokens are ignored for forward compatibility. Returns false on a malformed reply
+// (caller treats that as fatal). *master_ms is 0 when the master sent no clock.
+bool ParseReplconfUuidReply(std::string_view reply, std::string* master_uuid, uint64_t* master_ms);
+
 }  // namespace dfly

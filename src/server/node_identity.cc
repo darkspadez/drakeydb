@@ -5,7 +5,11 @@
 
 #include <absl/random/random.h>
 #include <absl/strings/ascii.h>
+#include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
+#include <absl/strings/str_split.h>
+
+#include <vector>
 
 #include "base/logging.h"
 #include "core/detail/gen_utils.h"
@@ -38,6 +42,17 @@ bool IsValidNodeUuid(std::string_view uuid) {
 std::string NormalizeNodeUuid(std::string_view uuid) {
   DCHECK(IsValidNodeUuid(uuid));
   return absl::AsciiStrToLower(uuid);
+}
+
+bool ParseReplconfUuidReply(std::string_view reply, std::string* master_uuid, uint64_t* master_ms) {
+  std::vector<std::string_view> tokens = absl::StrSplit(reply, ' ', absl::SkipEmpty());
+  if (tokens.empty() || !IsValidNodeUuid(tokens[0]))
+    return false;
+  *master_ms = 0;
+  if (tokens.size() >= 2 && !absl::SimpleAtoi(tokens[1], master_ms))
+    return false;
+  *master_uuid = NormalizeNodeUuid(tokens[0]);
+  return true;
 }
 
 }  // namespace dfly
