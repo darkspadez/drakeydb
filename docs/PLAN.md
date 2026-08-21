@@ -3,7 +3,7 @@
 > **Continue here.** This is the approved, living plan and canonical copy for the drakeydb fork.
 > Update the status block below as phases land.
 
-## Current status (last updated 2026-08-21)
+## Current status (last updated 2026-08-20)
 
 | Phase | Status | Where |
 |---|---|---|
