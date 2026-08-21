@@ -3649,8 +3649,8 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
       }
       string peer_uuid = NormalizeNodeUuid(arg);
       // Registration into peer_registry_ happens later, in DflyCmd::CreateSyncSession, once this
-      // connection actually becomes a sync-session replica -- not here, where any unauthenticated
-      // client (REPLCONF is exempt from AUTH-gating) could otherwise grow the registry forever.
+      // connection actually becomes a sync-session replica -- not here, where REPLCONF is reachable
+      // pre-auth when requirepass is unset and could otherwise grow the registry forever.
       cntx->conn_state.replication_info.repl_node_uuid = peer_uuid;
       return builder->SendSimpleString(absl::StrCat(node_uuid(), " ", GetCurrentTimeMs()));
     } else if (cmd == "ACK" && args.size() == 2) {

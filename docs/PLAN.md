@@ -58,6 +58,15 @@ seed). Peer registration deliberately happens in `DflyCmd::CreateSyncSession`, *
 `REPLCONF UUID` arm: `REPLCONF` is reachable pre-auth when `requirepass` is unset, and
 `PeerRegistry` has no reclamation API, so registering there let any client grow it without bound.
 
+**P1 KeyDB interop is one-directional:** inbound (drakeydb replica ← KeyDB master) is the claimed
+scope and works — our parser accepts KeyDB's bare-uuid reply, and `IsValidNodeUuid` matches KeyDB's
+`strlen != 36` + `uuid_parse` check exactly. Outbound (KeyDB replica ← drakeydb master) does
+**not**: real KeyDB validates our `REPLCONF UUID` reply with an exact-length check
+(`KeyDB/src/replication.cpp:3654-3657`), and drakeydb's `+<36-char uuid> <13-digit ms>` reply
+(51 chars) fails it outright. This is scope, not a bug — the ms suffix was a deliberate P1 choice —
+but costly to revisit later: the exchange predates `capa dragonfly`/`CLIENT-VERSION`, so there is no
+peer signal yet to gate the suffix on, and P8's clock-skew work will come to depend on it.
+
 **Resuming work — environment notes (macOS dev machine):**
 - Container runtime is **OrbStack**: `orbctl start` if the docker daemon is down. VM is
   linux/arm64 with 8 GB RAM / 12 CPUs.

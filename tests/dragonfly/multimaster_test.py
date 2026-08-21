@@ -100,6 +100,10 @@ async def test_uuid_survives_master_restart(df_factory: DflyInstanceFactory, tmp
     uuid_before = (await c_replica.info("replication"))["master_node_uuid"]
     master.stop()
     master.start()
+    # The master's own identity is the thing being tested; check it directly here, independent of
+    # how long the replica takes to notice the restart (see the two loops below).
+    c_master = master.client()
+    assert (await c_master.info("replication"))["node_uuid"] == uuid_before
     for _ in range(100):  # first wait for the link to actually drop
         if (await c_replica.info("replication")).get("master_link_status") == "down":
             break

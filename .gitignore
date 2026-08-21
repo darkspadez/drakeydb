@@ -40,3 +40,4 @@ _codeql_build_dir/
 /KeyDB/
 # drakeydb: per-node identity file written into --dir at runtime (Phase 1)
 drakeydb.uuid
+drakeydb.uuid.tmp.*
