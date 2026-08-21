@@ -23,13 +23,15 @@ async def assert_start_fails(node):
 
     # Startup listens before ServerFamily validates node identity, so a fast machine can observe
     # the dynamic port just before the process exits and make node.start() return successfully.
-    for _ in range(50):
+    # Budget matches the other waits in this file (20s): validation runs after the listener opens,
+    # so a loaded CI machine can take far longer than the exit itself suggests.
+    for _ in range(100):
         return_code = node.proc.poll()
         if return_code is not None:
             node.stop(kill=True)  # clear the failed process from fixture teardown
             assert return_code != 0
             return
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.2)
     pytest.fail("node remained running despite invalid identity configuration")
 
 

@@ -19,7 +19,14 @@ class Proxy:
         self._next_response_override = None
 
     async def override_next_response(self, request_marker, replacement):
-        """Replace the next simple-line response after a request containing `request_marker`."""
+        """Replace the next simple-line response after a request containing `request_marker`.
+
+        Precondition: the proxied client must be strictly request/response on this connection and
+        must not pipeline. The override is armed when `request_marker` is seen in the request
+        stream and consumed on the very next response, so a second command sent before the first
+        response arrives would substitute the earlier response instead. `forward_requests` raises
+        if it detects such a case rather than silently overriding the wrong response.
+        """
         if not request_marker:
             raise ValueError("request marker must not be empty")
         if not replacement.endswith(b"\r\n"):
@@ -68,6 +75,21 @@ class Proxy:
                         request_marker, replacement = pending
                         request_data = request_tail + data
                         if request_marker in request_data:
+                            # Refuse to arm when another command follows the marked one in the
+                            # same read: the override is consumed by the next response, so that
+                            # would replace the earlier command's response and leave the marked
+                            # one untouched. Fail loudly rather than silently test the wrong
+                            # thing. Replication clients send inline commands
+                            # (RedisReplyBuilderBase::SerializeCommand appends only CRLF), so the
+                            # first CRLF at or after the marker ends the marked command and any
+                            # bytes past it are a pipelined follower.
+                            marker_pos = request_data.find(request_marker)
+                            line_end = request_data.find(b"\r\n", marker_pos)
+                            if line_end != -1 and request_data[line_end + 2 :]:
+                                raise RuntimeError(
+                                    "override_next_response requires a non-pipelining client: "
+                                    "another command follows the marked one in the same read"
+                                )
                             response_override = replacement
                             self._next_response_override = None
                             request_tail = b""
