@@ -3,13 +3,14 @@
 > **Continue here.** This is the approved, living plan and canonical copy for the drakeydb fork.
 > Update the status block below as phases land.
 
-## Current status (last updated 2026-08-19)
+## Current status (last updated 2026-08-21)
 
 | Phase | Status | Where |
 |---|---|---|
 | **P0 — Repo hygiene + rename** | ✅ **complete, verified** | PR [#1](https://github.com/darkspadez/drakeydb/pull/1), branch `feat/phase0-drakeydb-rename`, commit `7ca99f4c` |
-| **P1 — Identity foundations** | ⏭️ **next up** | see [Phase 1](#phase-1--identity-foundations) |
-| P2–P9 | not started | — |
+| **P1 — Identity foundations** | ✅ **complete, verified** | branch `feat/phase1-identity`, commits `9e653ab3..225d1881` (10 commits) |
+| **P2 — Writable multi-source replica** | ⏭️ **next up** | see [Phase 2](#phase-2--writable-multi-source-replica-fan-in) |
+| P3–P9 | not started | — |
 
 **P0 verification record** (Ubuntu 24.04 arm64 container, OrbStack): debug build produces
 `build-dbg/drakeydb` + `dragonfly` compat symlink; `--version` → `drakeydb dev-…`; live server
@@ -17,15 +18,68 @@ answers PING/SET/GET and INFO still reports `dragonfly_version`/`redis_version` 
 `journal_test` 8/8; `pymemcached_test.py::TestMemcached::test_basic` passes via the harness's
 default binary path; pre-commit clean; dry-run `git merge upstream/main` conflict-free.
 
+**P1 verification record** (Ubuntu 24.04 arm64 container, OrbStack, `--security-opt
+seccomp=unconfined` so io_uring is exercised rather than the epoll fallback):
+full `ctest -L DFLY` **86/86 passed, 0 failed** (983 s) after a complete `ninja` build — note
+`check_dfly` builds only a subset, so a bare `ctest -L DFLY` after it reports unbuilt binaries as
+"Not Run"; `multi_master_test` 19 passed + 1 skip (`UnwritableDirIsEphemeral` self-skips as root,
+and was separately proven to execute and pass under a non-root user); `multimaster_test.py`
+7 passed + 1 skip; full `replication_test.py` **43 passed, 0 failed** (334 s) with **no flakes, so
+no triage was required**; `cluster_test.py::test_cluster_migrations_sequence` passed (run
+explicitly because the `slaveN` INFO change is the one most exposed to its lag parser);
+pre-commit clean across all 16 changed files.
+
+**Known P1 coverage gap:** `multimaster_test.py::test_replicaof_real_redis_tolerates_missing_uuid`
+**skips locally** — the harness's `RedisServer` looks for version-suffixed binaries
+(`redis-server-7.2.2` / `redis-server-6.2.11` / `valkey-server-8.0.1`, `tests/dragonfly/instance.py`),
+which this container lacks. It is the **only automated coverage of the `-ERR` tolerance path**, i.e.
+replicating from a master that predates the UUID exchange; `replication_test.py` and
+`multimaster_test.py` are both drakeydb↔drakeydb. That path was hand-validated against a real
+unmodified `redis-server 7.0.15` (full sync succeeded, `master_node_uuid` absent throughout,
+expected WARNING logged, replication continued) and traced in source, but **watch CI for it**.
+
+**P3 prerequisites recorded during P1** (neither is a P1 defect; both bite later):
+1. **Per-instance test identity.** The pytest harness's dragonfly cwd is *session*-scoped
+   (`conftest.py` `determine_scope` returns `"session"`), and `create()` never defaults `--dir`, so
+   every instance without an explicit `dir=` now shares one `drakeydb.uuid` and comes up with an
+   **identical `node_uuid`**. Inert while nothing consumes the uuid; from P3 on, self-origin drop
+   keys on exactly this identity, so a mesh test would see every node claiming to be every other
+   node and the failure would look like a protocol bug. Give each `df_factory` instance a distinct
+   identity by default (per-instance `dir=`, or a generated `--node_uuid`) before P3 lands.
+2. **Duplicate-identity detection.** If a peer presents our own uuid (cloned VM image, copied
+   `drakeydb.uuid`), `PeerRegistry::AddOrGet` returns `kSelfIdx` and P3 would drop those entries as
+   self-originated — silent data loss with no diagnostic. KeyDB checks for this during the
+   handshake. P1 deliberately does not, to keep scope tight.
+
+**P1 note for P2/P3:** `MasterContext::master_node_uuid` is never cleared on disconnect, so INFO
+can report a stale `master_node_uuid` if a master at the same host:port is replaced in place by a
+build lacking the exchange. `master_clock_ms` is captured but read nowhere yet (a P8 clock-skew
+seed). Peer registration deliberately happens in `DflyCmd::CreateSyncSession`, **not** in the
+`REPLCONF UUID` arm: `REPLCONF` is reachable pre-auth when `requirepass` is unset, and
+`PeerRegistry` has no reclamation API, so registering there let any client grow it without bound.
+
 **Resuming work — environment notes (macOS dev machine):**
 - Container runtime is **OrbStack**: `orbctl start` if the docker daemon is down. VM is
   linux/arm64 with 8 GB RAM / 12 CPUs.
-- Build container: `docker run -v "$PWD":/src -w /src ubuntu:24.04` + apt packages from
+- Build container: `docker run -d --name drakeydb-build --security-opt seccomp=unconfined
+  -v "$PWD":/src -w /src ubuntu:24.04 sleep infinity` + apt packages from
   `docs/build-from-source.md` (add `binutils` for pytest teardown symbolization, plus
-  `redis-tools python3-venv` for smoke tests). Then `./helio/blaze.sh -DWITH_AWS=OFF
-  -DWITH_GCP=OFF && cd build-dbg && ninja -j4 dragonfly`.
+  `redis-tools redis-server python3-venv` for smoke and interop tests). Then
+  `./helio/blaze.sh -DWITH_AWS=OFF -DWITH_GCP=OFF && cd build-dbg && ninja -j4 dragonfly`.
   **Use `-j4`** — default 12-way parallelism OOM-kills `cc1plus` in the 8 GB VM.
+  **`--security-opt seccomp=unconfined` is required**: without it Docker's default seccomp profile
+  blocks the io_uring syscalls, `UringProactor::Init()` aborts, and every proactor-based test
+  (including all `BaseFamilyTest` fixtures) dies unless you pass `--force_epoll` everywhere —
+  which also means you stop exercising the io_uring path CI uses. A long-lived container plus
+  `docker exec` avoids reinstalling apt packages on every run; `docker commit` it before recreating
+  so the deps and the pytest venv survive.
 - pytest deps: `python3 -m venv /tmp/tv && /tmp/tv/bin/pip install -r tests/dragonfly/requirements.txt`.
+- **`DRAGONFLY_PATH` must be absolute** (e.g. `/src/build-dbg/dragonfly`). A relative path fails for
+  every test in this harness, because `instance.py` spawns the binary with `cwd` set to the
+  harness's temp directory rather than the repo root.
+- Full C++ gate: run a complete `ninja -j4` **before** `ctest -L DFLY`. The `check_dfly` target
+  builds and runs only a subset, so `ctest` afterwards reports the unbuilt binaries as "Not Run" —
+  which is easy to misread as failures.
 - Host has no pre-commit/pipx: `python3 -m venv <dir> && <dir>/bin/pip install pre-commit`,
   then `pre-commit run --files <changed files>`.
 - Remotes: `origin` = `git@github.com:darkspadez/drakeydb.git`, `upstream` =
@@ -218,10 +272,24 @@ helm chart copied to `contrib/charts/drakeydb` (golden harness dropped from copy
 workflows removed; `--version_check=false` default; banner/usage/version strings rebranded.
 Tag scheme `drakey-X.Y.Z` (no `v` prefix) — first tag cut in P9.
 
-## Phase 1 — Identity foundations
+## Phase 1 — Identity foundations ✅ (branch `feat/phase1-identity`)
 `node_identity` (persisted UUID at `<dir>/drakeydb.uuid`), `REPLCONF UUID` exchange (additive
 case in `ReplConf`), `PeerRegistry`, INFO `node_uuid`. No behavior change otherwise.
 **Verify:** C++ unit; pytest: two nodes exchange + report UUIDs; existing replication tests green.
+
+Delivered: `node_identity.{h,cc}` (uuid generate/validate/normalize, `ParseReplconfUuidReply`
+accepting both KeyDB's bare-uuid and drakeydb's `<uuid> <ms>` reply, persisted identity with the
+6-row boot policy, `--node_uuid` override); `multi_master.{h,cc}` (`PeerRegistry`, append-only
+uuid↔origin_idx with self at 0, fiber-safe, no reclamation API by design); identity load in
+`ServerFamily::Init()`; master-side `REPLCONF UUID` arm; replica-side exchange in `Greet()`
+tolerating `-ERR` from pre-exchange masters; INFO `node_uuid` (both roles), `master_node_uuid`
+(replica), and `,node_uuid=` inside `slaveN:` (master). 20 C++ cases + 8 pytest cases.
+Upstream-file footprint deliberately small and additive: `server_family.{h,cc}` +19/-0 in P1's
+wiring task and +12/-0 in the ReplConf task.
+
+Note: inside `slaveN:`, `node_uuid` is inserted **before** `lag`, not appended last. `lag` must
+stay the trailing field — `replication_test.py` and `cluster_test.py` both parse it with a
+`lag=([0-9]+)\r\n` regex that anchors on the line ending.
 
 ## Phase 2 — Writable multi-source replica (fan-in)
 Flags + validation; peer-mode `Replica` (no read-only flip; skip flush; override-load merge,
