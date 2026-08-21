@@ -3,23 +3,25 @@
 
 #include "server/node_identity.h"
 
+#include <absl/cleanup/cleanup.h>
 #include <absl/random/random.h>
 #include <absl/strings/ascii.h>
 #include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_split.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
-#include <memory>
 #include <system_error>
 #include <vector>
 
 #include "base/flags.h"
 #include "base/logging.h"
 #include "core/detail/gen_utils.h"
-#include "io/file.h"
 #include "io/file_util.h"
 #include "server/detail/snapshot_storage.h"
 
@@ -59,92 +61,123 @@ std::string NormalizeNodeUuid(std::string_view uuid) {
   return absl::AsciiStrToLower(uuid);
 }
 
-bool ParseReplconfUuidReply(std::string_view reply, std::string* master_uuid, uint64_t* master_ms) {
+ReplconfUuidReplyStatus ParseReplconfUuidReply(std::string_view reply, std::string* master_uuid,
+                                               uint64_t* master_ms) {
+  if (reply == "OK")
+    return ReplconfUuidReplyStatus::kUnsupported;
+
   std::vector<std::string_view> tokens = absl::StrSplit(reply, ' ', absl::SkipEmpty());
   if (tokens.empty() || !IsValidNodeUuid(tokens[0]))
-    return false;
+    return ReplconfUuidReplyStatus::kMalformed;
   uint64_t ms = 0;
   if (tokens.size() >= 2 && !absl::SimpleAtoi(tokens[1], &ms))
-    return false;
+    return ReplconfUuidReplyStatus::kMalformed;
   *master_uuid = NormalizeNodeUuid(tokens[0]);
   *master_ms = ms;
-  return true;
+  return ReplconfUuidReplyStatus::kSuccess;
 }
 
 namespace {
 
-// Create a directory and all its parents if they don't exist. Independent copy of the
-// file-local helper at server/detail/save_stages_controller.cc:40 (that file is not modified by
-// this fork).
-std::error_code CreateDirs(fs::path dir_path) {
-  std::error_code ec;
-  fs::file_status dir_status = fs::status(dir_path, ec);
-  if (ec == std::errc::no_such_file_or_directory) {
-    fs::create_directories(dir_path, ec);
-    if (!ec)
-      dir_status = fs::status(dir_path, ec);
-  }
-  return ec;
+std::error_code ErrnoError() {
+  return std::error_code(errno, std::generic_category());
 }
 
-// Writes `uuid` to `file` via a temp file plus atomic rename, creating `dir` first if needed.
-// The temp file name carries a pid suffix because parallel ctest/pytest processes can share a
-// cwd. Returns false on any failure (directory creation, open, write, close, or rename), in
-// which case it best-effort removes the temp file and never renames it into place.
-//
-// Deliberately no fsync: the worst case after a crash or power loss is a *missing* file, never a
-// torn one, since rename(2) is atomic, the old file (if any) is never touched in place, and any
-// write or close failure aborts before the rename. A missing file just falls back to the
-// "generate a new identity" path on the next boot.
+bool SyncFd(int fd, const fs::path& path) {
+  while (fsync(fd) == -1) {
+    if (errno == EINTR)
+      continue;
+    LOG(ERROR) << "Failed to sync " << path << ": " << ErrnoError().message();
+    return false;
+  }
+  return true;
+}
+
+// Writes `uuid` through a unique temp file, syncs its data, atomically renames it, then syncs the
+// parent directory. A true return means the identity and its directory entry are durable. Failures
+// before rename remove the temp file; failures after rename may leave a valid final file but still
+// return false because its durability could not be confirmed.
 bool PersistUuid(const fs::path& dir, const fs::path& file, std::string_view uuid) {
   std::error_code ec;
-  // dir == "" means the identity file resolves cwd-relative (same as an unset --dir); mirror
-  // upstream's own guard (save_stages_controller.cc:399) rather than asking CreateDirs to
-  // create_directories(""), which fails with EINVAL.
   if (!dir.empty()) {
-    ec = CreateDirs(dir);
+    fs::create_directories(dir, ec);
     if (ec) {
       LOG(ERROR) << "Could not create directory " << dir << ": " << ec.message();
       return false;
     }
   }
 
-  fs::path tmp_file{file};
-  tmp_file += ".tmp.";
-  tmp_file += std::to_string(getpid());
-
-  io::Result<io::WriteFile*> res = io::OpenWrite(tmp_file.string());
-  if (!res) {
-    LOG(ERROR) << "Failed to open " << tmp_file << " with error: " << res.error().message();
+  std::string tmp_template = absl::StrCat(file.string(), ".tmp.XXXXXX");
+  int fd = mkstemp(tmp_template.data());
+  if (fd == -1) {
+    LOG(ERROR) << "Failed to create temporary node uuid file next to " << file << ": "
+               << ErrnoError().message();
     return false;
   }
-  std::unique_ptr<io::WriteFile> wf(res.value());
+  fs::path tmp_file{tmp_template};
+  bool renamed = false;
+  absl::Cleanup cleanup = [&] {
+    if (fd != -1)
+      close(fd);
+    if (!renamed)
+      fs::remove(tmp_file, ec);
+  };
 
-  std::error_code write_ec = wf->Write(absl::StrCat(uuid, "\n"));
-  if (write_ec) {
-    LOG(ERROR) << "Failed to write " << tmp_file << " with error: " << write_ec.message();
-    wf->Close();
-    fs::remove(tmp_file, ec);
-    return false;
+  std::string payload = absl::StrCat(uuid, "\n");
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    ssize_t written = write(fd, payload.data() + offset, payload.size() - offset);
+    if (written == -1 && errno == EINTR)
+      continue;
+    if (written <= 0) {
+      std::error_code write_ec =
+          written == -1 ? ErrnoError() : std::make_error_code(std::errc::io_error);
+      LOG(ERROR) << "Failed to write " << tmp_file << ": " << write_ec.message();
+      return false;
+    }
+    offset += written;
   }
 
-  write_ec = wf->Close();
-  if (write_ec) {
-    // A deferred write error (delayed writeback, NFS, ...) can surface here, meaning tmp_file
-    // may be short or truncated. Treat exactly like a write failure: never rename a possibly
-    // torn file into place, or a corrupt-file boot (row 5) could turn into a fatal exit even
-    // though this was meant to degrade to an ephemeral identity.
-    LOG(ERROR) << "Failed to close " << tmp_file << " with error: " << write_ec.message();
-    fs::remove(tmp_file, ec);
+  if (fchmod(fd, 0644) == -1) {
+    LOG(ERROR) << "Failed to set permissions on " << tmp_file << ": " << ErrnoError().message();
     return false;
   }
+  if (!SyncFd(fd, tmp_file))
+    return false;
+  if (close(fd) == -1) {
+    fd = -1;
+    LOG(ERROR) << "Failed to close " << tmp_file << ": " << ErrnoError().message();
+    return false;
+  }
+  fd = -1;
 
-  fs::rename(tmp_file, file, ec);
-  if (ec) {
-    LOG(ERROR) << "Failed to rename " << tmp_file << " to " << file << ": " << ec.message();
-    fs::remove(tmp_file, ec);
+  if (rename(tmp_file.c_str(), file.c_str()) == -1) {
+    LOG(ERROR) << "Failed to rename " << tmp_file << " to " << file << ": "
+               << ErrnoError().message();
     return false;
   }
+  renamed = true;
+
+  fs::path parent_dir = dir.empty() ? fs::path{"."} : dir;
+  int dir_fd = open(parent_dir.c_str(), O_RDONLY | O_DIRECTORY);
+  if (dir_fd == -1) {
+    LOG(ERROR) << "Failed to open node uuid directory " << parent_dir << ": "
+               << ErrnoError().message();
+    return false;
+  }
+  absl::Cleanup close_dir = [&] {
+    if (dir_fd != -1)
+      close(dir_fd);
+  };
+  if (!SyncFd(dir_fd, parent_dir))
+    return false;
+  if (close(dir_fd) == -1) {
+    dir_fd = -1;
+    LOG(ERROR) << "Failed to close node uuid directory " << parent_dir << ": "
+               << ErrnoError().message();
+    return false;
+  }
+  dir_fd = -1;
   return true;
 }
 

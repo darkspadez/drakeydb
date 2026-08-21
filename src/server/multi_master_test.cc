@@ -74,7 +74,8 @@ TEST(NodeUuid, ValidateRejectsMalformed) {
 TEST(ReplconfUuidReply, ParsesKeydbBareUuid) {
   std::string uuid;
   uint64_t ms = 12345;
-  ASSERT_TRUE(ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd", &uuid, &ms));
+  ASSERT_EQ(ReplconfUuidReplyStatus::kSuccess,
+            ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd", &uuid, &ms));
   EXPECT_EQ("01234567-89ab-4cde-8f01-23456789abcd", uuid);
   EXPECT_EQ(0u, ms);  // KeyDB sends no clock
 }
@@ -82,33 +83,49 @@ TEST(ReplconfUuidReply, ParsesKeydbBareUuid) {
 TEST(ReplconfUuidReply, ParsesDrakeydbUuidWithMs) {
   std::string uuid;
   uint64_t ms = 0;
-  ASSERT_TRUE(
+  ASSERT_EQ(
+      ReplconfUuidReplyStatus::kSuccess,
       ParseReplconfUuidReply("01234567-89AB-4cde-8f01-23456789abcd 1755600000000", &uuid, &ms));
   EXPECT_EQ("01234567-89ab-4cde-8f01-23456789abcd", uuid);  // normalized
   EXPECT_EQ(1755600000000u, ms);
 }
 
+TEST(ReplconfUuidReply, UnsupportedOkMustBeExact) {
+  std::string uuid = "sentinel";
+  uint64_t ms = 4242;
+  EXPECT_EQ(ReplconfUuidReplyStatus::kUnsupported, ParseReplconfUuidReply("OK", &uuid, &ms));
+  EXPECT_EQ(ReplconfUuidReplyStatus::kMalformed, ParseReplconfUuidReply("ok", &uuid, &ms));
+  EXPECT_EQ(ReplconfUuidReplyStatus::kMalformed, ParseReplconfUuidReply("OK ", &uuid, &ms));
+  EXPECT_EQ(ReplconfUuidReplyStatus::kMalformed, ParseReplconfUuidReply("OK extra", &uuid, &ms));
+  EXPECT_EQ("sentinel", uuid);
+  EXPECT_EQ(4242u, ms);
+}
+
 TEST(ReplconfUuidReply, MalformedRejectedExtraTokensIgnored) {
   std::string uuid;
   uint64_t ms = 0;
-  EXPECT_FALSE(ParseReplconfUuidReply("", &uuid, &ms));
-  EXPECT_FALSE(ParseReplconfUuidReply("OK", &uuid, &ms));
-  EXPECT_FALSE(ParseReplconfUuidReply("not-a-uuid 123", &uuid, &ms));
-  EXPECT_FALSE(ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd notanum", &uuid, &ms));
+  EXPECT_EQ(ReplconfUuidReplyStatus::kMalformed, ParseReplconfUuidReply("", &uuid, &ms));
+  EXPECT_EQ(ReplconfUuidReplyStatus::kMalformed,
+            ParseReplconfUuidReply("not-a-uuid 123", &uuid, &ms));
+  EXPECT_EQ(ReplconfUuidReplyStatus::kMalformed,
+            ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd notanum", &uuid, &ms));
   // Forward compat: a third token from a future master is ignored.
-  EXPECT_TRUE(ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd 5 future", &uuid, &ms));
+  EXPECT_EQ(ReplconfUuidReplyStatus::kSuccess,
+            ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd 5 future", &uuid, &ms));
   EXPECT_EQ(5u, ms);
 }
 
 TEST(ReplconfUuidReply, FailureLeavesOutParamsUntouched) {
   std::string uuid = "sentinel";
   uint64_t ms = 4242;
-  EXPECT_FALSE(ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd notanum", &uuid, &ms));
+  EXPECT_EQ(ReplconfUuidReplyStatus::kMalformed,
+            ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd notanum", &uuid, &ms));
   EXPECT_EQ("sentinel", uuid);
   EXPECT_EQ(4242u, ms);
   // Overflow used to write UINT64_MAX through the out-param before returning false.
-  EXPECT_FALSE(ParseReplconfUuidReply(
-      "01234567-89ab-4cde-8f01-23456789abcd 99999999999999999999999", &uuid, &ms));
+  EXPECT_EQ(ReplconfUuidReplyStatus::kMalformed,
+            ParseReplconfUuidReply("01234567-89ab-4cde-8f01-23456789abcd 99999999999999999999999",
+                                   &uuid, &ms));
   EXPECT_EQ("sentinel", uuid);
   EXPECT_EQ(4242u, ms);
 }
@@ -123,6 +140,11 @@ TEST(NodeIdentityFile, CreatesAndPersists) {
   auto content = io::ReadFileToString(dir + "/drakeydb.uuid");
   ASSERT_TRUE(content);
   EXPECT_EQ(absl::StrCat(id1->uuid, "\n"), *content);
+  size_t temp_count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    temp_count += entry.path().filename().string().starts_with("drakeydb.uuid.tmp.");
+  }
+  EXPECT_EQ(0u, temp_count);
   auto id2 = LoadOrCreateNodeIdentity(dir, "");  // reread returns the same identity
   ASSERT_TRUE(id2);
   EXPECT_EQ(id1->uuid, id2->uuid);
@@ -308,12 +330,13 @@ TEST_F(MultiMasterFamilyTest, ReplconfUuidRepliesOwnUuidAndMs) {
   std::string reply{ToSV(resp.GetBuf())};
   std::string uuid;
   uint64_t ms = 0;
-  ASSERT_TRUE(ParseReplconfUuidReply(reply, &uuid, &ms)) << reply;
+  ASSERT_EQ(ReplconfUuidReplyStatus::kSuccess, ParseReplconfUuidReply(reply, &uuid, &ms)) << reply;
   EXPECT_TRUE(IsValidNodeUuid(uuid));
   EXPECT_EQ(1755600000000u, ms);
   // Second send with a different uuid also succeeds (idempotent handling).
   auto resp2 = Run({"replconf", "uuid", "01234567-89ab-4cde-8f01-000000000002"});
-  ASSERT_TRUE(ParseReplconfUuidReply(std::string{ToSV(resp2.GetBuf())}, &uuid, &ms));
+  ASSERT_EQ(ReplconfUuidReplyStatus::kSuccess,
+            ParseReplconfUuidReply(std::string{ToSV(resp2.GetBuf())}, &uuid, &ms));
 }
 
 TEST_F(MultiMasterFamilyTest, ReplconfUuidInvalidRejected) {

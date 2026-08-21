@@ -786,14 +786,6 @@ auto DflyCmd::CreateSyncSession(ConnectionState* state) -> std::pair<uint32_t, u
 
   LOG(INFO) << "Registered replica " << address << ":" << port;
 
-  // Registration is deliberately tied to sync-session creation, not to the REPLCONF UUID handler
-  // itself: REPLCONF is reachable by any unauthenticated client when no requirepass is set, and
-  // PeerRegistry has no removal API, so registering there would let a client grow this
-  // process-lifetime structure forever. Plain-redis replicas never send a uuid, so node_uuid may
-  // legitimately be empty here.
-  if (!node_uuid.empty())
-    sf_->peer_registry()->AddOrGet(node_uuid);
-
   auto replica_ptr = make_shared<ReplicaInfo>(flow_count, std::move(address), port,
                                               std::move(node_uuid), std::move(err_handler));
   auto [it, inserted] = replica_infos_.emplace(sync_id, std::move(replica_ptr));

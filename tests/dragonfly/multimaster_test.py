@@ -15,6 +15,24 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 FIXED_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 
+async def assert_start_fails(node):
+    try:
+        node.start()
+    except DflyStartException:
+        return
+
+    # Startup listens before ServerFamily validates node identity, so a fast machine can observe
+    # the dynamic port just before the process exits and make node.start() return successfully.
+    for _ in range(50):
+        return_code = node.proc.poll()
+        if return_code is not None:
+            node.stop(kill=True)  # clear the failed process from fixture teardown
+            assert return_code != 0
+            return
+        await asyncio.sleep(0.02)
+    pytest.fail("node remained running despite invalid identity configuration")
+
+
 async def test_node_uuid_reported_and_persisted(df_factory: DflyInstanceFactory, tmp_path):
     node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "n1"))
     node.start()
@@ -45,8 +63,7 @@ async def test_node_uuid_override_is_ephemeral(df_factory: DflyInstanceFactory, 
 
 async def test_invalid_node_uuid_flag_fails_boot(df_factory: DflyInstanceFactory, tmp_path):
     node = df_factory.create(proactor_threads=1, dir=str(tmp_path / "n1"), node_uuid="nonsense")
-    with pytest.raises(DflyStartException):
-        node.start()
+    await assert_start_fails(node)
 
 
 async def test_corrupt_uuid_file_fails_boot(df_factory: DflyInstanceFactory, tmp_path):
@@ -54,8 +71,7 @@ async def test_corrupt_uuid_file_fails_boot(df_factory: DflyInstanceFactory, tmp
     d.mkdir()
     (d / "drakeydb.uuid").write_text("garbage-not-a-uuid\n")
     node = df_factory.create(proactor_threads=1, dir=str(d))
-    with pytest.raises(DflyStartException):
-        node.start()
+    await assert_start_fails(node)
 
 
 async def test_replconf_uuid_wire_reply(df_factory: DflyInstanceFactory, tmp_path):
@@ -100,22 +116,76 @@ async def test_uuid_survives_master_restart(df_factory: DflyInstanceFactory, tmp
     uuid_before = (await c_replica.info("replication"))["master_node_uuid"]
     master.stop()
     master.start()
-    # The master's own identity is the thing being tested; check it directly here, independent of
-    # how long the replica takes to notice the restart (see the two loops below).
+    # Check persistence directly on the master, then require a post-restart write on the replica
+    # so stale INFO state cannot make the reconnect assertion pass vacuously.
     c_master = master.client()
     assert (await c_master.info("replication"))["node_uuid"] == uuid_before
-    for _ in range(100):  # first wait for the link to actually drop
-        if (await c_replica.info("replication")).get("master_link_status") == "down":
-            break
-        await asyncio.sleep(0.2)
-    for _ in range(100):  # replica auto-reconnects; poll until the link is up again
-        ri = await c_replica.info("replication")
-        if ri.get("master_link_status") == "up" and "master_node_uuid" in ri:
+    await c_master.set("written-after-restart", "yes")
+    for _ in range(100):
+        try:
+            ri = await c_replica.info("replication")
+            replicated_value = await c_replica.get("written-after-restart")
+        except (redis.exceptions.BusyLoadingError, redis.exceptions.ConnectionError):
+            await asyncio.sleep(0.2)
+            continue
+        if (
+            ri.get("master_link_status") == "up"
+            and ri.get("master_node_uuid") == uuid_before
+            and replicated_value == "yes"
+        ):
             break
         await asyncio.sleep(0.2)
     else:
         pytest.fail("replica did not reconnect after master restart")
     assert ri["master_node_uuid"] == uuid_before
+
+
+@pytest.mark.parametrize(
+    "unsupported_reply",
+    [b"+OK\r\n", b"-ERR unknown REPLCONF option\r\n"],
+    ids=["ok", "error"],
+)
+async def test_uuid_cleared_when_reconnect_master_lacks_exchange(
+    df_factory: DflyInstanceFactory, tmp_path, proxy_factory, unsupported_reply
+):
+    master = df_factory.create(proactor_threads=2, dir=str(tmp_path / "m"))
+    replica = df_factory.create(proactor_threads=2, dir=str(tmp_path / "r"))
+    df_factory.start_all([master, replica])
+    c_master, c_replica = master.client(), replica.client()
+    proxy = await proxy_factory(master.port)
+
+    await c_replica.execute_command(f"REPLICAOF localhost {proxy.port}")
+    await wait_available_async(c_replica)
+    master_uuid = (await c_master.info("replication"))["node_uuid"]
+    for _ in range(100):
+        info = await c_replica.info("replication")
+        if info.get("master_link_status") == "up" and info.get("master_node_uuid") == master_uuid:
+            break
+        await asyncio.sleep(0.2)
+    else:
+        pytest.fail("initial UUID exchange did not complete")
+
+    await proxy.override_next_response(b"REPLCONF UUID ", unsupported_reply)
+    await proxy.close()
+    await proxy.start_serving()
+    await c_master.set("written-after-unsupported-reconnect", "yes")
+
+    for _ in range(100):
+        try:
+            info = await c_replica.info("replication")
+            replicated_value = await c_replica.get("written-after-unsupported-reconnect")
+        except (redis.exceptions.BusyLoadingError, redis.exceptions.ConnectionError):
+            await asyncio.sleep(0.2)
+            continue
+        if (
+            info.get("master_link_status") == "up"
+            and "master_node_uuid" not in info
+            and replicated_value == "yes"
+        ):
+            break
+        await asyncio.sleep(0.2)
+    else:
+        pytest.fail("replica did not reconnect without stale UUID state")
 
 
 async def test_replicaof_real_redis_tolerates_missing_uuid(

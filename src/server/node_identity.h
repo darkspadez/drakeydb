@@ -28,11 +28,19 @@ bool IsValidNodeUuid(std::string_view uuid);
 // Precondition: IsValidNodeUuid(uuid). Returns the lowercase canonical form.
 std::string NormalizeNodeUuid(std::string_view uuid);
 
-// Parses the master's REPLCONF UUID success reply: "<uuid>" (KeyDB) or "<uuid> <ms>" (drakeydb).
-// Extra tokens are ignored for forward compatibility. Returns false on a malformed reply
-// (caller treats that as fatal). On success, *master_uuid is the normalized uuid and *master_ms
-// is 0 when the master sent no clock. On failure, neither out-param is modified.
-bool ParseReplconfUuidReply(std::string_view reply, std::string* master_uuid, uint64_t* master_ms);
+enum class ReplconfUuidReplyStatus : uint8_t {
+  kSuccess,
+  kUnsupported,
+  kMalformed,
+};
+
+// Parses the master's REPLCONF UUID string reply: "<uuid>" (KeyDB), "<uuid> <ms>" (drakeydb),
+// or exact "OK" from a master that ignores unsupported REPLCONF options. Extra tokens after the
+// clock are ignored for forward compatibility. On success, *master_uuid is the normalized uuid
+// and *master_ms is 0 when the master sent no clock. On any other status, neither out-param is
+// modified.
+ReplconfUuidReplyStatus ParseReplconfUuidReply(std::string_view reply, std::string* master_uuid,
+                                               uint64_t* master_ms);
 
 // The node's persistent identity, as loaded or created for this boot.
 struct NodeIdentity {

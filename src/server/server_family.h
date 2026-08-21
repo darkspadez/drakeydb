@@ -222,10 +222,6 @@ class ServerFamily {
     return node_identity_.uuid;
   }
 
-  PeerRegistry* peer_registry() {
-    return &peer_registry_;
-  }
-
   // The lineage root replication id of this node: its own replid if it is a true master, or the
   // ancestor id advertised by its master when it is itself a replica (cascaded replication).
   std::string GetLineageId() const ABSL_LOCKS_EXCLUDED(replicaof_mu_);

@@ -15,6 +15,19 @@ class Proxy:
         self._forwarding = asyncio.Event()
         self._forwarding.set()
         self._conn_gates = []
+        self._response_override_lock = asyncio.Lock()
+        self._next_response_override = None
+
+    async def override_next_response(self, request_marker, replacement):
+        """Replace the next simple-line response after a request containing `request_marker`."""
+        if not request_marker:
+            raise ValueError("request marker must not be empty")
+        if not replacement.endswith(b"\r\n"):
+            raise ValueError("replacement must be a complete RESP line")
+        async with self._response_override_lock:
+            if self._next_response_override is not None:
+                raise RuntimeError("a response override is already pending")
+            self._next_response_override = (request_marker, replacement)
 
     async def handle(self, reader, writer):
         task = asyncio.current_task()
@@ -37,19 +50,60 @@ class Proxy:
         gate.set()
         self._conn_gates.append(gate)
 
-        async def forward(reader, writer):
+        response_override = None
+        request_tail = b""
+
+        async def forward_requests(reader, writer):
+            nonlocal request_tail, response_override
             while True:
                 await self._forwarding.wait()
                 await gate.wait()
                 data = await reader.read(1024)
                 if not data:
                     break
+
+                async with self._response_override_lock:
+                    pending = self._next_response_override
+                    if pending is not None:
+                        request_marker, replacement = pending
+                        request_data = request_tail + data
+                        if request_marker in request_data:
+                            response_override = replacement
+                            self._next_response_override = None
+                            request_tail = b""
+                        else:
+                            tail_size = len(request_marker) - 1
+                            request_tail = request_data[-tail_size:] if tail_size else b""
+
                 writer.write(data)
                 await writer.drain()
             writer.close()
 
-        task1 = asyncio.ensure_future(forward(reader, remote_writer))
-        task2 = asyncio.ensure_future(forward(remote_reader, writer))
+        async def forward_responses(reader, writer):
+            nonlocal response_override
+            response_buffer = b""
+            while True:
+                await self._forwarding.wait()
+                await gate.wait()
+                data = await reader.read(1024)
+                if not data:
+                    break
+
+                if response_override is not None:
+                    response_buffer += data
+                    line_end = response_buffer.find(b"\r\n")
+                    if line_end == -1:
+                        continue
+                    data = response_override + response_buffer[line_end + 2 :]
+                    response_override = None
+                    response_buffer = b""
+
+                writer.write(data)
+                await writer.drain()
+            writer.close()
+
+        task1 = asyncio.ensure_future(forward_requests(reader, remote_writer))
+        task2 = asyncio.ensure_future(forward_responses(remote_reader, writer))
 
         def cleanup():
             task1.cancel()

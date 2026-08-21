@@ -3,7 +3,7 @@
 > **Continue here.** This is the approved, living plan and canonical copy for the drakeydb fork.
 > Update the status block below as phases land.
 
-## Current status (last updated 2026-08-20)
+## Current status (last updated 2026-08-21)
 
 | Phase | Status | Where |
 |---|---|---|
@@ -22,21 +22,21 @@ default binary path; pre-commit clean; dry-run `git merge upstream/main` conflic
 seccomp=unconfined` so io_uring is exercised rather than the epoll fallback):
 full `ctest -L DFLY` **86/86 passed, 0 failed** (983 s) after a complete `ninja` build — note
 `check_dfly` builds only a subset, so a bare `ctest -L DFLY` after it reports unbuilt binaries as
-"Not Run"; `multi_master_test` 19 passed + 1 skip (`UnwritableDirIsEphemeral` self-skips as root,
+"Not Run"; `multi_master_test` 20 passed + 1 skip (`UnwritableDirIsEphemeral` self-skips as root,
 and was separately proven to execute and pass under a non-root user); `multimaster_test.py`
-7 passed + 1 skip; full `replication_test.py` **43 passed, 0 failed** (334 s) with **no flakes, so
+9 passed + 1 skip; full `replication_test.py` **43 passed, 0 failed** (334 s) with **no flakes, so
 no triage was required**; `cluster_test.py::test_cluster_migrations_sequence` passed (run
 explicitly because the `slaveN` INFO change is the one most exposed to its lag parser);
-pre-commit clean across all 16 changed files.
+pre-commit clean across all 18 changed files.
 
 **Known P1 coverage gap:** `multimaster_test.py::test_replicaof_real_redis_tolerates_missing_uuid`
 **skips locally** — the harness's `RedisServer` looks for version-suffixed binaries
 (`redis-server-7.2.2` / `redis-server-6.2.11` / `valkey-server-8.0.1`, `tests/dragonfly/instance.py`),
-which this container lacks. It is the **only automated coverage of the `-ERR` tolerance path**, i.e.
-replicating from a master that predates the UUID exchange; `replication_test.py` and
-`multimaster_test.py` are both drakeydb↔drakeydb. That path was hand-validated against a real
-unmodified `redis-server 7.0.15` (full sync succeeded, `master_node_uuid` absent throughout,
-expected WARNING logged, replication continued) and traced in source, but **watch CI for it**.
+which this container lacks. The proxy-backed reconnect regression now automates both `-ERR` and
+exact `+OK` tolerance, including stale-identity clearing, but it does not replace the real-binary
+interoperability check. That case was hand-validated against a real unmodified
+`redis-server 7.0.15` (full sync succeeded, `master_node_uuid` absent throughout, expected WARNING
+logged, replication continued), but **watch CI for it**.
 
 **P3 prerequisites recorded during P1** (neither is a P1 defect; both bite later):
 1. **Per-instance test identity.** The pytest harness's dragonfly cwd is *session*-scoped
@@ -51,12 +51,13 @@ expected WARNING logged, replication continued) and traced in source, but **watc
    self-originated — silent data loss with no diagnostic. KeyDB checks for this during the
    handshake. P1 deliberately does not, to keep scope tight.
 
-**P1 note for P2/P3:** `MasterContext::master_node_uuid` is never cleared on disconnect, so INFO
-can report a stale `master_node_uuid` if a master at the same host:port is replaced in place by a
-build lacking the exchange. `master_clock_ms` is captured but read nowhere yet (a P8 clock-skew
-seed). Peer registration deliberately happens in `DflyCmd::CreateSyncSession`, **not** in the
-`REPLCONF UUID` arm: `REPLCONF` is reachable pre-auth when `requirepass` is unset, and
-`PeerRegistry` has no reclamation API, so registering there let any client grow it without bound.
+**P1 note for P2/P3:** `MasterContext::master_node_uuid` and `master_clock_ms` are cleared before
+each UUID exchange, so reconnecting to a build that lacks the exchange cannot leave stale INFO
+data. `master_clock_ms` is otherwise read nowhere yet (a P8 clock-skew seed). Peer registration
+is deliberately deferred until a later phase defines trusted peer admission: `REPLCONF` and sync
+session creation are both reachable without authentication when `requirepass` is unset, while
+`PeerRegistry` has no reclamation API. It remains initialized with only the local node in P1, so
+untrusted clients cannot grow its process-lifetime storage.
 
 **P1 KeyDB interop is one-directional:** inbound (drakeydb replica ← KeyDB master) is the claimed
 scope and works — our parser accepts KeyDB's bare-uuid reply, and `IsValidNodeUuid` matches KeyDB's
@@ -291,8 +292,10 @@ accepting both KeyDB's bare-uuid and drakeydb's `<uuid> <ms>` reply, persisted i
 6-row boot policy, `--node_uuid` override); `multi_master.{h,cc}` (`PeerRegistry`, append-only
 uuid↔origin_idx with self at 0, fiber-safe, no reclamation API by design); identity load in
 `ServerFamily::Init()`; master-side `REPLCONF UUID` arm; replica-side exchange in `Greet()`
-tolerating `-ERR` from pre-exchange masters; INFO `node_uuid` (both roles), `master_node_uuid`
-(replica), and `,node_uuid=` inside `slaveN:` (master). 20 C++ cases + 8 pytest cases.
+tolerating `-ERR` or exact `+OK` from pre-exchange masters; INFO `node_uuid` (both roles),
+`master_node_uuid` (replica), and `,node_uuid=` inside `slaveN:` (master). The process-wide
+`PeerRegistry` is initialized with self only; remote registration is intentionally deferred until
+peer admission is defined. 21 C++ cases + 10 pytest cases.
 Upstream-file footprint deliberately small and additive: `server_family.{h,cc}` +19/-0 in P1's
 wiring task and +12/-0 in the ReplConf task.
 

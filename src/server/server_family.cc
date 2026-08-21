@@ -3647,11 +3647,10 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
       if (!IsValidNodeUuid(arg)) {
         return cmd_cntx->SendError("Invalid UUID");
       }
-      string peer_uuid = NormalizeNodeUuid(arg);
-      // Registration into peer_registry_ happens later, in DflyCmd::CreateSyncSession, once this
-      // connection actually becomes a sync-session replica -- not here, where REPLCONF is reachable
-      // pre-auth when requirepass is unset and could otherwise grow the registry forever.
-      cntx->conn_state.replication_info.repl_node_uuid = peer_uuid;
+      // Keep the validated UUID on this connection for ReplicaInfo/INFO. PeerRegistry remains
+      // self-only in Phase 1; later peer-mode work must define trusted admission before
+      // registration because its monotonic indices cannot be reclaimed.
+      cntx->conn_state.replication_info.repl_node_uuid = NormalizeNodeUuid(arg);
       return builder->SendSimpleString(absl::StrCat(node_uuid(), " ", GetCurrentTimeMs()));
     } else if (cmd == "ACK" && args.size() == 2) {
       // Don't send error/Ok back through the socket, because we don't want to interleave with
