@@ -16,6 +16,8 @@
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/metrics.h"
+#include "server/multi_master.h"
+#include "server/node_identity.h"
 #include "server/replica_types.h"
 #include "server/server_state.h"
 #include "server/stats.h"
@@ -73,6 +75,7 @@ struct ReplicaRoleInfo {
   uint32_t listening_port;
   std::string_view state;
   uint64_t lsn_lag;
+  std::string node_uuid;
 };
 
 // Contains the state of the last save operation.
@@ -213,6 +216,10 @@ class ServerFamily {
 
   const std::string& master_replid() const {
     return master_replid_;
+  }
+
+  const std::string& node_uuid() const {
+    return node_identity_.uuid;
   }
 
   // The lineage root replication id of this node: its own replid if it is a true master, or the
@@ -381,6 +388,9 @@ class ServerFamily {
 
   std::string master_replid_;
   std::optional<LastMasterSyncData> last_master_data_;
+
+  NodeIdentity node_identity_;
+  PeerRegistry peer_registry_;
 
   time_t start_time_ = 0;  // in seconds, epoch time.
 

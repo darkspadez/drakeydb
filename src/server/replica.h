@@ -37,6 +37,8 @@ struct MasterContext {
   unsigned num_flows = 0;
   DflyVersion version = DflyVersion::VER1;
   std::string lineage_id;  // lineage id of master
+  std::string master_node_uuid;
+  uint64_t master_clock_ms = 0;  // drakeydb reply extension; 0 = unknown (KeyDB master)
 };
 
 // This class manages replication from both Dragonfly and Redis masters.

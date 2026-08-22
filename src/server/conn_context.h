@@ -181,6 +181,7 @@ struct ConnectionState {
     uint32_t repl_flow_id = UINT32_MAX;
     std::string repl_ip_address;
     uint32_t repl_listening_port = 0;
+    std::string repl_node_uuid;  // set by REPLCONF UUID; empty if the peer never sent one
   };
 
   struct SquashingInfo {

@@ -782,11 +782,12 @@ auto DflyCmd::CreateSyncSession(ConnectionState* state) -> std::pair<uint32_t, u
 
   string address = state->replication_info.repl_ip_address;
   uint32_t port = state->replication_info.repl_listening_port;
+  string node_uuid = state->replication_info.repl_node_uuid;
 
   LOG(INFO) << "Registered replica " << address << ":" << port;
 
-  auto replica_ptr =
-      make_shared<ReplicaInfo>(flow_count, std::move(address), port, std::move(err_handler));
+  auto replica_ptr = make_shared<ReplicaInfo>(flow_count, std::move(address), port,
+                                              std::move(node_uuid), std::move(err_handler));
   auto [it, inserted] = replica_infos_.emplace(sync_id, std::move(replica_ptr));
   CHECK(inserted);
 
@@ -901,7 +902,8 @@ std::vector<ReplicaRoleInfo> DflyCmd::GetReplicasRoleInfo() const {
     // entry defaults to lag=0 — exactly what we want for any other state.
     LSN lag = replication_lags[id];
     vec.push_back(ReplicaRoleInfo{std::string{info->GetId()}, info->GetAddress(),
-                                  info->GetListeningPort(), SyncStateName(state), lag});
+                                  info->GetListeningPort(), SyncStateName(state), lag,
+                                  std::string{info->GetNodeUuid()}});
   }
   return vec;
 }
