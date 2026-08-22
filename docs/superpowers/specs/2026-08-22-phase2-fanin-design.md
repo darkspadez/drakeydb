@@ -201,6 +201,12 @@ unit tests pass their own flag). `Acquire(absl::FunctionRef<bool()> cancelled)` 
 empty `Lease` when cancelled. `Lease` is a movable RAII handle that releases on destruction and
 wakes the next waiter (`notify_all`). Test hooks: `IsHeld()`, `NumWaiting()`.
 
+**(as built)** every `notify_all()` — the cancel path in `Acquire()`, and `Release()` — runs while
+`mu_` is still held, not after releasing it: `util::fb2::CondVarAny` has no internal mutex of its
+own (unlike `std::condition_variable_any`), so notifying outside the lock races the wait queue it
+touches. The first landed version notified outside `mu_`; code review caught the race and it was
+fixed before the branch was done (commit `4aa0a093`).
+
 ### D-6. `PeerReplicationManager` (`peer_replication.h/.cc`)
 
 ```cpp
@@ -247,6 +253,14 @@ under `mu_` and call `Replica` (thread-safe, hops to its proactor) outside the l
 objects are constructed on the calling proactor (REPLICAOF connection thread, or the
 `GetNextProactor()` used by `Init`) — same as upstream.
 
+**(as built)** the private member shipped as `std::vector<PeerLink> peers_ ABSL_GUARDED_BY(mu_)`
+with `struct PeerLink { Endpoint ep; std::shared_ptr<Replica> replica; }`, not the
+`std::vector<std::shared_ptr<Replica>>` sketched above. Pairing the endpoint with the `Replica` at
+`Add()` time lets `Add()`/`Remove()` identify a peer by the exact endpoint it was given, as a pure
+in-memory comparison under `mu_` — never a `GetSummary()` hop while the lock is held. `Endpoints()`
+is hop-free too; `Summaries()` still hops outside the lock (unavoidable — it reads live link
+state).
+
 ### D-7. `ServerFamily` / `DflyCmd` wiring (additive)
 
 - `server_family.h`: `class PeerReplicationManager;` forward decl; member
@@ -260,6 +274,13 @@ objects are constructed on the calling proactor (REPLICAOF connection thread, or
   `kRemove` → `Remove` or error `"Not attached to the specified master"`; `kAdd` → `LOG(INFO)`,
   `peers_->Add(..., master_replid(), mode, &already)` with mode from `on_error`
   (`kReturnOnError`→blocking, `kContinueReplication`→background) → OK or `ec.Format()`.
+  **(as built)** for a peer whose connection is refused immediately (the common unreachable-peer
+  case), `ec` carries upstream's pre-existing generic `"replication cancelled"` text: by the time
+  `Start()`'s `check_connection_error()` runs after `ConnectAndAuth()` fails, `exec_st_` has
+  already flipped to cancelled, so it takes the generic branch instead of the specific
+  `"could not connect to master: ..."` one — same wording classic (non-active) `REPLICAOF` hits
+  for the same race (see `replica.cc`, and `multi_master_test.cc`'s
+  `ReplicaOfGrammarAndNoPeersPaths`), not a new peer-specific message.
 - `ReplConf` after the cascaded gate (3580): `if (IsActiveReplica()) return
   cmd_cntx->SendError("Replicating from an active-replica node is not supported");` — the single
   choke point: no sync session can ever be created, so `DFLY FLOW/SYNC/...` fail with their
@@ -278,7 +299,8 @@ objects are constructed on the calling proactor (REPLICAOF connection thread, or
   entry of `flag.peers` inside one `GetNextProactor()->Await`. Non-active: unchanged.
 - `ReplicaOfFlag` gains `std::vector<std::pair<std::string, std::string>> peers;` (host/port mirror
   `peers[0]`); `AbslParseFlag` splits on `,` and parses each piece with the existing single-endpoint
-  logic (extracted into a static helper), `AbslUnparseFlag` joins with `,`.
+  logic (extracted into a static helper — **(as built)** `ParseOneReplicaOf`), `AbslUnparseFlag`
+  joins with `,`.
 - `ReplicaOfNoOne`, `AddReplicaOf`, `ROLE`, `Metrics` untouched: active mode never reaches
   `ReplicaOfNoOne` (handled in `ReplicaOfActive`), `AddReplicaOf` already errors for masters,
   `ROLE` reports `master` (peers not listed), no `replica_side_info` metrics for the active node.
