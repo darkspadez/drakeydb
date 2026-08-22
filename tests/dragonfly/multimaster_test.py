@@ -4,6 +4,7 @@ import asyncio
 import re
 import time
 
+import async_timeout
 import pytest
 
 import redis
@@ -224,3 +225,36 @@ async def test_harness_gives_each_instance_a_distinct_identity(df_factory: DflyI
     a.stop()
     a.start()  # same args -> same identity across restart
     assert (await a.client().info("replication"))["node_uuid"] == ua
+
+
+async def wait_for_peers(c, n, timeout=90):
+    """Wait until INFO shows n attached peers, all link up and not syncing; returns the info."""
+    async with async_timeout.timeout(timeout):
+        while True:
+            info = await c.info("replication")
+            peers = [info.get(f"master{i}") for i in range(int(info.get("connected_masters", 0)))]
+            if len(peers) == n and all(
+                p and p["link_status"] == "up" and p["sync_in_progress"] == 0 for p in peers
+            ):
+                return info
+            await asyncio.sleep(0.2)
+
+
+async def test_replicaof_flag_list_requires_active_replica(df_factory: DflyInstanceFactory):
+    node = df_factory.create(proactor_threads=1, replicaof="localhost:1,localhost:2")
+    await assert_start_fails(node)
+
+
+async def test_replicaof_flag_list_attaches_all_peers(df_factory: DflyInstanceFactory, port_picker):
+    b = df_factory.create(proactor_threads=1, port=port_picker.get_available_port())
+    c = df_factory.create(proactor_threads=1, port=port_picker.get_available_port())
+    df_factory.start_all([b, c])
+    a = df_factory.create(
+        proactor_threads=2,
+        active_replica="true",
+        multi_master="true",
+        replicaof=f"localhost:{b.port},localhost:{c.port}",
+    )
+    a.start()
+    info = await wait_for_peers(a.client(), 2)
+    assert {info["master0"]["port"], info["master1"]["port"]} == {b.port, c.port}
