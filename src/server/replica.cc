@@ -34,8 +34,10 @@ extern "C" {
 #include "server/journal/journal.h"
 #include "server/journal/serializer.h"
 #include "server/main_service.h"
+#include "server/multi_master.h"
 #include "server/namespaces.h"
 #include "server/node_identity.h"
+#include "server/peer_replication.h"
 #include "server/rdb_load.h"
 #include "strings/human_readable.h"
 
@@ -96,13 +98,15 @@ vector<vector<unsigned>> Partition(unsigned num_flows) {
 }  // namespace
 
 Replica::Replica(string host, uint16_t port, Service* se, std::string_view id,
-                 std::optional<cluster::SlotRange> slot_range)
+                 std::optional<cluster::SlotRange> slot_range,
+                 std::optional<ReplicaPeerMode> peer_mode)
     : ProtocolClient(std::move(host), port),
       service_(*se),
       id_{id},
       slot_range_(slot_range),
       creation_time_(time(nullptr)),
-      client_id_(facade::Connection::NextClientId()) {
+      client_id_(facade::Connection::NextClientId()),
+      peer_mode_(peer_mode) {
   proactor_ = ProactorBase::me();
 }
 
@@ -236,7 +240,10 @@ std::error_code Replica::TakeOver(unsigned timeout_sec, bool save_flag) {
 void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sync_data) {
   VLOG(1) << "Main replication fiber started " << this;
   // Switch shard states to replication.
-  SetShardStates(true);
+  // drakeydb: a peer-mode replica belongs to an active node that stays a master, so it must not
+  // flip the shards into replica mode (that would stop expiry/eviction process-wide).
+  if (!IsPeerMode())
+    SetShardStates(true);
 
   error_code ec;
   while (state_mask_ & R_ENABLED) {
@@ -287,6 +294,16 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
 
     // 3. Initiate full sync
     if ((state_mask_ & R_SYNC_OK) == 0) {
+      // drakeydb: peer full syncs are serialized process-wide (LOADING is global); an empty lease
+      // means we were stopped while waiting.
+      SyncGate::Lease sync_lease;
+      if (peer_mode_ && peer_mode_->sync_gate) {
+        sync_lease = peer_mode_->sync_gate->Acquire([this] { return !exec_st_.IsRunning(); });
+        if (!sync_lease) {
+          state_mask_ &= R_ENABLED;
+          continue;
+        }
+      }
       if (HasDflyMaster()) {
         ec = InitiateDflySync(std::exchange(last_master_sync_data, nullopt));
       } else
@@ -323,7 +340,8 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
   exec_st_.JoinErrorHandler();
 
   // Revert shard states to normal state.
-  SetShardStates(false);
+  if (!IsPeerMode())
+    SetShardStates(false);
 
   VLOG(1) << "Main replication fiber finished";
 }
@@ -379,6 +397,20 @@ error_code Replica::Greet() {
       master_context_.master_node_uuid = std::move(master_uuid);
       master_context_.master_clock_ms = master_ms;
     }
+  }
+
+  // drakeydb: peer-mode identity checks. A peer that presents our own uuid is a clone of this
+  // node's data dir (P3's origin tagging would silently drop its entries) - refuse it. Otherwise
+  // register the peer so later phases can map its uuid to an origin index.
+  if (IsPeerMode() && !master_context_.master_node_uuid.empty()) {
+    const std::string& self_uuid = service_.server_family().node_uuid();
+    if (master_context_.master_node_uuid == self_uuid) {
+      LOG(ERROR) << "Peer " << server().Description() << " presents our own node uuid " << self_uuid
+                 << "; refusing to replicate from a clone of this node";
+      return std::make_error_code(std::errc::operation_not_permitted);
+    }
+    if (peer_mode_->registry)
+      peer_mode_->registry->AddOrGet(master_context_.master_node_uuid);
   }
 
   // Announce that we are the dragonfly client.
@@ -522,7 +554,11 @@ error_code Replica::InitiatePSync() {
 
     absl::Cleanup cleanup = [this]() { service_.RemoveLoadingState(); };
 
-    if (slot_range_.has_value()) {
+    if (IsPeerMode()) {
+      // drakeydb: an active node merges the peer's snapshot into its own dataset instead of
+      // replacing it. RdbLoader already overrides existing keys (last-loaded-wins until P6).
+      LOG(INFO) << "Peer full sync: merging without flush " << this;
+    } else if (slot_range_.has_value()) {
       JournalExecutor{&service_}.FlushSlots(slot_range_.value());
     } else {
       JournalExecutor{&service_}.FlushAll();
@@ -531,6 +567,8 @@ error_code Replica::InitiatePSync() {
     RdbLoadContext load_context;
     RdbLoader loader(NULL, &load_context);
     loader.SetLoadUnownedSlots(true);
+    if (IsPeerMode())
+      loader.SetOverrideExistingKeys(true);  // drakeydb: merge
     loader.set_source_limit(snapshot_size);
     // TODO: to allow registering callbacks within loader to send '\n' pings back to master.
     // Also to allow updating last_io_time_.
@@ -690,7 +728,11 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
       DVLOG(1) << "Calling Flush on all slots " << this;
 
       passed_full_sync_ = false;
-      if (slot_range_.has_value()) {
+      if (IsPeerMode()) {
+        // drakeydb: an active node merges the peer's snapshot into its own dataset instead of
+        // replacing it. RdbLoader already overrides existing keys (last-loaded-wins until P6).
+        LOG(INFO) << "Peer full sync: merging without flush " << this;
+      } else if (slot_range_.has_value()) {
         JournalExecutor{&service_}.FlushSlots(slot_range_.value());
       } else {
         JournalExecutor{&service_}.FlushAll();

@@ -29,6 +29,8 @@ class ConnectionContext;
 class JournalExecutor;
 struct JournalReader;
 class DflyShardReplica;
+class SyncGate;      // server/peer_replication.h
+class PeerRegistry;  // server/multi_master.h
 
 // The attributes of the master we are connecting to.
 struct MasterContext {
@@ -39,6 +41,15 @@ struct MasterContext {
   std::string lineage_id;  // lineage id of master
   std::string master_node_uuid;
   uint64_t master_clock_ms = 0;  // drakeydb reply extension; 0 = unknown (KeyDB master)
+};
+
+// drakeydb: configuration of a peer-mode Replica -- an active node consuming from one of its
+// masters. A peer-mode Replica never flips the process into read-only replica mode, never flushes
+// the local dataset on full sync (it merges; last-loaded-wins until P6), serializes its full syncs
+// through `sync_gate`, refuses a peer that presents our own node uuid, and registers the peer uuid.
+struct ReplicaPeerMode {
+  SyncGate* sync_gate = nullptr;     // null: full syncs are not serialized (unit tests)
+  PeerRegistry* registry = nullptr;  // null: peer uuids are not registered (unit tests)
 };
 
 // This class manages replication from both Dragonfly and Redis masters.
@@ -57,7 +68,8 @@ class Replica : ProtocolClient {
 
  public:
   Replica(std::string master_host, uint16_t port, Service* se, std::string_view id,
-          std::optional<cluster::SlotRange> slot_range);
+          std::optional<cluster::SlotRange> slot_range,
+          std::optional<ReplicaPeerMode> peer_mode = std::nullopt);
   ~Replica();
 
   // Spawns a fiber that runs until link with master is broken or the replication is stopped.
@@ -125,6 +137,11 @@ class Replica : ProtocolClient {
 
   bool HasDflyMaster() const {
     return !master_context_.dfly_session_id.empty();
+  }
+
+  // drakeydb: true if this Replica was constructed with peer_mode set (see ReplicaPeerMode).
+  bool IsPeerMode() const {
+    return peer_mode_.has_value();
   }
 
   // The replication id of the lineage root master. Equals the direct master's id, unless the
@@ -214,6 +231,9 @@ class Replica : ProtocolClient {
 
   const time_t creation_time_;
   const uint32_t client_id_;
+
+  // drakeydb: set iff this Replica is a peer-mode replica of an active node (see IsPeerMode()).
+  std::optional<ReplicaPeerMode> peer_mode_;
 };
 
 class RdbLoader;
