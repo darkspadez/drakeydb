@@ -41,7 +41,8 @@ SyncGate::Lease SyncGate::Acquire(absl::FunctionRef<bool()> cancelled) {
   while (!ready()) {
     if (cancelled()) {
       waiters_.erase(std::find(waiters_.begin(), waiters_.end(), my));
-      lk.unlock();
+      // fb2::CondVarAny has no internal mutex (unlike std::condition_variable_any): notify_all()
+      // must be called while still holding mu_, or it races the wait queue it touches.
       cv_.notify_all();
       return Lease{};
     }
@@ -53,10 +54,10 @@ SyncGate::Lease SyncGate::Acquire(absl::FunctionRef<bool()> cancelled) {
 }
 
 void SyncGate::Release() {
-  {
-    std::lock_guard lk(mu_);
-    held_ = false;
-  }
+  std::lock_guard lk(mu_);
+  held_ = false;
+  // fb2::CondVarAny has no internal mutex (unlike std::condition_variable_any): notify_all() must
+  // be called while still holding mu_, or it races the wait queue it touches.
   cv_.notify_all();
 }
 

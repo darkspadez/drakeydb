@@ -48,15 +48,48 @@ class SyncGateTest : public ::testing::Test {
 };
 
 namespace {
-// Polls `pred` inside proactor `i` until true (or 5s). Returns the final value.
+
+constexpr int kPollIters = 1000;
+constexpr auto kPollInterval = std::chrono::milliseconds(5);  // kPollIters * kPollInterval ~= 5s.
+
+// Polls `pred` inside proactor `i` until true (or 5s). Returns the final value. For use from the
+// bare gtest thread to check gate state, which must never be touched directly from that thread.
 bool AwaitUntil(util::ProactorPool* pp, unsigned i, absl::FunctionRef<bool()> pred) {
-  for (int n = 0; n < 1000; ++n) {
+  for (int n = 0; n < kPollIters; ++n) {
     if (pp->at(i)->Await([&] { return pred(); }))
       return true;
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::this_thread::sleep_for(kPollInterval);
   }
   return false;
 }
+
+// Polls `pred` until true (or 5s). Returns the final value. For use *inside* a fiber only (calls
+// `pred` directly and sleeps via ThisFiber): bounds what would otherwise be an unbounded spin, so
+// a regression that keeps `pred` false forever fails the enclosing ASSERT/EXPECT instead of
+// hanging the fiber -- and, transitively, whatever later joins it -- forever.
+bool WaitFor(absl::FunctionRef<bool()> pred) {
+  for (int n = 0; n < kPollIters; ++n) {
+    if (pred())
+      return true;
+    util::ThisFiber::SleepFor(kPollInterval);
+  }
+  return false;
+}
+
+// Polls a plain atomic flag (not gate state, so safe to read from the bare gtest thread the same
+// way this file already reads/writes `cancel`/`release`/`got` directly) until true, or 5s. Used
+// before Fiber::Join() on a fiber whose body calls SyncGate::Acquire(): Join() blocks
+// unconditionally, so if Acquire() itself never returns (the regression these tests exist to
+// catch), a bare Join() would hang the whole test binary with no diagnostic.
+bool WaitForFlag(const std::atomic_bool& flag) {
+  for (int n = 0; n < kPollIters; ++n) {
+    if (flag.load())
+      return true;
+    std::this_thread::sleep_for(kPollInterval);
+  }
+  return false;
+}
+
 }  // namespace
 
 TEST_F(SyncGateTest, SerializesAndIsFifo) {
@@ -67,8 +100,9 @@ TEST_F(SyncGateTest, SerializesAndIsFifo) {
   util::fb2::Fiber a = pp_->at(0)->LaunchFiber(util::fb2::Launch::post, [&] {
     auto lease = gate.Acquire(never);
     ASSERT_TRUE(lease);
-    while (gate.NumWaiting() < 2)  // hold until two waiters are queued behind us
-      util::ThisFiber::SleepFor(std::chrono::milliseconds(5));
+    // Hold until two waiters are queued behind us; bounded so a mutual-exclusion regression
+    // fails this assertion instead of spinning forever.
+    ASSERT_TRUE(WaitFor([&] { return gate.NumWaiting() >= 2; }));
     EXPECT_TRUE(gate.IsHeld());
     order[order_idx++] = 0;
   });
@@ -97,36 +131,59 @@ TEST_F(SyncGateTest, CancelledWaiterGetsEmptyLease) {
   std::atomic_bool cancel{false}, release{false};
   util::fb2::Fiber holder = pp_->at(0)->LaunchFiber(util::fb2::Launch::post, [&] {
     auto lease = gate.Acquire([] { return false; });
-    while (!release.load())
-      util::ThisFiber::SleepFor(std::chrono::milliseconds(5));
+    ASSERT_TRUE(WaitFor([&] { return release.load(); }));
   });
   ASSERT_TRUE(AwaitUntil(pp_.get(), 1, [&] { return gate.IsHeld(); }));
-  std::atomic_bool got{true};
+  std::atomic_bool got{true}, waiter_done{false};
   util::fb2::Fiber waiter = pp_->at(1)->LaunchFiber(util::fb2::Launch::post, [&] {
     auto lease = gate.Acquire([&] { return cancel.load(); });
     got = static_cast<bool>(lease);
+    waiter_done = true;
   });
   ASSERT_TRUE(AwaitUntil(pp_.get(), 0, [&] { return gate.NumWaiting() >= 1; }));
   cancel = true;
-  waiter.Join();  // returns within ~100ms although the holder never released
+  // waiter.Join() blocks unconditionally, and `holder` deliberately never releases until after
+  // this check (that's what proves cancellation -- not the gate freeing up -- is what unblocks
+  // the waiter). If SyncGate's cancellation check has regressed, Acquire() may never return, so
+  // wait for `waiter_done` with a bound first: on timeout this ASSERT_TRUE fails (with a
+  // diagnostic) and returns before the unconditional Join() below can hang. `waiter` is
+  // deliberately left un-joined on that path rather than Detach()-ed: once `holder` (below) also
+  // gives up on its own bound and releases the gate, a detached-but-still-blocked-in-Acquire()
+  // `waiter` could eventually resume and touch this function's now-destroyed locals; leaving it
+  // joinable instead means its destructor's own CHECK aborts the process deterministically,
+  // before any other fiber gets a chance to run.
+  ASSERT_TRUE(WaitForFlag(waiter_done)) << "waiter fiber did not return within the time bound -- "
+                                           "SyncGate::Acquire cancellation appears broken";
+  waiter.Join();
   EXPECT_FALSE(got.load());
   EXPECT_EQ(0u, pp_->at(0)->Await([&] { return gate.NumWaiting(); }));
   release = true;
-  holder.Join();
+  holder.Join();  // bounded: holder's own wait above gives up after ~5s regardless of `release`.
   EXPECT_FALSE(pp_->at(0)->Await([&] { return gate.IsHeld(); }));
 }
 
 TEST_F(SyncGateTest, ExternalLoadingDefersGrant) {
   std::atomic_bool loading{true};
   SyncGate gate([&] { return loading.load(); });
-  std::atomic_bool acquired{false};
+  std::atomic_bool acquired{false}, done{false};
   util::fb2::Fiber f = pp_->at(0)->LaunchFiber(util::fb2::Launch::post, [&] {
     auto lease = gate.Acquire([] { return false; });
     acquired = static_cast<bool>(lease);
+    done = true;
   });
   std::this_thread::sleep_for(std::chrono::milliseconds(250));
   EXPECT_FALSE(acquired.load());
   loading = false;
+  // f.Join() blocks unconditionally; if SyncGate stopped re-checking external_loading_ after the
+  // first poll, Acquire() may never return even though `loading` is now false. Wait for `done`
+  // with a bound first: on timeout this ASSERT_TRUE fails (with a diagnostic) and returns before
+  // the unconditional Join() below can hang. `f` is deliberately left un-joined on that path
+  // (not Detach()-ed) so its destructor's own CHECK aborts the process deterministically instead
+  // of risking a detached, still-blocked-in-Acquire() fiber later touching this function's
+  // now-destroyed locals -- see the identical reasoning in CancelledWaiterGetsEmptyLease above.
+  ASSERT_TRUE(WaitForFlag(done)) << "fiber did not return within the time bound after "
+                                    "external_loading cleared -- SyncGate may not be "
+                                    "re-checking external_loading_";
   f.Join();
   EXPECT_TRUE(acquired.load());
 }
