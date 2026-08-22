@@ -104,11 +104,11 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
   *already_attached = false;
 
   // A peer's identity is the endpoint stored in its PeerLink (see the class/member comments), so
-  // this is a pure in-memory scan -- never touches any peer's Replica, never hops. Only ever
-  // called below while mu_ is held (no ABSL_EXCLUSIVE_LOCKS_REQUIRED here: unlike a member
-  // function, that annotation on a lambda's declarator isn't an established pattern elsewhere in
-  // this codebase and isn't needed for correctness).
-  auto has_endpoint = [this](const Endpoint& target) {
+  // this is a pure in-memory scan -- never touches any peer's Replica, never hops. Annotated
+  // ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_): Clang's thread-safety analysis gives a lambda's operator()
+  // its own empty lockset, so reading peers_ here would otherwise fail -Werror=thread-safety on
+  // the Clang CI legs even though every call site below holds mu_ via LockGuard.
+  auto has_endpoint = [this](const Endpoint& target) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
     for (const auto& pl : peers_) {
       if (SameEndpoint(pl.ep, target))
         return true;
