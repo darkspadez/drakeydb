@@ -64,6 +64,7 @@ bool ValidateNotifyKeyspaceEventsFlag();
 class CommandContext;
 class CommandRegistry;
 class DflyCmd;
+class PeerReplicationManager;  // drakeydb: active-replica peer links (server/peer_replication.h)
 class Replica;
 class Service;
 class ScriptMgr;
@@ -326,6 +327,11 @@ class ServerFamily {
   void ReplicaOfInternal(facade::ParsedArgs args, CommandContext* cmnd_cntx,
                          ActionOnConnectionFail on_error) ABSL_LOCKS_EXCLUDED(replicaof_mu_);
 
+  // drakeydb: active-node REPLICAOF, delegating to peers_ (PeerReplicationManager) instead of
+  // replica_. See ReplicaOfInternal's IsActiveReplica() dispatch.
+  void ReplicaOfActive(facade::ParsedArgs args, CommandContext* cmd_cntx,
+                       ActionOnConnectionFail on_error);
+
   void ReplicaOfNoOne(SinkReplyBuilder* builder) ABSL_LOCKS_EXCLUDED(replicaof_mu_);
 
   struct LoadOptions {
@@ -382,6 +388,8 @@ class ServerFamily {
   std::shared_ptr<Replica> replica_ ABSL_GUARDED_BY(replicaof_mu_);
   std::vector<std::unique_ptr<Replica>> cluster_replicas_
       ABSL_GUARDED_BY(replicaof_mu_);  // used to replicating multiple nodes to single dragonfly
+
+  std::unique_ptr<PeerReplicationManager> peers_;  // drakeydb: active-replica peer links
 
   std::unique_ptr<ScriptMgr> script_mgr_;
   std::unique_ptr<DflyCmd> dfly_cmd_;

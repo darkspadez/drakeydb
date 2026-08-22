@@ -511,6 +511,11 @@ void DflyCmd::TakeOver(CmdArgParser parser, CommandContext* cmd_cntx) {
 
   RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
 
+  // drakeydb: fan-in has no single upstream master to hand this node's role off to.
+  if (IsActiveReplica()) {
+    return cmd_cntx->SendError("TAKEOVER is not supported on an active-replica node");
+  }
+
   VLOG(1) << "Got DFLY TAKEOVER " << sync_id_str << " time out:" << timeout;
 
   auto [sync_id, replica_ptr] = GetReplicaInfoOrReply(sync_id_str, cmd_cntx);

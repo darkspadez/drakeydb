@@ -69,6 +69,7 @@ extern "C" {
 #include "server/multi_command_squasher.h"
 #include "server/namespaces.h"
 #include "server/node_identity.h"
+#include "server/peer_replication.h"
 #include "server/rdb_load.h"
 #include "server/rdb_save.h"
 #include "server/replica.h"
@@ -1184,6 +1185,7 @@ ServerFamily::ServerFamily(Service* service) : service_(*service) {
   // runtime and can abort (SIGABRT). Keep these checks out of this ctor.
 
   dfly_cmd_ = make_unique<DflyCmd>(this);
+  peers_ = std::make_unique<PeerReplicationManager>(&service_, &peer_registry_);  // drakeydb
   legacy_format_metrics_ = GetFlag(FLAGS_keep_legacy_memory_metrics);
 }
 
@@ -1385,6 +1387,7 @@ void ServerFamily::Shutdown() {
       replica_->Stop();
     }
     StopAllClusterReplicas();
+    peers_->Shutdown();  // drakeydb: stop this node's active-replica peer links too
 
     dfly_cmd_->CancelReplicas();
     DebugCmd::Shutdown();
@@ -1665,6 +1668,7 @@ void ServerFamily::PauseReplication(bool pause) {
     CHECK(repl_ptr);
     repl_ptr->Pause(pause);
   }
+  peers_->PauseAll(pause);  // drakeydb: also pause/resume this node's active-replica peer links
 }
 
 std::optional<ReplicaOffsetInfo> ServerFamily::GetReplicaOffsetInfo() {
@@ -2993,6 +2997,10 @@ string ServerFamily::FormatInfoMetrics(
         }
       }
       append("master_replid", master_replid_);
+      if (IsActiveReplica()) {  // drakeydb: peer links of an active node (fan-in)
+        info.append(
+            RenderPeerReplicationInfo(peers_->Summaries(), IsMultiMaster(), show_managed_info));
+      }
     } else {
       append("role", GetFlag(FLAGS_info_replication_valkey_compatible) ? "slave" : "replica");
 
@@ -3435,6 +3443,11 @@ void ServerFamily::ReplicaOfNoOne(SinkReplyBuilder* builder) {
 void ServerFamily::ReplicaOfInternal(facade::ParsedArgs args, CommandContext* cmd_cntx,
                                      ActionOnConnectionFail on_error)
     ABSL_LOCKS_EXCLUDED(replicaof_mu_) {
+  // drakeydb: an active node manages its masters through PeerReplicationManager (fan-in).
+  if (IsActiveReplica()) {
+    return ReplicaOfActive(args, cmd_cntx, on_error);
+  }
+
   auto replicaof_args = ReplicaOfArgs::FromCmdArgs(args);
   if (!replicaof_args.has_value()) {
     return cmd_cntx->SendError(replicaof_args.error());
@@ -3505,6 +3518,43 @@ void ServerFamily::ReplicaOfInternal(facade::ParsedArgs args, CommandContext* cm
   cmd_cntx->rb()->SendOk();
 }
 
+// drakeydb: active-node REPLICAOF -- attaches/detaches peer masters via peers_ instead of
+// managing a single replica_. See PeerReplicationManager for the fan-in semantics.
+void ServerFamily::ReplicaOfActive(facade::ParsedArgs args, CommandContext* cmd_cntx,
+                                   ActionOnConnectionFail on_error) {
+  auto cmd = ParsePeerReplicaOfArgs(args);
+  if (!cmd.has_value()) {
+    return cmd_cntx->SendError(cmd.error());
+  }
+  using Kind = PeerReplicaOfCmd::Kind;
+  PeerReplicationManager::Endpoint ep{cmd->host, cmd->port};
+  switch (cmd->kind) {
+    case Kind::kNoOne:
+      LOG(INFO) << "Detaching all peer masters";
+      peers_->RemoveAll();
+      return cmd_cntx->rb()->SendOk();
+    case Kind::kRemove:
+      LOG(INFO) << "Detaching peer master " << ep.host << ":" << ep.port;
+      if (!peers_->Remove(ep)) {
+        return cmd_cntx->SendError("Not attached to the specified master");
+      }
+      return cmd_cntx->rb()->SendOk();
+    case Kind::kAdd: {
+      LOG(INFO) << "Attaching peer master " << ep.host << ":" << ep.port;
+      bool already = false;
+      auto mode = on_error == ActionOnConnectionFail::kReturnOnError
+                      ? PeerReplicationManager::StartMode::kBlockingHandshake
+                      : PeerReplicationManager::StartMode::kBackground;
+      GenericError ec = peers_->Add(ep, master_replid(), mode, &already);
+      if (ec) {
+        return cmd_cntx->SendError(ec.Format());
+      }
+      LOG_IF(INFO, already) << "Already attached to " << ep.host << ":" << ep.port;
+      return cmd_cntx->rb()->SendOk();
+    }
+  }
+}
+
 // REPLTAKEOVER <seconds> [SAVE]
 // SAVE is used only by tests.
 void ServerFamily::ReplTakeOver(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
@@ -3522,6 +3572,11 @@ void ServerFamily::ReplTakeOver(facade::CmdArgParser parser, CommandContext* cmd
   // We allow zero timeouts for tests.
   if (timeout_sec < 0) {
     return cmd_cntx->SendError("timeout is negative");
+  }
+
+  // drakeydb: fan-in has no single upstream master to hand this node's role off to.
+  if (IsActiveReplica()) {
+    return cmd_cntx->SendError("REPLTAKEOVER is not supported on an active-replica node");
   }
 
   // The LockGuard must precede the master check to ensure atomicity for the subsequent repl_ptr
@@ -3577,6 +3632,11 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
     if (!IsMaster()) {
       return cmd_cntx->SendError("Replicating a replica is unsupported");
     }
+  }
+
+  // drakeydb: an active node does not serve replication consumers yet (Phase 3 admits peers).
+  if (IsActiveReplica()) {
+    return cmd_cntx->SendError("Replicating from an active-replica node is not supported");
   }
 
   auto err_cb = [&]() mutable {

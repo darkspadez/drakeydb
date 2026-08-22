@@ -450,4 +450,56 @@ TEST_F(MultiMasterFamilyTest, ReplconfUuidInvalidRejected) {
   EXPECT_THAT(resp, ErrArg("Invalid UUID"));
 }
 
+// Boots with --active_replica and --multi_master on, on top of MultiMasterFamilyTest's private
+// --dir (base's saver_ restores both flags on TearDown, same as it already does for --dir).
+class ActiveReplicaFamilyTest : public MultiMasterFamilyTest {
+ protected:
+  ActiveReplicaFamilyTest() {
+    absl::SetFlag(&FLAGS_active_replica, true);
+    absl::SetFlag(&FLAGS_multi_master, true);
+  }
+};
+
+TEST_F(ActiveReplicaFamilyTest, ReplconfRefusedWhileActive) {
+  auto resp = Run({"replconf", "listening-port", "1"});
+  EXPECT_THAT(resp, ErrArg("active-replica"));
+  resp = Run({"replconf", "capa", "dragonfly"});
+  EXPECT_THAT(resp, ErrArg("active-replica"));
+}
+
+TEST_F(ActiveReplicaFamilyTest, ReplTakeoverRefusedWhileActive) {
+  EXPECT_THAT(Run({"repltakeover", "1"}), ErrArg("active-replica"));
+}
+
+TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
+  auto resp = Run({"info", "replication"});
+  std::string info{ToSV(resp.GetBuf())};
+  EXPECT_NE(std::string::npos, info.find("role:master\r\n"));
+  EXPECT_NE(std::string::npos, info.find("active_replica:1\r\n"));
+  EXPECT_NE(std::string::npos, info.find("multi_master:1\r\n"));
+  EXPECT_NE(std::string::npos, info.find("connected_masters:0\r\n"));
+  EXPECT_EQ(std::string::npos, info.find("master_host:"));
+}
+
+TEST_F(ActiveReplicaFamilyTest, ReplicaOfGrammarAndNoPeersPaths) {
+  EXPECT_THAT(Run({"replicaof", "remove", "localhost", "1"}), ErrArg("Not attached"));
+  EXPECT_EQ("OK", Run({"replicaof", "no", "one"}));
+  EXPECT_THAT(Run({"replicaof", "localhost", "6379", "0", "100"}), ErrArg("slot ranges"));
+  // unreachable peer: error, nothing attached, still a writable master. The classic (non-active)
+  // REPLICAOF path hits the same wording for an immediately-refused connection: by the time
+  // Replica::Start()'s check_connection_error() runs after ConnectAndAuth(), exec_st_ has already
+  // flipped to cancelled, so it takes the generic branch instead of the specific "could not
+  // connect to master: ..." one (see replica.cc). Verified independent of active/peer mode.
+  EXPECT_THAT(Run({"replicaof", "localhost", "1"}), ErrArg("replication cancelled"));
+  std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
+  EXPECT_NE(std::string::npos, info.find("connected_masters:0\r\n"));
+  EXPECT_EQ("OK", Run({"set", "k", "v"}));
+}
+
+TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
+  std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
+  EXPECT_EQ(std::string::npos, info.find("active_replica:"));
+  EXPECT_EQ(std::string::npos, info.find("connected_masters:"));
+}
+
 }  // namespace dfly
