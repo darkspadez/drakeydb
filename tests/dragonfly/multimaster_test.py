@@ -245,6 +245,13 @@ async def test_replicaof_flag_list_requires_active_replica(df_factory: DflyInsta
     await assert_start_fails(node)
 
 
+async def test_replicaof_flag_list_requires_multi_master(df_factory: DflyInstanceFactory):
+    node = df_factory.create(
+        proactor_threads=1, active_replica="true", replicaof="localhost:1,localhost:2"
+    )
+    await assert_start_fails(node)
+
+
 async def test_replicaof_flag_list_attaches_all_peers(df_factory: DflyInstanceFactory, port_picker):
     b = df_factory.create(proactor_threads=1, port=port_picker.get_available_port())
     c = df_factory.create(proactor_threads=1, port=port_picker.get_available_port())

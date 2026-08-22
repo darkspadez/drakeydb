@@ -361,7 +361,8 @@ the Phase 2 suite added to `multimaster_test.py`.
   (`"Replicating from an active-replica node is not supported"`); P3 replaces it with peer
   admission.
 - `--replicaof` accepts a comma-separated peer list; in active mode `Init` loads the node's own
-  snapshot before attaching every peer.
+  snapshot before attaching every peer. A list of more than one target requires both
+  `--active_replica` and `--multi_master` (boot error otherwise).
 - Peer uuids are registered in `PeerRegistry` from inside `Greet()`, not from a separate
   admission step.
 - The clone-uuid refusal in `Greet()` only fires in peer mode; a non-peer `--replicaof` clone is

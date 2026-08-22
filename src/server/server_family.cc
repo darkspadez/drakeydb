@@ -134,7 +134,9 @@ ABSL_FLAG(int, epoll_file_threads, 0,
 ABSL_FLAG(ReplicaOfFlag, replicaof, ReplicaOfFlag{},
           "Specifies a host and port which point to a target master "
           "to replicate. "
-          "Format should be <IPv4>:<PORT> or host:<PORT> or [<IPv6>]:<PORT>");
+          "Format should be <IPv4>:<PORT> or host:<PORT> or [<IPv6>]:<PORT>. "
+          "With --active_replica --multi_master, a comma-separated list of targets attaches all "
+          "of them (drakeydb).");
 ABSL_FLAG(int32_t, slowlog_log_slower_than, 10000,
           "Add commands slower than this threshold to slow log. The value is expressed in "
           "microseconds and if it's negative - disables the slowlog.");
@@ -226,9 +228,16 @@ bool AbslParseFlag(std::string_view in, ReplicaOfFlag* flag, std::string* err) {
   }
 
   // drakeydb: --replicaof accepts a comma-separated list of targets (active-replica fan-in).
+  // Reset first, mirroring the empty-input branch above: AbslParseFlag may run more than once
+  // against the same ReplicaOfFlag (e.g. absl flag-parsing helpers reusing a default instance),
+  // and without this a second parse would append onto `peers` instead of replacing it.
+  flag->peers.clear();
+  flag->host.clear();
+  flag->port.clear();
   for (string_view piece : absl::StrSplit(in, ',', absl::SkipEmpty())) {
     string host, port;
-    if (!ParseOneReplicaOf(piece, &host, &port, err))
+    // Tolerate whitespace around each piece (e.g. "a:1, b:2") without rejecting the whole flag.
+    if (!ParseOneReplicaOf(absl::StripAsciiWhitespace(piece), &host, &port, err))
       return false;
     flag->peers.emplace_back(std::move(host), std::move(port));
   }
@@ -1315,11 +1324,18 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
   LOG(INFO) << "Node uuid: " << node_identity_.uuid
             << (node_identity_.ephemeral ? " (ephemeral)" : "");
 
-  // check for '--replicaof' before loading anything
+  // --replicaof: a non-active node replicates instead of loading a snapshot; an active node loads
+  // its own snapshot first (drakeydb) and then attaches every target.
   if (ReplicaOfFlag flag = GetFlag(FLAGS_replicaof); flag.has_value()) {
-    if (flag.peers.size() > 1 && !IsActiveReplica()) {  // drakeydb
-      LOG(ERROR) << "--replicaof with several targets requires --active_replica";
-      exit(1);
+    if (flag.peers.size() > 1) {  // drakeydb: a peer list needs both active-replica and fan-in
+      if (!IsActiveReplica()) {
+        LOG(ERROR) << "--replicaof with several targets requires --active_replica";
+        exit(1);
+      }
+      if (!IsMultiMaster()) {
+        LOG(ERROR) << "--replicaof with several targets requires --multi_master";
+        exit(1);
+      }
     }
     if (IsActiveReplica()) {  // drakeydb: an active node keeps its own snapshot and merges peers
       LoadFromSnapshot();
@@ -1328,7 +1344,7 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
       for (const auto& [host, port] : flag.peers)
         this->Replicate(host, port);
     });
-  } else {  // load from snapshot only if --replicaof is empty
+  } else {  // --replicaof is empty: load this node's own snapshot as usual
     LoadFromSnapshot();
   }
 

@@ -389,8 +389,6 @@ class ServerFamily {
   std::vector<std::unique_ptr<Replica>> cluster_replicas_
       ABSL_GUARDED_BY(replicaof_mu_);  // used to replicating multiple nodes to single dragonfly
 
-  std::unique_ptr<PeerReplicationManager> peers_;  // drakeydb: active-replica peer links
-
   std::unique_ptr<ScriptMgr> script_mgr_;
   std::unique_ptr<DflyCmd> dfly_cmd_;
 
@@ -399,6 +397,13 @@ class ServerFamily {
 
   NodeIdentity node_identity_;
   PeerRegistry peer_registry_;
+
+  // drakeydb: active-replica peer links, internally synchronized by its own mutex -- not guarded
+  // by replicaof_mu_. Declared after peer_registry_/node_identity_ so it is destroyed first:
+  // ~PeerReplicationManager() calls Shutdown() -> Replica::Stop(), and a peer's background fiber
+  // can still be inside Greet() touching peer_registry_/node_identity_ at that point -- reverse
+  // declaration-order destruction must not tear those down before peers_ is gone.
+  std::unique_ptr<PeerReplicationManager> peers_;
 
   time_t start_time_ = 0;  // in seconds, epoch time.
 

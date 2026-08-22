@@ -44,7 +44,7 @@ build dir, OrbStack stopped. Main checkout (`~/Documents/qops/git/drakeydb`) has
 | # | Decision |
 |---|---|
 | D1 | A peer's **full sync keeps Dragonfly LOADING semantics** (clients get `-LOADING` for the merge-load duration). Steady state fully writable. Serve-during-merge stays future work. |
-| D2 | `--replicaof` accepts a **comma-separated list** (`h1:p1,h2:p2,[::1]:p3`) — only meaningful with `--active_replica`; >1 target without it is a boot error. In active mode the node **also loads its own snapshot** at boot (upstream skips the snapshot when `--replicaof` is set). |
+| D2 | `--replicaof` accepts a **comma-separated list** (`h1:p1,h2:p2,[::1]:p3`) — only meaningful with `--active_replica`; >1 target without it is a boot error. In active mode the node **also loads its own snapshot** at boot (upstream skips the snapshot when `--replicaof` is set). **(as built)** >1 target also requires `--multi_master`, not only `--active_replica` — without fan-in, `PeerReplicationManager::Add`'s replace semantics would silently keep only the last target. |
 | D3 | P3 prerequisites pulled into P2: **(a)** pytest harness gives every instance a distinct node identity by default; **(b)** a peer presenting **our own uuid is refused** (peer mode only — non-active behaviour stays byte-identical to upstream). |
 | D4 | Review cadence: Opus 5 **per task** (spec-compliance review, then code-quality review) **plus a final whole-branch review**. Sonnet 5 implements. |
 | D5 | **KeyDB parity:** without `--multi_master`, `REPLICAOF h p` **replaces** the single peer (still writable, no flush); with `--multi_master` it **appends**. `REPLICAOF REMOVE h p` and `REPLICAOF NO ONE` work in both. |
@@ -297,6 +297,9 @@ state).
 - `Init` (1292-1298): `if (flag.peers.size() > 1 && !IsActiveReplica()) { LOG(ERROR) << ...; exit(1); }`;
   in active mode call `LoadFromSnapshot()` first (D2), then `Replicate(host, port)` for **every**
   entry of `flag.peers` inside one `GetNextProactor()->Await`. Non-active: unchanged.
+  **(as built)** >1 target also requires `--multi_master`: when `flag.peers.size() > 1`,
+  `!IsActiveReplica()` keeps the existing exit, and `IsActiveReplica() && !IsMultiMaster()` now
+  exits with `"--replicaof with several targets requires --multi_master"` too.
 - `ReplicaOfFlag` gains `std::vector<std::pair<std::string, std::string>> peers;` (host/port mirror
   `peers[0]`); `AbslParseFlag` splits on `,` and parses each piece with the existing single-endpoint
   logic (extracted into a static helper — **(as built)** `ParseOneReplicaOf`), `AbslUnparseFlag`
