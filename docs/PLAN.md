@@ -9,7 +9,7 @@
 |---|---|---|
 | **P0 — Repo hygiene + rename** | ✅ **complete, verified** | PR [#1](https://github.com/darkspadez/drakeydb/pull/1), branch `feat/phase0-drakeydb-rename`, commit `7ca99f4c` |
 | **P1 — Identity foundations** | ✅ **complete, verified** | branch `feat/phase1-identity`, commits `9e653ab3..9c491fac` |
-| **P2 — Writable multi-source replica** | ✅ **complete, pending PR** | PR pending, branch `feat/phase2-fanin` — see [Phase 2](#phase-2--writable-multi-source-replica-fan-in) |
+| **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3), branch `feat/phase2-fanin` — see [Phase 2](#phase-2--writable-multi-source-replica-fan-in) |
 | **P3 — Origin-tagged journal + active pair/mesh** | ⏭️ **next up** | see [Phase 3](#phase-3--origin-tagged-journal--active-pairmesh) |
 | P4–P9 | not started | — |
 
