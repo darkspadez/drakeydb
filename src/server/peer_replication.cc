@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <utility>
 
 #include "server/multi_master.h"
@@ -142,20 +143,26 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
   // Step 3: single critical section -- re-check (closes the race where a concurrent Add()
   // attached the same endpoint while we were blocked above) and, if still clear, register:
   // replace the existing peer set unless --multi_master is on. Both the check and the mutation
-  // happen under the same lock acquisition, so this is fully atomic; no residual race.
+  // happen under the same lock acquisition, so this is fully atomic; no residual race. Any
+  // replaced peer(s) are stopped before mu_ is released rather than after (see the class
+  // comment): mu_ serializes every Replica-touching call, so a replaced peer's Stop() can never
+  // run concurrently with a GetSummary()/Pause() that some other manager method is mid-way
+  // through on the same Replica.
   bool closed = false;
-  std::vector<PeerLink> replaced;
   {
     util::fb2::LockGuard lk(mu_);
     closed = closed_;
     if (!closed) {
       *already_attached = has_endpoint(ep);
       if (!*already_attached) {
+        std::vector<PeerLink> replaced;
         if (!IsMultiMaster()) {
           replaced = std::move(peers_);
           peers_.clear();
         }
         peers_.push_back(PeerLink{ep, r});
+        for (auto& pl : replaced)
+          pl.replica->Stop();
       }
     }
   }
@@ -168,79 +175,64 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
     return {};
   }
 
-  // Step 4: unlocked. Stop the peer(s) this one replaced, then -- same ordering as upstream
-  // ReplicaOfInternal -- start the main replication fiber only after registration.
-  for (auto& pl : replaced)
-    pl.replica->Stop();
+  // Step 4: unlocked -- same ordering as upstream ReplicaOfInternal -- start the main replication
+  // fiber only after registration.
   if (mode == StartMode::kBlockingHandshake)
     r->StartMainReplicationFiber(std::nullopt);
   return {};
 }
 
 bool PeerReplicationManager::Remove(const Endpoint& ep) {
-  std::shared_ptr<Replica> target;
-  {
-    util::fb2::LockGuard lk(mu_);
-    auto it = std::find_if(peers_.begin(), peers_.end(),
-                           [&](const PeerLink& pl) { return SameEndpoint(pl.ep, ep); });
-    if (it != peers_.end()) {
-      target = std::move(it->replica);
-      peers_.erase(it);
-    }
-  }
-  if (!target)
+  // mu_ held across Stop(): see the class comment -- this serializes Remove() against every other
+  // Replica-touching call the manager makes (Summaries(), PauseAll(), RemoveAll(), Shutdown(), and
+  // the replaced-peer Stop()s inside Add()), so this target's Stop() can never race a GetSummary()
+  // or Pause() some other method is mid-way through on it.
+  util::fb2::LockGuard lk(mu_);
+  auto it = std::find_if(peers_.begin(), peers_.end(),
+                         [&](const PeerLink& pl) { return SameEndpoint(pl.ep, ep); });
+  if (it == peers_.end())
     return false;
+  std::shared_ptr<Replica> target = std::move(it->replica);
+  peers_.erase(it);
   target->Stop();
   return true;
 }
 
 void PeerReplicationManager::RemoveAll() {
-  std::vector<PeerLink> snapshot;
-  {
-    util::fb2::LockGuard lk(mu_);
-    snapshot = std::move(peers_);
-    peers_.clear();
-  }
+  // mu_ held across every Stop(): see the class comment / Remove() above.
+  util::fb2::LockGuard lk(mu_);
+  std::vector<PeerLink> snapshot = std::move(peers_);
+  peers_.clear();
   for (auto& pl : snapshot)
     pl.replica->Stop();
 }
 
 void PeerReplicationManager::Shutdown() {
-  std::vector<PeerLink> snapshot;
-  {
-    util::fb2::LockGuard lk(mu_);
-    closed_ = true;
-    snapshot = std::move(peers_);
-    peers_.clear();
-  }
+  // mu_ held across every Stop(): see the class comment / Remove() above.
+  util::fb2::LockGuard lk(mu_);
+  closed_ = true;
+  std::vector<PeerLink> snapshot = std::move(peers_);
+  peers_.clear();
   for (auto& pl : snapshot)
     pl.replica->Stop();
 }
 
 void PeerReplicationManager::PauseAll(bool pause) {
-  std::vector<std::shared_ptr<Replica>> snapshot;
-  {
-    util::fb2::LockGuard lk(mu_);
-    snapshot.reserve(peers_.size());
-    for (auto& pl : peers_)
-      snapshot.push_back(pl.replica);
-  }
-  for (auto& p : snapshot)
-    p->Pause(pause);
+  // mu_ held across every Pause(): see the class comment / Remove() above.
+  util::fb2::LockGuard lk(mu_);
+  for (auto& pl : peers_)
+    pl.replica->Pause(pause);
 }
 
 std::vector<ReplicaSummary> PeerReplicationManager::Summaries() const {
-  std::vector<std::shared_ptr<Replica>> snapshot;
-  {
-    util::fb2::LockGuard lk(mu_);
-    snapshot.reserve(peers_.size());
-    for (auto& pl : peers_)
-      snapshot.push_back(pl.replica);
-  }
+  // mu_ held across every GetSummary(): see the class comment / Remove() above -- this is what
+  // keeps INFO replication from ever observing a Replica mid-Stop() from a concurrent
+  // Remove()/RemoveAll()/Shutdown()/Add() replace.
+  util::fb2::LockGuard lk(mu_);
   std::vector<ReplicaSummary> out;
-  out.reserve(snapshot.size());
-  for (auto& p : snapshot)
-    out.push_back(p->GetSummary());
+  out.reserve(peers_.size());
+  for (auto& pl : peers_)
+    out.push_back(pl.replica->GetSummary());
   return out;
 }
 

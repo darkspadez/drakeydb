@@ -6,6 +6,7 @@
 #include <absl/base/thread_annotations.h>
 #include <absl/functional/function_ref.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -63,7 +64,8 @@ class SyncGate {
 
   // Blocks until this caller holds the gate (FIFO among waiters) and external_loading() is false.
   // Returns an empty Lease if cancelled() becomes true while waiting (checked every 100ms and on
-  // every release). Must be called from a fiber.
+  // every release). cancelled(), like external_loading(), is evaluated under the internal mutex,
+  // so it must be cheap and non-blocking. Must be called from a fiber.
   Lease Acquire(absl::FunctionRef<bool()> cancelled);
 
   bool IsHeld() const;
@@ -95,10 +97,17 @@ class SyncGate {
 // look a peer up as a pure, non-blocking in-memory comparison under mu_ (see PeerLink) instead of
 // having to ask the peer's own Replica.
 //
-// Thread-safe: every method may be called from any fiber. mu_ only ever guards the `peers_`
-// vector and the `closed_` flag -- both cheap to touch -- so it is never held across a network
-// operation or a call into a Replica: Replica's own methods (Stop(), Pause(), GetSummary()) hop
-// to that replica's own proactor and so must never run while mu_ is held.
+// Thread-safe: every method may be called from any fiber. mu_ guards the `peers_` vector and the
+// `closed_` flag, and -- deliberately -- is also held across every call this class makes into a
+// Replica (Stop(), Pause(), GetSummary()), so mu_ serializes all Replica-touching operations: at
+// most one runs at a time, and none can race another on the same Replica (e.g. INFO replication's
+// Summaries() can never overlap a concurrent Remove()/RemoveAll()/Shutdown()'s Stop() on the same
+// Replica -- see Replica::Stop() vs Replica::GetSummary() on shard_flows_). The one exception is
+// the network handshake in Add() (Start()/EnableReplication(), and the later
+// StartMainReplicationFiber()): that step runs on a freshly constructed Replica no other method
+// can reach yet (it is not in peers_), so nothing can race it, and it must not block mu_ since it
+// waits on DNS/TCP. Holding mu_ across Stop()/Pause()/GetSummary() cannot deadlock: Replica never
+// calls back into PeerReplicationManager.
 class PeerReplicationManager {
  public:
   struct Endpoint {
@@ -153,9 +162,10 @@ class PeerReplicationManager {
   // A peer's identity is the endpoint it was given at Add() time (exact host string + port),
   // stored alongside its Replica so Add()/Remove() can look a peer up by endpoint as a pure,
   // non-blocking in-memory comparison under mu_. Replica itself exposes no accessor for this
-  // cheaper than GetSummary(), which hops to the peer's own proactor and so cannot be called
-  // while mu_ is held (ProtocolClient::GetHost()/GetPort() are hidden by Replica's private
-  // inheritance from ProtocolClient).
+  // cheaper than GetSummary() (ProtocolClient::GetHost()/GetPort() are hidden by Replica's
+  // private inheritance from ProtocolClient) -- and GetSummary() is one of the calls this class
+  // makes while holding mu_ (see the class comment above), so using it for the lookup here would
+  // mean paying for a proactor hop, under the lock, on every Add()/Remove().
   struct PeerLink {
     Endpoint ep;  // as given to Add(); identifies this peer for Add()/Remove() lookups
     std::shared_ptr<Replica> replica;
