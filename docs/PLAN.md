@@ -74,7 +74,21 @@ scope and works — our parser accepts KeyDB's bare-uuid reply, and `IsValidNode
 but costly to revisit later: the exchange predates `capa dragonfly`/`CLIENT-VERSION`, so there is no
 peer signal yet to gate the suffix on, and P8's clock-skew work will come to depend on it.
 
-**P2 verification record:** appended after the final gate run (see the commit that follows).
+**P2 verification record** (Ubuntu 24.04 arm64 container `drakeydb-p2` from the re-committed
+`drakeydb-build:deps-p2` image, OrbStack, `--security-opt seccomp=unconfined`): full `ninja` (273
+targets) warning-free; `ctest -L DFLY` **87/87 passed** (P1's 86 + `peer_replication_test`; 272 s,
+re-run after the final-review fix wave on `84bdfc7b`: 87/87, 265 s); pytest with an absolute
+`DRAGONFLY_PATH`: `multimaster_test.py` **21 passed** + 1 pre-existing skip (real-redis binary);
+`replication_test.py` **43 passed** (21 `large` deselected); `replication_config_test.py` **18 passed**
++ 6 skipped (versioned redis binaries absent); `replication_resilience_test.py` **41 passed** +
+1 pre-existing xfail (8 deselected); `cluster_test.py` **55 passed** + 2 skipped (9 deselected);
+`replication_specific_test.py` **60 passed** (13 deselected) — 0 failures, no flakes; the three
+replication/multimaster suites were re-run green on the final HEAD. Host pre-commit clean over all
+changed files. Review: every task had an Opus spec+quality review (two fix rounds: SyncGate
+notify-under-mutex + bounded test waits; PeerReplicationManager stored endpoints + clang
+thread-safety annotation), plus a final whole-branch review whose four Important findings
+(`Summaries()` vs `Stop()` serialization, `--replicaof` lists requiring `--multi_master`, member
+destruction order, stale flag docs) landed in `761f9ac6..84bdfc7b` and were re-reviewed clean.
 
 **Resuming work — environment notes (macOS dev machine):**
 - Container runtime is **OrbStack**: `orbctl start` if the docker daemon is down. VM is

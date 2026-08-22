@@ -257,9 +257,18 @@ objects are constructed on the calling proactor (REPLICAOF connection thread, or
 with `struct PeerLink { Endpoint ep; std::shared_ptr<Replica> replica; }`, not the
 `std::vector<std::shared_ptr<Replica>>` sketched above. Pairing the endpoint with the `Replica` at
 `Add()` time lets `Add()`/`Remove()` identify a peer by the exact endpoint it was given, as a pure
-in-memory comparison under `mu_` — never a `GetSummary()` hop while the lock is held. `Endpoints()`
-is hop-free too; `Summaries()` still hops outside the lock (unavoidable — it reads live link
-state).
+in-memory comparison under `mu_`. `Endpoints()` is hop-free.
+
+**(as built, final review)** the lock scope above was widened: `mu_` is held across every
+`Replica` call in `Remove/RemoveAll/Shutdown/PauseAll/Summaries`, and replaced peers are stopped
+inside `Add()`'s step-(3) lock scope. Only the handshake in `Add()` (`Start()`/
+`EnableReplication()`) and `StartMainReplicationFiber()` run outside `mu_`. Reason: upstream only
+ever calls `Replica::GetSummary()` under the same mutex it holds around `Replica::Stop()`
+(`Stop()` resets `shard_flows_` on the caller's thread while `GetSummary()` iterates it on the
+peer's proactor); the copy-then-act pattern sketched above reintroduced that race between
+`INFO replication` and `REPLICAOF REMOVE`/`NO ONE`/shutdown. Holding `mu_` across those calls
+cannot deadlock because `Replica` never calls back into the manager (it only holds `&gate_` and
+`registry_`), and `INFO` simply waits for an in-flight `Stop()`.
 
 ### D-7. `ServerFamily` / `DflyCmd` wiring (additive)
 
