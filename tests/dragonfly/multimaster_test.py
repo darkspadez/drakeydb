@@ -209,3 +209,18 @@ async def test_replicaof_real_redis_tolerates_missing_uuid(
         assert "master_node_uuid" not in info  # old master answered -ERR; tolerated
     finally:
         await r.aclose()
+
+
+async def test_harness_gives_each_instance_a_distinct_identity(df_factory: DflyInstanceFactory):
+    # No dir= on purpose: these share the session cwd, so without the harness default they would
+    # all load the same drakeydb.uuid file.
+    a = df_factory.create(proactor_threads=1)
+    b = df_factory.create(proactor_threads=1)
+    df_factory.start_all([a, b])
+    ua = (await a.client().info("replication"))["node_uuid"]
+    ub = (await b.client().info("replication"))["node_uuid"]
+    assert UUID_RE.match(ua) and UUID_RE.match(ub)
+    assert ua != ub
+    a.stop()
+    a.start()  # same args -> same identity across restart
+    assert (await a.client().info("replication"))["node_uuid"] == ua
