@@ -15,6 +15,16 @@
 
 namespace dfly {
 
+// --active_replica / --multi_master accessors (boot-only flags, declared in multi_master.cc).
+bool IsActiveReplica();
+bool IsMultiMaster();
+
+// Validates the multi-master flag combination: --multi_master requires --active_replica, and
+// --active_replica is incompatible with --cluster_mode, tiering (--tiered_prefix) and
+// --experimental_cascaded_partial_sync. Logs and returns false on a bad combination. Called from
+// main() before the proactor pool starts (see dfly_main.cc), like the TLS/snapshot validators.
+bool ValidateMultiMasterFlags();
+
 // PeerRegistry maps a peer's uuid to a small, dense "origin index", assigned in the order
 // uuids are first seen. The local node always occupies kSelfIdx (0). Indices are assigned
 // monotonically and are NEVER reused or reclaimed, even after a peer disconnects: Phase 3 stamps

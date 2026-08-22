@@ -17,6 +17,7 @@
 
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
+#include "absl/flags/reflection.h"
 #include "base/gtest.h"
 #include "facade/facade_test.h"
 #include "io/file_util.h"
@@ -28,6 +29,11 @@
 
 ABSL_DECLARE_FLAG(bool, force_epoll);
 ABSL_DECLARE_FLAG(std::string, dir);
+ABSL_DECLARE_FLAG(bool, active_replica);
+ABSL_DECLARE_FLAG(bool, multi_master);
+ABSL_DECLARE_FLAG(std::string, cluster_mode);
+ABSL_DECLARE_FLAG(std::string, tiered_prefix);
+ABSL_DECLARE_FLAG(bool, experimental_cascaded_partial_sync);
 
 namespace dfly {
 
@@ -241,6 +247,38 @@ TEST(PeerRegistry, SelfIsZeroAndAddOrGetIsMonotonicIdempotent) {
   EXPECT_EQ(std::nullopt, reg.FindIdx("01234567-89ab-4cde-8f01-0000000000ff"));
   EXPECT_EQ("", reg.GetUuid(99));
   EXPECT_EQ(3u, reg.Size());
+}
+
+TEST(MultiMasterFlags, DefaultsAreValidAndOff) {
+  absl::FlagSaver saver;
+  EXPECT_FALSE(IsActiveReplica());
+  EXPECT_FALSE(IsMultiMaster());
+  EXPECT_TRUE(ValidateMultiMasterFlags());
+}
+
+TEST(MultiMasterFlags, MultiMasterRequiresActiveReplica) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_multi_master, true);
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+  absl::SetFlag(&FLAGS_active_replica, true);
+  EXPECT_TRUE(ValidateMultiMasterFlags());
+  EXPECT_TRUE(IsActiveReplica());
+  EXPECT_TRUE(IsMultiMaster());
+}
+
+TEST(MultiMasterFlags, ActiveReplicaRejectsIncompatibleFlags) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_active_replica, true);
+  absl::SetFlag(&FLAGS_cluster_mode, "emulated");
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+  absl::SetFlag(&FLAGS_cluster_mode, "");
+  absl::SetFlag(&FLAGS_tiered_prefix, "/tmp/x");
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+  absl::SetFlag(&FLAGS_tiered_prefix, "");
+  absl::SetFlag(&FLAGS_experimental_cascaded_partial_sync, true);
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+  absl::SetFlag(&FLAGS_experimental_cascaded_partial_sync, false);
+  EXPECT_TRUE(ValidateMultiMasterFlags());
 }
 
 // Launch::post-constructed fibers only get queued (AddReady) on the constructing thread's
