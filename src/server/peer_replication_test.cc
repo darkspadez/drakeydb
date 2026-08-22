@@ -5,6 +5,7 @@
 
 #include <absl/flags/declare.h>
 #include <absl/flags/flag.h>
+#include <absl/flags/reflection.h>
 #include <absl/functional/function_ref.h>
 
 #include <array>
@@ -14,10 +15,17 @@
 #include <thread>
 
 #include "base/gtest.h"
+#include "facade/facade_test.h"
+#include "server/multi_master.h"
+#include "server/node_identity.h"
+#include "server/test_utils.h"
 #include "util/fibers/fibers.h"
 #include "util/fibers/pool.h"
 
 ABSL_DECLARE_FLAG(bool, force_epoll);
+ABSL_DECLARE_FLAG(std::string, dir);
+ABSL_DECLARE_FLAG(bool, active_replica);
+ABSL_DECLARE_FLAG(bool, multi_master);
 
 namespace dfly {
 
@@ -186,6 +194,104 @@ TEST_F(SyncGateTest, ExternalLoadingDefersGrant) {
                                     "re-checking external_loading_";
   f.Join();
   EXPECT_TRUE(acquired.load());
+}
+
+// Fixture for PeerReplicationManager, modelled on MultiMasterFamilyTest (multi_master_test.cc):
+// its own private --dir, active/multi-master mode on by default, and a FlagSaver to restore all
+// three flags on teardown (saver_ is the fixture's only data member, so -- same reasoning as
+// MultiMasterFamilyTest -- it is constructed, capturing the pre-test values, before the
+// constructor body below runs, and destroyed, restoring them, after TearDown()).
+//
+// Every PeerReplicationManager call in the tests below -- including read-only ones like Size()
+// and Summaries() -- runs inside pp_->at(0)->Await(...): the manager's mutex is a fiber mutex
+// (util::fb2::Mutex) and the bare gtest thread is not a fiber, so it must never take it directly.
+// Each test ends with an explicit mgr.Shutdown() inside that Await so that when `mgr` (a local
+// variable) is destroyed on the bare gtest thread at the end of the test body, its destructor's
+// own Shutdown() call finds closed_ already true and peers_ already empty: it still takes mu_,
+// but uncontended and with zero Replica calls, which is safe even off a fiber.
+class PeerManagerFamilyTest : public BaseFamilyTest {
+ protected:
+  PeerManagerFamilyTest() {
+    absl::SetFlag(&FLAGS_dir, base::GetTestTempPath("peer_mgr"));
+    absl::SetFlag(&FLAGS_active_replica, true);
+    absl::SetFlag(&FLAGS_multi_master, true);
+  }
+
+  absl::FlagSaver saver_;
+};
+
+using StartMode = PeerReplicationManager::StartMode;
+constexpr char kReplid[] = "0123456789abcdef0123456789abcdef01234567";
+
+TEST_F(PeerManagerFamilyTest, BlockingAddToUnreachablePortFailsAndLeavesNoPeer) {
+  PeerRegistry reg;
+  reg.Init(GenerateNodeUuid());
+  PeerReplicationManager mgr(service_.get(), &reg);
+  pp_->at(0)->Await([&] {
+    bool already = false;
+    GenericError ec = mgr.Add({"localhost", 1}, kReplid, StartMode::kBlockingHandshake, &already);
+    EXPECT_TRUE(ec) << "port 1 must refuse the connection";
+    EXPECT_FALSE(already);
+    EXPECT_EQ(0u, mgr.Size());
+    EXPECT_TRUE(mgr.Summaries().empty());
+    mgr.Shutdown();
+  });
+}
+
+TEST_F(PeerManagerFamilyTest, BackgroundAddRemoveNoOneAndDuplicate) {
+  PeerRegistry reg;
+  reg.Init(GenerateNodeUuid());
+  PeerReplicationManager mgr(service_.get(), &reg);
+  pp_->at(0)->Await([&] {
+    bool already = false;
+    EXPECT_FALSE(mgr.Add({"localhost", 1}, kReplid, StartMode::kBackground, &already));
+    EXPECT_FALSE(already);
+    EXPECT_FALSE(mgr.Add({"localhost", 1}, kReplid, StartMode::kBackground, &already));
+    EXPECT_TRUE(already);  // duplicate endpoint is a no-op
+    EXPECT_FALSE(mgr.Add({"localhost", 2}, kReplid, StartMode::kBackground, &already));
+    EXPECT_FALSE(already);
+    EXPECT_EQ(2u, mgr.Size());
+    auto sums = mgr.Summaries();
+    ASSERT_EQ(2u, sums.size());
+    EXPECT_EQ("localhost", sums[0].host);
+    EXPECT_EQ(1, sums[0].port);
+    EXPECT_EQ(2, sums[1].port);
+    EXPECT_FALSE(sums[0].master_link_established);
+    EXPECT_TRUE(mgr.Remove({"localhost", 1}));
+    EXPECT_FALSE(mgr.Remove({"localhost", 1}));
+    EXPECT_EQ(1u, mgr.Size());
+    mgr.RemoveAll();
+    EXPECT_EQ(0u, mgr.Size());
+    mgr.Shutdown();
+  });
+}
+
+TEST_F(PeerManagerFamilyTest, SinglePeerReplaceWhenMultiMasterOff) {
+  absl::SetFlag(&FLAGS_multi_master, false);
+  PeerRegistry reg;
+  reg.Init(GenerateNodeUuid());
+  PeerReplicationManager mgr(service_.get(), &reg);
+  pp_->at(0)->Await([&] {
+    bool already = false;
+    EXPECT_FALSE(mgr.Add({"localhost", 1}, kReplid, StartMode::kBackground, &already));
+    EXPECT_FALSE(mgr.Add({"localhost", 2}, kReplid, StartMode::kBackground, &already));
+    ASSERT_EQ(1u, mgr.Size());
+    EXPECT_EQ(2, mgr.Endpoints()[0].port);
+    mgr.Shutdown();
+  });
+}
+
+TEST_F(PeerManagerFamilyTest, ShutdownRefusesFurtherAdds) {
+  PeerRegistry reg;
+  reg.Init(GenerateNodeUuid());
+  PeerReplicationManager mgr(service_.get(), &reg);
+  pp_->at(0)->Await([&] {
+    bool already = false;
+    EXPECT_FALSE(mgr.Add({"localhost", 1}, kReplid, StartMode::kBackground, &already));
+    mgr.Shutdown();
+    EXPECT_TRUE(mgr.Add({"localhost", 2}, kReplid, StartMode::kBackground, &already));
+    EXPECT_EQ(0u, mgr.Size());
+  });
 }
 
 }  // namespace dfly
