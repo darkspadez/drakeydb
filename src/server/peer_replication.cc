@@ -79,21 +79,9 @@ namespace {
 
 constexpr char kClosedMsg[] = "peer replication manager is shut down";
 
-bool SameEndpoint(const PeerReplicationManager::Endpoint& ep, const ReplicaSummary& s) {
-  return ep.host == s.host && ep.port == s.port;
-}
-
-// Hops to each peer's own proactor (via GetSummary()) to compare it against `ep`. Replica has no
-// cheaper accessor for its connection target: ProtocolClient::GetHost()/GetPort() are hidden by
-// Replica's private inheritance from ProtocolClient, and GetSummary() is the only public window
-// onto host/port. Must therefore be called with mu_ NOT held -- see the class-level comment.
-bool AnyMatches(const std::vector<std::shared_ptr<Replica>>& snapshot,
-                const PeerReplicationManager::Endpoint& ep) {
-  for (const auto& p : snapshot) {
-    if (SameEndpoint(ep, p->GetSummary()))
-      return true;
-  }
-  return false;
+bool SameEndpoint(const PeerReplicationManager::Endpoint& a,
+                  const PeerReplicationManager::Endpoint& b) {
+  return a.host == b.host && a.port == b.port;
 }
 
 }  // namespace
@@ -115,23 +103,29 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
                                          StartMode mode, bool* already_attached) {
   *already_attached = false;
 
+  // A peer's identity is the endpoint stored in its PeerLink (see the class/member comments), so
+  // this is a pure in-memory scan -- never touches any peer's Replica, never hops. Only ever
+  // called below while mu_ is held (no ABSL_EXCLUSIVE_LOCKS_REQUIRED here: unlike a member
+  // function, that annotation on a lambda's declarator isn't an established pattern elsewhere in
+  // this codebase and isn't needed for correctness).
+  auto has_endpoint = [this](const Endpoint& target) {
+    for (const auto& pl : peers_) {
+      if (SameEndpoint(pl.ep, target))
+        return true;
+    }
+    return false;
+  };
+
   // Step 1: refuse if closed; short-circuit if `ep` is already attached, so a plain duplicate
-  // REPLICAOF never pays for a network handshake below. peers_ is snapshotted under mu_, but the
-  // actual endpoint comparison (which hops to each peer's own proactor) happens after releasing
-  // the lock.
-  bool closed = false;
-  std::vector<std::shared_ptr<Replica>> snapshot;
+  // REPLICAOF never pays for a network handshake below.
   {
     util::fb2::LockGuard lk(mu_);
-    closed = closed_;
-    if (!closed)
-      snapshot = peers_;
-  }
-  if (closed)
-    return GenericError{kClosedMsg};
-  if (AnyMatches(snapshot, ep)) {
-    *already_attached = true;
-    return {};
+    if (closed_)
+      return GenericError{kClosedMsg};
+    if (has_endpoint(ep)) {
+      *already_attached = true;
+      return {};
+    }
   }
 
   // Step 2: build and start the candidate replica with mu_ released -- Start() blocks on DNS/TCP.
@@ -145,106 +139,91 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
     r->EnableReplication();
   }
 
-  // Step 3: re-check -- closes the race where a concurrent Add() attached the same endpoint while
-  // we were blocked above -- and, if still clear, register. A vanishingly narrow window remains
-  // between this check and the commit below (the check itself must run off mu_); accepted the
-  // same way upstream ReplicaOfInternal accepts its own "weak check" races (see its comment).
-  {
-    util::fb2::LockGuard lk(mu_);
-    closed = closed_;
-    if (!closed)
-      snapshot = peers_;
-  }
-  if (!closed && AnyMatches(snapshot, ep)) {
-    r->Stop();
-    *already_attached = true;
-    return {};
-  }
-
-  std::vector<std::shared_ptr<Replica>> replaced;
+  // Step 3: single critical section -- re-check (closes the race where a concurrent Add()
+  // attached the same endpoint while we were blocked above) and, if still clear, register:
+  // replace the existing peer set unless --multi_master is on. Both the check and the mutation
+  // happen under the same lock acquisition, so this is fully atomic; no residual race.
+  bool closed = false;
+  std::vector<PeerLink> replaced;
   {
     util::fb2::LockGuard lk(mu_);
     closed = closed_;
     if (!closed) {
-      if (!IsMultiMaster()) {
-        replaced = std::move(peers_);
-        peers_.clear();
+      *already_attached = has_endpoint(ep);
+      if (!*already_attached) {
+        if (!IsMultiMaster()) {
+          replaced = std::move(peers_);
+          peers_.clear();
+        }
+        peers_.push_back(PeerLink{ep, r});
       }
-      peers_.push_back(r);
     }
   }
   if (closed) {
     r->Stop();
     return GenericError{kClosedMsg};
   }
+  if (*already_attached) {
+    r->Stop();
+    return {};
+  }
 
   // Step 4: unlocked. Stop the peer(s) this one replaced, then -- same ordering as upstream
   // ReplicaOfInternal -- start the main replication fiber only after registration.
-  for (auto& p : replaced)
-    p->Stop();
+  for (auto& pl : replaced)
+    pl.replica->Stop();
   if (mode == StartMode::kBlockingHandshake)
     r->StartMainReplicationFiber(std::nullopt);
   return {};
 }
 
 bool PeerReplicationManager::Remove(const Endpoint& ep) {
-  std::vector<std::shared_ptr<Replica>> snapshot;
+  std::shared_ptr<Replica> target;
   {
     util::fb2::LockGuard lk(mu_);
-    snapshot = peers_;
-  }
-  std::shared_ptr<Replica> target;
-  for (auto& p : snapshot) {
-    if (SameEndpoint(ep, p->GetSummary())) {
-      target = p;
-      break;
+    auto it = std::find_if(peers_.begin(), peers_.end(),
+                           [&](const PeerLink& pl) { return SameEndpoint(pl.ep, ep); });
+    if (it != peers_.end()) {
+      target = std::move(it->replica);
+      peers_.erase(it);
     }
   }
   if (!target)
     return false;
-
-  bool removed = false;
-  {
-    util::fb2::LockGuard lk(mu_);
-    auto it = std::find(peers_.begin(), peers_.end(), target);
-    if (it != peers_.end()) {
-      peers_.erase(it);
-      removed = true;
-    }
-  }
-  if (removed)
-    target->Stop();
-  return removed;
+  target->Stop();
+  return true;
 }
 
 void PeerReplicationManager::RemoveAll() {
-  std::vector<std::shared_ptr<Replica>> snapshot;
+  std::vector<PeerLink> snapshot;
   {
     util::fb2::LockGuard lk(mu_);
     snapshot = std::move(peers_);
     peers_.clear();
   }
-  for (auto& p : snapshot)
-    p->Stop();
+  for (auto& pl : snapshot)
+    pl.replica->Stop();
 }
 
 void PeerReplicationManager::Shutdown() {
-  std::vector<std::shared_ptr<Replica>> snapshot;
+  std::vector<PeerLink> snapshot;
   {
     util::fb2::LockGuard lk(mu_);
     closed_ = true;
     snapshot = std::move(peers_);
     peers_.clear();
   }
-  for (auto& p : snapshot)
-    p->Stop();
+  for (auto& pl : snapshot)
+    pl.replica->Stop();
 }
 
 void PeerReplicationManager::PauseAll(bool pause) {
   std::vector<std::shared_ptr<Replica>> snapshot;
   {
     util::fb2::LockGuard lk(mu_);
-    snapshot = peers_;
+    snapshot.reserve(peers_.size());
+    for (auto& pl : peers_)
+      snapshot.push_back(pl.replica);
   }
   for (auto& p : snapshot)
     p->Pause(pause);
@@ -254,7 +233,9 @@ std::vector<ReplicaSummary> PeerReplicationManager::Summaries() const {
   std::vector<std::shared_ptr<Replica>> snapshot;
   {
     util::fb2::LockGuard lk(mu_);
-    snapshot = peers_;
+    snapshot.reserve(peers_.size());
+    for (auto& pl : peers_)
+      snapshot.push_back(pl.replica);
   }
   std::vector<ReplicaSummary> out;
   out.reserve(snapshot.size());
@@ -264,9 +245,11 @@ std::vector<ReplicaSummary> PeerReplicationManager::Summaries() const {
 }
 
 std::vector<PeerReplicationManager::Endpoint> PeerReplicationManager::Endpoints() const {
+  util::fb2::LockGuard lk(mu_);
   std::vector<Endpoint> out;
-  for (auto& s : Summaries())
-    out.push_back({s.host, s.port});
+  out.reserve(peers_.size());
+  for (auto& pl : peers_)
+    out.push_back(pl.ep);
   return out;
 }
 

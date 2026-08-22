@@ -90,6 +90,11 @@ class SyncGate {
 // single-master REPLICAOF semantics); with --multi_master, peers accumulate (fan-in). Detaching a
 // peer (Remove/RemoveAll) only stops the link -- data already merged from it is never rolled back.
 //
+// Each attached peer is identified by the exact endpoint (host string + port) it was given to
+// Add() -- not by a resolved address or anything read back from the peer -- so Add()/Remove() can
+// look a peer up as a pure, non-blocking in-memory comparison under mu_ (see PeerLink) instead of
+// having to ask the peer's own Replica.
+//
 // Thread-safe: every method may be called from any fiber. mu_ only ever guards the `peers_`
 // vector and the `closed_` flag -- both cheap to touch -- so it is never held across a network
 // operation or a call into a Replica: Replica's own methods (Stop(), Pause(), GetSummary()) hop
@@ -134,7 +139,8 @@ class PeerReplicationManager {
   // One summary per attached peer, in attach order. Each hops to that peer's own proactor.
   std::vector<ReplicaSummary> Summaries() const;
 
-  // The attached endpoints, in attach order.
+  // The attached endpoints, in attach order. A pure read of what was stored at Add() time --
+  // unlike Summaries(), this never hops to a peer's Replica.
   std::vector<Endpoint> Endpoints() const;
 
   size_t Size() const;
@@ -143,7 +149,18 @@ class PeerReplicationManager {
 
  private:
   mutable util::fb2::Mutex mu_;
-  std::vector<std::shared_ptr<Replica>> peers_ ABSL_GUARDED_BY(mu_);  // attach order
+
+  // A peer's identity is the endpoint it was given at Add() time (exact host string + port),
+  // stored alongside its Replica so Add()/Remove() can look a peer up by endpoint as a pure,
+  // non-blocking in-memory comparison under mu_. Replica itself exposes no accessor for this
+  // cheaper than GetSummary(), which hops to the peer's own proactor and so cannot be called
+  // while mu_ is held (ProtocolClient::GetHost()/GetPort() are hidden by Replica's private
+  // inheritance from ProtocolClient).
+  struct PeerLink {
+    Endpoint ep;  // as given to Add(); identifies this peer for Add()/Remove() lookups
+    std::shared_ptr<Replica> replica;
+  };
+  std::vector<PeerLink> peers_ ABSL_GUARDED_BY(mu_);  // attach order
   bool closed_ ABSL_GUARDED_BY(mu_) = false;
   SyncGate gate_;
   Service* service_;
