@@ -725,19 +725,20 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
       }
       sync_type = "full";
 
-      DVLOG(1) << "Calling Flush on all slots " << this;
-
       passed_full_sync_ = false;
       if (IsPeerMode()) {
         // drakeydb: an active node merges the peer's snapshot into its own dataset instead of
         // replacing it. RdbLoader already overrides existing keys (last-loaded-wins until P6).
         LOG(INFO) << "Peer full sync: merging without flush " << this;
-      } else if (slot_range_.has_value()) {
-        JournalExecutor{&service_}.FlushSlots(slot_range_.value());
       } else {
-        JournalExecutor{&service_}.FlushAll();
+        DVLOG(1) << "Calling Flush on all slots " << this;
+        if (slot_range_.has_value()) {
+          JournalExecutor{&service_}.FlushSlots(slot_range_.value());
+        } else {
+          JournalExecutor{&service_}.FlushAll();
+        }
+        DVLOG(1) << "Flush on all slots ended " << this;
       }
-      DVLOG(1) << "Flush on all slots ended " << this;
     } else if (num_full_flows == 0) {
       sync_type = "partial";
     } else {
