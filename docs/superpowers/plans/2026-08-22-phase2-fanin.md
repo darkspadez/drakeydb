@@ -821,8 +821,7 @@ SyncGate::Lease SyncGate::Acquire(absl::FunctionRef<bool()> cancelled) {
   while (!ready()) {
     if (cancelled()) {
       waiters_.erase(std::find(waiters_.begin(), waiters_.end(), my));
-      lk.unlock();
-      cv_.notify_all();
+      cv_.notify_all();  // under mu_: fb2::CondVarAny must be notified while holding the lock
       return Lease{};
     }
     cv_.wait_for(lk, std::chrono::milliseconds(100));
@@ -833,8 +832,9 @@ SyncGate::Lease SyncGate::Acquire(absl::FunctionRef<bool()> cancelled) {
 }
 
 void SyncGate::Release() {
-  { std::lock_guard lk(mu_); held_ = false; }
-  cv_.notify_all();
+  std::lock_guard lk(mu_);
+  held_ = false;
+  cv_.notify_all();  // under mu_ (helio CondVarAny has no internal lock)
 }
 bool SyncGate::IsHeld() const { std::lock_guard lk(mu_); return held_; }
 size_t SyncGate::NumWaiting() const { std::lock_guard lk(mu_); return waiters_.size(); }
