@@ -17,6 +17,7 @@
 #include "server/common.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/serializer.h"
+#include "server/multi_master.h"  // drakeydb: IsActiveReplica() gates Phase 3 journal framing v2.
 #include "strings/human_readable.h"
 #include "util/fibers/fibers.h"
 
@@ -131,7 +132,10 @@ void JournalSlice::AddLogRecord(const Entry& entry) {
     item.journal_item.entry_flags = entry.entry_flags;
 
     io::StringSink sink;
-    JournalWriter writer{&sink};
+    // drakeydb: Phase 3 journal framing v2 only on an active node; every other node stays
+    // byte-identical to upstream. See JournalWriter's ctor comment for why the flag is read
+    // here (the call site) instead of inside the serializer.
+    JournalWriter writer{&sink, IsActiveReplica()};
     writer.Write(entry);
 
     std::move(sink).str().swap(item.journal_item.data);

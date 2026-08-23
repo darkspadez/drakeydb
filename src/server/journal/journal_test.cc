@@ -117,6 +117,181 @@ TEST(Journal, WriteRead) {
   }
 }
 
+// drakeydb: Phase 3 T2 -- proves the legacy (extended_framing == false) wire format is
+// byte-identical to pre-T2 upstream framing. `kGoldenLegacyBytes` was captured by dumping
+// JournalWriter's raw output for this exact 7-entry fixture *before* the T2 change landed (see
+// task-2-report.md for the capture procedure); it must only ever be refreshed by re-capturing
+// against a known-good pre-Phase-3 build, never by re-deriving it from the new code.
+TEST(Journal, WriteLegacyFramingIsByteIdentical) {
+  StoredSlices slices{};
+  StoredLists lists{};
+
+  auto slice = [v = &slices](auto... ss) { return StoreSlice(v, ss...); };
+  auto list = [v = &lists](auto... ss) { return StoreList(v, ss...); };
+  using Payload = Entry::Payload;
+
+  std::vector<Entry> test_entries = {
+      {0, Op::COMMAND, 0, nullopt, Payload("MSET", slice("A", "1", "B", "2"))},
+      {0, Op::COMMAND, 0, nullopt, Payload("MSET", slice("C", "3"))},
+      {1, Op::COMMAND, 0, nullopt, Payload("DEL", list("A", "B"))},
+      {2, Op::COMMAND, 1, nullopt, Payload("LPUSH", list("l", "v1", "v2"))},
+      {3, Op::COMMAND, 0, nullopt, Payload("MSET", slice("D", "4"))},
+      {4, Op::COMMAND, 1, nullopt, Payload("DEL", list("l1"))},
+      {5, Op::COMMAND, 2, nullopt, Payload("DEL", list("E", "2"))}};
+
+  base::IoBuf buf;
+  io::BufSink sink{&buf};
+
+  JournalWriter writer{&sink, /*extended_framing=*/false};
+  for (const auto& entry : test_entries) {
+    writer.Write(entry);
+  }
+
+  // Golden buffer: bytes for the 7 entries above, one literal chunk per entry (chunk sizes are
+  // 20/14/13/21/16/14/15, summing to 113). Captured pre-change; see comment above.
+  constexpr char kGoldenLegacyBytes[] =
+      "\x06\x00\x0a\x00\x01\x05\x08\x04\x4d\x53\x45\x54\x01\x41\x01\x31\x01\x42\x01\x32"
+      "\x0a\x00\x01\x03\x06\x04\x4d\x53\x45\x54\x01\x43\x01\x33"
+      "\x0a\x01\x01\x03\x05\x03\x44\x45\x4c\x01\x41\x01\x42"
+      "\x06\x01\x0a\x02\x01\x04\x0a\x05\x4c\x50\x55\x53\x48\x01\x6c\x02\x76\x31\x02\x76\x32"
+      "\x06\x00\x0a\x03\x01\x03\x06\x04\x4d\x53\x45\x54\x01\x44\x01\x34"
+      "\x06\x01\x0a\x04\x01\x02\x05\x03\x44\x45\x4c\x02\x6c\x31"
+      "\x06\x02\x0a\x05\x01\x03\x05\x03\x44\x45\x4c\x01\x45\x01\x32";
+  constexpr size_t kGoldenLegacyLen = sizeof(kGoldenLegacyBytes) - 1;
+  ASSERT_EQ(kGoldenLegacyLen, 113u);
+  std::string_view golden(kGoldenLegacyBytes, kGoldenLegacyLen);
+
+  io::Bytes written_bytes = buf.InputBuffer();
+  std::string_view written(reinterpret_cast<const char*>(written_bytes.data()),
+                           written_bytes.size());
+  EXPECT_EQ(written, golden);
+
+  // Belt-and-suspenders: the framing-version/deprecated-field byte of the first COMMAND entry
+  // (index 4 -- SELECT opcode, SELECT dbid, COMMAND opcode, txid, *header*) must be the literal
+  // `1`, so a mis-captured golden literal that happened to already match the *new* v2 output
+  // could not silently hide a framing drift right at the header.
+  ASSERT_GE(written.size(), 5u);
+  EXPECT_EQ(static_cast<uint8_t>(written[4]), 1u);
+}
+
+// drakeydb: Phase 3 T2 -- extended_framing == true round trips origin_idx/mvcc/entry_flags.
+TEST(Journal, WriteReadExtendedFraming) {
+  StoredSlices slices{};
+  auto slice = [v = &slices](auto... ss) { return StoreSlice(v, ss...); };
+  using Payload = Entry::Payload;
+
+  Entry entry{7, Op::COMMAND, 2, nullopt, Payload("SET", slice("key", "value"))};
+  entry.origin_idx = 3;
+  entry.mvcc = 0;  // drakeydb: P4 fills mvcc; P3 always writes 0 (see task brief).
+  entry.entry_flags = kEntryFlagExpired;
+
+  base::IoBuf buf;
+  io::BufSink sink{&buf};
+  JournalWriter writer{&sink, /*extended_framing=*/true};
+  writer.Write(entry);
+
+  io::BufSource source{&buf};
+  JournalReader reader{&source, 0};
+  ParsedEntry res;
+  auto ec = reader.ReadEntry(&res);
+  ASSERT_FALSE(ec);
+
+  EXPECT_EQ(res.opcode, Op::COMMAND);
+  EXPECT_EQ(res.txid, 7u);
+  EXPECT_EQ(res.dbid, 2u);
+  EXPECT_EQ(res.origin_idx, 3u);
+  EXPECT_EQ(res.mvcc, 0u);
+  EXPECT_EQ(res.entry_flags, kEntryFlagExpired);
+  EXPECT_EQ(ExtractPayload(entry), ExtractPayload(res));
+}
+
+// drakeydb: Phase 3 T2 -- the reader is version-agnostic: one JournalReader instance, with no
+// knowledge of either writer's framing choice, parses a v2 entry followed by a v1 entry, and the
+// legacy-framed entry does not inherit the previous v2 entry's origin metadata.
+TEST(Journal, ReadEntryIsVersionAgnostic) {
+  StoredSlices slices{};
+  auto slice = [v = &slices](auto... ss) { return StoreSlice(v, ss...); };
+  using Payload = Entry::Payload;
+
+  base::IoBuf buf;
+  io::BufSink sink{&buf};
+
+  Entry extended{1, Op::COMMAND, 0, nullopt, Payload("SET", slice("b", "2"))};
+  extended.origin_idx = 5;
+  extended.entry_flags = kEntryFlagExpired;
+  JournalWriter extended_writer{&sink, /*extended_framing=*/true};
+  extended_writer.Write(extended);
+
+  Entry legacy{2, Op::COMMAND, 0, nullopt, Payload("SET", slice("a", "1"))};
+  JournalWriter legacy_writer{&sink, /*extended_framing=*/false};
+  legacy_writer.Write(legacy);
+
+  io::BufSource source{&buf};
+  JournalReader reader{&source, 0};
+
+  ParsedEntry res;
+  ASSERT_FALSE(reader.ReadEntry(&res));
+  EXPECT_EQ(res.txid, 1u);
+  EXPECT_EQ(res.origin_idx, 5u);
+  EXPECT_EQ(res.entry_flags, kEntryFlagExpired);
+  EXPECT_EQ(ExtractPayload(extended), ExtractPayload(res));
+
+  ASSERT_FALSE(reader.ReadEntry(&res));
+  EXPECT_EQ(res.txid, 2u);
+  // Must NOT leak the previous (extended-framed) entry's origin_idx/entry_flags onto this
+  // legacy-framed one -- ReadEntry resets Phase 3 fields on every call.
+  EXPECT_EQ(res.origin_idx, 0u);
+  EXPECT_EQ(res.entry_flags, 0u);
+  EXPECT_EQ(ExtractPayload(legacy), ExtractPayload(res));
+}
+
+// drakeydb: Phase 3 T2 -- an unrecognized framing-version header must error out rather than
+// silently misparsing the rest of the stream (today's upstream behavior, which this branch
+// replaces).
+TEST(Journal, ReadEntryRejectsUnknownFramingVersion) {
+  base::IoBuf buf;
+  io::BufSink sink{&buf};
+
+  // Hand-craft a COMMAND entry with an out-of-range framing-version header (3); no JournalWriter
+  // can legitimately produce this, so the raw primitives are used directly.
+  JournalWriter writer{&sink, /*extended_framing=*/false};
+  writer.Write(static_cast<uint64_t>(Op::COMMAND));  // opcode
+  writer.Write(uint64_t{0});                         // txid
+  writer.Write(uint64_t{3});                         // bogus framing-version header
+
+  io::BufSource source{&buf};
+  JournalReader reader{&source, 0};
+  ParsedEntry res;
+  EXPECT_TRUE(reader.ReadEntry(&res));
+}
+
+// drakeydb: Phase 3 T2 -- Op::ORIGIN round trips idx + uuid, and TransactionData::AddEntry (see
+// tx_executor.cc) has its own case for it so it is never mistaken for a command.
+TEST(Journal, OriginEntryRoundTrips) {
+  Entry entry{Op::ORIGIN, /*dbid=*/0, nullopt};
+  entry.origin_idx = 4;
+  const string_view kUuid = "11111111-2222-3333-4444-555555555555";
+  entry.payload.cmd = kUuid;
+
+  base::IoBuf buf;
+  io::BufSink sink{&buf};
+  JournalWriter writer{&sink, /*extended_framing=*/true};
+  writer.Write(entry);
+
+  io::BufSource source{&buf};
+  JournalReader reader{&source, 0};
+  ParsedEntry res;
+  auto ec = reader.ReadEntry(&res);
+  ASSERT_FALSE(ec);
+
+  EXPECT_EQ(res.opcode, Op::ORIGIN);
+  EXPECT_EQ(res.origin_idx, 4u);
+  EXPECT_EQ(res.mvcc, 0u);
+  EXPECT_EQ(res.entry_flags, 0u);
+  ASSERT_EQ(res.cmd.size(), 1u);
+  EXPECT_EQ(res.cmd.at(0), kUuid);
+}
+
 TEST(Journal, PendingBuf) {
   PendingBuf pbuf;
 
