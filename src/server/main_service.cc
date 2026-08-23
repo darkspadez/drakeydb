@@ -1790,6 +1790,10 @@ uint32_t Service::DispatchSquashedBatch(facade::ParsedCommand* first, unsigned c
     if (!dist_trans) {
       dist_trans.reset(new Transaction{exec_cid_});
       dist_trans->StartMultiNonAtomic(Transaction::DEFAULT);
+      // drakeydb: Phase 3 fix-round-1 -- this Transaction is built fresh (not via
+      // PrepareTransaction), so it would otherwise always journal as kSelfIdx regardless of the
+      // connection's actual apply-origin. Copy it explicitly, once, at construction.
+      dist_trans->SetReplOrigin(dfly_cntx->repl_origin_idx, dfly_cntx->repl_mvcc);
     } else {
       // Reset to original command id as it's changed during squashing
       dist_trans->MultiSwitchCmd(exec_cid_);

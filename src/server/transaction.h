@@ -21,7 +21,6 @@
 #include "server/cluster_support.h"
 #include "server/common.h"
 #include "server/journal/types.h"
-#include "server/multi_master.h"
 #include "server/tx_base.h"
 #include "util/fibers/synchronization.h"
 
@@ -664,9 +663,11 @@ class Transaction {
   uint64_t time_now_ms_{0};
 
   // drakeydb: Phase 3 replication-apply origin, stamped onto every journal entry this
-  // transaction records (see LogJournalOnShard/SetReplOrigin). kSelfIdx (0) for an ordinary
-  // client-issued transaction; a peer's PeerRegistry index when applying that peer's writes.
-  uint32_t repl_origin_idx_{PeerRegistry::kSelfIdx};
+  // transaction records (see LogJournalOnShard/SetReplOrigin). 0 == PeerRegistry::kSelfIdx
+  // (server/multi_master.h) for an ordinary client-issued transaction; a peer's PeerRegistry
+  // index when applying that peer's writes. A literal, not the named constant, to avoid pulling
+  // that header into one of the most widely-included headers in the tree.
+  uint32_t repl_origin_idx_{0};
   uint64_t repl_mvcc_{0};
 
   std::atomic_uint32_t use_count_{0};  // transaction exists only as an intrusive_ptr

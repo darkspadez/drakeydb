@@ -13,7 +13,6 @@
 #include "facade/reply_mode.h"
 #include "server/acl/acl_commands_def.h"
 #include "server/common.h"
-#include "server/multi_master.h"
 #include "server/tx_base.h"
 #include "server/version.h"
 
@@ -359,7 +358,9 @@ class ConnectionContext : public facade::ConnectionContext {
   // CommandContext::ReuseInternal, conn_context.cc), so this persists for the connection's
   // lifetime, matching a peer link's origin being constant. Copied onto the Transaction in
   // PrepareTransaction (main_service.cc), which is what actually stamps journal entries.
-  uint32_t repl_origin_idx = PeerRegistry::kSelfIdx;
+  // 0 == PeerRegistry::kSelfIdx (server/multi_master.h); a literal, not the named constant, to
+  // avoid pulling that header into one of the most widely-included headers in the tree.
+  uint32_t repl_origin_idx = 0;
   uint64_t repl_mvcc = 0;
 
   bool monitor = false;  // when a monitor command is sent over a given connection, we need to aware

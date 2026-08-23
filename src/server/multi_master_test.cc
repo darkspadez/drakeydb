@@ -20,6 +20,7 @@
 #include "absl/flags/reflection.h"
 #include "base/gtest.h"
 #include "facade/facade_test.h"
+#include "facade/reply_builder.h"
 #include "io/file_util.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/executor.h"
@@ -541,10 +542,12 @@ class OriginJournalFamilyTest : public MultiMasterFamilyTest {
 TEST_F(OriginJournalFamilyTest, ApplyOriginTagsJournalEntries) {
   OriginCapturingConsumer consumer;
   uint32_t consumer_id = 0;
-  shard_set->Await(0, [&] {
-    journal::StartInThread();
-    consumer_id = journal::RegisterConsumer(&consumer);
-  });
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
 
   // A normal client-issued command journals under kSelfIdx (self).
   EXPECT_EQ("OK", Run({"set", "client-key", "v1"}));
@@ -553,26 +556,128 @@ TEST_F(OriginJournalFamilyTest, ApplyOriginTagsJournalEntries) {
 
   // A command applied through a JournalExecutor with SetApplyOrigin(k) journals under k, as if
   // it were being replicated in from peer `k` (real peer wiring is task T6; this only proves the
-  // plumbing carries the value through). Constructed and driven on shard 0's own thread, matching
-  // how every production caller (rdb_load.cc, incoming_slot_migration.cc) always uses
-  // JournalExecutor from a fiber already running on a shard/proactor thread: Execute() calls into
-  // Service::DispatchCommand, which needs ServerState::tlocal() to resolve on the calling thread.
+  // plumbing carries the value through). Constructed and driven on a regular fiber on shard 0's
+  // own proactor thread, matching how every production caller (rdb_load.cc,
+  // incoming_slot_migration.cc) always uses JournalExecutor from a fiber already running on a
+  // shard/proactor thread: Execute() calls into Service::DispatchCommand, which needs
+  // ServerState::tlocal() to resolve on the calling thread. Deliberately NOT shard_set->Await --
+  // that runs the callback directly on shard 0's own TxQueue-processing fiber, which self-
+  // deadlocks the moment a dispatched command needs that same queue to schedule a hop (see
+  // SquashedStubInheritsParentOrigin below, which hit exactly that).
   constexpr uint32_t kPeerOrigin = 7;
   facade::DispatchResult dispatch_result = facade::DispatchResult::ERROR;
-  shard_set->Await(0, [&] {
-    JournalExecutor executor(service_.get());
-    executor.SetApplyOrigin(kPeerOrigin);
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        JournalExecutor executor(service_.get());
+        executor.SetApplyOrigin(kPeerOrigin);
 
-    journal::ParsedEntry::CmdData cmd_data;
-    std::vector<std::string> parts{"SET", "peer-key", "v2"};
-    cmd_data.Assign(parts.begin(), parts.end(), parts.size());
-    dispatch_result = executor.Execute(0, cmd_data);
-  });
+        journal::ParsedEntry::CmdData cmd_data;
+        std::vector<std::string> parts{"SET", "peer-key", "v2"};
+        cmd_data.Assign(parts.begin(), parts.end(), parts.size());
+        dispatch_result = executor.Execute(0, cmd_data);
+      })
+      .Join();
   EXPECT_EQ(facade::DispatchResult::OK, dispatch_result);
   ASSERT_FALSE(consumer.origins.empty());
   EXPECT_EQ(kPeerOrigin, consumer.origins.back());
 
-  shard_set->Await(0, [&] { journal::UnregisterConsumer(consumer_id); });
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+}
+
+// drakeydb: Phase 3 fix-round-1 -- the first acceptance test above never squashes, so it never
+// exercises Transaction's parent/shard_id/slot_id constructor (transaction.cc), which is what
+// makes a SQUASHED_STUB inherit its parent's apply-origin. This test forces exactly that with a
+// real MULTI/EXEC (two transactional writes, no eval/global command, so DeduceExecMode picks
+// LOCK_AHEAD): EXEC's default multi_exec_squash=true path builds one SQUASHED_STUB Transaction
+// per shard via multi_command_squasher.cc's atomic branch (`new Transaction{cntx_->transaction,
+// sid, nullopt}`, the same ctor the single-shard-EVAL fast path also uses), and its squashed
+// commands run through SquashedHopCb -> Service::InvokeCmd directly -- NOT through
+// PrepareTransaction again. That distinction matters: an EVAL script's redis.call *does* go
+// back through DispatchCommand/PrepareTransaction for each call (verified empirically -- an
+// EVAL-based version of this test kept passing even with the ctor's inheritance lines deleted,
+// because PrepareTransaction's hook alone was silently covering for it), so only a path that
+// bypasses PrepareTransaction -- like this one -- actually isolates the ctor's contribution.
+// Falsifying: deleting the two inheritance lines at the end of that constructor makes the stub
+// default to kSelfIdx, so both LPUSHes come back origin 0 instead of kPeerOrigin.
+TEST_F(OriginJournalFamilyTest, SquashedStubInheritsParentOrigin) {
+  OriginCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  // Instrument LPUSH to directly confirm each squashed invocation actually ran on a
+  // SQUASHED_STUB transaction (same technique as MultiTest.SquashedCallbackBadAlloc in
+  // multi_test.cc) -- without this, a broken squash setup could silently fall back to running
+  // each command on the (already origin-correct via PrepareTransaction) top-level EXEC
+  // transaction, and this test would pass vacuously. A fresh Service/CommandRegistry is created
+  // per test via ResetService(), so this handler replacement doesn't leak across tests.
+  static std::atomic<int> stub_hits{0};
+  static std::atomic<int> total_hits{0};
+  stub_hits = 0;
+  total_hits = 0;
+  // Real command handlers detect stub-ness (and trigger auto-journal, via RunCallback wrapping
+  // the shard callback below) by scheduling a hop, not by reading cmd_cntx->tx() directly -- see
+  // MultiTest.SquashedCallbackBadAlloc in multi_test.cc for the same technique.
+  auto handler = [](facade::CmdArgParser, CommandContext* cmd_cntx) {
+    auto cb = [](Transaction* t, EngineShard*) -> OpResult<long> {
+      total_hits.fetch_add(1);
+      if (t->IsSquashedStub())
+        stub_hits.fetch_add(1);
+      return 1L;
+    };
+    OpResult<long> res = cmd_cntx->tx()->ScheduleSingleHopT(cb);
+    auto* rb = cmd_cntx->rb();
+    if (res)
+      rb->SendLong(*res);
+    else
+      rb->SendError(res.status());
+  };
+  std::move(*service_->mutable_registry()->Find("LPUSH")).SetHandler(handler);
+
+  constexpr uint32_t kPeerOrigin = 9;
+  facade::DispatchResult multi_res = facade::DispatchResult::ERROR;
+  facade::DispatchResult a_res = facade::DispatchResult::ERROR;
+  facade::DispatchResult b_res = facade::DispatchResult::ERROR;
+  facade::DispatchResult exec_res = facade::DispatchResult::ERROR;
+  // Run on a regular fiber on shard 0's proactor thread (not shard_set->Await, which runs
+  // directly on shard 0's own TxQueue-processing fiber and would self-deadlock the moment EXEC
+  // needs that same queue to schedule the squashed hop). A plain fiber mirrors how a real
+  // connection dispatches.
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        JournalExecutor executor(service_.get());
+        executor.SetApplyOrigin(kPeerOrigin);
+
+        auto dispatch = [&](std::vector<std::string> parts) {
+          journal::ParsedEntry::CmdData cmd_data;
+          cmd_data.Assign(parts.begin(), parts.end(), parts.size());
+          return executor.Execute(0, cmd_data);
+        };
+        multi_res = dispatch({"MULTI"});
+        a_res = dispatch({"LPUSH", "squash-a", "v1"});
+        b_res = dispatch({"LPUSH", "squash-b", "v2"});
+        exec_res = dispatch({"EXEC"});
+      })
+      .Join();
+  EXPECT_EQ(facade::DispatchResult::OK, multi_res);
+  EXPECT_EQ(facade::DispatchResult::OK, a_res);
+  EXPECT_EQ(facade::DispatchResult::OK, b_res);
+  EXPECT_EQ(facade::DispatchResult::OK, exec_res);
+
+  // Guard against a vacuous pass: both LPUSHes must have actually executed on squashed stubs.
+  EXPECT_EQ(2, total_hits.load());
+  EXPECT_EQ(2, stub_hits.load());
+
+  ASSERT_GE(consumer.origins.size(), 2u);
+  for (uint32_t origin : consumer.origins) {
+    EXPECT_EQ(kPeerOrigin, origin);
+  }
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
 }
 
 }  // namespace dfly
