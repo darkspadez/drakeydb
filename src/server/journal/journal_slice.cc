@@ -67,6 +67,7 @@ void JournalSlice::Init() {
   ring_buffer_.set_capacity(kDefaultBacklogCapacity);
   max_age_ms_ = absl::GetFlag(FLAGS_shard_repl_backlog_time_ms);
   max_bytes_ = GetPerShardBacklogMaxBytes();
+  extended_framing_ = IsActiveReplica();
 }
 
 bool JournalSlice::IsLSNInBuffer(LSN lsn) const {
@@ -133,9 +134,10 @@ void JournalSlice::AddLogRecord(const Entry& entry) {
 
     io::StringSink sink;
     // drakeydb: Phase 3 journal framing v2 only on an active node; every other node stays
-    // byte-identical to upstream. See JournalWriter's ctor comment for why the flag is read
-    // here (the call site) instead of inside the serializer.
-    JournalWriter writer{&sink, IsActiveReplica()};
+    // byte-identical to upstream. extended_framing_ is cached once in Init() (boot-only flag)
+    // rather than re-read here on every call. See JournalWriter's ctor comment for why the flag
+    // is passed in at the call site instead of read inside the serializer.
+    JournalWriter writer{&sink, extended_framing_};
     writer.Write(entry);
 
     std::move(sink).str().swap(item.journal_item.data);

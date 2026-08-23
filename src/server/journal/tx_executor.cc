@@ -67,10 +67,9 @@ void TransactionData::AddEntry(journal::ParsedEntry&& entry) {
     case journal::Op::ORIGIN:
       // drakeydb: Phase 3 origin announcement. Record the mapping for observability only --
       // wiring it into peer admission/registry lookups (see multi_master.h's PeerRegistry) is
-      // a later task. Must never fall into the command path below: entry.cmd here holds a bare
-      // uuid, not a command.
+      // a later task. Must never fall into the command path below.
       VLOG(1) << "Journal origin mapping: idx=" << entry.origin_idx
-              << " uuid=" << (entry.cmd.empty() ? string_view{} : entry.cmd.at(0));
+              << " uuid=" << entry.origin_uuid;
       return;
     case journal::Op::EXPIRED:
     case journal::Op::COMMAND:

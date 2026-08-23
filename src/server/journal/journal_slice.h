@@ -99,6 +99,10 @@ class JournalSlice {
   uint32_t max_age_ms_ = 0;
   size_t max_bytes_ = 0;
 
+  // drakeydb: cached once in Init() (--active_replica is boot-only), like max_age_ms_/
+  // max_bytes_ above, rather than reading the flag on every AddLogRecord call.
+  bool extended_framing_ = false;
+
   size_t ring_buffer_bytes_ = 0;
 };
 

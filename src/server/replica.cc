@@ -1243,6 +1243,19 @@ void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
         // if journal is active.
         journal::RecordEntry(0, journal::Op::PING, 0, nullopt, {});
       }
+    } else if (tx_data.opcode == journal::Op::ORIGIN) {
+      // drakeydb: Phase 3 origin announcements are not yet consumed on the stable-sync path;
+      // skip explicitly, on opcode, so ExecuteTx() is never called with an ORIGIN entry's
+      // command/dbid/txid fields, which AddEntry deliberately leaves untouched (and which
+      // `tx_data` -- reused across loop iterations -- would otherwise still hold from whatever
+      // entry preceded this one). T6/T7 wire up real handling (peer-registry mapping, and
+      // whether/how to re-forward down a replication chain, cf. Op::PING's re-record below).
+      //
+      // Unlike Op::LSN (a synthetic, streamer-only checkpoint that never touches AddLogRecord),
+      // an Op::ORIGIN entry is written via the normal per-shard journal path and so occupies a
+      // real LSN slot on the master -- it must count here like Op::PING does, or partial-sync
+      // resume offset would drift the moment a peer link starts emitting these.
+      journal_rec_executed_.fetch_add(1, std::memory_order_relaxed);
     } else {
       const bool is_successful = ExecuteTx(std::move(tx_data), cntx);
       if (is_successful) {

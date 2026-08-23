@@ -19,6 +19,14 @@ using namespace std;
 
 namespace dfly {
 
+namespace {
+// drakeydb: generous bound on Op::ORIGIN's uuid length. A real node uuid is 36 chars
+// (node_identity.h's RFC-4122 v4 form); this cap exists only to stop a corrupt or hostile frame
+// from forcing a huge allocation (or an uncaught std::length_error) in the reader fiber before
+// any content validation happens.
+constexpr uint64_t kMaxOriginUuidLen = 128;
+}  // namespace
+
 JournalWriter::JournalWriter(io::Sink* sink, bool extended_framing)
     : sink_{sink}, extended_framing_{extended_framing} {
 }
@@ -93,9 +101,13 @@ void JournalWriter::Write(const journal::Entry& entry) {
       Write(entry.payload);
       break;
     case journal::Op::ORIGIN:
-      // drakeydb: origin announcement -- idx + uuid only, no txid and no Entry::Payload framing
-      // (the uuid rides in entry.payload.cmd as a plain string, but is written directly via the
-      // string primitive below, not through the args-array Write(Payload&) path).
+      // drakeydb: Op::ORIGIN is v2-only. Nothing constructs one with extended_framing_ == false
+      // today, but a future non-active emitter putting v2-only bytes into an otherwise
+      // upstream-compatible stream would silently break byte-identity, so guard it explicitly.
+      DCHECK(extended_framing_) << "Op::ORIGIN written without extended_framing";
+      // idx + uuid only, no txid and no Entry::Payload framing (the uuid rides in
+      // entry.payload.cmd as a plain string, but is written directly via the string primitive
+      // below, not through the args-array Write(Payload&) path).
       Write(entry.origin_idx);
       Write(entry.payload.cmd);
       break;
@@ -238,10 +250,11 @@ std::error_code JournalReader::ReadEntry(journal::ParsedEntry* dest) {
   dest->cmd.clear();
   // drakeydb: reset Phase 3 fields on every entry so a reused ParsedEntry never leaks a
   // previous v2 entry's origin metadata onto one that doesn't carry any (legacy-framed COMMAND,
-  // PING, LSN, or ORIGIN itself, which only ever sets origin_idx below).
+  // PING, LSN, or ORIGIN itself, which only ever sets origin_idx/origin_uuid below).
   dest->origin_idx = 0;
   dest->mvcc = 0;
   dest->entry_flags = 0;
+  dest->origin_uuid.clear();
 
   if (opcode == journal::Op::PING) {
     return {};
@@ -254,18 +267,20 @@ std::error_code JournalReader::ReadEntry(journal::ParsedEntry* dest) {
 
   if (opcode == journal::Op::ORIGIN) {
     // drakeydb: origin announcement -- idx + uuid, symmetric with the writer's payload-free
-    // branch. The uuid is stashed as the sole element of `cmd` (like a one-arg command buffer)
-    // but callers must dispatch on `opcode`, not on whether `cmd` is populated -- see
-    // TransactionData::AddEntry's dedicated case, which never treats this as a command.
+    // branch. The uuid lands in its own field (ParsedEntry::origin_uuid, see types.h for why),
+    // leaving `cmd` empty -- but callers must still dispatch on `opcode`, not on whether
+    // `cmd`/`origin_uuid` is populated. See TransactionData::AddEntry's dedicated case, and the
+    // explicit ORIGIN guards in rdb_load.cc/replica.cc, none of which treat this as a command.
     SET_OR_RETURN(ReadUInt<uint32_t>(), dest->origin_idx);
     uint64_t uuid_len = 0;
     SET_OR_RETURN(ReadUInt<uint64_t>(), uuid_len);
-    std::string uuid(uuid_len, '\0');
-    uint8_t* ptr = reinterpret_cast<uint8_t*>(uuid.data());
+    // Bound-check before allocating -- see kMaxOriginUuidLen's comment above.
+    if (uuid_len > kMaxOriginUuidLen)
+      return make_error_code(errc::illegal_byte_sequence);
+    dest->origin_uuid.resize(uuid_len);
+    uint8_t* ptr = reinterpret_cast<uint8_t*>(dest->origin_uuid.data());
     if (auto ec = ReadString({ptr, uuid_len}); ec)
       return ec;
-    dest->cmd.Reserve(1, uuid_len + 1);
-    dest->cmd.PushArg(uuid);
     return {};
   }
 

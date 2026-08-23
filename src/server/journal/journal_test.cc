@@ -5,6 +5,7 @@
 #include <array>
 #include <random>
 #include <string>
+#include <system_error>
 
 #include "base/flags.h"
 #include "base/gtest.h"
@@ -172,6 +173,23 @@ TEST(Journal, WriteLegacyFramingIsByteIdentical) {
   // could not silently hide a framing drift right at the header.
   ASSERT_GE(written.size(), 5u);
   EXPECT_EQ(static_cast<uint8_t>(written[4]), 1u);
+
+  // drakeydb: fix-round-1 finding 3 -- pin the *default* too. The assertion above only proves
+  // `extended_framing=false` is byte-identical; nothing else in this suite would notice the
+  // ctor's default argument flipping from false to true, which would silently break every
+  // upstream-facing call site that constructs JournalWriter with just a sink (cmd_serializer.cc,
+  // streamer.cc). Build a second writer with no explicit argument and check it against the same
+  // golden buffer.
+  base::IoBuf default_buf;
+  io::BufSink default_sink{&default_buf};
+  JournalWriter default_writer{&default_sink};  // no extended_framing argument -- pins the default
+  for (const auto& entry : test_entries) {
+    default_writer.Write(entry);
+  }
+  io::Bytes default_written_bytes = default_buf.InputBuffer();
+  std::string_view default_written(reinterpret_cast<const char*>(default_written_bytes.data()),
+                                   default_written_bytes.size());
+  EXPECT_EQ(default_written, golden);
 }
 
 // drakeydb: Phase 3 T2 -- extended_framing == true round trips origin_idx/mvcc/entry_flags.
@@ -248,6 +266,15 @@ TEST(Journal, ReadEntryIsVersionAgnostic) {
 // drakeydb: Phase 3 T2 -- an unrecognized framing-version header must error out rather than
 // silently misparsing the rest of the stream (today's upstream behavior, which this branch
 // replaces).
+//
+// drakeydb: fix-round-1 finding 1 -- a well-formed (empty) legacy payload follows the bogus
+// header, and the assertion checks the *specific* error code. Without the payload, the buffer
+// would end right after the header, so even a version of ReadEntry with the rejection branch
+// deleted would fall through to ReadCommand, hit EOF, and return errc::io_error -- still
+// truthy, so a bare EXPECT_TRUE(ec) could not tell "rejected the header" apart from "ran out of
+// bytes". With the payload present, that same buggy code path would instead succeed (num_strings
+// == 0 needs no further bytes), so the specific-error-code assertion below is what actually
+// pins the rejection branch's presence and behavior.
 TEST(Journal, ReadEntryRejectsUnknownFramingVersion) {
   base::IoBuf buf;
   io::BufSink sink{&buf};
@@ -258,15 +285,22 @@ TEST(Journal, ReadEntryRejectsUnknownFramingVersion) {
   writer.Write(static_cast<uint64_t>(Op::COMMAND));  // opcode
   writer.Write(uint64_t{0});                         // txid
   writer.Write(uint64_t{3});                         // bogus framing-version header
+  writer.Write(uint64_t{0});                         // well-formed payload: num_strings = 0
+  writer.Write(uint64_t{0});                         // well-formed payload: cmd_size = 0
 
   io::BufSource source{&buf};
   JournalReader reader{&source, 0};
   ParsedEntry res;
-  EXPECT_TRUE(reader.ReadEntry(&res));
+  std::error_code ec = reader.ReadEntry(&res);
+  EXPECT_EQ(ec, make_error_code(errc::illegal_byte_sequence));
 }
 
 // drakeydb: Phase 3 T2 -- Op::ORIGIN round trips idx + uuid, and TransactionData::AddEntry (see
 // tx_executor.cc) has its own case for it so it is never mistaken for a command.
+//
+// drakeydb: fix-round-1 finding 2 -- the uuid now lands in its own field (origin_uuid), and
+// `cmd` stays empty for an ORIGIN entry (see types.h), so a dispatcher keying off cmd.empty()
+// (rdb_load.cc, replica.cc) can no longer mistake the uuid for a command name.
 TEST(Journal, OriginEntryRoundTrips) {
   Entry entry{Op::ORIGIN, /*dbid=*/0, nullopt};
   entry.origin_idx = 4;
@@ -288,8 +322,30 @@ TEST(Journal, OriginEntryRoundTrips) {
   EXPECT_EQ(res.origin_idx, 4u);
   EXPECT_EQ(res.mvcc, 0u);
   EXPECT_EQ(res.entry_flags, 0u);
-  ASSERT_EQ(res.cmd.size(), 1u);
-  EXPECT_EQ(res.cmd.at(0), kUuid);
+  EXPECT_TRUE(res.cmd.empty());
+  EXPECT_EQ(res.origin_uuid, kUuid);
+}
+
+// drakeydb: fix-round-1 finding 4 -- Op::ORIGIN's uuid length is bounds-checked before any
+// allocation, so a corrupt or hostile frame cannot force a huge allocation (or an uncaught
+// std::length_error) in the reader fiber. No bytes follow the absurd length -- if the bound
+// check were missing or came after the allocation/read attempt, this would instead hit EOF and
+// return errc::io_error, so the specific-error-code assertion is what distinguishes "rejected
+// up front" from "ran out of bytes trying to honor it".
+TEST(Journal, OriginEntryRejectsOversizedUuidLength) {
+  base::IoBuf buf;
+  io::BufSink sink{&buf};
+
+  JournalWriter writer{&sink, /*extended_framing=*/true};
+  writer.Write(static_cast<uint64_t>(Op::ORIGIN));  // opcode
+  writer.Write(uint64_t{0});                        // origin_idx
+  writer.Write(uint64_t{1'000'000});                // absurd uuid length; no bytes follow
+
+  io::BufSource source{&buf};
+  JournalReader reader{&source, 0};
+  ParsedEntry res;
+  std::error_code ec = reader.ReadEntry(&res);
+  EXPECT_EQ(ec, make_error_code(errc::illegal_byte_sequence));
 }
 
 TEST(Journal, PendingBuf) {

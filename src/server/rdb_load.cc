@@ -2967,6 +2967,14 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
 
     done++;
 
+    // drakeydb: Phase 3 origin announcements are not yet consumed by RDB-embedded journal
+    // replay; skip explicitly, on opcode rather than on entry.cmd's shape, so a uuid can never
+    // be dispatched to journal_executor_->Execute() as a command name. T6/T7 wire up real
+    // handling. Latent today (nothing emits Op::ORIGIN yet) but this guard is what closes it.
+    if (entry.opcode == journal::Op::ORIGIN) {
+      continue;
+    }
+
     if (entry.cmd.empty()) {
       if (entry.opcode == journal::Op::PING) {
         continue;

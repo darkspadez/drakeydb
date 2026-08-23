@@ -91,6 +91,14 @@ struct ParsedEntry : public EntryBase {
   using CmdData = cmn::BackedArguments;
   CmdData cmd;
 
+  // drakeydb: Phase 3 uuid carrier for Op::ORIGIN entries only (populated by
+  // JournalReader::ReadEntry, see serializer.cc). Deliberately NOT folded into `cmd`: a
+  // dispatcher that keys off whether `cmd` is populated (rdb_load.cc's HandleJournalBlob,
+  // replica.cc's StableSyncDflyReadFb) must not be able to mistake an origin uuid for a command
+  // name. Callers must still switch on `opcode` regardless -- this field is only meaningful when
+  // opcode == Op::ORIGIN.
+  std::string origin_uuid;
+
   ParsedEntry(const ParsedEntry&) = delete;
   ParsedEntry() = default;
 
