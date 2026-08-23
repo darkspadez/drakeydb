@@ -68,6 +68,10 @@ std::string_view GetEntry(LSN lsn) {
   return journal_slice.GetEntry(lsn);
 }
 
+const JournalItem& GetEntryMeta(LSN lsn) {
+  return journal_slice.GetEntryMeta(lsn);
+}
+
 uint32_t RegisterConsumer(JournalConsumerInterface* consumer) {
   return journal_slice.RegisterOnChange(consumer);
 }

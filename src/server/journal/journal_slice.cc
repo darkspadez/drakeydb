@@ -90,6 +90,15 @@ std::string_view JournalSlice::GetEntry(LSN lsn) const {
   return ring_buffer_[lsn - start].data;
 }
 
+// drakeydb: see the declaration in journal_slice.h for why this exists alongside GetEntry().
+const JournalItem& JournalSlice::GetEntryMeta(LSN lsn) const {
+  DCHECK(ring_buffer_.capacity() > 0 && IsLSNInBuffer(lsn));
+
+  auto start = ring_buffer_.front().lsn;
+  DCHECK(ring_buffer_[lsn - start].lsn == lsn);
+  return ring_buffer_[lsn - start];
+}
+
 void JournalSlice::SetFlushMode(bool allow_flush) {
   DCHECK(allow_flush != enable_journal_flush_);
   enable_journal_flush_ = allow_flush;
@@ -116,6 +125,10 @@ void JournalSlice::AddLogRecord(const Entry& entry) {
     // only used by RestoreStreamer
     item.cmd = entry.payload.cmd;
     item.slot = entry.slot;
+
+    // drakeydb: Phase 3 origin metadata, mirrored onto JournalItem -- see types.h.
+    item.journal_item.origin_idx = entry.origin_idx;
+    item.journal_item.entry_flags = entry.entry_flags;
 
     io::StringSink sink;
     JournalWriter writer{&sink};

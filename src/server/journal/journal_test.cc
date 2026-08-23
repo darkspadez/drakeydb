@@ -213,6 +213,32 @@ void AddSetRecord(JournalSlice* slice, string_view value) {
       Entry{0, Op::COMMAND, 0, nullopt, Entry::Payload{"SET", ArgSlice{args.data(), args.size()}}});
 }
 
+// drakeydb: Phase 3 T1 -- origin_idx/entry_flags must survive AddLogRecord -> ring buffer ->
+// GetEntryMeta without being reparsed from `data`.
+TEST(Journal, OriginMetadataSurvivesRoundTrip) {
+  JournalSlice slice;
+  slice.Init();
+
+  array<string_view, 2> args{"key", "value"};
+  Entry entry{0, Op::COMMAND, 0, nullopt,
+              Entry::Payload{"SET", ArgSlice{args.data(), args.size()}}};
+  entry.origin_idx = 7;
+  entry.entry_flags = kEntryFlagExpired;
+  slice.AddLogRecord(entry);
+
+  const JournalItem& meta = slice.GetEntryMeta(1);
+  EXPECT_EQ(meta.lsn, 1u);
+  EXPECT_EQ(meta.origin_idx, 7u);
+  EXPECT_EQ(meta.entry_flags, kEntryFlagExpired);
+
+  // Default (self-originated) entries stay at the zero-value defaults -- non-active behavior is
+  // unaffected.
+  AddSetRecord(&slice, "x");
+  const JournalItem& default_meta = slice.GetEntryMeta(2);
+  EXPECT_EQ(default_meta.origin_idx, 0u);
+  EXPECT_EQ(default_meta.entry_flags, 0u);
+}
+
 TEST(Journal, BacklogHonorsByteLimitAndReplacesOversizedRecord) {
   absl::FlagSaver flag_saver;
   absl::SetFlag(&FLAGS_shard_repl_backlog_time_ms, 0u);

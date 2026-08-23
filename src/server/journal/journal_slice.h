@@ -50,6 +50,11 @@ class JournalSlice {
   /// from the buffer.
   bool IsLSNInBuffer(LSN lsn) const;
   std::string_view GetEntry(LSN lsn) const;
+  // drakeydb: Phase 3 metadata accessor. Returns the full buffered JournalItem -- including
+  // origin_idx/entry_flags -- so a later peer-echo filter can inspect them without reparsing
+  // `data`. Added alongside GetEntry() (rather than widening it) so GetEntry's existing caller
+  // in streamer.cc, outside this task's scope, stays untouched.
+  const JournalItem& GetEntryMeta(LSN lsn) const;
   // SetFlushMode with allow_flush=false is used to disable preemptions during
   // subsequent calls to AddLogRecord.
   // SetFlushMode with allow_flush=true flushes all log records aggregated

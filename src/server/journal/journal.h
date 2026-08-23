@@ -32,6 +32,9 @@ inline bool HasRegisteredCallbacks() {
 bool IsLSNInBuffer(LSN lsn);
 
 std::string_view GetEntry(LSN lsn);
+// drakeydb: mirrors JournalSlice::GetEntryMeta -- see journal_slice.h for why this exists
+// alongside GetEntry().
+const JournalItem& GetEntryMeta(LSN lsn);
 
 LSN GetLsn();
 uint32_t RegisterConsumer(JournalConsumerInterface* consumer);

@@ -15,7 +15,18 @@
 namespace dfly {
 namespace journal {
 
-enum class Op : uint8_t { SELECT = 6, EXPIRED = 9 /* sunset*/, COMMAND = 10, PING = 13, LSN = 15 };
+enum class Op : uint8_t {
+  SELECT = 6,
+  EXPIRED = 9 /* sunset*/,
+  COMMAND = 10,
+  PING = 13,
+  LSN = 15,
+  ORIGIN = 16
+};
+
+// drakeydb: entry_flags bit for an expiry-triggered deletion. Op::EXPIRED (9, above) is sunset
+// on the write side; this bit is its Phase 3 replacement carrier.
+inline constexpr uint8_t kEntryFlagExpired = 1 << 0;
 
 struct EntryBase {
   TxId txid;
@@ -23,6 +34,12 @@ struct EntryBase {
   DbIndex dbid;
   std::optional<SlotId> slot;
   LSN lsn{0};
+
+  // drakeydb: Phase 3 origin metadata. All defaulted so non-active nodes stay byte-identical to
+  // upstream, and placed after `lsn` so the aggregate-init constructors below keep compiling.
+  uint32_t origin_idx{0};  // PeerRegistry index of this entry's author; kSelfIdx (0) == self.
+  uint64_t mvcc{0};        // Reserved for future conflict resolution; not yet threaded further.
+  uint8_t entry_flags{0};  // Bitmask; bit0 == kEntryFlagExpired.
 };
 
 // This struct represents a single journal entry.
@@ -84,6 +101,13 @@ struct JournalItem {
   LSN lsn;
   uint64_t time_ms = 0;
   std::string data;
+
+  // drakeydb: Phase 3 origin metadata, mirrored from EntryBase by JournalSlice::AddLogRecord.
+  // Lives here (not only on JournalChangeItem) because the ring buffer stores JournalItem; this
+  // is what lets a later peer-echo filter read origin/flags without reparsing `data` -- see
+  // JournalSlice::GetEntryMeta().
+  uint32_t origin_idx{0};
+  uint8_t entry_flags{0};
 };
 
 struct JournalChangeItem {
