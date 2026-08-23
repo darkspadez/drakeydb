@@ -37,6 +37,16 @@ class JournalExecutor {
     return &conn_context_;
   }
 
+  // drakeydb: Phase 3. Marks every command this executor replays as authored by peer `idx`
+  // (a PeerRegistry index), so journaling triggered on this node tags entries with the peer's
+  // origin instead of kSelfIdx -- see ConnectionContext::repl_origin_idx and PrepareTransaction
+  // (main_service.cc). A peer link's origin is constant for the link's lifetime, so call this
+  // once when the flow is set up (T6), not per entry. Leave unset (kSelfIdx) for non-peer flows,
+  // e.g. rdb_load.cc's snapshot/journal-blob loader and incoming_slot_migration.cc.
+  void SetApplyOrigin(uint32_t idx) {
+    conn_context_.repl_origin_idx = idx;
+  }
+
  private:
   facade::DispatchResult Execute(CommandContext* cmd_cntx);
 

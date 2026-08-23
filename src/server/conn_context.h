@@ -13,6 +13,7 @@
 #include "facade/reply_mode.h"
 #include "server/acl/acl_commands_def.h"
 #include "server/common.h"
+#include "server/multi_master.h"
 #include "server/tx_base.h"
 #include "server/version.h"
 
@@ -351,6 +352,15 @@ class ConnectionContext : public facade::ConnectionContext {
   // This flag is true only on replica side, where we need to setup a special ConnectionContext
   // instance that helps applying commands coming from master.
   bool is_replicating = false;
+
+  // drakeydb: Phase 3 apply-origin metadata. Set once via JournalExecutor::SetApplyOrigin() at
+  // flow setup for a peer replication link (see journal/executor.h); stays at the kSelfIdx
+  // default for an ordinary client connection. Never reset per command (see
+  // CommandContext::ReuseInternal, conn_context.cc), so this persists for the connection's
+  // lifetime, matching a peer link's origin being constant. Copied onto the Transaction in
+  // PrepareTransaction (main_service.cc), which is what actually stamps journal entries.
+  uint32_t repl_origin_idx = PeerRegistry::kSelfIdx;
+  uint64_t repl_mvcc = 0;
 
   bool monitor = false;  // when a monitor command is sent over a given connection, we need to aware
                          // of it as a state for the connection

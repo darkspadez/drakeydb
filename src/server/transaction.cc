@@ -166,6 +166,14 @@ Transaction::Transaction(const Transaction* parent, ShardId shard_id, std::optio
   if (slot_id.has_value()) {
     unique_slot_checker_.Add(*slot_id);
   }
+
+  // drakeydb: Phase 3. A SQUASHED_STUB is what actually journals: LogAutoJournalOnShard only
+  // skips the SQUASHER parent, not its stubs. Inherit the parent's apply-origin here (this ctor
+  // is the single construction point for every squashed-multi stub, incl. the general
+  // multi_command_squasher.cc path) so a squashed MULTI/EXEC applied from a peer journals under
+  // that peer's origin instead of echoing back to it as self-originated.
+  repl_origin_idx_ = parent->repl_origin_idx_;
+  repl_mvcc_ = parent->repl_mvcc_;
 }
 
 Transaction::~Transaction() {
@@ -1658,8 +1666,11 @@ void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult resul
 }
 
 void Transaction::LogJournalOnShard(journal::Entry::Payload&& payload) const {
+  // drakeydb: Phase 3 -- stamp this transaction's replication-apply origin (kSelfIdx/0 for an
+  // ordinary client transaction) onto the recorded entry.
   journal::RecordEntry(txid_, journal::Op::COMMAND, db_index_,
-                       unique_slot_checker_.GetUniqueSlotId(), std::move(payload));
+                       unique_slot_checker_.GetUniqueSlotId(), std::move(payload), repl_origin_idx_,
+                       repl_mvcc_);
 }
 
 void Transaction::ReviveAutoJournal() {

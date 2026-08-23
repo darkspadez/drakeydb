@@ -21,6 +21,7 @@
 #include "server/cluster_support.h"
 #include "server/common.h"
 #include "server/journal/types.h"
+#include "server/multi_master.h"
 #include "server/tx_base.h"
 #include "util/fibers/synchronization.h"
 
@@ -367,6 +368,16 @@ class Transaction {
   // Write a journal entry to a shard journal with the given payload.
   void LogJournalOnShard(journal::Entry::Payload&& payload) const;
 
+  // drakeydb: Phase 3. Sets the replication-apply origin metadata that LogJournalOnShard stamps
+  // onto every journal entry this transaction records. Copied from the ConnectionContext once
+  // per dispatch in PrepareTransaction (main_service.cc); squashed-multi stub transactions
+  // instead inherit it directly from their parent (see the parent/shard_id/slot_id constructor)
+  // since they never go through PrepareTransaction.
+  void SetReplOrigin(uint32_t origin_idx, uint64_t mvcc) {
+    repl_origin_idx_ = origin_idx;
+    repl_mvcc_ = mvcc;
+  }
+
   // Re-enable auto journal for commands marked as NO_AUTOJOURNAL. Call during setup.
   void ReviveAutoJournal();
 
@@ -651,6 +662,12 @@ class Transaction {
   Namespace* namespace_{nullptr};
   DbIndex db_index_{0};
   uint64_t time_now_ms_{0};
+
+  // drakeydb: Phase 3 replication-apply origin, stamped onto every journal entry this
+  // transaction records (see LogJournalOnShard/SetReplOrigin). kSelfIdx (0) for an ordinary
+  // client-issued transaction; a peer's PeerRegistry index when applying that peer's writes.
+  uint32_t repl_origin_idx_{PeerRegistry::kSelfIdx};
+  uint64_t repl_mvcc_{0};
 
   std::atomic_uint32_t use_count_{0};  // transaction exists only as an intrusive_ptr
 

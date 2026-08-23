@@ -22,6 +22,9 @@
 #include "facade/facade_test.h"
 #include "io/file_util.h"
 #include "server/engine_shard_set.h"
+#include "server/journal/executor.h"
+#include "server/journal/journal.h"
+#include "server/journal/types.h"
 #include "server/node_identity.h"
 #include "server/test_utils.h"
 #include "util/fibers/fibers.h"
@@ -34,6 +37,7 @@ ABSL_DECLARE_FLAG(bool, multi_master);
 ABSL_DECLARE_FLAG(std::string, cluster_mode);
 ABSL_DECLARE_FLAG(std::string, tiered_prefix);
 ABSL_DECLARE_FLAG(bool, experimental_cascaded_partial_sync);
+ABSL_DECLARE_FLAG(uint32_t, num_shards);
 
 namespace dfly {
 
@@ -498,6 +502,77 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
   EXPECT_EQ(std::string::npos, info.find("active_replica:"));
   EXPECT_EQ(std::string::npos, info.find("connected_masters:"));
+}
+
+namespace {
+// drakeydb: Phase 3 T3 -- captures the origin_idx of every COMMAND journal entry seen on the
+// shard this consumer is registered on, via JournalSlice::AddLogRecord -> CallOnChange (see
+// journal_slice.cc). That's populated straight from Entry::origin_idx regardless of wire
+// framing, so this works without enabling active-replica/extended framing.
+class OriginCapturingConsumer : public journal::JournalConsumerInterface {
+ public:
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    origins.push_back(item.journal_item.origin_idx);
+  }
+  void ThrottleIfNeeded() override {
+  }
+
+  std::vector<uint32_t> origins;
+};
+}  // namespace
+
+// Pins the test to a single shard on a single thread so a journal consumer registered on shard 0
+// is guaranteed to observe every command this fixture runs, regardless of key hashing. saver_
+// (inherited from MultiMasterFamilyTest) restores FLAGS_num_shards on teardown.
+class OriginJournalFamilyTest : public MultiMasterFamilyTest {
+ protected:
+  OriginJournalFamilyTest() {
+    num_threads_ = 1;
+    absl::SetFlag(&FLAGS_num_shards, 1);
+  }
+};
+
+// drakeydb: Phase 3 T3 acceptance case. Proves the apply-origin plumbing end to end: a command
+// dispatched through a JournalExecutor with SetApplyOrigin(k) must produce a journal entry
+// carrying origin_idx == k, while a normal client-issued command must still produce kSelfIdx.
+// Falsifying: reverting the PrepareTransaction hook, Transaction::SetReplOrigin/
+// LogJournalOnShard/RecordEntry threading, or JournalExecutor::SetApplyOrigin makes every
+// entry -- including the peer-applied one -- come back as kSelfIdx, failing the second check.
+TEST_F(OriginJournalFamilyTest, ApplyOriginTagsJournalEntries) {
+  OriginCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  shard_set->Await(0, [&] {
+    journal::StartInThread();
+    consumer_id = journal::RegisterConsumer(&consumer);
+  });
+
+  // A normal client-issued command journals under kSelfIdx (self).
+  EXPECT_EQ("OK", Run({"set", "client-key", "v1"}));
+  ASSERT_FALSE(consumer.origins.empty());
+  EXPECT_EQ(PeerRegistry::kSelfIdx, consumer.origins.back());
+
+  // A command applied through a JournalExecutor with SetApplyOrigin(k) journals under k, as if
+  // it were being replicated in from peer `k` (real peer wiring is task T6; this only proves the
+  // plumbing carries the value through). Constructed and driven on shard 0's own thread, matching
+  // how every production caller (rdb_load.cc, incoming_slot_migration.cc) always uses
+  // JournalExecutor from a fiber already running on a shard/proactor thread: Execute() calls into
+  // Service::DispatchCommand, which needs ServerState::tlocal() to resolve on the calling thread.
+  constexpr uint32_t kPeerOrigin = 7;
+  facade::DispatchResult dispatch_result = facade::DispatchResult::ERROR;
+  shard_set->Await(0, [&] {
+    JournalExecutor executor(service_.get());
+    executor.SetApplyOrigin(kPeerOrigin);
+
+    journal::ParsedEntry::CmdData cmd_data;
+    std::vector<std::string> parts{"SET", "peer-key", "v2"};
+    cmd_data.Assign(parts.begin(), parts.end(), parts.size());
+    dispatch_result = executor.Execute(0, cmd_data);
+  });
+  EXPECT_EQ(facade::DispatchResult::OK, dispatch_result);
+  ASSERT_FALSE(consumer.origins.empty());
+  EXPECT_EQ(kPeerOrigin, consumer.origins.back());
+
+  shard_set->Await(0, [&] { journal::UnregisterConsumer(consumer_id); });
 }
 
 }  // namespace dfly

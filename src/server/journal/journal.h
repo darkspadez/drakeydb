@@ -40,8 +40,13 @@ LSN GetLsn();
 uint32_t RegisterConsumer(JournalConsumerInterface* consumer);
 void UnregisterConsumer(uint32_t id);
 
+// drakeydb: Phase 3 -- origin_idx/mvcc default to self (PeerRegistry::kSelfIdx == 0, and 0
+// respectively), so every pre-existing call site (PING/DEL/cluster control entries) is
+// unaffected. Transaction::LogJournalOnShard is the only caller that passes non-default values,
+// forwarding a transaction's replication-apply origin so entries applied from a peer are tagged
+// with that peer's origin instead of self.
 void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
-                 Entry::Payload payload);
+                 Entry::Payload payload, uint32_t origin_idx = 0, uint64_t mvcc = 0);
 
 size_t LsnBufferSize();
 size_t LsnBufferBytes();
