@@ -47,11 +47,12 @@ taking either side blindly:
 | `src/server/journal/serializer.cc` | journal v2 framing (origin/mvcc extension) |
 | `src/server/journal/types.h`, `journal_slice.cc`, `streamer.*`, `executor.*` | origin tagging + peer filtering |
 | `src/server/replica.cc` | peer-mode (writable, no-flush) sync path; peer-mode hooks: no shard flip, no flush, sync gate, uuid guard |
+| `src/server/main_service.h`, `main_service.cc` | exclusive LOADING reservation for peer full sync |
 | `src/server/dflycmd.cc` | peer version/UUID gating; `DFLY TAKEOVER` refusal in active mode |
 | `src/server/server_family.cc` | REPLICAOF delegation + INFO additions (kept to additive lines); `--replicaof` list parser + active-mode REPLICAOF/INFO/REPLCONF/REPLTAKEOVER hooks, peers_ member |
 | `src/server/transaction.cc`, `tx_base.cc` | journal origin context |
 | `src/server/version.h` | upstream protocol versions — **always take upstream**, fork uses 65 |
-| `src/server/dfly_main.cc` | banner/usage strings, `version_check` default; `ValidateMultiMasterFlags()` call |
+| `src/server/dfly_main.cc` | banner/usage strings, `version_check` default; `ValidateReplicaOfFlags()` + `ValidateMultiMasterFlags()` calls |
 | `src/server/CMakeLists.txt` | `OUTPUT_NAME drakeydb` + symlink lines; `peer_replication.cc` + `peer_replication_test` |
 | `tests/dragonfly/instance.py` | per-instance `--node_uuid` default in `DflyInstanceFactory.create()` |
 

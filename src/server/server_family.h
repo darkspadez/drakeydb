@@ -61,6 +61,10 @@ bool ValidateSnapshotFilenameFlags();
 // on an invalid value.
 bool ValidateNotifyKeyspaceEventsFlag();
 
+// Validates that a multi-target --replicaof list is only used in active multi-master mode.
+// Returns false and logs on an invalid configuration.
+bool ValidateReplicaOfFlags();
+
 class CommandContext;
 class CommandRegistry;
 class DflyCmd;

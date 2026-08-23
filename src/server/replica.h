@@ -116,6 +116,7 @@ class Replica : ProtocolClient {
   // if a stable sync is interrupted to join the cancelled stable sync fibers.
   void JoinDflyFlows();
   void SetShardStates(bool replica);  // Call SetReplica(replica) on all shards.
+  bool EnterLoadingState();
 
   // Send DFLY ${kind} to the master instance.
   std::error_code SendNextPhaseRequest(std::string_view kind);

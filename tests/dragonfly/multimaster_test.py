@@ -1,4 +1,4 @@
-"""Phase 1 multi-master identity tests: node uuid persistence + REPLCONF UUID exchange."""
+"""Multi-master identity and active-replica fan-in tests."""
 
 import asyncio
 import re
@@ -212,6 +212,37 @@ async def test_replicaof_real_redis_tolerates_missing_uuid(
         await r.aclose()
 
 
+async def test_active_replica_merges_redis_full_sync_and_stays_writable(
+    df_factory: DflyInstanceFactory, redis_server, tmp_path
+):
+    node = df_factory.create(
+        proactor_threads=2,
+        dir=str(tmp_path / "active-redis"),
+        active_replica="true",
+    )
+    node.start()
+    c = node.client()
+    import redis.asyncio as aioredis
+
+    r = aioredis.Redis(port=redis_server.port, decode_responses=True)
+    try:
+        await c.mset({"local-only": "local", "conflict": "local"})
+        await r.mset({"redis-only": "redis", "conflict": "redis"})
+        assert await c.execute_command(f"REPLICAOF localhost {redis_server.port}") == "OK"
+        await wait_available_async(c)
+
+        @assert_eventually(times=300)
+        async def merged():
+            assert await c.get("local-only") == "local"
+            assert await c.get("redis-only") == "redis"
+            assert await c.get("conflict") == "redis"
+
+        await merged()
+        assert await c.set("still-writable", "yes")
+    finally:
+        await r.aclose()
+
+
 async def test_harness_gives_each_instance_a_distinct_identity(df_factory: DflyInstanceFactory):
     # No dir= on purpose: these share the session cwd, so without the harness default they would
     # all load the same drakeydb.uuid file.
@@ -240,16 +271,41 @@ async def wait_for_peers(c, n, timeout=90):
             await asyncio.sleep(0.2)
 
 
-async def test_replicaof_flag_list_requires_active_replica(df_factory: DflyInstanceFactory):
-    node = df_factory.create(proactor_threads=1, replicaof="localhost:1,localhost:2")
-    await assert_start_fails(node)
-
-
-async def test_replicaof_flag_list_requires_multi_master(df_factory: DflyInstanceFactory):
+async def test_replicaof_flag_list_requires_active_replica(
+    df_factory: DflyInstanceFactory, tmp_path
+):
+    pidfile = tmp_path / "requires-active.pid"
     node = df_factory.create(
-        proactor_threads=1, active_replica="true", replicaof="localhost:1,localhost:2"
+        proactor_threads=1,
+        pidfile=str(pidfile),
+        replicaof="localhost:1,localhost:2",
     )
-    await assert_start_fails(node)
+    with pytest.raises(DflyStartException):
+        node.start()
+    assert not pidfile.exists()
+
+
+async def test_replicaof_flag_list_requires_multi_master(df_factory: DflyInstanceFactory, tmp_path):
+    pidfile = tmp_path / "requires-multi-master.pid"
+    node = df_factory.create(
+        proactor_threads=1,
+        pidfile=str(pidfile),
+        active_replica="true",
+        replicaof="localhost:1,localhost:2",
+    )
+    with pytest.raises(DflyStartException):
+        node.start()
+    assert not pidfile.exists()
+
+
+@pytest.mark.parametrize(
+    "replicaof",
+    [",localhost:1", "localhost:1,", "localhost:1,,localhost:2"],
+)
+async def test_replicaof_flag_list_rejects_empty_targets(
+    df_factory: DflyInstanceFactory, replicaof: str
+):
+    await assert_start_fails(df_factory.create(proactor_threads=1, replicaof=replicaof))
 
 
 async def test_replicaof_flag_list_attaches_all_peers(df_factory: DflyInstanceFactory, port_picker):

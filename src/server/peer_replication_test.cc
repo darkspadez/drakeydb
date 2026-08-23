@@ -12,7 +12,6 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
-#include <thread>
 
 #include "base/gtest.h"
 #include "facade/facade_test.h"
@@ -60,21 +59,8 @@ namespace {
 constexpr int kPollIters = 1000;
 constexpr auto kPollInterval = std::chrono::milliseconds(5);  // kPollIters * kPollInterval ~= 5s.
 
-// Polls `pred` inside proactor `i` until true (or 5s). Returns the final value. For use from the
-// bare gtest thread to check gate state, which must never be touched directly from that thread.
-bool AwaitUntil(util::ProactorPool* pp, unsigned i, absl::FunctionRef<bool()> pred) {
-  for (int n = 0; n < kPollIters; ++n) {
-    if (pp->at(i)->Await([&] { return pred(); }))
-      return true;
-    std::this_thread::sleep_for(kPollInterval);
-  }
-  return false;
-}
-
-// Polls `pred` until true (or 5s). Returns the final value. For use *inside* a fiber only (calls
-// `pred` directly and sleeps via ThisFiber): bounds what would otherwise be an unbounded spin, so
-// a regression that keeps `pred` false forever fails the enclosing ASSERT/EXPECT instead of
-// hanging the fiber -- and, transitively, whatever later joins it -- forever.
+// Polls `pred` until true (or 5s). Returns the final value. Must run inside a fiber so each wait
+// yields to the proactor scheduler.
 bool WaitFor(absl::FunctionRef<bool()> pred) {
   for (int n = 0; n < kPollIters; ++n) {
     if (pred())
@@ -84,18 +70,10 @@ bool WaitFor(absl::FunctionRef<bool()> pred) {
   return false;
 }
 
-// Polls a plain atomic flag (not gate state, so safe to read from the bare gtest thread the same
-// way this file already reads/writes `cancel`/`release`/`got` directly) until true, or 5s. Used
-// before Fiber::Join() on a fiber whose body calls SyncGate::Acquire(): Join() blocks
-// unconditionally, so if Acquire() itself never returns (the regression these tests exist to
-// catch), a bare Join() would hang the whole test binary with no diagnostic.
-bool WaitForFlag(const std::atomic_bool& flag) {
-  for (int n = 0; n < kPollIters; ++n) {
-    if (flag.load())
-      return true;
-    std::this_thread::sleep_for(kPollInterval);
-  }
-  return false;
+// Runs the bounded polling loop on proactor `i`. This lets the bare gtest thread safely observe
+// gate state without taking a fiber mutex itself or blocking a proactor thread.
+bool AwaitUntil(util::ProactorPool* pp, unsigned i, absl::FunctionRef<bool()> pred) {
+  return pp->at(i)->Await([&] { return WaitFor(pred); });
 }
 
 }  // namespace
@@ -160,14 +138,25 @@ TEST_F(SyncGateTest, CancelledWaiterGetsEmptyLease) {
   // `waiter` could eventually resume and touch this function's now-destroyed locals; leaving it
   // joinable instead means its destructor's own CHECK aborts the process deterministically,
   // before any other fiber gets a chance to run.
-  ASSERT_TRUE(WaitForFlag(waiter_done)) << "waiter fiber did not return within the time bound -- "
-                                           "SyncGate::Acquire cancellation appears broken";
+  ASSERT_TRUE(AwaitUntil(pp_.get(), 0, [&] { return waiter_done.load(); }))
+      << "waiter fiber did not return within the time bound -- "
+         "SyncGate::Acquire cancellation appears broken";
   waiter.Join();
   EXPECT_FALSE(got.load());
   EXPECT_EQ(0u, pp_->at(0)->Await([&] { return gate.NumWaiting(); }));
   release = true;
   holder.Join();  // bounded: holder's own wait above gives up after ~5s regardless of `release`.
   EXPECT_FALSE(pp_->at(0)->Await([&] { return gate.IsHeld(); }));
+}
+
+TEST_F(SyncGateTest, AlreadyCancelledWaiterDoesNotAcquireFreeGate) {
+  SyncGate gate;
+  pp_->at(0)->Await([&] {
+    auto lease = gate.Acquire([] { return true; });
+    EXPECT_FALSE(lease);
+    EXPECT_FALSE(gate.IsHeld());
+    EXPECT_EQ(0u, gate.NumWaiting());
+  });
 }
 
 TEST_F(SyncGateTest, ExternalLoadingDefersGrant) {
@@ -179,7 +168,7 @@ TEST_F(SyncGateTest, ExternalLoadingDefersGrant) {
     acquired = static_cast<bool>(lease);
     done = true;
   });
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  pp_->at(1)->Await([] { util::ThisFiber::SleepFor(std::chrono::milliseconds(250)); });
   EXPECT_FALSE(acquired.load());
   loading = false;
   // f.Join() blocks unconditionally; if SyncGate stopped re-checking external_loading_ after the
@@ -189,9 +178,9 @@ TEST_F(SyncGateTest, ExternalLoadingDefersGrant) {
   // (not Detach()-ed) so its destructor's own CHECK aborts the process deterministically instead
   // of risking a detached, still-blocked-in-Acquire() fiber later touching this function's
   // now-destroyed locals -- see the identical reasoning in CancelledWaiterGetsEmptyLease above.
-  ASSERT_TRUE(WaitForFlag(done)) << "fiber did not return within the time bound after "
-                                    "external_loading cleared -- SyncGate may not be "
-                                    "re-checking external_loading_";
+  ASSERT_TRUE(AwaitUntil(pp_.get(), 1, [&] { return done.load(); }))
+      << "fiber did not return within the time bound after external_loading cleared -- "
+         "SyncGate may not be re-checking external_loading_";
   f.Join();
   EXPECT_TRUE(acquired.load());
 }
@@ -222,6 +211,7 @@ class PeerManagerFamilyTest : public BaseFamilyTest {
 
 using StartMode = PeerReplicationManager::StartMode;
 constexpr char kReplid[] = "0123456789abcdef0123456789abcdef01234567";
+constexpr char kUnresolvableHost[] = "invalid host";
 
 TEST_F(PeerManagerFamilyTest, BlockingAddToUnreachablePortFailsAndLeavesNoPeer) {
   PeerRegistry reg;
@@ -229,8 +219,9 @@ TEST_F(PeerManagerFamilyTest, BlockingAddToUnreachablePortFailsAndLeavesNoPeer) 
   PeerReplicationManager mgr(service_.get(), &reg);
   pp_->at(0)->Await([&] {
     bool already = false;
-    GenericError ec = mgr.Add({"localhost", 1}, kReplid, StartMode::kBlockingHandshake, &already);
-    EXPECT_TRUE(ec) << "port 1 must refuse the connection";
+    GenericError ec =
+        mgr.Add({kUnresolvableHost, 1}, kReplid, StartMode::kBlockingHandshake, &already);
+    EXPECT_TRUE(ec) << "the invalid host must fail DNS resolution";
     EXPECT_FALSE(already);
     EXPECT_EQ(0u, mgr.Size());
     EXPECT_TRUE(mgr.Summaries().empty());
@@ -244,21 +235,21 @@ TEST_F(PeerManagerFamilyTest, BackgroundAddRemoveNoOneAndDuplicate) {
   PeerReplicationManager mgr(service_.get(), &reg);
   pp_->at(0)->Await([&] {
     bool already = false;
-    EXPECT_FALSE(mgr.Add({"localhost", 1}, kReplid, StartMode::kBackground, &already));
+    EXPECT_FALSE(mgr.Add({kUnresolvableHost, 1}, kReplid, StartMode::kBackground, &already));
     EXPECT_FALSE(already);
-    EXPECT_FALSE(mgr.Add({"localhost", 1}, kReplid, StartMode::kBackground, &already));
+    EXPECT_FALSE(mgr.Add({kUnresolvableHost, 1}, kReplid, StartMode::kBackground, &already));
     EXPECT_TRUE(already);  // duplicate endpoint is a no-op
-    EXPECT_FALSE(mgr.Add({"localhost", 2}, kReplid, StartMode::kBackground, &already));
+    EXPECT_FALSE(mgr.Add({kUnresolvableHost, 2}, kReplid, StartMode::kBackground, &already));
     EXPECT_FALSE(already);
     EXPECT_EQ(2u, mgr.Size());
     auto sums = mgr.Summaries();
     ASSERT_EQ(2u, sums.size());
-    EXPECT_EQ("localhost", sums[0].host);
+    EXPECT_EQ(kUnresolvableHost, sums[0].host);
     EXPECT_EQ(1, sums[0].port);
     EXPECT_EQ(2, sums[1].port);
     EXPECT_FALSE(sums[0].master_link_established);
-    EXPECT_TRUE(mgr.Remove({"localhost", 1}));
-    EXPECT_FALSE(mgr.Remove({"localhost", 1}));
+    EXPECT_TRUE(mgr.Remove({kUnresolvableHost, 1}));
+    EXPECT_FALSE(mgr.Remove({kUnresolvableHost, 1}));
     EXPECT_EQ(1u, mgr.Size());
     mgr.RemoveAll();
     EXPECT_EQ(0u, mgr.Size());
@@ -273,8 +264,8 @@ TEST_F(PeerManagerFamilyTest, SinglePeerReplaceWhenMultiMasterOff) {
   PeerReplicationManager mgr(service_.get(), &reg);
   pp_->at(0)->Await([&] {
     bool already = false;
-    EXPECT_FALSE(mgr.Add({"localhost", 1}, kReplid, StartMode::kBackground, &already));
-    EXPECT_FALSE(mgr.Add({"localhost", 2}, kReplid, StartMode::kBackground, &already));
+    EXPECT_FALSE(mgr.Add({kUnresolvableHost, 1}, kReplid, StartMode::kBackground, &already));
+    EXPECT_FALSE(mgr.Add({kUnresolvableHost, 2}, kReplid, StartMode::kBackground, &already));
     ASSERT_EQ(1u, mgr.Size());
     EXPECT_EQ(2, mgr.Endpoints()[0].port);
     mgr.Shutdown();
@@ -287,10 +278,35 @@ TEST_F(PeerManagerFamilyTest, ShutdownRefusesFurtherAdds) {
   PeerReplicationManager mgr(service_.get(), &reg);
   pp_->at(0)->Await([&] {
     bool already = false;
-    EXPECT_FALSE(mgr.Add({"localhost", 1}, kReplid, StartMode::kBackground, &already));
+    EXPECT_FALSE(mgr.Add({kUnresolvableHost, 1}, kReplid, StartMode::kBackground, &already));
     mgr.Shutdown();
-    EXPECT_TRUE(mgr.Add({"localhost", 2}, kReplid, StartMode::kBackground, &already));
+    EXPECT_TRUE(mgr.Add({kUnresolvableHost, 2}, kReplid, StartMode::kBackground, &already));
     EXPECT_EQ(0u, mgr.Size());
+  });
+}
+
+TEST_F(PeerManagerFamilyTest, ExclusivePeerLoadingRejectsConcurrentLoader) {
+  pp_->at(0)->Await([&] {
+    ASSERT_TRUE(service_->RequestExclusiveLoadingState());
+    EXPECT_FALSE(service_->RequestLoadingState());
+    service_->RemoveLoadingState();
+
+    ASSERT_TRUE(service_->RequestLoadingState());
+    ASSERT_TRUE(service_->RequestLoadingState());
+    service_->RemoveLoadingState();
+    EXPECT_FALSE(service_->RequestExclusiveLoadingState());
+    service_->RemoveLoadingState();
+  });
+}
+
+TEST_F(PeerManagerFamilyTest, ExclusiveLoadingIsUnavailableOutsideActiveMode) {
+  absl::SetFlag(&FLAGS_active_replica, false);
+  pp_->at(0)->Await([&] {
+    EXPECT_FALSE(service_->RequestExclusiveLoadingState());
+    ASSERT_TRUE(service_->RequestLoadingState());
+    ASSERT_TRUE(service_->RequestLoadingState());
+    service_->RemoveLoadingState();
+    service_->RemoveLoadingState();
   });
 }
 

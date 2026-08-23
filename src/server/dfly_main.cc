@@ -1138,11 +1138,11 @@ Usage: drakeydb [FLAGS]
   // pidfile and before starting the proactor pool. They return false on a bad config; we exit
   // cleanly (code 1) here, before the fiber runtime exists, which avoids a stale pidfile and
   // aborting during fiber-runtime teardown.
-  // drakeydb: also validate the --active_replica/--multi_master flag combination here, under the
-  // same boot-time-only contract as the validators above.
+  // drakeydb: also validate --replicaof peer lists and the --active_replica/--multi_master flag
+  // combination here, under the same boot-time-only contract as the validators above.
   if (!dfly::ValidateServerTlsFlags() || !dfly::ValidateClientTlsFlags() ||
       !dfly::ValidateSnapshotFilenameFlags() || !dfly::ValidateNotifyKeyspaceEventsFlag() ||
-      !dfly::ValidateMultiMasterFlags()) {
+      !dfly::ValidateReplicaOfFlags() || !dfly::ValidateMultiMasterFlags()) {
     return 1;
   }
 

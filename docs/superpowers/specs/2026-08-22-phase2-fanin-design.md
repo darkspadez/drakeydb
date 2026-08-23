@@ -7,13 +7,13 @@ peer's dataset on full sync instead of flushing, keeps expiring/evicting keys it
 peer full syncs, refuses anyone replicating *from* it (until Phase 3), and exposes the peer links
 in `INFO replication`.
 
-**Architecture:** A peer-mode flag on upstream's `Replica` (4 guarded sites: no shard-state flip,
-no flush on DF + Redis full sync, FIFO sync gate, duplicate-uuid refusal + registry registration in
-`Greet`) plus a new `PeerReplicationManager` (vector of peer `Replica`s, add/remove/no-one,
-replace-vs-append by `--multi_master`) that `ServerFamily` delegates to when active. All new logic
-lives in new files (`peer_replication.*`, additions to `multi_master.*`); upstream files get small
-additive hooks only (`server_family.cc` ≈ 60 lines, `replica.cc` ≈ 35, `dfly_main.cc` 1 line,
-`dflycmd.cc` 3 lines).
+**Architecture:** A peer-mode flag on upstream's `Replica` (no shard-state flip, no flush on DF +
+Redis full sync, FIFO sync gate, duplicate-uuid refusal + registry registration in `Greet`) plus a
+new `PeerReplicationManager` (vector of peer `Replica`s, add/remove/no-one, replace-vs-append by
+`--multi_master`) that `ServerFamily` delegates to when active. `Service` also exposes an exclusive
+LOADING reservation used by peer full sync to close the handoff race with loaders outside the sync
+gate. New logic primarily lives in `peer_replication.*` and additions to `multi_master.*`; upstream
+files receive additive, flag-gated hooks.
 
 **Tech Stack:** C++20, helio fibers (`util::fb2::Mutex/CondVarAny`), abseil flags, gtest
 (`BaseFamilyTest`), pytest harness in `tests/dragonfly/` (`DflyInstanceFactory`), OrbStack
@@ -201,6 +201,16 @@ unit tests pass their own flag). `Acquire(absl::FunctionRef<bool()> cancelled)` 
 empty `Lease` when cancelled. `Lease` is a movable RAII handle that releases on destruction and
 wakes the next waiter (`notify_all`). Test hooks: `IsHeld()`, `NumWaiting()`.
 
+**(as built after final review)** the external-loading sample prevents an already-running loader
+from receiving a gate lease, while `Replica::EnterLoadingState()` closes the inverse race where a
+loader starts after gate admission. Peer full sync loops until
+`Service::RequestExclusiveLoadingState()` atomically reserves ACTIVE→LOADING; ordinary
+`RequestLoadingState()` calls fail while that reservation is held. These semantics are gated by
+`IsActiveReplica()`; non-active calls execute the byte-identical upstream
+`RequestLoadingState()`/`RemoveLoadingState()` paths, and exclusive requests return false. The
+same review also moved the cancellation check ahead of `ready()`, so an already-cancelled waiter
+cannot acquire a free gate.
+
 **(as built)** every `notify_all()` — the cancel path in `Acquire()`, and `Release()` — runs while
 `mu_` is still held, not after releasing it: `util::fb2::CondVarAny` has no internal mutex of its
 own (unlike `std::condition_variable_any`), so notifying outside the lock races the wait queue it
@@ -246,12 +256,12 @@ ReplicaPeerMode{&gate_, registry_})`; blocking → `Start()` (error or
 `IsContextCancelled()` → return error, nothing registered); background → `EnableReplication()`.
 (3) under `mu_`: if `closed_` or the endpoint appeared meanwhile → `Stop()` the new one, return
 accordingly; if `!IsMultiMaster()` move all current peers out (`replaced`); push the new one.
-(4) unlocked: `Stop()` each replaced peer; blocking → `StartMainReplicationFiber(nullopt)`
-(same ordering as `ReplicaOfInternal`: register, then start the fiber). Endpoint equality is
-exact string host + port. `Remove/RemoveAll/Shutdown/PauseAll/Summaries` copy the `shared_ptr`s out
-under `mu_` and call `Replica` (thread-safe, hops to its proactor) outside the lock. `Replica`
-objects are constructed on the calling proactor (REPLICAOF connection thread, or the
-`GetNextProactor()` used by `Init`) — same as upstream.
+(4) under the same lock, stop replaced peers; for blocking mode, call
+`StartMainReplicationFiber(nullopt)` as part of publication so `Remove()`/`Shutdown()` cannot call
+`Stop()` before `sync_fb_` is assigned. Endpoint equality is exact string host + port.
+`Remove/RemoveAll/Shutdown/PauseAll/Summaries` hold `mu_` across their `Replica` calls to serialize
+`Stop()` with `GetSummary()`/`Pause()`. `Replica` objects are constructed on the calling proactor
+(REPLICAOF connection thread, or the `GetNextProactor()` used by `Init`) — same as upstream.
 
 **(as built)** the private member shipped as `std::vector<PeerLink> peers_ ABSL_GUARDED_BY(mu_)`
 with `struct PeerLink { Endpoint ep; std::shared_ptr<Replica> replica; }`, not the
@@ -262,8 +272,11 @@ in-memory comparison under `mu_`. `Endpoints()` is hop-free.
 **(as built, final review)** the lock scope above was widened: `mu_` is held across every
 `Replica` call in `Remove/RemoveAll/Shutdown/PauseAll/Summaries`, and replaced peers are stopped
 inside `Add()`'s step-(3) lock scope. Only the handshake in `Add()` (`Start()`/
-`EnableReplication()`) and `StartMainReplicationFiber()` run outside `mu_`. Reason: upstream only
-ever calls `Replica::GetSummary()` under the same mutex it holds around `Replica::Stop()`
+`EnableReplication()`) runs outside `mu_`. For a blocking handshake,
+`StartMainReplicationFiber()` runs under `mu_` as part of publication: once the peer is visible in
+`peers_`, `Remove()`/`Shutdown()` may call `Stop()`, so assigning `sync_fb_` must be serialized with
+those operations. The wider scope also follows upstream, which only ever calls
+`Replica::GetSummary()` under the same mutex it holds around `Replica::Stop()`
 (`Stop()` resets `shard_flows_` on the caller's thread while `GetSummary()` iterates it on the
 peer's proactor); the copy-then-act pattern sketched above reintroduced that race between
 `INFO replication` and `REPLICAOF REMOVE`/`NO ONE`/shutdown. Holding `mu_` across those calls
@@ -312,7 +325,7 @@ cannot deadlock because `Replica` never calls back into the manager (it only hol
 - `ReplicaOfFlag` gains `std::vector<std::pair<std::string, std::string>> peers;` (host/port mirror
   `peers[0]`); `AbslParseFlag` splits on `,` and parses each piece with the existing single-endpoint
   logic (extracted into a static helper — **(as built)** `ParseOneReplicaOf`), `AbslUnparseFlag`
-  joins with `,`.
+  joins with `,`. Empty pieces (leading, trailing, or repeated commas) are rejected.
 - `ReplicaOfNoOne`, `AddReplicaOf`, `ROLE`, `Metrics` untouched: active mode never reaches
   `ReplicaOfNoOne` (handled in `ReplicaOfActive`), `AddReplicaOf` already errors for masters,
   `ROLE` reports `master` (peers not listed), no `replica_side_info` metrics for the active node.
@@ -320,7 +333,7 @@ cannot deadlock because `Replica` never calls back into the manager (it only hol
 ### D-8. INFO rendering (`multi_master.h/.cc`)
 
 `std::string RenderPeerReplicationInfo(const std::vector<ReplicaSummary>& peers, bool multi_master, bool show_peer_lines)` returns
-```
+```text
 active_replica:1\r\n
 multi_master:<0|1>\r\n
 connected_masters:<peers.size()>\r\n
@@ -363,9 +376,10 @@ recorded as a P3 note.
 | `src/server/multi_master.h/.cc` (P1) | + flags `active_replica`/`multi_master`, `IsActiveReplica()`, `IsMultiMaster()`, `ValidateMultiMasterFlags()`, `PeerReplicaOfCmd` + `ParsePeerReplicaOfArgs()`, `RenderPeerReplicationInfo()` |
 | `src/server/peer_replication.h/.cc` (new) | `SyncGate`, `PeerReplicationManager` |
 | `src/server/replica.h/.cc` | `ReplicaPeerMode`, ctor param, `IsPeerMode()`, 5 guarded sites |
+| `src/server/main_service.h/.cc` | exclusive LOADING reservation used by peer full sync |
 | `src/server/server_family.h/.cc` | `peers_` member, `ReplicaOfActive`, hooks in `ReplicaOfInternal`/`ReplConf`/`ReplTakeOver`/INFO/`Shutdown`/`PauseReplication`/ctor/`Init`, `--replicaof` list parser |
 | `src/server/dflycmd.cc` | `TakeOver` guard |
-| `src/server/dfly_main.cc` | `ValidateMultiMasterFlags()` in the validator conjunction |
+| `src/server/dfly_main.cc` | `ValidateReplicaOfFlags()` + `ValidateMultiMasterFlags()` in the validator conjunction |
 | `src/server/CMakeLists.txt` | `peer_replication.cc` source; `peer_replication_test` registration + `check_dfly` dep |
 | `src/server/multi_master_test.cc` (P1) | + flag validation, arg parser, INFO render, `ActiveReplicaFamilyTest` command-level tests |
 | `src/server/peer_replication_test.cc` (new) | `SyncGate` fiber tests, `PeerReplicationManager` family tests |
@@ -378,9 +392,8 @@ recorded as a P3 note.
 - Non-active (`--active_replica` off) behaviour must stay byte-identical to upstream: every new
   code path is gated by `IsActiveReplica()`/`IsPeerMode()`. INFO emits the new fields only in
   active mode.
-- Upstream-file diffs stay small and additive (`docs/UPSTREAM-SYNC.md`): `server_family.cc`
-  ≈ 60 added lines, `replica.cc` ≈ 35, `dflycmd.cc` ≈ 3, `dfly_main.cc` 1. Never edit `helio/`,
-  `main_service.cc`, `engine_shard.cc`, `dash.h`, `compact_object.*`.
+- Upstream-file diffs stay additive and flag-gated (`docs/UPSTREAM-SYNC.md`). Never edit `helio/`,
+  `engine_shard.cc`, `dash.h`, or `compact_object.*`.
 - Keep `lag=` the trailing field of `slaveN:` lines; do not add a second `lag=` anywhere.
 - C++: clang-format (100 cols), `// drakeydb:` comment on each hook in an upstream file, no
   `std::mutex`/`std::thread` (fibers only), new files carry `// Copyright 2026, drakeydb authors.`

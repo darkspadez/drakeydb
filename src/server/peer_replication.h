@@ -99,15 +99,15 @@ class SyncGate {
 //
 // Thread-safe: every method may be called from any fiber. mu_ guards the `peers_` vector and the
 // `closed_` flag, and -- deliberately -- is also held across every call this class makes into a
-// Replica (Stop(), Pause(), GetSummary()), so mu_ serializes all Replica-touching operations: at
-// most one runs at a time, and none can race another on the same Replica (e.g. INFO replication's
-// Summaries() can never overlap a concurrent Remove()/RemoveAll()/Shutdown()'s Stop() on the same
-// Replica -- see Replica::Stop() vs Replica::GetSummary() on shard_flows_). The one exception is
-// the network handshake in Add() (Start()/EnableReplication(), and the later
-// StartMainReplicationFiber()): that step runs on a freshly constructed Replica no other method
+// Replica (StartMainReplicationFiber(), Stop(), Pause(), GetSummary()), so mu_ serializes all
+// Replica-touching operations: at most one runs at a time, and none can race another on the same
+// Replica (e.g. INFO replication's Summaries() can never overlap a concurrent
+// Remove()/RemoveAll()/Shutdown()'s Stop() on the same Replica -- see Replica::Stop() vs
+// Replica::GetSummary() on shard_flows_). The one exception is the network handshake in Add()
+// (Start()/EnableReplication()): that step runs on a freshly constructed Replica no other method
 // can reach yet (it is not in peers_), so nothing can race it, and it must not block mu_ since it
-// waits on DNS/TCP. Holding mu_ across Stop()/Pause()/GetSummary() cannot deadlock: Replica never
-// calls back into PeerReplicationManager.
+// waits on DNS/TCP. Holding mu_ across the serialized calls cannot deadlock: Replica never calls
+// back into PeerReplicationManager.
 class PeerReplicationManager {
  public:
   struct Endpoint {

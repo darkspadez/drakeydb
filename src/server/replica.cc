@@ -173,6 +173,21 @@ void Replica::EnableReplication() {
   sync_fb_ = MakeFiber(&Replica::MainReplicationFb, this, nullopt);  // call replication fiber
 }
 
+bool Replica::EnterLoadingState() {
+  if (!IsPeerMode())
+    return service_.RequestLoadingState();
+
+  // The sync gate serializes peer loaders, while this exclusive reservation closes the smaller
+  // race with loaders outside the gate: one may enter LOADING after gate admission but before the
+  // full-sync protocol reaches this point. Wait for it to finish instead of loading concurrently.
+  while (exec_st_.IsRunning()) {
+    if (service_.RequestExclusiveLoadingState())
+      return true;
+    ThisFiber::SleepFor(100ms);
+  }
+  return false;
+}
+
 std::optional<Replica::LastMasterSyncData> Replica::Stop() {
   VLOG(1) << "Stopping replication " << this;
   // Stops the loop in MainReplicationFb.
@@ -405,8 +420,8 @@ error_code Replica::Greet() {
   if (IsPeerMode() && !master_context_.master_node_uuid.empty()) {
     const std::string& self_uuid = service_.server_family().node_uuid();
     if (master_context_.master_node_uuid == self_uuid) {
-      LOG(ERROR) << "Peer " << server().Description() << " presents our own node uuid " << self_uuid
-                 << "; refusing to replicate from a clone of this node";
+      LOG_EVERY_T(ERROR, 60) << "Peer " << server().Description() << " presents our own node uuid "
+                             << self_uuid << "; refusing to replicate from a clone of this node";
       return std::make_error_code(std::errc::operation_not_permitted);
     }
     if (peer_mode_->registry)
@@ -547,7 +562,7 @@ error_code Replica::InitiatePSync() {
     io::PrefixSource ps{io_buf.InputBuffer(), Sock()};
 
     // Set LOADING state.
-    if (!service_.RequestLoadingState()) {
+    if (!EnterLoadingState()) {
       return exec_st_.ReportError(std::make_error_code(errc::state_not_recoverable),
                                   "Failed to enter LOADING state");
     }
@@ -719,7 +734,7 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
 
     if (num_full_flows == num_df_flows) {
       // Make sure we're in LOADING state.
-      if (!service_.RequestLoadingState()) {
+      if (!EnterLoadingState()) {
         return exec_st_.ReportError(std::make_error_code(errc::state_not_recoverable),
                                     "Failed to enter LOADING state");
       }

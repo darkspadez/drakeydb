@@ -234,7 +234,7 @@ bool AbslParseFlag(std::string_view in, ReplicaOfFlag* flag, std::string* err) {
   flag->peers.clear();
   flag->host.clear();
   flag->port.clear();
-  for (string_view piece : absl::StrSplit(in, ',', absl::SkipEmpty())) {
+  for (string_view piece : absl::StrSplit(in, ',')) {
     string host, port;
     // Tolerate whitespace around each piece (e.g. "a:1, b:2") without rejecting the whole flag.
     if (!ParseOneReplicaOf(absl::StripAsciiWhitespace(piece), &host, &port, err))
@@ -1069,6 +1069,22 @@ bool ValidateSnapshotFilenameFlags() {
   return true;
 }
 
+bool ValidateReplicaOfFlags() {
+  ReplicaOfFlag flag = GetFlag(FLAGS_replicaof);
+  if (flag.peers.size() <= 1)
+    return true;
+
+  if (!IsActiveReplica()) {
+    LOG(ERROR) << "--replicaof with several targets requires --active_replica";
+    return false;
+  }
+  if (!IsMultiMaster()) {
+    LOG(ERROR) << "--replicaof with several targets requires --multi_master";
+    return false;
+  }
+  return true;
+}
+
 void SlowLogGet(facade::ParsedArgs args, std::string_view sub_cmd, util::ProactorPool* pp,
                 CommandContext* cmd_cntx) {
   size_t requested_slow_log_length = UINT32_MAX;
@@ -1327,16 +1343,6 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
   // --replicaof: a non-active node replicates instead of loading a snapshot; an active node loads
   // its own snapshot first (drakeydb) and then attaches every target.
   if (ReplicaOfFlag flag = GetFlag(FLAGS_replicaof); flag.has_value()) {
-    if (flag.peers.size() > 1) {  // drakeydb: a peer list needs both active-replica and fan-in
-      if (!IsActiveReplica()) {
-        LOG(ERROR) << "--replicaof with several targets requires --active_replica";
-        exit(1);
-      }
-      if (!IsMultiMaster()) {
-        LOG(ERROR) << "--replicaof with several targets requires --multi_master";
-        exit(1);
-      }
-    }
     if (IsActiveReplica()) {  // drakeydb: an active node keeps its own snapshot and merges peers
       LoadFromSnapshot();
     }

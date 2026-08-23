@@ -74,6 +74,10 @@ class Service : public facade::ServiceInterface {
   GlobalState SwitchState(GlobalState from, GlobalState to) ABSL_LOCKS_EXCLUDED(mu_);
 
   bool RequestLoadingState() ABSL_LOCKS_EXCLUDED(mu_);
+  // drakeydb: reserves LOADING for one active-replica peer full sync. Unlike
+  // RequestLoadingState(), this only succeeds from ACTIVE and makes concurrent loading requests
+  // fail until RemoveLoadingState(). It always returns false outside active-replica mode.
+  bool RequestExclusiveLoadingState() ABSL_LOCKS_EXCLUDED(mu_);
   void RemoveLoadingState() ABSL_LOCKS_EXCLUDED(mu_);
 
   // Return true if state is LOADING and loading_state_counter_ == 0, that is,
@@ -210,6 +214,7 @@ class Service : public facade::ServiceInterface {
   mutable util::fb2::Mutex mu_;
   GlobalState global_state_ ABSL_GUARDED_BY(mu_) = GlobalState::ACTIVE;
   uint32_t loading_state_counter_ ABSL_GUARDED_BY(mu_) = 0;
+  bool exclusive_loading_ ABSL_GUARDED_BY(mu_) = false;  // drakeydb: peer full-sync reservation.
 };
 
 }  // namespace dfly

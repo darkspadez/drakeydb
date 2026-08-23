@@ -38,19 +38,21 @@ SyncGate::Lease::~Lease() {
 
 SyncGate::Lease SyncGate::Acquire(absl::FunctionRef<bool()> cancelled) {
   std::unique_lock lk(mu_);
-  const uint64_t my = next_ticket_++;
-  waiters_.push_back(my);
+  const uint64_t ticket = next_ticket_++;
+  waiters_.push_back(ticket);
   auto ready = [&] {
-    return !held_ && waiters_.front() == my && !(external_loading_ && external_loading_());
+    return !held_ && waiters_.front() == ticket && !(external_loading_ && external_loading_());
   };
-  while (!ready()) {
+  while (true) {
     if (cancelled()) {
-      waiters_.erase(std::find(waiters_.begin(), waiters_.end(), my));
+      waiters_.erase(std::find(waiters_.begin(), waiters_.end(), ticket));
       // fb2::CondVarAny has no internal mutex (unlike std::condition_variable_any): notify_all()
       // must be called while still holding mu_, or it races the wait queue it touches.
       cv_.notify_all();
       return Lease{};
     }
+    if (ready())
+      break;
     cv_.wait_for(lk, std::chrono::milliseconds(100));
   }
   waiters_.pop_front();
@@ -147,7 +149,9 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
   // replaced peer(s) are stopped before mu_ is released rather than after (see the class
   // comment): mu_ serializes every Replica-touching call, so a replaced peer's Stop() can never
   // run concurrently with a GetSummary()/Pause() that some other manager method is mid-way
-  // through on the same Replica.
+  // through on the same Replica. For a blocking handshake, starting the main fiber is part of
+  // publication too: once `r` is visible in peers_, Remove()/Shutdown() may call Stop(), so the
+  // sync_fb_ assignment must happen under the same lock that serializes those operations.
   bool closed = false;
   {
     util::fb2::LockGuard lk(mu_);
@@ -163,6 +167,8 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
         peers_.push_back(PeerLink{ep, r});
         for (auto& pl : replaced)
           pl.replica->Stop();
+        if (mode == StartMode::kBlockingHandshake)
+          r->StartMainReplicationFiber(std::nullopt);
       }
     }
   }
@@ -175,10 +181,6 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
     return {};
   }
 
-  // Step 4: unlocked -- same ordering as upstream ReplicaOfInternal -- start the main replication
-  // fiber only after registration.
-  if (mode == StartMode::kBlockingHandshake)
-    r->StartMainReplicationFiber(std::nullopt);
   return {};
 }
 

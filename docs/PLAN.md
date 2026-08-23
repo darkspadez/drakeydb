@@ -268,15 +268,15 @@ tiering, and `--experimental_cascaded_partial_sync`.
 | `replica.h/.cc` | P1 (done): greeting adds `REPLCONF UUID`. **P2 (done):** `ReplicaPeerMode{SyncGate*, PeerRegistry*}` trailing ctor param, `IsPeerMode()`; guards the `SetShardStates` flip (both directions in `MainReplicationFb`), a `SyncGate::Lease` around the full-sync step, and the flush skip in `InitiateDflySync`/`InitiatePSync` (the latter also adds an explicit `SetOverrideExistingKeys(true)`; the DF path already had it set), plus a `Greet()` self-uuid refusal + `PeerRegistry::AddOrGet`. P7 (future): `capa activeExpire` on the redis path, `ConsumeRedisStream` RREPLAY unwrap |
 | `dflycmd.cc` | **P2 (done):** `DflyCmd::TakeOver` refuses on an active node. (Future) `ReplicaInfo` stores peer uuid; refuse version <65 / missing UUID while active; additive `DFLY MVCC <key>` debug subcommand |
 | `server_family.cc` | P1 (done): additive `REPLCONF UUID` case. **P2 (done):** `peers_` member; `ReplicaOfInternal` delegates to `ReplicaOfActive` (`PeerReplicationManager`) when active (replace-vs-append by `--multi_master`, `REPLICAOF REMOVE <h> <p>`, NO ONE clears all); `ReplConf` refuses all replication consumers on an active node (single choke point; P3 replaces it with peer admission); `REPLTAKEOVER` refused; INFO block appended after `master_replid`; `Shutdown`/`PauseReplication` route through `peers_`; `--replicaof` now parses a comma-separated peer list (`ParseOneReplicaOf`) and, in active mode, `Init` loads the node's own snapshot before attaching peers |
-| `dfly_main.cc` | banner/usage strings, `version_check` default. **P2 (done):** `ValidateMultiMasterFlags()` added to the boot-time validator conjunction, before the proactor pool starts |
+| `dfly_main.cc` | banner/usage strings, `version_check` default. **P2 (done):** `ValidateReplicaOfFlags()` and `ValidateMultiMasterFlags()` added to the boot-time validator conjunction, before the proactor pool starts |
+| `main_service.h/.cc` | **P2 (done):** exclusive LOADING reservation for peer full sync, preventing overlap with loaders outside the peer sync gate |
 | `tests/dragonfly/instance.py` | **P2 (done):** `DflyInstanceFactory.create()` gives every instance without an explicit `dir=` (version ≥ 100) a unique `--node_uuid` default |
 | `table.h` (~126-128) | `DbTable` += mvcc side DashTable (active mode only) |
 | `db_slice.h/.cc` | `SetMvcc/GetMvcc/DelMvcc`; rule: **mirror every `mcflag` touch-point** (AddOrUpdate/Del/flush/defrag) |
 | `rdb_save.cc` (~1761) | per-key aux `mvcc-tstamp` in active mode (KeyDB's exact format — one codepath serves DF↔DF and KeyDB ingest) |
 | `rdb_load.cc` (~3024, ~3238) | parse `mvcc-tstamp` aux → seed side table; peer-merge LWW hook at 3238 (skip incoming when stored mvcc newer); log-and-ignore KeyDB `repl-masters` aux |
 
-**Deliberately untouched hot files:** `main_service.cc`, `engine_shard.cc`, `dash.h`,
-`compact_object.*`.
+**Deliberately untouched hot files:** `engine_shard.cc`, `dash.h`, `compact_object.*`.
 
 ### INFO / protocol surface
 
@@ -377,6 +377,8 @@ the Phase 2 suite added to `multimaster_test.py`.
 - `--replicaof` accepts a comma-separated peer list; in active mode `Init` loads the node's own
   snapshot before attaching every peer. A list of more than one target requires both
   `--active_replica` and `--multi_master` (boot error otherwise).
+- Peer full sync reserves LOADING exclusively after sync-gate admission, closing the race with
+  boot/DEBUG loaders that could otherwise enter between gate admission and the actual merge load.
 - Peer uuids are registered in `PeerRegistry` from inside `Greet()`, not from a separate
   admission step.
 - The clone-uuid refusal in `Greet()` only fires in peer mode; a non-peer `--replicaof` clone is
