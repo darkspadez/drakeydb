@@ -34,8 +34,10 @@ extern "C" {
 #include "server/journal/journal.h"
 #include "server/journal/serializer.h"
 #include "server/main_service.h"
+#include "server/multi_master.h"
 #include "server/namespaces.h"
 #include "server/node_identity.h"
+#include "server/peer_replication.h"
 #include "server/rdb_load.h"
 #include "strings/human_readable.h"
 
@@ -96,13 +98,15 @@ vector<vector<unsigned>> Partition(unsigned num_flows) {
 }  // namespace
 
 Replica::Replica(string host, uint16_t port, Service* se, std::string_view id,
-                 std::optional<cluster::SlotRange> slot_range)
+                 std::optional<cluster::SlotRange> slot_range,
+                 std::optional<ReplicaPeerMode> peer_mode)
     : ProtocolClient(std::move(host), port),
       service_(*se),
       id_{id},
       slot_range_(slot_range),
       creation_time_(time(nullptr)),
-      client_id_(facade::Connection::NextClientId()) {
+      client_id_(facade::Connection::NextClientId()),
+      peer_mode_(peer_mode) {
   proactor_ = ProactorBase::me();
 }
 
@@ -110,6 +114,7 @@ Replica::~Replica() {
   sync_fb_.JoinIfNeeded();
   acks_fb_.JoinIfNeeded();
   exec_st_.JoinErrorHandler();
+  ReleasePeerIdentityClaim();
 }
 
 static const char kConnErr[] = "could not connect to master: ";
@@ -169,6 +174,21 @@ void Replica::EnableReplication() {
   sync_fb_ = MakeFiber(&Replica::MainReplicationFb, this, nullopt);  // call replication fiber
 }
 
+bool Replica::EnterLoadingState() {
+  if (!IsPeerMode())
+    return service_.RequestLoadingState();
+
+  // The sync gate serializes peer loaders, while this exclusive reservation closes the smaller
+  // race with loaders outside the gate: one may enter LOADING after gate admission but before the
+  // full-sync protocol reaches this point. Wait for it to finish instead of loading concurrently.
+  while (exec_st_.IsRunning()) {
+    if (service_.RequestExclusiveLoadingState())
+      return true;
+    ThisFiber::SleepFor(100ms);
+  }
+  return false;
+}
+
 std::optional<Replica::LastMasterSyncData> Replica::Stop() {
   VLOG(1) << "Stopping replication " << this;
   // Stops the loop in MainReplicationFb.
@@ -187,6 +207,9 @@ std::optional<Replica::LastMasterSyncData> Replica::Stop() {
   for (auto& flow : shard_flows_) {
     flow.reset();
   }
+  // Release only after the replication fiber and flows are stopped, so an alias cannot acquire
+  // this UUID while the old stream is still capable of applying journal entries.
+  ReleasePeerIdentityClaim();
 
   if (last_journal_LSNs_.has_value()) {
     std::string lineage_id = absl::GetFlag(FLAGS_experimental_cascaded_partial_sync)
@@ -236,7 +259,10 @@ std::error_code Replica::TakeOver(unsigned timeout_sec, bool save_flag) {
 void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sync_data) {
   VLOG(1) << "Main replication fiber started " << this;
   // Switch shard states to replication.
-  SetShardStates(true);
+  // drakeydb: a peer-mode replica belongs to an active node that stays a master, so it must not
+  // flip the shards into replica mode (that would stop expiry/eviction process-wide).
+  if (!IsPeerMode())
+    SetShardStates(true);
 
   error_code ec;
   while (state_mask_ & R_ENABLED) {
@@ -275,9 +301,16 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
     if ((state_mask_ & R_GREETED) == 0) {
       ec = Greet();
       if (ec) {
-        LOG(WARNING) << "Error greeting " << server().Description()
-                     << " (phase: " << GetCurrentPhase() << "): " << ec << " " << ec.message()
-                     << ", socket state: " + SockInfo();
+        if (IsPeerMode() &&
+            (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use)) {
+          LOG_EVERY_T(WARNING, 60)
+              << "Error greeting " << server().Description() << " (phase: " << GetCurrentPhase()
+              << "): " << ec << " " << ec.message() << ", socket state: " + SockInfo();
+        } else {
+          LOG(WARNING) << "Error greeting " << server().Description()
+                       << " (phase: " << GetCurrentPhase() << "): " << ec << " " << ec.message()
+                       << ", socket state: " + SockInfo();
+        }
         state_mask_ &= R_ENABLED;
         continue;
       }
@@ -287,6 +320,16 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
 
     // 3. Initiate full sync
     if ((state_mask_ & R_SYNC_OK) == 0) {
+      // drakeydb: peer full syncs are serialized process-wide (LOADING is global); an empty lease
+      // means we were stopped while waiting.
+      SyncGate::Lease sync_lease;
+      if (peer_mode_ && peer_mode_->sync_gate) {
+        sync_lease = peer_mode_->sync_gate->Acquire([this] { return !exec_st_.IsRunning(); });
+        if (!sync_lease) {
+          state_mask_ &= R_ENABLED;
+          continue;
+        }
+      }
       if (HasDflyMaster()) {
         ec = InitiateDflySync(std::exchange(last_master_sync_data, nullopt));
       } else
@@ -323,7 +366,8 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
   exec_st_.JoinErrorHandler();
 
   // Revert shard states to normal state.
-  SetShardStates(false);
+  if (!IsPeerMode())
+    SetShardStates(false);
 
   VLOG(1) << "Main replication fiber finished";
 }
@@ -379,6 +423,32 @@ error_code Replica::Greet() {
       master_context_.master_node_uuid = std::move(master_uuid);
       master_context_.master_clock_ms = master_ms;
     }
+  }
+
+  // drakeydb: peer-mode identity admission. Refuse our own uuid (a cloned data dir) and any uuid
+  // already claimed by another live peer link; otherwise register it for later origin mapping.
+  if (IsPeerMode() && !master_context_.master_node_uuid.empty()) {
+    const std::string& self_uuid = service_.server_family().node_uuid();
+    if (master_context_.master_node_uuid == self_uuid) {
+      ReleasePeerIdentityClaim();
+      LOG_EVERY_T(ERROR, 60) << "Peer " << server().Description() << " presents our own node uuid "
+                             << self_uuid << "; refusing to replicate from a clone of this node";
+      return std::make_error_code(std::errc::operation_not_permitted);
+    }
+    if (peer_mode_->identity_claims &&
+        !peer_mode_->identity_claims->TryClaim(client_id_, master_context_.master_node_uuid)) {
+      LOG_EVERY_T(ERROR, 60)
+          << "Peer " << server().Description() << " presents node uuid "
+          << master_context_.master_node_uuid
+          << " which is already attached through another endpoint; refusing duplicate stream";
+      return std::make_error_code(std::errc::address_in_use);
+    }
+    if (peer_mode_->registry)
+      peer_mode_->registry->AddOrGet(master_context_.master_node_uuid);
+  } else if (IsPeerMode()) {
+    // UUID exchange is optional for Redis/older masters. Do not retain a stale claim if a
+    // reconnect succeeds against a source that no longer identifies itself.
+    ReleasePeerIdentityClaim();
   }
 
   // Announce that we are the dragonfly client.
@@ -515,14 +585,18 @@ error_code Replica::InitiatePSync() {
     io::PrefixSource ps{io_buf.InputBuffer(), Sock()};
 
     // Set LOADING state.
-    if (!service_.RequestLoadingState()) {
+    if (!EnterLoadingState()) {
       return exec_st_.ReportError(std::make_error_code(errc::state_not_recoverable),
                                   "Failed to enter LOADING state");
     }
 
     absl::Cleanup cleanup = [this]() { service_.RemoveLoadingState(); };
 
-    if (slot_range_.has_value()) {
+    if (IsPeerMode()) {
+      // drakeydb: an active node merges the peer's snapshot into its own dataset instead of
+      // replacing it. RdbLoader already overrides existing keys (last-loaded-wins until P6).
+      LOG(INFO) << "Peer full sync: merging without flush " << this;
+    } else if (slot_range_.has_value()) {
       JournalExecutor{&service_}.FlushSlots(slot_range_.value());
     } else {
       JournalExecutor{&service_}.FlushAll();
@@ -531,6 +605,8 @@ error_code Replica::InitiatePSync() {
     RdbLoadContext load_context;
     RdbLoader loader(NULL, &load_context);
     loader.SetLoadUnownedSlots(true);
+    if (IsPeerMode())
+      loader.SetOverrideExistingKeys(true);  // drakeydb: merge
     loader.set_source_limit(snapshot_size);
     // TODO: to allow registering callbacks within loader to send '\n' pings back to master.
     // Also to allow updating last_io_time_.
@@ -681,21 +757,26 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
 
     if (num_full_flows == num_df_flows) {
       // Make sure we're in LOADING state.
-      if (!service_.RequestLoadingState()) {
+      if (!EnterLoadingState()) {
         return exec_st_.ReportError(std::make_error_code(errc::state_not_recoverable),
                                     "Failed to enter LOADING state");
       }
       sync_type = "full";
 
-      DVLOG(1) << "Calling Flush on all slots " << this;
-
       passed_full_sync_ = false;
-      if (slot_range_.has_value()) {
-        JournalExecutor{&service_}.FlushSlots(slot_range_.value());
+      if (IsPeerMode()) {
+        // drakeydb: an active node merges the peer's snapshot into its own dataset instead of
+        // replacing it. RdbLoader already overrides existing keys (last-loaded-wins until P6).
+        LOG(INFO) << "Peer full sync: merging without flush " << this;
       } else {
-        JournalExecutor{&service_}.FlushAll();
+        DVLOG(1) << "Calling Flush on all slots " << this;
+        if (slot_range_.has_value()) {
+          JournalExecutor{&service_}.FlushSlots(slot_range_.value());
+        } else {
+          JournalExecutor{&service_}.FlushAll();
+        }
+        DVLOG(1) << "Flush on all slots ended " << this;
       }
-      DVLOG(1) << "Flush on all slots ended " << this;
     } else if (num_full_flows == 0) {
       sync_type = "partial";
     } else {
@@ -1536,6 +1617,11 @@ std::vector<unsigned> Replica::GetFlowMapAtIndex(size_t index) const {
     return {};
   }
   return thread_flow_map_[index];
+}
+
+void Replica::ReleasePeerIdentityClaim() {
+  if (peer_mode_ && peer_mode_->identity_claims)
+    peer_mode_->identity_claims->Release(client_id_);
 }
 
 size_t Replica::GetRecCountExecutedPerShard(const std::vector<unsigned>& indexes) const {

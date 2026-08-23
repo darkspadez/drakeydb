@@ -17,6 +17,7 @@
 
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
+#include "absl/flags/reflection.h"
 #include "base/gtest.h"
 #include "facade/facade_test.h"
 #include "io/file_util.h"
@@ -28,6 +29,11 @@
 
 ABSL_DECLARE_FLAG(bool, force_epoll);
 ABSL_DECLARE_FLAG(std::string, dir);
+ABSL_DECLARE_FLAG(bool, active_replica);
+ABSL_DECLARE_FLAG(bool, multi_master);
+ABSL_DECLARE_FLAG(std::string, cluster_mode);
+ABSL_DECLARE_FLAG(std::string, tiered_prefix);
+ABSL_DECLARE_FLAG(bool, experimental_cascaded_partial_sync);
 
 namespace dfly {
 
@@ -243,6 +249,106 @@ TEST(PeerRegistry, SelfIsZeroAndAddOrGetIsMonotonicIdempotent) {
   EXPECT_EQ(3u, reg.Size());
 }
 
+TEST(MultiMasterFlags, DefaultsAreValidAndOff) {
+  absl::FlagSaver saver;
+  EXPECT_FALSE(IsActiveReplica());
+  EXPECT_FALSE(IsMultiMaster());
+  EXPECT_TRUE(ValidateMultiMasterFlags());
+}
+
+TEST(MultiMasterFlags, MultiMasterRequiresActiveReplica) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_multi_master, true);
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+  absl::SetFlag(&FLAGS_active_replica, true);
+  EXPECT_TRUE(ValidateMultiMasterFlags());
+  EXPECT_TRUE(IsActiveReplica());
+  EXPECT_TRUE(IsMultiMaster());
+}
+
+TEST(MultiMasterFlags, ActiveReplicaRejectsIncompatibleFlags) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_active_replica, true);
+  absl::SetFlag(&FLAGS_cluster_mode, "emulated");
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+  absl::SetFlag(&FLAGS_cluster_mode, "");
+  absl::SetFlag(&FLAGS_tiered_prefix, "/tmp/x");
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+  absl::SetFlag(&FLAGS_tiered_prefix, "");
+  absl::SetFlag(&FLAGS_experimental_cascaded_partial_sync, true);
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+  absl::SetFlag(&FLAGS_experimental_cascaded_partial_sync, false);
+  EXPECT_TRUE(ValidateMultiMasterFlags());
+}
+
+namespace {
+nonstd::expected<PeerReplicaOfCmd, facade::ErrorReply> ParsePeer(std::vector<std::string> words) {
+  CmdArgVec vec;
+  for (auto& w : words)
+    vec.emplace_back(w);
+  CmdArgList list = absl::MakeSpan(vec);
+  return ParsePeerReplicaOfArgs(list);
+}
+}  // namespace
+
+TEST(PeerReplicaOfArgs, ParsesAddRemoveAndNoOne) {
+  auto add = ParsePeer({"localhost", "6379"});
+  ASSERT_TRUE(add.has_value());
+  EXPECT_EQ(PeerReplicaOfCmd::Kind::kAdd, add->kind);
+  EXPECT_EQ("localhost", add->host);
+  EXPECT_EQ(6379, add->port);
+
+  auto rem = ParsePeer({"REMOVE", "10.0.0.7", "7000"});
+  ASSERT_TRUE(rem.has_value());
+  EXPECT_EQ(PeerReplicaOfCmd::Kind::kRemove, rem->kind);
+  EXPECT_EQ("10.0.0.7", rem->host);
+  EXPECT_EQ(7000, rem->port);
+
+  auto none = ParsePeer({"NO", "ONE"});
+  ASSERT_TRUE(none.has_value());
+  EXPECT_EQ(PeerReplicaOfCmd::Kind::kNoOne, none->kind);
+  auto none_lc = ParsePeer({"no", "one"});
+  ASSERT_TRUE(none_lc.has_value());
+}
+
+TEST(PeerReplicaOfArgs, RejectsBadForms) {
+  EXPECT_FALSE(ParsePeer({"localhost"}).has_value());
+  EXPECT_FALSE(ParsePeer({"localhost", "0"}).has_value());
+  EXPECT_FALSE(ParsePeer({"localhost", "70000"}).has_value());
+  EXPECT_FALSE(ParsePeer({"localhost", "abc"}).has_value());
+  EXPECT_FALSE(ParsePeer({"REMOVE", "localhost"}).has_value());
+  EXPECT_FALSE(ParsePeer({"localhost", "6379", "0", "100"}).has_value());  // slot range
+  EXPECT_FALSE(ParsePeer({"NO"}).has_value());
+}
+
+TEST(PeerReplicationInfo, RendersCountsAndPeerLines) {
+  ReplicaSummary up{};
+  up.host = "localhost";
+  up.port = 7001;
+  up.master_link_established = true;
+  up.full_sync_in_progress = false;
+  up.master_last_io_sec = 3;
+  up.master_node_uuid = "01234567-89ab-4cde-8f01-23456789abcd";
+  ReplicaSummary down{};
+  down.host = "10.0.0.9";
+  down.port = 7002;
+  down.master_link_established = false;
+  down.full_sync_in_progress = true;
+  down.master_last_io_sec = 0;
+  std::string s = RenderPeerReplicationInfo({up, down}, true, true);
+  EXPECT_EQ(
+      "active_replica:1\r\nmulti_master:1\r\nconnected_masters:2\r\n"
+      "master0:host=localhost,port=7001,link_status=up,last_io_seconds_ago=3,"
+      "sync_in_progress=0,node_uuid=01234567-89ab-4cde-8f01-23456789abcd\r\n"
+      "master1:host=10.0.0.9,port=7002,link_status=down,last_io_seconds_ago=0,"
+      "sync_in_progress=1\r\n",
+      s);
+  EXPECT_EQ("active_replica:1\r\nmulti_master:0\r\nconnected_masters:2\r\n",
+            RenderPeerReplicationInfo({up, down}, false, false));
+  EXPECT_EQ("active_replica:1\r\nmulti_master:0\r\nconnected_masters:0\r\n",
+            RenderPeerReplicationInfo({}, false, true));
+}
+
 // Launch::post-constructed fibers only get queued (AddReady) on the constructing thread's
 // scheduler; they don't start running until that thread yields (e.g. at Join()). And
 // util::fb2::Mutex::lock()'s uncontended fast path never suspends. So fibers built directly on
@@ -342,6 +448,56 @@ TEST_F(MultiMasterFamilyTest, ReplconfUuidRepliesOwnUuidAndMs) {
 TEST_F(MultiMasterFamilyTest, ReplconfUuidInvalidRejected) {
   auto resp = Run({"replconf", "uuid", "not-a-uuid"});
   EXPECT_THAT(resp, ErrArg("Invalid UUID"));
+}
+
+// Boots with --active_replica and --multi_master on, on top of MultiMasterFamilyTest's private
+// --dir (base's saver_ restores both flags on TearDown, same as it already does for --dir).
+class ActiveReplicaFamilyTest : public MultiMasterFamilyTest {
+ protected:
+  ActiveReplicaFamilyTest() {
+    absl::SetFlag(&FLAGS_active_replica, true);
+    absl::SetFlag(&FLAGS_multi_master, true);
+  }
+};
+
+TEST_F(ActiveReplicaFamilyTest, ReplconfRefusedWhileActive) {
+  auto resp = Run({"replconf", "listening-port", "1"});
+  EXPECT_THAT(resp, ErrArg("active-replica"));
+  resp = Run({"replconf", "capa", "dragonfly"});
+  EXPECT_THAT(resp, ErrArg("active-replica"));
+}
+
+TEST_F(ActiveReplicaFamilyTest, ReplTakeoverRefusedWhileActive) {
+  EXPECT_THAT(Run({"repltakeover", "1"}), ErrArg("active-replica"));
+}
+
+TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
+  auto resp = Run({"info", "replication"});
+  std::string info{ToSV(resp.GetBuf())};
+  EXPECT_NE(std::string::npos, info.find("role:master\r\n"));
+  EXPECT_NE(std::string::npos, info.find("active_replica:1\r\n"));
+  EXPECT_NE(std::string::npos, info.find("multi_master:1\r\n"));
+  EXPECT_NE(std::string::npos, info.find("connected_masters:0\r\n"));
+  EXPECT_EQ(std::string::npos, info.find("master_host:"));
+}
+
+TEST_F(ActiveReplicaFamilyTest, ReplicaOfGrammarAndNoPeersPaths) {
+  EXPECT_THAT(Run({"replicaof", "remove", "localhost", "1"}), ErrArg("Not attached"));
+  EXPECT_EQ("OK", Run({"replicaof", "no", "one"}));
+  EXPECT_THAT(Run({"replicaof", "localhost", "6379", "0", "100"}), ErrArg("slot ranges"));
+  // Unresolvable peer: error, nothing attached, still a writable master. Use a syntactically
+  // invalid hostname so this unit test exercises manager cleanup without depending on DNS or a
+  // listening socket; live peer connections are covered by the integration suite.
+  EXPECT_THAT(Run({"replicaof", "invalid host", "1"}), ErrArg("replication cancelled"));
+  std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
+  EXPECT_NE(std::string::npos, info.find("connected_masters:0\r\n"));
+  EXPECT_EQ("OK", Run({"set", "k", "v"}));
+}
+
+TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
+  std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
+  EXPECT_EQ(std::string::npos, info.find("active_replica:"));
+  EXPECT_EQ(std::string::npos, info.find("connected_masters:"));
 }
 
 }  // namespace dfly

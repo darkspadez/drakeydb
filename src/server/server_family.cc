@@ -9,6 +9,7 @@
 #include <absl/strings/match.h>
 #include <absl/strings/str_join.h>
 #include <absl/strings/str_replace.h>
+#include <absl/strings/str_split.h>
 #include <absl/strings/strip.h>
 #include <croncpp.h>  // cron::cronexpr
 #include <fcntl.h>    // for mkstemp
@@ -69,6 +70,7 @@ extern "C" {
 #include "server/multi_command_squasher.h"
 #include "server/namespaces.h"
 #include "server/node_identity.h"
+#include "server/peer_replication.h"
 #include "server/rdb_load.h"
 #include "server/rdb_save.h"
 #include "server/replica.h"
@@ -93,6 +95,8 @@ using namespace std;
 struct ReplicaOfFlag {
   string host;
   string port;
+  // drakeydb: every target of a comma-separated list; host/port mirror peers[0]
+  std::vector<std::pair<string, string>> peers;
 
   bool has_value() const {
     return !host.empty() && !port.empty();
@@ -130,7 +134,9 @@ ABSL_FLAG(int, epoll_file_threads, 0,
 ABSL_FLAG(ReplicaOfFlag, replicaof, ReplicaOfFlag{},
           "Specifies a host and port which point to a target master "
           "to replicate. "
-          "Format should be <IPv4>:<PORT> or host:<PORT> or [<IPv6>]:<PORT>");
+          "Format should be <IPv4>:<PORT> or host:<PORT> or [<IPv6>]:<PORT>. "
+          "With --active_replica --multi_master, a comma-separated list of targets attaches all "
+          "of them (drakeydb).");
 ABSL_FLAG(int32_t, slowlog_log_slower_than, 10000,
           "Add commands slower than this threshold to slow log. The value is expressed in "
           "microseconds and if it's negative - disables the slowlog.");
@@ -177,7 +183,8 @@ ABSL_DECLARE_FLAG(string, tls_ca_cert_dir);
 ABSL_DECLARE_FLAG(int, replica_priority);
 ABSL_DECLARE_FLAG(double, rss_oom_deny_ratio);
 
-bool AbslParseFlag(std::string_view in, ReplicaOfFlag* flag, std::string* err) {
+// drakeydb: single host:port parser, reused for each piece of a comma-separated --replicaof list.
+static bool ParseOneReplicaOf(std::string_view in, string* host, string* port, string* err) {
 #define RETURN_ON_ERROR(cond, m)                                           \
   do {                                                                     \
     if ((cond)) {                                                          \
@@ -187,18 +194,13 @@ bool AbslParseFlag(std::string_view in, ReplicaOfFlag* flag, std::string* err) {
     }                                                                      \
   } while (0)
 
-  if (in.empty()) {  // on empty flag "parse" nothing. If we return false then DF exists.
-    *flag = ReplicaOfFlag{};
-    return true;
-  }
-
   auto pos = in.find_last_of(':');
   RETURN_ON_ERROR(pos == string::npos, "missing ':'.");
 
   string_view ip = in.substr(0, pos);
-  flag->port = in.substr(pos + 1);
+  *port = in.substr(pos + 1);
 
-  RETURN_ON_ERROR(ip.empty() || flag->port.empty(), "IP/host or port are empty.");
+  RETURN_ON_ERROR(ip.empty() || port->empty(), "IP/host or port are empty.");
 
   // For IPv6: ip1.front == '[' AND ip1.back == ']'
   // For IPv4: ip1.front != '[' AND ip1.back != ']'
@@ -209,18 +211,50 @@ bool AbslParseFlag(std::string_view in, ReplicaOfFlag* flag, std::string* err) {
     // shortest possible IPv6 is '::1' (loopback)
     RETURN_ON_ERROR(ip.length() <= 2, "IPv6 host name is too short");
 
-    flag->host = ip.substr(1, ip.length() - 2);
+    *host = ip.substr(1, ip.length() - 2);
   } else {
-    flag->host = ip;
+    *host = ip;
   }
 
-  VLOG(1) << "--replicaof: Received " << flag->host << " :  " << flag->port;
+  VLOG(1) << "--replicaof: Received " << *host << " :  " << *port;
   return true;
 #undef RETURN_ON_ERROR
 }
 
+bool AbslParseFlag(std::string_view in, ReplicaOfFlag* flag, std::string* err) {
+  if (in.empty()) {  // on empty flag "parse" nothing. If we return false then DF exists.
+    *flag = ReplicaOfFlag{};
+    return true;
+  }
+
+  // drakeydb: --replicaof accepts a comma-separated list of targets (active-replica fan-in).
+  // Reset first, mirroring the empty-input branch above: AbslParseFlag may run more than once
+  // against the same ReplicaOfFlag (e.g. absl flag-parsing helpers reusing a default instance),
+  // and without this a second parse would append onto `peers` instead of replacing it.
+  flag->peers.clear();
+  flag->host.clear();
+  flag->port.clear();
+  for (string_view piece : absl::StrSplit(in, ',')) {
+    string host, port;
+    // Tolerate whitespace around each piece (e.g. "a:1, b:2") without rejecting the whole flag.
+    if (!ParseOneReplicaOf(absl::StripAsciiWhitespace(piece), &host, &port, err))
+      return false;
+    flag->peers.emplace_back(std::move(host), std::move(port));
+  }
+  if (flag->peers.empty()) {
+    *err = "missing ':'.";
+    LOG(WARNING) << "Error in parsing arguments for --replicaof: " << *err;
+    return false;
+  }
+
+  flag->host = flag->peers.front().first;
+  flag->port = flag->peers.front().second;
+  return true;
+}
+
 std::string AbslUnparseFlag(const ReplicaOfFlag& flag) {
-  return (flag.has_value()) ? absl::StrCat(flag.host, ":", flag.port) : "";
+  // drakeydb: join every peer's host:port with ',' (single-target output is unchanged).
+  return flag.has_value() ? absl::StrJoin(flag.peers, ",", absl::PairFormatter(":")) : "";
 }
 
 bool AbslParseFlag(std::string_view in, CronExprFlag* flag, std::string* err) {
@@ -1035,6 +1069,22 @@ bool ValidateSnapshotFilenameFlags() {
   return true;
 }
 
+bool ValidateReplicaOfFlags() {
+  ReplicaOfFlag flag = GetFlag(FLAGS_replicaof);
+  if (flag.peers.size() <= 1)
+    return true;
+
+  if (!IsActiveReplica()) {
+    LOG(ERROR) << "--replicaof with several targets requires --active_replica";
+    return false;
+  }
+  if (!IsMultiMaster()) {
+    LOG(ERROR) << "--replicaof with several targets requires --multi_master";
+    return false;
+  }
+  return true;
+}
+
 void SlowLogGet(facade::ParsedArgs args, std::string_view sub_cmd, util::ProactorPool* pp,
                 CommandContext* cmd_cntx) {
   size_t requested_slow_log_length = UINT32_MAX;
@@ -1184,6 +1234,7 @@ ServerFamily::ServerFamily(Service* service) : service_(*service) {
   // runtime and can abort (SIGABRT). Keep these checks out of this ctor.
 
   dfly_cmd_ = make_unique<DflyCmd>(this);
+  peers_ = std::make_unique<PeerReplicationManager>(&service_, &peer_registry_);  // drakeydb
   legacy_format_metrics_ = GetFlag(FLAGS_keep_legacy_memory_metrics);
 }
 
@@ -1289,11 +1340,17 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
   LOG(INFO) << "Node uuid: " << node_identity_.uuid
             << (node_identity_.ephemeral ? " (ephemeral)" : "");
 
-  // check for '--replicaof' before loading anything
+  // --replicaof: a non-active node replicates instead of loading a snapshot; an active node loads
+  // its own snapshot first (drakeydb) and then attaches every target.
   if (ReplicaOfFlag flag = GetFlag(FLAGS_replicaof); flag.has_value()) {
-    service_.proactor_pool().GetNextProactor()->Await(
-        [this, &flag]() { this->Replicate(flag.host, flag.port); });
-  } else {  // load from snapshot only if --replicaof is empty
+    if (IsActiveReplica()) {  // drakeydb: an active node keeps its own snapshot and merges peers
+      LoadFromSnapshot();
+    }
+    service_.proactor_pool().GetNextProactor()->Await([this, &flag]() {
+      for (const auto& [host, port] : flag.peers)
+        this->Replicate(host, port);
+    });
+  } else {  // --replicaof is empty: load this node's own snapshot as usual
     LoadFromSnapshot();
   }
 
@@ -1385,6 +1442,7 @@ void ServerFamily::Shutdown() {
       replica_->Stop();
     }
     StopAllClusterReplicas();
+    peers_->Shutdown();  // drakeydb: stop this node's active-replica peer links too
 
     dfly_cmd_->CancelReplicas();
     DebugCmd::Shutdown();
@@ -1665,6 +1723,7 @@ void ServerFamily::PauseReplication(bool pause) {
     CHECK(repl_ptr);
     repl_ptr->Pause(pause);
   }
+  peers_->PauseAll(pause);  // drakeydb: also pause/resume this node's active-replica peer links
 }
 
 std::optional<ReplicaOffsetInfo> ServerFamily::GetReplicaOffsetInfo() {
@@ -2993,6 +3052,10 @@ string ServerFamily::FormatInfoMetrics(
         }
       }
       append("master_replid", master_replid_);
+      if (IsActiveReplica()) {  // drakeydb: peer links of an active node (fan-in)
+        info.append(
+            RenderPeerReplicationInfo(peers_->Summaries(), IsMultiMaster(), show_managed_info));
+      }
     } else {
       append("role", GetFlag(FLAGS_info_replication_valkey_compatible) ? "slave" : "replica");
 
@@ -3435,6 +3498,11 @@ void ServerFamily::ReplicaOfNoOne(SinkReplyBuilder* builder) {
 void ServerFamily::ReplicaOfInternal(facade::ParsedArgs args, CommandContext* cmd_cntx,
                                      ActionOnConnectionFail on_error)
     ABSL_LOCKS_EXCLUDED(replicaof_mu_) {
+  // drakeydb: an active node manages its masters through PeerReplicationManager (fan-in).
+  if (IsActiveReplica()) {
+    return ReplicaOfActive(args, cmd_cntx, on_error);
+  }
+
   auto replicaof_args = ReplicaOfArgs::FromCmdArgs(args);
   if (!replicaof_args.has_value()) {
     return cmd_cntx->SendError(replicaof_args.error());
@@ -3505,6 +3573,43 @@ void ServerFamily::ReplicaOfInternal(facade::ParsedArgs args, CommandContext* cm
   cmd_cntx->rb()->SendOk();
 }
 
+// drakeydb: active-node REPLICAOF -- attaches/detaches peer masters via peers_ instead of
+// managing a single replica_. See PeerReplicationManager for the fan-in semantics.
+void ServerFamily::ReplicaOfActive(facade::ParsedArgs args, CommandContext* cmd_cntx,
+                                   ActionOnConnectionFail on_error) {
+  auto cmd = ParsePeerReplicaOfArgs(args);
+  if (!cmd.has_value()) {
+    return cmd_cntx->SendError(cmd.error());
+  }
+  using Kind = PeerReplicaOfCmd::Kind;
+  PeerReplicationManager::Endpoint ep{cmd->host, cmd->port};
+  switch (cmd->kind) {
+    case Kind::kNoOne:
+      LOG(INFO) << "Detaching all peer masters";
+      peers_->RemoveAll();
+      return cmd_cntx->rb()->SendOk();
+    case Kind::kRemove:
+      LOG(INFO) << "Detaching peer master " << ep.host << ":" << ep.port;
+      if (!peers_->Remove(ep)) {
+        return cmd_cntx->SendError("Not attached to the specified master");
+      }
+      return cmd_cntx->rb()->SendOk();
+    case Kind::kAdd: {
+      LOG(INFO) << "Attaching peer master " << ep.host << ":" << ep.port;
+      bool already = false;
+      auto mode = on_error == ActionOnConnectionFail::kReturnOnError
+                      ? PeerReplicationManager::StartMode::kBlockingHandshake
+                      : PeerReplicationManager::StartMode::kBackground;
+      GenericError ec = peers_->Add(ep, master_replid(), mode, &already);
+      if (ec) {
+        return cmd_cntx->SendError(ec.Format());
+      }
+      LOG_IF(INFO, already) << "Already attached to " << ep.host << ":" << ep.port;
+      return cmd_cntx->rb()->SendOk();
+    }
+  }
+}
+
 // REPLTAKEOVER <seconds> [SAVE]
 // SAVE is used only by tests.
 void ServerFamily::ReplTakeOver(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
@@ -3522,6 +3627,11 @@ void ServerFamily::ReplTakeOver(facade::CmdArgParser parser, CommandContext* cmd
   // We allow zero timeouts for tests.
   if (timeout_sec < 0) {
     return cmd_cntx->SendError("timeout is negative");
+  }
+
+  // drakeydb: fan-in has no single upstream master to hand this node's role off to.
+  if (IsActiveReplica()) {
+    return cmd_cntx->SendError("REPLTAKEOVER is not supported on an active-replica node");
   }
 
   // The LockGuard must precede the master check to ensure atomicity for the subsequent repl_ptr
@@ -3577,6 +3687,11 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
     if (!IsMaster()) {
       return cmd_cntx->SendError("Replicating a replica is unsupported");
     }
+  }
+
+  // drakeydb: an active node does not serve replication consumers yet (Phase 3 admits peers).
+  if (IsActiveReplica()) {
+    return cmd_cntx->SendError("Replicating from an active-replica node is not supported");
   }
 
   auto err_cb = [&]() mutable {

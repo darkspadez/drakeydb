@@ -60,6 +60,7 @@ ABSL_DECLARE_FLAG(std::string, dir);
 #include "server/common.h"
 #include "server/generic_family.h"
 #include "server/main_service.h"
+#include "server/multi_master.h"  // drakeydb: ValidateMultiMasterFlags()
 #include "server/server_family.h"
 #include "server/set_family.h"
 #include "server/version.h"
@@ -1137,8 +1138,11 @@ Usage: drakeydb [FLAGS]
   // pidfile and before starting the proactor pool. They return false on a bad config; we exit
   // cleanly (code 1) here, before the fiber runtime exists, which avoids a stale pidfile and
   // aborting during fiber-runtime teardown.
+  // drakeydb: also validate --replicaof peer lists and the --active_replica/--multi_master flag
+  // combination here, under the same boot-time-only contract as the validators above.
   if (!dfly::ValidateServerTlsFlags() || !dfly::ValidateClientTlsFlags() ||
-      !dfly::ValidateSnapshotFilenameFlags() || !dfly::ValidateNotifyKeyspaceEventsFlag()) {
+      !dfly::ValidateSnapshotFilenameFlags() || !dfly::ValidateNotifyKeyspaceEventsFlag() ||
+      !dfly::ValidateReplicaOfFlags() || !dfly::ValidateMultiMasterFlags()) {
     return 1;
   }
 

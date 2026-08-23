@@ -61,9 +61,14 @@ bool ValidateSnapshotFilenameFlags();
 // on an invalid value.
 bool ValidateNotifyKeyspaceEventsFlag();
 
+// Validates that a multi-target --replicaof list is only used in active multi-master mode.
+// Returns false and logs on an invalid configuration.
+bool ValidateReplicaOfFlags();
+
 class CommandContext;
 class CommandRegistry;
 class DflyCmd;
+class PeerReplicationManager;  // drakeydb: active-replica peer links (server/peer_replication.h)
 class Replica;
 class Service;
 class ScriptMgr;
@@ -326,6 +331,11 @@ class ServerFamily {
   void ReplicaOfInternal(facade::ParsedArgs args, CommandContext* cmnd_cntx,
                          ActionOnConnectionFail on_error) ABSL_LOCKS_EXCLUDED(replicaof_mu_);
 
+  // drakeydb: active-node REPLICAOF, delegating to peers_ (PeerReplicationManager) instead of
+  // replica_. See ReplicaOfInternal's IsActiveReplica() dispatch.
+  void ReplicaOfActive(facade::ParsedArgs args, CommandContext* cmd_cntx,
+                       ActionOnConnectionFail on_error);
+
   void ReplicaOfNoOne(SinkReplyBuilder* builder) ABSL_LOCKS_EXCLUDED(replicaof_mu_);
 
   struct LoadOptions {
@@ -391,6 +401,13 @@ class ServerFamily {
 
   NodeIdentity node_identity_;
   PeerRegistry peer_registry_;
+
+  // drakeydb: active-replica peer links, internally synchronized by its own mutex -- not guarded
+  // by replicaof_mu_. Declared after peer_registry_/node_identity_ so it is destroyed first:
+  // ~PeerReplicationManager() calls Shutdown() -> Replica::Stop(), and a peer's background fiber
+  // can still be inside Greet() touching peer_registry_/node_identity_ at that point -- reverse
+  // declaration-order destruction must not tear those down before peers_ is gone.
+  std::unique_ptr<PeerReplicationManager> peers_;
 
   time_t start_time_ = 0;  // in seconds, epoch time.
 

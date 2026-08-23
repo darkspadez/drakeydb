@@ -8,6 +8,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 
 import aiohttp
@@ -458,6 +459,13 @@ class DflyInstanceFactory:
 
         if version >= 1.26:
             args.setdefault("fiber_safety_margin=4096")
+
+        # drakeydb: every instance needs its own node identity. Instances with an explicit --dir
+        # persist one in <dir>/drakeydb.uuid (production behaviour); the rest share the session
+        # cwd, so give them a unique ephemeral --node_uuid instead. A restarted DflyInstance keeps
+        # its args, hence its identity. Old upstream binaries (version < 100) lack the flag.
+        if version >= 100 and "dir" not in args:
+            args.setdefault("node_uuid", str(uuid.uuid4()))
 
         # When a custom S3 endpoint is configured (e.g. MinIO), pass it to Dragonfly
         s3_endpoint = os.environ.get("MINIO_S3_ENDPOINT")

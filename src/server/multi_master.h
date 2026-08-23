@@ -6,14 +6,42 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <cstdint>
+#include <nonstd/expected.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "facade/facade_types.h"
+#include "server/replica_types.h"
 #include "util/fibers/synchronization.h"
 
 namespace dfly {
+
+// --active_replica / --multi_master accessors (boot-only flags, declared in multi_master.cc).
+bool IsActiveReplica();
+bool IsMultiMaster();
+
+// Validates the multi-master flag combination: --multi_master requires --active_replica, and
+// --active_replica is incompatible with --cluster_mode, tiering (--tiered_prefix) and
+// --experimental_cascaded_partial_sync. Logs and returns false on a bad combination. Called from
+// main() before the proactor pool starts (see dfly_main.cc), like the TLS/snapshot validators.
+bool ValidateMultiMasterFlags();
+
+struct PeerReplicaOfCmd {
+  enum class Kind : uint8_t { kAdd, kRemove, kNoOne };
+  Kind kind = Kind::kAdd;
+  std::string host;
+  uint16_t port = 0;
+};
+// Active-mode REPLICAOF grammar: "<host> <port>" | "REMOVE <host> <port>" | "NO ONE".
+// Slot ranges (cluster fan-in syntax) are rejected: active mode is incompatible with cluster mode.
+nonstd::expected<PeerReplicaOfCmd, facade::ErrorReply> ParsePeerReplicaOfArgs(
+    facade::ParsedArgs args);
+
+// INFO replication block for an active node (see D-8).
+std::string RenderPeerReplicationInfo(const std::vector<ReplicaSummary>& peers, bool multi_master,
+                                      bool show_peer_lines);
 
 // PeerRegistry maps a peer's uuid to a small, dense "origin index", assigned in the order
 // uuids are first seen. The local node always occupies kSelfIdx (0). Indices are assigned

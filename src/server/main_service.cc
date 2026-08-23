@@ -55,6 +55,7 @@ extern "C" {
 #include "server/hset_family.h"
 #include "server/http_api.h"
 #include "server/multi_command_squasher.h"
+#include "server/multi_master.h"  // drakeydb: gate peer-only LOADING semantics.
 #include "server/namespaces.h"
 #include "server/script_mgr.h"
 #include "server/search/search_family.h"
@@ -2967,26 +2968,86 @@ GlobalState Service::SwitchState(GlobalState from, GlobalState to) {
 }
 
 bool Service::RequestLoadingState() {
-  GlobalState prev = SwitchState(GlobalState::ACTIVE, GlobalState::LOADING);
-  if (prev == GlobalState::ACTIVE || prev == GlobalState::LOADING) {
-    util::fb2::LockGuard lk(mu_);
-    loading_state_counter_++;
-    return true;
+  // drakeydb: preserve upstream's loading-state path unless active replication is enabled.
+  if (!IsActiveReplica()) {
+    GlobalState prev = SwitchState(GlobalState::ACTIVE, GlobalState::LOADING);
+    if (prev == GlobalState::ACTIVE || prev == GlobalState::LOADING) {
+      util::fb2::LockGuard lk(mu_);
+      loading_state_counter_++;
+      return true;
+    }
+    return false;
   }
-  return false;
+
+  util::fb2::LockGuard lk(mu_);
+  if (exclusive_loading_ ||
+      (global_state_ != GlobalState::ACTIVE && global_state_ != GlobalState::LOADING)) {
+    return false;
+  }
+
+  ++loading_state_counter_;
+  if (global_state_ == GlobalState::LOADING)
+    return true;
+
+  VLOG(1) << "Switching state from " << GlobalState::ACTIVE << " to " << GlobalState::LOADING;
+  global_state_ = GlobalState::LOADING;
+  pp_.Await([](ProactorBase*) { ServerState::tlocal()->set_gstate(GlobalState::LOADING); });
+  return true;
+}
+
+bool Service::RequestExclusiveLoadingState() {
+  // drakeydb: exclusive LOADING is only meaningful for active-replica peer full syncs.
+  if (!IsActiveReplica())
+    return false;
+
+  util::fb2::LockGuard lk(mu_);
+  if (global_state_ != GlobalState::ACTIVE || loading_state_counter_ != 0)
+    return false;
+
+  VLOG(1) << "Switching state from " << GlobalState::ACTIVE << " to " << GlobalState::LOADING;
+  global_state_ = GlobalState::LOADING;
+  loading_state_counter_ = 1;
+  exclusive_loading_ = true;
+  pp_.Await([](ProactorBase*) { ServerState::tlocal()->set_gstate(GlobalState::LOADING); });
+  return true;
 }
 
 void Service::RemoveLoadingState() {
-  bool switch_state = false;
-  {
-    util::fb2::LockGuard lk(mu_);
-    CHECK_GT(loading_state_counter_, 0u);
-    --loading_state_counter_;
-    switch_state = loading_state_counter_ == 0;
+  // drakeydb: preserve upstream's loading-state path unless active replication is enabled.
+  if (!IsActiveReplica()) {
+    bool switch_state = false;
+    {
+      util::fb2::LockGuard lk(mu_);
+      CHECK_GT(loading_state_counter_, 0u);
+      --loading_state_counter_;
+      switch_state = loading_state_counter_ == 0;
+    }
+    if (switch_state) {
+      SwitchState(GlobalState::LOADING, GlobalState::ACTIVE);
+    }
+    return;
   }
-  if (switch_state) {
-    SwitchState(GlobalState::LOADING, GlobalState::ACTIVE);
-  }
+
+  util::fb2::LockGuard lk(mu_);
+  CHECK_GT(loading_state_counter_, 0u);
+  --loading_state_counter_;
+  if (loading_state_counter_ != 0)
+    return;
+
+  exclusive_loading_ = false;
+  if (global_state_ != GlobalState::LOADING)
+    return;
+
+  VLOG(1) << "Switching state from " << GlobalState::LOADING << " to " << GlobalState::ACTIVE;
+  global_state_ = GlobalState::ACTIVE;
+  pp_.Await([&](ProactorBase*) {
+    ServerState::tlocal()->set_gstate(GlobalState::ACTIVE);
+    auto* es = EngineShard::tlocal();
+    if (es) {
+      DbSlice& db = namespaces->GetDefaultNamespace().GetDbSlice(es->shard_id());
+      DCHECK(db.IsLoadRefCountZero());
+    }
+  });
 }
 
 bool Service::IsLoadingExclusively() {
