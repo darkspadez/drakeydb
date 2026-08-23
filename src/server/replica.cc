@@ -114,6 +114,7 @@ Replica::~Replica() {
   sync_fb_.JoinIfNeeded();
   acks_fb_.JoinIfNeeded();
   exec_st_.JoinErrorHandler();
+  ReleasePeerIdentityClaim();
 }
 
 static const char kConnErr[] = "could not connect to master: ";
@@ -206,6 +207,9 @@ std::optional<Replica::LastMasterSyncData> Replica::Stop() {
   for (auto& flow : shard_flows_) {
     flow.reset();
   }
+  // Release only after the replication fiber and flows are stopped, so an alias cannot acquire
+  // this UUID while the old stream is still capable of applying journal entries.
+  ReleasePeerIdentityClaim();
 
   if (last_journal_LSNs_.has_value()) {
     std::string lineage_id = absl::GetFlag(FLAGS_experimental_cascaded_partial_sync)
@@ -297,9 +301,16 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
     if ((state_mask_ & R_GREETED) == 0) {
       ec = Greet();
       if (ec) {
-        LOG(WARNING) << "Error greeting " << server().Description()
-                     << " (phase: " << GetCurrentPhase() << "): " << ec << " " << ec.message()
-                     << ", socket state: " + SockInfo();
+        if (IsPeerMode() &&
+            (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use)) {
+          LOG_EVERY_T(WARNING, 60)
+              << "Error greeting " << server().Description() << " (phase: " << GetCurrentPhase()
+              << "): " << ec << " " << ec.message() << ", socket state: " + SockInfo();
+        } else {
+          LOG(WARNING) << "Error greeting " << server().Description()
+                       << " (phase: " << GetCurrentPhase() << "): " << ec << " " << ec.message()
+                       << ", socket state: " + SockInfo();
+        }
         state_mask_ &= R_ENABLED;
         continue;
       }
@@ -414,18 +425,30 @@ error_code Replica::Greet() {
     }
   }
 
-  // drakeydb: peer-mode identity checks. A peer that presents our own uuid is a clone of this
-  // node's data dir (P3's origin tagging would silently drop its entries) - refuse it. Otherwise
-  // register the peer so later phases can map its uuid to an origin index.
+  // drakeydb: peer-mode identity admission. Refuse our own uuid (a cloned data dir) and any uuid
+  // already claimed by another live peer link; otherwise register it for later origin mapping.
   if (IsPeerMode() && !master_context_.master_node_uuid.empty()) {
     const std::string& self_uuid = service_.server_family().node_uuid();
     if (master_context_.master_node_uuid == self_uuid) {
+      ReleasePeerIdentityClaim();
       LOG_EVERY_T(ERROR, 60) << "Peer " << server().Description() << " presents our own node uuid "
                              << self_uuid << "; refusing to replicate from a clone of this node";
       return std::make_error_code(std::errc::operation_not_permitted);
     }
+    if (peer_mode_->identity_claims &&
+        !peer_mode_->identity_claims->TryClaim(client_id_, master_context_.master_node_uuid)) {
+      LOG_EVERY_T(ERROR, 60)
+          << "Peer " << server().Description() << " presents node uuid "
+          << master_context_.master_node_uuid
+          << " which is already attached through another endpoint; refusing duplicate stream";
+      return std::make_error_code(std::errc::address_in_use);
+    }
     if (peer_mode_->registry)
       peer_mode_->registry->AddOrGet(master_context_.master_node_uuid);
+  } else if (IsPeerMode()) {
+    // UUID exchange is optional for Redis/older masters. Do not retain a stale claim if a
+    // reconnect succeeds against a source that no longer identifies itself.
+    ReleasePeerIdentityClaim();
   }
 
   // Announce that we are the dragonfly client.
@@ -1594,6 +1617,11 @@ std::vector<unsigned> Replica::GetFlowMapAtIndex(size_t index) const {
     return {};
   }
   return thread_flow_map_[index];
+}
+
+void Replica::ReleasePeerIdentityClaim() {
+  if (peer_mode_ && peer_mode_->identity_claims)
+    peer_mode_->identity_claims->Release(client_id_);
 }
 
 size_t Replica::GetRecCountExecutedPerShard(const std::vector<unsigned>& indexes) const {

@@ -9,11 +9,49 @@
 #include <optional>
 #include <utility>
 
+#include "base/logging.h"
 #include "server/multi_master.h"
 #include "server/replica.h"
 #include "server/server_state.h"
 
 namespace dfly {
+
+bool PeerIdentityClaims::TryClaim(uint64_t owner_id, std::string_view uuid) {
+  DCHECK(!uuid.empty());
+  util::fb2::LockGuard lk(mu_);
+
+  auto claim = owners_by_uuid_.find(uuid);
+  if (claim != owners_by_uuid_.end() && claim->second != owner_id) {
+    ReleaseLocked(owner_id);
+    return false;
+  }
+
+  auto previous = uuids_by_owner_.find(owner_id);
+  if (previous != uuids_by_owner_.end() && previous->second != uuid) {
+    owners_by_uuid_.erase(previous->second);
+    previous->second = uuid;
+  } else if (previous == uuids_by_owner_.end()) {
+    uuids_by_owner_.try_emplace(owner_id, uuid);
+  }
+  owners_by_uuid_.insert_or_assign(std::string(uuid), owner_id);
+  return true;
+}
+
+void PeerIdentityClaims::Release(uint64_t owner_id) {
+  util::fb2::LockGuard lk(mu_);
+  ReleaseLocked(owner_id);
+}
+
+void PeerIdentityClaims::ReleaseLocked(uint64_t owner_id) {
+  auto owner = uuids_by_owner_.find(owner_id);
+  if (owner == uuids_by_owner_.end())
+    return;
+
+  auto claim = owners_by_uuid_.find(owner->second);
+  if (claim != owners_by_uuid_.end() && claim->second == owner_id)
+    owners_by_uuid_.erase(claim);
+  uuids_by_owner_.erase(owner);
+}
 
 SyncGate::SyncGate(ExternalLoadingFn external_loading)
     : external_loading_(std::move(external_loading)) {
@@ -133,7 +171,7 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
 
   // Step 2: build and start the candidate replica with mu_ released -- Start() blocks on DNS/TCP.
   auto r = std::make_shared<Replica>(ep.host, ep.port, service_, self_replid, std::nullopt,
-                                     ReplicaPeerMode{&gate_, registry_});
+                                     ReplicaPeerMode{&gate_, registry_, &identity_claims_});
   if (mode == StartMode::kBlockingHandshake) {
     GenericError ec = r->Start();
     if (ec || r->IsContextCancelled())

@@ -46,7 +46,7 @@ taking either side blindly:
 |---|---|
 | `src/server/journal/serializer.cc` | journal v2 framing (origin/mvcc extension) |
 | `src/server/journal/types.h`, `journal_slice.cc`, `streamer.*`, `executor.*` | origin tagging + peer filtering |
-| `src/server/replica.cc` | peer-mode (writable, no-flush) sync path; peer-mode hooks: no shard flip, no flush, sync gate, uuid guard |
+| `src/server/replica.cc` | peer-mode (writable, no-flush) sync path; hooks: no shard flip/flush, sync gate, self/duplicate uuid guard + claim release |
 | `src/server/main_service.h`, `main_service.cc` | exclusive LOADING reservation for peer full sync |
 | `src/server/dflycmd.cc` | peer version/UUID gating; `DFLY TAKEOVER` refusal in active mode |
 | `src/server/server_family.cc` | REPLICAOF delegation + INFO additions (kept to additive lines); `--replicaof` list parser + active-mode REPLICAOF/INFO/REPLCONF/REPLTAKEOVER hooks, peers_ member |

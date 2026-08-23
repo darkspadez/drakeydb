@@ -29,8 +29,9 @@ class ConnectionContext;
 class JournalExecutor;
 struct JournalReader;
 class DflyShardReplica;
-class SyncGate;      // server/peer_replication.h
-class PeerRegistry;  // server/multi_master.h
+class SyncGate;            // server/peer_replication.h
+class PeerIdentityClaims;  // server/peer_replication.h
+class PeerRegistry;        // server/multi_master.h
 
 // The attributes of the master we are connecting to.
 struct MasterContext {
@@ -46,10 +47,11 @@ struct MasterContext {
 // drakeydb: configuration of a peer-mode Replica -- an active node consuming from one of its
 // masters. A peer-mode Replica never flips the process into read-only replica mode, never flushes
 // the local dataset on full sync (it merges; last-loaded-wins until P6), serializes its full syncs
-// through `sync_gate`, refuses a peer that presents our own node uuid, and registers the peer uuid.
+// through `sync_gate`, refuses self/duplicate peer uuids, and registers the peer uuid.
 struct ReplicaPeerMode {
-  SyncGate* sync_gate = nullptr;     // null: full syncs are not serialized (unit tests)
-  PeerRegistry* registry = nullptr;  // null: peer uuids are not registered (unit tests)
+  SyncGate* sync_gate = nullptr;                  // null: full syncs are not serialized (tests)
+  PeerRegistry* registry = nullptr;               // null: peer uuids are not registered (tests)
+  PeerIdentityClaims* identity_claims = nullptr;  // null: duplicate uuids are not rejected (tests)
 };
 
 // This class manages replication from both Dragonfly and Redis masters.
@@ -117,6 +119,9 @@ class Replica : ProtocolClient {
   void JoinDflyFlows();
   void SetShardStates(bool replica);  // Call SetReplica(replica) on all shards.
   bool EnterLoadingState();
+
+  // drakeydb: releases this peer-mode Replica's live UUID admission, if one was claimed.
+  void ReleasePeerIdentityClaim();
 
   // Send DFLY ${kind} to the master instance.
   std::error_code SendNextPhaseRequest(std::string_view kind);

@@ -11,12 +11,12 @@ peer full syncs, refuses anyone replicating *from* it (until Phase 3), and expos
 in `INFO replication`.
 
 **Architecture:** A peer-mode flag on upstream's `Replica` (no shard-state flip, no flush on DF +
-Redis full sync, FIFO sync gate, duplicate-uuid refusal + registry registration in `Greet`) plus a
-new `PeerReplicationManager` (vector of peer `Replica`s, add/remove/no-one, replace-vs-append by
-`--multi_master`) that `ServerFamily` delegates to when active. `Service` also exposes an exclusive
-LOADING reservation used by peer full sync to close the handoff race with loaders outside the sync
-gate. New logic primarily lives in `peer_replication.*` and additions to `multi_master.*`; upstream
-files receive additive, flag-gated hooks.
+Redis full sync, FIFO sync gate, self/duplicate-uuid refusal + registry registration in `Greet`)
+plus a new `PeerReplicationManager` (vector of peer `Replica`s, add/remove/no-one,
+replace-vs-append by `--multi_master`) that `ServerFamily` delegates to when active. `Service` also
+exposes an exclusive LOADING reservation used by peer full sync to close the handoff race with
+loaders outside the sync gate. New logic primarily lives in `peer_replication.*` and additions to
+`multi_master.*`; upstream files receive additive, flag-gated hooks.
 
 **Tech Stack:** C++20, helio fibers (`util::fb2::Mutex/CondVarAny`), abseil flags, gtest
 (`BaseFamilyTest`), pytest harness in `tests/dragonfly/` (`DflyInstanceFactory`), OrbStack
@@ -48,7 +48,7 @@ build dir, OrbStack stopped. Main checkout (`~/Documents/qops/git/drakeydb`) has
 |---|---|
 | D1 | A peer's **full sync keeps Dragonfly LOADING semantics** (clients get `-LOADING` for the merge-load duration). Steady state fully writable. Serve-during-merge stays future work. |
 | D2 | `--replicaof` accepts a **comma-separated list** (`h1:p1,h2:p2,[::1]:p3`) — only meaningful with `--active_replica`; >1 target without it is a boot error. In active mode the node **also loads its own snapshot** at boot (upstream skips the snapshot when `--replicaof` is set). |
-| D3 | P3 prerequisites pulled into P2: **(a)** pytest harness gives every instance a distinct node identity by default; **(b)** a peer presenting **our own uuid is refused** (peer mode only — non-active behaviour stays byte-identical to upstream). |
+| D3 | P3 prerequisites pulled into P2: **(a)** pytest harness gives every instance a distinct node identity by default; **(b)** a peer presenting **our own uuid is refused**; **(c)** only one live link may claim a remote uuid, so endpoint aliases cannot apply the same stream twice (peer mode only — non-active behaviour stays byte-identical to upstream). |
 | D4 | Review cadence: Opus 5 **per task** (spec-compliance review, then code-quality review) **plus a final whole-branch review**. Sonnet 5 implements. |
 | D5 | **KeyDB parity:** without `--multi_master`, `REPLICAOF h p` **replaces** the single peer (still writable, no flush); with `--multi_master` it **appends**. `REPLICAOF REMOVE h p` and `REPLICAOF NO ONE` work in both. |
 | D6 | INFO: `connected_masters:N` + **one line per peer** `masterN:host=..,port=..,link_status=up\|down,last_io_seconds_ago=..,sync_in_progress=0\|1[,node_uuid=..]` (mirrors `slaveN:`; redis-py parses it into a dict). `role:master` stays. |
@@ -58,8 +58,10 @@ build dir, OrbStack stopped. Main checkout (`~/Documents/qops/git/drakeydb`) has
 | D10 | New long-lived build container for this worktree, fresh debug build. |
 | D11 | Final gate: full `ninja` + `ctest -L DFLY`, `replication_test.py`, `replication_config_test.py`, **full** `replication_resilience_test.py`, **full** `cluster_test.py`, `multimaster_test.py`, pre-commit clean, Opus branch review. |
 
-Other calls made in design (not asked, defaults stated): duplicate `REPLICAOF` of an attached peer
-is a no-op `OK`; peers share the global `--masterauth/--masteruser/--tls_replication` (per-peer
+Other calls made in design (not asked, defaults stated): duplicate `REPLICAOF` of the exact
+attached endpoint is a no-op `OK`; a blocking alias that presents an already-attached uuid is
+rejected, while a background alias stays down/retrying and can acquire the claim after the winner
+is removed; peers share the global `--masterauth/--masteruser/--tls_replication` (per-peer
 credentials are v2); `ROLE` output unchanged (`master`); no Prometheus per-peer metrics (P8);
 peers that lack the UUID exchange (stock Dragonfly masters) are accepted (uuid just absent).
 
@@ -150,16 +152,18 @@ peers that lack the UUID exchange (stock Dragonfly masters) are accepted (uuid j
 ### D-4. Peer-mode `Replica` (`replica.h/.cc`)
 
 ```cpp
-class SyncGate;      // server/peer_replication.h
-class PeerRegistry;  // server/multi_master.h
+class SyncGate;            // server/peer_replication.h
+class PeerIdentityClaims;  // server/peer_replication.h
+class PeerRegistry;        // server/multi_master.h
 
 // drakeydb: configuration of a peer-mode Replica — an active node consuming from one of its
 // masters. A peer-mode Replica never flips the process into read-only replica mode, never flushes
 // the local dataset on full sync (it merges; last-loaded-wins until P6), serializes its full syncs
-// through `sync_gate`, refuses a peer that presents our own node uuid, and registers the peer uuid.
+// through `sync_gate`, refuses self/duplicate peer uuids, and registers the peer uuid.
 struct ReplicaPeerMode {
-  SyncGate* sync_gate = nullptr;    // null: full syncs are not serialized (unit tests)
-  PeerRegistry* registry = nullptr; // null: peer uuids are not registered (unit tests)
+  SyncGate* sync_gate = nullptr;
+  PeerRegistry* registry = nullptr;
+  PeerIdentityClaims* identity_claims = nullptr;
 };
 
 Replica(std::string master_host, uint16_t port, Service* se, std::string_view id,
@@ -178,16 +182,14 @@ Guarded sites (all additive, each with a `// drakeydb:` comment):
    `RequestLoadingState()` stays (D1).
 4. `InitiatePSync` 525-533: same skip; additionally `loader.SetOverrideExistingKeys(true)` in peer
    mode (the DF path already sets it at 1093).
-5. `Greet()` right after P1's UUID block (after line 382): in peer mode, if
-   `master_context_.master_node_uuid` is non-empty and equals
-   `service_.server_family().node_uuid()` → `LOG(ERROR)` with both uuids and return
-   `std::make_error_code(std::errc::operation_not_permitted)` (client sees
-   `could not greet master Operation not permitted`; the log carries the details — same UX class as
-   every other greet failure upstream). Otherwise, if `peer_mode_->registry` and the uuid is
-   non-empty → `registry->AddOrGet(master_context_.master_node_uuid)` (idempotent; uuid already
-   normalized by `ParseReplconfUuidReply`).
+5. `Greet()` right after P1's UUID block: self uuid returns `operation_not_permitted`; otherwise
+   `PeerIdentityClaims::TryClaim(client_id_, uuid)` atomically refuses a uuid already owned by
+   another live peer before full/stable sync can begin, then `PeerRegistry::AddOrGet` preserves the
+   append-only origin mapping. `Stop()` releases the claim only after its replication fiber/flows
+   stop; destruction is an idempotent fallback. A reconnect to a UUID-less source releases a stale
+   claim. Identity errors are rate-limited in the background reconnect loop.
 
-Nothing else changes: LSN/partial-sync bookkeeping, `Stop()`, `Pause()`, `GetSummary()` (already
+Nothing else changes: LSN/partial-sync bookkeeping, `Pause()`, and `GetSummary()` (which already
 carries host/port/link/last-io/sync-in-progress/`master_node_uuid`).
 
 ### D-5. `SyncGate` (`peer_replication.h/.cc`)
@@ -243,13 +245,14 @@ class PeerReplicationManager {
   std::vector<std::shared_ptr<Replica>> peers_ ABSL_GUARDED_BY(mu_);  // attach order
   bool closed_ ABSL_GUARDED_BY(mu_) = false;
   SyncGate gate_;
+  PeerIdentityClaims identity_claims_;
   Service* service_;
   PeerRegistry* registry_;
 };
 ```
 `Add` algorithm: (1) under `mu_`: refuse if `closed_`; if endpoint present → already, OK.
 (2) unlocked: `make_shared<Replica>(host, port, service_, self_replid, nullopt,
-ReplicaPeerMode{&gate_, registry_})`; blocking → `Start()` (error or
+ReplicaPeerMode{&gate_, registry_, &identity_claims_})`; blocking → `Start()` (error or
 `IsContextCancelled()` → return error, nothing registered); background → `EnableReplication()`.
 (3) under `mu_`: if `closed_` or the endpoint appeared meanwhile → `Stop()` the new one, return
 accordingly; if `!IsMultiMaster()` move all current peers out (`replaced`); push the new one.
@@ -259,6 +262,13 @@ accordingly; if `!IsMultiMaster()` move all current peers out (`replaced`); push
 `Remove/RemoveAll/Shutdown/PauseAll/Summaries` hold `mu_` across their `Replica` calls to serialize
 `Stop()` with `GetSummary()`/`Pause()`. `Replica` objects are constructed on the calling proactor
 (REPLICAOF connection thread, or the `GetNextProactor()` used by `Init`) — same as upstream.
+
+**(as built after alias review)** `PeerIdentityClaims` is a separate fiber-mutex-protected live
+UUID ownership map, not part of manager `mu_` or append-only `PeerRegistry`. `Greet()` runs the
+claim before sync admission. This avoids a manager callback deadlock for background handshakes,
+while ensuring two endpoint spellings of one master can never both apply its stream. A blocking
+duplicate fails its command; a background duplicate remains down and retries, becoming eligible
+only after `Stop()` fully quiesces and releases the winning claim.
 
 ### D-7. `ServerFamily` / `DflyCmd` wiring (additive)
 
@@ -341,15 +351,15 @@ recorded as a P3 note.
 | File | Change |
 |---|---|
 | `src/server/multi_master.h/.cc` (P1) | + flags `active_replica`/`multi_master`, `IsActiveReplica()`, `IsMultiMaster()`, `ValidateMultiMasterFlags()`, `PeerReplicaOfCmd` + `ParsePeerReplicaOfArgs()`, `RenderPeerReplicationInfo()` |
-| `src/server/peer_replication.h/.cc` (new) | `SyncGate`, `PeerReplicationManager` |
-| `src/server/replica.h/.cc` | `ReplicaPeerMode`, ctor param, `IsPeerMode()`, 5 guarded sites |
+| `src/server/peer_replication.h/.cc` (new) | `SyncGate`, `PeerIdentityClaims`, `PeerReplicationManager` |
+| `src/server/replica.h/.cc` | `ReplicaPeerMode`, ctor param, `IsPeerMode()`, guarded sync/identity sites |
 | `src/server/main_service.h/.cc` | exclusive LOADING reservation used by peer full sync |
 | `src/server/server_family.h/.cc` | `peers_` member, `ReplicaOfActive`, hooks in `ReplicaOfInternal`/`ReplConf`/`ReplTakeOver`/INFO/`Shutdown`/`PauseReplication`/ctor/`Init`, `--replicaof` list parser |
 | `src/server/dflycmd.cc` | `TakeOver` guard |
 | `src/server/dfly_main.cc` | `ValidateReplicaOfFlags()` + `ValidateMultiMasterFlags()` in the validator conjunction |
 | `src/server/CMakeLists.txt` | `peer_replication.cc` source; `peer_replication_test` registration + `check_dfly` dep |
 | `src/server/multi_master_test.cc` (P1) | + flag validation, arg parser, INFO render, `ActiveReplicaFamilyTest` command-level tests |
-| `src/server/peer_replication_test.cc` (new) | `SyncGate` fiber tests, `PeerReplicationManager` family tests |
+| `src/server/peer_replication_test.cc` (new) | identity-claim, `SyncGate`, and manager tests |
 | `tests/dragonfly/instance.py` | per-instance `--node_uuid` default |
 | `tests/dragonfly/multimaster_test.py` (P1) | + Phase 2 fan-in suite |
 | `docs/PLAN.md`, `docs/UPSTREAM-SYNC.md`, `docs/superpowers/specs/…`, `docs/superpowers/plans/…` | status, decisions, watchlist, spec/plan copies |
@@ -916,18 +926,29 @@ size_t SyncGate::NumWaiting() const { std::lock_guard lk(mu_); return waiters_.s
   after `loader.SetLoadUnownedSlots(true);` add `if (IsPeerMode()) loader.SetOverrideExistingKeys(true);  // drakeydb: merge`.
 - [ ] **Step 5:** `Greet()` after the P1 UUID block (after line 382):
 ```cpp
-  // drakeydb: peer-mode identity checks. A peer that presents our own uuid is a clone of this
-  // node's data dir (P3's origin tagging would silently drop its entries) - refuse it. Otherwise
-  // register the peer so later phases can map its uuid to an origin index.
+  // drakeydb: peer-mode identity admission. Refuse our own uuid (a cloned data dir) and any uuid
+  // already claimed by another live peer link; otherwise register it for later origin mapping.
   if (IsPeerMode() && !master_context_.master_node_uuid.empty()) {
     const std::string& self_uuid = service_.server_family().node_uuid();
     if (master_context_.master_node_uuid == self_uuid) {
-      LOG(ERROR) << "Peer " << server().Description() << " presents our own node uuid "
-                 << self_uuid << "; refusing to replicate from a clone of this node";
+      ReleasePeerIdentityClaim();
+      LOG_EVERY_T(ERROR, 60) << "Peer " << server().Description()
+                             << " presents our own node uuid " << self_uuid
+                             << "; refusing to replicate from a clone of this node";
       return std::make_error_code(std::errc::operation_not_permitted);
+    }
+    if (peer_mode_->identity_claims &&
+        !peer_mode_->identity_claims->TryClaim(client_id_, master_context_.master_node_uuid)) {
+      LOG_EVERY_T(ERROR, 60)
+          << "Peer " << server().Description() << " presents node uuid "
+          << master_context_.master_node_uuid
+          << " which is already attached through another endpoint; refusing duplicate stream";
+      return std::make_error_code(std::errc::address_in_use);
     }
     if (peer_mode_->registry)
       peer_mode_->registry->AddOrGet(master_context_.master_node_uuid);
+  } else if (IsPeerMode()) {
+    ReleasePeerIdentityClaim();
   }
 ```
 - [ ] **Step 6:** build `ninja -j4 dragonfly multi_master_test dragonfly_test` and run
@@ -1041,7 +1062,8 @@ TEST_F(PeerManagerFamilyTest, ShutdownRefusesFurtherAdds) {
   `~PeerReplicationManager() { Shutdown(); }`; gate constructed with
   `[] { auto* ss = ServerState::tlocal(); return ss != nullptr && ss->gstate() == GlobalState::LOADING; }`
   — include `server/server_state.h`). `Add` step (2) must run with `mu_` released (blocking
-  network); `Replica` ctor receives `ReplicaPeerMode{&gate_, registry_}`.
+  network); `Replica` ctor receives
+  `ReplicaPeerMode{&gate_, registry_, &identity_claims_}`.
 - [ ] **Step 4:** `./peer_replication_test` → all PASS; `./multi_master_test` still green.
 - [ ] **Step 5:** pre-commit; commit `feat: PeerReplicationManager - add/remove/no-one for active-node peer links (P2)`.
 

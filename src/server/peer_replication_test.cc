@@ -28,6 +28,24 @@ ABSL_DECLARE_FLAG(bool, multi_master);
 
 namespace dfly {
 
+TEST(PeerIdentityClaimsTest, RejectsDuplicateAndReleasesOrMovesClaims) {
+  PeerIdentityClaims claims;
+  EXPECT_TRUE(claims.TryClaim(1, "peer-a"));
+  EXPECT_TRUE(claims.TryClaim(1, "peer-a"));  // idempotent reconnect
+  EXPECT_FALSE(claims.TryClaim(2, "peer-a"));
+
+  claims.Release(1);
+  EXPECT_TRUE(claims.TryClaim(2, "peer-a"));
+  EXPECT_TRUE(claims.TryClaim(2, "peer-b"));
+  EXPECT_TRUE(claims.TryClaim(1, "peer-a"));  // moving owner 2 released its old UUID
+
+  // A failed identity switch releases the caller's stale claim.
+  EXPECT_FALSE(claims.TryClaim(1, "peer-b"));
+  EXPECT_TRUE(claims.TryClaim(3, "peer-a"));
+  claims.Release(2);
+  EXPECT_TRUE(claims.TryClaim(1, "peer-b"));
+}
+
 // Launch::post-constructed fibers only get queued (AddReady) on the constructing thread's
 // scheduler; they don't start running until that thread yields (e.g. at Join()). So fibers built
 // directly on the bare gtest thread never actually interleave -- a real test of SyncGate's FIFO

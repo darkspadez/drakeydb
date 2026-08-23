@@ -271,6 +271,20 @@ async def wait_for_peers(c, n, timeout=90):
             await asyncio.sleep(0.2)
 
 
+async def wait_for_peer_links(c, total, up, timeout=90):
+    """Wait until INFO shows `total` attached peers and at least `up` established links."""
+    async with async_timeout.timeout(timeout):
+        while True:
+            info = await c.info("replication")
+            peers = [info.get(f"master{i}") for i in range(int(info.get("connected_masters", 0)))]
+            if (
+                len(peers) == total
+                and sum(bool(p and p["link_status"] == "up") for p in peers) >= up
+            ):
+                return info
+            await asyncio.sleep(0.2)
+
+
 async def test_replicaof_flag_list_requires_active_replica(
     df_factory: DflyInstanceFactory, tmp_path
 ):
@@ -321,6 +335,44 @@ async def test_replicaof_flag_list_attaches_all_peers(df_factory: DflyInstanceFa
     a.start()
     info = await wait_for_peers(a.client(), 2)
     assert {info["master0"]["port"], info["master1"]["port"]} == {b.port, c.port}
+
+
+async def test_replicaof_flag_aliases_admit_one_peer_uuid(df_factory: DflyInstanceFactory):
+    master = df_factory.create(proactor_threads=2)
+    master.start()
+    c_master = master.client()
+    await c_master.set("alias:counter", 0)
+
+    active = df_factory.create(
+        proactor_threads=2,
+        active_replica="true",
+        multi_master="true",
+        replicaof=f"localhost:{master.port},127.0.0.1:{master.port}",
+    )
+    active.start()
+    c_active = active.client()
+
+    await wait_for_peer_links(c_active, total=2, up=1)
+    # The losing background link keeps retrying, but must never be admitted while the winner owns
+    # this UUID. Give it several reconnect intervals before checking the steady link count.
+    await asyncio.sleep(1.5)
+    info = await c_active.info("replication")
+    peers = [info[f"master{i}"] for i in range(info["connected_masters"])]
+    assert sum(p["link_status"] == "up" for p in peers) == 1
+
+    assert await c_master.incr("alias:counter") == 1
+    await wait_for_value(c_active, "alias:counter", "1")
+    await asyncio.sleep(1.0)
+    assert await c_active.get("alias:counter") == "1"
+
+    winner = next(p for p in peers if p["link_status"] == "up")
+    assert (
+        await c_active.execute_command(f"REPLICAOF REMOVE {winner['host']} {winner['port']}")
+        == "OK"
+    )
+    await wait_for_peers(c_active, 1)
+    assert await c_master.incr("alias:counter") == 2
+    await wait_for_value(c_active, "alias:counter", "2")
 
 
 # ---- Phase 2: fan-in ----
@@ -447,6 +499,25 @@ async def test_same_uuid_peer_refused(df_factory: DflyInstanceFactory):
     with pytest.raises(redis.exceptions.ResponseError):
         await c_a.execute_command(f"REPLICAOF localhost {clone.port}")
     assert (await c_a.info("replication"))["connected_masters"] == 0
+
+
+async def test_same_master_alias_endpoint_refused(df_factory: DflyInstanceFactory):
+    a = df_factory.create(**active_args())
+    master = df_factory.create(proactor_threads=2)
+    df_factory.start_all([a, master])
+    c_a, c_master = a.client(), master.client()
+    await c_master.set("blocking-alias:counter", 0)
+
+    assert await c_a.execute_command(f"REPLICAOF localhost {master.port}") == "OK"
+    await wait_for_peers(c_a, 1)
+    with pytest.raises(redis.exceptions.ResponseError):
+        await c_a.execute_command(f"REPLICAOF 127.0.0.1 {master.port}")
+    await wait_for_peers(c_a, 1)
+
+    assert await c_master.incr("blocking-alias:counter") == 1
+    await wait_for_value(c_a, "blocking-alias:counter", "1")
+    await asyncio.sleep(1.0)
+    assert await c_a.get("blocking-alias:counter") == "1"
 
 
 async def test_active_replica_single_peer_replaces(df_factory: DflyInstanceFactory):
