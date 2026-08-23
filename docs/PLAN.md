@@ -3,14 +3,14 @@
 > **Continue here.** This is the approved, living plan and canonical copy for the drakeydb fork.
 > Update the status block below as phases land.
 
-## Current status (last updated 2026-08-22)
+## Current status (last updated 2026-08-23)
 
 | Phase | Status | Where |
 |---|---|---|
 | **P0 — Repo hygiene + rename** | ✅ **complete, verified** | PR [#1](https://github.com/darkspadez/drakeydb/pull/1), branch `feat/phase0-drakeydb-rename`, commit `7ca99f4c` |
 | **P1 — Identity foundations** | ✅ **complete, verified** | branch `feat/phase1-identity`, commits `9e653ab3..9c491fac` |
-| **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3), branch `feat/phase2-fanin` — see [Phase 2](#phase-2--writable-multi-source-replica-fan-in) |
-| **P3 — Origin-tagged journal + active pair/mesh** | ⏭️ **next up** | see [Phase 3](#phase-3--origin-tagged-journal--active-pairmesh) |
+| **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3) **merged** as `cd8e0602` — see [Phase 2](#phase-2--writable-multi-source-replica-fan-in) |
+| **P3 — Origin-tagged journal + active pair/mesh** | 🚧 **in progress** | branch `feat/phase3-origin-journal`; design + task plan in `docs/superpowers/{specs,plans}/2026-08-23-phase3-origin-journal*.md` — see [Phase 3](#phase-3--origin-tagged-journal--active-pairmesh) |
 | P4–P9 | not started | — |
 
 **P0 verification record** (Ubuntu 24.04 arm64 container, OrbStack): debug build produces
