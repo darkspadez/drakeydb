@@ -680,4 +680,137 @@ TEST_F(OriginJournalFamilyTest, SquashedStubInheritsParentOrigin) {
   pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
 }
 
+namespace {
+// drakeydb: Phase 3 T4 -- like OriginCapturingConsumer above, but also captures entry_flags and
+// the command name, so a test can isolate the "DEL" entries among a mix of setup commands
+// instead of assuming a DEL is the only or the last entry seen.
+struct CapturedEntry {
+  std::string cmd;
+  uint32_t origin_idx;
+  uint8_t entry_flags;
+};
+
+class OriginFlagCapturingConsumer : public journal::JournalConsumerInterface {
+ public:
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    entries.push_back(
+        {std::string(item.cmd), item.journal_item.origin_idx, item.journal_item.entry_flags});
+  }
+  void ThrottleIfNeeded() override {
+  }
+
+  std::vector<CapturedEntry> entries;
+};
+
+// Returns the last captured entry with cmd == "DEL", or nullptr if none was seen.
+const CapturedEntry* LastDel(const std::vector<CapturedEntry>& entries) {
+  for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+    if (it->cmd == "DEL")
+      return &*it;
+  }
+  return nullptr;
+}
+}  // namespace
+
+// drakeydb: Phase 3 T4 acceptance case. A plain user-issued DEL is an ordinary auto-journaled
+// command (Transaction::LogJournalOnShard) and must carry neither the expiry flag nor a
+// non-self origin. A key that outlives its TTL and is then accessed is instead deleted via
+// db_slice.cc's ExpireIfNeeded -> RecordExpiryBlocking (tx_base.h/.cc) -- a completely different
+// path from the user DEL above -- and must carry journal::kEntryFlagExpired with origin
+// kSelfIdx: an expiry is always a local decision, never the replay of a peer's command.
+// Falsifying: dropping the entry_flags plumbing in RecordExpiryBlocking (tx_base.cc) makes the
+// second DEL come back with entry_flags == 0, indistinguishable from the first.
+TEST_F(OriginJournalFamilyTest, ExpiredKeyDelCarriesExpiryFlagUserDelDoesNot) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  Run({"set", "plain-key", "v"});
+  Run({"del", "plain-key"});
+  EXPECT_EQ(Run({"exists", "plain-key"}).GetInt(), 0);
+
+  Run({"set", "expiring-key", "v", "PX", "1"});
+  AdvanceTime(2);
+  Run({"get", "expiring-key"});  // triggers lazy ExpireIfNeeded on access.
+  EXPECT_EQ(Run({"exists", "expiring-key"}).GetInt(), 0);
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+
+  std::vector<CapturedEntry> dels;
+  for (const auto& e : consumer.entries) {
+    if (e.cmd == "DEL")
+      dels.push_back(e);
+  }
+  ASSERT_EQ(2u, dels.size());
+
+  EXPECT_EQ(0, dels[0].entry_flags);
+  EXPECT_EQ(PeerRegistry::kSelfIdx, dels[0].origin_idx);
+
+  EXPECT_TRUE(dels[1].entry_flags & journal::kEntryFlagExpired);
+  EXPECT_EQ(PeerRegistry::kSelfIdx, dels[1].origin_idx);
+}
+
+// drakeydb: Phase 3 T4 acceptance case. A DEL derived from a collection command emptying its key
+// -- here, HTTL discovering a hash field's TTL has lazily expired, leaving the hash empty, via
+// HSetFamily::DeleteIfEmpty (hset_family.cc) -- must inherit the causing transaction's origin
+// instead of always being attributed to this node. Falsifying: reverting
+// DbContext::repl_origin_idx (tx_base.h), Transaction::GetDbContext's propagation of it
+// (transaction.h), or the DeleteIfEmpty call site's switch to the DbContext-aware RecordDelete
+// overload (hset_family.cc) makes the derived DEL come back kSelfIdx even though the causing
+// HTTL ran under kPeerOrigin.
+TEST_F(OriginJournalFamilyTest, DerivedDeleteInheritsCausingTransactionOrigin) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  // Set up a hash with one field carrying a short TTL, as an ordinary self-originated client
+  // command -- the setup's own origin is irrelevant to what this test checks.
+  EXPECT_EQ(Run({"hset", "h", "f", "v"}).GetInt(), 1);
+  Run({"hexpire", "h", "1", "FIELDS", "1", "f"});
+  AdvanceTime(1100);
+
+  // Dispatch HTTL -- which lazily discovers the field expired and, finding the hash now empty,
+  // calls HSetFamily::DeleteIfEmpty -- through a JournalExecutor tagged as peer kPeerOrigin, as
+  // if this were a peer's own read triggering its own lazy cleanup (real peer wiring is T6;
+  // like the T3 tests above, this only proves the plumbing carries the value through).
+  // Dispatched via a plain fiber on shard 0's own proactor thread, not shard_set->Await, which
+  // runs directly on shard 0's own TxQueue-processing fiber and would self-deadlock the moment
+  // HTTL's ScheduleSingleHopT needs that same queue to schedule its hop (see
+  // SquashedStubInheritsParentOrigin above, which hit exactly that).
+  constexpr uint32_t kPeerOrigin = 5;
+  facade::DispatchResult dispatch_result = facade::DispatchResult::ERROR;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        JournalExecutor executor(service_.get());
+        executor.SetApplyOrigin(kPeerOrigin);
+
+        journal::ParsedEntry::CmdData cmd_data;
+        std::vector<std::string> parts{"HTTL", "h", "FIELDS", "1", "f"};
+        cmd_data.Assign(parts.begin(), parts.end(), parts.size());
+        dispatch_result = executor.Execute(0, cmd_data);
+      })
+      .Join();
+  EXPECT_EQ(facade::DispatchResult::OK, dispatch_result);
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+
+  // Guard against a vacuous pass: the hash must have actually been cleaned up.
+  EXPECT_EQ(Run({"exists", "h"}).GetInt(), 0);
+
+  const CapturedEntry* del = LastDel(consumer.entries);
+  ASSERT_NE(nullptr, del);
+  EXPECT_EQ(kPeerOrigin, del->origin_idx);
+  EXPECT_EQ(0, del->entry_flags);  // A derived DEL, not an expiry DEL.
+}
+
 }  // namespace dfly

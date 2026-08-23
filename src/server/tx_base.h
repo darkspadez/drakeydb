@@ -67,6 +67,17 @@ struct DbContext {
   // Optimizes unnecessary serialization reordering
   bool is_omittable_operation = false;
 
+  // drakeydb: Phase 3 -- replication-apply origin, propagated from Transaction::GetDbContext()
+  // (see repl_origin_idx_/SetReplOrigin in transaction.h). DbContext is what reaches helpers like
+  // HSetFamily::DeleteIfEmpty/SetFamily::DeleteSetIfEmpty (they take a DbContext, not an OpArgs or
+  // Transaction), so this is how RecordDelete's DbContext overload below learns the origin of the
+  // command that caused a derived DEL. Defaulted and trailing so every existing positional
+  // DbContext{...} aggregate-init call site keeps compiling unchanged (verified: none of them
+  // supply more than 3 of the 4 pre-existing fields). 0 == PeerRegistry::kSelfIdx
+  // (server/multi_master.h); a literal, not the named constant, to avoid pulling that header into
+  // one of the most widely-included headers in the tree.
+  uint32_t repl_origin_idx = 0;
+
   // Convenience method.
   DbSlice& GetDbSlice(ShardId shard_id) const;
 };
@@ -225,11 +236,24 @@ void RecordJournal(const OpArgs& op_args, std::string_view cmd, ArgSlice args, u
 
 void RecordDelete(DbIndex dbid, std::string_view key);
 
+// drakeydb: Phase 3 -- transaction-aware overload. Reads the replication-apply origin off
+// db_cntx (see DbContext::repl_origin_idx above) so a DEL derived from a collection command
+// emptying its key (HSetFamily::DeleteIfEmpty, SetFamily::DeleteSetIfEmpty, generic_family.cc's
+// OpScanAndDelete) inherits the origin of the command that caused it, instead of always being
+// attributed to this node. Never sets kEntryFlagExpired -- that flag is reserved for
+// RecordExpiryBlocking below, which does not go through RecordDelete.
+void RecordDelete(const DbContext& db_cntx, std::string_view key);
+
 // Record expiry in journal with independent transaction.
 // Must be called from shard thread owning key.
 // Might block the calling fiber unless journal::SetFlushMode(false) is called.
-inline void RecordExpiryBlocking(DbIndex dbid, std::string_view key) {
-  RecordDelete(dbid, key);
-}
+// drakeydb: Phase 3 -- flags the DEL as expiry-originated (journal::kEntryFlagExpired) so a later
+// peer-echo filter (T5) can suppress it: every active node expires/evicts its own keys
+// independently (KeyDB semantics), so shipping this DEL to a peer would be redundant and could
+// race with that peer's own expiry of the same key. Origin stays kSelfIdx (0, the default): an
+// expiry is always a local decision, never the replay of a peer's command. Defined out-of-line
+// (tx_base.cc) rather than inline here because it needs journal::kEntryFlagExpired and can no
+// longer just forward to RecordDelete(DbIndex, ...), which must stay flag-free.
+void RecordExpiryBlocking(DbIndex dbid, std::string_view key);
 
 }  // namespace dfly

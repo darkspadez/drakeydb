@@ -344,7 +344,13 @@ class Transaction {
   bool IsGlobal() const;
 
   DbContext GetDbContext() const {
-    return DbContext{namespace_, db_index_, time_now_ms_};
+    // drakeydb: Phase 3 -- propagate this transaction's replication-apply origin so
+    // DbContext-only call sites (e.g. HSetFamily::DeleteIfEmpty/SetFamily::DeleteSetIfEmpty ->
+    // RecordDelete) can journal derived DELs under the correct origin. See
+    // repl_origin_idx_/SetReplOrigin below.
+    DbContext ctx{namespace_, db_index_, time_now_ms_};
+    ctx.repl_origin_idx = repl_origin_idx_;
+    return ctx;
   }
 
   Namespace& GetNamespace() const {

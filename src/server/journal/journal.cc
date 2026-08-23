@@ -85,12 +85,14 @@ LSN GetLsn() {
 }
 
 void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
-                 Entry::Payload payload, uint32_t origin_idx, uint64_t mvcc) {
+                 Entry::Payload payload, uint32_t origin_idx, uint64_t mvcc, uint8_t entry_flags) {
   Entry entry{txid, opcode, dbid, slot, std::move(payload)};
-  // drakeydb: Phase 3 -- stamp origin/mvcc onto the entry; defaults to self (0/0) for callers
-  // that don't pass them. See journal.h for why this isn't folded into the Entry constructor.
+  // drakeydb: Phase 3 -- stamp origin/mvcc/entry_flags onto the entry; defaults to self/0/none
+  // for callers that don't pass them. See journal.h for why this isn't folded into the Entry
+  // constructor.
   entry.origin_idx = origin_idx;
   entry.mvcc = mvcc;
+  entry.entry_flags = entry_flags;
   journal_slice.AddLogRecord(entry);
 }
 

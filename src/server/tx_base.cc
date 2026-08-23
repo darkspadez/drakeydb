@@ -69,6 +69,20 @@ void RecordDelete(DbIndex dbid, string_view key) {
   journal::RecordEntry(0, journal::Op::COMMAND, dbid, KeySlot(key), Payload("DEL", ArgSlice{key}));
 }
 
+void RecordDelete(const DbContext& db_cntx, string_view key) {
+  // drakeydb: Phase 3 -- see the declaration in tx_base.h. origin_idx is the only non-default
+  // journal::RecordEntry arg passed here; entry_flags stays 0 (this is never an expiry DEL).
+  journal::RecordEntry(0, journal::Op::COMMAND, db_cntx.db_index, KeySlot(key),
+                       Payload("DEL", ArgSlice{key}), db_cntx.repl_origin_idx);
+}
+
+void RecordExpiryBlocking(DbIndex dbid, string_view key) {
+  // drakeydb: Phase 3 -- see the declaration in tx_base.h. origin_idx stays default (0 ==
+  // kSelfIdx; an expiry is always a local decision); entry_flags carries kEntryFlagExpired.
+  journal::RecordEntry(0, journal::Op::COMMAND, dbid, KeySlot(key), Payload("DEL", ArgSlice{key}),
+                       /* origin_idx= */ 0, /* mvcc= */ 0, journal::kEntryFlagExpired);
+}
+
 LockTag::LockTag(std::string_view key) {
   if (LockTagOptions::instance().enabled)
     str_ = LockTagOptions::instance().Tag(key);
