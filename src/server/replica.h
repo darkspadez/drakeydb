@@ -240,16 +240,35 @@ class Replica : ProtocolClient {
 
   // drakeydb: set iff this Replica is a peer-mode replica of an active node (see IsPeerMode()).
   std::optional<ReplicaPeerMode> peer_mode_;
+
+  // drakeydb: Phase 3 T6 -- the PeerRegistry origin index for master_context_.master_node_uuid,
+  // captured by Greet() from PeerRegistry::AddOrGet(). Threaded down to each DflyShardReplica
+  // (see InitiateDflySync) and to ConsumeRedisStream's own ConnectionContext, so writes applied
+  // from this peer are journaled with its origin instead of kSelfIdx. Stays at its default for a
+  // non-peer Replica, since Greet()'s peer-only branches never run for one.
+  // 0 == PeerRegistry::kSelfIdx (server/multi_master.h); a literal, not the named constant,
+  // matching ConnectionContext::repl_origin_idx's own convention (conn_context.h) to avoid
+  // pulling that header into this one just for a constant.
+  uint32_t peer_origin_idx_ = 0;
 };
 
 class RdbLoader;
 // This class implements a single shard replication flow from a Dragonfly master instance.
 // Multiple DflyShardReplica objects are managed by a Replica object.
 class DflyShardReplica : public ProtocolClient {
+  // drakeydb: Phase 3 T6 -- lets DflyShardReplicaOriginTest (peer_replication_test.cc)
+  // construct a flow directly (no socket) and inspect that the origin idx passed at
+  // construction reaches executor_'s ConnectionContext.
+  friend class DflyShardReplicaOriginTest;
+
  public:
+  // `origin_idx`: this flow's PeerRegistry origin index (Replica::Greet() obtains it from
+  // PeerRegistry::AddOrGet()); PeerRegistry::kSelfIdx (0) for a non-peer flow. Threaded straight
+  // to executor_->SetApplyOrigin() at construction -- see that method's doc comment
+  // (journal/executor.h) for why this is set once here rather than reaching back into Replica.
   DflyShardReplica(ServerContext server_context, MasterContext master_context, uint32_t flow_id,
                    Service* service, std::shared_ptr<MultiShardExecution> multi_shard_exe,
-                   class RdbLoadContext* load_context);
+                   class RdbLoadContext* load_context, uint32_t origin_idx);
   ~DflyShardReplica();
 
   void Cancel();

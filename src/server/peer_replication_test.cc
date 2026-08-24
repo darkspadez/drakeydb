@@ -15,8 +15,11 @@
 
 #include "base/gtest.h"
 #include "facade/facade_test.h"
+#include "server/journal/executor.h"
 #include "server/multi_master.h"
 #include "server/node_identity.h"
+#include "server/rdb_load_context.h"
+#include "server/replica.h"
 #include "server/test_utils.h"
 #include "util/fibers/fibers.h"
 #include "util/fibers/pool.h"
@@ -325,6 +328,52 @@ TEST_F(PeerManagerFamilyTest, ExclusiveLoadingIsUnavailableOutsideActiveMode) {
     ASSERT_TRUE(service_->RequestLoadingState());
     service_->RemoveLoadingState();
     service_->RemoveLoadingState();
+  });
+}
+
+// drakeydb: Phase 3 T6 -- verifies DflyShardReplica threads the origin idx passed at
+// construction into its JournalExecutor via SetApplyOrigin(). That single value is what both
+// (a) PrepareTransaction (main_service.cc) reads, via the executor's ConnectionContext, to tag
+// every command this flow applies, and (b) the peer's PING re-record
+// (Replica::StableSyncDflyReadFb, replica.cc) reads via
+// executor_->connection_context()->repl_origin_idx for its own origin stamp -- so this pins the
+// one shared source of truth both consumers depend on.
+//
+// No socket is exercised: DflyShardReplica's constructor performs no I/O (ConnectAndAuth happens
+// later, in StartSyncFlow/FullSyncDflyFb), so this is a pure, in-process construction test.
+//
+// Falsifying (verified by hand): removing the executor_->SetApplyOrigin(origin_idx) call from
+// DflyShardReplica's constructor (or dropping/ignoring the origin_idx parameter) leaves
+// repl_origin_idx at its kSelfIdx/0 default, and the kPeerIdx EXPECT_EQ below fails.
+class DflyShardReplicaOriginTest : public BaseFamilyTest {
+ protected:
+  // Constructs a DflyShardReplica with `origin_idx` (no socket -- the constructor performs no
+  // I/O) and returns the origin idx observed on its JournalExecutor's ConnectionContext. Defined
+  // as a genuine member of this exact friended class, not inlined into a TEST_F body: gtest
+  // generates TEST_F's body as a method of a *derived* class
+  // (DflyShardReplicaOriginTest_Name_Test), and friendship is not inherited, so code accessing
+  // DflyShardReplica's private/protected members must run as a member of DflyShardReplicaOriginTest
+  // itself (same reasoning as MemBufControllerTest in rdb_test.cc).
+  uint32_t ObservedOriginIdx(uint32_t origin_idx) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, origin_idx);
+    return flow.executor_->connection_context()->repl_origin_idx;
+  }
+};
+
+TEST_F(DflyShardReplicaOriginTest, ConstructorThreadsOriginIntoExecutor) {
+  constexpr uint32_t kPeerIdx = 7;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  pp_->at(0)->Await([&] {
+    EXPECT_EQ(kPeerIdx, ObservedOriginIdx(kPeerIdx));
+
+    // A non-peer flow (PeerRegistry::kSelfIdx == 0) must stay byte-identical to upstream: 0 is
+    // already ConnectionContext::repl_origin_idx's default, so SetApplyOrigin(0) is a true no-op.
+    EXPECT_EQ(PeerRegistry::kSelfIdx, ObservedOriginIdx(PeerRegistry::kSelfIdx));
   });
 }
 

@@ -444,11 +444,21 @@ error_code Replica::Greet() {
       return std::make_error_code(std::errc::address_in_use);
     }
     if (peer_mode_->registry)
-      peer_mode_->registry->AddOrGet(master_context_.master_node_uuid);
+      peer_origin_idx_ = peer_mode_->registry->AddOrGet(master_context_.master_node_uuid);
   } else if (IsPeerMode()) {
-    // UUID exchange is optional for Redis/older masters. Do not retain a stale claim if a
-    // reconnect succeeds against a source that no longer identifies itself.
+    // drakeydb: D2b -- peer mode now requires a uuid. Without one there is no origin to stamp,
+    // and stamping kSelfIdx would make this active node forward the source's writes back out to
+    // its own peers, breaking the no-forward rule (JournalStreamer::ShouldWrite, streamer.cc).
+    // Release any stale claim from a previous connection to this endpoint first -- exactly what
+    // the old "optional" branch did on a benign reconnect -- then refuse. KeyDB masters do reply
+    // with a uuid, so this only withdraws fan-in from a source that never identifies itself
+    // (stock Dragonfly, plain Redis) while --active_replica is on; non-active REPLICAOF is
+    // untouched (this branch only runs when IsPeerMode()).
     ReleasePeerIdentityClaim();
+    LOG_EVERY_T(ERROR, 60) << "Peer " << server().Description()
+                           << " did not send REPLCONF UUID; refusing to replicate from an "
+                              "unidentified source in peer mode";
+    return std::make_error_code(std::errc::operation_not_permitted);
   }
 
   // Announce that we are the dragonfly client.
@@ -545,6 +555,24 @@ std::error_code Replica::ConfigureDflyMaster() {
   RETURN_ON_ERR(
       SendCommandAndReadResponse(StrCat("REPLCONF CLIENT-VERSION ", DflyVersion::CURRENT_VER)));
   PC_RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
+
+  // drakeydb: announce the fork replication protocol version on every drakeydb replica, and mark
+  // ourselves as a peer link when we are one, so the master (once T7 lands) can gate peer-only
+  // behavior on it. A pre-fork master -- including, until T7 lands, every drakeydb master -- does
+  // not recognize either pair and answers -ERR; tolerate that exactly like the REPLCONF UUID
+  // fallback above and keep replicating. This tolerance is load-bearing right now, not optional.
+  RETURN_ON_ERR(
+      SendCommandAndReadResponse(StrCat("REPLCONF DRAKEY-VERSION ", kDrakeydbReplVersion)));
+  if (!CheckRespIsSimpleReply("OK")) {
+    LOG_FIRST_N(WARNING, 1) << "Master does not support REPLCONF DRAKEY-VERSION";
+  }
+
+  if (IsPeerMode()) {
+    RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF PEER 1"));
+    if (!CheckRespIsSimpleReply("OK")) {
+      LOG_FIRST_N(WARNING, 1) << "Master does not support REPLCONF PEER";
+    }
+  }
 
   return error_code{};
 }
@@ -668,7 +696,8 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
       partial_sync_lsn = shard_flows_[i]->JournalExecutedCount();
     }
     shard_flows_[i].reset(new DflyShardReplica(server(), master_context_, i, &service_,
-                                               multi_shard_exe_, load_context.get()));
+                                               multi_shard_exe_, load_context.get(),
+                                               peer_origin_idx_));
     if (partial_sync_lsn > 0) {
       shard_flows_[i]->SetRecordsExecuted(partial_sync_lsn);
     }
@@ -838,6 +867,13 @@ error_code Replica::ConsumeRedisStream() {
   conn_context.journal_emulated = true;
   conn_context.skip_acl_validation = true;
   conn_context.ns = &namespaces->GetDefaultNamespace();
+  // drakeydb: Phase 3 T6 -- tag every command this Redis-protocol stream applies with the
+  // source's PeerRegistry origin (kSelfIdx/0 for a non-peer Replica, so this is a no-op there).
+  // PrepareTransaction (main_service.cc) reads this off the connection to stamp the resulting
+  // Transaction/journal entries. This ConnectionContext is separate from JournalExecutor's (used
+  // by the DflyShardReplica/dfly-stream path), so it needs this same value set independently --
+  // see JournalExecutor::SetApplyOrigin's doc comment (journal/executor.h).
+  conn_context.repl_origin_idx = peer_origin_idx_;
 
   // we never reply back on the commands.
   facade::CapturingReplyBuilder null_builder{facade::ReplyMode::NONE};
@@ -1241,7 +1277,14 @@ void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
       if (EngineShard::tlocal() && EngineShard::tlocal()->journal()) {
         // We must register this entry to the journal to allow partial sync
         // if journal is active.
-        journal::RecordEntry(0, journal::Op::PING, 0, nullopt, {});
+        // drakeydb: Phase 3 T6 -- stamp this peer's origin (the same value threaded into
+        // executor_'s ConnectionContext at construction, see SetApplyOrigin above), so a
+        // peer-mode consumer of OUR journal (JournalStreamer::ShouldWrite) recognizes this
+        // re-recorded PING as peer-authored and does not forward it back out to our other
+        // peers. Without this the PING is indistinguishable from a self-originated one and
+        // circulates the mesh forever, consuming a real LSN slot on every node each hop.
+        journal::RecordEntry(0, journal::Op::PING, 0, nullopt, {},
+                             executor_->connection_context()->repl_origin_idx);
       }
     } else if (tx_data.opcode == journal::Op::ORIGIN) {
       // drakeydb: Phase 3 origin announcements are not yet consumed on the stable-sync path;
@@ -1344,13 +1387,17 @@ void DflyShardReplica::StableSyncDflyAcksFb(ExecutionState* cntx) {
 DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext master_context,
                                    uint32_t flow_id, Service* service,
                                    std::shared_ptr<MultiShardExecution> multi_shard_exe,
-                                   RdbLoadContext* load_context)
+                                   RdbLoadContext* load_context, uint32_t origin_idx)
     : ProtocolClient(server_context),
       service_(*service),
       master_context_(master_context),
       multi_shard_exe_(multi_shard_exe),
       flow_id_(flow_id) {
   executor_ = std::make_unique<JournalExecutor>(service);
+  // drakeydb: Phase 3 T6 -- a link's origin is constant for its lifetime, so this is set once,
+  // here at flow setup, not per entry. Also read back by StableSyncDflyReadFb's PING re-record
+  // below, via executor_->connection_context()->repl_origin_idx.
+  executor_->SetApplyOrigin(origin_idx);
   rdb_loader_ = std::make_unique<RdbLoader>(&service_, load_context);
   rdb_loader_->SetLoadUnownedSlots(true);
   rdb_loader_->SetShardCount(master_context.num_flows);

@@ -191,6 +191,56 @@ async def test_uuid_cleared_when_reconnect_master_lacks_exchange(
         pytest.fail("replica did not reconnect without stale UUID state")
 
 
+async def test_configure_dfly_master_sends_and_tolerates_drakey_version_and_peer(
+    df_factory: DflyInstanceFactory, proxy_factory
+):
+    """ConfigureDflyMaster (replica.cc) sends REPLCONF DRAKEY-VERSION on every drakeydb replica,
+    and additionally REPLCONF PEER 1 in peer mode. Our own master doesn't recognize either pair
+    yet (the master-side parser lands in a later task) and answers -ERR; the replica must
+    tolerate that and keep replicating regardless -- this is load-bearing, not optional, until
+    that lands.
+
+    Falsifying: override_next_response only clears its pending override once its marker is
+    actually seen on the wire (see proxy.py), and refuses to arm a second one while the first is
+    still pending. Greet() -- and thus the blocking REPLICAOF below -- only returns once
+    ConfigureDflyMaster has finished sending both REPLCONF pairs for that attempt, so if either
+    stopped being sent, its override would still be pending by the time the harmless probe below
+    is armed, and that call would raise "a response override is already pending" instead of
+    letting the assertions that follow run. Each half uses its own proxy so the two probes can't
+    interfere with each other.
+    """
+    master = df_factory.create(proactor_threads=2)
+    active = df_factory.create(proactor_threads=2, active_replica="true")
+    df_factory.start_all([master, active])
+    c_master, c_active = master.client(), active.client()
+    await c_master.set("k1", "v1")
+
+    # --- REPLCONF DRAKEY-VERSION: sent on every drakeydb replica, peer or not.
+    proxy1 = await proxy_factory(master.port)
+    await proxy1.override_next_response(
+        b"REPLCONF DRAKEY-VERSION ", b"-ERR unknown REPLCONF option\r\n"
+    )
+    assert await c_active.execute_command(f"REPLICAOF localhost {proxy1.port}") == "OK"
+    await proxy1.override_next_response(b"__unused_probe_marker__", b"+PONG\r\n")
+    # wait_available_async (PING-based) is not a reliable full-sync-done signal for a peer link:
+    # unlike a plain replica's LOADING state, it does not reliably fail PING with
+    # BusyLoadingError. wait_for_peers checks sync_in_progress==0 on the peer link itself instead
+    # -- the same signal every other fan-in test in this file uses for the same reason.
+    await wait_for_peers(c_active, 1)
+    assert await c_active.get("k1") == "v1"
+    assert await c_active.execute_command(f"REPLICAOF REMOVE localhost {proxy1.port}") == "OK"
+
+    # --- REPLCONF PEER 1: peer-mode only. A fresh proxy and a second key so this half doesn't
+    # depend on (or get masked by) the first half's already-merged data.
+    await c_master.set("k2", "v2")
+    proxy2 = await proxy_factory(master.port)
+    await proxy2.override_next_response(b"REPLCONF PEER ", b"-ERR unknown REPLCONF option\r\n")
+    assert await c_active.execute_command(f"REPLICAOF localhost {proxy2.port}") == "OK"
+    await proxy2.override_next_response(b"__unused_probe_marker__", b"+PONG\r\n")
+    await wait_for_peers(c_active, 1)
+    assert await c_active.get("k2") == "v2"
+
+
 async def test_replicaof_real_redis_tolerates_missing_uuid(
     df_factory: DflyInstanceFactory, redis_server, tmp_path
 ):
@@ -212,9 +262,18 @@ async def test_replicaof_real_redis_tolerates_missing_uuid(
         await r.aclose()
 
 
-async def test_active_replica_merges_redis_full_sync_and_stays_writable(
+async def test_active_replica_refuses_redis_master_without_uuid(
     df_factory: DflyInstanceFactory, redis_server, tmp_path
 ):
+    """D2b: an active node's REPLICAOF now requires the source to identify itself via REPLCONF
+    UUID. A real Redis master never does, so the handshake must now be refused instead of merging
+    -- this reverses this test's own pre-D2b behavior (plain-Redis/stock-Dragonfly fan-in was
+    never a stated goal; see PLAN.md's D2b entry). Non-active REPLICAOF against the same real
+    Redis master is untouched -- see test_replicaof_real_redis_tolerates_missing_uuid above.
+
+    Falsifying: with the D2b refusal branch reverted to its old "optional uuid" behavior, the
+    REPLICAOF call below succeeds instead of raising, and this test fails at pytest.raises.
+    """
     node = df_factory.create(
         proactor_threads=2,
         dir=str(tmp_path / "active-redis"),
@@ -226,18 +285,14 @@ async def test_active_replica_merges_redis_full_sync_and_stays_writable(
 
     r = aioredis.Redis(port=redis_server.port, decode_responses=True)
     try:
-        await c.mset({"local-only": "local", "conflict": "local"})
-        await r.mset({"redis-only": "redis", "conflict": "redis"})
-        assert await c.execute_command(f"REPLICAOF localhost {redis_server.port}") == "OK"
-        await wait_available_async(c)
-
-        @assert_eventually(times=300)
-        async def merged():
-            assert await c.get("local-only") == "local"
-            assert await c.get("redis-only") == "redis"
-            assert await c.get("conflict") == "redis"
-
-        await merged()
+        await c.set("local-only", "local")
+        await r.set("redis-only", "redis")
+        with pytest.raises(redis.exceptions.ResponseError):
+            await c.execute_command(f"REPLICAOF localhost {redis_server.port}")
+        assert (await c.info("replication"))["connected_masters"] == 0
+        # A refused handshake must not merge the source's data, drop our own, or stop writes.
+        assert await c.get("local-only") == "local"
+        assert await c.get("redis-only") is None
         assert await c.set("still-writable", "yes")
     finally:
         await r.aclose()

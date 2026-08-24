@@ -869,13 +869,10 @@ class JournalStreamerPeerFilterTest : public ::testing::Test {
 // drakeydb: fix-round-1 -- LSN2/LSN9 (peer-origin SET) are representative of shipped behavior:
 // Transaction::LogJournalOnShard already threads a real peer origin onto COMMAND entries applied
 // from a peer (T3, tested in multi_master_test.cc's OriginJournalFamilyTest suite). LSN5
-// (peer-origin PING) is NOT representative of what production emits today: replica.cc:1244
-// re-records a received PING via journal::RecordEntry(0, journal::Op::PING, 0, nullopt, {}) with
-// the default (self) origin, unconditionally, regardless of who sent it. This test still pins
-// the correct ShouldWrite behavior for a PING that *does* carry a peer origin -- worth keeping,
-// since T6 is expected to make replica.cc stamp one -- but do not read LSN5 passing as evidence
-// that peer PINGs are already suppressed end to end; see ShouldWrite's own comment (streamer.cc)
-// for the same caveat.
+// (peer-origin PING) was NOT representative of what production emitted at the time this test was
+// written; T6 closed that gap -- replica.cc's StableSyncDflyReadFb now re-records a received PING
+// with the sending peer's origin (via executor_->connection_context()->repl_origin_idx), not the
+// default self origin -- so LSN5 now also pins real, shipped behavior, like LSN2/LSN9.
 TEST_F(JournalStreamerPeerFilterTest, MixedOriginBacklogPeerVsFullStream) {
   constexpr uint32_t kPeerIdx = 5;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
   const std::string kUuid = "11111111-2222-3333-4444-555555555555";
@@ -904,10 +901,9 @@ TEST_F(JournalStreamerPeerFilterTest, MixedOriginBacklogPeerVsFullStream) {
 
     RecordEntry(0, Op::PING, 0, nullopt, {},
                 kPeerIdx);  // LSN5: a PING carrying a peer origin -- dropped for peer via the
-                            // *origin* check (not opcode), kept full. This pins ShouldWrite's
-                            // behavior for a PING that DOES carry a peer origin; it does not
-                            // claim replica.cc produces one today -- see the fix-round-1 note
-                            // below and in ShouldWrite's own comment (streamer.cc).
+                            // *origin* check (not opcode), kept full. Representative of shipped
+                            // behavior since T6 (see the fix-round-1 note below and ShouldWrite's
+                            // own comment in streamer.cc).
 
     {
       // LSN6: Op::ORIGIN, given origin_idx == kSelfIdx (matching how PeerRegistry::AddOrGet

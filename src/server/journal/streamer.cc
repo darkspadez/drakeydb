@@ -189,15 +189,10 @@ bool JournalStreamer::ShouldWrite(const journal::JournalChangeItem& item) const 
   //
   // Op::LSN and Op::PING are deliberately NOT dropped by opcode here: LSN bookkeeping and
   // ack/partial-resume accounting on the receiving side depend on both reaching the consumer
-  // (see TransactionReader::NextTxData's DCHECK_EQ and replica.cc's journal_rec_executed_).
-  //
-  // drakeydb: KNOWN GAP, not this task's to fix (assigned to T6) -- a peer's re-recorded PING is
-  // NOT currently suppressed by the origin_idx check above. replica.cc:1244 re-records a received
-  // PING via journal::RecordEntry(0, journal::Op::PING, 0, nullopt, {}), unconditionally with the
-  // default (self) origin, never the sending peer's -- so this filter cannot distinguish it from
-  // a locally-originated PING and forwards it. Stamping the peer's origin at that re-record site
-  // is T6's job. This comment exists so the gap stays visible instead of reading as already
-  // handled; see journal_test.cc's MixedOriginBacklogPeerVsFullStream for the same caveat.
+  // (see TransactionReader::NextTxData's DCHECK_EQ and replica.cc's journal_rec_executed_). A
+  // peer's re-recorded PING (replica.cc's StableSyncDflyReadFb) carries that peer's origin (T6),
+  // so the origin_idx check above -- not an opcode check -- is what suppresses it from being
+  // forwarded back out and circulating the mesh forever.
   if (meta.opcode == journal::Op::ORIGIN)
     return false;
 
