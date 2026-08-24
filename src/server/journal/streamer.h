@@ -24,6 +24,15 @@ class JournalStreamer : public journal::JournalConsumerInterface {
     bool should_sent_lsn = false;
     bool init_from_stable_sync = false;
     LSN start_partial_sync_at = 0;
+
+    // drakeydb: Phase 3 T5 -- populated by T7 in DflyCmd::StartStableSyncInThread from the
+    // peer's ReplicaInfo (not this task's scope -- see multi_master.{h,cc}'s PeerRegistry for
+    // where a peer's identity is established). When peer_mode is set, the base ShouldWrite()
+    // drops entries that are not this node's own writes (origin_idx != PeerRegistry::kSelfIdx),
+    // expiry-flagged DELs, and Op::ORIGIN dictionary entries -- see streamer.cc. peer_uuid names
+    // which peer this streamer feeds; T5's filter does not consult it (reserved for T6/T7).
+    bool peer_mode = false;
+    std::string peer_uuid;
   };
 
   JournalStreamer(ExecutionState* cntx, Config config);
@@ -59,9 +68,13 @@ class JournalStreamer : public journal::JournalConsumerInterface {
   // Blocks the if the consumer if not keeping up.
   void ThrottleIfNeeded() final;
 
-  virtual bool ShouldWrite(const journal::JournalChangeItem& item) const {
-    return cntx_->IsRunning();
-  }
+  // drakeydb: Phase 3 T5 -- base implementation is the peer-echo filter (see streamer.cc); moved
+  // out of line (was inline `return cntx_->IsRunning();`) because it now needs PeerRegistry and
+  // journal::Op, which streamer.h does not otherwise depend on. Covers both the live path
+  // (ConsumeJournalChange) and the partial-replay path (MaybePartialStreamLSNs), since both
+  // funnel through ConsumeJournalChange -> ShouldWrite. RestoreStreamer's override below does
+  // NOT call this base -- see its own declaration.
+  virtual bool ShouldWrite(const journal::JournalChangeItem& item) const;
 
   void WaitForInflightToComplete(bool with_timeout);
 
@@ -77,11 +90,17 @@ class JournalStreamer : public journal::JournalConsumerInterface {
 
   PendingBuf pending_buf_;
 
- private:
   // Return true if all lsn's from config_.start_partial_sync_at were sent (or if started from 0).
   // Return false if not all lsn's were sent (stalled) in time. Cancels the context with error.
+  // drakeydb: Phase 3 T5 -- protected (was private) so journal_test.cc's mixed-origin backlog
+  // test can drive this directly, via a test-only subclass exposing it with a `using` declaration
+  // -- see journal_test.cc. In production this is only ever reached via the stalled-writer fiber
+  // below (StalledDataWriterFiber), which additionally requires config_.init_from_stable_sync and
+  // a live ProactorBase; calling it directly lets the test exercise the real partial-replay
+  // metadata plumbing without standing up that fiber machinery.
   bool MaybePartialStreamLSNs();
 
+ private:
   void AsyncWrite(bool force_send);
   void OnCompletion(std::error_code ec, size_t len);
 

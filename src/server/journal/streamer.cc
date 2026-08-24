@@ -19,6 +19,7 @@
 #include "server/engine_shard.h"
 #include "server/journal/cmd_serializer.h"
 #include "server/journal/serializer.h"
+#include "server/multi_master.h"  // drakeydb: Phase 3 T5 -- PeerRegistry::kSelfIdx for ShouldWrite.
 #include "server/rdb_save.h"
 #include "server/server_state.h"
 #include "util/fibers/synchronization.h"
@@ -144,6 +145,61 @@ void JournalStreamer::ConsumeJournalChange(const JournalChangeItem& item) {
   }
 }
 
+// drakeydb: Phase 3 T5 -- peer-echo filter. In an N-node active-replica mesh, each of the
+// N*(N-1) one-way peer streams must carry only its sender's own writes, or an applied write
+// reflects back to its origin and re-amplifies around the mesh (PLAN.md Risk #1/#7: an echo
+// storm). Covers both the live path (ConsumeJournalChange, called directly off the journal
+// callback) and the partial-replay path (MaybePartialStreamLSNs below), since both call this via
+// ConsumeJournalChange -- see MaybePartialStreamLSNs's comment for why populating the metadata
+// this filter reads is the important part of that path.
+//
+// A full-stream (non-peer) consumer -- config_.peer_mode == false, e.g. a plain replica or
+// RestoreStreamer's own override (which does not call this base at all) -- gets everything: all
+// origins, expiry DELs, and Op::ORIGIN dictionary entries. A plain replica needs the ORIGIN
+// entries to resolve origin_idx tags on the regular entries it receives, since (unlike a mesh
+// peer) it has no direct connection of its own to learn those uuids from.
+bool JournalStreamer::ShouldWrite(const journal::JournalChangeItem& item) const {
+  if (!cntx_->IsRunning())
+    return false;
+
+  if (!config_.peer_mode)
+    return true;
+
+  const JournalItem& meta = item.journal_item;
+
+  // Not this node's own write -- it was applied here from some peer (or is that peer's own
+  // control traffic re-recorded locally, e.g. a re-recorded PING; see journal.h's RecordEntry
+  // comment and replica.cc's PING re-record). Forwarding it back to a peer stream risks echoing
+  // it toward -- or through -- whichever peer authored it.
+  if (meta.origin_idx != PeerRegistry::kSelfIdx)
+    return false;
+
+  // Expiry-triggered DEL: every node expires independently on its own clock, so peers must not
+  // receive (and re-apply) each other's expiry deletions -- see kEntryFlagExpired's definition
+  // in types.h.
+  if (meta.entry_flags & kEntryFlagExpired)
+    return false;
+
+  // Op::ORIGIN dictionary entries are always recorded self-origin (PeerRegistry::AddOrGet emits
+  // them locally), but the value it stamps into origin_idx is the *announced* peer's index, not
+  // "who authored this journal record" -- see multi_master.cc's AddOrGet. So this opcode check is
+  // independently required: the origin_idx check above cannot be trusted to catch every ORIGIN
+  // entry (it only would if the announced index happened to be kSelfIdx), and conflating the two
+  // meanings of origin_idx for this one opcode would be fragile. A mesh peer doesn't need these
+  // relayed -- it discovers every other node directly (full mesh) -- so they are dropped here
+  // unconditionally for a peer consumer.
+  //
+  // Op::LSN and Op::PING are deliberately NOT dropped by opcode here: LSN bookkeeping and
+  // ack/partial-resume accounting on the receiving side depend on both reaching the consumer
+  // (see TransactionReader::NextTxData's DCHECK_EQ and replica.cc's journal_rec_executed_). A
+  // peer's own re-recorded PING is still suppressed, but via the origin_idx check above, not by
+  // opcode.
+  if (meta.opcode == journal::Op::ORIGIN)
+    return false;
+
+  return true;
+}
+
 void JournalStreamer::Start(util::FiberSocketBase* dest) {
   CHECK(dest_ == nullptr && dest != nullptr);
   dest_ = dest;
@@ -214,8 +270,27 @@ bool JournalStreamer::MaybePartialStreamLSNs() {
     // The replica sends the LSN of the next entry is wants to receive.
     while (cntx_->IsRunning() && journal::IsLSNInBuffer(lsn)) {
       JournalChangeItem item;
-      item.journal_item.data = journal::GetEntry(lsn);
-      item.journal_item.lsn = lsn;
+      // drakeydb: Phase 3 T5 -- populate origin_idx/entry_flags/opcode from the ring buffer via
+      // GetEntryMeta, not just `data`+`lsn` as before. ShouldWrite() (the peer-echo filter) reads
+      // those fields; a bare JournalChangeItem left them at their zero-value defaults (self
+      // origin, no flags, Op::COMMAND), which would have made every entry pass a peer filter --
+      // the exact echo-storm bug this task exists to close, and the reason a reconnecting peer's
+      // partial-resync is the most important case to get right (see PLAN.md Risk #1/#7).
+      //
+      // GetEntryMeta returns a reference into the ring buffer (see its contract in
+      // journal_slice.h): copy every field out here, inside this scope, before calling
+      // ConsumeJournalChange below -- which can preempt (Write -> AsyncWrite may yield) -- so the
+      // reference is never held across a point where a concurrent AddLogRecord could invalidate
+      // it (ring-buffer overwrite, CleanEntries eviction, or set_capacity growth).
+      {
+        const JournalItem& meta = journal::GetEntryMeta(lsn);
+        item.journal_item.data = meta.data;
+        item.journal_item.lsn = meta.lsn;
+        item.journal_item.time_ms = meta.time_ms;
+        item.journal_item.origin_idx = meta.origin_idx;
+        item.journal_item.entry_flags = meta.entry_flags;
+        item.journal_item.opcode = meta.opcode;
+      }
       ConsumeJournalChange(item);
       lsn++;
     }

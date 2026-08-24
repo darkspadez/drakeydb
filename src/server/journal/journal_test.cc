@@ -1,6 +1,7 @@
 #include <absl/cleanup/cleanup.h>
 #include <absl/flags/reflection.h>
 #include <absl/strings/str_join.h>
+#include <sys/socket.h>
 
 #include <array>
 #include <random>
@@ -11,18 +12,25 @@
 #include "base/gtest.h"
 #include "base/logging.h"
 #include "core/detail/gen_utils.h"
+#include "facade/facade_stats.h"
 #include "server/common.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/journal_slice.h"
 #include "server/journal/pending_buf.h"
 #include "server/journal/serializer.h"
+#include "server/journal/streamer.h"
 #include "server/journal/types.h"
+#include "server/multi_master.h"
 #include "server/serializer_commons.h"
+#include "server/server_state.h"
 #include "strings/human_readable.h"
+#include "util/fiber_socket_base.h"
 #include "util/fibers/fibers.h"
+#include "util/fibers/pool.h"
 
 ABSL_DECLARE_FLAG(uint32_t, shard_repl_backlog_time_ms);
 ABSL_DECLARE_FLAG(strings::MemoryBytesFlag, shard_repl_backlog_max_bytes);
+ABSL_DECLARE_FLAG(bool, active_replica);
 
 using namespace testing;
 using namespace std;
@@ -628,6 +636,323 @@ TEST(Journal, BacklogBoundsTimeBasedCleanup) {
   EXPECT_FALSE(slice.IsLSNInBuffer(kExpiredEntries - 1));
   EXPECT_TRUE(slice.IsLSNInBuffer(kExpiredEntries));
   EXPECT_TRUE(slice.IsLSNInBuffer(kExpiredEntries + 1));
+}
+
+// drakeydb: Phase 3 T5 -- an in-memory util::FiberSocketBase double for the JournalStreamer tests
+// below. JournalStreamer only ever calls AsyncWrite/AsyncWriteSome on its destination (never the
+// sync Write/WriteSome path, and never reads), and io::AsyncSink::AsyncWrite (io.cc) is pure
+// buffer bookkeeping with no ProactorBase dependency, so a synchronous, immediate, in-memory
+// AsyncWriteSome needs no real proactor, fiber, or OS socket at all -- just a shard/journal
+// thread-local, which the fixture below provides. Everything else is unreachable from
+// JournalStreamer's write-only usage and is stubbed only to satisfy the abstract interface.
+class CapturingFiberSocket : public util::FiberSocketBase {
+ public:
+  CapturingFiberSocket() : util::FiberSocketBase(nullptr) {
+  }
+
+  void AsyncWriteSome(const iovec* v, uint32_t len, io::AsyncProgressCb cb) override {
+    size_t total = 0;
+    for (uint32_t i = 0; i < len; ++i) {
+      captured.append(reinterpret_cast<const char*>(v[i].iov_base), v[i].iov_len);
+      total += v[i].iov_len;
+    }
+    cb(io::Result<size_t>(total));
+  }
+
+  io::Result<size_t> WriteSome(const iovec* v, uint32_t len) override {
+    size_t total = 0;
+    for (uint32_t i = 0; i < len; ++i) {
+      captured.append(reinterpret_cast<const char*>(v[i].iov_base), v[i].iov_len);
+      total += v[i].iov_len;
+    }
+    return total;
+  }
+
+  // Unused by these tests -- stubbed to satisfy FiberSocketBase's abstract interface.
+  error_code Shutdown(int) override {
+    return {};
+  }
+  AcceptResult Accept() override {
+    return nonstd::make_unexpected(std::make_error_code(std::errc::not_supported));
+  }
+  error_code Connect(const endpoint_type&, std::function<void(int)>) override {
+    return {};
+  }
+  error_code Close() override {
+    return {};
+  }
+  bool IsOpen() const override {
+    return true;
+  }
+  io::Result<size_t> RecvMsg(const msghdr&, int) override {
+    return size_t{0};
+  }
+  io::Result<size_t> Recv(const io::MutableBytes&, int) override {
+    return size_t{0};
+  }
+  void set_timeout(uint32_t) override {
+  }
+  uint32_t timeout() const override {
+    return 0;
+  }
+  endpoint_type LocalEndpoint() const override {
+    return {};
+  }
+  endpoint_type RemoteEndpoint() const override {
+    return {};
+  }
+  void RegisterOnErrorCb(std::function<void(uint32_t)>) override {
+  }
+  void CancelOnErrorCb() override {
+  }
+  void AsyncReadSome(const iovec*, uint32_t, io::AsyncProgressCb) override {
+  }
+  void RegisterOnRecv(OnRecvCb) override {
+  }
+  void ResetOnRecvHook() override {
+  }
+  bool IsUDS() const override {
+    return false;
+  }
+  native_handle_type native_handle() const override {
+    return -1;
+  }
+  error_code Create(unsigned short) override {
+    return {};
+  }
+  error_code Bind(const struct sockaddr*, unsigned) override {
+    return {};
+  }
+  error_code Listen(unsigned) override {
+    return {};
+  }
+  error_code Listen(uint16_t, unsigned) override {
+    return {};
+  }
+  error_code ListenUDS(const char*, mode_t, unsigned) override {
+    return {};
+  }
+  io::Result<size_t> TrySend(io::Bytes) override {
+    return size_t{0};
+  }
+  io::Result<size_t> TrySend(const iovec*, uint32_t) override {
+    return size_t{0};
+  }
+  io::Result<size_t> TryRecv(io::MutableBytes) override {
+    return size_t{0};
+  }
+
+  std::string captured;
+};
+
+// drakeydb: Phase 3 T5 -- exposes JournalStreamer's protected partial-replay driver for direct
+// testing. streamer.h documents why MaybePartialStreamLSNs is protected (not private) rather than
+// friended via gtest_prod.h's FRIEND_TEST: streamer.h is a production header compiled into the
+// `dragonfly` binary itself, and this project's CMake (helio_cxx_test, helio/cmake/internal.cmake)
+// only adds gtest's include directory to *_test targets, so a header a production target depends
+// on cannot include <gtest/gtest_prod.h>.
+class TestPartialSyncStreamer : public JournalStreamer {
+ public:
+  TestPartialSyncStreamer(ExecutionState* cntx, Config config) : JournalStreamer(cntx, config) {
+  }
+  using JournalStreamer::MaybePartialStreamLSNs;
+};
+
+// Needs a real per-shard journal (EngineShard::tlocal()) to drive the actual
+// journal::RecordEntry/journal::GetEntryMeta/JournalStreamer::MaybePartialStreamLSNs code path --
+// not a reimplementation of it -- so a minimal single-shard ProactorPool + EngineShardSet is
+// stood up, mirroring TransactionTest's fixture in transaction_test.cc.
+class JournalStreamerPeerFilterTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    // drakeydb: Phase 3 T5 -- JournalSlice::Init() caches extended_framing_ = IsActiveReplica()
+    // once, and Op::ORIGIN can only be written with extended framing (serializer.cc DCHECKs
+    // this). saver_ restores the flag in TearDown regardless of test outcome.
+    absl::SetFlag(&FLAGS_active_replica, true);
+    // The default backlog byte budget is 0.5% of max_memory_limit, which is unset (0) in this
+    // fixture -- CleanEntries would then evict every entry almost as soon as it's added (see
+    // BacklogHonorsByteLimitAndReplacesOversizedRecord above for the same trap). Give the backlog
+    // a generous, fixed budget instead, comfortably larger than this test's handful of entries.
+    absl::SetFlag(&FLAGS_shard_repl_backlog_max_bytes, strings::MemoryBytesFlag{1024 * 1024});
+
+    pp_.reset(fb2::Pool::Epoll(1));
+    pp_->Run();
+    pp_->AwaitBrief([](unsigned index, ProactorBase*) {
+      ServerState::Init(index, 1, nullptr, nullptr);
+      if (facade::tl_facade_stats == nullptr) {
+        facade::tl_facade_stats = new facade::FacadeStats;
+      }
+    });
+
+    shard_set = new EngineShardSet(pp_.get());
+    // Pass a no-op shard handler (not nullptr): the periodic shard-handler fiber would otherwise
+    // invoke an empty std::function and crash if it fires during the test (see TransactionTest).
+    shard_set->Init(1, [] {});
+
+    pp_->at(0)->Await([] { StartInThread(); });
+  }
+
+  void TearDown() override {
+    shard_set->PreShutdown();
+    shard_set->Shutdown();
+    delete shard_set;
+    shard_set = nullptr;
+
+    pp_->Stop();
+    pp_.reset();
+  }
+
+  absl::FlagSaver saver_;
+
+  // Decodes a captured byte stream (as accumulated by CapturingFiberSocket::captured) back into
+  // a per-entry tag list, so the test can assert on entry identity/order without needing
+  // ParsedEntry itself to be copyable (it isn't -- its copy ctor is explicitly deleted, which
+  // also suppresses the implicit move ctor, so it cannot live in a std::vector).
+  static std::vector<std::string> Decode(const std::string& bytes) {
+    base::IoBuf buf;
+    io::BufSink sink{&buf};
+    sink.Write(io::Buffer(bytes));
+    io::BufSource source{&buf};
+    JournalReader reader{&source, 0};
+
+    std::vector<std::string> tags;
+    ParsedEntry entry;
+    while (true) {
+      auto ec = reader.ReadEntry(&entry);
+      if (ec)
+        break;
+      switch (entry.opcode) {
+        case Op::COMMAND:
+          tags.push_back(absl::StrCat("CMD:", ExtractPayload(entry)));
+          break;
+        case Op::PING:
+          tags.push_back("PING");
+          break;
+        case Op::ORIGIN:
+          tags.push_back(absl::StrCat("ORIGIN:", entry.origin_uuid));
+          break;
+        default:
+          tags.push_back("OTHER");
+          break;
+      }
+    }
+    return tags;
+  }
+
+  std::unique_ptr<util::ProactorPool> pp_;
+};
+
+// drakeydb: Phase 3 T5 -- the brief's headline acceptance test (PLAN.md Risk #1 and #7 in one
+// test). Writes a ring-buffer backlog alternating self/peer origin, with one expiry-flagged DEL
+// and one Op::ORIGIN entry mixed in, then drives the REAL partial-replay path
+// (MaybePartialStreamLSNs, not a reimplementation of it) for a peer-mode consumer and a
+// full-stream consumer, and asserts the peer consumer receives only its own non-expiry,
+// non-ORIGIN writes while the full-stream consumer receives everything. Also exercises the live
+// path (ConsumeJournalChange), by writing two more entries after both streamers have caught up
+// and re-registered as live listeners (which MaybePartialStreamLSNs does at its own end).
+//
+// Falsifying (verified by hand -- see task-5-report.md for the exact reverts and results):
+//  - Reverting MaybePartialStreamLSNs to populate only `data`+`lsn` (dropping origin_idx/
+//    entry_flags/opcode) makes the peer capture equal the full capture for the backlog portion:
+//    every backlog entry defaults to origin_idx=kSelfIdx/entry_flags=0/opcode=Op::COMMAND from
+//    ShouldWrite's point of view, even for the real PING/DEL/ORIGIN entries (whose *data* bytes
+//    are unaffected, since only the filtering metadata is wrong) -- so all 7 pass the peer
+//    filter, not just 3.
+//  - Removing the origin_idx check lets LSN2/LSN5/LSN9 (peer-origin SET/PING/SET) through to the
+//    peer capture.
+//  - Removing the entry_flags check lets LSN3 (expiry-flagged DEL) through.
+//  - Removing the Op::ORIGIN opcode check lets LSN6 through -- this is the one drop rule the
+//    origin_idx check cannot backstop, because this test gives it origin_idx == kSelfIdx (as
+//    PeerRegistry::AddOrGet actually records it -- see multi_master.cc), so only the explicit
+//    opcode check catches it.
+TEST_F(JournalStreamerPeerFilterTest, MixedOriginBacklogPeerVsFullStream) {
+  constexpr uint32_t kPeerIdx = 5;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  const std::string kUuid = "11111111-2222-3333-4444-555555555555";
+
+  pp_->at(0)->Await([&] {
+    // --- Backlog: LSN1..LSN7, alternating self/peer origin plus one expiry DEL and one ORIGIN.
+    array<string_view, 2> set_a{"a", "1"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_a.data(), set_a.size()}},
+                PeerRegistry::kSelfIdx);  // LSN1: self -- kept by both.
+
+    array<string_view, 2> set_b{"b", "2"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_b.data(), set_b.size()}},
+                kPeerIdx);  // LSN2: peer -- dropped for peer, kept full.
+
+    array<string_view, 1> del_c{"c"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"DEL", ArgSlice{del_c.data(), del_c.size()}}, PeerRegistry::kSelfIdx,
+                /*mvcc=*/0,
+                kEntryFlagExpired);  // LSN3: self, expiry DEL -- dropped for peer, kept full.
+
+    RecordEntry(0, Op::PING, 0, nullopt, {},
+                PeerRegistry::kSelfIdx);  // LSN4: self PING -- never dropped by opcode; kept by
+                                          // both (origin check also passes: self).
+
+    RecordEntry(0, Op::PING, 0, nullopt, {},
+                kPeerIdx);  // LSN5: peer's re-recorded PING -- dropped for peer via the *origin*
+                            // check (not opcode), kept full.
+
+    {
+      // LSN6: Op::ORIGIN, given origin_idx == kSelfIdx (matching how PeerRegistry::AddOrGet
+      // actually records it -- see multi_master.cc) so the origin_idx check alone would NOT
+      // catch it; only the opcode check does. Dropped for peer, kept full.
+      Entry::Payload payload;
+      payload.cmd = kUuid;
+      RecordEntry(0, Op::ORIGIN, 0, nullopt, payload, PeerRegistry::kSelfIdx);
+    }
+
+    array<string_view, 2> set_d{"d", "4"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_d.data(), set_d.size()}},
+                PeerRegistry::kSelfIdx);  // LSN7: trailing self write -- kept by both; proves
+                                          // processing continues correctly past the ORIGIN entry.
+
+    ASSERT_EQ(8u, GetLsn());  // next LSN to assign; confirms exactly 7 entries were recorded.
+
+    // --- Drive the real partial-replay path for a peer-mode and a full-stream consumer.
+    ExecutionState peer_cntx;
+    JournalStreamer::Config peer_config;
+    peer_config.start_partial_sync_at = 1;
+    peer_config.peer_mode = true;
+    CapturingFiberSocket peer_socket;
+    TestPartialSyncStreamer peer_streamer(&peer_cntx, peer_config);
+    peer_streamer.Start(&peer_socket);
+    ASSERT_TRUE(peer_streamer.MaybePartialStreamLSNs());
+
+    ExecutionState full_cntx;
+    JournalStreamer::Config full_config;
+    full_config.start_partial_sync_at = 1;  // peer_mode left false: full-stream consumer.
+    CapturingFiberSocket full_socket;
+    TestPartialSyncStreamer full_streamer(&full_cntx, full_config);
+    full_streamer.Start(&full_socket);
+    ASSERT_TRUE(full_streamer.MaybePartialStreamLSNs());
+
+    // --- Live path: both streamers re-registered as listeners at the end of
+    // MaybePartialStreamLSNs; two more entries should reach them via ConsumeJournalChange.
+    array<string_view, 2> set_e{"e", "5"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_e.data(), set_e.size()}},
+                PeerRegistry::kSelfIdx);  // LSN8: self -- kept by both.
+
+    array<string_view, 2> set_f{"f", "6"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_f.data(), set_f.size()}},
+                kPeerIdx);  // LSN9: peer -- dropped for peer, kept full.
+
+    std::vector<std::string> expected_peer = {"CMD:SET a 1", "PING", "CMD:SET d 4", "CMD:SET e 5"};
+    std::vector<std::string> expected_full = {
+        "CMD:SET a 1", "CMD:SET b 2", "CMD:DEL c",  "PING", "PING", absl::StrCat("ORIGIN:", kUuid),
+        "CMD:SET d 4", "CMD:SET e 5", "CMD:SET f 6"};
+
+    EXPECT_EQ(expected_peer, JournalStreamerPeerFilterTest::Decode(peer_socket.captured));
+    EXPECT_EQ(expected_full, JournalStreamerPeerFilterTest::Decode(full_socket.captured));
+
+    peer_streamer.Cancel();
+    full_streamer.Cancel();
+  });
 }
 
 }  // namespace journal

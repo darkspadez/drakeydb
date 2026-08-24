@@ -116,6 +116,15 @@ struct JournalItem {
   // JournalSlice::GetEntryMeta().
   uint32_t origin_idx{0};
   uint8_t entry_flags{0};
+
+  // drakeydb: Phase 3 T5 -- mirrors EntryBase::opcode, exactly as origin_idx/entry_flags above,
+  // so JournalStreamer::ShouldWrite (the peer-echo filter) can drop Op::ORIGIN entries by opcode
+  // without reparsing `data`. Reparsing isn't viable: JournalWriter::Write emits a nested SELECT
+  // entry *inside* a COMMAND blob's bytes (see serializer.cc), so data[0] is frequently
+  // Op::SELECT rather than the entry's own opcode. Defaults to Op::COMMAND (the common case);
+  // JournalSlice::AddLogRecord always overwrites this from the real Entry being recorded, so the
+  // default is only ever observed for a JournalItem that was never populated via AddLogRecord.
+  Op opcode{Op::COMMAND};
 };
 
 struct JournalChangeItem {

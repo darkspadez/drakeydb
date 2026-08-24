@@ -813,4 +813,78 @@ TEST_F(OriginJournalFamilyTest, DerivedDeleteInheritsCausingTransactionOrigin) {
   EXPECT_EQ(0, del->entry_flags);  // A derived DEL, not an expiry DEL.
 }
 
+namespace {
+// drakeydb: Phase 3 T5 -- captures opcode/origin_idx/cmd for every journal entry seen. `cmd`
+// doubles as the announced uuid for an Op::ORIGIN entry: JournalSlice::AddLogRecord sets
+// JournalChangeItem::cmd from Entry::payload.cmd unconditionally (not gated on opcode), and
+// PeerRegistry::AddOrGet's ORIGIN emission puts the uuid in exactly that field (see
+// multi_master.cc) -- so this needs no wire-level decoding, unlike journal_test.cc's streamer
+// tests, which observe already-serialized bytes off a captured socket instead of live
+// JournalChangeItems.
+struct OriginOpcodeEntry {
+  journal::Op opcode;
+  uint32_t origin_idx;
+  std::string cmd;
+};
+
+class OriginOpcodeCapturingConsumer : public journal::JournalConsumerInterface {
+ public:
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    entries.push_back(
+        {item.journal_item.opcode, item.journal_item.origin_idx, std::string(item.cmd)});
+  }
+  void ThrottleIfNeeded() override {
+  }
+
+  std::vector<OriginOpcodeEntry> entries;
+};
+}  // namespace
+
+// drakeydb: Phase 3 T5 acceptance case for PeerRegistry::AddOrGet's journal fan-out. Falsifying:
+// removing the fan-out (or gating it on the wrong condition) leaves `entries` empty after the
+// first AddOrGet, failing the first ASSERT; emitting with the wrong opcode/origin_idx/payload
+// fails the three EXPECTs that follow it; re-emitting on an already-registered uuid (i.e. not
+// actually gating on `inserted`) grows entries.size() on the second, idempotent AddOrGet call.
+TEST_F(OriginJournalFamilyTest, AddOrGetEmitsOriginOnNewIndexOnly) {
+  // JournalSlice::Init() caches extended_framing_ = IsActiveReplica() once, and Op::ORIGIN can
+  // only be written with extended framing (serializer.cc DCHECKs this). Set before
+  // journal::StartInThread() below; MultiMasterFamilyTest's inherited saver_ restores it.
+  absl::SetFlag(&FLAGS_active_replica, true);
+
+  OriginOpcodeCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  PeerRegistry reg;
+  reg.Init(GenerateNodeUuid());
+  const std::string peer_uuid = GenerateNodeUuid();
+
+  // AddOrGet's shard fan-out (RunBriefInParallel) dispatches onto -- and blocks this fiber on --
+  // shard 0's own proactor thread, the same cross-thread dispatch+wait shape as
+  // JournalExecutor::Execute above; run it from an explicit fiber on shard 0 for the same reason.
+  uint32_t idx = 0;
+  pp_->at(0)->LaunchFiber([&] { idx = reg.AddOrGet(peer_uuid); }).Join();
+
+  ASSERT_FALSE(consumer.entries.empty());
+  const OriginOpcodeEntry& emitted = consumer.entries.back();
+  EXPECT_EQ(journal::Op::ORIGIN, emitted.opcode);
+  EXPECT_EQ(idx, emitted.origin_idx);
+  EXPECT_EQ(peer_uuid, emitted.cmd);
+
+  // Idempotent re-add of the same uuid: no new index, and (load-bearing for this test) no new
+  // ORIGIN entry -- AddOrGet's fan-out must be gated on actually having inserted a new index.
+  size_t count_before_repeat = consumer.entries.size();
+  uint32_t idx2 = 0;
+  pp_->at(0)->LaunchFiber([&] { idx2 = reg.AddOrGet(peer_uuid); }).Join();
+  EXPECT_EQ(idx, idx2);
+  EXPECT_EQ(count_before_repeat, consumer.entries.size());
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+}
+
 }  // namespace dfly

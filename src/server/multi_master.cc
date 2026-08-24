@@ -8,6 +8,8 @@
 #include "absl/strings/str_cat.h"
 #include "base/logging.h"
 #include "facade/cmd_arg_parser.h"
+#include "server/engine_shard_set.h"
+#include "server/journal/journal.h"
 
 ABSL_FLAG(bool, active_replica, false,
           "drakeydb: stay a writable master while replicating from the masters given to "
@@ -103,11 +105,51 @@ void PeerRegistry::Init(std::string_view self_uuid) {
 }
 
 uint32_t PeerRegistry::AddOrGet(std::string_view uuid) {
-  util::fb2::LockGuard lk(mu_);
-  auto [it, inserted] = uuid_to_idx_.try_emplace(std::string(uuid), idx_to_uuid_.size());
-  if (inserted)
-    idx_to_uuid_.emplace_back(uuid);
-  return it->second;
+  uint32_t idx;
+  bool inserted;
+  {
+    util::fb2::LockGuard lk(mu_);
+    auto [it, ins] = uuid_to_idx_.try_emplace(std::string(uuid), idx_to_uuid_.size());
+    if (ins)
+      idx_to_uuid_.emplace_back(uuid);
+    idx = it->second;
+    inserted = ins;
+  }  // drakeydb: Phase 3 T5 -- lock released before the shard fan-out below.
+
+  // drakeydb: Phase 3 T5 -- a newly-discovered peer gets announced on every shard's journal as an
+  // Op::ORIGIN entry ("this index == this uuid"), so downstream plain-replica consumers can later
+  // resolve origin_idx tags on entries this peer authored (a mesh peer doesn't need this relayed:
+  // it discovers every other node directly, so JournalStreamer::ShouldWrite drops Op::ORIGIN for
+  // peer consumers -- see streamer.cc).
+  //
+  // Emitted via journal::RecordEntry -- a real per-shard journal record occupying a real LSN slot
+  // -- rather than written directly onto a streamer's socket the way Op::LSN is. This is load
+  // bearing: replica.cc's journal_rec_executed_ accounting counts Op::ORIGIN like any other
+  // opcode, and TransactionReader::NextTxData advances its own lsn_ for every opcode except
+  // Op::LSN with a DCHECK_EQ tying the two together -- writing ORIGIN any other way would desync
+  // that counter the moment a peer link starts emitting these.
+  //
+  // Deliberately outside the lock above: RunBriefInParallel dispatches onto every shard's own
+  // fiber and blocks this fiber until they all complete, and AddOrGet can itself be called
+  // concurrently from several fibers (see PeerRegistryFiberTest) -- holding mu_ across that
+  // fan-out would serialize unrelated AddOrGet/FindIdx/GetUuid calls behind it for no reason.
+  //
+  // shard_set is null in this file's own PeerRegistry/PeerRegistryFiberTest unit tests, which
+  // exercise the registry without standing up a shard set; skip the fan-out there, the same way
+  // journal_slice.cc's GetPerShardBacklogMaxBytes() treats a null shard_set.
+  if (inserted && shard_set) {
+    using Payload = journal::Entry::Payload;
+    std::string uuid_copy(uuid);
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      if (shard->journal()) {
+        Payload payload;
+        payload.cmd = uuid_copy;
+        journal::RecordEntry(/*txid=*/0, journal::Op::ORIGIN, /*dbid=*/0, /*slot=*/std::nullopt,
+                             payload, /*origin_idx=*/idx);
+      }
+    });
+  }
+  return idx;
 }
 
 std::optional<uint32_t> PeerRegistry::FindIdx(std::string_view uuid) const {

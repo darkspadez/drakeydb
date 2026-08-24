@@ -69,6 +69,14 @@ class PeerRegistry {
   // Returns the origin index for `uuid`, assigning and appending the next monotonic index if
   // this is the first time `uuid` has been seen. Idempotent, including under concurrent callers:
   // exactly one index is ever assigned per distinct uuid.
+  //
+  // drakeydb: Phase 3 T5 -- when a NEW index is assigned, also records an Op::ORIGIN entry on
+  // every shard's journal (a fan-out from the calling fiber to shard_set, done outside this
+  // registry's own lock -- see multi_master.cc) announcing "this index == this uuid", so
+  // downstream plain-replica consumers can resolve origin_idx tags on this peer's entries. A
+  // no-op fan-out (idx assignment still happens) when shard_set is null, e.g. this file's own
+  // PeerRegistry/PeerRegistryFiberTest unit tests, which exercise the registry without a shard
+  // set.
   uint32_t AddOrGet(std::string_view uuid);
 
   // Returns the origin index for `uuid` if already registered, or nullopt otherwise. Never

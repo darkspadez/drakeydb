@@ -68,6 +68,9 @@ std::string_view GetEntry(LSN lsn) {
   return journal_slice.GetEntry(lsn);
 }
 
+// drakeydb: thin hook onto JournalSlice::GetEntryMeta -- see its declaration in journal.h and
+// definition in journal_slice.h/.cc for the contract (IsLSNInBuffer precondition, reference
+// lifetime tied to the ring buffer).
 const JournalItem& GetEntryMeta(LSN lsn) {
   return journal_slice.GetEntryMeta(lsn);
 }

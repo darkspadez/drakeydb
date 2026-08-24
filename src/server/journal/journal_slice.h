@@ -54,6 +54,22 @@ class JournalSlice {
   // origin_idx/entry_flags -- so a later peer-echo filter can inspect them without reparsing
   // `data`. Added alongside GetEntry() (rather than widening it) so GetEntry's existing caller
   // in streamer.cc, outside this task's scope, stays untouched.
+  //
+  // drakeydb: Phase 3 T5 -- contract (undocumented until now; this task is GetEntryMeta's first
+  // caller outside JournalSlice itself, via journal::GetEntryMeta -> JournalStreamer::ShouldWrite
+  // / MaybePartialStreamLSNs):
+  //  - IsLSNInBuffer(lsn) is a MANDATORY precondition. It is checked only via DCHECK here (like
+  //    GetEntry() above), so it is NOT enforced in release builds -- callers must check it
+  //    themselves first, exactly as MaybePartialStreamLSNs's `while (... && IsLSNInBuffer(lsn))`
+  //    loop guard does.
+  //  - The returned reference points INTO the ring buffer and is invalidated by any subsequent
+  //    call that mutates it: AddLogRecord's push_back once the buffer is full (overwrites the
+  //    oldest slot), CleanEntries's rerase (age/byte-limit eviction), or set_capacity (growth).
+  //    Since AddLogRecord can run from another fiber that preempts the caller (e.g. between two
+  //    statements, or inside a callback the caller invokes while still holding the reference),
+  //    the safe pattern is: take the reference, copy out the fields you need, and let it go out
+  //    of scope before doing anything that might preempt -- never store it in a variable that
+  //    outlives that copy.
   const JournalItem& GetEntryMeta(LSN lsn) const;
   // SetFlushMode with allow_flush=false is used to disable preemptions during
   // subsequent calls to AddLogRecord.

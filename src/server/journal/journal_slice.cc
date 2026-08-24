@@ -131,6 +131,9 @@ void JournalSlice::AddLogRecord(const Entry& entry) {
     // drakeydb: Phase 3 origin metadata, mirrored onto JournalItem -- see types.h.
     item.journal_item.origin_idx = entry.origin_idx;
     item.journal_item.entry_flags = entry.entry_flags;
+    // drakeydb: Phase 3 T5 -- mirror opcode too, for the same reason (see JournalItem::opcode's
+    // comment in types.h): the peer-echo filter needs Op::ORIGIN without reparsing `data`.
+    item.journal_item.opcode = entry.opcode;
 
     io::StringSink sink;
     // drakeydb: Phase 3 journal framing v2 only on an active node; every other node stays
