@@ -19,6 +19,7 @@
 #include "server/journal/pending_buf.h"
 #include "server/journal/serializer.h"
 #include "server/journal/streamer.h"
+#include "server/journal/tx_executor.h"
 #include "server/journal/types.h"
 #include "server/multi_master.h"
 #include "server/serializer_commons.h"
@@ -831,6 +832,13 @@ class JournalStreamerPeerFilterTest : public ::testing::Test {
         case Op::ORIGIN:
           tags.push_back(absl::StrCat("ORIGIN:", entry.origin_uuid));
           break;
+        // drakeydb: Phase 3 T6b -- surface the marker's carried LSN explicitly (rather than
+        // folding it into "OTHER" below), since PeerModeGapMarkerCoalescesAndReceiverLandsOnTrueLsn
+        // and the MixedOriginBacklogPeerVsFullStream update below both assert on its exact numeric
+        // value, not just its presence.
+        case Op::LSN:
+          tags.push_back(absl::StrCat("LSN:", entry.lsn));
+          break;
         default:
           tags.push_back("OTHER");
           break;
@@ -952,7 +960,21 @@ TEST_F(JournalStreamerPeerFilterTest, MixedOriginBacklogPeerVsFullStream) {
                 Entry::Payload{"SET", ArgSlice{set_f.data(), set_f.size()}},
                 kPeerIdx);  // LSN9: peer -- dropped for peer, kept full.
 
-    std::vector<std::string> expected_peer = {"CMD:SET a 1", "PING", "CMD:SET d 4", "CMD:SET e 5"};
+    // drakeydb: Phase 3 T6b -- the peer capture now also carries two gap-correction Op::LSN
+    // markers (see ConsumeJournalChange in streamer.cc), one per run of drops, each placed
+    // immediately before the next entry the peer filter actually lets through and carrying that
+    // entry's LSN minus 1 (the true per-shard LSN as of immediately before it): "LSN:3" precedes
+    // PING (LSN4), correcting for LSN2/LSN3 being dropped; "LSN:6" precedes CMD:SET d 4 (LSN7),
+    // correcting for LSN5/LSN6. No marker precedes CMD:SET a 1 (LSN1 is the very first entry, and
+    // last_lsn_writen_'s initial value of 0 makes 0+1 == 1 a non-gap), and none precedes
+    // CMD:SET e 5 (LSN8 immediately follows LSN7 with nothing dropped in between -- proving a
+    // contiguous run of self-writes, including one spanning the partial-replay/live-path seam,
+    // gets no spurious marker). expected_full is intentionally NOT updated: peer_mode is false
+    // for full_config below, so ConsumeJournalChange's gap-correction block never triggers for
+    // it -- this is this test's own proof that the T6b change leaves the full-stream path
+    // byte-identical.
+    std::vector<std::string> expected_peer = {"CMD:SET a 1", "LSN:3",       "PING",
+                                              "LSN:6",       "CMD:SET d 4", "CMD:SET e 5"};
     std::vector<std::string> expected_full = {
         "CMD:SET a 1", "CMD:SET b 2", "CMD:DEL c",  "PING", "PING", absl::StrCat("ORIGIN:", kUuid),
         "CMD:SET d 4", "CMD:SET e 5", "CMD:SET f 6"};
@@ -963,6 +985,163 @@ TEST_F(JournalStreamerPeerFilterTest, MixedOriginBacklogPeerVsFullStream) {
     peer_streamer.Cancel();
     full_streamer.Cancel();
   });
+}
+
+// drakeydb: Phase 3 T6b -- proves ConsumeJournalChange's gap-correction marker (a) coalesces any
+// number of consecutive drops into exactly one marker, (b) never fires for a contiguous run of
+// kept writes (including one spanning the partial-replay/live-path seam -- see
+// MixedOriginBacklogPeerVsFullStream above for that case), and (c) that the value it carries is
+// exactly what a peer-mode TransactionReader (tx_executor.cc) needs to land its derived position
+// back on the master's true LSN -- the full sender-to-receiver path, not just the bytes on the
+// wire.
+//
+// Falsifying (verified by hand -- see task-6b-report.md):
+//  - Reverting ConsumeJournalChange's gap-correction block (streamer.cc) entirely: the peer
+//    capture drops the "LSN:4" entry, and the `ASSERT_EQ(expected, Decode(...))` below fails
+//    immediately (3 entries captured, not 4).
+//  - Gating that block on drop count instead of an LSN-arithmetic gap (i.e. re-checking on every
+//    write instead of only after a real gap): the marker would also precede CMD:SET f 6, which
+//    the `ASSERT_EQ(expected, ...)` below also catches (5 entries, extra "LSN:6").
+//  - Reverting NextTxData's peer-mode branch (tx_executor.cc) so Op::LSN is always compared, not
+//    adopted: the third NextTxData call below (the marker itself) still returns true and reports
+//    tx_data.lsn correctly (that part of the wire format is unaffected), but DCHECK_EQ(4, 1)
+//    fires immediately -- this specific revert aborts the whole test binary rather than failing
+//    the assertion cleanly, which is exactly the crash this task exists to prevent once peer_mode
+//    is live (task brief's "Consequences once peer_mode is enabled").
+TEST_F(JournalStreamerPeerFilterTest, PeerModeGapMarkerCoalescesAndReceiverLandsOnTrueLsn) {
+  constexpr uint32_t kPeerIdx = 5;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  pp_->at(0)->Await([&] {
+    array<string_view, 2> set_a{"a", "1"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_a.data(), set_a.size()}},
+                PeerRegistry::kSelfIdx);  // LSN1: self -- kept, no marker (very first entry).
+
+    array<string_view, 2> set_b{"b", "2"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_b.data(), set_b.size()}},
+                kPeerIdx);  // LSN2: peer -- dropped (1st of 3 consecutive drops).
+
+    array<string_view, 2> set_c{"c", "3"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_c.data(), set_c.size()}},
+                kPeerIdx);  // LSN3: peer -- dropped (2nd).
+
+    array<string_view, 2> set_d{"d", "4"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_d.data(), set_d.size()}},
+                kPeerIdx);  // LSN4: peer -- dropped (3rd).
+
+    array<string_view, 2> set_e{"e", "5"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_e.data(), set_e.size()}},
+                PeerRegistry::kSelfIdx);  // LSN5: self -- kept; must be preceded by exactly ONE
+                                          // marker carrying 4 (LSN5 - 1), not three.
+
+    array<string_view, 2> set_f{"f", "6"};
+    RecordEntry(0, Op::COMMAND, 0, nullopt,
+                Entry::Payload{"SET", ArgSlice{set_f.data(), set_f.size()}},
+                PeerRegistry::kSelfIdx);  // LSN6: self, immediately after LSN5 -- kept, no marker
+                                          // (contiguous: proves the marker isn't emitted on every
+                                          // write, only after an actual gap).
+
+    ASSERT_EQ(7u, GetLsn());  // next LSN to assign; confirms exactly 6 entries were recorded.
+
+    ExecutionState peer_cntx;
+    JournalStreamer::Config peer_config;
+    peer_config.start_partial_sync_at = 1;
+    peer_config.peer_mode = true;
+    CapturingFiberSocket peer_socket;
+    TestPartialSyncStreamer peer_streamer(&peer_cntx, peer_config);
+    peer_streamer.Start(&peer_socket);
+    ASSERT_TRUE(peer_streamer.MaybePartialStreamLSNs());
+    peer_streamer.Cancel();
+
+    std::vector<std::string> expected = {"CMD:SET a 1", "LSN:4", "CMD:SET e 5", "CMD:SET f 6"};
+    ASSERT_EQ(expected, JournalStreamerPeerFilterTest::Decode(peer_socket.captured));
+
+    // --- Receiver side: replay the exact same bytes through a peer-mode TransactionReader,
+    // mirroring StableSyncDflyReadFb's own bookkeeping rule (replica.cc, AdoptAuthoritativeLsn):
+    // journal_rec_executed_ starts at the seed (matching start_partial_sync_at), advances by 1
+    // per received non-LSN entry, and -- in peer mode -- is SET to marker_lsn + 1 by an Op::LSN
+    // marker instead of being left untouched. Calls are counted explicitly, not driven to EOF, so
+    // a wrong entry count can't hide behind ReadEntry's own EOF-shaped error path (this phase has
+    // already caught a test that passed vacuously only via an EOF error -- see task-6b-report.md).
+    base::IoBuf buf;
+    io::BufSink sink{&buf};
+    sink.Write(io::Buffer(peer_socket.captured));
+    io::BufSource source{&buf};
+    JournalReader reader{&source, 0};
+
+    constexpr uint64_t kSeed = 1;  // matches peer_config.start_partial_sync_at
+    TransactionReader tx_reader{kSeed - 1, /*peer_mode=*/true};
+    ExecutionState read_cntx;
+    TransactionData tx_data;
+    uint64_t journal_rec_executed = kSeed;
+
+    ASSERT_TRUE(tx_reader.NextTxData(&reader, &read_cntx, &tx_data));  // CMD:SET a 1 (LSN1)
+    ASSERT_EQ(Op::COMMAND, tx_data.opcode);
+    ++journal_rec_executed;
+
+    ASSERT_TRUE(tx_reader.NextTxData(&reader, &read_cntx, &tx_data));  // LSN marker
+    ASSERT_EQ(Op::LSN, tx_data.opcode);
+    ASSERT_EQ(4u, tx_data.lsn);
+    journal_rec_executed = tx_data.lsn + 1;  // authoritative adoption, not a relative nudge
+
+    ASSERT_TRUE(tx_reader.NextTxData(&reader, &read_cntx, &tx_data));  // CMD:SET e 5 (LSN5)
+    ASSERT_EQ(Op::COMMAND, tx_data.opcode);
+    ++journal_rec_executed;
+
+    ASSERT_TRUE(tx_reader.NextTxData(&reader, &read_cntx, &tx_data));  // CMD:SET f 6 (LSN6)
+    ASSERT_EQ(Op::COMMAND, tx_data.opcode);
+    ++journal_rec_executed;
+
+    EXPECT_TRUE(read_cntx.IsRunning());  // exactly 4 entries consumed; a parse error along the
+                                         // way would have left this false.
+    EXPECT_EQ(GetLsn(), journal_rec_executed);  // <-- the headline assertion: despite 3 dropped
+                                                // entries, the receiver's derived position exactly
+                                                // matches the master's true next LSN.
+  });
+}
+
+// drakeydb: Phase 3 T6b -- proves NextTxData's non-peer path is untouched: an Op::LSN marker that
+// does NOT match the running count still trips DCHECK_EQ (tx_executor.cc), exactly as upstream.
+// This is the byte-identical-outside-peer-mode guarantee's falsifying counterpart to
+// PeerModeGapMarkerCoalescesAndReceiverLandsOnTrueLsn above (which proves peer mode *adopts* a
+// mismatched marker instead of flagging it): together they pin that the new branch really is
+// conditioned on peer_mode, not a blanket replacement of the old check.
+//
+// A death test, not a plain assertion: DCHECK_EQ aborts the process in a DCHECK-enabled build
+// (this is one -- see CLAUDE.md's build instructions), so "does the check still fire" can only be
+// observed by expecting that abort; a build with DCHECKs compiled out could not tell a working
+// check apart from a silently-removed one. No fixture/proactor pool is used here (unlike the
+// tests above): gtest's death tests fork() the process, and this statement needs none of that
+// machinery, so avoiding it sidesteps any question about forking a multi-fibered process.
+//
+// Falsifying (verified by hand -- see task-6b-report.md): constructing tx_reader with
+// peer_mode=true turns this from a crash into a silent, successful adoption -- EXPECT_DEATH then
+// fails because the statement did not die.
+TEST(JournalDeathTest, NonPeerModeStillDchecksMismatchedLsnMarker) {
+  StoredSlices slices{};
+  auto slice = [v = &slices](auto... ss) { return StoreSlice(v, ss...); };
+  using Payload = Entry::Payload;
+
+  base::IoBuf buf;
+  io::BufSink sink{&buf};
+  JournalWriter writer{&sink};
+  writer.Write(Entry{0, Op::COMMAND, 0, nullopt, Payload("SET", slice("k", "v"))});
+  // Deliberately wrong: the COMMAND above advances the reader's internal count to 1, not 99.
+  writer.Write(Entry{Op::LSN, /*lsn=*/99});
+
+  io::BufSource source{&buf};
+  JournalReader reader{&source, 0};
+  TransactionReader tx_reader{0};  // peer_mode defaults to false
+  ExecutionState cntx;
+  TransactionData tx_data;
+
+  ASSERT_TRUE(tx_reader.NextTxData(&reader, &cntx, &tx_data));  // consumes the COMMAND; lsn_ -> 1
+  ASSERT_EQ(Op::COMMAND, tx_data.opcode);
+
+  EXPECT_DEATH(tx_reader.NextTxData(&reader, &cntx, &tx_data), "");
 }
 
 }  // namespace journal

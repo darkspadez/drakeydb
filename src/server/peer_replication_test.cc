@@ -361,7 +361,7 @@ class DflyShardReplicaOriginTest : public BaseFamilyTest {
     auto multi_shard_exe = std::make_shared<MultiShardExecution>();
     RdbLoadContext load_context;
     DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
-                          &load_context, origin_idx);
+                          &load_context, origin_idx, /*peer_mode=*/false);
     return flow.executor_->connection_context()->repl_origin_idx;
   }
 };
@@ -374,6 +374,52 @@ TEST_F(DflyShardReplicaOriginTest, ConstructorThreadsOriginIntoExecutor) {
     // A non-peer flow (PeerRegistry::kSelfIdx == 0) must stay byte-identical to upstream: 0 is
     // already ConnectionContext::repl_origin_idx's default, so SetApplyOrigin(0) is a true no-op.
     EXPECT_EQ(PeerRegistry::kSelfIdx, ObservedOriginIdx(PeerRegistry::kSelfIdx));
+  });
+}
+
+// drakeydb: Phase 3 T6b -- verifies DflyShardReplica threads `peer_mode` from construction into
+// AdoptAuthoritativeLsn's gate, and that AdoptAuthoritativeLsn itself sets journal_rec_executed_
+// (JournalExecutedCount(), what a reconnecting flow reports as its partial-sync resume LSN -- see
+// Replica::InitiateDflySync's partial_sync_lsn) to master_lsn + 1 -- unconditionally overwriting
+// whatever count-based value the seed held, proving this is a true adoption rather than a
+// relative nudge that could compound drift.
+//
+// No socket is exercised, for the same reason as DflyShardReplicaOriginTest above: the
+// constructor performs no I/O, and AdoptAuthoritativeLsn touches only journal_rec_executed_, so
+// this is a pure, in-process test of the exact method StableSyncDflyReadFb's Op::LSN branch
+// calls -- not a reimplementation of its logic.
+//
+// Falsifying (verified by hand -- see task-6b-report.md): gating AdoptAuthoritativeLsn's body
+// out entirely (as if peer mode were never threaded through) makes the first EXPECT_EQ below
+// fail (43u vs the untouched seed, 5u). Dropping the `if (!peer_mode_) return;` guard makes the
+// second EXPECT_EQ fail (43u instead of the untouched seed, 5u) -- proving non-peer flows are
+// unaffected is exactly what that guard is for.
+class DflyShardReplicaPeerModeTest : public BaseFamilyTest {
+ protected:
+  uint64_t ObservedJournalExecutedAfterMarker(uint64_t seed, uint64_t master_lsn, bool peer_mode) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, /*origin_idx=*/0, peer_mode);
+    flow.SetRecordsExecuted(seed);
+    flow.AdoptAuthoritativeLsn(master_lsn);
+    return flow.JournalExecutedCount();
+  }
+};
+
+TEST_F(DflyShardReplicaPeerModeTest, AdoptAuthoritativeLsnSetsExecutedCountInPeerModeOnly) {
+  pp_->at(0)->Await([&] {
+    // Peer mode: journal_rec_executed_ becomes master_lsn + 1, discarding the seed entirely.
+    EXPECT_EQ(43u, ObservedJournalExecutedAfterMarker(/*seed=*/5, /*master_lsn=*/42,
+                                                      /*peer_mode=*/true));
+
+    // Non-peer mode: byte-identical to upstream's "Do nothing" Op::LSN branch -- the seed must
+    // survive untouched.
+    EXPECT_EQ(5u, ObservedJournalExecutedAfterMarker(/*seed=*/5, /*master_lsn=*/42,
+                                                     /*peer_mode=*/false));
   });
 }
 

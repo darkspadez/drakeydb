@@ -132,6 +132,39 @@ void JournalStreamer::ConsumeJournalChange(const JournalChangeItem& item) {
   }
 
   DCHECK_GT(item.journal_item.lsn, last_lsn_writen_);
+
+  // drakeydb: Phase 3 T6b -- peer-mode gap correction. ShouldWrite() above may have silently
+  // dropped one or more entries (non-self-origin, expiry DELs, Op::ORIGIN) since the last entry
+  // this stream actually wrote -- their LSNs were consumed on the sender (every AddLogRecord call
+  // advances the shard's real journal LSN by exactly 1, dropped or not -- see
+  // JournalSlice::AddLogRecord) but never reached this peer. Left uncorrected, the receiver's
+  // position -- which it derives purely by COUNTING received records, see
+  // TransactionReader::NextTxData -- falls behind the master's true LSN by exactly the number of
+  // entries dropped since the last write.
+  //
+  // Detect the gap by comparing this entry's real LSN to the last one actually written: a run of
+  // any number of consecutive drops (regardless of why each was dropped) coalesces into exactly
+  // one marker here, since last_lsn_writen_ only advances on a real write. The marker carries the
+  // true LSN as of immediately before this entry (item.journal_item.lsn - 1), i.e. "everything up
+  // to here is resolved -- applied or correctly skipped -- next up is this entry", and is placed
+  // on the wire strictly before it (both Write() calls below only ever append to pending_buf_, a
+  // FIFO, so program order here is wire order regardless of how AsyncWrite's completion is timed).
+  // See tx_executor.cc's peer-mode handling of Op::LSN (NextTxData) and replica.cc's
+  // AdoptAuthoritativeLsn for the receiving half, and why adopting this value can never run the
+  // resume LSN ahead of what was actually applied.
+  //
+  // Gated on config_.peer_mode: a full-stream (non-peer) consumer never has ShouldWrite drop
+  // anything (see ShouldWrite below), so item.journal_item.lsn == last_lsn_writen_ + 1 always
+  // holds for it and this block would be a provable no-op even if left ungated -- but gating it
+  // explicitly keeps non-peer behavior byte-identical to upstream on inspection, not just in
+  // practice.
+  if (config_.peer_mode && item.journal_item.lsn != last_lsn_writen_ + 1) {
+    io::StringSink gap_sink;
+    JournalWriter gap_writer(&gap_sink);
+    gap_writer.Write(Entry{journal::Op::LSN, item.journal_item.lsn - 1});
+    Write(std::move(gap_sink).str());
+  }
+
   Write(item.journal_item.data);
   time_t now = time(nullptr);
   last_lsn_writen_ = item.journal_item.lsn;

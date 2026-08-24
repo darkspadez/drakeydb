@@ -697,7 +697,7 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
     }
     shard_flows_[i].reset(new DflyShardReplica(server(), master_context_, i, &service_,
                                                multi_shard_exe_, load_context.get(),
-                                               peer_origin_idx_));
+                                               peer_origin_idx_, IsPeerMode()));
     if (partial_sync_lsn > 0) {
       shard_flows_[i]->SetRecordsExecuted(partial_sync_lsn);
     }
@@ -1248,6 +1248,32 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
   VLOG(1) << "FullSyncDflyFb finished after reading " << rdb_loader_->bytes_read() << " bytes";
 }
 
+// drakeydb: Phase 3 T6b -- see replica.h's declaration for the summary; called from
+// StableSyncDflyReadFb's Op::LSN branch below.
+//
+// Correctness argument for why this can never run journal_rec_executed_ (the "next LSN this
+// replica wants to receive", per InitiateDflySync's partial_sync_lsn/MaybePartialStreamLSNs'
+// own comment) AHEAD of what was actually applied -- the one constraint that matters more than
+// closing every gap:
+//
+// NextTxData (tx_executor.cc) parses one entry per call, and StableSyncDflyReadFb applies it
+// (ExecuteTx, or the PING/ORIGIN counters below) before looping back to parse the next one --
+// all on this one fiber, strictly in order. So by the time a given Op::LSN marker is parsed,
+// every entry that could possibly precede it on the wire has already either been applied, or
+// was never sent to this link at all because ConsumeJournalChange's gap check (streamer.cc)
+// filtered it out -- there is no entry still "in flight" whose fate this replica doesn't yet
+// know. master_lsn, as the sender computes it (item.journal_item.lsn - 1, i.e. the true LSN as
+// of immediately before the next entry it writes), names exactly that boundary: everything up
+// to and including master_lsn is resolved, one way or the other, right now. The next LSN this
+// replica needs is therefore exactly master_lsn + 1 -- never higher than what's resolved, so
+// adopting it can only ever catch this counter up to the truth, not overshoot it.
+void DflyShardReplica::AdoptAuthoritativeLsn(uint64_t master_lsn) {
+  if (!peer_mode_) {
+    return;
+  }
+  journal_rec_executed_.store(master_lsn + 1, std::memory_order_relaxed);
+}
+
 void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
   DCHECK_EQ(proactor_index_, ProactorBase::me()->GetPoolIndex());
 
@@ -1261,7 +1287,8 @@ void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
 
   JournalReader reader{&ps, 0};
   DCHECK_GE(journal_rec_executed_, 1u);
-  TransactionReader tx_reader{journal_rec_executed_.load(std::memory_order_relaxed) - 1};
+  TransactionReader tx_reader{journal_rec_executed_.load(std::memory_order_relaxed) - 1,
+                              peer_mode_};
 
   acks_fb_ = fb2::Fiber("shard_acks", &DflyShardReplica::StableSyncDflyAcksFb, this, cntx);
   TransactionData tx_data;
@@ -1270,7 +1297,11 @@ void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
 
     last_io_time_ = TimeSec();
     if (tx_data.opcode == journal::Op::LSN) {
-      //  Do nothing
+      // drakeydb: Phase 3 T6b -- outside peer mode this stays the original no-op (tx_reader's own
+      // DCHECK_EQ, tx_executor.cc, already verified this marker matches our count). In peer mode,
+      // AdoptAuthoritativeLsn resyncs journal_rec_executed_ to the master's true LSN -- see its
+      // definition below for why this can never run the resume LSN ahead of what was applied.
+      AdoptAuthoritativeLsn(tx_data.lsn);
     } else if (tx_data.opcode == journal::Op::PING) {
       force_ping_ = true;
       journal_rec_executed_.fetch_add(1, std::memory_order_relaxed);
@@ -1387,10 +1418,12 @@ void DflyShardReplica::StableSyncDflyAcksFb(ExecutionState* cntx) {
 DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext master_context,
                                    uint32_t flow_id, Service* service,
                                    std::shared_ptr<MultiShardExecution> multi_shard_exe,
-                                   RdbLoadContext* load_context, uint32_t origin_idx)
+                                   RdbLoadContext* load_context, uint32_t origin_idx,
+                                   bool peer_mode)
     : ProtocolClient(server_context),
       service_(*service),
       master_context_(master_context),
+      peer_mode_(peer_mode),
       multi_shard_exe_(multi_shard_exe),
       flow_id_(flow_id) {
   executor_ = std::make_unique<JournalExecutor>(service);

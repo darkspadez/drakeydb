@@ -57,13 +57,21 @@ struct TransactionData {
 // The journal stream can contain interleaved data for multiple multi transactions,
 // expiries and out of order executed transactions that need to be grouped on the replica side.
 struct TransactionReader {
-  TransactionReader(std::optional<uint64_t> lsn = std::nullopt) : lsn_(lsn) {
+  // drakeydb: Phase 3 T6b -- `peer_mode` selects how an arriving Op::LSN marker is handled (see
+  // NextTxData): outside peer mode (the default -- every pre-existing caller, e.g.
+  // incoming_slot_migration.cc, is unaffected), it is compared against the running count and
+  // DCHECK_EQ'd, exactly as upstream. In peer mode it is instead adopted as authoritative -- see
+  // streamer.cc's ConsumeJournalChange for why a peer link's stream can legitimately have gaps a
+  // plain count can't self-correct.
+  TransactionReader(std::optional<uint64_t> lsn = std::nullopt, bool peer_mode = false)
+      : lsn_(lsn), peer_mode_(peer_mode) {
   }
 
   bool NextTxData(JournalReader* reader, ExecutionState* cntx, TransactionData* dest);
 
  private:
   std::optional<uint64_t> lsn_ = 0;
+  bool peer_mode_ = false;
 };
 
 }  // namespace dfly

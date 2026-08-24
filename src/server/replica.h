@@ -261,14 +261,26 @@ class DflyShardReplica : public ProtocolClient {
   // construction reaches executor_'s ConnectionContext.
   friend class DflyShardReplicaOriginTest;
 
+  // drakeydb: Phase 3 T6b -- lets DflyShardReplicaPeerModeTest (peer_replication_test.cc)
+  // construct a flow directly (no socket) and drive AdoptAuthoritativeLsn() to observe its effect
+  // on journal_rec_executed_, the same way DflyShardReplicaOriginTest above drives origin_idx.
+  friend class DflyShardReplicaPeerModeTest;
+
  public:
   // `origin_idx`: this flow's PeerRegistry origin index (Replica::Greet() obtains it from
   // PeerRegistry::AddOrGet()); PeerRegistry::kSelfIdx (0) for a non-peer flow. Threaded straight
   // to executor_->SetApplyOrigin() at construction -- see that method's doc comment
   // (journal/executor.h) for why this is set once here rather than reaching back into Replica.
+  //
+  // `peer_mode`: drakeydb: Phase 3 T6b -- true iff this flow belongs to a peer-mode Replica (see
+  // Replica::IsPeerMode()). Threaded in at construction the same way origin_idx is -- this class
+  // has no way to reach back into the owning Replica -- but, unlike origin_idx, kept as a member
+  // (see peer_mode_ below) rather than forwarded once and forgotten: it is consulted repeatedly,
+  // later, by StableSyncDflyReadFb, both to select TransactionReader's adopt-vs-compare behavior
+  // for Op::LSN and to gate AdoptAuthoritativeLsn().
   DflyShardReplica(ServerContext server_context, MasterContext master_context, uint32_t flow_id,
                    Service* service, std::shared_ptr<MultiShardExecution> multi_shard_exe,
-                   class RdbLoadContext* load_context, uint32_t origin_idx);
+                   class RdbLoadContext* load_context, uint32_t origin_idx, bool peer_mode);
   ~DflyShardReplica();
 
   void Cancel();
@@ -310,6 +322,12 @@ class DflyShardReplica : public ProtocolClient {
   void Pause(bool pause);
 
  private:
+  // drakeydb: Phase 3 T6b -- adopts `master_lsn` (an incoming Op::LSN marker's payload) as
+  // journal_rec_executed_'s new authoritative value; a no-op outside peer mode. See the .cc
+  // definition for the full correctness argument (why this can never run the resume LSN ahead of
+  // what was actually applied) and StableSyncDflyReadFb for its one call site.
+  void AdoptAuthoritativeLsn(uint64_t master_lsn);
+
   Service& service_;
   MasterContext master_context_;
 
@@ -329,6 +347,12 @@ class DflyShardReplica : public ProtocolClient {
   // run out-of-order on the master instance.
   // Atomic, because JournalExecutedCount() can be called from any thread.
   std::atomic_uint64_t journal_rec_executed_ = 1;
+
+  // drakeydb: Phase 3 T6b -- see the constructor's doc comment for `peer_mode`. Named the same as
+  // (but independent of, and a different type than) Replica::peer_mode_ -- both classes already
+  // duplicate MasterContext master_context_ the same way; each keeps its own copy of what it
+  // needs rather than reaching back into the other.
+  bool peer_mode_ = false;
 
   util::fb2::Fiber sync_fb_, acks_fb_;
   size_t ack_offs_ = 0;
