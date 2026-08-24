@@ -59,6 +59,83 @@ TEST(PeerIdentityClaimsTest, RejectsDuplicateAndReleasesOrMovesClaims) {
   EXPECT_TRUE(claims.TryClaim(1, "peer-b"));
 }
 
+// drakeydb D-7: HasUnestablishedClaim is what PeerReplicationManager::HasUnestablishedPeerWithUuid
+// answers the reciprocal-connect tiebreak's "is P one of our own not-yet-established peer links"
+// question from (see peer_replication.h). Proves: a fresh claim starts not-established; a
+// non-matching uuid (nothing claims it) is never reported as unestablished -- only an actual
+// unestablished claim is, so a non-reciprocal consumer is never caught by the tiebreak;
+// MarkEstablished flips a claim so it stops being reported -- an already-established link must
+// never trigger the tiebreak (that would tear down a healthy mesh edge); and a genuine reconnect
+// (a fresh TryClaim, even for the same owner/uuid pair an earlier, now-dropped connection held)
+// resets back to not-established, since the new link has not synced yet either.
+//
+// Falsifying (verified by hand -- see task-8-report.md): removing PeerIdentityClaims::
+// MarkEstablished's body (or never calling it from replica.cc) makes the second EXPECT_FALSE
+// below fail (stays true forever); removing the Claim::established reset in TryClaim's final
+// insert_or_assign makes the fourth EXPECT_TRUE (after the reconnect) fail (reads false, stale
+// from the MarkEstablished call three lines above it).
+TEST(PeerIdentityClaimsTest, TracksEstablishedStateForTiebreakQuery) {
+  PeerIdentityClaims claims;
+
+  // No claim at all for this uuid: never "unestablished" -- just absent.
+  EXPECT_FALSE(claims.HasUnestablishedClaim("peer-a"));
+
+  // A fresh claim starts not-established.
+  EXPECT_TRUE(claims.TryClaim(1, "peer-a"));
+  EXPECT_TRUE(claims.HasUnestablishedClaim("peer-a"));
+
+  // MarkEstablished flips it off.
+  claims.MarkEstablished(1);
+  EXPECT_FALSE(claims.HasUnestablishedClaim("peer-a"));
+
+  // A no-op owner (never claimed anything, or already released) is safe.
+  claims.MarkEstablished(999);
+
+  // A genuine reconnect -- a fresh TryClaim, even reclaiming the same uuid -- resets to
+  // not-established: the old (established) link is gone, and the new one has not synced yet.
+  EXPECT_TRUE(claims.TryClaim(1, "peer-a"));
+  EXPECT_TRUE(claims.HasUnestablishedClaim("peer-a"));
+
+  claims.MarkEstablished(1);
+  claims.Release(1);
+  EXPECT_FALSE(claims.HasUnestablishedClaim("peer-a"));  // claim gone entirely
+}
+
+// drakeydb D-7: ShouldRefuseReciprocalPeer is the exact predicate server_family.cc's ReplConf
+// calls to decide the reciprocal-connect tiebreak. Both nodes of a reciprocal pair call it with
+// the two uuids in swapped roles (each node's own uuid vs. the uuid the other one presents), so
+// this proves directly, on the real production function: it is impossible for both sides to
+// defer (both would need their own uuid to sort before the other's, which cannot happen for two
+// distinct strings), and -- whenever both sides genuinely observe the reciprocal condition --
+// impossible for neither to defer either. Also covers the two "must not fire" inputs: no
+// reciprocal link on this side (has_unestablished_own_link=false, standing in for both "uuid
+// doesn't match any of our links" and "the matching link is already established"), on both
+// operand orders.
+//
+// Falsifying (verified by hand -- see task-8-report.md): flipping `self_uuid < peer_uuid` to
+// `self_uuid > peer_uuid` makes lo_refuses/hi_refuses swap outcomes -- EXPECT_TRUE(lo_refuses)
+// and EXPECT_FALSE(hi_refuses) both fail (their values invert). `<=` would NOT falsify this
+// specific test: kLo and kHi are distinct, so `<=` and `<` agree on both calls below -- a
+// same-vs-different-string edge case a `<=` mutant would need a third, equal-uuid case to catch,
+// which is intentionally out of scope here (self_uuid == peer_uuid is excluded upstream by the
+// admission check's own_uuid refusal, server_family.cc, before this predicate ever runs).
+TEST(ShouldRefuseReciprocalPeerTest, ExactlyOneSideDefersOnBothOperandOrders) {
+  constexpr char kLo[] = "10000000-0000-4000-8000-000000000000";  // sorts before kHi
+  constexpr char kHi[] = "20000000-0000-4000-8000-000000000000";
+
+  // Both sides see the reciprocal condition: the lower uuid's own side refuses, the higher
+  // uuid's own side admits -- never both, never neither.
+  bool lo_refuses = ShouldRefuseReciprocalPeer(/*has_unestablished_own_link=*/true, kLo, kHi);
+  bool hi_refuses = ShouldRefuseReciprocalPeer(/*has_unestablished_own_link=*/true, kHi, kLo);
+  EXPECT_TRUE(lo_refuses);
+  EXPECT_FALSE(hi_refuses);
+  EXPECT_NE(lo_refuses, hi_refuses);  // exactly one, spelled out directly
+
+  // No reciprocal link on this side -- never refuses, regardless of uuid ordering.
+  EXPECT_FALSE(ShouldRefuseReciprocalPeer(/*has_unestablished_own_link=*/false, kLo, kHi));
+  EXPECT_FALSE(ShouldRefuseReciprocalPeer(/*has_unestablished_own_link=*/false, kHi, kLo));
+}
+
 // Launch::post-constructed fibers only get queued (AddReady) on the constructing thread's
 // scheduler; they don't start running until that thread yields (e.g. at Join()). So fibers built
 // directly on the bare gtest thread never actually interleave -- a real test of SyncGate's FIFO

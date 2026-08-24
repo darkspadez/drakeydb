@@ -301,8 +301,13 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
     if ((state_mask_ & R_GREETED) == 0) {
       ec = Greet();
       if (ec) {
+        // drakeydb D-7: device_or_resource_busy is the reciprocal-connect uuid tiebreak refusal
+        // (see the CheckRespSimpleError(kReciprocalPeerConnectMsg) check in Greet() below) --
+        // expected to clear itself within a retry or two, so it stays in this quiet bucket
+        // alongside the other two peer-identity refusals.
         if (IsPeerMode() &&
-            (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use)) {
+            (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use ||
+             ec == std::errc::device_or_resource_busy)) {
           LOG_EVERY_T(WARNING, 60)
               << "Error greeting " << server().Description() << " (phase: " << GetCurrentPhase()
               << "): " << ec << " " << ec.message() << ", socket state: " + SockInfo();
@@ -343,6 +348,12 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
         continue;
       }
       state_mask_ |= R_SYNC_OK;
+      // drakeydb D-7: this link has reached stable sync -- tell identity_claims_ so
+      // PeerReplicationManager::HasUnestablishedPeerWithUuid stops treating it as a
+      // reciprocal-connect candidate (the tiebreak must never fire against an already-established
+      // link -- see that method's own doc comment). A no-op outside peer mode.
+      if (peer_mode_ && peer_mode_->identity_claims)
+        peer_mode_->identity_claims->MarkEstablished(client_id_);
       continue;
     }
 
@@ -484,6 +495,25 @@ error_code Replica::Greet() {
   // Announce that we are the dragonfly client.
   // Note that we currently do not support dragonfly->redis replication.
   RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa dragonfly"));
+  // drakeydb D-7: this exact error text means an active master refused us purely because of the
+  // reciprocal-connect uuid tiebreak (both nodes are REPLICAOF-ing each other at once, and this
+  // side lost) -- not a real protocol problem. Recognized before the generic bad-response check
+  // below so it can return a distinct, retryable errc instead of the generic bad_message that
+  // check would otherwise produce; MainReplicationFb's Greet-error handling quiets logging for
+  // it accordingly, and the normal 500ms reconnect loop retries -- by then the winning side's
+  // link should have left LOADING.
+  //
+  // "ERR " prefix: kReciprocalPeerConnectMsg is the bare message server_family.cc passes to
+  // SendError(); RedisReplyBuilderBase::SendError (reply_builder.cc) auto-prepends "-ERR " on the
+  // wire for any message not already starting with '-', so the parsed error text carries that
+  // prefix too. Matched here, not baked into the shared constant, since the prefix is
+  // SendError's wire-framing detail, not part of the refusal's logical identity.
+  if (IsPeerMode() && CheckRespSimpleError(StrCat("ERR ", kReciprocalPeerConnectMsg))) {
+    LOG_EVERY_T(WARNING, 60) << "Peer " << server().Description()
+                             << " refused us via the reciprocal-connect uuid tiebreak (both nodes "
+                                "are REPLICAOF-ing each other); retrying";
+    return std::make_error_code(std::errc::device_or_resource_busy);
+  }
   PC_RETURN_ON_BAD_RESPONSE(CheckRespFirstTypes({RespExpr::STRING}));
 
   if (LastResponseArgs().size() == 1) {  // Redis

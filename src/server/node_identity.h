@@ -22,6 +22,16 @@ inline constexpr unsigned kDrakeydbReplVersion = 65;
 
 inline constexpr char kNodeUuidFileName[] = "drakeydb.uuid";
 
+// D-7: exact REPLCONF capa dragonfly error text an active master sends when it refuses a peer
+// consumer solely because of the reciprocal-connect uuid tiebreak (server_family.cc's ReplConf,
+// PeerReplicationManager::HasUnestablishedPeerWithUuid) -- two active nodes REPLICAOF-ing each
+// other at nearly the same time. Distinguished from every other admission refusal (own uuid,
+// missing uuid, stale protocol version) so replica.cc's Greet() can recognize it via
+// CheckRespSimpleError and retry quietly (peer-mode Greet errors are log-softened) instead of
+// logging loudly on every 500ms retry -- this one is expected to resolve itself shortly, once the
+// winning side's link leaves LOADING.
+inline constexpr char kReciprocalPeerConnectMsg[] = "Reciprocal peer connect in progress, retry";
+
 // Returns a canonical lowercase RFC-4122 v4 uuid.
 std::string GenerateNodeUuid();
 

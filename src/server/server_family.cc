@@ -3724,6 +3724,22 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
           if (rinfo.repl_drakey_version < kDrakeydbReplVersion) {
             return cmd_cntx->SendError("Replicating from an active-replica node is not supported");
           }
+          // drakeydb D-7: reciprocal-connect uuid tiebreak. Two active nodes REPLICAOF-ing each
+          // other at nearly the same time each have their own outbound peer link to the other
+          // mid-handshake right as the other's inbound connection reaches here. If this consumer's
+          // uuid (P) matches one of our own not-yet-established peer links, this is exactly that
+          // race: refuse iff our own uuid sorts before P, so exactly one side ever refuses (both
+          // nodes evaluate ShouldRefuseReciprocalPeer with the operands swapped -- see its own doc
+          // comment, peer_replication.h, for why that can never both-defer or neither-defer). The
+          // refused side's Greet() (replica.cc) fails with a retryable error and retries on its
+          // normal 500ms loop -- by then this link should be established and no longer eligible.
+          // HasUnestablishedPeerWithUuid excludes an already-established link by construction, so
+          // a healthy mesh edge is never torn down by this check.
+          if (rinfo.repl_is_peer &&
+              ShouldRefuseReciprocalPeer(peers_->HasUnestablishedPeerWithUuid(rinfo.repl_node_uuid),
+                                         node_uuid(), rinfo.repl_node_uuid)) {
+            return cmd_cntx->SendError(kReciprocalPeerConnectMsg);
+          }
           // Admitted: either a peer (repl_is_peer, has_uuid, !own_uuid) or a plain replica
           // (!repl_is_peer). CreateSyncSession (below) copies repl_is_peer/repl_node_uuid into
           // the new ReplicaInfo exactly as it already does for repl_node_uuid alone.

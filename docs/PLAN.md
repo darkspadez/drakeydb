@@ -190,7 +190,14 @@ untracked in `KeyDB/` (local reference only, gitignored). The goals:
   suppressed (`db.cpp:1988-1990`), gated on `capa activeExpire` (`replication.cpp:1798`);
   FAILOVER rejected in active mode.
 - KeyDB things NOT ported: dead `mvccLastSync`/`staleKeyMap` machinery (verified never fires);
-  arrival-order-only streaming (we add an LWW guard); per-boot UUID regeneration (we persist).
+  arrival-order-only streaming (we add an LWW guard); per-boot UUID regeneration (we persist);
+  `processReplconfUuid`'s reciprocal-connect tiebreak (`replication.cpp:1557-1599`) is also dead
+  code -- it guards on `FSameUuidNoNil(mi->master_uuid, c->uuid)`, true only when the two uuids
+  are *equal* (`replication.cpp:92-98`), so the following `memcmp(mi->master_uuid, c->uuid, ...)
+  < 0` compares a value with itself and is always `0`; `freeClientAsync` never fires. D-7 ports
+  the *intent* (self uuid vs. peer uuid), not the code: `ShouldRefuseReciprocalPeer`
+  (`peer_replication.{h,cc}`) plus `PeerReplicationManager::HasUnestablishedPeerWithUuid`, called
+  from the admission check in `server_family.cc`'s `ReplConf`.
 - Auto-update pings dragonflydb.io on `v`-prefixed tags (`dfly_main.cc:481`); `DflyVersion`
   (`version.h`, VER6) is the upstream replication protocol version — leave to upstream.
 

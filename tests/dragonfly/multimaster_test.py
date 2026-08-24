@@ -733,6 +733,58 @@ async def test_peer_mesh_own_writes_not_echoed_back(df_factory: DflyInstanceFact
     assert await c_b.get("cnt2") == "1"
 
 
+async def test_simultaneous_reciprocal_replicaof_converges(
+    df_factory: DflyInstanceFactory, port_picker
+):
+    """D-7: when two active nodes' --replicaof boot flags point at each other, both start racing
+    to full-sync from the other at nearly the same instant. The reciprocal-connect uuid tiebreak
+    (server_family.cc's ReplConf admission check, backed by
+    PeerReplicationManager::HasUnestablishedPeerWithUuid / ShouldRefuseReciprocalPeer in
+    peer_replication.{h,cc}) settles this deterministically: the side whose own uuid sorts later
+    refuses the other's inbound connection with a retryable error while its own outbound link to
+    that uuid is still unestablished, so only one direction pays for the first full sync; the
+    refused side's Greet() (replica.cc) retries on its normal 500ms loop and is admitted normally
+    once the winner's link is up.
+
+    Two boot-time --replicaof flags (StartMode::kBackground), not two interactive REPLICAOF
+    commands gathered via asyncio.gather: an interactive REPLICAOF is a *single* blocking
+    handshake attempt (PeerReplicationManager::Add's kBlockingHandshake) with no retry of its
+    own, so losing the tiebreak on that one attempt would fail the command outright instead of
+    quietly retrying. The 500ms retry loop this task's tiebreak is a determinism layer on top of
+    is background-mode-only (Replica::MainReplicationFb) -- which boot's --replicaof uses -- and
+    is also the natural way "two active nodes REPLICAOF each other simultaneously" actually
+    happens when bringing up a mesh from static config. df_factory.start_all() launches both
+    processes back to back (not one-after-the-other-and-wait), so both sides' outbound connection
+    attempts genuinely race.
+
+    Falsifying: see task-8-report.md.
+    """
+    a_port = port_picker.get_available_port()
+    b_port = port_picker.get_available_port()
+    a = df_factory.create(**active_args(port=a_port, replicaof=f"localhost:{b_port}"))
+    b = df_factory.create(**active_args(port=b_port, replicaof=f"localhost:{a_port}"))
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    await asyncio.gather(wait_for_peers(c_a, 1), wait_for_peers(c_b, 1))
+
+    # The mesh actually converges both ways, not just link_status flipping to up.
+    assert await c_a.incr("cnt") == 1
+    await wait_for_value(c_b, "cnt", "1")
+    assert await c_b.incr("cnt2") == 1
+    await wait_for_value(c_a, "cnt2", "1")
+
+    a.stop()
+    b.stop()
+    # The tiebreak actually fired on (at least) one side -- this is what makes the test genuinely
+    # about the tiebreak, rather than merely re-proving that a merge-not-flush full sync converges
+    # even when done redundantly in both directions at once (which it may well do on its own).
+    refused = a.find_in_logs("reciprocal-connect uuid tiebreak") + b.find_in_logs(
+        "reciprocal-connect uuid tiebreak"
+    )
+    assert refused, "neither side ever logged a reciprocal-connect tiebreak refusal"
+
+
 async def test_drakey_handshake_pairs_no_longer_log_parse_errors(df_factory: DflyInstanceFactory):
     """P3 T7: REPLCONF DRAKEY-VERSION / PEER are now parsed by every drakeydb master (active or
     not), not just tolerated by the replica -- see server_family.cc ReplConf. Before this task,
