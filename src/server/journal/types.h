@@ -143,5 +143,28 @@ struct JournalConsumerInterface {
   virtual void ThrottleIfNeeded() = 0;
 };
 
+// drakeydb: Phase 3 T7b -- the ONE definition of the peer-echo-prevention rule: drop an entry
+// not authored by this node itself (origin_idx != PeerRegistry::kSelfIdx), drop an
+// expiry-triggered deletion (every node expires independently on its own clock, so peers must
+// not receive and re-apply each other's expiry deletions -- see kEntryFlagExpired above), and
+// drop an Op::ORIGIN dictionary entry (a mesh peer discovers every other node directly and does
+// not need these relayed; also, ORIGIN entries are always recorded self-origin by
+// PeerRegistry::AddOrGet, so the origin_idx check above cannot be relied on to catch them -- see
+// multi_master.cc's AddOrGet). Op::LSN and Op::PING are deliberately NOT dropped by opcode: LSN
+// bookkeeping and ack/partial-resume accounting on the receiving side depend on both reaching the
+// consumer (see TransactionReader::NextTxData's DCHECK_EQ/adoption logic and
+// DflyShardReplica::journal_rec_executed_); a peer's re-recorded PING carries that peer's origin
+// (T6), so the origin_idx check above -- not an opcode check -- is what suppresses it.
+//
+// Two consumers apply this identical rule to two different windows of the same replication
+// stream, and must never diverge: JournalStreamer::ShouldWrite (streamer.cc) for the STABLE-SYNC
+// stream, and SliceSnapshot::ConsumeJournalChange (snapshot.cc) for the FULL-SYNC window's
+// concurrent journal blob. Defined out-of-line in types.cc (not here) because it needs
+// PeerRegistry::kSelfIdx from multi_master.h, which must NOT be pulled into this header --
+// journal/types.h is one of the most widely-included headers in the tree, and multi_master.h
+// drags in flat_hash_map/nonstd::expected/replica_types.h/fiber sync for one constant (see the
+// same discipline already applied to ConnectionContext::repl_origin_idx, conn_context.h).
+bool PassesPeerEchoFilter(const JournalItem& item);
+
 }  // namespace journal
 }  // namespace dfly

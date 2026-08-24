@@ -52,10 +52,11 @@ constexpr size_t kMinBlobSize = 8_KB;
 
 SliceSnapshot::SliceSnapshot(CompressionMode compression_mode, DbSlice* slice,
                              SnapshotDataConsumerInterface* consumer, ExecutionState* cntx,
-                             DflyVersion replica_dfly_version)
+                             DflyVersion replica_dfly_version, bool peer_mode)
     : SerializerBase(slice, cntx),
       compression_mode_(compression_mode),
       replica_dfly_version_(replica_dfly_version),
+      peer_mode_(peer_mode),
       consumer_(consumer) {
   tl_slice_snapshots.insert(this);
 }
@@ -349,6 +350,23 @@ bool SliceSnapshot::PushSerialized(bool force) {
 // guaranteed by call order on the mutation fiber (OnChange precedes ConsumeJournalChange);
 // stream_mu_ is not needed for that ordering.
 void SliceSnapshot::ConsumeJournalChange(const journal::JournalChangeItem& item) {
+  // drakeydb: Phase 3 T7b -- apply the SAME peer-echo filter JournalStreamer::ShouldWrite uses
+  // for the stable-sync stream (journal::PassesPeerEchoFilter, journal/types.h) to the FULL-SYNC
+  // window's concurrent journal blob. Without this, a peer full-syncing (e.g. because its
+  // partial-sync backlog was evicted -- see PendingBuf/CleanEntries) would receive every
+  // concurrent write inline and unfiltered through this path instead of streamer.cc's: peer-origin
+  // writes echoed back toward their author, expiry-flagged DELs, and Op::ORIGIN entries alike.
+  //
+  // Gated on peer_mode_ (false unless CreateSyncSession admitted this consumer as a peer of an
+  // active node -- see dflycmd.cc's StartFullSyncInThread), so a plain replica's or a local
+  // backup snapshot's journal blob stays completely unfiltered, exactly as upstream: filtering a
+  // plain replica's stream would be silent data loss, not an echo fix.
+  //
+  // Checked before taking stream_mu_: a dropped entry never reaches the serializer, so there is
+  // nothing for the lock to protect here.
+  if (peer_mode_ && !journal::PassesPeerEchoFilter(item.journal_item))
+    return;
+
   std::lock_guard lk{stream_mu_};
   std::ignore = serializer_->WriteJournalEntry(item.journal_item.data);
   ++stats_.jounal_changes;

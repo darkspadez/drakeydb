@@ -279,6 +279,20 @@ class RdbLoaderBase {
   std::unique_ptr<JournalReader> journal_reader_;
   std::unique_ptr<JournalExecutor> journal_executor_;
 
+  // drakeydb: Phase 3 T7b -- the PeerRegistry origin index HandleJournalBlob stamps onto
+  // journal_executor_ at construction (via JournalExecutor::SetApplyOrigin, journal/executor.h),
+  // so a peer's full-sync concurrent journal blob is applied -- and re-journaled -- with THAT
+  // peer's origin instead of this node's own. Set via RdbLoader::SetApplyOrigin before Load()
+  // runs (DflyShardReplica's constructor does this, mirroring how it seeds executor_'s origin --
+  // replica.cc). Stays at its default (self) for every other loader: a local RDB file load
+  // (LOAD/startup), a plain replica's full sync, or a test construction that never calls the
+  // setter -- all byte-identical to upstream, since 0 is also ConnectionContext::repl_origin_idx's
+  // own default.
+  // 0 == PeerRegistry::kSelfIdx (server/multi_master.h); a literal, not the named constant, to
+  // avoid pulling that header into this one just for a constant (same convention as
+  // ConnectionContext::repl_origin_idx, conn_context.h).
+  uint32_t apply_origin_idx_ = 0;
+
   // State for the tagged chunk currently being parsed
   struct ActiveTaggedChunk {
     // Identifies which interleaved object stream this chunk belongs to
@@ -311,6 +325,13 @@ class RdbLoader : protected RdbLoaderBase {
   // Does not necessarily match the shard count of the current instance.
   void SetShardCount(uint32_t shard_cnt) {
     shard_count_ = shard_cnt;
+  }
+
+  // drakeydb: Phase 3 T7b -- see apply_origin_idx_'s doc comment (RdbLoaderBase, above this
+  // class). `idx` is a PeerRegistry index; leave unset (default kSelfIdx) unless this loader is
+  // replaying a peer's full sync.
+  void SetApplyOrigin(uint32_t idx) {
+    apply_origin_idx_ = idx;
   }
 
   std::error_code Load(::io::Source* src);

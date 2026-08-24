@@ -413,7 +413,7 @@ void DflyCmd::Sync(CmdArgParser parser, CommandContext* cmd_cntx) {
         return;
       }
       status = StartFullSyncInThread(replica_ptr->GetVersion(), flow, &replica_ptr->GetExecState(),
-                                     shard);
+                                     shard, replica_ptr->IsPeer());
     };
     shard_set->RunBlockingInParallel(std::move(cb));
 
@@ -692,7 +692,8 @@ void DflyCmd::Load(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 OpStatus DflyCmd::StartFullSyncInThread(DflyVersion version, FlowInfo* flow,
-                                        ExecutionState* exec_st, EngineShard* shard) {
+                                        ExecutionState* exec_st, EngineShard* shard,
+                                        bool peer_mode) {
   DCHECK(shard);
   DCHECK(flow->conn);
 
@@ -700,7 +701,10 @@ OpStatus DflyCmd::StartFullSyncInThread(DflyVersion version, FlowInfo* flow,
   // of the flows also contain them.
   SaveMode save_mode =
       shard->shard_id() == 0 ? SaveMode::SINGLE_SHARD_WITH_SUMMARY : SaveMode::SINGLE_SHARD;
-  flow->saver = std::make_unique<RdbSaver>(flow->conn->socket(), save_mode, false, "", version);
+  // drakeydb: Phase 3 T7b -- peer_mode threaded to RdbSaver so its SliceSnapshot filters the
+  // concurrent journal blob for an admitted peer's full sync (see rdb_save.h's comment).
+  flow->saver =
+      std::make_unique<RdbSaver>(flow->conn->socket(), save_mode, false, "", version, peer_mode);
 
   flow->cleanup = [flow, shard]() {
     // socket shutdown is needed before calling saver->Cancel(). Because

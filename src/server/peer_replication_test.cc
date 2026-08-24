@@ -7,6 +7,8 @@
 #include <absl/flags/flag.h>
 #include <absl/flags/reflection.h>
 #include <absl/functional/function_ref.h>
+#include <absl/strings/str_cat.h>
+#include <absl/strings/str_format.h>
 
 #include <array>
 #include <atomic>
@@ -15,6 +17,7 @@
 
 #include "base/gtest.h"
 #include "facade/facade_test.h"
+#include "server/engine_shard_set.h"
 #include "server/journal/executor.h"
 #include "server/journal/serializer.h"
 #include "server/journal/streamer.h"
@@ -23,7 +26,9 @@
 #include "server/journal/types.h"
 #include "server/multi_master.h"
 #include "server/node_identity.h"
+#include "server/rdb_load.h"
 #include "server/rdb_load_context.h"
+#include "server/rdb_save.h"
 #include "server/replica.h"
 #include "server/test_utils.h"
 #include "util/fibers/fibers.h"
@@ -350,6 +355,55 @@ TEST_F(PeerManagerFamilyTest, ExclusiveLoadingIsUnavailableOutsideActiveMode) {
 // Falsifying (verified by hand): removing the executor_->SetApplyOrigin(origin_idx) call from
 // DflyShardReplica's constructor (or dropping/ignoring the origin_idx parameter) leaves
 // repl_origin_idx at its kSelfIdx/0 default, and the kPeerIdx EXPECT_EQ below fails.
+namespace {
+
+// drakeydb: Phase 3 T7b -- builds a single-entry journal blob (mirroring rdb_test.cc's
+// MakeJournalDel, which established this exact JournalWriter -> RdbSerializer::WriteJournalEntry
+// technique) wrapping a SET command, for feeding into RdbLoaderBase::HandleJournalBlob via
+// RdbLoader::Load() directly, no socket involved.
+std::string MakeJournalSet(std::string_view key, std::string_view val) {
+  io::StringSink sink;
+  JournalWriter writer(&sink);
+  std::array<std::string_view, 2> kv{key, val};
+  writer.Write(journal::Entry{1, journal::Op::COMMAND, 0, std::nullopt,
+                              journal::Entry::Payload("SET", ArgSlice{kv.data(), kv.size()})});
+
+  RdbSerializer serializer(CompressionMode::NONE);
+  CHECK(!serializer.WriteJournalEntry(std::move(sink).str()));
+  return serializer.Flush(RdbSerializer::FlushState::kFlushEndEntry);
+}
+
+// drakeydb: Phase 3 T7b -- mirrors rdb_test.cc's WrapInRdb (file-local there, so duplicated here
+// rather than shared across translation units for one 8-line helper): wraps a raw body in the
+// magic/EOF/checksum framing RdbLoader::Load() requires. The all-zero checksum is the same
+// convention RdbSerializer::SendEofAndChecksum itself always writes (rdb_save.cc hard-codes
+// chksum = 0), which RdbLoader::VerifyChecksum() is documented to skip.
+std::string WrapInRdbForTest(std::string_view body) {
+  std::string out = absl::StrFormat("REDIS%04d", RDB_SER_VERSION);
+  out.append(body);
+  out.push_back(static_cast<char>(RDB_OPCODE_EOF));
+  constexpr uint8_t checksum[8] = {};
+  out.append(reinterpret_cast<const char*>(checksum), sizeof(checksum));
+  return out;
+}
+
+// drakeydb: Phase 3 T7b -- captures the origin_idx of the last Op::COMMAND entry this node
+// itself journals while registered. Does not need friend access (JournalConsumerInterface is a
+// public interface), so it lives outside the friended fixture class below, unlike the methods
+// that touch DflyShardReplica's private members directly.
+struct CapturingConsumer : public journal::JournalConsumerInterface {
+  std::optional<uint32_t> last_command_origin_idx;
+
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    if (item.journal_item.opcode == journal::Op::COMMAND)
+      last_command_origin_idx = item.journal_item.origin_idx;
+  }
+  void ThrottleIfNeeded() override {
+  }
+};
+
+}  // namespace
+
 class DflyShardReplicaOriginTest : public BaseFamilyTest {
  protected:
   // Constructs a DflyShardReplica with `origin_idx` (no socket -- the constructor performs no
@@ -369,6 +423,45 @@ class DflyShardReplicaOriginTest : public BaseFamilyTest {
                           &load_context, origin_idx, /*peer_mode=*/false);
     return flow.executor_->connection_context()->repl_origin_idx;
   }
+
+  // drakeydb: Phase 3 T7b -- constructs a DflyShardReplica with `origin_idx`, replays a
+  // hand-crafted "SET key replayed-value" through its rdb_loader_ (the full-sync
+  // concurrent-journal-blob apply path, RdbLoaderBase::HandleJournalBlob -- reaching rdb_loader_,
+  // a private member, is why this runs as a member of this friended class, same reasoning as
+  // ObservedOriginIdx above), then returns the origin_idx THIS node stamped on the re-journaled
+  // write. `key` must hash to shard 0 (the caller is responsible for choosing one, e.g. via
+  // Shard(key, shard_set->size()) -- see the TEST_F below): the capturing listener below is
+  // registered on shard 0 only, matching the pp_->at(0) fiber this always runs on (same
+  // convention as ObservedOriginIdx, which never leaves shard 0 either since it does no actual
+  // dispatch). Runs entirely off-socket: Load() reads a std::string source, not the network.
+  uint32_t ObservedReplayedOriginIdx(uint32_t origin_idx, std::string_view key) {
+    // drakeydb: Phase 3 T7b -- the SET's normal auto-journal path (PrepareTransaction) is a
+    // silent no-op on a shard where journaling was never enabled -- which a fresh BaseFamilyTest
+    // boot never does on its own (production enables it the first time a replica connects).
+    // Idempotent (an early return once already initialized), so safe on every invocation.
+    journal::StartInThread();
+
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, origin_idx, /*peer_mode=*/true);
+
+    CapturingConsumer capture;
+    uint32_t cb_id = journal::RegisterConsumer(&capture);
+
+    std::string rdb = WrapInRdbForTest(MakeJournalSet(key, "replayed-value"));
+    io::BytesSource src{io::Buffer(rdb)};
+    std::error_code ec = flow.rdb_loader_->Load(&src);
+    CHECK(!ec) << ec.message();
+
+    journal::UnregisterConsumer(cb_id);
+    CHECK(capture.last_command_origin_idx.has_value())
+        << "the replayed SET was never re-journaled on this node";
+    return *capture.last_command_origin_idx;
+  }
 };
 
 TEST_F(DflyShardReplicaOriginTest, ConstructorThreadsOriginIntoExecutor) {
@@ -380,6 +473,47 @@ TEST_F(DflyShardReplicaOriginTest, ConstructorThreadsOriginIntoExecutor) {
     // already ConnectionContext::repl_origin_idx's default, so SetApplyOrigin(0) is a true no-op.
     EXPECT_EQ(PeerRegistry::kSelfIdx, ObservedOriginIdx(PeerRegistry::kSelfIdx));
   });
+}
+
+// drakeydb: Phase 3 T7b -- a peer's FULL SYNC has a second apply path besides the stable-sync
+// executor_ ConstructorThreadsOriginIntoExecutor above covers: the concurrent journal blob
+// embedded in the full sync itself, replayed via rdb_loader_ (RdbLoaderBase::HandleJournalBlob).
+// Proves that path also stamps -- and re-journals -- with THIS flow's origin, not kSelfIdx by
+// default, and that the underlying write genuinely applies (not merely gets tagged).
+//
+// Falsifying (verified by hand -- see task-7b-report.md): removing the
+// rdb_loader_->SetApplyOrigin(origin_idx) call added to DflyShardReplica's constructor
+// (replica.cc) makes the kPeerIdx EXPECT_EQ below fail (observes PeerRegistry::kSelfIdx instead
+// of kPeerIdx); the kSelfIdx EXPECT_EQ is unaffected, since SetApplyOrigin(0) is a no-op either
+// way -- exactly mirroring ConstructorThreadsOriginIntoExecutor's own falsification shape for
+// executor_ above.
+TEST_F(DflyShardReplicaOriginTest, FullSyncJournalBlobAppliesAndReJournalsWithFlowsOrigin) {
+  // Pick key names that hash to shard 0: ObservedReplayedOriginIdx registers its capturing
+  // journal listener on shard 0 only (matching the pp_->at(0) fiber below), so a key hashing to
+  // any other shard would silently miss the entry instead of failing loudly.
+  auto shard0_key = [&](std::string_view prefix) {
+    std::string key;
+    for (unsigned i = 0; i < 1000; ++i) {
+      key = absl::StrCat(prefix, i);
+      if (Shard(key, shard_set->size()) == 0)
+        return key;
+    }
+    ADD_FAILURE() << "could not find a shard-0 key for prefix " << prefix;
+    return key;
+  };
+  const std::string peer_key = shard0_key("t7b-peer-key-");
+  const std::string self_key = shard0_key("t7b-self-key-");
+
+  constexpr uint32_t kPeerIdx = 11;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  pp_->at(0)->Await([&] {
+    EXPECT_EQ(kPeerIdx, ObservedReplayedOriginIdx(kPeerIdx, peer_key));
+    // A non-peer flow keeps re-journaling as self-origin -- byte-identical to upstream.
+    EXPECT_EQ(PeerRegistry::kSelfIdx, ObservedReplayedOriginIdx(PeerRegistry::kSelfIdx, self_key));
+  });
+
+  // The writes genuinely applied -- not merely got tagged with the right origin.
+  EXPECT_EQ(Run({"GET", peer_key}), "replayed-value");
+  EXPECT_EQ(Run({"GET", self_key}), "replayed-value");
 }
 
 // drakeydb: Phase 3 T6b -- verifies DflyShardReplica threads `peer_mode` from construction into

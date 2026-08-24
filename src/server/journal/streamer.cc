@@ -240,6 +240,13 @@ void JournalStreamer::ConsumeJournalChange(const JournalChangeItem& item) {
 // origins, expiry DELs, and Op::ORIGIN dictionary entries. A plain replica needs the ORIGIN
 // entries to resolve origin_idx tags on the regular entries it receives, since (unlike a mesh
 // peer) it has no direct connection of its own to learn those uuids from.
+//
+// drakeydb: Phase 3 T7b -- the actual drop rule (and why each condition exists) now lives in ONE
+// place, journal::PassesPeerEchoFilter (types.h/.cc), shared with SliceSnapshot's full-sync
+// concurrent journal blob filter (snapshot.cc's ConsumeJournalChange) -- see that function's own
+// doc comment for the per-condition rationale (origin_idx/kEntryFlagExpired/Op::ORIGIN, and why
+// Op::LSN/Op::PING are never dropped by opcode). Do not re-derive the rule here; update
+// PassesPeerEchoFilter instead so both consumers move together.
 bool JournalStreamer::ShouldWrite(const journal::JournalChangeItem& item) const {
   if (!cntx_->IsRunning())
     return false;
@@ -247,38 +254,7 @@ bool JournalStreamer::ShouldWrite(const journal::JournalChangeItem& item) const 
   if (!config_.peer_mode)
     return true;
 
-  const JournalItem& meta = item.journal_item;
-
-  // Not this node's own write -- it was applied here from some peer. Forwarding it back to a
-  // peer stream risks echoing it toward -- or through -- whichever peer authored it.
-  if (meta.origin_idx != PeerRegistry::kSelfIdx)
-    return false;
-
-  // Expiry-triggered DEL: every node expires independently on its own clock, so peers must not
-  // receive (and re-apply) each other's expiry deletions -- see kEntryFlagExpired's definition
-  // in types.h.
-  if (meta.entry_flags & kEntryFlagExpired)
-    return false;
-
-  // Op::ORIGIN dictionary entries are always recorded self-origin (PeerRegistry::AddOrGet emits
-  // them locally), but the value it stamps into origin_idx is the *announced* peer's index, not
-  // "who authored this journal record" -- see multi_master.cc's AddOrGet. So this opcode check is
-  // independently required: the origin_idx check above cannot be trusted to catch every ORIGIN
-  // entry (it only would if the announced index happened to be kSelfIdx), and conflating the two
-  // meanings of origin_idx for this one opcode would be fragile. A mesh peer doesn't need these
-  // relayed -- it discovers every other node directly (full mesh) -- so they are dropped here
-  // unconditionally for a peer consumer.
-  //
-  // Op::LSN and Op::PING are deliberately NOT dropped by opcode here: LSN bookkeeping and
-  // ack/partial-resume accounting on the receiving side depend on both reaching the consumer
-  // (see TransactionReader::NextTxData's DCHECK_EQ and replica.cc's journal_rec_executed_). A
-  // peer's re-recorded PING (replica.cc's StableSyncDflyReadFb) carries that peer's origin (T6),
-  // so the origin_idx check above -- not an opcode check -- is what suppresses it from being
-  // forwarded back out and circulating the mesh forever.
-  if (meta.opcode == journal::Op::ORIGIN)
-    return false;
-
-  return true;
+  return journal::PassesPeerEchoFilter(item.journal_item);
 }
 
 void JournalStreamer::Start(util::FiberSocketBase* dest) {

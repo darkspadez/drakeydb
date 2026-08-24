@@ -29,8 +29,10 @@ class JournalStreamer : public journal::JournalConsumerInterface {
     // peer's ReplicaInfo (not this task's scope -- see multi_master.{h,cc}'s PeerRegistry for
     // where a peer's identity is established). When peer_mode is set, the base ShouldWrite()
     // drops entries that are not this node's own writes (origin_idx != PeerRegistry::kSelfIdx),
-    // expiry-flagged DELs, and Op::ORIGIN dictionary entries -- see streamer.cc. peer_uuid names
-    // which peer this streamer feeds; T5's filter does not consult it (reserved for T6/T7).
+    // expiry-flagged DELs, and Op::ORIGIN dictionary entries -- see journal::PassesPeerEchoFilter
+    // (journal/types.h), the single shared definition of that rule (T7b) -- streamer.cc's
+    // ShouldWrite is one of its two callers. peer_uuid names which peer this streamer feeds; the
+    // filter does not consult it (reserved for future diagnostics).
     bool peer_mode = false;
     std::string peer_uuid;
 

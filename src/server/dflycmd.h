@@ -334,9 +334,12 @@ class DflyCmd {
 
   void Load(facade::CmdArgParser parser, CommandContext* cmd_cntx);
 
-  // Start full sync in thread. Start FullSyncFb. Called for each flow.
+  // Start full sync in thread. Start FullSyncFb. Called for each flow. peer_mode comes from the
+  // replica's ReplicaInfo (IsPeer()) and gates the full-sync window's concurrent journal blob
+  // filter -- see RdbSaver's peer_mode parameter (rdb_save.h) and
+  // SliceSnapshot::ConsumeJournalChange (snapshot.cc).
   facade::OpStatus StartFullSyncInThread(DflyVersion version, FlowInfo* flow, ExecutionState* cntx,
-                                         EngineShard* shard);
+                                         EngineShard* shard, bool peer_mode);
 
   // Stop full sync in thread. Run state switch cleanup.
   facade::OpStatus StopFullSyncInThread(FlowInfo* flow, ExecutionState* cntx, EngineShard* shard);

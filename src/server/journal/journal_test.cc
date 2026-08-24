@@ -641,6 +641,67 @@ TEST(Journal, BacklogBoundsTimeBasedCleanup) {
   EXPECT_TRUE(slice.IsLSNInBuffer(kExpiredEntries + 1));
 }
 
+// drakeydb: Phase 3 T7b -- journal::PassesPeerEchoFilter (types.h/.cc) is the ONE shared
+// definition of the peer-echo-prevention rule: JournalStreamer::ShouldWrite (streamer.cc, the
+// stable-sync stream) and SliceSnapshot::ConsumeJournalChange (snapshot.cc, the full-sync
+// window's concurrent journal blob) both call it rather than each re-deriving the rule. This
+// exhaustively pins each of its three drop conditions -- plus the two things it must NOT drop by
+// opcode -- on the pure function itself, independent of either caller's own plumbing (which have
+// their own coverage: JournalStreamerPeerFilterTest below for the streamer, and
+// multi_master_test.cc / peer_replication_test.cc for the full-sync send/receive sides).
+//
+// Falsifying: removing any one of the three `return false` branches in PassesPeerEchoFilter
+// (types.cc) makes exactly the EXPECT_FALSE case for that condition fail (the matching
+// EXPECT_TRUE cases are unaffected, since they exercise the OTHER branches); removing the whole
+// function body down to `return true;` fails every EXPECT_FALSE case at once.
+TEST(PassesPeerEchoFilterTest, DropsForeignOriginExpiryDelAndOriginOpcodeOnly) {
+  constexpr uint32_t kPeerIdx = 3;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+
+  JournalItem self_write{};
+  self_write.origin_idx = PeerRegistry::kSelfIdx;
+  self_write.opcode = Op::COMMAND;
+  EXPECT_TRUE(PassesPeerEchoFilter(self_write)) << "a plain self-origin write must pass";
+
+  JournalItem foreign_write{};
+  foreign_write.origin_idx = kPeerIdx;
+  foreign_write.opcode = Op::COMMAND;
+  EXPECT_FALSE(PassesPeerEchoFilter(foreign_write)) << "a foreign-origin write must be dropped";
+
+  JournalItem expiry_del{};
+  expiry_del.origin_idx = PeerRegistry::kSelfIdx;
+  expiry_del.opcode = Op::COMMAND;
+  expiry_del.entry_flags = kEntryFlagExpired;
+  EXPECT_FALSE(PassesPeerEchoFilter(expiry_del)) << "an expiry-flagged DEL must be dropped";
+
+  JournalItem origin_entry{};
+  // Op::ORIGIN entries are always recorded self-origin (PeerRegistry::AddOrGet emits them
+  // locally) -- give this one origin_idx == kSelfIdx too, so only the opcode check can catch it,
+  // exactly matching what production actually emits (see multi_master.cc's AddOrGet).
+  origin_entry.origin_idx = PeerRegistry::kSelfIdx;
+  origin_entry.opcode = Op::ORIGIN;
+  EXPECT_FALSE(PassesPeerEchoFilter(origin_entry)) << "an Op::ORIGIN entry must be dropped";
+
+  // Op::LSN and Op::PING are never dropped by opcode -- LSN bookkeeping and ack/partial-resume
+  // accounting on the receiving side depend on both reaching the consumer.
+  JournalItem self_lsn{};
+  self_lsn.origin_idx = PeerRegistry::kSelfIdx;
+  self_lsn.opcode = Op::LSN;
+  EXPECT_TRUE(PassesPeerEchoFilter(self_lsn)) << "Op::LSN must not be dropped by opcode";
+
+  JournalItem self_ping{};
+  self_ping.origin_idx = PeerRegistry::kSelfIdx;
+  self_ping.opcode = Op::PING;
+  EXPECT_TRUE(PassesPeerEchoFilter(self_ping)) << "Op::PING must not be dropped by opcode";
+
+  // A foreign-origin PING IS dropped -- by the origin_idx check (every entry's general rule),
+  // not by an opcode-specific carve-out. Distinguishes "never dropped by opcode" from "never
+  // dropped at all".
+  JournalItem foreign_ping{};
+  foreign_ping.origin_idx = kPeerIdx;
+  foreign_ping.opcode = Op::PING;
+  EXPECT_FALSE(PassesPeerEchoFilter(foreign_ping));
+}
+
 // drakeydb: Phase 3 T6b fix-round-1 (Q1) -- CapturingFiberSocket now lives in
 // test_capturing_socket.h, shared with peer_replication_test.cc's
 // AdoptAuthoritativeLsnComposesWithRealSenderMarker (see that test's own comment).

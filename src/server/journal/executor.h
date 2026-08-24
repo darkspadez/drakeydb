@@ -41,8 +41,17 @@ class JournalExecutor {
   // (a PeerRegistry index), so journaling triggered on this node tags entries with the peer's
   // origin instead of kSelfIdx -- see ConnectionContext::repl_origin_idx and PrepareTransaction
   // (main_service.cc). A peer link's origin is constant for the link's lifetime, so call this
-  // once when the flow is set up (T6), not per entry. Leave unset (kSelfIdx) for non-peer flows,
-  // e.g. rdb_load.cc's snapshot/journal-blob loader and incoming_slot_migration.cc.
+  // once when the flow is set up (T6), not per entry. Leave unset (kSelfIdx) for a flow that is
+  // genuinely not a peer -- e.g. a plain replica's flow, a local RDB file load (LOAD/startup),
+  // or incoming_slot_migration.cc.
+  //
+  // drakeydb: Phase 3 T7b -- rdb_load.cc's RdbLoaderBase::HandleJournalBlob is NOT
+  // unconditionally "non-peer": it is also the concurrent-journal-blob loader for a PEER's full
+  // sync (the FULL-SYNC-window equivalent of this executor), and DOES call this now -- see
+  // RdbLoader::SetApplyOrigin, threaded from DflyShardReplica's own origin_idx at construction,
+  // the same value passed to executor_->SetApplyOrigin two lines above it (replica.cc). A prior
+  // version of this comment declared that loader non-peer unconditionally; that was written
+  // before peer full sync existed and was wrong once it did.
   void SetApplyOrigin(uint32_t idx) {
     conn_context_.repl_origin_idx = idx;
   }

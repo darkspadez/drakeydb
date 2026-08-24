@@ -2951,8 +2951,15 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
   if (!journal_reader_)
     journal_reader_ = std::make_unique<JournalReader>(nullptr, 0);
 
-  if (!journal_executor_)
+  if (!journal_executor_) {
     journal_executor_ = std::make_unique<JournalExecutor>(service);
+    // drakeydb: Phase 3 T7b -- stamp this loader's configured apply origin (self, unless this is
+    // a peer's full sync -- see apply_origin_idx_'s doc comment) onto the executor at
+    // construction, mirroring DflyShardReplica's own executor_->SetApplyOrigin(origin_idx) for
+    // the stable-sync path (replica.cc). journal_executor_ is reused across every JOURNAL_BLOB
+    // opcode in this load, so this runs once per loader, not per entry.
+    journal_executor_->SetApplyOrigin(apply_origin_idx_);
+  }
 
   io::BytesSource bs{io::Buffer(journal_blob)};
   journal_reader_->SetSource(&bs);
@@ -2967,10 +2974,15 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
 
     done++;
 
-    // drakeydb: Phase 3 origin announcements are not yet consumed by RDB-embedded journal
-    // replay; skip explicitly, on opcode rather than on entry.cmd's shape, so a uuid can never
-    // be dispatched to journal_executor_->Execute() as a command name. T6/T7 wire up real
-    // handling. Latent today (nothing emits Op::ORIGIN yet) but this guard is what closes it.
+    // drakeydb: Phase 3 origin announcements are not consumed by RDB-embedded journal replay;
+    // skip explicitly, on opcode rather than on entry.cmd's shape, so a uuid can never be
+    // dispatched to journal_executor_->Execute() as a command name. Resolving these into a local
+    // PeerRegistry mapping (the way a plain replica's stable-sync stream will eventually need to,
+    // per Op::ORIGIN's own purpose -- see journal/types.h) is observability-only today, same as
+    // tx_executor.cc's TransactionData::AddEntry for the stable-sync path -- not wired into
+    // PeerRegistry lookups by any consumer yet. Not needed for T7b: this loader's OWN applied
+    // origin comes from apply_origin_idx_ (a constant for the whole load, set once via
+    // SetApplyOrigin), never from a per-entry ORIGIN announcement in the blob it is replaying.
     if (entry.opcode == journal::Op::ORIGIN) {
       continue;
     }

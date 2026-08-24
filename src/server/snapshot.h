@@ -44,9 +44,15 @@ class SliceSnapshot : public SerializerBase, public journal::JournalConsumerInte
     virtual void Finalize() = 0;
   };
 
+  // drakeydb: Phase 3 T7b -- `peer_mode` gates the FULL-SYNC window's concurrent journal blob
+  // filter (see ConsumeJournalChange in snapshot.cc); false for every caller except
+  // RdbSaver::Impl::CreateSliceSnapshot forwarding an admitted peer's full sync (dflycmd.cc's
+  // StartFullSyncInThread -> RdbSaver -> Impl -> here). A plain replica's or a local backup
+  // snapshot's SliceSnapshot always gets false, keeping its journal blob byte-identical to
+  // upstream: unfiltered.
   SliceSnapshot(CompressionMode compression_mode, DbSlice* slice,
                 SnapshotDataConsumerInterface* consumer, ExecutionState* cntx,
-                DflyVersion replica_dfly_version);
+                DflyVersion replica_dfly_version, bool peer_mode = false);
   ~SliceSnapshot();
 
   static size_t GetThreadLocalMemoryUsage();
@@ -128,6 +134,9 @@ class SliceSnapshot : public SerializerBase, public journal::JournalConsumerInte
 
   bool use_background_mode_ = false;
   DflyVersion replica_dfly_version_ = DflyVersion::CURRENT_VER;
+
+  // drakeydb: Phase 3 T7b -- see the constructor's doc comment. Immutable after construction.
+  const bool peer_mode_ = false;
 
   uint64_t rec_id_ = 1, last_pushed_id_ = 0;
 

@@ -1456,6 +1456,12 @@ DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext m
   rdb_loader_ = std::make_unique<RdbLoader>(&service_, load_context);
   rdb_loader_->SetLoadUnownedSlots(true);
   rdb_loader_->SetShardCount(master_context.num_flows);
+  // drakeydb: Phase 3 T7b -- same origin_idx as executor_ above, applied to this flow's OTHER
+  // apply path: rdb_loader_'s own journal_executor_ (RdbLoaderBase::HandleJournalBlob,
+  // rdb_load.cc), which replays the concurrent journal blob embedded in this flow's full sync.
+  // Without this, a peer's full-sync writes would apply -- and re-journal -- as self-origin,
+  // which is the no-forward violation this phase exists to prevent (see task-7b-brief.md).
+  rdb_loader_->SetApplyOrigin(origin_idx);
 }
 
 DflyShardReplica::~DflyShardReplica() {

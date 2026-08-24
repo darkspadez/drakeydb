@@ -271,6 +271,10 @@ class DflyShardReplica : public ProtocolClient {
   // PeerRegistry::AddOrGet()); PeerRegistry::kSelfIdx (0) for a non-peer flow. Threaded straight
   // to executor_->SetApplyOrigin() at construction -- see that method's doc comment
   // (journal/executor.h) for why this is set once here rather than reaching back into Replica.
+  // drakeydb: Phase 3 T7b -- also threaded to rdb_loader_->SetApplyOrigin() at construction, the
+  // same way and for the same reason: this flow's OTHER apply path (the full sync's embedded
+  // journal blob, RdbLoaderBase::HandleJournalBlob) must stamp this flow's origin too, not
+  // kSelfIdx by default.
   //
   // `peer_mode`: drakeydb: Phase 3 T6b -- true iff this flow belongs to a peer-mode Replica (see
   // Replica::IsPeerMode()). Threaded in at construction the same way origin_idx is -- this class
