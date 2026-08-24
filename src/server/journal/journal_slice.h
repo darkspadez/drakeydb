@@ -52,8 +52,15 @@ class JournalSlice {
   std::string_view GetEntry(LSN lsn) const;
   // drakeydb: Phase 3 metadata accessor. Returns the full buffered JournalItem -- including
   // origin_idx/entry_flags -- so a later peer-echo filter can inspect them without reparsing
-  // `data`. Added alongside GetEntry() (rather than widening it) so GetEntry's existing caller
-  // in streamer.cc, outside this task's scope, stays untouched.
+  // `data`. Added alongside GetEntry() (rather than widening it) so a caller that only wants the
+  // raw bytes isn't forced to pull in the rest of JournalItem.
+  //
+  // drakeydb: fix-round-1 -- GetEntry()/GetEntryMeta() were sibling accessors when this comment
+  // was first written, because GetEntry() had a caller in streamer.cc that stayed on raw bytes
+  // only. T5's own MaybePartialStreamLSNs fix switched that call site to GetEntryMeta() (it needs
+  // origin_idx/entry_flags/opcode, not just `data`), so GetEntry() currently has no callers left
+  // anywhere in this tree -- noted here rather than removing GetEntry(), since it's still a
+  // reasonable narrower accessor for a future raw-bytes-only caller.
   //
   // drakeydb: Phase 3 T5 -- contract (undocumented until now; this task is GetEntryMeta's first
   // caller outside JournalSlice itself, via journal::GetEntryMeta -> JournalStreamer::ShouldWrite

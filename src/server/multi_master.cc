@@ -129,7 +129,7 @@ uint32_t PeerRegistry::AddOrGet(std::string_view uuid) {
   // Op::LSN with a DCHECK_EQ tying the two together -- writing ORIGIN any other way would desync
   // that counter the moment a peer link starts emitting these.
   //
-  // Deliberately outside the lock above: RunBriefInParallel dispatches onto every shard's own
+  // Deliberately outside the lock above: the fan-out below dispatches onto every shard's own
   // fiber and blocks this fiber until they all complete, and AddOrGet can itself be called
   // concurrently from several fibers (see PeerRegistryFiberTest) -- holding mu_ across that
   // fan-out would serialize unrelated AddOrGet/FindIdx/GetUuid calls behind it for no reason.
@@ -140,7 +140,13 @@ uint32_t PeerRegistry::AddOrGet(std::string_view uuid) {
   if (inserted && shard_set) {
     using Payload = journal::Entry::Payload;
     std::string uuid_copy(uuid);
-    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    // drakeydb: fix-round-1 -- RunBriefInParallel (via DispatchBrief) contractually requires
+    // `func` not to preempt (engine_shard_set.h:65,71). journal::RecordEntry -> AddLogRecord ->
+    // CallOnChange -> JournalStreamer::ThrottleIfNeeded can block on waker_.await_until
+    // (streamer.cc) whenever a registered consumer is stalled -- exactly the replication
+    // back-pressure a newly joining peer tends to cause. RunBlockingInParallel (via Dispatch,
+    // which spawns a real fiber per shard) is the preemption-safe fan-out primitive.
+    shard_set->RunBlockingInParallel([&](EngineShard* shard) {
       if (shard->journal()) {
         Payload payload;
         payload.cmd = uuid_copy;

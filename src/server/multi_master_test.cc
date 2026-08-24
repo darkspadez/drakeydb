@@ -814,77 +814,120 @@ TEST_F(OriginJournalFamilyTest, DerivedDeleteInheritsCausingTransactionOrigin) {
 }
 
 namespace {
-// drakeydb: Phase 3 T5 -- captures opcode/origin_idx/cmd for every journal entry seen. `cmd`
-// doubles as the announced uuid for an Op::ORIGIN entry: JournalSlice::AddLogRecord sets
+// drakeydb: Phase 3 T5 -- captures opcode/origin_idx/cmd/shard_id for every journal entry seen.
+// `cmd` doubles as the announced uuid for an Op::ORIGIN entry: JournalSlice::AddLogRecord sets
 // JournalChangeItem::cmd from Entry::payload.cmd unconditionally (not gated on opcode), and
 // PeerRegistry::AddOrGet's ORIGIN emission puts the uuid in exactly that field (see
 // multi_master.cc) -- so this needs no wire-level decoding, unlike journal_test.cc's streamer
 // tests, which observe already-serialized bytes off a captured socket instead of live
 // JournalChangeItems.
+//
+// drakeydb: fix-round-1 -- AddOrGet's fan-out (RunBlockingInParallel) dispatches one fiber per
+// shard, each on that shard's own thread, so ConsumeJournalChange can fire on this SAME consumer
+// instance concurrently from multiple threads. mu_ makes that safe; shard_id is captured via
+// EngineShard::tlocal() inside ConsumeJournalChange, which runs on the recording shard's own
+// thread, so it always names the shard that actually produced the entry.
 struct OriginOpcodeEntry {
   journal::Op opcode;
   uint32_t origin_idx;
   std::string cmd;
+  ShardId shard_id;
 };
 
 class OriginOpcodeCapturingConsumer : public journal::JournalConsumerInterface {
  public:
   void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
-    entries.push_back(
-        {item.journal_item.opcode, item.journal_item.origin_idx, std::string(item.cmd)});
+    util::fb2::LockGuard lk(mu_);
+    entries.push_back({item.journal_item.opcode, item.journal_item.origin_idx,
+                       std::string(item.cmd), EngineShard::tlocal()->shard_id()});
   }
   void ThrottleIfNeeded() override {
   }
 
-  std::vector<OriginOpcodeEntry> entries;
+  util::fb2::Mutex mu_;
+  std::vector<OriginOpcodeEntry> entries;  // guarded by mu_
 };
 }  // namespace
 
-// drakeydb: Phase 3 T5 acceptance case for PeerRegistry::AddOrGet's journal fan-out. Falsifying:
-// removing the fan-out (or gating it on the wrong condition) leaves `entries` empty after the
-// first AddOrGet, failing the first ASSERT; emitting with the wrong opcode/origin_idx/payload
-// fails the three EXPECTs that follow it; re-emitting on an already-registered uuid (i.e. not
-// actually gating on `inserted`) grows entries.size() on the second, idempotent AddOrGet call.
-TEST_F(OriginJournalFamilyTest, AddOrGetEmitsOriginOnNewIndexOnly) {
+// Uses MultiMasterFamilyTest's (== BaseFamilyTest's) default shard count directly, deliberately
+// NOT OriginJournalFamilyTest's num_threads_=1/num_shards=1 pin: this test needs more than one
+// shard to be meaningful, and (unlike the T3/T4 tests sharing OriginJournalFamilyTest) it never
+// dispatches a keyed Redis command whose shard routing needs to be predictable.
+class MultiShardOriginJournalFamilyTest : public MultiMasterFamilyTest {};
+
+// drakeydb: Phase 3 T5 acceptance case for PeerRegistry::AddOrGet's journal fan-out, strengthened
+// in fix-round-1 to actually exercise "every shard's journal" (not just shard 0) and the
+// cross-proactor RunBlockingInParallel dispatch it now uses.
+//
+// Falsifying:
+//  - Removing the fan-out (or gating it on the wrong condition) leaves `entries` empty after the
+//    first AddOrGet, failing the first ASSERT.
+//  - Emitting on fewer than all shards, or more than once on any shard, fails the
+//    entries.size() == num_shards assertion or the per-shard seen[] uniqueness check.
+//  - Emitting with the wrong opcode/origin_idx/payload fails the three EXPECTs in the loop.
+//  - Re-emitting on an already-registered uuid (i.e. not actually gating on `inserted`) grows
+//    entries.size() on the second, idempotent AddOrGet call.
+TEST_F(MultiShardOriginJournalFamilyTest, AddOrGetEmitsOriginOnNewIndexOnly) {
   // JournalSlice::Init() caches extended_framing_ = IsActiveReplica() once, and Op::ORIGIN can
   // only be written with extended framing (serializer.cc DCHECKs this). Set before
   // journal::StartInThread() below; MultiMasterFamilyTest's inherited saver_ restores it.
   absl::SetFlag(&FLAGS_active_replica, true);
 
+  const size_t num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "test requires more than one shard to be meaningful";
+
   OriginOpcodeCapturingConsumer consumer;
-  uint32_t consumer_id = 0;
-  pp_->at(0)
-      ->LaunchFiber([&] {
-        journal::StartInThread();
-        consumer_id = journal::RegisterConsumer(&consumer);
-      })
-      .Join();
+  std::vector<uint32_t> consumer_ids(num_shards, 0);
+  // RunBriefInParallel (not RunBlockingInParallel): StartInThread/RegisterConsumer don't preempt,
+  // so the brief (DispatchBrief) contract is fine here -- this loop is just setup, not the
+  // fan-out under test.
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
 
   PeerRegistry reg;
   reg.Init(GenerateNodeUuid());
   const std::string peer_uuid = GenerateNodeUuid();
 
-  // AddOrGet's shard fan-out (RunBriefInParallel) dispatches onto -- and blocks this fiber on --
-  // shard 0's own proactor thread, the same cross-thread dispatch+wait shape as
-  // JournalExecutor::Execute above; run it from an explicit fiber on shard 0 for the same reason.
+  // AddOrGet's shard fan-out dispatches onto -- and blocks this fiber on -- every shard's own
+  // proactor thread, the same cross-thread dispatch+wait shape as JournalExecutor::Execute
+  // elsewhere in this file; run it from an explicit fiber for the same reason.
   uint32_t idx = 0;
   pp_->at(0)->LaunchFiber([&] { idx = reg.AddOrGet(peer_uuid); }).Join();
 
-  ASSERT_FALSE(consumer.entries.empty());
-  const OriginOpcodeEntry& emitted = consumer.entries.back();
-  EXPECT_EQ(journal::Op::ORIGIN, emitted.opcode);
-  EXPECT_EQ(idx, emitted.origin_idx);
-  EXPECT_EQ(peer_uuid, emitted.cmd);
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    // Exactly one entry per shard -- not just a non-empty vector -- so a duplicate emission on
+    // this first call (as opposed to only on a later, idempotent re-add) cannot pass unnoticed.
+    ASSERT_EQ(num_shards, consumer.entries.size());
+
+    std::vector<bool> seen(num_shards, false);
+    for (const auto& e : consumer.entries) {
+      EXPECT_EQ(journal::Op::ORIGIN, e.opcode);
+      EXPECT_EQ(idx, e.origin_idx);
+      EXPECT_EQ(peer_uuid, e.cmd);
+      ASSERT_LT(e.shard_id, num_shards);
+      EXPECT_FALSE(seen[e.shard_id]) << "shard " << e.shard_id << " got more than one entry";
+      seen[e.shard_id] = true;
+    }
+    for (size_t sid = 0; sid < num_shards; ++sid)
+      EXPECT_TRUE(seen[sid]) << "shard " << sid << " never got an ORIGIN entry";
+  }
 
   // Idempotent re-add of the same uuid: no new index, and (load-bearing for this test) no new
-  // ORIGIN entry -- AddOrGet's fan-out must be gated on actually having inserted a new index.
-  size_t count_before_repeat = consumer.entries.size();
+  // ORIGIN entry on any shard -- AddOrGet's fan-out must be gated on actually having inserted a
+  // new index.
   uint32_t idx2 = 0;
   pp_->at(0)->LaunchFiber([&] { idx2 = reg.AddOrGet(peer_uuid); }).Join();
   EXPECT_EQ(idx, idx2);
-  EXPECT_EQ(count_before_repeat, consumer.entries.size());
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    EXPECT_EQ(num_shards, consumer.entries.size());
+  }
 
-  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
 }
 
 }  // namespace dfly

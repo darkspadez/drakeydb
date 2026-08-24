@@ -758,8 +758,14 @@ void DflyCmd::StartStableSyncInThread(FlowInfo* flow, ExecutionState* exec_st, E
   DCHECK(flow->conn);
 
   LSN partial_lsn = flow->start_partial_sync_at.value_or(0);
-  JournalStreamer::Config config{
-      .should_sent_lsn = true, .init_from_stable_sync = true, .start_partial_sync_at = partial_lsn};
+  // drakeydb: fix-round-1 -- peer_mode/peer_uuid designated with their safe (off) defaults here
+  // to silence -Wmissing-field-initializers (CI runs -Werror); T7 is responsible for populating
+  // them from this flow's ReplicaInfo so the peer-echo filter (streamer.cc) actually activates.
+  JournalStreamer::Config config{.should_sent_lsn = true,
+                                 .init_from_stable_sync = true,
+                                 .start_partial_sync_at = partial_lsn,
+                                 .peer_mode = false,
+                                 .peer_uuid = {}};
   flow->streamer.reset(new JournalStreamer(exec_st, config));
   flow->streamer->Start(flow->conn->socket());
 

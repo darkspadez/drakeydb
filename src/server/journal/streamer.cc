@@ -167,10 +167,8 @@ bool JournalStreamer::ShouldWrite(const journal::JournalChangeItem& item) const 
 
   const JournalItem& meta = item.journal_item;
 
-  // Not this node's own write -- it was applied here from some peer (or is that peer's own
-  // control traffic re-recorded locally, e.g. a re-recorded PING; see journal.h's RecordEntry
-  // comment and replica.cc's PING re-record). Forwarding it back to a peer stream risks echoing
-  // it toward -- or through -- whichever peer authored it.
+  // Not this node's own write -- it was applied here from some peer. Forwarding it back to a
+  // peer stream risks echoing it toward -- or through -- whichever peer authored it.
   if (meta.origin_idx != PeerRegistry::kSelfIdx)
     return false;
 
@@ -191,9 +189,15 @@ bool JournalStreamer::ShouldWrite(const journal::JournalChangeItem& item) const 
   //
   // Op::LSN and Op::PING are deliberately NOT dropped by opcode here: LSN bookkeeping and
   // ack/partial-resume accounting on the receiving side depend on both reaching the consumer
-  // (see TransactionReader::NextTxData's DCHECK_EQ and replica.cc's journal_rec_executed_). A
-  // peer's own re-recorded PING is still suppressed, but via the origin_idx check above, not by
-  // opcode.
+  // (see TransactionReader::NextTxData's DCHECK_EQ and replica.cc's journal_rec_executed_).
+  //
+  // drakeydb: KNOWN GAP, not this task's to fix (assigned to T6) -- a peer's re-recorded PING is
+  // NOT currently suppressed by the origin_idx check above. replica.cc:1244 re-records a received
+  // PING via journal::RecordEntry(0, journal::Op::PING, 0, nullopt, {}), unconditionally with the
+  // default (self) origin, never the sending peer's -- so this filter cannot distinguish it from
+  // a locally-originated PING and forwards it. Stamping the peer's origin at that re-record site
+  // is T6's job. This comment exists so the gap stays visible instead of reading as already
+  // handled; see journal_test.cc's MixedOriginBacklogPeerVsFullStream for the same caveat.
   if (meta.opcode == journal::Op::ORIGIN)
     return false;
 
