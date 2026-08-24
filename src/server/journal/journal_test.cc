@@ -658,6 +658,20 @@ class TestPartialSyncStreamer : public JournalStreamer {
   using JournalStreamer::MaybePartialStreamLSNs;
 };
 
+// drakeydb: Phase 3 T6b fix-round-2 -- JournalStreamer::Config::lsn_marker_throttle_sec
+// (streamer.h) set to this value makes the write-path periodic marker / drop-path resolution
+// marker throttle (ConsumeJournalChange, streamer.cc) provably never re-fire during a test's real
+// execution window, no matter how slow or loaded the machine running it is -- replacing what used
+// to be an implicit, unstated assumption that the whole test body would finish inside the
+// hard-coded 3-second window (it does not always: a Sanitizers-matrix runner under load is exactly
+// where that assumption broke -- see task-6b-report.md's round-2 section). 1,000,000 seconds
+// (~11.5 days) is comfortably larger than any test could plausibly run, yet comfortably smaller
+// than the current UNIX epoch (~1.7 billion seconds as of 2026) -- last_lsn_time_ starts at its
+// zero default, so the very first throttle check ("now - 0 > threshold") must still evaluate true
+// for a fresh streamer's first marker to fire immediately, exactly as every comment in this file
+// documents.
+constexpr int kNeverThrottleSec = 1'000'000;
+
 // Needs a real per-shard journal (EngineShard::tlocal()) to drive the actual
 // journal::RecordEntry/journal::GetEntryMeta/JournalStreamer::MaybePartialStreamLSNs code path --
 // not a reimplementation of it -- so a minimal single-shard ProactorPool + EngineShardSet is
@@ -834,6 +848,12 @@ TEST_F(JournalStreamerPeerFilterTest, MixedOriginBacklogPeerVsFullStream) {
     JournalStreamer::Config peer_config;
     peer_config.start_partial_sync_at = 1;
     peer_config.peer_mode = true;
+    // drakeydb: Phase 3 T6b fix-round-2 -- see kNeverThrottleSec's own comment. Without this, the
+    // exact marker vector asserted below (expected_peer) would depend on this whole scenario --
+    // every RecordEntry call after the first, plus both streamers' partial-replay and live-path
+    // machinery -- finishing inside a real 3-second wall-clock window, which is not guaranteed on
+    // a slow or loaded runner (this project's Sanitizers CI matrix, for one).
+    peer_config.lsn_marker_throttle_sec = kNeverThrottleSec;
     CapturingFiberSocket peer_socket;
     TestPartialSyncStreamer peer_streamer(&peer_cntx, peer_config);
     peer_streamer.Start(&peer_socket);
@@ -865,16 +885,18 @@ TEST_F(JournalStreamerPeerFilterTest, MixedOriginBacklogPeerVsFullStream) {
     // "LSN:2" (fix-round-1, C2) fires on LSN2, the very FIRST entry this streamer's drop path
     // ever evaluates: last_lsn_time_ (reused by the drop-path block, like the pre-existing
     // write-path periodic marker it was borrowed from) also starts at its zero default, so the
-    // very first `now - last_lsn_time_ > 3` check -- on either path -- is always true; this
-    // fires immediately rather than waiting out a throttle window that hasn't started yet. Not a
-    // new quirk: the pre-existing write-path periodic marker (config_.should_sent_lsn, left
-    // false here) already had the identical "fires immediately on the very first check" property
-    // before this task. "LSN:3" (dropped LSN3, no marker: fired too soon after LSN:2 to clear the
-    // 3s throttle -- both markers share last_lsn_time_) does NOT appear; instead "LSN:3" precedes
-    // PING (LSN4) as fix-round-1's original write-path gap-correction marker (this task, not the
-    // C2 fix-round-1 addition), correcting for LSN2/LSN3 having been dropped since last_lsn_writen_
-    // was last advanced (by the LSN2 drop-path marker, to 2) -- "LSN:6" precedes CMD:SET d 4
-    // (LSN7) the same way, correcting for LSN5/LSN6. No marker precedes CMD:SET a 1:
+    // very first throttle check -- on either path -- is always true; this fires immediately
+    // rather than waiting out a throttle window that hasn't started yet. Not a new quirk: the
+    // pre-existing write-path periodic marker (config_.should_sent_lsn, left false here) already
+    // had the identical "fires immediately on the very first check" property before this task.
+    // "LSN:3" (dropped LSN3, no marker of its own: fix-round-2's kNeverThrottleSec guarantees --
+    // by construction, not by how fast this scenario happens to run -- that the drop-path
+    // throttle cannot re-fire before LSN3 is evaluated, since it just fired on LSN2 above) does
+    // NOT appear; instead "LSN:3" precedes PING (LSN4) as fix-round-1's original write-path
+    // gap-correction marker (this task, not the C2 fix-round-1 addition -- and never throttled at
+    // all, see ConsumeJournalChange), correcting for LSN2/LSN3 having been dropped since
+    // last_lsn_writen_ was last advanced (by the LSN2 drop-path marker, to 2) -- "LSN:6" precedes
+    // CMD:SET d 4 (LSN7) the same way, correcting for LSN5/LSN6. No marker precedes CMD:SET a 1:
     // peer_config.start_partial_sync_at is 1 below, so JournalStreamer's constructor
     // (fix-round-1, streamer.cc) seeds last_lsn_writen_ to 1 - 1 = 0, and 0 + 1 == 1 (LSN1's own
     // LSN) is a non-gap -- this is specific to resuming at LSN 1, not a general "first entry
@@ -967,8 +989,11 @@ TEST_F(JournalStreamerPeerFilterTest, PeerModeGapMarkerCoalescesAndTransactionRe
     array<string_view, 2> set_c{"c", "3"};
     RecordEntry(0, Op::COMMAND, 0, nullopt,
                 Entry::Payload{"SET", ArgSlice{set_c.data(), set_c.size()}},
-                kPeerIdx);  // LSN3: peer -- dropped (2nd); no marker of its own -- fired too soon
-                            // after LSN2's to clear the 3s throttle (shared via last_lsn_time_).
+                kPeerIdx);  // LSN3: peer -- dropped (2nd); no marker of its own -- peer_config's
+                            // lsn_marker_throttle_sec is set to kNeverThrottleSec below, which
+                            // guarantees (by construction, not by how fast this test happens to
+                            // run) that the shared last_lsn_time_ throttle cannot re-fire so soon
+                            // after LSN2's marker.
 
     array<string_view, 2> set_d{"d", "4"};
     RecordEntry(0, Op::COMMAND, 0, nullopt,
@@ -998,6 +1023,10 @@ TEST_F(JournalStreamerPeerFilterTest, PeerModeGapMarkerCoalescesAndTransactionRe
     JournalStreamer::Config peer_config;
     peer_config.start_partial_sync_at = 1;
     peer_config.peer_mode = true;
+    // drakeydb: Phase 3 T6b fix-round-2 -- see kNeverThrottleSec's own comment: without this, the
+    // exact marker vector asserted below depends on this whole scenario finishing inside a real
+    // 3-second wall-clock window, which is not guaranteed under load.
+    peer_config.lsn_marker_throttle_sec = kNeverThrottleSec;
     CapturingFiberSocket peer_socket;
     TestPartialSyncStreamer peer_streamer(&peer_cntx, peer_config);
     peer_streamer.Start(&peer_socket);
@@ -1109,16 +1138,15 @@ TEST(JournalDeathTest, NonPeerModeStillDchecksMismatchedLsnMarker) {
 // eviction before it) would force a full resync whose last-loaded-wins merge (rdb_load.cc) can
 // resurrect stale values.
 //
-// The two RecordEntry calls are split by a real ~4.5s sleep so each falls in its own
-// last_lsn_time_ throttle window (reused, not a separate timer -- see the drop-path block's own
-// comment for why a separate timer fiber would reintroduce a cross-fiber ordering question this
-// design otherwise avoids): the first proves a marker fires at all despite every entry being
-// dropped, the second proves the mechanism keeps refreshing, not just firing once. The sleep is
-// 4.5s, not just over 3s, because last_lsn_time_/`now` are time_t (1-second granularity): if the
-// first marker happened to land right at the start of a wall-clock second, only 3.0-3.99s would
-// actually elapse by the time `now`'s truncated value is read back, and the check needs
-// STRICTLY more than 3 whole seconds -- 3.1s alone was observed to flake on exactly this
-// boundary during this fix's own test run (see task-6b-report.md).
+// drakeydb: Phase 3 T6b fix-round-2 -- the original round-1 version of this test proved "keeps
+// refreshing" with a real ~4.5s sleep between the two RecordEntry calls, needed to clear
+// last_lsn_time_'s then-hard-coded 3-second throttle window despite time_t's 1-second truncation
+// (3.1s alone was observed to flake on exactly that boundary -- see task-6b-report.md's original
+// round). peer_config.lsn_marker_throttle_sec = 0 below disables the throttle outright (see its
+// own doc comment in streamer.h and ConsumeJournalChange's special case in streamer.cc), so both
+// drops get their own marker unconditionally -- no sleep, no wall-clock dependency of any kind,
+// and no throttle-window race for a slow or loaded runner (this project's Sanitizers CI matrix,
+// for one) to lose.
 //
 // Falsifying (verified by hand -- see task-6b-report.md): removing the drop-path block entirely
 // makes the EXPECT_EQ below fail (empty capture vs. the two expected markers).
@@ -1128,6 +1156,7 @@ TEST_F(JournalStreamerPeerFilterTest, PeerModeFullyFilteredLinkStillEmitsResolut
     ExecutionState peer_cntx;
     JournalStreamer::Config peer_config;
     peer_config.peer_mode = true;
+    peer_config.lsn_marker_throttle_sec = 0;  // fix-round-2: always fire -- see header comment.
     CapturingFiberSocket peer_socket;
     JournalStreamer peer_streamer(&peer_cntx, peer_config);
     peer_streamer.Start(&peer_socket);  // live listener; start_partial_sync_at defaults to 0.
@@ -1135,22 +1164,22 @@ TEST_F(JournalStreamerPeerFilterTest, PeerModeFullyFilteredLinkStillEmitsResolut
     array<string_view, 2> set_a{"a", "1"};
     RecordEntry(0, Op::COMMAND, 0, nullopt,
                 Entry::Payload{"SET", ArgSlice{set_a.data(), set_a.size()}},
-                kPeerIdx);  // LSN1: peer -- dropped, and the ONLY entry this link will ever see
-                            // for the next 3s: nothing else races the throttle window.
-
-    ThisFiber::SleepFor(std::chrono::milliseconds(4500));  // clear last_lsn_time_'s 3s window
-                                                           // with margin -- see header comment.
+                kPeerIdx);  // LSN1: peer -- dropped; the throttle is disabled, so this gets its
+                            // own marker unconditionally, not merely because it's the first check.
 
     array<string_view, 2> set_b{"b", "2"};
     RecordEntry(0, Op::COMMAND, 0, nullopt,
                 Entry::Payload{"SET", ArgSlice{set_b.data(), set_b.size()}},
-                kPeerIdx);  // LSN2: peer -- also dropped.
+                kPeerIdx);  // LSN2: peer -- also dropped, immediately after LSN1 with no sleep in
+                            // between; proves the mechanism keeps firing on every eligible entry
+                            // instead of firing once and going silent, without depending on real
+                            // elapsed wall-clock time to prove it.
 
     peer_streamer.Cancel();
 
-    // One marker per drop here (the sleep pushed the second past the throttle window), each
-    // carrying that drop's own true LSN directly -- not LSN - 1: unlike the write-path marker,
-    // neither drop has a following write of its own to set up for (see ConsumeJournalChange).
+    // One marker per drop here (the throttle is disabled), each carrying that drop's own true LSN
+    // directly -- not LSN - 1: unlike the write-path marker, neither drop has a following write of
+    // its own to set up for (see ConsumeJournalChange).
     std::vector<std::string> expected = {"LSN:1", "LSN:2"};
     EXPECT_EQ(expected, JournalStreamerPeerFilterTest::Decode(peer_socket.captured));
   });

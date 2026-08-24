@@ -159,7 +159,13 @@ void JournalStreamer::ConsumeJournalChange(const JournalChangeItem& item) {
     // re-flag a gap this marker already closed.
     if (config_.peer_mode && cntx_->IsRunning()) {
       time_t now = time(nullptr);
-      if (now - last_lsn_time_ > 3) {
+      // drakeydb: Phase 3 T6b fix-round-2 -- config_.lsn_marker_throttle_sec == 0 bypasses the
+      // real-clock comparison entirely (see its doc comment in streamer.h) rather than comparing
+      // "now - last_lsn_time_ > 0": time_t truncates to whole seconds, so two calls made within
+      // the same wall-clock second -- as happens in a fast-running test with no sleep between
+      // them -- would otherwise both see a 0 delta and the second marker would silently not fire.
+      if (config_.lsn_marker_throttle_sec == 0 ||
+          now - last_lsn_time_ > config_.lsn_marker_throttle_sec) {
         last_lsn_time_ = now;
         io::StringSink drop_sink;
         JournalWriter drop_writer(&drop_sink);
@@ -209,7 +215,10 @@ void JournalStreamer::ConsumeJournalChange(const JournalChangeItem& item) {
   time_t now = time(nullptr);
   last_lsn_writen_ = item.journal_item.lsn;
   // TODO: to chain it to the previous Write call.
-  if (config_.should_sent_lsn && now - last_lsn_time_ > 3) {
+  // drakeydb: Phase 3 T6b fix-round-2 -- see the drop-path block above for why
+  // lsn_marker_throttle_sec == 0 is special-cased rather than folded into the real-clock compare.
+  if (config_.should_sent_lsn && (config_.lsn_marker_throttle_sec == 0 ||
+                                  now - last_lsn_time_ > config_.lsn_marker_throttle_sec)) {
     last_lsn_time_ = now;
     io::StringSink sink;
     JournalWriter writer(&sink);

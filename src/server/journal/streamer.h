@@ -33,6 +33,22 @@ class JournalStreamer : public journal::JournalConsumerInterface {
     // which peer this streamer feeds; T5's filter does not consult it (reserved for T6/T7).
     bool peer_mode = false;
     std::string peer_uuid;
+
+    // drakeydb: Phase 3 T6b fix-round-2 -- throttle (seconds) shared by the write-path periodic
+    // Op::LSN heartbeat (should_sent_lsn) and the peer-mode drop-path resolution marker -- see
+    // ConsumeJournalChange in streamer.cc. Defaults to the pre-existing hard-coded 3, so
+    // production behavior (dflycmd.cc's should_sent_lsn=true callers) is unchanged. Exists so
+    // tests can make marker timing deterministic instead of racing a real wall clock:
+    //   - 0 disables the throttle entirely -- every eligible entry gets its own marker,
+    //     unconditionally (ConsumeJournalChange special-cases this rather than comparing against
+    //     a real clock, since two back-to-back calls with no sleep between them would otherwise
+    //     both read the same truncated time_t second and the throttle would never appear to
+    //     elapse).
+    //   - a large value (comfortably below the current UNIX epoch -- see journal_test.cc's
+    //     kNeverThrottleSec -- so the very first check, with last_lsn_time_ still at its zero
+    //     default, still fires immediately) makes the throttle never re-fire during a test's real
+    //     execution window, however slow or loaded the runner is.
+    int lsn_marker_throttle_sec = 3;
   };
 
   JournalStreamer(ExecutionState* cntx, Config config);

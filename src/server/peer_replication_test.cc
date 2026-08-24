@@ -552,11 +552,19 @@ TEST_F(DflyShardReplicaPeerModeTest, AdoptAuthoritativeLsnComposesWithRealSender
                                      // sender-computed marker immediately (see this test's own
                                      // header comment).
 
-    streamer.Cancel();
-
+    // drakeydb: Phase 3 T6b fix-round-2 -- read immediately after the last RecordEntry, before
+    // Cancel(). Cancel() can yield this fiber (WaitForInflightToComplete awaits the socket write's
+    // completion), and this fixture does not own shard 0 exclusively -- it's a real BaseFamilyTest
+    // shard (see this test's own header comment) -- so an unrelated journal record landing on
+    // shard 0 during that yield would advance GetLsn() past what this scenario itself produced,
+    // decoupling "ground truth" from the marker this test is actually checking. Closed in practice
+    // today (no keys, no other clients touch this shard during this Await), but not by
+    // construction -- reading here removes the window entirely instead of relying on that holding.
     LSN true_next_lsn = journal::GetLsn();  // ground truth: the ONE thing this test does not
                                             // derive from any formula shared with the code under
                                             // test, on either the sender or the receiver side.
+
+    streamer.Cancel();
 
     base::IoBuf buf;
     io::BufSink sink{&buf};
