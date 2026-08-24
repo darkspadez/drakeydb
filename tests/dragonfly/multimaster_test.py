@@ -287,12 +287,77 @@ async def test_active_replica_refuses_redis_master_without_uuid(
     try:
         await c.set("local-only", "local")
         await r.set("redis-only", "redis")
-        with pytest.raises(redis.exceptions.ResponseError):
+        # "replication cancelled" is what actually surfaces here, not a message naming D2b/uuid:
+        # Replica::Start()'s RETURN_ON_ERR coerces the GenericError from check_connection_error
+        # through operator std::error_code(), which drops a string-only GenericError's message
+        # (its underlying std::error_code stays default/empty), so Start() falls through to `return
+        # {}` and PeerReplicationManager::Add() reports the generic IsContextCancelled() fallback
+        # text instead -- the same pre-existing quirk test_active_node_refuses_consumers_and_takeover
+        # documents for the plain-REPLICAOF-failure case. Verified empirically against this exact
+        # scenario (an active node's blocking REPLICAOF against a real, uuid-less Redis master); not
+        # this task's bug to fix. match= still ties this to a real REPLICAOF-handshake failure
+        # instead of any ResponseError whatsoever.
+        with pytest.raises(redis.exceptions.ResponseError, match="replication cancelled"):
             await c.execute_command(f"REPLICAOF localhost {redis_server.port}")
         assert (await c.info("replication"))["connected_masters"] == 0
         # A refused handshake must not merge the source's data, drop our own, or stop writes.
         assert await c.get("local-only") == "local"
         assert await c.get("redis-only") is None
+        assert await c.set("still-writable", "yes")
+    finally:
+        await r.aclose()
+
+
+async def test_active_replica_merges_redis_full_sync_via_synthetic_uuid(
+    df_factory: DflyInstanceFactory, redis_server, proxy_factory, tmp_path
+):
+    """The peer-mode Redis-protocol full-sync merge branch (replica.cc's InitiatePSync:
+    `if (IsPeerMode())` skips the flush and merges instead, and
+    `loader.SetOverrideExistingKeys(true)`) is still shipped production code -- it is the
+    KeyDB-onboarding path this fork exists for. D2b
+    (test_active_replica_refuses_redis_master_without_uuid above) means that branch can no
+    longer be reached with a real, unmodified Redis master, since real Redis never sends
+    REPLCONF UUID. This test puts a proxy in front of real Redis that answers REPLCONF UUID with
+    a synthetic-but-valid uuid -- the closest KeyDB stand-in this environment allows (no real
+    keydb-server binary is available here) -- so a peer-mode replica gets past D2b's admission
+    check and actually exercises the merge branch, the same way this test's now-deleted P2
+    predecessor (test_active_replica_merges_redis_full_sync_and_stays_writable) did before D2b
+    withdrew plain-Redis fan-in.
+
+    Falsifying: temporarily reverting InitiatePSync's `if (IsPeerMode())` guard so a peer full
+    sync flushes like an ordinary replica (i.e. always taking the `else` FlushAll/FlushSlots
+    branch) drops "local-only", and merged()'s first assertion below fails. Verified by hand.
+    """
+    SYNTHETIC_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    node = df_factory.create(
+        proactor_threads=2,
+        dir=str(tmp_path / "active-redis-proxy"),
+        active_replica="true",
+    )
+    node.start()
+    c = node.client()
+    import redis.asyncio as aioredis
+
+    r = aioredis.Redis(port=redis_server.port, decode_responses=True)
+    proxy = await proxy_factory(redis_server.port)
+    try:
+        await c.mset({"local-only": "local", "conflict": "local"})
+        await r.mset({"redis-only": "redis", "conflict": "redis"})
+        # A bare uuid simple-string reply is the KeyDB-compatible format (no " <ms>" suffix) --
+        # see ParseReplconfUuidReply / node_identity.h.
+        await proxy.override_next_response(b"REPLCONF UUID ", f"+{SYNTHETIC_UUID}\r\n".encode())
+        assert await c.execute_command(f"REPLICAOF localhost {proxy.port}") == "OK"
+        info = await c.info("replication")
+        assert info["connected_masters"] == 1
+        assert info["master0"]["node_uuid"] == SYNTHETIC_UUID
+
+        @assert_eventually(times=300)
+        async def merged():
+            assert await c.get("local-only") == "local"  # not flushed -- peer merge, not replace
+            assert await c.get("redis-only") == "redis"  # full sync actually landed
+            assert await c.get("conflict") == "redis"  # SetOverrideExistingKeys(true): last wins
+
+        await merged()
         assert await c.set("still-writable", "yes")
     finally:
         await r.aclose()
