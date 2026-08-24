@@ -669,9 +669,11 @@ async def test_peer_mesh_own_writes_not_echoed_back(df_factory: DflyInstanceFact
     whenever IsPeerMode(), which peer_replication.cc sets on every Replica an active node creates
     for its own masters -- see ReplicaOfInternal's `if (IsActiveReplica())` routing in
     server_family.cc) -- is the smallest topology where a forwarding bug is observable in the
-    FINAL STATE, not just on the wire. INCR is not idempotent: a single echoed-back replay of an
-    already-applied entry inflates the counter by exactly one extra, deterministically, rather
-    than merely leaving a key transiently stale (which a slow/flaky link could also explain).
+    FINAL STATE, not just on the wire. INCR is not idempotent, so an echoed-back replay of an
+    already-applied entry inflates the counter deterministically -- unlike a merely stale key,
+    which a slow/flaky link could also explain. In THIS test's mutual mesh, the same ShouldWrite
+    guards both outbound streams at once, so a break does not stay at a fixed +1: Falsifying
+    below documents it compounding into unbounded amplification instead.
 
     This is genuinely new coverage: every other fan-in test in this file attaches at most one
     active node to plain masters, so this is the first test where an active node is ever on the
@@ -688,10 +690,13 @@ async def test_peer_mesh_own_writes_not_echoed_back(df_factory: DflyInstanceFact
     exactly the echo path back in. That check is the only thing stopping re-forwarding in EITHER
     direction, and both A's and B's outbound streams share the same ShouldWrite, so disabling it
     breaks the loop-guard symmetrically: one INCR on A amplifies through an unbounded A<->B
-    ping-pong (observed: cnt reaches ~72 within 1s of the single INCR, climbing ~80/s indefinitely
-    on both sides), so the test fails with a TimeoutError at the very first wait_for_value below
-    -- cnt races past "1" before the exact-match poll can ever observe it -- rather than at the
-    `cnt == "1"` assert two lines later. Neither revert leaves this test passing.
+    ping-pong. The existence poll below (not an exact-match wait_for_value) only guards "did the
+    first hop land at all" -- it does not race the storm -- so the echo itself surfaces as a hard
+    value assertion two lines later: observed `assert await c_a.get("cnt") == "1"` failing with
+    `AssertionError: assert equals failed / -'80' / +'1'` (an earlier run of the same revert, on
+    a raw sleep+read probe instead of this test's own assertions, saw cnt at 72 within 1s of the
+    single INCR, climbing ~80/s indefinitely on both sides -- consistent with this run's 80).
+    Neither revert leaves this test passing.
     """
     a = df_factory.create(**active_args())
     b = df_factory.create(**active_args())
@@ -707,7 +712,12 @@ async def test_peer_mesh_own_writes_not_echoed_back(df_factory: DflyInstanceFact
     await wait_for_peers(c_b, 1)
 
     assert await c_a.incr("cnt") == 1
-    await wait_for_value(c_b, "cnt", "1")  # confirm the direct A->B hop landed
+    # Existence, not an exact-match wait_for_value poll: an equality poll can race past
+    # "1" if it climbs faster than the poll interval (see the amplification-storm evidence
+    # below), turning a real echo into a misleading TimeoutError instead of a wrong value.
+    async with async_timeout.timeout(30):
+        while not await c_b.exists("cnt"):  # confirm the direct A->B hop landed
+            await asyncio.sleep(0.1)
     # Give a would-be echo hop (B->A, carrying A's own write back) time to arrive and misapply.
     await asyncio.sleep(1.0)
     assert await c_a.get("cnt") == "1"
@@ -715,7 +725,9 @@ async def test_peer_mesh_own_writes_not_echoed_back(df_factory: DflyInstanceFact
 
     # The mesh is still healthy end to end in the other direction too.
     assert await c_b.incr("cnt2") == 1
-    await wait_for_value(c_a, "cnt2", "1")
+    async with async_timeout.timeout(30):
+        while not await c_a.exists("cnt2"):
+            await asyncio.sleep(0.1)
     await asyncio.sleep(1.0)
     assert await c_a.get("cnt2") == "1"
     assert await c_b.get("cnt2") == "1"
