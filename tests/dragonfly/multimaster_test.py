@@ -293,8 +293,9 @@ async def test_active_replica_refuses_redis_master_without_uuid(
         # through operator std::error_code(), which drops a string-only GenericError's message
         # (its underlying std::error_code stays default/empty), so Start() falls through to `return
         # {}` and PeerReplicationManager::Add() reports the generic IsContextCancelled() fallback
-        # text instead -- the same pre-existing quirk test_active_node_refuses_consumers_and_takeover
-        # documents for the plain-REPLICAOF-failure case. Verified empirically against this exact
+        # text instead -- the same pre-existing quirk
+        # test_active_node_admits_fork_consumers_refuses_others_and_takeover documents for the
+        # plain-REPLICAOF-failure case. Verified empirically against this exact
         # scenario (an active node's blocking REPLICAOF against a real, uuid-less Redis master); not
         # this task's bug to fix. match= still ties this to a real REPLICAOF-handshake failure
         # instead of any ResponseError whatsoever.
@@ -585,7 +586,9 @@ async def test_fanin_remove_and_no_one_keep_data(df_factory: DflyInstanceFactory
     assert await c_a.set("still", "writable")
 
 
-async def test_active_node_refuses_consumers_and_takeover(df_factory: DflyInstanceFactory):
+async def test_active_node_admits_fork_consumers_refuses_others_and_takeover(
+    df_factory: DflyInstanceFactory,
+):
     """P3 T7 updates this P2 regression: an active node's admission gate (server_family.cc
     ReplConf, the CAPA dragonfly case) moved from a blanket top-of-function refusal to a check
     that admits a consumer completing the fork handshake (REPLCONF DRAKEY-VERSION, sent by every
@@ -676,9 +679,19 @@ async def test_peer_mesh_own_writes_not_echoed_back(df_factory: DflyInstanceFact
     PEER 1) -- i.e. the first test where peer_mode has ever been true on a live production
     JournalStreamer at all, active or not.
 
-    Falsifying: hardcoding peer_mode=false in StartStableSyncInThread's JournalStreamer::Config
-    (undoing this task's wiring, so every consumer gets a full stream again) makes A's own INCR
-    relay through B and back to A, so A's final "cnt" is 2 instead of 1.
+    Falsifying (two independent reverts, both confirmed by hand): (1) hardcoding peer_mode=false
+    in StartStableSyncInThread's JournalStreamer::Config (undoing this task's wiring entirely, so
+    every consumer gets a full stream) makes the mesh itself never form cleanly -- B's REPLICAOF A
+    times out during attach, since both links silently disagree with what the peer-mode receive
+    path expects. (2) The narrower revert -- disabling only ShouldWrite's `origin_idx !=
+    kSelfIdx` check (streamer.cc), leaving peer_mode and every other filter untouched -- lets
+    exactly the echo path back in. That check is the only thing stopping re-forwarding in EITHER
+    direction, and both A's and B's outbound streams share the same ShouldWrite, so disabling it
+    breaks the loop-guard symmetrically: one INCR on A amplifies through an unbounded A<->B
+    ping-pong (observed: cnt reaches ~72 within 1s of the single INCR, climbing ~80/s indefinitely
+    on both sides), so the test fails with a TimeoutError at the very first wait_for_value below
+    -- cnt races past "1" before the exact-match poll can ever observe it -- rather than at the
+    `cnt == "1"` assert two lines later. Neither revert leaves this test passing.
     """
     a = df_factory.create(**active_args())
     b = df_factory.create(**active_args())

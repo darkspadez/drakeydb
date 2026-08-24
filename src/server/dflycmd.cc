@@ -28,6 +28,7 @@
 #include "server/journal/journal.h"
 #include "server/journal/streamer.h"
 #include "server/main_service.h"
+#include "server/multi_master.h"  // drakeydb: for IsActiveReplica(), used directly below.
 #include "server/namespaces.h"
 #include "server/rdb_save.h"
 #include "server/replica.h"

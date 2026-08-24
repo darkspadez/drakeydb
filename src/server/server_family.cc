@@ -3793,7 +3793,7 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
       // dragonfly, above) gates on the value.
       unsigned version = 0;
       if (!absl::SimpleAtoi(arg, &version)) {
-        return err_cb();
+        return cmd_cntx->SendError(kInvalidIntErr);
       }
       cntx->conn_state.replication_info.repl_drakey_version = version;
     } else if (cmd == "PEER" && args.size() == 2) {
@@ -3801,7 +3801,7 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
       // connecting replica is itself in peer mode). "0" or "1" only.
       int peer_flag = -1;
       if (!absl::SimpleAtoi(arg, &peer_flag) || (peer_flag != 0 && peer_flag != 1)) {
-        return err_cb();
+        return cmd_cntx->SendError(kInvalidIntErr);
       }
       cntx->conn_state.replication_info.repl_is_peer = (peer_flag == 1);
     } else if (cmd == "ACK" && args.size() == 2) {

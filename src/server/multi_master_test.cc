@@ -22,11 +22,13 @@
 #include "facade/facade_test.h"
 #include "facade/reply_builder.h"
 #include "io/file_util.h"
+#include "server/dflycmd.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/executor.h"
 #include "server/journal/journal.h"
 #include "server/journal/types.h"
 #include "server/node_identity.h"
+#include "server/server_family.h"
 #include "server/test_utils.h"
 #include "util/fibers/fibers.h"
 #include "util/fibers/pool.h"
@@ -484,9 +486,11 @@ TEST_F(ActiveReplicaFamilyTest, ReplTakeoverRefusedWhileActive) {
 // drakeydb: P3 T7 -- master-side peer admission. Each test below drives the same handshake
 // sequence Greet() uses (REPLCONF UUID / DRAKEY-VERSION / PEER, strictly before CAPA dragonfly)
 // directly through Run(), one REPLCONF invocation per pair exactly as the real wire handshake
-// does it, and inspects only the final CAPA dragonfly reply -- an array on admission, an error
-// otherwise -- so each test exercises exactly one row of the admission table in
-// task-7-brief.md and is agnostic to how the gate is implemented internally.
+// does it, and inspects both the final CAPA dragonfly reply -- an array on admission, an error
+// otherwise -- and the resulting DflyCmd::ReplicaInfo::IsPeer(), via the public
+// GetReplicaInfoSnapshot(), so a peer admission and a plain-replica admission are distinguished
+// by more than "some array came back" -- each row asserts the one property that differs between
+// them, not just the property they share.
 TEST_F(ActiveReplicaFamilyTest, ReplconfAdmitsPeerWithValidForeignUuid) {
   const std::string kForeignUuid = "01234567-89ab-4cde-8f01-23456789abcd";
   Run({"replconf", "uuid", kForeignUuid});
@@ -497,6 +501,11 @@ TEST_F(ActiveReplicaFamilyTest, ReplconfAdmitsPeerWithValidForeignUuid) {
   // Not StrArray(): the reply mixes strings with two integer elements (flow_count, version) --
   // StrArray()'s GetBuf() call on those would throw (wrong std::variant alternative).
   EXPECT_EQ(5u, resp.GetVec().size());
+
+  auto infos = service_->server_family().GetDflyCmd()->GetReplicaInfoSnapshot();
+  ASSERT_EQ(1u, infos.size());
+  EXPECT_TRUE(infos[0]->IsPeer()) << "PEER 1 was requested; ReplicaInfo must record it as a peer";
+  EXPECT_EQ(kForeignUuid, infos[0]->GetNodeUuid());
 }
 
 TEST_F(ActiveReplicaFamilyTest, ReplconfAdmitsPlainReplicaWithoutPeerFlag) {
@@ -509,6 +518,10 @@ TEST_F(ActiveReplicaFamilyTest, ReplconfAdmitsPlainReplicaWithoutPeerFlag) {
   // Not StrArray(): the reply mixes strings with two integer elements (flow_count, version) --
   // StrArray()'s GetBuf() call on those would throw (wrong std::variant alternative).
   EXPECT_EQ(5u, resp.GetVec().size());
+
+  auto infos = service_->server_family().GetDflyCmd()->GetReplicaInfoSnapshot();
+  ASSERT_EQ(1u, infos.size());
+  EXPECT_FALSE(infos[0]->IsPeer()) << "PEER was never sent; ReplicaInfo must not record a peer";
 }
 
 TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesPeerWithoutUuid) {
