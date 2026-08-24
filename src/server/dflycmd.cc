@@ -468,7 +468,8 @@ void DflyCmd::StartStable(CmdArgParser parser, CommandContext* cmd_cntx) {
         }
       }
 
-      StartStableSyncInThread(flow, &replica_ptr->GetExecState(), shard);
+      StartStableSyncInThread(flow, &replica_ptr->GetExecState(), shard, replica_ptr->IsPeer(),
+                              replica_ptr->GetNodeUuid());
     };
     shard_set->RunBlockingInParallel(std::move(cb));
 
@@ -752,20 +753,21 @@ OpStatus DflyCmd::StopFullSyncInThread(FlowInfo* flow, ExecutionState* exec_st,
   return OpStatus::OK;
 }
 
-void DflyCmd::StartStableSyncInThread(FlowInfo* flow, ExecutionState* exec_st, EngineShard* shard) {
+void DflyCmd::StartStableSyncInThread(FlowInfo* flow, ExecutionState* exec_st, EngineShard* shard,
+                                      bool peer_mode, std::string_view peer_uuid) {
   // Create streamer for shard flows.
   DCHECK(shard);
   DCHECK(flow->conn);
 
   LSN partial_lsn = flow->start_partial_sync_at.value_or(0);
-  // drakeydb: fix-round-1 -- peer_mode/peer_uuid designated with their safe (off) defaults here
-  // to silence -Wmissing-field-initializers (CI runs -Werror); T7 is responsible for populating
-  // them from this flow's ReplicaInfo so the peer-echo filter (streamer.cc) actually activates.
+  // drakeydb: peer_mode/peer_uuid come from the replica's ReplicaInfo (IsPeer()/GetNodeUuid(),
+  // set at CreateSyncSession time) so the peer-echo filter (streamer.cc's ShouldWrite) activates
+  // only for an admitted peer of an active node -- see the StartStable call site.
   JournalStreamer::Config config{.should_sent_lsn = true,
                                  .init_from_stable_sync = true,
                                  .start_partial_sync_at = partial_lsn,
-                                 .peer_mode = false,
-                                 .peer_uuid = {}};
+                                 .peer_mode = peer_mode,
+                                 .peer_uuid = std::string(peer_uuid)};
   flow->streamer.reset(new JournalStreamer(exec_st, config));
   flow->streamer->Start(flow->conn->socket());
 
@@ -794,11 +796,19 @@ auto DflyCmd::CreateSyncSession(ConnectionState* state) -> std::pair<uint32_t, u
   string address = state->replication_info.repl_ip_address;
   uint32_t port = state->replication_info.repl_listening_port;
   string node_uuid = state->replication_info.repl_node_uuid;
+  unsigned drakey_version = state->replication_info.repl_drakey_version;
+  // drakeydb: peer-stream filtering is a property of this node's active-replica role, not merely
+  // the consumer's claim -- server_family.cc's admission check only ever admits a consumer with
+  // repl_is_peer set when IsActiveReplica() is also true, but re-check here too so a non-active
+  // node's stream stays byte-identical to upstream even if repl_is_peer were ever set some other
+  // way (e.g. by a future admission path or a test harness poking ConnectionState directly).
+  bool is_peer = IsActiveReplica() && state->replication_info.repl_is_peer;
 
   LOG(INFO) << "Registered replica " << address << ":" << port;
 
-  auto replica_ptr = make_shared<ReplicaInfo>(flow_count, std::move(address), port,
-                                              std::move(node_uuid), std::move(err_handler));
+  auto replica_ptr =
+      make_shared<ReplicaInfo>(flow_count, std::move(address), port, std::move(node_uuid),
+                               drakey_version, is_peer, std::move(err_handler));
   auto [it, inserted] = replica_infos_.emplace(sync_id, std::move(replica_ptr));
   CHECK(inserted);
 
@@ -1015,6 +1025,12 @@ void DflyCmd::UpdateReplicaInfoCacheLocked() {
 
 void DflyCmd::SetDflyClientVersion(ConnectionState* state, DflyVersion version) {
   auto replica_ptr = GetReplicaInfo(state->replication_info.repl_session_id);
+  // drakeydb: unlike the neighbouring CLIENT-ID case (ReplConf, server_family.cc), this had no
+  // null guard -- a CLIENT-VERSION sent before a successful "capa dragonfly" (no session yet)
+  // would dereference a null shared_ptr. Cheap to fix while here; see the P3 T7 task brief.
+  if (!replica_ptr) {
+    return;
+  }
   VLOG(1) << "Client version for session_id=" << state->replication_info.repl_session_id << " is "
           << int(version);
 

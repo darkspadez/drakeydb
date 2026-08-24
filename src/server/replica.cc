@@ -461,6 +461,26 @@ error_code Replica::Greet() {
     return std::make_error_code(std::errc::operation_not_permitted);
   }
 
+  // drakeydb: announce the fork replication protocol version on every drakeydb replica, and mark
+  // ourselves as a peer link when we are one. Sent strictly before "capa dragonfly" (like UUID
+  // above), not from ConfigureDflyMaster's post-capa block, so an active-replica master's
+  // admission check (server_family.cc ReplConf, CAPA dragonfly case) can see both values when it
+  // decides whether to admit this connection. A pre-fork master -- including plain Redis or a
+  // stock Dragonfly -- does not recognize either pair and answers -ERR; tolerate that exactly
+  // like the REPLCONF UUID fallback above and keep replicating.
+  RETURN_ON_ERR(
+      SendCommandAndReadResponse(StrCat("REPLCONF DRAKEY-VERSION ", kDrakeydbReplVersion)));
+  if (!CheckRespIsSimpleReply("OK")) {
+    LOG_FIRST_N(WARNING, 1) << "Master does not support REPLCONF DRAKEY-VERSION";
+  }
+
+  if (IsPeerMode()) {
+    RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF PEER 1"));
+    if (!CheckRespIsSimpleReply("OK")) {
+      LOG_FIRST_N(WARNING, 1) << "Master does not support REPLCONF PEER";
+    }
+  }
+
   // Announce that we are the dragonfly client.
   // Note that we currently do not support dragonfly->redis replication.
   RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa dragonfly"));
@@ -555,24 +575,6 @@ std::error_code Replica::ConfigureDflyMaster() {
   RETURN_ON_ERR(
       SendCommandAndReadResponse(StrCat("REPLCONF CLIENT-VERSION ", DflyVersion::CURRENT_VER)));
   PC_RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
-
-  // drakeydb: announce the fork replication protocol version on every drakeydb replica, and mark
-  // ourselves as a peer link when we are one, so the master (once T7 lands) can gate peer-only
-  // behavior on it. A pre-fork master -- including, until T7 lands, every drakeydb master -- does
-  // not recognize either pair and answers -ERR; tolerate that exactly like the REPLCONF UUID
-  // fallback above and keep replicating. This tolerance is load-bearing right now, not optional.
-  RETURN_ON_ERR(
-      SendCommandAndReadResponse(StrCat("REPLCONF DRAKEY-VERSION ", kDrakeydbReplVersion)));
-  if (!CheckRespIsSimpleReply("OK")) {
-    LOG_FIRST_N(WARNING, 1) << "Master does not support REPLCONF DRAKEY-VERSION";
-  }
-
-  if (IsPeerMode()) {
-    RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF PEER 1"));
-    if (!CheckRespIsSimpleReply("OK")) {
-      LOG_FIRST_N(WARNING, 1) << "Master does not support REPLCONF PEER";
-    }
-  }
 
   return error_code{};
 }

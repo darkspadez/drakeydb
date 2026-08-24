@@ -194,20 +194,21 @@ async def test_uuid_cleared_when_reconnect_master_lacks_exchange(
 async def test_configure_dfly_master_sends_and_tolerates_drakey_version_and_peer(
     df_factory: DflyInstanceFactory, proxy_factory
 ):
-    """ConfigureDflyMaster (replica.cc) sends REPLCONF DRAKEY-VERSION on every drakeydb replica,
-    and additionally REPLCONF PEER 1 in peer mode. Our own master doesn't recognize either pair
-    yet (the master-side parser lands in a later task) and answers -ERR; the replica must
-    tolerate that and keep replicating regardless -- this is load-bearing, not optional, until
-    that lands.
+    """Greet() (replica.cc) sends REPLCONF DRAKEY-VERSION on every drakeydb replica, and
+    additionally REPLCONF PEER 1 in peer mode -- strictly before REPLCONF capa dragonfly, like
+    REPLCONF UUID, so an active master's admission check can see them (P3 T7). This test proxies
+    an old-style -ERR reply to both pairs to prove the replica still tolerates a master that
+    predates this task (or any master that simply doesn't recognize them, e.g. plain Redis) and
+    keeps replicating regardless -- our own master here understands both pairs now, but the
+    tolerance path must stay live for a real old peer.
 
     Falsifying: override_next_response only clears its pending override once its marker is
     actually seen on the wire (see proxy.py), and refuses to arm a second one while the first is
-    still pending. Greet() -- and thus the blocking REPLICAOF below -- only returns once
-    ConfigureDflyMaster has finished sending both REPLCONF pairs for that attempt, so if either
-    stopped being sent, its override would still be pending by the time the harmless probe below
-    is armed, and that call would raise "a response override is already pending" instead of
-    letting the assertions that follow run. Each half uses its own proxy so the two probes can't
-    interfere with each other.
+    still pending. Greet() -- and thus the blocking REPLICAOF below -- only returns once it has
+    finished sending both REPLCONF pairs for that attempt, so if either stopped being sent, its
+    override would still be pending by the time the harmless probe below is armed, and that call
+    would raise "a response override is already pending" instead of letting the assertions that
+    follow run. Each half uses its own proxy so the two probes can't interfere with each other.
     """
     master = df_factory.create(proactor_threads=2)
     active = df_factory.create(proactor_threads=2, active_replica="true")
@@ -585,27 +586,154 @@ async def test_fanin_remove_and_no_one_keep_data(df_factory: DflyInstanceFactory
 
 
 async def test_active_node_refuses_consumers_and_takeover(df_factory: DflyInstanceFactory):
+    """P3 T7 updates this P2 regression: an active node's admission gate (server_family.cc
+    ReplConf, the CAPA dragonfly case) moved from a blanket top-of-function refusal to a check
+    that admits a consumer completing the fork handshake (REPLCONF DRAKEY-VERSION, sent by every
+    drakeydb replica's Greet). `d` below is a real drakeydb node, so its REPLICAOF now succeeds
+    as a plain (non-peer, full-stream) replica instead of being refused -- `d` never sends
+    REPLCONF PEER, so it isn't asking for peer mode. A raw consumer that never announces itself
+    (a stock Dragonfly, an older drakeydb, or anything speaking plain Redis replication) is still
+    refused, with the same error text the old blanket check used. REPLTAKEOVER is untouched by
+    this task and stays refused unconditionally.
+
+    Falsifying: reverting the CAPA dragonfly admission check to the old blanket refusal makes
+    `d`'s REPLICAOF below raise instead of succeeding, and connected_slaves stays 0.
+    """
     a = df_factory.create(**active_args())
     d = df_factory.create(proactor_threads=2)
     df_factory.start_all([a, d])
     c_a, c_d = a.client(), d.client()
-    with pytest.raises(redis.exceptions.ResponseError, match="active-replica"):
-        await c_a.execute_command("REPLCONF listening-port 1")
+
     with pytest.raises(redis.exceptions.ResponseError, match="active-replica"):
         await c_a.execute_command("REPLTAKEOVER 1")
-    # A plain node pointing at A fails its synchronous greet (A refuses REPLCONF). Start()'s
-    # check_connection_error() builds a GenericError from a plain string ("could not greet
-    # master ..."), but ReplicaOfInternal's RETURN_ON_ERR coerces that GenericError through
-    # operator std::error_code(), which returns only the (empty) ec_ and silently drops the
-    # string. So Start() reports success, and ReplicaOfInternal falls back to its generic
-    # "replication cancelled" text (see server_family.cc ReplicaOfInternal, and replica.cc
-    # check_connection_error). This is deterministic, independent of active/peer mode, and
-    # already pinned for the plain-REPLICAOF-failure case by
-    # MultiMasterFamilyTest.ReplicaOfGrammarAndNoPeersPaths in multi_master_test.cc.
-    with pytest.raises(redis.exceptions.ResponseError, match="replication cancelled"):
-        await c_d.execute_command(f"REPLICAOF localhost {a.port}")
-    assert (await c_d.info("replication"))["role"] == "master"
-    assert (await c_a.info("replication"))["connected_slaves"] == 0
+
+    # A raw, unidentified consumer -- no REPLCONF UUID/DRAKEY-VERSION ever sent on this
+    # connection -- is refused right at CAPA dragonfly, same as a stock Dragonfly or a pre-P3
+    # drakeydb build would be.
+    with pytest.raises(redis.exceptions.ResponseError, match="active-replica"):
+        await c_a.execute_command("REPLCONF capa dragonfly")
+
+    # A real drakeydb node's REPLICAOF completes the full fork handshake and is admitted.
+    assert await c_d.execute_command(f"REPLICAOF localhost {a.port}") == "OK"
+    await wait_available_async(c_d)
+    info_d = await c_d.info("replication")
+    assert info_d["master_link_status"] == "up"
+    assert (await c_a.info("replication"))["connected_slaves"] == 1
+
+
+async def test_plain_replica_of_active_node_gets_full_unfiltered_stream(
+    df_factory: DflyInstanceFactory,
+):
+    """The failure mode that matters most for P3 T7: a PLAIN (non-peer) replica must never get a
+    filtered stream. JournalStreamer::ShouldWrite's `if (!config_.peer_mode) return true;` (P3
+    T5, streamer.cc) is what guarantees this once peer_mode is false; T7 is what actually sets
+    config_.peer_mode per consumer (DflyCmd::StartStableSyncInThread, fed from
+    ReplicaInfo::IsPeer(), which server_family.cc's admission check only ever sets true for a
+    REPLCONF PEER 1 request). Getting that boolean backwards -- peer_mode wired true for a plain
+    consumer -- would silently drop every entry the active node relays in from its OWN peers
+    (ShouldWrite's origin_idx != kSelfIdx branch) while leaving the active node's own writes
+    untouched, so a test that only checks the active node's own writes reach the replica would
+    keep passing under that bug. This test specifically writes on B (A's fan-in source, never
+    directly connected to D) and checks B's write reaches D purely by relay through A.
+
+    Falsifying: hardcoding peer_mode=true in StartStableSyncInThread's JournalStreamer::Config
+    (in place of the peer_mode parameter) makes "relayed-through-a" never appear on D, and
+    wait_for_value below times out.
+    """
+    a = df_factory.create(**active_args())
+    b = df_factory.create(proactor_threads=2)
+    d = df_factory.create(proactor_threads=2)
+    df_factory.start_all([a, b, d])
+    c_a, c_b, c_d = a.client(), b.client(), d.client()
+
+    await attach(c_a, b)
+    await wait_for_peers(c_a, 1)
+    assert await c_d.execute_command(f"REPLICAOF localhost {a.port}") == "OK"
+    await wait_available_async(c_d)
+
+    await c_b.set("relayed-through-a", "1")
+    await c_a.set("a-own", "1")
+
+    await wait_for_value(c_d, "a-own", "1")
+    await wait_for_value(c_d, "relayed-through-a", "1")
+
+
+async def test_peer_mesh_own_writes_not_echoed_back(df_factory: DflyInstanceFactory):
+    """P3 T7's core guarantee: an active node's outbound peer stream carries only its OWN writes
+    (JournalStreamer::ShouldWrite's peer_mode gate, streamer.cc), so a write is never echoed back
+    toward the peer it came from. Two active nodes in a mutual peer mesh -- each REPLICAOF-ing
+    the other, so both links are peer-admitted (replica.cc's Greet sends REPLCONF PEER 1
+    whenever IsPeerMode(), which peer_replication.cc sets on every Replica an active node creates
+    for its own masters -- see ReplicaOfInternal's `if (IsActiveReplica())` routing in
+    server_family.cc) -- is the smallest topology where a forwarding bug is observable in the
+    FINAL STATE, not just on the wire. INCR is not idempotent: a single echoed-back replay of an
+    already-applied entry inflates the counter by exactly one extra, deterministically, rather
+    than merely leaving a key transiently stale (which a slow/flaky link could also explain).
+
+    This is genuinely new coverage: every other fan-in test in this file attaches at most one
+    active node to plain masters, so this is the first test where an active node is ever on the
+    RECEIVING end of a peer-filtered stream (as opposed to only ever being the one requesting
+    PEER 1) -- i.e. the first test where peer_mode has ever been true on a live production
+    JournalStreamer at all, active or not.
+
+    Falsifying: hardcoding peer_mode=false in StartStableSyncInThread's JournalStreamer::Config
+    (undoing this task's wiring, so every consumer gets a full stream again) makes A's own INCR
+    relay through B and back to A, so A's final "cnt" is 2 instead of 1.
+    """
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    # Sequential, not concurrent: a node mid full-sync-load answers PING with -LOADING, which
+    # the connecting side's Greet treats as a hard handshake failure -- so B's REPLICAOF A must
+    # wait for A's own full sync (from attach(c_a, b)) to finish before it can succeed.
+    await attach(c_a, b)  # A REPLICAOF B
+    await wait_for_peers(c_a, 1)
+    await attach(c_b, a)  # B REPLICAOF A
+    await wait_for_peers(c_b, 1)
+
+    assert await c_a.incr("cnt") == 1
+    await wait_for_value(c_b, "cnt", "1")  # confirm the direct A->B hop landed
+    # Give a would-be echo hop (B->A, carrying A's own write back) time to arrive and misapply.
+    await asyncio.sleep(1.0)
+    assert await c_a.get("cnt") == "1"
+    assert await c_b.get("cnt") == "1"
+
+    # The mesh is still healthy end to end in the other direction too.
+    assert await c_b.incr("cnt2") == 1
+    await wait_for_value(c_a, "cnt2", "1")
+    await asyncio.sleep(1.0)
+    assert await c_a.get("cnt2") == "1"
+    assert await c_b.get("cnt2") == "1"
+
+
+async def test_drakey_handshake_pairs_no_longer_log_parse_errors(df_factory: DflyInstanceFactory):
+    """P3 T7: REPLCONF DRAKEY-VERSION / PEER are now parsed by every drakeydb master (active or
+    not), not just tolerated by the replica -- see server_family.cc ReplConf. Before this task,
+    every drakeydb->drakeydb handshake hit the unrecognized-REPLCONF fallback on the master and
+    logged an ERROR once per pair actually sent (twice here, since `active` is a peer and so also
+    sends REPLCONF PEER). That log line is a real diagnostic signal in production (a genuinely
+    unrecognized REPLCONF option, or a protocol mismatch); a drakeydb master that can't parse its
+    own fork's handshake pairs would be a regression worth flagging loudly, so this pins its
+    absence explicitly rather than leaving it as incidental background noise nobody checks.
+
+    Falsifying: reverting the DRAKEY-VERSION/PEER cases in ReplConf back to falling through to
+    the unrecognized-option branch makes the find_in_logs call below return a non-empty list.
+    """
+    master = df_factory.create(proactor_threads=2)
+    active = df_factory.create(proactor_threads=2, active_replica="true")
+    df_factory.start_all([master, active])
+    c_master, c_active = master.client(), active.client()
+    await c_master.set("k", "v")
+    assert await c_active.execute_command(f"REPLICAOF localhost {master.port}") == "OK"
+    await wait_for_peers(c_active, 1)
+    assert await c_active.get("k") == "v"
+    assert await c_active.execute_command(f"REPLICAOF REMOVE localhost {master.port}") == "OK"
+
+    active.stop()
+    master.stop()
+    assert master.find_in_logs("Error in receiving command") == []
 
 
 async def test_same_uuid_peer_refused(df_factory: DflyInstanceFactory):

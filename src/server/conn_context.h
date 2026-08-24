@@ -182,6 +182,12 @@ struct ConnectionState {
     std::string repl_ip_address;
     uint32_t repl_listening_port = 0;
     std::string repl_node_uuid;  // set by REPLCONF UUID; empty if the peer never sent one
+    // drakeydb: fork protocol version and peer-mode request, set by REPLCONF DRAKEY-VERSION /
+    // REPLCONF PEER (server_family.cc ReplConf). Populated unconditionally for any drakeydb
+    // consumer; only an active node's admission check (ReplConf's CAPA dragonfly case) and
+    // DflyCmd::CreateSyncSession act on the values. See node_identity.h for kDrakeydbReplVersion.
+    unsigned repl_drakey_version = 0;
+    bool repl_is_peer = false;
   };
 
   struct SquashingInfo {

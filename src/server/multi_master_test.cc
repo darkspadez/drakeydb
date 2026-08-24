@@ -466,14 +466,72 @@ class ActiveReplicaFamilyTest : public MultiMasterFamilyTest {
 };
 
 TEST_F(ActiveReplicaFamilyTest, ReplconfRefusedWhileActive) {
+  // drakeydb: P3 T7 moved the admission gate from a blanket top-of-function refusal to the CAPA
+  // dragonfly case alone, so earlier handshake steps (like LISTENING-PORT) now succeed
+  // unconditionally -- Greet() must be allowed to run to completion so the admission check can
+  // see what it sent. Only CAPA dragonfly -- with no DRAKEY-VERSION ever presented on this
+  // connection -- is still refused, with the same text the old blanket check used.
   auto resp = Run({"replconf", "listening-port", "1"});
-  EXPECT_THAT(resp, ErrArg("active-replica"));
+  EXPECT_EQ("OK", resp);
   resp = Run({"replconf", "capa", "dragonfly"});
   EXPECT_THAT(resp, ErrArg("active-replica"));
 }
 
 TEST_F(ActiveReplicaFamilyTest, ReplTakeoverRefusedWhileActive) {
   EXPECT_THAT(Run({"repltakeover", "1"}), ErrArg("active-replica"));
+}
+
+// drakeydb: P3 T7 -- master-side peer admission. Each test below drives the same handshake
+// sequence Greet() uses (REPLCONF UUID / DRAKEY-VERSION / PEER, strictly before CAPA dragonfly)
+// directly through Run(), one REPLCONF invocation per pair exactly as the real wire handshake
+// does it, and inspects only the final CAPA dragonfly reply -- an array on admission, an error
+// otherwise -- so each test exercises exactly one row of the admission table in
+// task-7-brief.md and is agnostic to how the gate is implemented internally.
+TEST_F(ActiveReplicaFamilyTest, ReplconfAdmitsPeerWithValidForeignUuid) {
+  const std::string kForeignUuid = "01234567-89ab-4cde-8f01-23456789abcd";
+  Run({"replconf", "uuid", kForeignUuid});
+  EXPECT_EQ("OK", Run({"replconf", "drakey-version", absl::StrCat(kDrakeydbReplVersion)}));
+  EXPECT_EQ("OK", Run({"replconf", "peer", "1"}));
+  auto resp = Run({"replconf", "capa", "dragonfly"});
+  ASSERT_EQ(RespExpr::ARRAY, resp.type) << "expected peer admission to succeed: " << resp;
+  // Not StrArray(): the reply mixes strings with two integer elements (flow_count, version) --
+  // StrArray()'s GetBuf() call on those would throw (wrong std::variant alternative).
+  EXPECT_EQ(5u, resp.GetVec().size());
+}
+
+TEST_F(ActiveReplicaFamilyTest, ReplconfAdmitsPlainReplicaWithoutPeerFlag) {
+  const std::string kForeignUuid = "01234567-89ab-4cde-8f01-23456789abce";
+  Run({"replconf", "uuid", kForeignUuid});
+  EXPECT_EQ("OK", Run({"replconf", "drakey-version", absl::StrCat(kDrakeydbReplVersion)}));
+  // No REPLCONF PEER sent -- this consumer never asked for peer mode.
+  auto resp = Run({"replconf", "capa", "dragonfly"});
+  ASSERT_EQ(RespExpr::ARRAY, resp.type) << "expected plain-replica admission to succeed: " << resp;
+  // Not StrArray(): the reply mixes strings with two integer elements (flow_count, version) --
+  // StrArray()'s GetBuf() call on those would throw (wrong std::variant alternative).
+  EXPECT_EQ(5u, resp.GetVec().size());
+}
+
+TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesPeerWithoutUuid) {
+  EXPECT_EQ("OK", Run({"replconf", "drakey-version", absl::StrCat(kDrakeydbReplVersion)}));
+  EXPECT_EQ("OK", Run({"replconf", "peer", "1"}));
+  // No REPLCONF UUID sent -- PEER 1 alone is not a valid identity.
+  auto resp = Run({"replconf", "capa", "dragonfly"});
+  EXPECT_THAT(resp, ErrArg("REPLCONF PEER requires a valid REPLCONF UUID identity"));
+}
+
+TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesOwnUuid) {
+  // A version high enough to admit and PEER unset, so the own-uuid refusal below cannot be a
+  // side effect of some other row's check -- if the own-uuid guard were removed, this exact
+  // sequence would be admitted (an ARRAY reply), not refused.
+  std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
+  size_t pos = info.find("\nnode_uuid:");
+  ASSERT_NE(std::string::npos, pos);
+  std::string own_uuid = info.substr(pos + 11, 36);
+
+  Run({"replconf", "uuid", own_uuid});
+  EXPECT_EQ("OK", Run({"replconf", "drakey-version", absl::StrCat(kDrakeydbReplVersion)}));
+  auto resp = Run({"replconf", "capa", "dragonfly"});
+  EXPECT_THAT(resp, ErrArg("Refusing to admit a consumer presenting this node's own uuid"));
 }
 
 TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {

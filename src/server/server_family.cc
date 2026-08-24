@@ -3689,11 +3689,6 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
     }
   }
 
-  // drakeydb: an active node does not serve replication consumers yet (Phase 3 admits peers).
-  if (IsActiveReplica()) {
-    return cmd_cntx->SendError("Replicating from an active-replica node is not supported");
-  }
-
   auto err_cb = [&]() mutable {
     LOG(ERROR) << "Error in receiving command, num args: " << args.size();
     cmd_cntx->SendError(kSyntaxErr);
@@ -3710,6 +3705,30 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
     std::string_view arg = args[i + 1];
     if (cmd == "CAPA") {
       if (arg == "dragonfly" && args.size() == 2 && i == 0) {
+        // drakeydb: admission gate for an active node. By now the replica has already sent
+        // UUID, DRAKEY-VERSION, and (if requesting peer mode) PEER -- replica.cc's Greet() sends
+        // all three strictly before "REPLCONF capa dragonfly" precisely so this decision can see
+        // them. A non-active node skips this entirely and stays byte-identical to upstream:
+        // every consumer is admitted with a full stream, regardless of what it advertises.
+        if (IsActiveReplica()) {
+          const auto& rinfo = cntx->conn_state.replication_info;
+          const bool has_uuid = !rinfo.repl_node_uuid.empty();
+          const bool own_uuid = has_uuid && rinfo.repl_node_uuid == node_uuid();
+          if (own_uuid) {
+            return cmd_cntx->SendError(
+                "Refusing to admit a consumer presenting this node's own uuid");
+          }
+          if (rinfo.repl_is_peer && !has_uuid) {
+            return cmd_cntx->SendError("REPLCONF PEER requires a valid REPLCONF UUID identity");
+          }
+          if (rinfo.repl_drakey_version < kDrakeydbReplVersion) {
+            return cmd_cntx->SendError("Replicating from an active-replica node is not supported");
+          }
+          // Admitted: either a peer (repl_is_peer, has_uuid, !own_uuid) or a plain replica
+          // (!repl_is_peer). CreateSyncSession (below) copies repl_is_peer/repl_node_uuid into
+          // the new ReplicaInfo exactly as it already does for repl_node_uuid alone.
+        }
+
         auto [sid, flow_count] = dfly_cmd_->CreateSyncSession(&cntx->conn_state);
         cntx->conn()->SetName(absl::StrCat("repl_ctrl_", sid));
 
@@ -3767,6 +3786,24 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
       // registration because its monotonic indices cannot be reclaimed.
       cntx->conn_state.replication_info.repl_node_uuid = NormalizeNodeUuid(arg);
       return builder->SendSimpleString(absl::StrCat(node_uuid(), " ", GetCurrentTimeMs()));
+    } else if (cmd == "DRAKEY-VERSION" && args.size() == 2) {
+      // drakeydb: fork protocol version advertisement (replica.cc's Greet). Parsed
+      // unconditionally -- active or not -- so a drakeydb replica's handshake with any drakeydb
+      // master no longer errors on this pair; only an active node's admission check (CAPA
+      // dragonfly, above) gates on the value.
+      unsigned version = 0;
+      if (!absl::SimpleAtoi(arg, &version)) {
+        return err_cb();
+      }
+      cntx->conn_state.replication_info.repl_drakey_version = version;
+    } else if (cmd == "PEER" && args.size() == 2) {
+      // drakeydb: peer-mode admission request (replica.cc's Greet, sent only when the
+      // connecting replica is itself in peer mode). "0" or "1" only.
+      int peer_flag = -1;
+      if (!absl::SimpleAtoi(arg, &peer_flag) || (peer_flag != 0 && peer_flag != 1)) {
+        return err_cb();
+      }
+      cntx->conn_state.replication_info.repl_is_peer = (peer_flag == 1);
     } else if (cmd == "ACK" && args.size() == 2) {
       // Don't send error/Ok back through the socket, because we don't want to interleave with
       // the journal writes that we write into the same socket.
