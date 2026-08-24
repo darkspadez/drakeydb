@@ -354,6 +354,25 @@ class DflyShardReplica : public ProtocolClient {
   // needs rather than reaching back into the other.
   bool peer_mode_ = false;
 
+  // drakeydb: Phase 3 T6b fix-round-1 (C1) -- set (peer mode only) by StableSyncDflyReadFb when
+  // ExecuteTx returns false while the link is still running (e.g. a local OOM on this replica --
+  // facade::DispatchResult::OOM is a normal operational outcome, not a can't-happen; see
+  // ExecuteTx's caller). journal_rec_executed_ is deliberately NOT advanced for that entry (see
+  // the comment on ExecuteTx's success branch below), so it still correctly names the un-applied
+  // entry as "still needed" -- but a LATER, authoritative Op::LSN marker (this task's own
+  // gap-correction marker, the fully-filtered-link resolution marker, or the pre-existing
+  // periodic heartbeat -- dflycmd.cc enables should_sent_lsn for peer links) would otherwise
+  // silently overwrite journal_rec_executed_ past that unresolved entry the moment it next fires,
+  // permanently losing it: a reconnect would never re-offer an LSN the counter claims is already
+  // resolved. Sticky (never cleared) for this flow's lifetime once set: the single scalar counter
+  // this class uses cannot represent "entry K failed but K+1..N succeeded", so once one entry's
+  // fate is unknown there is no way back to precise tracking short of a fresh full sync (a new
+  // DflyShardReplica, with a fresh journal_rec_executed_ seed from the RDB cut) -- which is
+  // exactly what a sufficiently stale journal_rec_executed_ (this flow having stopped advancing
+  // it via markers, however far behind the master's true LSN by the time of the next reconnect)
+  // naturally triggers. See AdoptAuthoritativeLsn's use of this flag.
+  bool apply_failed_ = false;
+
   util::fb2::Fiber sync_fb_, acks_fb_;
   size_t ack_offs_ = 0;
   int proactor_index_ = -1;

@@ -1271,6 +1271,14 @@ void DflyShardReplica::AdoptAuthoritativeLsn(uint64_t master_lsn) {
   if (!peer_mode_) {
     return;
   }
+  // drakeydb: Phase 3 T6b fix-round-1 (C1) -- once an apply has failed on this flow, its true
+  // resume position is no longer knowable from a single scalar count (see apply_failed_'s own
+  // comment, replica.h) -- refuse to let any later marker paper over that. journal_rec_executed_
+  // is left exactly where it was: still correctly naming the un-applied entry as needed, safely
+  // stale rather than silently wrong.
+  if (apply_failed_) {
+    return;
+  }
   journal_rec_executed_.store(master_lsn + 1, std::memory_order_relaxed);
 }
 
@@ -1347,6 +1355,18 @@ void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
         // 2. We are ACTIVE global state
         if (cntx->IsRunning() && ((*ServerState::tlocal()).gstate() == GlobalState::ACTIVE)) {
           LOG(DFATAL) << "ExecuteTx() on replica should be successful.";
+        }
+        // drakeydb: Phase 3 T6b fix-round-1 (C1) -- in peer mode, journal_rec_executed_ is not
+        // just an ACK offset (as for a plain replica): a later authoritative Op::LSN marker (see
+        // AdoptAuthoritativeLsn) would otherwise overwrite it wholesale, silently advancing past
+        // this un-applied entry forever. LOG(DFATAL) above already aborts in a debug build (this
+        // one); this flag is what protects a release build, where DispatchResult::OOM is a real,
+        // recoverable-by-reconnect operational outcome, not a can't-happen. See apply_failed_'s
+        // own comment (replica.h) for why it is sticky and gated on peer_mode_ only -- a plain
+        // replica's Op::LSN is still purely a DCHECK'd count, never an authoritative overwrite,
+        // so this cannot change its behavior.
+        if (peer_mode_) {
+          apply_failed_ = true;
         }
       }
     }

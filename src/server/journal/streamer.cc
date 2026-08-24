@@ -117,6 +117,15 @@ JournalStreamer::JournalStreamer(ExecutionState* cntx, JournalStreamer::Config c
   migration_buckets_sleep_usec_cached = absl::GetFlag(FLAGS_migration_buckets_sleep_usec);
   replication_dispatch_threshold = absl::GetFlag(FLAGS_replication_dispatch_threshold);
   last_async_write_time_ = base::CycleClock::Now();
+  // drakeydb: Phase 3 T6b fix-round-1 (minor) -- seed last_lsn_writen_ from the partial-sync
+  // starting point instead of always 0, so ConsumeJournalChange's gap check does not treat the
+  // very first entry of a resume as a gap merely because it isn't LSN 1 -- a reconnecting peer
+  // almost never resumes from LSN 1. Harmless either way (the resulting marker is a correct,
+  // redundant confirmation of the same starting point -- see ConsumeJournalChange), just
+  // wasteful; a no-op when start_partial_sync_at is 0 (live-only start) or 1.
+  if (config_.start_partial_sync_at > 0) {
+    last_lsn_writen_ = config_.start_partial_sync_at - 1;
+  }
 }
 
 JournalStreamer::~JournalStreamer() {
@@ -128,6 +137,37 @@ JournalStreamer::~JournalStreamer() {
 
 void JournalStreamer::ConsumeJournalChange(const JournalChangeItem& item) {
   if (!ShouldWrite(item)) {
+    // drakeydb: Phase 3 T6b fix-round-1 (C2) -- a peer link whose entries are ALL dropped (e.g.
+    // read-mostly while its peer writes heavily -- the steady state for many mesh topologies, not
+    // a corner case) would otherwise never reach either marker block below: both live only on the
+    // write path, past this early return. Left uncorrected, journal_rec_executed_ never advances
+    // while the master's true LSN races ahead, and the eventual reconnect (or ring-buffer
+    // eviction before it) forces a full resync whose last-loaded-wins merge (rdb_load.cc) can
+    // resurrect stale values.
+    //
+    // A dropped entry is, by definition, already fully resolved (this link correctly chose not
+    // to forward it) -- so on the SAME timer as the write-path periodic marker below (reusing
+    // last_lsn_time_, not a separate timer fiber: emitting off a fiber other than the one
+    // ConsumeJournalChange itself runs on would reintroduce the cross-fiber ordering question
+    // this design otherwise avoids -- see AdoptAuthoritativeLsn's correctness argument, which
+    // depends on markers and the entries around them being strictly ordered on one call path),
+    // emit Op::LSN carrying this entry's own LSN directly -- not LSN - 1: unlike the write-path
+    // marker, there is no following write whose own +1 increment this marker needs to set up for;
+    // the receiver's adoption (master_lsn + 1) already names the correct next-expected value on
+    // its own, since this dropped entry itself is the last thing resolved so far.
+    // last_lsn_writen_ is kept in sync too, so a later real write's own gap check below does not
+    // re-flag a gap this marker already closed.
+    if (config_.peer_mode && cntx_->IsRunning()) {
+      time_t now = time(nullptr);
+      if (now - last_lsn_time_ > 3) {
+        last_lsn_time_ = now;
+        io::StringSink drop_sink;
+        JournalWriter drop_writer(&drop_sink);
+        drop_writer.Write(Entry{journal::Op::LSN, item.journal_item.lsn});
+        Write(std::move(drop_sink).str());
+        last_lsn_writen_ = item.journal_item.lsn;
+      }
+    }
     return;
   }
 

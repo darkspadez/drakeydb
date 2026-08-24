@@ -16,6 +16,11 @@
 #include "base/gtest.h"
 #include "facade/facade_test.h"
 #include "server/journal/executor.h"
+#include "server/journal/serializer.h"
+#include "server/journal/streamer.h"
+#include "server/journal/test_capturing_socket.h"
+#include "server/journal/tx_executor.h"
+#include "server/journal/types.h"
 #include "server/multi_master.h"
 #include "server/node_identity.h"
 #include "server/rdb_load_context.h"
@@ -408,6 +413,42 @@ class DflyShardReplicaPeerModeTest : public BaseFamilyTest {
     flow.AdoptAuthoritativeLsn(master_lsn);
     return flow.JournalExecutedCount();
   }
+
+  // drakeydb: Phase 3 T6b fix-round-1 (C1) -- genuine member, not inlined into a TEST_F body (see
+  // this class's own reasoning above, same as DflyShardReplicaOriginTest's): sets apply_failed_
+  // the same way StableSyncDflyReadFb's ExecuteTx failure branch does (replica.cc), then calls
+  // the real AdoptAuthoritativeLsn.
+  uint64_t ObservedJournalExecutedAfterFailedApplyThenMarker(uint64_t seed, uint64_t master_lsn) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, /*origin_idx=*/0, /*peer_mode=*/true);
+    flow.SetRecordsExecuted(seed);
+    flow.apply_failed_ = true;
+    flow.AdoptAuthoritativeLsn(master_lsn);
+    return flow.JournalExecutedCount();
+  }
+
+  // drakeydb: Phase 3 T6b fix-round-1 (Q1) -- genuine member driving the real
+  // AdoptAuthoritativeLsn from a caller-supplied LSN. The caller (see
+  // AdoptAuthoritativeLsnComposesWithRealSenderMarker) decodes that value from a real,
+  // sender-produced marker via a real TransactionReader entirely outside this friended class --
+  // decoding needs no DflyShardReplica access at all -- so only the actual adoption call has to
+  // run as a genuine member here.
+  uint64_t ObservedJournalExecutedAfterAdopt(uint64_t master_lsn) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, /*origin_idx=*/0, /*peer_mode=*/true);
+    flow.AdoptAuthoritativeLsn(master_lsn);
+    return flow.JournalExecutedCount();
+  }
 };
 
 TEST_F(DflyShardReplicaPeerModeTest, AdoptAuthoritativeLsnSetsExecutedCountInPeerModeOnly) {
@@ -420,6 +461,130 @@ TEST_F(DflyShardReplicaPeerModeTest, AdoptAuthoritativeLsnSetsExecutedCountInPee
     // survive untouched.
     EXPECT_EQ(5u, ObservedJournalExecutedAfterMarker(/*seed=*/5, /*master_lsn=*/42,
                                                      /*peer_mode=*/false));
+  });
+}
+
+// drakeydb: Phase 3 T6b fix-round-1 (C1) -- once an apply has failed on this flow (a local OOM
+// applying an entry is a normal operational outcome -- facade::DispatchResult::OOM -- not a
+// can't-happen), AdoptAuthoritativeLsn must refuse to adopt ANY later marker, no matter its
+// value: without this, the very next authoritative Op::LSN marker (this task's own gap-correction
+// marker, the fully-filtered-link resolution marker, or the pre-existing periodic heartbeat)
+// would silently overwrite journal_rec_executed_ past the entry that was never actually applied,
+// and a reconnect would never re-offer it -- permanent, silent divergence from the mesh. This
+// pins that refusal directly (apply_failed_ set the same way StableSyncDflyReadFb's ExecuteTx
+// failure branch sets it -- replica.cc -- via friend access, since driving that branch for real
+// needs a live socket StableSyncDflyReadFb's own tests avoid for the same reason
+// DflyShardReplicaOriginTest's comment gives).
+//
+// Falsifying (verified by hand -- see task-6b-report.md): removing the `if (apply_failed_)
+// return;` guard from AdoptAuthoritativeLsn makes the EXPECT_EQ below fail (43 instead of the
+// un-advanced seed, 5).
+TEST_F(DflyShardReplicaPeerModeTest, AdoptAuthoritativeLsnSuppressedAfterApplyFailure) {
+  pp_->at(0)->Await([&] {
+    EXPECT_EQ(5u, ObservedJournalExecutedAfterFailedApplyThenMarker(/*seed=*/5,
+                                                                    /*master_lsn=*/42));
+  });
+}
+
+// drakeydb: Phase 3 T6b fix-round-1 (Q1) -- the original PeerModeGapMarkerCoalescesAndReceiver
+// LandsOnTrueLsn (journal/journal_test.cc) hand-computed its expected journal_rec_executed_ as
+// `tx_data.lsn + 1`, duplicating AdoptAuthoritativeLsn's own arithmetic rather than calling it --
+// so it could not have failed even if the real method used `+ 2`. This test drives the REAL
+// sender (a real peer-mode JournalStreamer processing real journal::RecordEntry calls, so the
+// marker's value is computed by streamer.cc's actual code, not chosen by this test), decodes it
+// with a real TransactionReader, and feeds that DECODED value into the REAL
+// DflyShardReplica::AdoptAuthoritativeLsn (replica.cc's own expression,
+// AdoptAuthoritativeLsn(tx_data.lsn), just called from here instead of from inside
+// StableSyncDflyReadFb's loop, which needs a live socket -- see DflyShardReplicaOriginTest's own
+// comment on why a bare construction test is this codebase's established alternative). The
+// closing assertion compares against journal::GetLsn(), read directly after the recording is
+// done -- not a formula this test shares with either the sender's or the receiver's arithmetic --
+// so an inconsistency on EITHER side is what this test can catch that the two single-sided tests
+// (this file's AdoptAuthoritativeLsnSetsExecutedCountInPeerModeOnly and journal_test.cc's own
+// sender-side coalescing test) cannot.
+//
+// The one dropped entry below is deliberately the ONLY drop in this scenario, not a run of
+// several: it is the very first entry this fresh streamer's drop path (fix-round-1, C2) ever
+// evaluates, and that path's own last_lsn_time_ throttle -- like the pre-existing write-path
+// periodic marker it is borrowed from -- always fires on its first-ever check (see streamer.cc's
+// drop-path comment, and journal_test.cc's MixedOriginBacklogPeerVsFullStream for the same
+// property spelled out in detail). A second, immediately-following drop would not reliably
+// produce a second marker for the write-path gap-correction code to compose instead (its own
+// coalescing behavior is already covered, against exact hand-verified values, by
+// journal_test.cc's PeerModeGapMarkerCoalescesAndTransactionReaderAdoptsCleanly) -- so this test
+// keeps to the one guaranteed-deterministic marker instead of also depending on throttle timing.
+//
+// journal::RecordEntry is called directly against this fixture's real (BaseFamilyTest) shard --
+// unlike journal_test.cc's own tests, which use a bespoke, deliberately minimal single-shard
+// fixture built for exactly this purpose (see JournalStreamerPeerFilterTest's own comment).
+// DflyShardReplica needs a real, valid Service* from its very first constructor statement
+// (service_(*service) -- an unconditional dereference), which only BaseFamilyTest provides in
+// this codebase; building one from scratch to keep this test in journal_test.cc's fixture instead
+// was judged more invasive than the alternative taken here.
+TEST_F(DflyShardReplicaPeerModeTest, AdoptAuthoritativeLsnComposesWithRealSenderMarker) {
+  constexpr uint32_t kPeerIdx = 9;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  pp_->at(0)->Await([&] {
+    // Unlike journal_test.cc's own fixture (which calls this in its own SetUp), a plain
+    // BaseFamilyTest never starts this shard's journal on its own -- production only does so
+    // lazily, when a replica first connects (dflycmd.cc's JOURNAL START). Idempotent
+    // (JournalSlice::Init() is a no-op if already initialized), so safe to call unconditionally.
+    journal::StartInThread();
+    LSN base = journal::GetLsn();  // not assumed to be a pristine 1: this fixture does not own
+                                   // its shard exclusively. Used only to seed tx_reader below,
+                                   // matching a real partial resume's own seeding.
+
+    ExecutionState send_cntx;
+    JournalStreamer::Config config;
+    config.peer_mode = true;
+    CapturingFiberSocket socket;
+    JournalStreamer streamer(&send_cntx, config);
+    streamer.Start(&socket);  // start_partial_sync_at == 0: registers as a live listener now.
+
+    std::array<std::string_view, 2> set_a{"a", "1"};
+    journal::RecordEntry(0, journal::Op::COMMAND, 0, std::nullopt,
+                         journal::Entry::Payload{"SET", ArgSlice{set_a.data(), set_a.size()}},
+                         PeerRegistry::kSelfIdx);  // self -- kept.
+    std::array<std::string_view, 2> set_b{"b", "2"};
+    journal::RecordEntry(0, journal::Op::COMMAND, 0, std::nullopt,
+                         journal::Entry::Payload{"SET", ArgSlice{set_b.data(), set_b.size()}},
+                         kPeerIdx);  // peer -- dropped; the very first entry this streamer's
+                                     // drop path evaluates, so it gets its own real,
+                                     // sender-computed marker immediately (see this test's own
+                                     // header comment).
+
+    streamer.Cancel();
+
+    LSN true_next_lsn = journal::GetLsn();  // ground truth: the ONE thing this test does not
+                                            // derive from any formula shared with the code under
+                                            // test, on either the sender or the receiver side.
+
+    base::IoBuf buf;
+    io::BufSink sink{&buf};
+    sink.Write(io::Buffer(socket.captured));
+    io::BufSource source{&buf};
+    JournalReader reader{&source, 0};
+    TransactionReader tx_reader{base - 1, /*peer_mode=*/true};
+    ExecutionState read_cntx;
+    TransactionData tx_data;
+
+    ASSERT_TRUE(tx_reader.NextTxData(&reader, &read_cntx, &tx_data));  // SET a
+    ASSERT_EQ(journal::Op::COMMAND, tx_data.opcode);
+
+    ASSERT_TRUE(tx_reader.NextTxData(&reader, &read_cntx, &tx_data));  // the real drop-path marker
+    ASSERT_EQ(journal::Op::LSN, tx_data.opcode);
+
+    // drakeydb: Phase 3 T6b fix-round-1 (Q1) -- ObservedJournalExecutedAfterAdopt is a genuine
+    // member of DflyShardReplicaPeerModeTest (see that class's own comment): this lambda is a
+    // separate, unrelated closure type, not a member of the friended class itself, so it cannot
+    // touch DflyShardReplica's private members (or the protected ServerContext) directly --
+    // constructing a DflyShardReplica right here, inline, does not compile.
+    uint64_t observed = ObservedJournalExecutedAfterAdopt(tx_data.lsn);  // the decoded value --
+                                                                         // not a literal.
+
+    // The composition: the sender's drop-path marker carries the dropped entry's own true LSN
+    // (streamer.cc); adopting it (+1) must land exactly on the next LSN the master has not
+    // assigned yet.
+    EXPECT_EQ(true_next_lsn, observed);
   });
 }
 
