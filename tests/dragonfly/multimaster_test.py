@@ -1594,10 +1594,10 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
     previously-untimed asyncio.gather(task_a, task_b)), the storm is severe enough --
     reproduced identically twice -- to blow the EARLIER `wait_for_value(c_b, "conflict-key",
     "a-while-c-down")` call's own 30s budget first, well before the restart/LOADING phase is
-    ever reached: `TimeoutError` raised from that wait_for_value call, total run 33.95-34.65s (vs. round
-    1's 163.67s). This is still exactly the outcome review round 1 asked for -- fast, and naming
-    a concrete symptom (a specific key never reached a specific value on a specific node) --
-    it simply is not THIS bound specifically that fires first once every gate is bounded, because
+    ever reached: `TimeoutError` raised from that wait_for_value call, total run 33.95-34.65s
+    (vs. round 1's 163.67s). This is still exactly the outcome review round 1 asked for -- fast
+    and naming a concrete symptom (a specific key never reached a specific value on a specific
+    node) -- it simply is not THIS bound specifically that fires first once every gate is bounded:
     PassesPeerEchoFilter is one shared, destination-agnostic check: the same revert floods the
     still-healthy A<->B pair too, and that is simply the earliest bounded assertion in program
     order. wait_until_not_loading's own message was independently confirmed correct and
