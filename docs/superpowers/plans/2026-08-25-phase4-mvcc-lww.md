@@ -223,7 +223,7 @@ expiry clause:
 
 ```bash
 docker exec drakeydb-p2 sh -c 'cd /src/build-dbg && ninja -j4 journal_test && \
-  /src/build-dbg/journal/journal_test --gtest_filter="PassesPeerEchoFilterTest.*"'
+  /src/build-dbg/journal_test --gtest_filter="PassesPeerEchoFilterTest.*"'
 ```
 
 Expected: PASS, including the pre-existing cases.
@@ -299,7 +299,7 @@ adjacent P3 comment to name the new flag.
 ```bash
 docker exec drakeydb-p2 sh -c 'cd /src/build-dbg && ninja -j4 multi_master_test journal_test && \
   /src/build-dbg/multi_master_test --gtest_filter="OriginJournalFamilyTest.*" && \
-  /src/build-dbg/journal/journal_test --gtest_filter="PassesPeerEchoFilterTest.*"'
+  /src/build-dbg/journal_test --gtest_filter="PassesPeerEchoFilterTest.*"'
 ```
 
 Expected: PASS.
@@ -405,7 +405,8 @@ git add -A && git commit -m "fix: keep derived collection-empty DELs off peer li
   `REPLCONF UUID` exchange (`+<uuid> <ms>`) and, per `docs/PLAN.md`, **read nowhere
   else today**. `ParseReplconfUuidReply` in `node_identity.h`.
 - Produces: `int64_t ReplicaSummary::clock_skew_ms`; INFO field
-  `mvcc_clock_skew_ms` inside the active-mode replication block.
+  `clock_skew_ms=<n>` appended to each `masterN:` peer line of the active-mode
+  replication block.
 
 **Why now.** LWW quality rests entirely on NTP, and D3's `max(tick, stored + 1)`
 repair deliberately fabricates future timestamps under skew (bounded by the skew, and
@@ -504,7 +505,11 @@ Add `std::atomic<int64_t> clock_skew_ms_{0};` to `Replica`'s members in `replica
 (it is read from the INFO fiber, written from the replication fiber), surface it from
 the existing summary accessor into `ReplicaSummary::clock_skew_ms`
 (`replica_types.h`), and render it in `RenderPeerReplicationInfo`
-(`multi_master.cc`) as `master_N_clock_skew_ms`, beside the existing per-peer fields.
+(`multi_master.cc`) as a `,clock_skew_ms=<n>` pair appended to each `masterN:` line,
+exactly as `node_uuid` already is at `multi_master.cc:96-97`. Those per-peer lines are a
+single comma-separated k=v value, NOT one INFO field per attribute; redis-py parses the csv
+into a nested dict, which is why the pytest below reads `info["master0"]["clock_skew_ms"]`
+(see `tests/dragonfly/multimaster_test.py:106` for the same idiom on `node_uuid`).
 
 - [ ] **Step 6: Build and run the whole multi_master suite**
 
@@ -530,8 +535,8 @@ async def test_peer_clock_skew_reported(df_factory):
     await wait_for_peers(c_b, 1)
 
     info = await c_b.info("replication")
-    assert "master_0_clock_skew_ms" in info, sorted(info)
-    assert abs(int(info["master_0_clock_skew_ms"])) < 250
+    assert "clock_skew_ms" in info["master0"], sorted(info["master0"])
+    assert abs(int(info["master0"]["clock_skew_ms"])) < 250
 ```
 
 - [ ] **Step 8: Run it**
@@ -546,7 +551,7 @@ Expected: PASS.
 
 - [ ] **Step 9: Falsify, per D9**
 
-Delete the `master_N_clock_skew_ms` line from `RenderPeerReplicationInfo`, rebuild, and
+Delete the `clock_skew_ms=` append from `RenderPeerReplicationInfo`, rebuild, and
 re-run the pytest. Record the observed failure (a `KeyError`/assertion naming the
 missing field) in the ledger, then restore.
 
