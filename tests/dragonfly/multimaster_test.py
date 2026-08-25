@@ -194,6 +194,96 @@ async def test_uuid_cleared_when_reconnect_master_lacks_exchange(
         pytest.fail("replica did not reconnect without stale UUID state")
 
 
+async def test_peer_clock_skew_cleared_on_reconnect_refusal(
+    df_factory: DflyInstanceFactory, tmp_path, proxy_factory
+):
+    """Sibling to test_uuid_cleared_when_reconnect_master_lacks_exchange above, not an extension
+    of it: --active_replica is a boot-time, process-wide flag (ReplicaOfInternal branches on
+    IsActiveReplica() before even parsing REPLICAOF's arguments), so clock_skew_ms is only ever
+    observable via a masterN: block (RenderPeerReplicationInfo, gated on IsActiveReplica()) --
+    which requires the node under test to be active-mode from the start. Flipping that test's
+    plain replica to active mode would invalidate every one of its assertions (top-level
+    master_node_uuid/master_link_status don't exist for an active node; it always reports
+    role=master), tangling two genuinely different configurations into one test.
+
+    Active/peer mode also changes the *outcome* of an unsupported reconnect, not just its INFO
+    shape: D2b (replica.cc, `else if (IsPeerMode())`) refuses a peer-mode Greet() outright once
+    the uuid comes back empty, where plain mode tolerates it and settles. So unlike the sibling
+    above, this state does not converge and stay -- the normal 500ms reconnect loop
+    (MainReplicationFb, replica.cc) retries and lands a fresh, valid exchange shortly after.
+    Hence a tight poll for a real-but-brief window, synchronized to start right after the
+    unsupported reply is actually consumed, rather than the sibling's converge-and-stay pattern.
+
+    The reset this covers (replica.cc's `clock_skew_ms_.store(0, ...)`, beside the existing
+    master_node_uuid/master_clock_ms reset) needs two things test_peer_clock_skew_reflects_
+    injected_offset (previous review round) doesn't provide: a *nonzero* baseline -- two real
+    instances on one host have a genuine skew of ~0 regardless of whether the reset fires, so a
+    reconnect back to ~0 would prove nothing -- and the *same* Replica C++ object surviving the
+    reconnect. MainReplicationFb loops on `this`, calling Greet() repeatedly on one object across
+    reconnects (confirmed by reading replica.cc) -- unlike that offset test's freshly-constructed
+    node, whose first-ever Greet() cannot distinguish the reset firing from clock_skew_ms_'s own
+    atomic {0} default.
+
+    So: the first exchange keeps the real master's actual uuid (peer-mode admission requires one)
+    but overrides the ms token to inject a +5s offset, giving a distinguishable nonzero baseline.
+    The second exchange gets the same "unsupported" reply the sibling test already covers, which
+    peer mode refuses instead of tolerating -- Greet() fails right after storing the reset, and
+    the retry loop has not yet landed a fresh answer. Arming a third, harmless override (the
+    __unused_probe_marker__ idiom from test_configure_dfly_master_sends_and_tolerates_drakey_
+    version_and_peer below) is used purely as a synchronization signal: it only succeeds once the
+    "unsupported" override has actually been consumed off the wire, the earliest safe moment to
+    start polling.
+
+    Falsifying: deleting replica.cc's `clock_skew_ms_.store(0, ...)` reset leaves clock_skew_ms_
+    at its stale ~+5000 value (the atomic is never re-zeroed before the refused exchange, and the
+    refused exchange's kUnsupported/error-reply branches never re-store it either), so the poll
+    loop below never observes clock_skew_ms==0 alongside an absent node_uuid and times out.
+    Verified by hand; see task-2-report.md's fix-round-2 section for the exact command and
+    output.
+    """
+    offset_ms = 5000
+    master = df_factory.create(proactor_threads=2, dir=str(tmp_path / "m"))
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "n"), active_replica="true")
+    df_factory.start_all([master, node])
+    c_master, c_node = master.client(), node.client()
+    master_uuid = (await c_master.info("replication"))["node_uuid"]
+    proxy = await proxy_factory(master.port)
+
+    peer_ms = int(time.time() * 1000) + offset_ms
+    await proxy.override_next_response(b"REPLCONF UUID ", f"+{master_uuid} {peer_ms}\r\n".encode())
+    assert await c_node.execute_command(f"REPLICAOF localhost {proxy.port}") == "OK"
+    info = await c_node.info("replication")
+    assert info["master0"]["node_uuid"] == master_uuid, info["master0"]
+    baseline_skew = int(info["master0"]["clock_skew_ms"])
+    assert abs(baseline_skew - offset_ms) < 2000, info["master0"]
+
+    await proxy.override_next_response(b"REPLCONF UUID ", b"-ERR unknown REPLCONF option\r\n")
+    await proxy.close()
+    await proxy.start_serving()
+
+    # Wait for the "unsupported" override to actually be consumed off the wire -- see the
+    # docstring above and test_configure_dfly_master_sends_and_tolerates_drakey_version_and_peer
+    # below for the same idiom.
+    async with async_timeout.timeout(30):
+        while True:
+            try:
+                await proxy.override_next_response(b"__unused_probe_marker__", b"+PONG\r\n")
+                break
+            except RuntimeError:
+                await asyncio.sleep(0.02)
+
+    # The refused-exchange state is real but brief (the 500ms reconnect loop then lands a fresh
+    # valid exchange), so poll tightly rather than sleep-then-check-once.
+    async with async_timeout.timeout(2):
+        while True:
+            info = await c_node.info("replication")
+            m0 = info.get("master0")
+            if m0 and "node_uuid" not in m0:
+                assert int(m0["clock_skew_ms"]) == 0, m0
+                return
+            await asyncio.sleep(0.02)
+
+
 async def test_configure_dfly_master_sends_and_tolerates_drakey_version_and_peer(
     df_factory: DflyInstanceFactory, proxy_factory
 ):
