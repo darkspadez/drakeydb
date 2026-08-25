@@ -29,6 +29,7 @@ extern "C" {
 #include "facade/redis_parser.h"
 #include "facade/reply_capture.h"
 #include "facade/socket_utils.h"
+#include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/journal/executor.h"
 #include "server/journal/journal.h"
@@ -448,6 +449,16 @@ error_code Replica::Greet() {
       PC_RETURN_ON_BAD_RESPONSE(status == ReplconfUuidReplyStatus::kSuccess);
       master_context_.master_node_uuid = std::move(master_uuid);
       master_context_.master_clock_ms = master_ms;
+
+      // drakeydb: P4-0 -- the handshake clock echo is the only cross-node clock sample we get.
+      const int64_t skew_ms =
+          ComputeClockSkewMs(static_cast<int64_t>(GetCurrentTimeMs()),
+                             static_cast<int64_t>(master_context_.master_clock_ms));
+      clock_skew_ms_.store(skew_ms, std::memory_order_relaxed);
+      LOG_IF(WARNING, IsClockSkewConcerning(skew_ms))
+          << "Peer " << master_context_.master_node_uuid << " clock differs by " << skew_ms
+          << " ms (threshold " << kClockSkewWarnMs
+          << " ms). Last-write-wins resolution degrades with clock skew; check NTP.";
     }
   }
 
@@ -1703,6 +1714,7 @@ auto Replica::GetSummary() const -> Summary {
 
     res.master_id = master_context_.master_repl_id;
     res.master_node_uuid = master_context_.master_node_uuid;
+    res.clock_skew_ms = clock_skew_ms_.load(std::memory_order_relaxed);
     res.reconnect_count = reconnect_count_;
     if (HasDflyMaster()) {
       res.repl_offset_sum = 0;

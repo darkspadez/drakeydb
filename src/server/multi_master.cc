@@ -81,6 +81,16 @@ nonstd::expected<PeerReplicaOfCmd, facade::ErrorReply> ParsePeerReplicaOfArgs(
   return cmd;
 }
 
+int64_t ComputeClockSkewMs(int64_t local_clock_ms, int64_t peer_clock_ms) {
+  if (peer_clock_ms == 0)
+    return 0;
+  return peer_clock_ms - local_clock_ms;
+}
+
+bool IsClockSkewConcerning(int64_t skew_ms) {
+  return skew_ms >= kClockSkewWarnMs || skew_ms <= -kClockSkewWarnMs;
+}
+
 std::string RenderPeerReplicationInfo(const std::vector<ReplicaSummary>& peers, bool multi_master,
                                       bool show_peer_lines) {
   std::string out = absl::StrCat("active_replica:1\r\nmulti_master:", multi_master ? 1 : 0,
@@ -95,6 +105,10 @@ std::string RenderPeerReplicationInfo(const std::vector<ReplicaSummary>& peers, 
                     ",sync_in_progress=", p.full_sync_in_progress ? 1 : 0);
     if (!p.master_node_uuid.empty())
       absl::StrAppend(&out, ",node_uuid=", p.master_node_uuid);
+    // drakeydb: P4-0 -- unconditional (unlike node_uuid above): ComputeClockSkewMs's 0 default
+    // is itself the meaningful "no clock sample yet" value, so there is no separate "absent"
+    // case to omit the field for.
+    absl::StrAppend(&out, ",clock_skew_ms=", p.clock_skew_ms);
     absl::StrAppend(&out, "\r\n");
   }
   return out;

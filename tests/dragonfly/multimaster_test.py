@@ -522,6 +522,22 @@ async def attach(c_a, *nodes):
         assert await c_a.execute_command(f"REPLICAOF localhost {n.port}") == "OK"
 
 
+async def test_peer_clock_skew_reported(df_factory):
+    """Both nodes run on one host, so real skew is ~0; the assertion is that the field
+    exists and is small. Falsified by removing the RenderPeerReplicationInfo line --
+    the KeyError names the missing field."""
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_b = b.client()
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+
+    info = await c_b.info("replication")
+    assert "clock_skew_ms" in info["master0"], sorted(info["master0"])
+    assert abs(int(info["master0"]["clock_skew_ms"])) < 250
+
+
 async def test_fanin_merges_two_masters_and_stays_writable(df_factory: DflyInstanceFactory):
     a = df_factory.create(**active_args())
     b = df_factory.create(proactor_threads=2)

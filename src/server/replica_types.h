@@ -32,6 +32,10 @@ struct ReplicaSummary {
   // when the link is down. It's reset whenever a full sync is initiated again.
   bool passed_full_sync;
   std::string master_node_uuid;
+  // drakeydb: P4-0 -- signed skew (peer - local, ms) sampled from the REPLCONF UUID handshake
+  // clock echo; see Replica::GetSummary() / multi_master.h's ComputeClockSkewMs. 0 when the peer
+  // never sent a clock (pre-exchange, or a plain Redis/old KeyDB master).
+  int64_t clock_skew_ms;
 };
 
 struct LastMasterSyncData {

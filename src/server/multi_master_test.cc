@@ -337,24 +337,41 @@ TEST(PeerReplicationInfo, RendersCountsAndPeerLines) {
   up.full_sync_in_progress = false;
   up.master_last_io_sec = 3;
   up.master_node_uuid = "01234567-89ab-4cde-8f01-23456789abcd";
+  up.clock_skew_ms = 42;
   ReplicaSummary down{};
   down.host = "10.0.0.9";
   down.port = 7002;
   down.master_link_established = false;
   down.full_sync_in_progress = true;
   down.master_last_io_sec = 0;
+  down.clock_skew_ms = -17;
   std::string s = RenderPeerReplicationInfo({up, down}, true, true);
   EXPECT_EQ(
       "active_replica:1\r\nmulti_master:1\r\nconnected_masters:2\r\n"
       "master0:host=localhost,port=7001,link_status=up,last_io_seconds_ago=3,"
-      "sync_in_progress=0,node_uuid=01234567-89ab-4cde-8f01-23456789abcd\r\n"
+      "sync_in_progress=0,node_uuid=01234567-89ab-4cde-8f01-23456789abcd,"
+      "clock_skew_ms=42\r\n"
       "master1:host=10.0.0.9,port=7002,link_status=down,last_io_seconds_ago=0,"
-      "sync_in_progress=1\r\n",
+      "sync_in_progress=1,clock_skew_ms=-17\r\n",
       s);
   EXPECT_EQ("active_replica:1\r\nmulti_master:0\r\nconnected_masters:2\r\n",
             RenderPeerReplicationInfo({up, down}, false, false));
   EXPECT_EQ("active_replica:1\r\nmulti_master:0\r\nconnected_masters:0\r\n",
             RenderPeerReplicationInfo({}, false, true));
+}
+
+TEST(ClockSkew, ComputesSignedSkewAndThreshold) {
+  // Peer's clock ahead of ours -> positive skew.
+  EXPECT_EQ(ComputeClockSkewMs(/* local_ms= */ 1'000, /* peer_ms= */ 1'500), 500);
+  // Peer behind -> negative.
+  EXPECT_EQ(ComputeClockSkewMs(/* local_ms= */ 1'500, /* peer_ms= */ 1'000), -500);
+  // Absent peer clock (a pre-exchange master) -> no skew, never a warning.
+  EXPECT_EQ(ComputeClockSkewMs(/* local_ms= */ 1'500, /* peer_ms= */ 0), 0);
+
+  EXPECT_FALSE(IsClockSkewConcerning(0));
+  EXPECT_FALSE(IsClockSkewConcerning(-kClockSkewWarnMs + 1));
+  EXPECT_TRUE(IsClockSkewConcerning(kClockSkewWarnMs));
+  EXPECT_TRUE(IsClockSkewConcerning(-kClockSkewWarnMs)) << "skew is concerning in both directions";
 }
 
 // Launch::post-constructed fibers only get queued (AddReady) on the constructing thread's
