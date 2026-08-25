@@ -272,7 +272,7 @@ tiering, and `--experimental_cascaded_partial_sync`.
 | `journal/types.h` | `EntryBase` += `origin_idx`, `mvcc`, `entry_flags`; `JournalItem` += `origin_idx` (ring-buffer filtering without reparse) |
 | `journal/serializer.cc` (~57-85, 205-235) | COMMAND case: header `2` + ext fields in active mode, else byte-identical `1`; reader accepts both |
 | `journal/journal_slice.cc` (~107-134) | thread origin into `JournalItem`/`JournalChangeItem` |
-| `journal/streamer.h/.cc` | `Config` += `{peer_uuid, peer_mode}`; live + partial-replay paths drop non-self-origin and expiry-flagged entries for peer consumers |
+| `journal/streamer.h/.cc` | `Config` += `{peer_mode}` (**as built** — a `peer_uuid` field was added then removed in the P3 fix wave: it was never read, since the filter keys on `origin_idx`, not on the peer's uuid); live + partial-replay paths drop non-self-origin and expiry-flagged entries for peer consumers, via the shared `journal::PassesPeerEchoFilter` |
 | `journal/executor.h/.cc` (~36-74) | set/clear apply-context around `Execute`; P5 streaming-LWW pre-check for classified commands |
 | `transaction.cc` (~1622-1663) | `LogJournalOnShard` reads origin/mvcc from context (default self + clock tick) |
 | `tx_base.cc` (~55-70) | manual `RecordJournal` helpers read origin context; expiry `DEL` sets entry-flag bit0 |
