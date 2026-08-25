@@ -306,12 +306,14 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
       ec = Greet();
       if (ec) {
         // drakeydb D-7: device_or_resource_busy is the reciprocal-connect uuid tiebreak refusal
-        // (see the CheckRespSimpleError(kReciprocalPeerConnectMsg) check in Greet() below) --
-        // expected to clear itself within a retry or two, so it stays in this quiet bucket
-        // alongside the other two peer-identity refusals.
+        // (see the CheckRespSimpleError(kReciprocalPeerConnectMsg) check in Greet() below);
+        // resource_unavailable_try_again is the peer-is-loading refusal (the PING check just
+        // above that one in Greet()) -- both are expected to clear themselves within a retry or
+        // two, so they stay in this quiet bucket alongside the other two peer-identity refusals.
         if (IsPeerMode() &&
             (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use ||
-             ec == std::errc::device_or_resource_busy)) {
+             ec == std::errc::device_or_resource_busy ||
+             ec == std::errc::resource_unavailable_try_again)) {
           LOG_EVERY_T(WARNING, 60)
               << "Error greeting " << server().Description() << " (phase: " << GetCurrentPhase()
               << "): " << ec << " " << ec.message() << ", socket state: " + SockInfo();
@@ -386,6 +388,21 @@ error_code Replica::Greet() {
   VLOG(1) << "greeting message handling";
   // Corresponds to server.repl_state == REPL_STATE_CONNECTING state in redis
   RETURN_ON_ERR(SendCommandAndReadResponse("PING"));  // optional.
+  // drakeydb D-7 (review round 2): a peer that is transiently LOADING (e.g. mid its own full
+  // sync with a third, unrelated peer -- GlobalState::LOADING is process-wide, and PING has no
+  // CO::LOADING exemption for a connection that has not yet identified itself as replicating,
+  // main_service.cc) rejects even this very first PING, long before our own admission-time
+  // tiebreak check is ever reached (REPLCONF capa dragonfly, far below in this function). This
+  // is exactly as transient as the tiebreak refusal itself -- the peer finishes loading and
+  // admits us on a later retry -- so it gets the identical quiet, retryable treatment.
+  // kLoadingErr (facade/error.h) already carries its own leading '-', so the parsed error text
+  // is that constant sans the one leading byte (verified against the real wire reply by hand;
+  // see task-8-report.md).
+  if (IsPeerMode() && CheckRespSimpleError(std::string_view(kLoadingErr).substr(1))) {
+    LOG_EVERY_T(WARNING, 60) << "Peer " << server().Description()
+                             << " is currently loading its own dataset; retrying";
+    return std::make_error_code(std::errc::resource_unavailable_try_again);
+  }
   PC_RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("PONG"));
 
   // Corresponds to server.repl_state == REPL_STATE_SEND_HANDSHAKE condition in replication.c

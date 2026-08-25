@@ -198,19 +198,26 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
     GenericError ec = r->Start();
     if (ec || r->IsContextCancelled()) {
       // drakeydb D-7 (review round 2): a blocking REPLICAOF's one and only Start() attempt can
-      // lose the reciprocal-connect uuid tiebreak (ShouldRefuseReciprocalPeer,
-      // HasUnestablishedPeerWithUuid) -- not a real failure, just this side deferring to the
-      // other for now. Unlike every other Start() failure, this one is expected to clear itself
-      // within a retry or two. Falling straight through to `return ec` below would surface
-      // "-ERR replication cancelled" indistinguishable from a DNS failure or an own-uuid
-      // refusal (GenericError(std::string)'s std::error_code member is always default-
-      // constructed -- see Replica::LastGreetEc()'s own doc comment, replica.h -- so `ec` itself
-      // cannot carry the specific errc here; LastGreetEc() is the one channel that does) --
-      // strictly worse than pre-task behavior, where this would have just succeeded. Recognized
-      // *only* by that specific errc: every other reason Start() can fail (unreachable host,
-      // own uuid, a uuid already claimed by another live peer, ...) still fails the command
-      // exactly as before -- silently backgrounding those would hide a real misconfiguration.
-      if (r->LastGreetEc() == std::errc::device_or_resource_busy) {
+      // fail for two known-transient reasons instead of a real one: it lost the
+      // reciprocal-connect uuid tiebreak (ShouldRefuseReciprocalPeer,
+      // HasUnestablishedPeerWithUuid -- device_or_resource_busy), or the target is itself
+      // transiently LOADING from a third, unrelated peer, which rejects even our PING before
+      // our own admission check is ever reached (Greet()'s own comment --
+      // resource_unavailable_try_again). Neither is a real failure, and both are expected to
+      // clear themselves within a retry or two (round-2 review: reproduced this exact second
+      // case losing to the first fix alone -- see task-8-report.md). Falling straight through
+      // to `return ec` below would surface "-ERR replication cancelled" indistinguishable from
+      // a DNS failure or an own-uuid refusal (GenericError(std::string)'s std::error_code
+      // member is always default-constructed -- see Replica::LastGreetEc()'s own doc comment,
+      // replica.h -- so `ec` itself cannot carry the specific errc here; LastGreetEc() is the
+      // one channel that does) -- strictly worse than pre-task behavior, where this would have
+      // just succeeded. Recognized *only* by these two specific errcs: every other reason
+      // Start() can fail (unreachable host, own uuid, a uuid already claimed by another live
+      // peer, ...) still fails the command exactly as before -- silently backgrounding those
+      // would hide a real misconfiguration.
+      std::error_code greet_ec = r->LastGreetEc();
+      if (greet_ec == std::errc::device_or_resource_busy ||
+          greet_ec == std::errc::resource_unavailable_try_again) {
         r->EnableReplication();         // fresh state_mask_/fiber; Start() never touched sync_fb_.
         mode = StartMode::kBackground;  // Step 3 below must not re-start the fiber.
       } else {

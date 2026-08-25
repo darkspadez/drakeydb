@@ -192,10 +192,11 @@ class PeerReplicationManager {
   };
 
   // REPLICAOF <host> <port> in active mode. kBlockingHandshake: connect+greet synchronously like
-  // upstream REPLICAOF -- on failure nothing changes and the error is returned, with one D-7
-  // exception: losing the reciprocal-connect uuid tiebreak on this one attempt falls back to
-  // publishing the peer and continuing in the background instead (see Add()'s own comment).
-  // kBackground: boot time (--replicaof); starts the reconnect loop and returns immediately.
+  // upstream REPLICAOF -- on failure nothing changes and the error is returned, with two D-7
+  // exceptions: losing the reciprocal-connect uuid tiebreak, or hitting a target that is itself
+  // transiently LOADING, on this one attempt falls back to publishing the peer and continuing
+  // in the background instead (see Add()'s own comment). kBackground: boot time (--replicaof);
+  // starts the reconnect loop and returns immediately.
   enum class StartMode { kBlockingHandshake, kBackground };  // REPLICAOF vs boot --replicaof
 
   PeerReplicationManager(Service* service, PeerRegistry* registry);
@@ -208,11 +209,12 @@ class PeerReplicationManager {
   // different endpoint presenting an attached UUID fails a blocking handshake; a background link
   // stays down/retrying until that UUID is released. Fails once Shutdown() has been called.
   //
-  // drakeydb D-7: a kBlockingHandshake that loses the reciprocal-connect uuid tiebreak on its
-  // one Start() attempt (Replica::LastGreetEc() == std::errc::device_or_resource_busy) is the
-  // one case that does NOT fail: the peer is published and continues in the background exactly
-  // as kBackground would, and Add() returns success. Every other blocking-handshake failure is
-  // unaffected.
+  // drakeydb D-7: a kBlockingHandshake whose one Start() attempt fails with one of two known-
+  // transient Replica::LastGreetEc() values -- std::errc::device_or_resource_busy (lost the
+  // reciprocal-connect uuid tiebreak) or std::errc::resource_unavailable_try_again (the target
+  // is itself transiently LOADING) -- does NOT fail: the peer is published and continues in the
+  // background exactly as kBackground would, and Add() returns success. Every other blocking-
+  // handshake failure is unaffected.
   GenericError Add(const Endpoint& ep, std::string_view self_replid, StartMode mode,
                    bool* already_attached);
 
