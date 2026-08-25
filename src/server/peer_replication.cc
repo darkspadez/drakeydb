@@ -96,11 +96,18 @@ SyncGate::Lease::~Lease() {
     gate_->Release();
 }
 
+// ABSL_NO_THREAD_SAFETY_ANALYSIS is on this method's declaration (peer_replication.h): see that
+// declaration's own comment for why std::unique_lock is required here instead of LockGuard.
 SyncGate::Lease SyncGate::Acquire(absl::FunctionRef<bool()> cancelled) {
   std::unique_lock lk(mu_);
   const uint64_t ticket = next_ticket_++;
   waiters_.push_back(ticket);
-  auto ready = [&] {
+  // ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_): Clang's thread-safety analysis gives a lambda's
+  // operator() its own empty lockset, so this function-level ABSL_NO_THREAD_SAFETY_ANALYSIS
+  // (peer_replication.h) does not cover it -- same reasoning as PeerReplicationManager::Add()'s
+  // has_endpoint lambda further below. Satisfied here: mu_ is held via std::unique_lock for this
+  // whole function, and ready() is only ever called below, still within that same scope.
+  auto ready = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
     return !held_ && waiters_.front() == ticket && !(external_loading_ && external_loading_());
   };
   while (true) {
@@ -121,7 +128,7 @@ SyncGate::Lease SyncGate::Acquire(absl::FunctionRef<bool()> cancelled) {
 }
 
 void SyncGate::Release() {
-  std::lock_guard lk(mu_);
+  util::fb2::LockGuard lk(mu_);
   held_ = false;
   // fb2::CondVarAny has no internal mutex (unlike std::condition_variable_any): notify_all() must
   // be called while still holding mu_, or it races the wait queue it touches.
@@ -129,12 +136,12 @@ void SyncGate::Release() {
 }
 
 bool SyncGate::IsHeld() const {
-  std::lock_guard lk(mu_);
+  util::fb2::LockGuard lk(mu_);
   return held_;
 }
 
 size_t SyncGate::NumWaiting() const {
-  std::lock_guard lk(mu_);
+  util::fb2::LockGuard lk(mu_);
   return waiters_.size();
 }
 

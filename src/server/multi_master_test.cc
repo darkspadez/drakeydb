@@ -404,6 +404,74 @@ TEST_F(PeerRegistryFiberTest, ConcurrentAddersDontDuplicate) {
     EXPECT_EQ(u, reg.GetUuid(*reg.FindIdx(u)));  // round-trip: catches index aliasing too.
 }
 
+// drakeydb: P3 T9 (e). Same distinct-proactor-threads rationale as PeerRegistryFiberTest above
+// (its own comment explains why fibers sharing one thread, or built on the bare gtest thread,
+// never actually interleave): LoadOrCreateNodeIdentity's mkstemp/write/fsync/link sequence is
+// raw, non-fiber-aware blocking syscalls, so genuinely racing it needs one racer fiber per real
+// OS thread.
+class NodeIdentityFiberTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+#ifdef __linux__
+    if (absl::GetFlag(FLAGS_force_epoll)) {
+      pp_.reset(util::fb2::Pool::Epoll(kRacers));
+    } else {
+      pp_.reset(util::fb2::Pool::IOUring(16, kRacers));
+    }
+#else
+    pp_.reset(util::fb2::Pool::Epoll(kRacers));
+#endif
+    pp_->Run();
+  }
+  void TearDown() override {
+    pp_->Stop();
+    pp_.reset();
+  }
+
+  static constexpr unsigned kRacers = 8;
+  std::unique_ptr<util::ProactorPool> pp_;
+};
+
+// drakeydb: P3 T9 (e) acceptance case. kRacers processes booting concurrently against the same
+// empty --dir must converge on ONE uuid -- matching what actually ends up on disk -- never each
+// keep the different uuid it locally generated. Before the fix, PersistUuid published via
+// mkstemp()+rename(), which always overwrites: every racer that saw "no such file" on its
+// initial read would go on to generate its own uuid and successfully rename() it over whatever
+// the last writer left, so racers' in-memory NodeIdentity::uuid values could differ from each
+// other and from whatever uuid ultimately ended up on disk -- a restart would then load a uuid
+// that does not match the identity this boot ran with.
+//
+// Falsifying: reverting PersistUuid to mkstemp+rename (no link()/EEXIST/adopt path) makes this
+// test fail with racer uuids that diverge from each other and/or from the file on disk --
+// observed failure text captured in task-9-report.md.
+TEST_F(NodeIdentityFiberTest, ConcurrentBootConvergesOnSameUuid) {
+  std::string dir = base::GetTestTempPath("nid_race");
+  std::filesystem::remove_all(dir);
+
+  std::vector<io::Result<NodeIdentity>> results(kRacers);
+  std::vector<util::fb2::Fiber> fibers;
+  for (unsigned i = 0; i < kRacers; ++i) {
+    fibers.emplace_back(pp_->at(i % pp_->size())->LaunchFiber(util::fb2::Launch::post, [&, i] {
+      results[i] = LoadOrCreateNodeIdentity(dir, "");
+    }));
+  }
+  for (auto& fb : fibers)
+    fb.Join();
+
+  for (unsigned i = 0; i < kRacers; ++i) {
+    ASSERT_TRUE(results[i]) << "racer " << i;
+    EXPECT_FALSE(results[i]->ephemeral) << "racer " << i;
+  }
+  const std::string expected_uuid = results[0]->uuid;
+  ASSERT_TRUE(IsValidNodeUuid(expected_uuid));
+  for (unsigned i = 1; i < kRacers; ++i)
+    EXPECT_EQ(expected_uuid, results[i]->uuid) << "racer " << i << " diverged from racer 0";
+
+  auto on_disk = io::ReadFileToString(dir + "/drakeydb.uuid");
+  ASSERT_TRUE(on_disk);
+  EXPECT_EQ(absl::StrCat(expected_uuid, "\n"), *on_disk);
+}
+
 // Gives this fixture's boot its own private --dir so its identity file never collides with
 // another test's, and restores the global --dir flag on teardown (saver_ is the fixture's only
 // data member, so it is constructed -- capturing the pre-test value -- before the constructor

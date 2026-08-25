@@ -460,11 +460,17 @@ class DflyInstanceFactory:
         if version >= 1.26:
             args.setdefault("fiber_safety_margin=4096")
 
-        # drakeydb: every instance needs its own node identity. Instances with an explicit --dir
-        # persist one in <dir>/drakeydb.uuid (production behaviour); the rest share the session
-        # cwd, so give them a unique ephemeral --node_uuid instead. A restarted DflyInstance keeps
-        # its args, hence its identity. Old upstream binaries (version < 100) lack the flag.
-        if version >= 100 and "dir" not in args:
+        # drakeydb: every instance needs its own node identity. Instances with an explicit,
+        # per-instance --dir persist one in <dir>/drakeydb.uuid (production behaviour); the rest
+        # -- including an instance whose --dir is the bare {DRAGONFLY_TMP} session root, which
+        # every instance defaulting to it shares for the life of the session/class-scoped tmp_dir
+        # fixture (P3 T9 (c): before this check, such instances opted out of the "no dir" branch
+        # below and silently shared one drakeydb.uuid file, not just within one test but across
+        # every test in the session/class that used the same bare default) -- get a unique
+        # ephemeral --node_uuid instead. A restarted DflyInstance keeps its args, hence its
+        # identity. Old upstream binaries (version < 100) lack the flag.
+        shares_session_tmp_dir = args.get("dir") in ("{DRAGONFLY_TMP}/", "{DRAGONFLY_TMP}")
+        if version >= 100 and ("dir" not in args or shares_session_tmp_dir):
             args.setdefault("node_uuid", str(uuid.uuid4()))
 
         # When a custom S3 endpoint is configured (e.g. MinIO), pass it to Dragonfly

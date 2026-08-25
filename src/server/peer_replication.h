@@ -142,7 +142,13 @@ class SyncGate {
   // Returns an empty Lease if cancelled() becomes true while waiting (checked every 100ms and on
   // every release). cancelled(), like external_loading(), is evaluated under the internal mutex,
   // so it must be cheap and non-blocking. Must be called from a fiber.
-  Lease Acquire(absl::FunctionRef<bool()> cancelled);
+  //
+  // ABSL_NO_THREAD_SAFETY_ANALYSIS: this loop unlocks/relocks mu_ across cv_.wait_for, so it must
+  // take mu_ via std::unique_lock rather than util::fb2::LockGuard (RAII-only: no manual
+  // unlock/relock). Clang's analysis only recognizes ABSL_SCOPED_LOCKABLE wrappers like
+  // LockGuard, not std::unique_lock, so it cannot see that mu_ is held anywhere in this function
+  // -- same reasoning as DflyCmd::BreakStalledFlowsInShard (dflycmd.h).
+  Lease Acquire(absl::FunctionRef<bool()> cancelled) ABSL_NO_THREAD_SAFETY_ANALYSIS;
 
   bool IsHeld() const;
   size_t NumWaiting() const;
@@ -152,9 +158,9 @@ class SyncGate {
 
   mutable util::fb2::Mutex mu_;
   util::fb2::CondVarAny cv_;
-  bool held_ = false;
-  uint64_t next_ticket_ = 0;
-  std::deque<uint64_t> waiters_;  // FIFO of tickets still waiting
+  bool held_ ABSL_GUARDED_BY(mu_) = false;
+  uint64_t next_ticket_ ABSL_GUARDED_BY(mu_) = 0;
+  std::deque<uint64_t> waiters_ ABSL_GUARDED_BY(mu_);  // FIFO of tickets still waiting
   ExternalLoadingFn external_loading_;
 };
 
