@@ -1,5 +1,15 @@
 # drakeydb Phase 3 — Origin-tagged Journal + Active Pair/Mesh — Design Spec
 
+> **Superseded in places.** This spec is the design as approved at the start of P3. Several of
+> its claims were corrected during implementation — most importantly, D-3's assertion that the
+> `PrepareTransaction` hook covers *every* journaling path (EXEC's `dist_trans` and the
+> non-atomic squash stub bypass it), and D-7's assumption that a refused peer always retries on
+> the 500 ms loop (interactive `REPLICAOF` greets synchronously and has no retry). The
+> authoritative as-built record, including behaviour changes and known limitations, is the
+> **Phase 3 section of `docs/PLAN.md`**.
+
+
+
 ## Context
 
 drakeydb is Jon's public fork of `dragonflydb/dragonfly` that ports KeyDB-style
