@@ -1772,12 +1772,11 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
 
     await asyncio.sleep(1.2)  # let every member's 1s TTL elapse on every node's own clock
 
-    # Measurement window starts here: from this point until delta_b is read below, nothing may
-    # run against b except the fixed idle wait -- an incidental command (e.g. a convergence-
-    # polling EXISTS) would itself inflate the very counter being measured. b is deliberately
-    # never probed at all in this test (see the module comment above for why), so this is mostly
-    # a formality here, but keeping the same discipline as the sibling FIELDEXPIRE-based
-    # assertions above avoids relying on that by accident.
+    # Measurement window starts here: from this point until delta_b is read below, nothing runs
+    # against b except the fixed idle wait a few lines down -- an incidental command (e.g. a
+    # convergence-polling EXISTS) would itself inflate the very counter being measured. b is not
+    # probed at all until after delta_b is captured -- the existence check further below runs
+    # strictly after, precisely so its own EXISTS traffic cannot contaminate this counter.
     before_b = await _total_commands_processed(c_b)
 
     # Re-probing each already-expired member via FIELDTTL (read-only) on a causes
@@ -1789,8 +1788,7 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
         pipe.execute_command("fieldttl", key, "m")
     await pipe.execute()
 
-    # The load-bearing assertion: plain converges (it received a's derived DEL outright); b does
-    # not, because that DEL was suppressed and nothing else ever told b to clean up its copy.
+    # plain converges (it received a's derived DEL outright); this does not touch b.
     @assert_eventually(timeout=30)
     async def plain_converged():
         for key in keys:
@@ -1798,21 +1796,25 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
 
     await plain_converged()
 
-    await asyncio.sleep(1.0)  # give a leaked DEL, if any, time to arrive before checking b
+    await asyncio.sleep(1.0)  # give a leaked DEL, if any, time to arrive before measuring b
 
+    # The load-bearing assertion: b applied nothing beyond idle mesh noise over this window (~2-4,
+    # per STORM_BOUND's own measured baseline above) -- a derived DEL leaking through for every
+    # key would show up here as ~n extra commands, an unmistakable jump against that baseline.
+    # Measured here, before the existence check below ever touches b, is what makes the "b is not
+    # probed at all until after delta_b is captured" comment above actually true.
+    delta_b = await _total_commands_processed(c_b) - before_b
+    assert delta_b < 10, (
+        f"peer applied {delta_b} commands with nothing legitimately sent to it (expected only "
+        f"idle mesh noise, comfortably under 10; a {n}-key leak would show ~{n}) -- looks like "
+        f"a's derived DELs leaked through to the peer"
+    )
+
+    # Corroborates the count above semantically: b's copy of every key should still exist, since
+    # nothing was ever forwarded to tell it to clean up. Runs after delta_b on purpose (see above).
     for key in keys:
         assert await _exists(c_b, key), (
             f"{key} no longer exists on the peer -- a's derived DEL must have leaked through "
             f"(SetFamily::DeleteSetIfEmpty's default -- not FIELDEXPIRE's carve-out -- is the "
             f"one under test here)"
         )
-
-    # Belt-and-suspenders on the command-count channel used by the sibling FIELDEXPIRE-vs-peer
-    # comparisons above: b's own counter should reflect nothing beyond idle mesh noise -- b was
-    # never itself probed, so there is no legitimate traffic at all to account for here, unlike
-    # the FIELDTTL-issued-directly-against-b variant this test does NOT use (see module comment).
-    delta_b = await _total_commands_processed(c_b) - before_b
-    assert delta_b < 1.5 * n, (
-        f"peer applied {delta_b} commands with nothing legitimately sent to it (expected close "
-        f"to 0, well under {1.5 * n}) -- looks like a's derived DELs leaked through to the peer"
-    )
