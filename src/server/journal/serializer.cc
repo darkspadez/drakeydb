@@ -64,6 +64,15 @@ void JournalWriter::Write(const journal::Entry::Payload& payload) {
 }
 
 void JournalWriter::Write(const journal::Entry& entry) {
+  // drakeydb: Op::ORIGIN is v2-only. Reject it before emitting a SELECT or opcode byte: in a
+  // release build DFATAL is non-fatal, so checking inside the switch would leave a truncated
+  // ORIGIN frame in an otherwise legacy stream.
+  if (entry.opcode == journal::Op::ORIGIN && !extended_framing_) {
+    LOG(DFATAL) << "Op::ORIGIN written without extended_framing; dropping entry to avoid "
+                   "corrupting the v1 stream";
+    return;
+  }
+
   // Check if entry has a new db index and we need to emit a SELECT entry.
   // drakeydb: Op::ORIGIN carries no dbid meaning -- excluded here like SELECT/LSN/PING so it
   // neither triggers a spurious nested SELECT nor mutates cur_dbid_.
@@ -101,16 +110,6 @@ void JournalWriter::Write(const journal::Entry& entry) {
       Write(entry.payload);
       break;
     case journal::Op::ORIGIN:
-      // drakeydb: Op::ORIGIN is v2-only. Nothing constructs one with extended_framing_ == false
-      // today, but a future non-active emitter putting v2-only bytes into an otherwise
-      // upstream-compatible stream would silently break byte-identity, so guard it explicitly.
-      // LOG(DFATAL) + hard skip (not DCHECK, which compiles out in release): a release build
-      // must not silently emit a v2-only frame into a v1 stream and corrupt a stock reader.
-      if (!extended_framing_) {
-        LOG(DFATAL) << "Op::ORIGIN written without extended_framing; dropping entry to avoid "
-                       "corrupting the v1 stream";
-        return;
-      }
       // idx + uuid only, no txid and no Entry::Payload framing (the uuid rides in
       // entry.payload.cmd as a plain string, but is written directly via the string primitive
       // below, not through the args-array Write(Payload&) path).

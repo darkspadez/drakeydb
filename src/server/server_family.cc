@@ -3714,7 +3714,7 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
           const auto& rinfo = cntx->conn_state.replication_info;
           const bool has_uuid = !rinfo.repl_node_uuid.empty();
           const bool own_uuid = has_uuid && rinfo.repl_node_uuid == node_uuid();
-          if (own_uuid) {
+          if (rinfo.repl_is_peer && own_uuid) {
             return cmd_cntx->SendError(
                 "Refusing to admit a consumer presenting this node's own uuid");
           }

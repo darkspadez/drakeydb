@@ -469,7 +469,12 @@ class DflyInstanceFactory:
         # every test in the session/class that used the same bare default) -- get a unique
         # ephemeral --node_uuid instead. A restarted DflyInstance keeps its args, hence its
         # identity. Old upstream binaries (version < 100) lack the flag.
-        shares_session_tmp_dir = args.get("dir") in ("{DRAGONFLY_TMP}/", "{DRAGONFLY_TMP}")
+        dir_arg = args.get("dir")
+        formatted_dir = dir_arg.format(**self.params.env) if isinstance(dir_arg, str) else dir_arg
+        session_tmp_dir = self.params.env["DRAGONFLY_TMP"].format(**self.params.env)
+        shares_session_tmp_dir = isinstance(formatted_dir, str) and os.path.realpath(
+            formatted_dir
+        ) == os.path.realpath(session_tmp_dir)
         if version >= 100 and ("dir" not in args or shares_session_tmp_dir):
             args.setdefault("node_uuid", str(uuid.uuid4()))
 

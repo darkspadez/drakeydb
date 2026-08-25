@@ -9,8 +9,8 @@
 |---|---|---|
 | **P0 — Repo hygiene + rename** | ✅ **complete, verified** | PR [#1](https://github.com/darkspadez/drakeydb/pull/1), branch `feat/phase0-drakeydb-rename`, commit `7ca99f4c` |
 | **P1 — Identity foundations** | ✅ **complete, verified** | branch `feat/phase1-identity`, commits `9e653ab3..9c491fac` |
-| **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3) **merged** as `cd8e0602` — see [Phase 2](#phase-2--writable-multi-source-replica-fan-in) |
-| **P3 — Origin-tagged journal + active pair/mesh** | ✅ **complete, verified** | PR [#4](https://github.com/darkspadez/drakeydb/pull/4), branch `feat/phase3-origin-journal`, 30 commits `6b0c995a..7bddd7fe` — see [Phase 3](#phase-3--origin-tagged-journal--active-pairmesh) |
+| **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3) **merged** as `cd8e0602` — see [Phase 2](#phase-2) |
+| **P3 — Origin-tagged journal + active pair/mesh** | ✅ **complete, verified** | PR [#4](https://github.com/darkspadez/drakeydb/pull/4), branch `feat/phase3-origin-journal`, 30 commits `6b0c995a..7bddd7fe` — see [Phase 3](#phase-3) |
 | **P4 — MVCC store + stamping + wire** | ⏭️ **next up** | see [Phase 4](#phase-4--mvcc-store--stamping--wire) |
 | P5–P9 | not started | — |
 
@@ -346,6 +346,8 @@ Note: inside `slaveN:`, `node_uuid` is inserted **before** `lag`, not appended l
 stay the trailing field — `replication_test.py` and `cluster_test.py` both parse it with a
 `lag=([0-9]+)\r\n` regex that anchors on the line ending.
 
+<a id="phase-2"></a>
+
 ## Phase 2 — Writable multi-source replica (fan-in) ✅ (branch `feat/phase2-fanin`)
 Flags + validation; peer-mode `Replica` (no read-only flip; skip flush; override-load merge,
 last-loaded-wins until P6); `REPLICAOF` append / `REPLICAOF REMOVE <h> <p>` / NO-ONE-clears-all
@@ -430,6 +432,8 @@ the Phase 2 suite added to `multimaster_test.py`.
     rename) succeed — the loser keeps running with a uuid that no longer matches the file a
     restart would load.
 
+<a id="phase-3"></a>
+
 ## Phase 3 — Origin-tagged journal + active pair/mesh ✅ (branch `feat/phase3-origin-journal`)
 Journal v2 framing; origin on `JournalItem`/`JournalChangeItem`; apply-context plumbing
 (ConnectionContext → Transaction → auto + manual journal paths); streamer peer filter
@@ -467,11 +471,13 @@ worth knowing because `CMakeLists.txt:77-79` gates that analysis on Clang and th
 builds with g++, so it never runs in the ordinary local gate.
 
 **Decisions and behaviour changes to know about:**
-- **D2b — an active node now REFUSES a source that does not identify itself.** P2 accepted fan-in
-  from a stock Dragonfly master (uuid simply absent). Without a uuid there is no origin, and stamping
-  such writes self-origin would forward them to peers. KeyDB masters do reply with a uuid, so P7
-  onboarding is unaffected; what stops working is fan-in from **stock Dragonfly or plain Redis** while
-  `--active_replica` is on.
+- **D2b — an active node now REFUSES a peer-mode source that does not identify itself.** P2
+  accepted fan-in from a stock Dragonfly master (uuid simply absent). Without a uuid there is no
+  origin, and stamping such writes self-origin would forward them to peers. On the consumer side,
+  the UUID requirement is likewise scoped to `PEER 1`: a fork-versioned non-PEER consumer remains
+  a plain full-stream replica even without a UUID. Missing or old `DRAKEY-VERSION` is a separate
+  refusal condition. KeyDB masters do reply with a uuid, so P7 onboarding is unaffected; what stops
+  working is peer-mode fan-in from **stock Dragonfly or plain Redis** while `--active_replica` is on.
 - **The replica handshake is no longer wire-identical to upstream** (two additive REPLCONF pairs,
   which pre-fork masters reject harmlessly). It must be unconditional, because admission requires
   `DRAKEY-VERSION` even from a plain sub-replica of an active node. **Journal bytes** — the property

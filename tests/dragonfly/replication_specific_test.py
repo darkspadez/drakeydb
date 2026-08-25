@@ -1681,20 +1681,27 @@ async def test_shared_tmp_dir_instances_get_distinct_identities(df_factory: Dfly
     an explicit --dir (any --dir, including this shared one) opted out of the harness's
     per-instance --node_uuid default, so every such instance loaded/persisted the very same
     <DRAGONFLY_TMP>/drakeydb.uuid file and silently ended up presenting the same identity. Now
-    that P3's origin-tagged journal keys peer admission on uuid, two nodes claiming the same
-    identity is exactly the failure that looks like a protocol bug -- so two instances that both
-    default to the shared tmp dir must still each get their own uuid.
+    that P3's origin-tagged journal keys peer admission on uuid, nodes claiming the same identity
+    are exactly the failure that looks like a protocol bug -- so instances that use equivalent
+    forms of the shared tmp dir must still each get their own uuid.
 
-    Falsifying: reverting instance.py's shares_session_tmp_dir check makes both instances below
-    load the same persisted drakeydb.uuid file and this test fails with ua == ub (observed
-    failure text captured in task-9-report.md).
+    Falsifying: reverting instance.py's shares_session_tmp_dir check makes the direct-path
+    instances below load the same persisted drakeydb.uuid file, leaving only two distinct
+    identities instead of three.
     """
-    a = df_factory.create(proactor_threads=1, dir="{DRAGONFLY_TMP}/")
-    b = df_factory.create(proactor_threads=1, dir="{DRAGONFLY_TMP}/")
-    df_factory.start_all([a, b])
-    ua = (await a.client().info("replication"))["node_uuid"]
-    ub = (await b.client().info("replication"))["node_uuid"]
-    assert ua != ub, "instances sharing {DRAGONFLY_TMP}/ must not share a node identity"
+    shared_dir = df_factory.params.env["DRAGONFLY_TMP"]
+    instances = [
+        df_factory.create(proactor_threads=1, dir="{DRAGONFLY_TMP}/"),
+        df_factory.create(proactor_threads=1, dir=shared_dir),
+        df_factory.create(proactor_threads=1, dir=f"{shared_dir}/"),
+    ]
+    df_factory.start_all(instances)
+    identities = {
+        (await instance.client().info("replication"))["node_uuid"] for instance in instances
+    }
+    assert len(identities) == len(
+        instances
+    ), "instances sharing equivalent DRAGONFLY_TMP paths must not share a node identity"
 
 
 # Verify chunked CF replication stays within the max chunk size budget.

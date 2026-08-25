@@ -640,7 +640,9 @@ async def test_plain_replica_of_active_node_gets_full_unfiltered_stream(
     (ShouldWrite's origin_idx != kSelfIdx branch) while leaving the active node's own writes
     untouched, so a test that only checks the active node's own writes reach the replica would
     keep passing under that bug. This test specifically writes on B (A's fan-in source, never
-    directly connected to D) and checks B's write reaches D purely by relay through A.
+    directly connected to D) and checks B's write reaches D purely by relay through A. It also
+    lets an A-local key expire and requires D to receive the resulting expiry DEL; D has
+    replica_delete_expired=false, so it cannot satisfy that assertion by expiring the key itself.
 
     Falsifying: hardcoding peer_mode=true in StartStableSyncInThread's JournalStreamer::Config
     (in place of the peer_mode parameter) makes "relayed-through-a" never appear on D, and
@@ -659,9 +661,13 @@ async def test_plain_replica_of_active_node_gets_full_unfiltered_stream(
 
     await c_b.set("relayed-through-a", "1")
     await c_a.set("a-own", "1")
+    await c_a.set("a-expiry", "1", px=1000)
 
     await wait_for_value(c_d, "a-own", "1")
     await wait_for_value(c_d, "relayed-through-a", "1")
+    await wait_for_value(c_d, "a-expiry", "1")
+    await wait_for_value(c_a, "a-expiry", None, timeout=10)
+    await wait_for_value(c_d, "a-expiry", None, timeout=10)
 
 
 async def test_peer_mesh_own_writes_not_echoed_back(df_factory: DflyInstanceFactory):

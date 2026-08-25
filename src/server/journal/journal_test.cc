@@ -3,6 +3,7 @@
 #include <absl/strings/str_join.h>
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <random>
@@ -41,6 +42,43 @@ using namespace util;
 
 namespace dfly {
 namespace journal {
+
+namespace {
+
+#ifdef USE_ABSL_LOG
+class ScopedLogCapture : public absl::LogSink {
+ public:
+  ScopedLogCapture() {
+    absl::AddLogSink(this);
+  }
+  ~ScopedLogCapture() override {
+    absl::RemoveLogSink(this);
+  }
+  void Send(const absl::LogEntry& entry) override {
+    logs.emplace_back(entry.text_message());
+  }
+
+  vector<string> logs;
+};
+#else
+class ScopedLogCapture : public google::LogSink {
+ public:
+  ScopedLogCapture() {
+    google::AddLogSink(this);
+  }
+  ~ScopedLogCapture() override {
+    google::RemoveLogSink(this);
+  }
+  void send(google::LogSeverity severity, const char* full_filename, const char* base_filename,
+            int line, const struct tm* tm_time, const char* message, size_t message_len) override {
+    logs.emplace_back(message, message_len);
+  }
+
+  vector<string> logs;
+};
+#endif
+
+}  // namespace
 
 struct EntryPayloadVisitor {
   void operator()(const Entry::Payload& p) {
@@ -335,6 +373,32 @@ TEST(Journal, OriginEntryRoundTrips) {
   EXPECT_EQ(res.entry_flags, 0u);
   EXPECT_TRUE(res.cmd.empty());
   EXPECT_EQ(res.origin_uuid, kUuid);
+}
+
+// Op::ORIGIN belongs exclusively to extended framing. In debug builds DFATAL proves misuse is
+// diagnosed; in release builds, where DFATAL is non-fatal, pin the stronger wire invariant: a
+// rejected ORIGIN must not emit even its opcode byte into the legacy stream.
+TEST(JournalDeathTest, LegacyWriterRejectsOriginBeforeWriting) {
+  Entry entry{Op::ORIGIN, /*dbid=*/0, nullopt};
+  entry.origin_idx = 4;
+  entry.payload.cmd = "11111111-2222-3333-4444-555555555555";
+
+#ifndef NDEBUG
+  EXPECT_DEATH(
+      {
+        base::IoBuf buf;
+        io::BufSink sink{&buf};
+        JournalWriter writer{&sink};
+        writer.Write(entry);
+      },
+      "Op::ORIGIN written without extended_framing");
+#else
+  base::IoBuf buf;
+  io::BufSink sink{&buf};
+  JournalWriter writer{&sink, /*extended_framing=*/false};
+  writer.Write(entry);
+  EXPECT_TRUE(buf.InputBuffer().empty());
+#endif
 }
 
 // drakeydb: fix-round-1 finding 4 -- Op::ORIGIN's uuid length is bounds-checked before any
@@ -656,6 +720,7 @@ TEST(Journal, BacklogBoundsTimeBasedCleanup) {
 // function body down to `return true;` fails every EXPECT_FALSE case at once.
 TEST(PassesPeerEchoFilterTest, DropsForeignOriginExpiryDelAndOriginOpcodeOnly) {
   constexpr uint32_t kPeerIdx = 3;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  ScopedLogCapture log_capture;
 
   JournalItem self_write{};
   self_write.origin_idx = PeerRegistry::kSelfIdx;
@@ -700,6 +765,11 @@ TEST(PassesPeerEchoFilterTest, DropsForeignOriginExpiryDelAndOriginOpcodeOnly) {
   foreign_ping.origin_idx = kPeerIdx;
   foreign_ping.opcode = Op::PING;
   EXPECT_FALSE(PassesPeerEchoFilter(foreign_ping));
+
+  size_t violation_logs = count_if(log_capture.logs.begin(), log_capture.logs.end(), [](auto& log) {
+    return log.find("Refusing to forward foreign-origin journal entry") != string::npos;
+  });
+  EXPECT_EQ(1u, violation_logs) << "the peer-protocol diagnostic must be rate-limited";
 }
 
 // drakeydb: Phase 3 T6b fix-round-1 (Q1) -- CapturingFiberSocket now lives in

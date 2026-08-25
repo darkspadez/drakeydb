@@ -128,8 +128,11 @@ void JournalSlice::AddLogRecord(const Entry& entry) {
     item.cmd = entry.payload.cmd;
     item.slot = entry.slot;
 
-    // drakeydb: Phase 3 origin metadata, mirrored onto JournalItem -- see types.h.
-    item.journal_item.origin_idx = entry.origin_idx;
+    // drakeydb: Phase 3 origin metadata, mirrored onto JournalItem -- see types.h. ORIGIN uses
+    // Entry::origin_idx as its serialized dictionary index, but the announcement itself is
+    // authored locally; keep those two meanings separate in the in-memory filter metadata.
+    item.journal_item.origin_idx =
+        entry.opcode == Op::ORIGIN ? PeerRegistry::kSelfIdx : entry.origin_idx;
     item.journal_item.entry_flags = entry.entry_flags;
     // drakeydb: Phase 3 T5 -- mirror opcode too, for the same reason (see JournalItem::opcode's
     // comment in types.h): the peer-echo filter needs Op::ORIGIN without reparsing `data`.

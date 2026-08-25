@@ -6,6 +6,7 @@
 
 #include <absl/strings/str_join.h>
 
+#include "base/logging.h"
 #include "server/multi_master.h"  // drakeydb: Phase 3 T7b -- PeerRegistry::kSelfIdx, see below.
 
 namespace dfly::journal {
@@ -48,8 +49,12 @@ string ParsedEntry::ToString() const {
 // drakeydb: Phase 3 T7b -- see the doc comment in types.h. Shared verbatim by
 // JournalStreamer::ShouldWrite and SliceSnapshot::ConsumeJournalChange.
 bool PassesPeerEchoFilter(const JournalItem& item) {
-  if (item.origin_idx != PeerRegistry::kSelfIdx)
+  if (item.origin_idx != PeerRegistry::kSelfIdx) {
+    LOG_EVERY_T(ERROR, 60) << "Refusing to forward foreign-origin journal entry on peer stream: "
+                           << "origin_idx=" << item.origin_idx
+                           << ", opcode=" << static_cast<unsigned>(item.opcode);
     return false;
+  }
 
   if (item.entry_flags & kEntryFlagExpired)
     return false;

@@ -26,6 +26,7 @@
 #include "server/engine_shard_set.h"
 #include "server/journal/executor.h"
 #include "server/journal/journal.h"
+#include "server/journal/serializer.h"
 #include "server/journal/types.h"
 #include "server/node_identity.h"
 #include "server/server_family.h"
@@ -600,10 +601,9 @@ TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesPeerWithoutUuid) {
   EXPECT_THAT(resp, ErrArg("REPLCONF PEER requires a valid REPLCONF UUID identity"));
 }
 
-TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesOwnUuid) {
-  // A version high enough to admit and PEER unset, so the own-uuid refusal below cannot be a
-  // side effect of some other row's check -- if the own-uuid guard were removed, this exact
-  // sequence would be admitted (an ARRAY reply), not refused.
+TEST_F(ActiveReplicaFamilyTest, ReplconfAdmitsPlainReplicaWithOwnUuid) {
+  // A plain consumer receives a full stream and cannot echo writes back, so UUID identity checks
+  // are peer-only. A restored/cloned read-only replica may legitimately present this UUID.
   std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
   size_t pos = info.find("\nnode_uuid:");
   ASSERT_NE(std::string::npos, pos);
@@ -611,6 +611,23 @@ TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesOwnUuid) {
 
   Run({"replconf", "uuid", own_uuid});
   EXPECT_EQ("OK", Run({"replconf", "drakey-version", absl::StrCat(kDrakeydbReplVersion)}));
+  auto resp = Run({"replconf", "capa", "dragonfly"});
+  ASSERT_EQ(RespExpr::ARRAY, resp.type) << "expected plain-replica admission to succeed: " << resp;
+
+  auto infos = service_->server_family().GetDflyCmd()->GetReplicaInfoSnapshot();
+  ASSERT_EQ(1u, infos.size());
+  EXPECT_FALSE(infos[0]->IsPeer());
+}
+
+TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesPeerWithOwnUuid) {
+  std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
+  size_t pos = info.find("\nnode_uuid:");
+  ASSERT_NE(std::string::npos, pos);
+  std::string own_uuid = info.substr(pos + 11, 36);
+
+  Run({"replconf", "uuid", own_uuid});
+  EXPECT_EQ("OK", Run({"replconf", "drakey-version", absl::StrCat(kDrakeydbReplVersion)}));
+  EXPECT_EQ("OK", Run({"replconf", "peer", "1"}));
   auto resp = Run({"replconf", "capa", "dragonfly"});
   EXPECT_THAT(resp, ErrArg("Refusing to admit a consumer presenting this node's own uuid"));
 }
@@ -953,7 +970,8 @@ TEST_F(OriginJournalFamilyTest, DerivedDeleteInheritsCausingTransactionOrigin) {
 }
 
 namespace {
-// drakeydb: Phase 3 T5 -- captures opcode/origin_idx/cmd/shard_id for every journal entry seen.
+// drakeydb: Phase 3 T5 -- captures opcode/origin_idx/cmd/shard_id and the serialized ORIGIN index
+// for every journal entry seen.
 // `cmd` doubles as the announced uuid for an Op::ORIGIN entry: JournalSlice::AddLogRecord sets
 // JournalChangeItem::cmd from Entry::payload.cmd unconditionally (not gated on opcode), and
 // PeerRegistry::AddOrGet's ORIGIN emission puts the uuid in exactly that field (see
@@ -969,6 +987,7 @@ namespace {
 struct OriginOpcodeEntry {
   journal::Op opcode;
   uint32_t origin_idx;
+  uint32_t wire_origin_idx;
   std::string cmd;
   ShardId shard_id;
 };
@@ -976,8 +995,14 @@ struct OriginOpcodeEntry {
 class OriginOpcodeCapturingConsumer : public journal::JournalConsumerInterface {
  public:
   void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    io::BytesSource source{item.journal_item.data};
+    JournalReader reader{&source, 0};
+    journal::ParsedEntry parsed;
+    CHECK(!reader.ReadEntry(&parsed));
+    CHECK(parsed.opcode == journal::Op::ORIGIN);
+
     util::fb2::LockGuard lk(mu_);
-    entries.push_back({item.journal_item.opcode, item.journal_item.origin_idx,
+    entries.push_back({item.journal_item.opcode, item.journal_item.origin_idx, parsed.origin_idx,
                        std::string(item.cmd), EngineShard::tlocal()->shard_id()});
   }
   void ThrottleIfNeeded() override {
@@ -1003,7 +1028,7 @@ class MultiShardOriginJournalFamilyTest : public MultiMasterFamilyTest {};
 //    first AddOrGet, failing the first ASSERT.
 //  - Emitting on fewer than all shards, or more than once on any shard, fails the
 //    entries.size() == num_shards assertion or the per-shard seen[] uniqueness check.
-//  - Emitting with the wrong opcode/origin_idx/payload fails the three EXPECTs in the loop.
+//  - Emitting with the wrong opcode/authorship/wire index/payload fails the EXPECTs in the loop.
 //  - Re-emitting on an already-registered uuid (i.e. not actually gating on `inserted`) grows
 //    entries.size() on the second, idempotent AddOrGet call.
 TEST_F(MultiShardOriginJournalFamilyTest, AddOrGetEmitsOriginOnNewIndexOnly) {
@@ -1044,7 +1069,8 @@ TEST_F(MultiShardOriginJournalFamilyTest, AddOrGetEmitsOriginOnNewIndexOnly) {
     std::vector<bool> seen(num_shards, false);
     for (const auto& e : consumer.entries) {
       EXPECT_EQ(journal::Op::ORIGIN, e.opcode);
-      EXPECT_EQ(idx, e.origin_idx);
+      EXPECT_EQ(PeerRegistry::kSelfIdx, e.origin_idx);
+      EXPECT_EQ(idx, e.wire_origin_idx);
       EXPECT_EQ(peer_uuid, e.cmd);
       ASSERT_LT(e.shard_id, num_shards);
       EXPECT_FALSE(seen[e.shard_id]) << "shard " << e.shard_id << " got more than one entry";

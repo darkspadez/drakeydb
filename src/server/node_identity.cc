@@ -93,6 +93,29 @@ bool SyncFd(int fd, const fs::path& path) {
   return true;
 }
 
+std::error_code SyncDirectory(const fs::path& path) {
+  int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY);
+  if (fd == -1) {
+    std::error_code ec = ErrnoError();
+    LOG(ERROR) << "Failed to open node uuid directory " << path << ": " << ec.message();
+    return ec;
+  }
+  absl::Cleanup close_dir = [&] {
+    if (fd != -1)
+      close(fd);
+  };
+  if (!SyncFd(fd, path))
+    return std::make_error_code(std::errc::io_error);
+  if (close(fd) == -1) {
+    std::error_code ec = ErrnoError();
+    fd = -1;
+    LOG(ERROR) << "Failed to close node uuid directory " << path << ": " << ec.message();
+    return ec;
+  }
+  fd = -1;
+  return {};
+}
+
 // Writes `uuid` through a unique temp file, syncs its data, then publishes it at `file` via
 // link() -- never rename() -- and syncs the parent directory. Unlike rename(), which always wins
 // and silently overwrites, link() fails atomically with EEXIST if `file` already exists. That
@@ -122,9 +145,10 @@ io::Result<std::string> PersistUuid(const fs::path& dir, const fs::path& file,
   std::string tmp_template = absl::StrCat(file.string(), ".tmp.XXXXXX");
   int fd = mkstemp(tmp_template.data());
   if (fd == -1) {
+    std::error_code create_ec = ErrnoError();
     LOG(ERROR) << "Failed to create temporary node uuid file next to " << file << ": "
-               << ErrnoError().message();
-    return nonstd::make_unexpected(ErrnoError());
+               << create_ec.message();
+    return nonstd::make_unexpected(create_ec);
   }
   fs::path tmp_file{tmp_template};
   // Unlike the old rename()-based publish, link() below never consumes the temp file's own
@@ -152,23 +176,27 @@ io::Result<std::string> PersistUuid(const fs::path& dir, const fs::path& file,
   }
 
   if (fchmod(fd, 0644) == -1) {
-    LOG(ERROR) << "Failed to set permissions on " << tmp_file << ": " << ErrnoError().message();
-    return nonstd::make_unexpected(ErrnoError());
+    std::error_code chmod_ec = ErrnoError();
+    LOG(ERROR) << "Failed to set permissions on " << tmp_file << ": " << chmod_ec.message();
+    return nonstd::make_unexpected(chmod_ec);
   }
   if (!SyncFd(fd, tmp_file))
     return nonstd::make_unexpected(std::make_error_code(std::errc::io_error));
   if (close(fd) == -1) {
+    std::error_code close_ec = ErrnoError();
     fd = -1;
-    LOG(ERROR) << "Failed to close " << tmp_file << ": " << ErrnoError().message();
-    return nonstd::make_unexpected(ErrnoError());
+    LOG(ERROR) << "Failed to close " << tmp_file << ": " << close_ec.message();
+    return nonstd::make_unexpected(close_ec);
   }
   fd = -1;
 
+  const fs::path parent_dir = dir.empty() ? fs::path{"."} : dir;
+
   if (link(tmp_file.c_str(), file.c_str()) == -1) {
-    if (errno != EEXIST) {
-      LOG(ERROR) << "Failed to link " << tmp_file << " to " << file << ": "
-                 << ErrnoError().message();
-      return nonstd::make_unexpected(ErrnoError());
+    std::error_code link_ec = ErrnoError();
+    if (link_ec != std::errc::file_exists) {
+      LOG(ERROR) << "Failed to link " << tmp_file << " to " << file << ": " << link_ec.message();
+      return nonstd::make_unexpected(link_ec);
     }
     // Lost the race: some other process already published its own uuid at `file` first. The
     // temp file above is already fully written and fsynced, so -- exactly like the winner's own
@@ -189,31 +217,16 @@ io::Result<std::string> PersistUuid(const fs::path& dir, const fs::path& file,
                  << " but its contents are not a valid uuid: " << *winner;
       return nonstd::make_unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
     }
-    // The winner's own PersistUuid call owns syncing the parent directory (it created the new
-    // directory entry, not us), so this call returns here without repeating that sync.
+    // The winner may not have reached its own directory fsync yet. Sync the directory ourselves
+    // before adopting its UUID so every successful return guarantees the published name is
+    // durable, regardless of which racer completes first.
+    if (std::error_code sync_ec = SyncDirectory(parent_dir); sync_ec)
+      return nonstd::make_unexpected(sync_ec);
     return NormalizeNodeUuid(trimmed);
   }
 
-  fs::path parent_dir = dir.empty() ? fs::path{"."} : dir;
-  int dir_fd = open(parent_dir.c_str(), O_RDONLY | O_DIRECTORY);
-  if (dir_fd == -1) {
-    LOG(ERROR) << "Failed to open node uuid directory " << parent_dir << ": "
-               << ErrnoError().message();
-    return nonstd::make_unexpected(ErrnoError());
-  }
-  absl::Cleanup close_dir = [&] {
-    if (dir_fd != -1)
-      close(dir_fd);
-  };
-  if (!SyncFd(dir_fd, parent_dir))
-    return nonstd::make_unexpected(std::make_error_code(std::errc::io_error));
-  if (close(dir_fd) == -1) {
-    dir_fd = -1;
-    LOG(ERROR) << "Failed to close node uuid directory " << parent_dir << ": "
-               << ErrnoError().message();
-    return nonstd::make_unexpected(ErrnoError());
-  }
-  dir_fd = -1;
+  if (std::error_code sync_ec = SyncDirectory(parent_dir); sync_ec)
+    return nonstd::make_unexpected(sync_ec);
   return std::string(uuid);
 }
 

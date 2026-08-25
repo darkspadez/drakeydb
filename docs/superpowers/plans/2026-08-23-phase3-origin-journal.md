@@ -107,7 +107,7 @@ specific (newest) value wins. P6 closes this.
 `IsActiveReplica()` at the `AddLogRecord` call site — no hidden global inside the
 serializer, so the round-trip test can drive both modes directly).
 
-```
+```text
 COMMAND entry, legacy (extended_framing == false)  — byte-identical to upstream
   [SELECT prefix] opcode(10) txid  1  payload
 COMMAND entry, v2 (extended_framing == true)
