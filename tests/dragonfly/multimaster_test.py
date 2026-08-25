@@ -1,6 +1,7 @@
 """Multi-master identity and active-replica fan-in tests."""
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -1362,3 +1363,279 @@ async def test_flushall_propagates_mesh_wide_without_storm(df_factory: DflyInsta
     # Mirrors the settle rationale in test_bidirectional_seeder_load_converges_without_echo_storm.
     await asyncio.sleep(1.0)
     await assert_no_command_storm(c_a, c_b)
+
+
+# ---- Phase 3: origin journal (T11) ----
+#
+# T10 (above) proved the origin-echo guard at seeder scale on a 2-node reciprocal mesh. Two
+# things a 2-node mesh cannot reach at all: (1) a THIRD node a write could land on twice -- once
+# direct from its origin, once relayed through the other peer -- which is a different failure
+# mode than T7's/T10's "don't echo a write back to the peer it came from" (there is no third
+# party for an echo to bounce off of with only 2 nodes); and (2) a node dying and rejoining,
+# which is the only way to exercise a peer full sync merging into an ALREADY-POPULATED local
+# database -- every other fan-in/mesh test in this file syncs into an empty node.
+#
+# Both tests gate on wait_for_peers, never check_all_replicas_finished (master->replica shaped,
+# does not describe a reciprocal mesh -- see the T10 section header above), and both run
+# assert_no_command_storm (T10) alongside dataset convergence: T10 proved convergence alone is
+# structurally unable to catch an echo storm (symmetric amplification replays the same bounced
+# multiset of operations on every node, so an eventually-consistent retry loop still finds a
+# moment they agree -- see test_bidirectional_seeder_load_converges_without_echo_storm's
+# docstring). STORM_BOUND (T10, above) was calibrated for a 2-node, 1-shard mesh; see
+# MESH3_STORM_BOUND below for the 3-node recalibration.
+
+
+async def attach_full_mesh(c_a, a, c_b, b, c_c, c):
+    """REPLICAOFs three active nodes to each other, forming all 6 one-way links of a full mesh
+    (each node REPLICAOF-ing the other two) one link at a time.
+
+    Strictly sequential, not concurrent: a node mid full-sync-load answers PING with -LOADING,
+    which the connecting side's Greet treats as a hard handshake failure --
+    test_peer_mesh_own_writes_not_echoed_back's docstring documents the 2-node version of this
+    same constraint ("B's REPLICAOF A must wait for A's own full sync ... to finish before it
+    can succeed"). The order below waits, after every single REPLICAOF, for THAT node's own full
+    sync to finish (wait_for_peers, which requires sync_in_progress == 0) before any other node
+    is allowed to dial it -- so no node is ever connected to while it is still loading:
+
+      1. a<-b   (a loads; wait for a)      4. c<-a   (c loads; wait for c)
+      2. b<-a   (b loads; wait for b)      5. b<-c   (b loads; wait for b)
+      3. a<-c   (a loads; wait for a)      6. c<-b   (c loads; wait for c)
+
+    Each step's target (the node on the right, being dialed) was the node most recently waited
+    on to finish loading in the step before it touched that same node -- e.g. step 4 dials a,
+    which was last confirmed non-loading at the end of step 3.
+    """
+    await attach(c_a, b)
+    await wait_for_peers(c_a, 1)
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+    await attach(c_a, c)
+    await wait_for_peers(c_a, 2)
+    await attach(c_c, a)
+    await wait_for_peers(c_c, 1)
+    await attach(c_b, c)
+    await wait_for_peers(c_b, 2)
+    await attach(c_c, b)
+    await wait_for_peers(c_c, 2)
+
+
+# drakeydb: measured healthy baseline (idle 3-node reciprocal mesh, proactor_threads=2 each side,
+# the pytest harness's default of 1 shard, 3s sample) was a rock-steady delta of 7 on EVERY node
+# across 5 repeated 3s samples taken while developing this test (see task-11-report.md for the
+# full log) -- exactly matching the prediction from STORM_BOUND's own comment (above), which
+# decomposes the 2-node idle baseline (4) as 3 x (shard flows x peers x 1/s REPLCONF ACK) + 1
+# self-INFO = 3x(1x1x1)+1: a 3-node mesh gives every node 2 peers instead of 1, so the same
+# formula predicts 3x(1x2x1)+1 = 7, confirmed by direct measurement, not just arithmetic.
+# STORM_BOUND keeps ~15x headroom over its own measured baseline (60/4); this bound preserves
+# that same order of margin over ITS baseline (100/7 ~= 14.3x) while staying far below any real
+# storm -- T10's seeder-scale 2-node storm alone hit ~36,000 in 3s, and this test's own INCR-based
+# no-forward check (a much smaller, single-write storm, closer in kind to
+# test_peer_mesh_own_writes_not_echoed_back's ~80 ops/s single-INCR echo) is independently
+# decisive regardless of this bound -- see that test's docstring's Falsifying section.
+MESH3_STORM_BOUND = 100
+
+
+async def test_three_node_mesh_converges_without_forwarding(df_factory: DflyInstanceFactory):
+    """P3 T11 item 1: three active nodes, each REPLICAOF-ing the other two (`--active_replica
+    --multi_master`; multi_master is what lets REPLICAOF append a second/third peer instead of
+    replacing one -- see test_replicaof_flag_list_requires_multi_master), form the first mesh in
+    this file with N*(N-1) = 6 one-way peer streams instead of 2.
+
+    This is genuinely new coverage, not just "more of the same 2-node test": in a full mesh every
+    pair has a DIRECT link, so a write from A reaches both B and C straight from A -- B must NOT
+    also relay it onward on B's own outbound stream to C once B receives it via the A->B link,
+    because C already has it directly from A. JournalStreamer::ShouldWrite's peer-mode gate
+    (journal::PassesPeerEchoFilter, journal/types.cc: `item.origin_idx != kSelfIdx`) passes only
+    entries a node authored ITSELF, on every peer-mode outbound stream, regardless of
+    destination -- so this is the exact same check T7's/T10's echo-back tests exercise, just
+    observed here on a THIRD party instead of bouncing back to the write's own origin. Neither a
+    2-node echo test nor a 2-node storm test can put a third node in the blast radius to notice
+    this at all; a full 3-node mesh is the smallest topology that can.
+
+    INCR (not a plain SET) makes a duplicate delivery visible in the FINAL STATE the same way
+    test_peer_mesh_own_writes_not_echoed_back's docstring explains for the echo-back case: an
+    idempotent SET relayed twice is invisible to a value check, but a relayed INCR inflates the
+    counter deterministically. Each of the three nodes gets a turn originating one INCR, so all
+    three nodes' outbound-filter instances are each checked at least once, not just one.
+
+    Dataset convergence (SeederV2, mixed types, matching T10's pattern) and
+    assert_no_command_storm (T10) are also both run, for the same reason T10 runs both: neither
+    implies the other. A storm big enough to fail assert_no_command_storm need not corrupt any
+    single VALUE (a duplicately-relayed SET is silently idempotent, unlike the INCR checks
+    above), and dataset convergence alone cannot catch a storm (T10's finding: symmetric
+    amplification still converges).
+
+    Falsifying (verified by hand; full transcript in task-11-report.md): commenting out
+    `journal::PassesPeerEchoFilter`'s `item.origin_idx != PeerRegistry::kSelfIdx` branch
+    (journal/types.cc) -- T10's exact revert -- turns every peer-mode outbound stream into an
+    unfiltered relay (both the echo-back AND the forward path, since one shared filter guards
+    both). Observed: the FIRST incr_and_check_no_duplicate call (A originating) failed outright,
+    on A's OWN copy of its OWN counter -- `AssertionError: assert equals failed / -'21144' /
+    +'1'` -- about 2s after a single INCR. This mesh never even reached the seeder/storm-bound
+    section: the no-forward property is not a subtler, harder-to-trip variant of the echo-back
+    bug, it is caught by the same shared filter and fails just as fast and just as hard.
+    """
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    c = df_factory.create(**active_args())
+    df_factory.start_all([a, b, c])
+    c_a, c_b, c_c = a.client(), b.client(), c.client()
+
+    await attach_full_mesh(c_a, a, c_b, b, c_c, c)
+
+    # No-forward, not just no-echo: whichever node originates the INCR, every OTHER node must
+    # land on exactly "1", never "2" (a "2" means a relayed duplicate landed on top of the
+    # direct delivery). Existence polls, not equality polls, guard the first-hop landing -- an
+    # equality poll can race past "1" if a relayed duplicate arrives fast (see
+    # test_peer_mesh_own_writes_not_echoed_back's docstring), turning a real bug into a
+    # misleading TimeoutError instead of a wrong value.
+    async def incr_and_check_no_duplicate(origin_c, key, *other_cs):
+        assert await origin_c.incr(key) == 1
+        async with async_timeout.timeout(30):
+            for oc in other_cs:
+                while not await oc.exists(key):
+                    await asyncio.sleep(0.1)
+        # Give a would-be relayed duplicate (through the third node) time to arrive and misapply.
+        await asyncio.sleep(1.0)
+        for oc in (origin_c, *other_cs):
+            assert await oc.get(key) == "1"
+
+    await incr_and_check_no_duplicate(c_a, "cnt-a", c_b, c_c)
+    await incr_and_check_no_duplicate(c_b, "cnt-b", c_a, c_c)
+    await incr_and_check_no_duplicate(c_c, "cnt-c", c_a, c_b)
+
+    seeder_a = SeederV2(key_target=500)
+    seeder_b = SeederV2(key_target=500)
+    seeder_c = SeederV2(key_target=500)
+    await asyncio.gather(
+        seeder_a.run(c_a, target_deviation=0.1),
+        seeder_b.run(c_b, target_deviation=0.1),
+        seeder_c.run(c_c, target_deviation=0.1),
+    )
+
+    @assert_eventually(times=300)
+    async def converged():
+        cap_a, cap_b, cap_c = await asyncio.gather(
+            SeederV2.capture(c_a), SeederV2.capture(c_b), SeederV2.capture(c_c)
+        )
+        assert cap_a == cap_b == cap_c
+
+    await converged()
+    # Not vacuous: three disjoint-prefixed seeders plus the 3 explicit counters above.
+    assert await c_a.dbsize() >= 1200
+    assert await c_b.dbsize() >= 1200
+    assert await c_c.dbsize() >= 1200
+
+    # Mirrors the settle rationale in test_bidirectional_seeder_load_converges_without_echo_storm.
+    await asyncio.sleep(1.0)
+    await assert_no_command_storm(c_a, c_b, c_c, bound=MESH3_STORM_BOUND)
+
+
+async def test_three_node_mesh_reconverges_after_kill_and_restart(
+    df_factory: DflyInstanceFactory, tmp_path, port_picker
+):
+    """P3 T11 item 2: kills one node of a live 3-node mesh (SIGKILL, mid write-load -- not a
+    clean REPLICAOF REMOVE or graceful shutdown) and restarts it from its own on-disk snapshot,
+    re-attaching via --replicaof boot flags (test_fanin_restart_remerge's restart pattern,
+    extended here to a true reciprocal mesh instead of one-way fan-in into a single active node).
+    The two survivors' own REPLICAOF-to-C links are never torn down, so they auto-reconnect on
+    their own once C's port reopens (replica.cc's reconnect loop, FLAGS_master_reconnect_timeout_
+    ms) -- this test never re-issues REPLICAOF on A or B, only on the restarted C, and gates
+    purely on wait_for_peers to prove the auto-reconnect actually happens, not just that a fresh
+    REPLICAOF would work.
+
+    CRITICAL -- do not "fix" this: the assertions below check MUTUAL convergence, never that a
+    specific (e.g. newest) write survives. On restart, C loads its OWN on-disk snapshot BEFORE
+    the peer full syncs from A and B land on top of it, and every one of those three loads uses
+    plain AddOrUpdate, so whichever of {C's own snapshot, A's full sync, B's full sync} happens
+    to apply LAST for a given key wins -- regardless of which write is actually newer. This is
+    not a bug to fix here: SetOverrideExistingKeys(true), passed on every peer full-sync load, is
+    currently behaviourally INERT (rdb_load.cc only gates a LOG(WARNING) on it; AddOrUpdate
+    overwrites unconditionally either way) -- true last-write-wins needs MVCC timestamps, which
+    land in a later phase (see the task brief). This test manufactures exactly that conflict on
+    purpose (the "conflict-key" below: C writes it, then dies; A writes a DIFFERENT value for the
+    SAME key while C is down) and asserts only that all three nodes agree on ONE value afterward,
+    never which one -- so nobody "fixes" this test into asserting newest-wins before P6 lands.
+
+    Falsifying (verified by hand; full transcript in task-11-report.md): same revert as
+    test_three_node_mesh_converges_without_forwarding's docstring. Observed: a DIFFERENT failure
+    mode than the mesh test above, and arguably a worse one -- the restarted node never finished
+    coming back up at all. reconverged()'s capture() call on c2 raised
+    `redis.exceptions.BusyLoadingError: Dragonfly is loading the dataset in memory` after 7
+    retry-loop attempts and 163.67s (vs. this test's normal ~9s full run), i.e. c2 was still
+    stuck in LOADING deep into what should have been a small, fast catch-up sync. This never
+    even reached the mutual-convergence or storm-bound assertions: with every peer-mode stream
+    unfiltered, C's boot-time full syncs from A and B (and A's/B's own reciprocal syncs from
+    C) get caught in the same unbounded relay storm the mesh test's docstring describes, and the
+    ordinary-sized catch-up this test expects never drains.
+    """
+    c_port = port_picker.get_available_port()
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    c_args = active_args(dir=str(tmp_path / "c"), dbfilename="dump", port=c_port)
+    c = df_factory.create(**c_args)
+    df_factory.start_all([a, b, c])
+    c_a, c_b, c_c = a.client(), b.client(), c.client()
+
+    await attach_full_mesh(c_a, a, c_b, b, c_c, c)
+
+    # C's pre-kill value for the key A will overwrite while C is down -- see docstring.
+    await c_c.set("conflict-key", "c-before-kill")
+    await wait_for_value(c_a, "conflict-key", "c-before-kill")
+    await wait_for_value(c_b, "conflict-key", "c-before-kill")
+    assert await c_c.execute_command("SAVE")  # guarantee c's own snapshot has this value
+
+    # Real, mixed-type write load on all three nodes (bounded, not continuous, so a/b's finish on
+    # their own once C is gone -- no explicit stop() bookkeeping needed) -- the kill below lands
+    # while this is still in flight, genuinely interrupting a write instead of hitting an idle
+    # mesh.
+    seeder_a = SeederV2(key_target=400)
+    seeder_b = SeederV2(key_target=400)
+    seeder_c = SeederV2(key_target=400)
+    task_a = asyncio.create_task(seeder_a.run(c_a, target_deviation=0.15))
+    task_b = asyncio.create_task(seeder_b.run(c_b, target_deviation=0.15))
+    task_c = asyncio.create_task(seeder_c.run(c_c, target_deviation=0.15))
+
+    await asyncio.sleep(1.0)  # let real, interleaved writes flow on all three before the kill
+    c.stop(kill=True)  # SIGKILL: ungraceful death mid-load, no clean shutdown snapshot from here
+    task_c.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task_c  # the kill above breaks c_c's connection; swallow whatever surfaces
+
+    # A and B keep converging with each other while C is gone; overwrite the shared key so C's
+    # stale disk copy has something to (legitimately) clash with once it rejoins.
+    await c_a.set("conflict-key", "a-while-c-down")
+    await wait_for_value(c_b, "conflict-key", "a-while-c-down")
+
+    await asyncio.gather(task_a, task_b)  # let a/b's bounded seeders finish naturally
+
+    c2 = df_factory.create(**c_args, replicaof=f"localhost:{a.port},localhost:{b.port}")
+    c2.start()
+    c_c2 = c2.client()
+
+    await wait_for_peers(c_c2, 2)  # c2's own two boot-time REPLICAOF links land
+    await wait_for_peers(c_a, 2)  # a's pre-existing link to c auto-reconnects, unassisted
+    await wait_for_peers(c_b, 2)  # ditto for b
+
+    @assert_eventually(times=300)
+    async def reconverged():
+        cap_a, cap_b, cap_c = await asyncio.gather(
+            SeederV2.capture(c_a), SeederV2.capture(c_b), SeederV2.capture(c_c2)
+        )
+        assert cap_a == cap_b == cap_c
+
+    await reconverged()
+
+    # Mutual convergence, NOT newest-wins -- see docstring. Either real write is an acceptable
+    # outcome; the only thing that must never happen is the three nodes disagreeing.
+    val_a = await c_a.get("conflict-key")
+    val_b = await c_b.get("conflict-key")
+    val_c = await c_c2.get("conflict-key")
+    assert val_a == val_b == val_c
+    assert val_a in ("a-while-c-down", "c-before-kill")
+
+    assert await c_a.dbsize() >= 500  # not vacuous -- real seeder load merged from both survivors
+    assert await c_c2.set("after:restart", "ok")  # mesh still writable everywhere post-restart
+
+    await asyncio.sleep(1.0)
+    await assert_no_command_storm(c_a, c_b, c_c2, bound=MESH3_STORM_BOUND)
