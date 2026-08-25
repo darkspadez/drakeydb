@@ -64,6 +64,13 @@ void TransactionData::AddEntry(journal::ParsedEntry&& entry) {
       return;
     case journal::Op::PING:
       return;
+    case journal::Op::ORIGIN:
+      // drakeydb: Phase 3 origin announcement. Record the mapping for observability only --
+      // wiring it into peer admission/registry lookups (see multi_master.h's PeerRegistry) is
+      // a later task. Must never fall into the command path below.
+      VLOG(1) << "Journal origin mapping: idx=" << entry.origin_idx
+              << " uuid=" << entry.origin_uuid;
+      return;
     case journal::Op::EXPIRED:
     case journal::Op::COMMAND:
       command = std::move(entry.cmd);
@@ -115,9 +122,23 @@ bool TransactionReader::NextTxData(JournalReader* reader, ExecutionState* cntx,
 
   if (lsn_.has_value() && dest->opcode == journal::Op::LSN) {
     DCHECK_NE(dest->lsn, 0u);
-    if (dest->lsn != *lsn_) {
-      LOG_EVERY_T(WARNING, 2) << "master lsn:" << dest->lsn << " replica lsn" << *lsn_;
+    if (peer_mode_) {
+      // drakeydb: Phase 3 T6b -- peer mode: adopt, don't merely compare. ShouldWrite
+      // (streamer.cc) may have dropped entries this link never receives, so *lsn_ -- a pure count
+      // of records actually received -- drifts from the master's true per-shard LSN by exactly
+      // the number dropped since the last marker. The sender's marker carries that true LSN (see
+      // ConsumeJournalChange's gap-correction comment); adopt it as ground truth rather than
+      // flagging the very drift it exists to correct.
+      *lsn_ = dest->lsn;
+    } else {
+      if (dest->lsn != *lsn_) {
+        LOG_EVERY_T(WARNING, 2) << "master lsn:" << dest->lsn << " replica lsn" << *lsn_;
+      }
     }
+    // Both modes: outside peer mode this is the original upstream check, verifying a full stream
+    // never drifts. In peer mode it is now a postcondition on the assignment just above (always
+    // holds by construction) -- a cheap guard against a future bug in that assignment, and what
+    // keeps this DCHECK meaningfully exercised (in a DCHECK-enabled build) on a filtered link too.
     DCHECK_EQ(dest->lsn, *lsn_);
   }
   return true;

@@ -157,6 +157,10 @@ GenericError Replica::Start() {
   VLOG(1) << "Greeting";
   state_mask_ = R_ENABLED | R_TCP_CONNECTED;
   ec = Greet();
+  // drakeydb D-7: captured before check_connection_error below coerces any failure into a
+  // string-only GenericError (see LastGreetEc()'s own doc comment, replica.h) -- this is the one
+  // place a blocking Start() caller can recover the specific errc.
+  last_greet_ec_ = ec;
   RETURN_ON_ERR(check_connection_error(ec, "could not greet master "));
 
   return {};
@@ -301,8 +305,15 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
     if ((state_mask_ & R_GREETED) == 0) {
       ec = Greet();
       if (ec) {
+        // drakeydb D-7: device_or_resource_busy is the reciprocal-connect uuid tiebreak refusal
+        // (see the CheckRespSimpleError(kReciprocalPeerConnectMsg) check in Greet() below);
+        // resource_unavailable_try_again is the peer-is-loading refusal (the PING check just
+        // above that one in Greet()) -- both are expected to clear themselves within a retry or
+        // two, so they stay in this quiet bucket alongside the other two peer-identity refusals.
         if (IsPeerMode() &&
-            (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use)) {
+            (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use ||
+             ec == std::errc::device_or_resource_busy ||
+             ec == std::errc::resource_unavailable_try_again)) {
           LOG_EVERY_T(WARNING, 60)
               << "Error greeting " << server().Description() << " (phase: " << GetCurrentPhase()
               << "): " << ec << " " << ec.message() << ", socket state: " + SockInfo();
@@ -377,6 +388,21 @@ error_code Replica::Greet() {
   VLOG(1) << "greeting message handling";
   // Corresponds to server.repl_state == REPL_STATE_CONNECTING state in redis
   RETURN_ON_ERR(SendCommandAndReadResponse("PING"));  // optional.
+  // drakeydb D-7 (review round 2): a peer that is transiently LOADING (e.g. mid its own full
+  // sync with a third, unrelated peer -- GlobalState::LOADING is process-wide, and PING has no
+  // CO::LOADING exemption for a connection that has not yet identified itself as replicating,
+  // main_service.cc) rejects even this very first PING, long before our own admission-time
+  // tiebreak check is ever reached (REPLCONF capa dragonfly, far below in this function). This
+  // is exactly as transient as the tiebreak refusal itself -- the peer finishes loading and
+  // admits us on a later retry -- so it gets the identical quiet, retryable treatment.
+  // kLoadingErr (facade/error.h) already carries its own leading '-', so the parsed error text
+  // is that constant sans the one leading byte (verified against the real wire reply by hand;
+  // see task-8-report.md).
+  if (IsPeerMode() && CheckRespSimpleError(std::string_view(kLoadingErr).substr(1))) {
+    LOG_EVERY_T(WARNING, 60) << "Peer " << server().Description()
+                             << " is currently loading its own dataset; retrying";
+    return std::make_error_code(std::errc::resource_unavailable_try_again);
+  }
   PC_RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("PONG"));
 
   // Corresponds to server.repl_state == REPL_STATE_SEND_HANDSHAKE condition in replication.c
@@ -444,16 +470,65 @@ error_code Replica::Greet() {
       return std::make_error_code(std::errc::address_in_use);
     }
     if (peer_mode_->registry)
-      peer_mode_->registry->AddOrGet(master_context_.master_node_uuid);
+      peer_origin_idx_ = peer_mode_->registry->AddOrGet(master_context_.master_node_uuid);
   } else if (IsPeerMode()) {
-    // UUID exchange is optional for Redis/older masters. Do not retain a stale claim if a
-    // reconnect succeeds against a source that no longer identifies itself.
+    // drakeydb: D2b -- peer mode now requires a uuid. Without one there is no origin to stamp,
+    // and stamping kSelfIdx would make this active node forward the source's writes back out to
+    // its own peers, breaking the no-forward rule (JournalStreamer::ShouldWrite, streamer.cc).
+    // Release any stale claim from a previous connection to this endpoint first -- exactly what
+    // the old "optional" branch did on a benign reconnect -- then refuse. KeyDB masters do reply
+    // with a uuid, so this only withdraws fan-in from a source that never identifies itself
+    // (stock Dragonfly, plain Redis) while --active_replica is on; non-active REPLICAOF is
+    // untouched (this branch only runs when IsPeerMode()).
     ReleasePeerIdentityClaim();
+    LOG_EVERY_T(ERROR, 60) << "Peer " << server().Description()
+                           << " did not send REPLCONF UUID; refusing to replicate from an "
+                              "unidentified source in peer mode";
+    return std::make_error_code(std::errc::operation_not_permitted);
+  }
+
+  // drakeydb: announce the fork replication protocol version on every drakeydb replica, and mark
+  // ourselves as a peer link when we are one. Sent strictly before "capa dragonfly" (like UUID
+  // above), not from ConfigureDflyMaster's post-capa block, so an active-replica master's
+  // admission check (server_family.cc ReplConf, CAPA dragonfly case) can see both values when it
+  // decides whether to admit this connection. A pre-fork master -- including plain Redis or a
+  // stock Dragonfly -- does not recognize either pair and answers -ERR; tolerate that exactly
+  // like the REPLCONF UUID fallback above and keep replicating.
+  RETURN_ON_ERR(
+      SendCommandAndReadResponse(StrCat("REPLCONF DRAKEY-VERSION ", kDrakeydbReplVersion)));
+  if (!CheckRespIsSimpleReply("OK")) {
+    LOG_FIRST_N(WARNING, 1) << "Master does not support REPLCONF DRAKEY-VERSION";
+  }
+
+  if (IsPeerMode()) {
+    RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF PEER 1"));
+    if (!CheckRespIsSimpleReply("OK")) {
+      LOG_FIRST_N(WARNING, 1) << "Master does not support REPLCONF PEER";
+    }
   }
 
   // Announce that we are the dragonfly client.
   // Note that we currently do not support dragonfly->redis replication.
   RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa dragonfly"));
+  // drakeydb D-7: this exact error text means an active master refused us purely because of the
+  // reciprocal-connect uuid tiebreak (both nodes are REPLICAOF-ing each other at once, and this
+  // side lost) -- not a real protocol problem. Recognized before the generic bad-response check
+  // below so it can return a distinct, retryable errc instead of the generic bad_message that
+  // check would otherwise produce; MainReplicationFb's Greet-error handling quiets logging for
+  // it accordingly, and the normal 500ms reconnect loop retries -- by then the winning side's
+  // link should have left LOADING.
+  //
+  // "ERR " prefix: kReciprocalPeerConnectMsg is the bare message server_family.cc passes to
+  // SendError(); RedisReplyBuilderBase::SendError (reply_builder.cc) auto-prepends "-ERR " on the
+  // wire for any message not already starting with '-', so the parsed error text carries that
+  // prefix too. Matched here, not baked into the shared constant, since the prefix is
+  // SendError's wire-framing detail, not part of the refusal's logical identity.
+  if (IsPeerMode() && CheckRespSimpleError(StrCat("ERR ", kReciprocalPeerConnectMsg))) {
+    LOG_EVERY_T(WARNING, 60) << "Peer " << server().Description()
+                             << " refused us via the reciprocal-connect uuid tiebreak (both nodes "
+                                "are REPLICAOF-ing each other); retrying";
+    return std::make_error_code(std::errc::device_or_resource_busy);
+  }
   PC_RETURN_ON_BAD_RESPONSE(CheckRespFirstTypes({RespExpr::STRING}));
 
   if (LastResponseArgs().size() == 1) {  // Redis
@@ -467,6 +542,18 @@ error_code Replica::Greet() {
   }
 
   state_mask_ |= R_GREETED;
+  // drakeydb D-7: this link has passed the identity handshake -- tell identity_claims_ so
+  // PeerReplicationManager::HasUnestablishedPeerWithUuid stops treating it as a
+  // reciprocal-connect candidate. Deliberately at R_GREETED, not later at R_SYNC_OK (full sync
+  // done): the tiebreak exists to settle the brief handshake-time race where both sides are
+  // scrambling to reach REPLCONF capa dragonfly first (review finding, T8 round 2) -- once our
+  // own handshake with this peer has itself resolved, that race is over for this connection
+  // attempt, regardless of how long the data transfer that follows takes. Marking established
+  // only at R_SYNC_OK made the "unestablished" window span the *entire* full sync (seconds to
+  // minutes), so any REPLICAOF issued on the peer while we were mid-sync -- ordinary sequential
+  // mesh bring-up, not a race at all -- lost a 50/50 uuid coin flip. A no-op outside peer mode.
+  if (peer_mode_ && peer_mode_->identity_claims)
+    peer_mode_->identity_claims->MarkEstablished(client_id_);
   return error_code{};
 }
 
@@ -605,8 +692,17 @@ error_code Replica::InitiatePSync() {
     RdbLoadContext load_context;
     RdbLoader loader(NULL, &load_context);
     loader.SetLoadUnownedSlots(true);
-    if (IsPeerMode())
+    if (IsPeerMode()) {
       loader.SetOverrideExistingKeys(true);  // drakeydb: merge
+      // drakeydb: Phase 3 fix wave -- this legacy Redis/KeyDB-protocol loader is peer-aware
+      // (merge above) but was missing the origin tag on its embedded journal-blob apply path.
+      // Unreachable today (a redis-protocol master emits no RDB_OPCODE_JOURNAL_BLOB), but P7
+      // (KeyDB onboarding) makes this path carry real data, and without this it would silently
+      // reproduce the echo defect T7b closed -- mirrors DflyShardReplica's constructor
+      // (rdb_loader_->SetApplyOrigin(origin_idx), above) and ConsumeRedisStream's
+      // conn_context.repl_origin_idx assignment for the command-stream side of this same link.
+      loader.SetApplyOrigin(peer_origin_idx_);
+    }
     loader.set_source_limit(snapshot_size);
     // TODO: to allow registering callbacks within loader to send '\n' pings back to master.
     // Also to allow updating last_io_time_.
@@ -668,7 +764,8 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
       partial_sync_lsn = shard_flows_[i]->JournalExecutedCount();
     }
     shard_flows_[i].reset(new DflyShardReplica(server(), master_context_, i, &service_,
-                                               multi_shard_exe_, load_context.get()));
+                                               multi_shard_exe_, load_context.get(),
+                                               peer_origin_idx_, IsPeerMode()));
     if (partial_sync_lsn > 0) {
       shard_flows_[i]->SetRecordsExecuted(partial_sync_lsn);
     }
@@ -838,6 +935,13 @@ error_code Replica::ConsumeRedisStream() {
   conn_context.journal_emulated = true;
   conn_context.skip_acl_validation = true;
   conn_context.ns = &namespaces->GetDefaultNamespace();
+  // drakeydb: Phase 3 T6 -- tag every command this Redis-protocol stream applies with the
+  // source's PeerRegistry origin (kSelfIdx/0 for a non-peer Replica, so this is a no-op there).
+  // PrepareTransaction (main_service.cc) reads this off the connection to stamp the resulting
+  // Transaction/journal entries. This ConnectionContext is separate from JournalExecutor's (used
+  // by the DflyShardReplica/dfly-stream path), so it needs this same value set independently --
+  // see JournalExecutor::SetApplyOrigin's doc comment (journal/executor.h).
+  conn_context.repl_origin_idx = peer_origin_idx_;
 
   // we never reply back on the commands.
   facade::CapturingReplyBuilder null_builder{facade::ReplyMode::NONE};
@@ -1212,6 +1316,40 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
   VLOG(1) << "FullSyncDflyFb finished after reading " << rdb_loader_->bytes_read() << " bytes";
 }
 
+// drakeydb: Phase 3 T6b -- see replica.h's declaration for the summary; called from
+// StableSyncDflyReadFb's Op::LSN branch below.
+//
+// Correctness argument for why this can never run journal_rec_executed_ (the "next LSN this
+// replica wants to receive", per InitiateDflySync's partial_sync_lsn/MaybePartialStreamLSNs'
+// own comment) AHEAD of what was actually applied -- the one constraint that matters more than
+// closing every gap:
+//
+// NextTxData (tx_executor.cc) parses one entry per call, and StableSyncDflyReadFb applies it
+// (ExecuteTx, or the PING/ORIGIN counters below) before looping back to parse the next one --
+// all on this one fiber, strictly in order. So by the time a given Op::LSN marker is parsed,
+// every entry that could possibly precede it on the wire has already either been applied, or
+// was never sent to this link at all because ConsumeJournalChange's gap check (streamer.cc)
+// filtered it out -- there is no entry still "in flight" whose fate this replica doesn't yet
+// know. master_lsn, as the sender computes it (item.journal_item.lsn - 1, i.e. the true LSN as
+// of immediately before the next entry it writes), names exactly that boundary: everything up
+// to and including master_lsn is resolved, one way or the other, right now. The next LSN this
+// replica needs is therefore exactly master_lsn + 1 -- never higher than what's resolved, so
+// adopting it can only ever catch this counter up to the truth, not overshoot it.
+void DflyShardReplica::AdoptAuthoritativeLsn(uint64_t master_lsn) {
+  if (!peer_mode_) {
+    return;
+  }
+  // drakeydb: Phase 3 T6b fix-round-1 (C1) -- once an apply has failed on this flow, its true
+  // resume position is no longer knowable from a single scalar count (see apply_failed_'s own
+  // comment, replica.h) -- refuse to let any later marker paper over that. journal_rec_executed_
+  // is left exactly where it was: still correctly naming the un-applied entry as needed, safely
+  // stale rather than silently wrong.
+  if (apply_failed_) {
+    return;
+  }
+  journal_rec_executed_.store(master_lsn + 1, std::memory_order_relaxed);
+}
+
 void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
   DCHECK_EQ(proactor_index_, ProactorBase::me()->GetPoolIndex());
 
@@ -1225,7 +1363,8 @@ void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
 
   JournalReader reader{&ps, 0};
   DCHECK_GE(journal_rec_executed_, 1u);
-  TransactionReader tx_reader{journal_rec_executed_.load(std::memory_order_relaxed) - 1};
+  TransactionReader tx_reader{journal_rec_executed_.load(std::memory_order_relaxed) - 1,
+                              peer_mode_};
 
   acks_fb_ = fb2::Fiber("shard_acks", &DflyShardReplica::StableSyncDflyAcksFb, this, cntx);
   TransactionData tx_data;
@@ -1234,15 +1373,39 @@ void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
 
     last_io_time_ = TimeSec();
     if (tx_data.opcode == journal::Op::LSN) {
-      //  Do nothing
+      // drakeydb: Phase 3 T6b -- outside peer mode this stays the original no-op (tx_reader's own
+      // DCHECK_EQ, tx_executor.cc, already verified this marker matches our count). In peer mode,
+      // AdoptAuthoritativeLsn resyncs journal_rec_executed_ to the master's true LSN -- see its
+      // definition below for why this can never run the resume LSN ahead of what was applied.
+      AdoptAuthoritativeLsn(tx_data.lsn);
     } else if (tx_data.opcode == journal::Op::PING) {
       force_ping_ = true;
       journal_rec_executed_.fetch_add(1, std::memory_order_relaxed);
       if (EngineShard::tlocal() && EngineShard::tlocal()->journal()) {
         // We must register this entry to the journal to allow partial sync
         // if journal is active.
-        journal::RecordEntry(0, journal::Op::PING, 0, nullopt, {});
+        // drakeydb: Phase 3 T6 -- stamp this peer's origin (the same value threaded into
+        // executor_'s ConnectionContext at construction, see SetApplyOrigin above), so a
+        // peer-mode consumer of OUR journal (JournalStreamer::ShouldWrite) recognizes this
+        // re-recorded PING as peer-authored and does not forward it back out to our other
+        // peers. Without this the PING is indistinguishable from a self-originated one and
+        // circulates the mesh forever, consuming a real LSN slot on every node each hop.
+        journal::RecordEntry(0, journal::Op::PING, 0, nullopt, {},
+                             executor_->connection_context()->repl_origin_idx);
       }
+    } else if (tx_data.opcode == journal::Op::ORIGIN) {
+      // drakeydb: Phase 3 origin announcements are not yet consumed on the stable-sync path;
+      // skip explicitly, on opcode, so ExecuteTx() is never called with an ORIGIN entry's
+      // command/dbid/txid fields, which AddEntry deliberately leaves untouched (and which
+      // `tx_data` -- reused across loop iterations -- would otherwise still hold from whatever
+      // entry preceded this one). T6/T7 wire up real handling (peer-registry mapping, and
+      // whether/how to re-forward down a replication chain, cf. Op::PING's re-record below).
+      //
+      // Unlike Op::LSN (a synthetic, streamer-only checkpoint that never touches AddLogRecord),
+      // an Op::ORIGIN entry is written via the normal per-shard journal path and so occupies a
+      // real LSN slot on the master -- it must count here like Op::PING does, or partial-sync
+      // resume offset would drift the moment a peer link starts emitting these.
+      journal_rec_executed_.fetch_add(1, std::memory_order_relaxed);
     } else {
       const bool is_successful = ExecuteTx(std::move(tx_data), cntx);
       if (is_successful) {
@@ -1260,6 +1423,18 @@ void DflyShardReplica::StableSyncDflyReadFb(ExecutionState* cntx) {
         // 2. We are ACTIVE global state
         if (cntx->IsRunning() && ((*ServerState::tlocal()).gstate() == GlobalState::ACTIVE)) {
           LOG(DFATAL) << "ExecuteTx() on replica should be successful.";
+        }
+        // drakeydb: Phase 3 T6b fix-round-1 (C1) -- in peer mode, journal_rec_executed_ is not
+        // just an ACK offset (as for a plain replica): a later authoritative Op::LSN marker (see
+        // AdoptAuthoritativeLsn) would otherwise overwrite it wholesale, silently advancing past
+        // this un-applied entry forever. LOG(DFATAL) above already aborts in a debug build (this
+        // one); this flag is what protects a release build, where DispatchResult::OOM is a real,
+        // recoverable-by-reconnect operational outcome, not a can't-happen. See apply_failed_'s
+        // own comment (replica.h) for why it is sticky and gated on peer_mode_ only -- a plain
+        // replica's Op::LSN is still purely a DCHECK'd count, never an authoritative overwrite,
+        // so this cannot change its behavior.
+        if (peer_mode_) {
+          apply_failed_ = true;
         }
       }
     }
@@ -1331,16 +1506,28 @@ void DflyShardReplica::StableSyncDflyAcksFb(ExecutionState* cntx) {
 DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext master_context,
                                    uint32_t flow_id, Service* service,
                                    std::shared_ptr<MultiShardExecution> multi_shard_exe,
-                                   RdbLoadContext* load_context)
+                                   RdbLoadContext* load_context, uint32_t origin_idx,
+                                   bool peer_mode)
     : ProtocolClient(server_context),
       service_(*service),
       master_context_(master_context),
+      peer_mode_(peer_mode),
       multi_shard_exe_(multi_shard_exe),
       flow_id_(flow_id) {
   executor_ = std::make_unique<JournalExecutor>(service);
+  // drakeydb: Phase 3 T6 -- a link's origin is constant for its lifetime, so this is set once,
+  // here at flow setup, not per entry. Also read back by StableSyncDflyReadFb's PING re-record
+  // below, via executor_->connection_context()->repl_origin_idx.
+  executor_->SetApplyOrigin(origin_idx);
   rdb_loader_ = std::make_unique<RdbLoader>(&service_, load_context);
   rdb_loader_->SetLoadUnownedSlots(true);
   rdb_loader_->SetShardCount(master_context.num_flows);
+  // drakeydb: Phase 3 T7b -- same origin_idx as executor_ above, applied to this flow's OTHER
+  // apply path: rdb_loader_'s own journal_executor_ (RdbLoaderBase::HandleJournalBlob,
+  // rdb_load.cc), which replays the concurrent journal blob embedded in this flow's full sync.
+  // Without this, a peer's full-sync writes would apply -- and re-journal -- as self-origin,
+  // which is the no-forward violation this phase exists to prevent (see task-7b-brief.md).
+  rdb_loader_->SetApplyOrigin(origin_idx);
 }
 
 DflyShardReplica::~DflyShardReplica() {

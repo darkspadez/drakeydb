@@ -344,7 +344,13 @@ class Transaction {
   bool IsGlobal() const;
 
   DbContext GetDbContext() const {
-    return DbContext{namespace_, db_index_, time_now_ms_};
+    // drakeydb: Phase 3 -- propagate this transaction's replication-apply origin so
+    // DbContext-only call sites (e.g. HSetFamily::DeleteIfEmpty/SetFamily::DeleteSetIfEmpty ->
+    // RecordDelete) can journal derived DELs under the correct origin. See
+    // repl_origin_idx_/SetReplOrigin below.
+    DbContext ctx{namespace_, db_index_, time_now_ms_};
+    ctx.repl_origin_idx = repl_origin_idx_;
+    return ctx;
   }
 
   Namespace& GetNamespace() const {
@@ -366,6 +372,16 @@ class Transaction {
 
   // Write a journal entry to a shard journal with the given payload.
   void LogJournalOnShard(journal::Entry::Payload&& payload) const;
+
+  // drakeydb: Phase 3. Sets the replication-apply origin metadata that LogJournalOnShard stamps
+  // onto every journal entry this transaction records. Copied from the ConnectionContext once
+  // per dispatch in PrepareTransaction (main_service.cc); squashed-multi stub transactions
+  // instead inherit it directly from their parent (see the parent/shard_id/slot_id constructor)
+  // since they never go through PrepareTransaction.
+  void SetReplOrigin(uint32_t origin_idx, uint64_t mvcc) {
+    repl_origin_idx_ = origin_idx;
+    repl_mvcc_ = mvcc;
+  }
 
   // Re-enable auto journal for commands marked as NO_AUTOJOURNAL. Call during setup.
   void ReviveAutoJournal();
@@ -651,6 +667,14 @@ class Transaction {
   Namespace* namespace_{nullptr};
   DbIndex db_index_{0};
   uint64_t time_now_ms_{0};
+
+  // drakeydb: Phase 3 replication-apply origin, stamped onto every journal entry this
+  // transaction records (see LogJournalOnShard/SetReplOrigin). 0 == PeerRegistry::kSelfIdx
+  // (server/multi_master.h) for an ordinary client-issued transaction; a peer's PeerRegistry
+  // index when applying that peer's writes. A literal, not the named constant, to avoid pulling
+  // that header into one of the most widely-included headers in the tree.
+  uint32_t repl_origin_idx_{0};
+  uint64_t repl_mvcc_{0};
 
   std::atomic_uint32_t use_count_{0};  // transaction exists only as an intrusive_ptr
 

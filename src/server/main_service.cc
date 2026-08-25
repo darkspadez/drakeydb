@@ -880,6 +880,16 @@ pair<intrusive_ptr<Transaction>, OpStatus> PrepareTransaction(const CommandId* c
 
   cmd_ctx->SetupTx(cid, dfly_cntx->transaction);
 
+  // drakeydb: Phase 3. Copy this connection's replication-apply origin onto the transaction so
+  // journaling done under it (auto-journal or any manual RecordJournal call, all of which funnel
+  // through Transaction::LogJournalOnShard) is tagged with the peer that authored the write
+  // instead of always kSelfIdx. Covers both branches above: a fresh transaction and MULTI reuse
+  // (MultiSwitchCmd) alike, since both flow through SetupTx just above. A no-op for ordinary
+  // client connections, whose repl_origin_idx/repl_mvcc stay at their kSelfIdx/0 defaults.
+  if (dfly_cntx->transaction) {
+    dfly_cntx->transaction->SetReplOrigin(dfly_cntx->repl_origin_idx, dfly_cntx->repl_mvcc);
+  }
+
   if (init) {
     DCHECK(cmd_ctx->tx());
     if (auto st =
@@ -1780,6 +1790,10 @@ uint32_t Service::DispatchSquashedBatch(facade::ParsedCommand* first, unsigned c
     if (!dist_trans) {
       dist_trans.reset(new Transaction{exec_cid_});
       dist_trans->StartMultiNonAtomic(Transaction::DEFAULT);
+      // drakeydb: Phase 3 fix-round-1 -- this Transaction is built fresh (not via
+      // PrepareTransaction), so it would otherwise always journal as kSelfIdx regardless of the
+      // connection's actual apply-origin. Copy it explicitly, once, at construction.
+      dist_trans->SetReplOrigin(dfly_cntx->repl_origin_idx, dfly_cntx->repl_mvcc);
     } else {
       // Reset to original command id as it's changed during squashing
       dist_trans->MultiSwitchCmd(exec_cid_);

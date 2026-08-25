@@ -115,12 +115,15 @@ class DflyCmd {
   class ABSL_LOCKABLE ReplicaInfo {
    public:
     ReplicaInfo(unsigned flow_count, std::string address, uint32_t listening_port,
-                std::string node_uuid, ExecutionState::ErrHandler err_handler)
+                std::string node_uuid, unsigned drakey_version, bool is_peer,
+                ExecutionState::ErrHandler err_handler)
         : replica_state_{SyncState::PREPARATION},
           exec_st_{std::move(err_handler)},
           address_{std::move(address)},
           listening_port_(listening_port),
           node_uuid_{std::move(node_uuid)},
+          drakey_version_(drakey_version),
+          is_peer_(is_peer),
           flows_{flow_count} {
     }
 
@@ -134,6 +137,21 @@ class DflyCmd {
     // Peer's uuid from REPLCONF UUID, or "" for a plain-redis replica that never sent one.
     const std::string& GetNodeUuid() const {
       return node_uuid_;
+    }
+    // drakeydb: fork protocol version from REPLCONF DRAKEY-VERSION, or 0 if never sent (a plain
+    // Redis or pre-fork Dragonfly replica). Immutable after construction, like node_uuid_.
+    unsigned GetDrakeyVersion() const {
+      return drakey_version_;
+    }
+    // drakeydb: true only for an admitted peer of an active node -- see server_family.cc's
+    // ReplConf admission check and DflyCmd::CreateSyncSession, which is the only production
+    // caller and always ANDs the consumer's REPLCONF PEER request with IsActiveReplica() before
+    // setting this, so it is always false on a non-active node regardless of what a consumer
+    // asked for. Immutable after construction, like node_uuid_. Consumed by
+    // StartStableSyncInThread to configure the peer-echo filter (JournalStreamer::Config's
+    // peer_mode, see streamer.cc's ShouldWrite).
+    bool IsPeer() const {
+      return is_peer_;
     }
 
     // Returns the replica ID, or an empty view if SetId has not been called.
@@ -230,6 +248,10 @@ class DflyCmd {
     // Immutable after construction, like address_; set from ConnectionState::ReplicationInfo at
     // sync-session creation time (see CreateSyncSession).
     const std::string node_uuid_;
+    // drakeydb: immutable after construction, like node_uuid_; see the GetDrakeyVersion/IsPeer
+    // getters above for how these are set and consumed.
+    const unsigned drakey_version_;
+    const bool is_peer_;
 
     // We expect to update version_ during handshaking, for now we set it to
     // the oldest version to be safe.
@@ -312,15 +334,21 @@ class DflyCmd {
 
   void Load(facade::CmdArgParser parser, CommandContext* cmd_cntx);
 
-  // Start full sync in thread. Start FullSyncFb. Called for each flow.
+  // Start full sync in thread. Start FullSyncFb. Called for each flow. peer_mode comes from the
+  // replica's ReplicaInfo (IsPeer()) and gates the full-sync window's concurrent journal blob
+  // filter -- see RdbSaver's peer_mode parameter (rdb_save.h) and
+  // SliceSnapshot::ConsumeJournalChange (snapshot.cc).
   facade::OpStatus StartFullSyncInThread(DflyVersion version, FlowInfo* flow, ExecutionState* cntx,
-                                         EngineShard* shard);
+                                         EngineShard* shard, bool peer_mode);
 
   // Stop full sync in thread. Run state switch cleanup.
   facade::OpStatus StopFullSyncInThread(FlowInfo* flow, ExecutionState* cntx, EngineShard* shard);
 
-  // Start stable sync in thread. Called for each flow.
-  void StartStableSyncInThread(FlowInfo* flow, ExecutionState* cntx, EngineShard* shard);
+  // Start stable sync in thread. Called for each flow. peer_mode comes from the replica's
+  // ReplicaInfo (IsPeer()) and configures the peer-echo filter -- see JournalStreamer::Config in
+  // journal/streamer.h.
+  void StartStableSyncInThread(FlowInfo* flow, ExecutionState* cntx, EngineShard* shard,
+                               bool peer_mode);
 
   // Get ReplicaInfo by sync_id.
   std::shared_ptr<ReplicaInfo> GetReplicaInfo(uint32_t sync_id) ABSL_LOCKS_EXCLUDED(mu_);

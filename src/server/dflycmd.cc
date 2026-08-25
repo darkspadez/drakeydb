@@ -28,6 +28,7 @@
 #include "server/journal/journal.h"
 #include "server/journal/streamer.h"
 #include "server/main_service.h"
+#include "server/multi_master.h"  // drakeydb: for IsActiveReplica(), used directly below.
 #include "server/namespaces.h"
 #include "server/rdb_save.h"
 #include "server/replica.h"
@@ -412,7 +413,7 @@ void DflyCmd::Sync(CmdArgParser parser, CommandContext* cmd_cntx) {
         return;
       }
       status = StartFullSyncInThread(replica_ptr->GetVersion(), flow, &replica_ptr->GetExecState(),
-                                     shard);
+                                     shard, replica_ptr->IsPeer());
     };
     shard_set->RunBlockingInParallel(std::move(cb));
 
@@ -468,7 +469,7 @@ void DflyCmd::StartStable(CmdArgParser parser, CommandContext* cmd_cntx) {
         }
       }
 
-      StartStableSyncInThread(flow, &replica_ptr->GetExecState(), shard);
+      StartStableSyncInThread(flow, &replica_ptr->GetExecState(), shard, replica_ptr->IsPeer());
     };
     shard_set->RunBlockingInParallel(std::move(cb));
 
@@ -690,7 +691,8 @@ void DflyCmd::Load(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 OpStatus DflyCmd::StartFullSyncInThread(DflyVersion version, FlowInfo* flow,
-                                        ExecutionState* exec_st, EngineShard* shard) {
+                                        ExecutionState* exec_st, EngineShard* shard,
+                                        bool peer_mode) {
   DCHECK(shard);
   DCHECK(flow->conn);
 
@@ -698,7 +700,10 @@ OpStatus DflyCmd::StartFullSyncInThread(DflyVersion version, FlowInfo* flow,
   // of the flows also contain them.
   SaveMode save_mode =
       shard->shard_id() == 0 ? SaveMode::SINGLE_SHARD_WITH_SUMMARY : SaveMode::SINGLE_SHARD;
-  flow->saver = std::make_unique<RdbSaver>(flow->conn->socket(), save_mode, false, "", version);
+  // drakeydb: Phase 3 T7b -- peer_mode threaded to RdbSaver so its SliceSnapshot filters the
+  // concurrent journal blob for an admitted peer's full sync (see rdb_save.h's comment).
+  flow->saver =
+      std::make_unique<RdbSaver>(flow->conn->socket(), save_mode, false, "", version, peer_mode);
 
   flow->cleanup = [flow, shard]() {
     // socket shutdown is needed before calling saver->Cancel(). Because
@@ -752,14 +757,20 @@ OpStatus DflyCmd::StopFullSyncInThread(FlowInfo* flow, ExecutionState* exec_st,
   return OpStatus::OK;
 }
 
-void DflyCmd::StartStableSyncInThread(FlowInfo* flow, ExecutionState* exec_st, EngineShard* shard) {
+void DflyCmd::StartStableSyncInThread(FlowInfo* flow, ExecutionState* exec_st, EngineShard* shard,
+                                      bool peer_mode) {
   // Create streamer for shard flows.
   DCHECK(shard);
   DCHECK(flow->conn);
 
   LSN partial_lsn = flow->start_partial_sync_at.value_or(0);
-  JournalStreamer::Config config{
-      .should_sent_lsn = true, .init_from_stable_sync = true, .start_partial_sync_at = partial_lsn};
+  // drakeydb: peer_mode comes from the replica's ReplicaInfo (IsPeer(), set at CreateSyncSession
+  // time) so the peer-echo filter (streamer.cc's ShouldWrite) activates only for an admitted peer
+  // of an active node -- see the StartStable call site.
+  JournalStreamer::Config config{.should_sent_lsn = true,
+                                 .init_from_stable_sync = true,
+                                 .start_partial_sync_at = partial_lsn,
+                                 .peer_mode = peer_mode};
   flow->streamer.reset(new JournalStreamer(exec_st, config));
   flow->streamer->Start(flow->conn->socket());
 
@@ -788,11 +799,19 @@ auto DflyCmd::CreateSyncSession(ConnectionState* state) -> std::pair<uint32_t, u
   string address = state->replication_info.repl_ip_address;
   uint32_t port = state->replication_info.repl_listening_port;
   string node_uuid = state->replication_info.repl_node_uuid;
+  unsigned drakey_version = state->replication_info.repl_drakey_version;
+  // drakeydb: peer-stream filtering is a property of this node's active-replica role, not merely
+  // the consumer's claim -- server_family.cc's admission check only ever admits a consumer with
+  // repl_is_peer set when IsActiveReplica() is also true, but re-check here too so a non-active
+  // node's stream stays byte-identical to upstream even if repl_is_peer were ever set some other
+  // way (e.g. by a future admission path or a test harness poking ConnectionState directly).
+  bool is_peer = IsActiveReplica() && state->replication_info.repl_is_peer;
 
   LOG(INFO) << "Registered replica " << address << ":" << port;
 
-  auto replica_ptr = make_shared<ReplicaInfo>(flow_count, std::move(address), port,
-                                              std::move(node_uuid), std::move(err_handler));
+  auto replica_ptr =
+      make_shared<ReplicaInfo>(flow_count, std::move(address), port, std::move(node_uuid),
+                               drakey_version, is_peer, std::move(err_handler));
   auto [it, inserted] = replica_infos_.emplace(sync_id, std::move(replica_ptr));
   CHECK(inserted);
 
@@ -1009,6 +1028,12 @@ void DflyCmd::UpdateReplicaInfoCacheLocked() {
 
 void DflyCmd::SetDflyClientVersion(ConnectionState* state, DflyVersion version) {
   auto replica_ptr = GetReplicaInfo(state->replication_info.repl_session_id);
+  // drakeydb: unlike the neighbouring CLIENT-ID case (ReplConf, server_family.cc), this had no
+  // null guard -- a CLIENT-VERSION sent before a successful "capa dragonfly" (no session yet)
+  // would dereference a null shared_ptr. Cheap to fix while here; see the P3 T7 task brief.
+  if (!replica_ptr) {
+    return;
+  }
   VLOG(1) << "Client version for session_id=" << state->replication_info.repl_session_id << " is "
           << int(version);
 

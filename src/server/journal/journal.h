@@ -32,13 +32,24 @@ inline bool HasRegisteredCallbacks() {
 bool IsLSNInBuffer(LSN lsn);
 
 std::string_view GetEntry(LSN lsn);
+// drakeydb: mirrors JournalSlice::GetEntryMeta -- see journal_slice.h for why this exists
+// alongside GetEntry().
+const JournalItem& GetEntryMeta(LSN lsn);
 
 LSN GetLsn();
 uint32_t RegisterConsumer(JournalConsumerInterface* consumer);
 void UnregisterConsumer(uint32_t id);
 
+// drakeydb: Phase 3 -- origin_idx/mvcc/entry_flags default to self/0/none (PeerRegistry::kSelfIdx
+// == 0), so every pre-existing call site (PING/DEL/cluster control entries) is unaffected.
+// Transaction::LogJournalOnShard is the only caller that passes a non-default origin_idx/mvcc,
+// forwarding a transaction's replication-apply origin so entries applied from a peer are tagged
+// with that peer's origin instead of self. tx_base.cc's RecordExpiryBlocking is the only caller
+// that passes a non-default entry_flags, tagging expiry/eviction-triggered DELs with
+// kEntryFlagExpired so a later peer-echo filter (T5) can suppress them.
 void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
-                 Entry::Payload payload);
+                 Entry::Payload payload, uint32_t origin_idx = 0, uint64_t mvcc = 0,
+                 uint8_t entry_flags = 0);
 
 size_t LsnBufferSize();
 size_t LsnBufferBytes();

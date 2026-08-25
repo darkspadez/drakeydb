@@ -11,13 +11,26 @@
 
 namespace dfly {
 
-// Fork replication protocol version, sent via REPLCONF CLIENT-VERSION starting in P2/P3.
-// Deliberately a plain unsigned, NOT a DflyVersion: the enum's value range is 0..7, so
-// DflyVersion(65) is UB, and sending 65 today would flip every master-side `>= VER6` gate
-// (rdb_save.cc:1782, snapshot.cc:101) against peers that don't support those features.
+// Fork replication protocol version, sent via REPLCONF DRAKEY-VERSION (replica.cc's Greet, P3
+// T7 -- strictly before REPLCONF capa dragonfly, like REPLCONF UUID, so an active master's
+// admission check can see it) -- never via REPLCONF CLIENT-VERSION, which stays at
+// DflyVersion::CURRENT_VER. Deliberately a plain unsigned, NOT a DflyVersion: the enum's value
+// range is 0..7, so DflyVersion(65) is UB, and sending 65 via CLIENT-VERSION would flip every
+// master-side `>= VER6` gate (rdb_save.cc:1782, snapshot.cc:101) against peers that don't
+// support those features.
 inline constexpr unsigned kDrakeydbReplVersion = 65;
 
 inline constexpr char kNodeUuidFileName[] = "drakeydb.uuid";
+
+// D-7: exact REPLCONF capa dragonfly error text an active master sends when it refuses a peer
+// consumer solely because of the reciprocal-connect uuid tiebreak (server_family.cc's ReplConf,
+// PeerReplicationManager::HasUnestablishedPeerWithUuid) -- two active nodes REPLICAOF-ing each
+// other at nearly the same time. Distinguished from every other admission refusal (own uuid,
+// missing uuid, stale protocol version) so replica.cc's Greet() can recognize it via
+// CheckRespSimpleError and retry quietly (peer-mode Greet errors are log-softened) instead of
+// logging loudly on every 500ms retry -- this one is expected to resolve itself shortly, once the
+// winning side's link leaves LOADING.
+inline constexpr char kReciprocalPeerConnectMsg[] = "Reciprocal peer connect in progress, retry";
 
 // Returns a canonical lowercase RFC-4122 v4 uuid.
 std::string GenerateNodeUuid();

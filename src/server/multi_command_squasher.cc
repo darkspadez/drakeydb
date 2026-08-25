@@ -105,6 +105,11 @@ MultiCommandSquasher::ShardExecInfo& MultiCommandSquasher::PrepareShardInfo(Shar
       // single-cell shard_data_.
       sinfo.local_tx = new Transaction{base_cid_};
       sinfo.local_tx->StartMultiNonAtomic(Transaction::SHARD_LOCAL);
+      // drakeydb: Phase 3 fix-round-1 -- non-atomic squashing builds a standalone Transaction
+      // (not via PrepareTransaction, and with no parent to inherit from), so it would otherwise
+      // always journal as kSelfIdx regardless of the connection's actual apply-origin. cntx_ is
+      // the same ConnectionContext PrepareTransaction reads from for the atomic/top-level case.
+      sinfo.local_tx->SetReplOrigin(cntx_->repl_origin_idx, cntx_->repl_mvcc);
     }
     num_shards_++;
   }

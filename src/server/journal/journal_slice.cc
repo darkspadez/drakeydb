@@ -17,6 +17,7 @@
 #include "server/common.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/serializer.h"
+#include "server/multi_master.h"  // drakeydb: IsActiveReplica() gates Phase 3 journal framing v2.
 #include "strings/human_readable.h"
 #include "util/fibers/fibers.h"
 
@@ -66,6 +67,7 @@ void JournalSlice::Init() {
   ring_buffer_.set_capacity(kDefaultBacklogCapacity);
   max_age_ms_ = absl::GetFlag(FLAGS_shard_repl_backlog_time_ms);
   max_bytes_ = GetPerShardBacklogMaxBytes();
+  extended_framing_ = IsActiveReplica();
 }
 
 bool JournalSlice::IsLSNInBuffer(LSN lsn) const {
@@ -88,6 +90,15 @@ std::string_view JournalSlice::GetEntry(LSN lsn) const {
   auto start = ring_buffer_.front().lsn;
   DCHECK(ring_buffer_[lsn - start].lsn == lsn);
   return ring_buffer_[lsn - start].data;
+}
+
+// drakeydb: see the declaration in journal_slice.h for why this exists alongside GetEntry().
+const JournalItem& JournalSlice::GetEntryMeta(LSN lsn) const {
+  DCHECK(ring_buffer_.capacity() > 0 && IsLSNInBuffer(lsn));
+
+  auto start = ring_buffer_.front().lsn;
+  DCHECK(ring_buffer_[lsn - start].lsn == lsn);
+  return ring_buffer_[lsn - start];
 }
 
 void JournalSlice::SetFlushMode(bool allow_flush) {
@@ -117,8 +128,22 @@ void JournalSlice::AddLogRecord(const Entry& entry) {
     item.cmd = entry.payload.cmd;
     item.slot = entry.slot;
 
+    // drakeydb: Phase 3 origin metadata, mirrored onto JournalItem -- see types.h. ORIGIN uses
+    // Entry::origin_idx as its serialized dictionary index, but the announcement itself is
+    // authored locally; keep those two meanings separate in the in-memory filter metadata.
+    item.journal_item.origin_idx =
+        entry.opcode == Op::ORIGIN ? PeerRegistry::kSelfIdx : entry.origin_idx;
+    item.journal_item.entry_flags = entry.entry_flags;
+    // drakeydb: Phase 3 T5 -- mirror opcode too, for the same reason (see JournalItem::opcode's
+    // comment in types.h): the peer-echo filter needs Op::ORIGIN without reparsing `data`.
+    item.journal_item.opcode = entry.opcode;
+
     io::StringSink sink;
-    JournalWriter writer{&sink};
+    // drakeydb: Phase 3 journal framing v2 only on an active node; every other node stays
+    // byte-identical to upstream. extended_framing_ is cached once in Init() (boot-only flag)
+    // rather than re-read here on every call. See JournalWriter's ctor comment for why the flag
+    // is passed in at the call site instead of read inside the serializer.
+    JournalWriter writer{&sink, extended_framing_};
     writer.Write(entry);
 
     std::move(sink).str().swap(item.journal_item.data);

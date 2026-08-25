@@ -1672,6 +1672,38 @@ async def test_bgsave_during_stable_sync(df_factory: DflyInstanceFactory):
     )
 
 
+@pytest.mark.asyncio
+async def test_shared_tmp_dir_instances_get_distinct_identities(df_factory: DflyInstanceFactory):
+    """
+    drakeydb: P3 T9 (c) regression test. test_bgsave_during_stable_sync above passes
+    dir="{DRAGONFLY_TMP}/" for its replica -- the session/class-scoped tmp_dir fixture's root,
+    shared by every instance in this file that defaults to it. Before this fix, an instance with
+    an explicit --dir (any --dir, including this shared one) opted out of the harness's
+    per-instance --node_uuid default, so every such instance loaded/persisted the very same
+    <DRAGONFLY_TMP>/drakeydb.uuid file and silently ended up presenting the same identity. Now
+    that P3's origin-tagged journal keys peer admission on uuid, nodes claiming the same identity
+    are exactly the failure that looks like a protocol bug -- so instances that use equivalent
+    forms of the shared tmp dir must still each get their own uuid.
+
+    Falsifying: reverting instance.py's shares_session_tmp_dir check makes the direct-path
+    instances below load the same persisted drakeydb.uuid file, leaving only two distinct
+    identities instead of three.
+    """
+    shared_dir = df_factory.params.env["DRAGONFLY_TMP"]
+    instances = [
+        df_factory.create(proactor_threads=1, dir="{DRAGONFLY_TMP}/"),
+        df_factory.create(proactor_threads=1, dir=shared_dir),
+        df_factory.create(proactor_threads=1, dir=f"{shared_dir}/"),
+    ]
+    df_factory.start_all(instances)
+    identities = {
+        (await instance.client().info("replication"))["node_uuid"] for instance in instances
+    }
+    assert len(identities) == len(
+        instances
+    ), "instances sharing equivalent DRAGONFLY_TMP paths must not share a node identity"
+
+
 # Verify chunked CF replication stays within the max chunk size budget.
 @pytest.mark.large
 async def test_cf_chunked_replication_chunk_size(df_factory: DflyInstanceFactory):

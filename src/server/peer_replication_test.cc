@@ -7,6 +7,8 @@
 #include <absl/flags/flag.h>
 #include <absl/flags/reflection.h>
 #include <absl/functional/function_ref.h>
+#include <absl/strings/str_cat.h>
+#include <absl/strings/str_format.h>
 
 #include <array>
 #include <atomic>
@@ -15,8 +17,19 @@
 
 #include "base/gtest.h"
 #include "facade/facade_test.h"
+#include "server/engine_shard_set.h"
+#include "server/journal/executor.h"
+#include "server/journal/serializer.h"
+#include "server/journal/streamer.h"
+#include "server/journal/test_capturing_socket.h"
+#include "server/journal/tx_executor.h"
+#include "server/journal/types.h"
 #include "server/multi_master.h"
 #include "server/node_identity.h"
+#include "server/rdb_load.h"
+#include "server/rdb_load_context.h"
+#include "server/rdb_save.h"
+#include "server/replica.h"
 #include "server/test_utils.h"
 #include "util/fibers/fibers.h"
 #include "util/fibers/pool.h"
@@ -44,6 +57,83 @@ TEST(PeerIdentityClaimsTest, RejectsDuplicateAndReleasesOrMovesClaims) {
   EXPECT_TRUE(claims.TryClaim(3, "peer-a"));
   claims.Release(2);
   EXPECT_TRUE(claims.TryClaim(1, "peer-b"));
+}
+
+// drakeydb D-7: HasUnestablishedClaim is what PeerReplicationManager::HasUnestablishedPeerWithUuid
+// answers the reciprocal-connect tiebreak's "is P one of our own not-yet-established peer links"
+// question from (see peer_replication.h). Proves: a fresh claim starts not-established; a
+// non-matching uuid (nothing claims it) is never reported as unestablished -- only an actual
+// unestablished claim is, so a non-reciprocal consumer is never caught by the tiebreak;
+// MarkEstablished flips a claim so it stops being reported -- an already-established link must
+// never trigger the tiebreak (that would tear down a healthy mesh edge); and a genuine reconnect
+// (a fresh TryClaim, even for the same owner/uuid pair an earlier, now-dropped connection held)
+// resets back to not-established, since the new link has not synced yet either.
+//
+// Falsifying (verified by hand -- see task-8-report.md): removing PeerIdentityClaims::
+// MarkEstablished's body (or never calling it from replica.cc) makes the second EXPECT_FALSE
+// below fail (stays true forever); removing the Claim::established reset in TryClaim's final
+// insert_or_assign makes the fourth EXPECT_TRUE (after the reconnect) fail (reads false, stale
+// from the MarkEstablished call three lines above it).
+TEST(PeerIdentityClaimsTest, TracksEstablishedStateForTiebreakQuery) {
+  PeerIdentityClaims claims;
+
+  // No claim at all for this uuid: never "unestablished" -- just absent.
+  EXPECT_FALSE(claims.HasUnestablishedClaim("peer-a"));
+
+  // A fresh claim starts not-established.
+  EXPECT_TRUE(claims.TryClaim(1, "peer-a"));
+  EXPECT_TRUE(claims.HasUnestablishedClaim("peer-a"));
+
+  // MarkEstablished flips it off.
+  claims.MarkEstablished(1);
+  EXPECT_FALSE(claims.HasUnestablishedClaim("peer-a"));
+
+  // A no-op owner (never claimed anything, or already released) is safe.
+  claims.MarkEstablished(999);
+
+  // A genuine reconnect -- a fresh TryClaim, even reclaiming the same uuid -- resets to
+  // not-established: the old (established) link is gone, and the new one has not synced yet.
+  EXPECT_TRUE(claims.TryClaim(1, "peer-a"));
+  EXPECT_TRUE(claims.HasUnestablishedClaim("peer-a"));
+
+  claims.MarkEstablished(1);
+  claims.Release(1);
+  EXPECT_FALSE(claims.HasUnestablishedClaim("peer-a"));  // claim gone entirely
+}
+
+// drakeydb D-7: ShouldRefuseReciprocalPeer is the exact predicate server_family.cc's ReplConf
+// calls to decide the reciprocal-connect tiebreak. Both nodes of a reciprocal pair call it with
+// the two uuids in swapped roles (each node's own uuid vs. the uuid the other one presents), so
+// this proves directly, on the real production function: it is impossible for both sides to
+// defer (both would need their own uuid to sort before the other's, which cannot happen for two
+// distinct strings), and -- whenever both sides genuinely observe the reciprocal condition --
+// impossible for neither to defer either. Also covers the two "must not fire" inputs: no
+// reciprocal link on this side (has_unestablished_own_link=false, standing in for both "uuid
+// doesn't match any of our links" and "the matching link is already established"), on both
+// operand orders.
+//
+// Falsifying (verified by hand -- see task-8-report.md): flipping `self_uuid < peer_uuid` to
+// `self_uuid > peer_uuid` makes lo_refuses/hi_refuses swap outcomes -- EXPECT_TRUE(lo_refuses)
+// and EXPECT_FALSE(hi_refuses) both fail (their values invert). `<=` would NOT falsify this
+// specific test: kLo and kHi are distinct, so `<=` and `<` agree on both calls below -- a
+// same-vs-different-string edge case a `<=` mutant would need a third, equal-uuid case to catch,
+// which is intentionally out of scope here (self_uuid == peer_uuid is excluded upstream by the
+// admission check's own_uuid refusal, server_family.cc, before this predicate ever runs).
+TEST(ShouldRefuseReciprocalPeerTest, ExactlyOneSideDefersOnBothOperandOrders) {
+  constexpr char kLo[] = "10000000-0000-4000-8000-000000000000";  // sorts before kHi
+  constexpr char kHi[] = "20000000-0000-4000-8000-000000000000";
+
+  // Both sides see the reciprocal condition: the lower uuid's own side refuses, the higher
+  // uuid's own side admits -- never both, never neither.
+  bool lo_refuses = ShouldRefuseReciprocalPeer(/*has_unestablished_own_link=*/true, kLo, kHi);
+  bool hi_refuses = ShouldRefuseReciprocalPeer(/*has_unestablished_own_link=*/true, kHi, kLo);
+  EXPECT_TRUE(lo_refuses);
+  EXPECT_FALSE(hi_refuses);
+  EXPECT_NE(lo_refuses, hi_refuses);  // exactly one, spelled out directly
+
+  // No reciprocal link on this side -- never refuses, regardless of uuid ordering.
+  EXPECT_FALSE(ShouldRefuseReciprocalPeer(/*has_unestablished_own_link=*/false, kLo, kHi));
+  EXPECT_FALSE(ShouldRefuseReciprocalPeer(/*has_unestablished_own_link=*/false, kHi, kLo));
 }
 
 // Launch::post-constructed fibers only get queued (AddReady) on the constructing thread's
@@ -231,6 +321,13 @@ using StartMode = PeerReplicationManager::StartMode;
 constexpr char kReplid[] = "0123456789abcdef0123456789abcdef01234567";
 constexpr char kUnresolvableHost[] = "invalid host";
 
+// drakeydb D-7 round 2: also stands as discrimination coverage for the reciprocal-connect
+// tiebreak's background fallback (PeerReplicationManager::Add, gated on Replica::LastGreetEc()
+// == std::errc::device_or_resource_busy): a DNS failure never reaches Greet() at all, so
+// LastGreetEc() can never read as the tiebreak's errc, and this Add() must still fail outright
+// and register nothing -- exactly as before that fallback existed. See
+// LastGreetEcStaysEmptyForNonGreetFailure below for the same guarantee pinned directly on
+// Replica::LastGreetEc() itself, in isolation from PeerReplicationManager.
 TEST_F(PeerManagerFamilyTest, BlockingAddToUnreachablePortFailsAndLeavesNoPeer) {
   PeerRegistry reg;
   reg.Init(GenerateNodeUuid());
@@ -245,6 +342,28 @@ TEST_F(PeerManagerFamilyTest, BlockingAddToUnreachablePortFailsAndLeavesNoPeer) 
     EXPECT_TRUE(mgr.Summaries().empty());
     mgr.Shutdown();
   });
+}
+
+// drakeydb D-7 round 2: pins Replica::LastGreetEc()'s own contract directly -- the signal
+// PeerReplicationManager::Add's background fallback discriminates on. A DNS failure fails
+// Start() before Greet() is ever called, so last_greet_ec_ must stay at its default-constructed
+// (no error) value; in particular it must never equal std::errc::device_or_resource_busy, which
+// would make Add() wrongly treat an unrelated failure as the reciprocal-connect tiebreak and
+// silently background it instead of failing the command.
+//
+// Falsifying (verified by hand -- see task-8-report.md): setting last_greet_ec_ unconditionally
+// in Start() (e.g. right after entering the function, instead of after `ec = Greet();`) to some
+// non-empty placeholder makes EXPECT_FALSE(r.LastGreetEc()) fail.
+TEST_F(PeerManagerFamilyTest, LastGreetEcStaysEmptyForNonGreetFailure) {
+  pp_->at(0)->Await(
+      [&] {
+        Replica r(kUnresolvableHost, 1, service_.get(), kReplid, std::nullopt);
+        GenericError ec = r.Start();
+        EXPECT_TRUE(ec) << "the invalid host must fail DNS resolution, before Greet() ever runs";
+        EXPECT_FALSE(r.LastGreetEc())
+            << "DNS resolution fails before Greet() is ever called, so LastGreetEc() must stay at "
+               "its default (no error) value -- never mistaken for the reciprocal-connect tiebreak";
+      });
 }
 
 TEST_F(PeerManagerFamilyTest, BackgroundAddRemoveNoOneAndDuplicate) {
@@ -325,6 +444,395 @@ TEST_F(PeerManagerFamilyTest, ExclusiveLoadingIsUnavailableOutsideActiveMode) {
     ASSERT_TRUE(service_->RequestLoadingState());
     service_->RemoveLoadingState();
     service_->RemoveLoadingState();
+  });
+}
+
+// drakeydb: Phase 3 T6 -- verifies DflyShardReplica threads the origin idx passed at
+// construction into its JournalExecutor via SetApplyOrigin(). That single value is what both
+// (a) PrepareTransaction (main_service.cc) reads, via the executor's ConnectionContext, to tag
+// every command this flow applies, and (b) the peer's PING re-record
+// (Replica::StableSyncDflyReadFb, replica.cc) reads via
+// executor_->connection_context()->repl_origin_idx for its own origin stamp -- so this pins the
+// one shared source of truth both consumers depend on.
+//
+// No socket is exercised: DflyShardReplica's constructor performs no I/O (ConnectAndAuth happens
+// later, in StartSyncFlow/FullSyncDflyFb), so this is a pure, in-process construction test.
+//
+// Falsifying (verified by hand): removing the executor_->SetApplyOrigin(origin_idx) call from
+// DflyShardReplica's constructor (or dropping/ignoring the origin_idx parameter) leaves
+// repl_origin_idx at its kSelfIdx/0 default, and the kPeerIdx EXPECT_EQ below fails.
+namespace {
+
+// drakeydb: Phase 3 T7b -- builds a single-entry journal blob (mirroring rdb_test.cc's
+// MakeJournalDel, which established this exact JournalWriter -> RdbSerializer::WriteJournalEntry
+// technique) wrapping a SET command, for feeding into RdbLoaderBase::HandleJournalBlob via
+// RdbLoader::Load() directly, no socket involved.
+std::string MakeJournalSet(std::string_view key, std::string_view val) {
+  io::StringSink sink;
+  JournalWriter writer(&sink);
+  std::array<std::string_view, 2> kv{key, val};
+  writer.Write(journal::Entry{1, journal::Op::COMMAND, 0, std::nullopt,
+                              journal::Entry::Payload("SET", ArgSlice{kv.data(), kv.size()})});
+
+  RdbSerializer serializer(CompressionMode::NONE);
+  CHECK(!serializer.WriteJournalEntry(std::move(sink).str()));
+  return serializer.Flush(RdbSerializer::FlushState::kFlushEndEntry);
+}
+
+// drakeydb: Phase 3 T7b -- mirrors rdb_test.cc's WrapInRdb (file-local there, so duplicated here
+// rather than shared across translation units for one 8-line helper): wraps a raw body in the
+// magic/EOF/checksum framing RdbLoader::Load() requires. The all-zero checksum is the same
+// convention RdbSerializer::SendEofAndChecksum itself always writes (rdb_save.cc hard-codes
+// chksum = 0), which RdbLoader::VerifyChecksum() is documented to skip.
+std::string WrapInRdbForTest(std::string_view body) {
+  std::string out = absl::StrFormat("REDIS%04d", RDB_SER_VERSION);
+  out.append(body);
+  out.push_back(static_cast<char>(RDB_OPCODE_EOF));
+  constexpr uint8_t checksum[8] = {};
+  out.append(reinterpret_cast<const char*>(checksum), sizeof(checksum));
+  return out;
+}
+
+// drakeydb: Phase 3 T7b -- captures the origin_idx of the last Op::COMMAND entry this node
+// itself journals while registered. Does not need friend access (JournalConsumerInterface is a
+// public interface), so it lives outside the friended fixture class below, unlike the methods
+// that touch DflyShardReplica's private members directly.
+struct CapturingConsumer : public journal::JournalConsumerInterface {
+  std::optional<uint32_t> last_command_origin_idx;
+
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    if (item.journal_item.opcode == journal::Op::COMMAND)
+      last_command_origin_idx = item.journal_item.origin_idx;
+  }
+  void ThrottleIfNeeded() override {
+  }
+};
+
+}  // namespace
+
+class DflyShardReplicaOriginTest : public BaseFamilyTest {
+ protected:
+  // Constructs a DflyShardReplica with `origin_idx` (no socket -- the constructor performs no
+  // I/O) and returns the origin idx observed on its JournalExecutor's ConnectionContext. Defined
+  // as a genuine member of this exact friended class, not inlined into a TEST_F body: gtest
+  // generates TEST_F's body as a method of a *derived* class
+  // (DflyShardReplicaOriginTest_Name_Test), and friendship is not inherited, so code accessing
+  // DflyShardReplica's private/protected members must run as a member of DflyShardReplicaOriginTest
+  // itself (same reasoning as MemBufControllerTest in rdb_test.cc).
+  uint32_t ObservedOriginIdx(uint32_t origin_idx) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, origin_idx, /*peer_mode=*/false);
+    return flow.executor_->connection_context()->repl_origin_idx;
+  }
+
+  // drakeydb: Phase 3 T7b -- constructs a DflyShardReplica with `origin_idx`, replays a
+  // hand-crafted "SET key replayed-value" through its rdb_loader_ (the full-sync
+  // concurrent-journal-blob apply path, RdbLoaderBase::HandleJournalBlob -- reaching rdb_loader_,
+  // a private member, is why this runs as a member of this friended class, same reasoning as
+  // ObservedOriginIdx above), then returns the origin_idx THIS node stamped on the re-journaled
+  // write. `key` must hash to shard 0 (the caller is responsible for choosing one, e.g. via
+  // Shard(key, shard_set->size()) -- see the TEST_F below): the capturing listener below is
+  // registered on shard 0 only, matching the pp_->at(0) fiber this always runs on (same
+  // convention as ObservedOriginIdx, which never leaves shard 0 either since it does no actual
+  // dispatch). Runs entirely off-socket: Load() reads a std::string source, not the network.
+  uint32_t ObservedReplayedOriginIdx(uint32_t origin_idx, std::string_view key) {
+    // drakeydb: Phase 3 T7b -- the SET's normal auto-journal path (PrepareTransaction) is a
+    // silent no-op on a shard where journaling was never enabled -- which a fresh BaseFamilyTest
+    // boot never does on its own (production enables it the first time a replica connects).
+    // Idempotent (an early return once already initialized), so safe on every invocation.
+    journal::StartInThread();
+
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, origin_idx, /*peer_mode=*/true);
+
+    CapturingConsumer capture;
+    uint32_t cb_id = journal::RegisterConsumer(&capture);
+
+    std::string rdb = WrapInRdbForTest(MakeJournalSet(key, "replayed-value"));
+    io::BytesSource src{io::Buffer(rdb)};
+    std::error_code ec = flow.rdb_loader_->Load(&src);
+    CHECK(!ec) << ec.message();
+
+    journal::UnregisterConsumer(cb_id);
+    CHECK(capture.last_command_origin_idx.has_value())
+        << "the replayed SET was never re-journaled on this node";
+    return *capture.last_command_origin_idx;
+  }
+};
+
+TEST_F(DflyShardReplicaOriginTest, ConstructorThreadsOriginIntoExecutor) {
+  constexpr uint32_t kPeerIdx = 7;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  pp_->at(0)->Await([&] {
+    EXPECT_EQ(kPeerIdx, ObservedOriginIdx(kPeerIdx));
+
+    // A non-peer flow (PeerRegistry::kSelfIdx == 0) must stay byte-identical to upstream: 0 is
+    // already ConnectionContext::repl_origin_idx's default, so SetApplyOrigin(0) is a true no-op.
+    EXPECT_EQ(PeerRegistry::kSelfIdx, ObservedOriginIdx(PeerRegistry::kSelfIdx));
+  });
+}
+
+// drakeydb: Phase 3 T7b -- a peer's FULL SYNC has a second apply path besides the stable-sync
+// executor_ ConstructorThreadsOriginIntoExecutor above covers: the concurrent journal blob
+// embedded in the full sync itself, replayed via rdb_loader_ (RdbLoaderBase::HandleJournalBlob).
+// Proves that path also stamps -- and re-journals -- with THIS flow's origin, not kSelfIdx by
+// default, and that the underlying write genuinely applies (not merely gets tagged).
+//
+// Falsifying (verified by hand -- see task-7b-report.md): removing the
+// rdb_loader_->SetApplyOrigin(origin_idx) call added to DflyShardReplica's constructor
+// (replica.cc) makes the kPeerIdx EXPECT_EQ below fail (observes PeerRegistry::kSelfIdx instead
+// of kPeerIdx); the kSelfIdx EXPECT_EQ is unaffected, since SetApplyOrigin(0) is a no-op either
+// way -- exactly mirroring ConstructorThreadsOriginIntoExecutor's own falsification shape for
+// executor_ above.
+TEST_F(DflyShardReplicaOriginTest, FullSyncJournalBlobAppliesAndReJournalsWithFlowsOrigin) {
+  // Pick key names that hash to shard 0: ObservedReplayedOriginIdx registers its capturing
+  // journal listener on shard 0 only (matching the pp_->at(0) fiber below), so a key hashing to
+  // any other shard would silently miss the entry instead of failing loudly.
+  auto shard0_key = [&](std::string_view prefix) {
+    std::string key;
+    for (unsigned i = 0; i < 1000; ++i) {
+      key = absl::StrCat(prefix, i);
+      if (Shard(key, shard_set->size()) == 0)
+        return key;
+    }
+    ADD_FAILURE() << "could not find a shard-0 key for prefix " << prefix;
+    return key;
+  };
+  const std::string peer_key = shard0_key("t7b-peer-key-");
+  const std::string self_key = shard0_key("t7b-self-key-");
+
+  constexpr uint32_t kPeerIdx = 11;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  pp_->at(0)->Await([&] {
+    EXPECT_EQ(kPeerIdx, ObservedReplayedOriginIdx(kPeerIdx, peer_key));
+    // A non-peer flow keeps re-journaling as self-origin -- byte-identical to upstream.
+    EXPECT_EQ(PeerRegistry::kSelfIdx, ObservedReplayedOriginIdx(PeerRegistry::kSelfIdx, self_key));
+  });
+
+  // The writes genuinely applied -- not merely got tagged with the right origin.
+  EXPECT_EQ(Run({"GET", peer_key}), "replayed-value");
+  EXPECT_EQ(Run({"GET", self_key}), "replayed-value");
+}
+
+// drakeydb: Phase 3 T6b -- verifies DflyShardReplica threads `peer_mode` from construction into
+// AdoptAuthoritativeLsn's gate, and that AdoptAuthoritativeLsn itself sets journal_rec_executed_
+// (JournalExecutedCount(), what a reconnecting flow reports as its partial-sync resume LSN -- see
+// Replica::InitiateDflySync's partial_sync_lsn) to master_lsn + 1 -- unconditionally overwriting
+// whatever count-based value the seed held, proving this is a true adoption rather than a
+// relative nudge that could compound drift.
+//
+// No socket is exercised, for the same reason as DflyShardReplicaOriginTest above: the
+// constructor performs no I/O, and AdoptAuthoritativeLsn touches only journal_rec_executed_, so
+// this is a pure, in-process test of the exact method StableSyncDflyReadFb's Op::LSN branch
+// calls -- not a reimplementation of its logic.
+//
+// Falsifying (verified by hand -- see task-6b-report.md): gating AdoptAuthoritativeLsn's body
+// out entirely (as if peer mode were never threaded through) makes the first EXPECT_EQ below
+// fail (43u vs the untouched seed, 5u). Dropping the `if (!peer_mode_) return;` guard makes the
+// second EXPECT_EQ fail (43u instead of the untouched seed, 5u) -- proving non-peer flows are
+// unaffected is exactly what that guard is for.
+class DflyShardReplicaPeerModeTest : public BaseFamilyTest {
+ protected:
+  uint64_t ObservedJournalExecutedAfterMarker(uint64_t seed, uint64_t master_lsn, bool peer_mode) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, /*origin_idx=*/0, peer_mode);
+    flow.SetRecordsExecuted(seed);
+    flow.AdoptAuthoritativeLsn(master_lsn);
+    return flow.JournalExecutedCount();
+  }
+
+  // drakeydb: Phase 3 T6b fix-round-1 (C1) -- genuine member, not inlined into a TEST_F body (see
+  // this class's own reasoning above, same as DflyShardReplicaOriginTest's): sets apply_failed_
+  // the same way StableSyncDflyReadFb's ExecuteTx failure branch does (replica.cc), then calls
+  // the real AdoptAuthoritativeLsn.
+  uint64_t ObservedJournalExecutedAfterFailedApplyThenMarker(uint64_t seed, uint64_t master_lsn) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, /*origin_idx=*/0, /*peer_mode=*/true);
+    flow.SetRecordsExecuted(seed);
+    flow.apply_failed_ = true;
+    flow.AdoptAuthoritativeLsn(master_lsn);
+    return flow.JournalExecutedCount();
+  }
+
+  // drakeydb: Phase 3 T6b fix-round-1 (Q1) -- genuine member driving the real
+  // AdoptAuthoritativeLsn from a caller-supplied LSN. The caller (see
+  // AdoptAuthoritativeLsnComposesWithRealSenderMarker) decodes that value from a real,
+  // sender-produced marker via a real TransactionReader entirely outside this friended class --
+  // decoding needs no DflyShardReplica access at all -- so only the actual adoption call has to
+  // run as a genuine member here.
+  uint64_t ObservedJournalExecutedAfterAdopt(uint64_t master_lsn) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, /*origin_idx=*/0, /*peer_mode=*/true);
+    flow.AdoptAuthoritativeLsn(master_lsn);
+    return flow.JournalExecutedCount();
+  }
+};
+
+TEST_F(DflyShardReplicaPeerModeTest, AdoptAuthoritativeLsnSetsExecutedCountInPeerModeOnly) {
+  pp_->at(0)->Await([&] {
+    // Peer mode: journal_rec_executed_ becomes master_lsn + 1, discarding the seed entirely.
+    EXPECT_EQ(43u, ObservedJournalExecutedAfterMarker(/*seed=*/5, /*master_lsn=*/42,
+                                                      /*peer_mode=*/true));
+
+    // Non-peer mode: byte-identical to upstream's "Do nothing" Op::LSN branch -- the seed must
+    // survive untouched.
+    EXPECT_EQ(5u, ObservedJournalExecutedAfterMarker(/*seed=*/5, /*master_lsn=*/42,
+                                                     /*peer_mode=*/false));
+  });
+}
+
+// drakeydb: Phase 3 T6b fix-round-1 (C1) -- once an apply has failed on this flow (a local OOM
+// applying an entry is a normal operational outcome -- facade::DispatchResult::OOM -- not a
+// can't-happen), AdoptAuthoritativeLsn must refuse to adopt ANY later marker, no matter its
+// value: without this, the very next authoritative Op::LSN marker (this task's own gap-correction
+// marker, the fully-filtered-link resolution marker, or the pre-existing periodic heartbeat)
+// would silently overwrite journal_rec_executed_ past the entry that was never actually applied,
+// and a reconnect would never re-offer it -- permanent, silent divergence from the mesh. This
+// pins that refusal directly (apply_failed_ set the same way StableSyncDflyReadFb's ExecuteTx
+// failure branch sets it -- replica.cc -- via friend access, since driving that branch for real
+// needs a live socket StableSyncDflyReadFb's own tests avoid for the same reason
+// DflyShardReplicaOriginTest's comment gives).
+//
+// Falsifying (verified by hand -- see task-6b-report.md): removing the `if (apply_failed_)
+// return;` guard from AdoptAuthoritativeLsn makes the EXPECT_EQ below fail (43 instead of the
+// un-advanced seed, 5).
+TEST_F(DflyShardReplicaPeerModeTest, AdoptAuthoritativeLsnSuppressedAfterApplyFailure) {
+  pp_->at(0)->Await([&] {
+    EXPECT_EQ(5u, ObservedJournalExecutedAfterFailedApplyThenMarker(/*seed=*/5,
+                                                                    /*master_lsn=*/42));
+  });
+}
+
+// drakeydb: Phase 3 T6b fix-round-1 (Q1) -- the original PeerModeGapMarkerCoalescesAndReceiver
+// LandsOnTrueLsn (journal/journal_test.cc) hand-computed its expected journal_rec_executed_ as
+// `tx_data.lsn + 1`, duplicating AdoptAuthoritativeLsn's own arithmetic rather than calling it --
+// so it could not have failed even if the real method used `+ 2`. This test drives the REAL
+// sender (a real peer-mode JournalStreamer processing real journal::RecordEntry calls, so the
+// marker's value is computed by streamer.cc's actual code, not chosen by this test), decodes it
+// with a real TransactionReader, and feeds that DECODED value into the REAL
+// DflyShardReplica::AdoptAuthoritativeLsn (replica.cc's own expression,
+// AdoptAuthoritativeLsn(tx_data.lsn), just called from here instead of from inside
+// StableSyncDflyReadFb's loop, which needs a live socket -- see DflyShardReplicaOriginTest's own
+// comment on why a bare construction test is this codebase's established alternative). The
+// closing assertion compares against journal::GetLsn(), read directly after the recording is
+// done -- not a formula this test shares with either the sender's or the receiver's arithmetic --
+// so an inconsistency on EITHER side is what this test can catch that the two single-sided tests
+// (this file's AdoptAuthoritativeLsnSetsExecutedCountInPeerModeOnly and journal_test.cc's own
+// sender-side coalescing test) cannot.
+//
+// The one dropped entry below is deliberately the ONLY drop in this scenario, not a run of
+// several: it is the very first entry this fresh streamer's drop path (fix-round-1, C2) ever
+// evaluates, and that path's own last_lsn_time_ throttle -- like the pre-existing write-path
+// periodic marker it is borrowed from -- always fires on its first-ever check (see streamer.cc's
+// drop-path comment, and journal_test.cc's MixedOriginBacklogPeerVsFullStream for the same
+// property spelled out in detail). A second, immediately-following drop would not reliably
+// produce a second marker for the write-path gap-correction code to compose instead (its own
+// coalescing behavior is already covered, against exact hand-verified values, by
+// journal_test.cc's PeerModeGapMarkerCoalescesAndTransactionReaderAdoptsCleanly) -- so this test
+// keeps to the one guaranteed-deterministic marker instead of also depending on throttle timing.
+//
+// journal::RecordEntry is called directly against this fixture's real (BaseFamilyTest) shard --
+// unlike journal_test.cc's own tests, which use a bespoke, deliberately minimal single-shard
+// fixture built for exactly this purpose (see JournalStreamerPeerFilterTest's own comment).
+// DflyShardReplica needs a real, valid Service* from its very first constructor statement
+// (service_(*service) -- an unconditional dereference), which only BaseFamilyTest provides in
+// this codebase; building one from scratch to keep this test in journal_test.cc's fixture instead
+// was judged more invasive than the alternative taken here.
+TEST_F(DflyShardReplicaPeerModeTest, AdoptAuthoritativeLsnComposesWithRealSenderMarker) {
+  constexpr uint32_t kPeerIdx = 9;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  pp_->at(0)->Await([&] {
+    // Unlike journal_test.cc's own fixture (which calls this in its own SetUp), a plain
+    // BaseFamilyTest never starts this shard's journal on its own -- production only does so
+    // lazily, when a replica first connects (dflycmd.cc's JOURNAL START). Idempotent
+    // (JournalSlice::Init() is a no-op if already initialized), so safe to call unconditionally.
+    journal::StartInThread();
+    LSN base = journal::GetLsn();  // not assumed to be a pristine 1: this fixture does not own
+                                   // its shard exclusively. Used only to seed tx_reader below,
+                                   // matching a real partial resume's own seeding.
+
+    ExecutionState send_cntx;
+    JournalStreamer::Config config;
+    config.peer_mode = true;
+    CapturingFiberSocket socket;
+    JournalStreamer streamer(&send_cntx, config);
+    streamer.Start(&socket);  // start_partial_sync_at == 0: registers as a live listener now.
+
+    std::array<std::string_view, 2> set_a{"a", "1"};
+    journal::RecordEntry(0, journal::Op::COMMAND, 0, std::nullopt,
+                         journal::Entry::Payload{"SET", ArgSlice{set_a.data(), set_a.size()}},
+                         PeerRegistry::kSelfIdx);  // self -- kept.
+    std::array<std::string_view, 2> set_b{"b", "2"};
+    journal::RecordEntry(0, journal::Op::COMMAND, 0, std::nullopt,
+                         journal::Entry::Payload{"SET", ArgSlice{set_b.data(), set_b.size()}},
+                         kPeerIdx);  // peer -- dropped; the very first entry this streamer's
+                                     // drop path evaluates, so it gets its own real,
+                                     // sender-computed marker immediately (see this test's own
+                                     // header comment).
+
+    // drakeydb: Phase 3 T6b fix-round-2 -- read immediately after the last RecordEntry, before
+    // Cancel(). Cancel() can yield this fiber (WaitForInflightToComplete awaits the socket write's
+    // completion), and this fixture does not own shard 0 exclusively -- it's a real BaseFamilyTest
+    // shard (see this test's own header comment) -- so an unrelated journal record landing on
+    // shard 0 during that yield would advance GetLsn() past what this scenario itself produced,
+    // decoupling "ground truth" from the marker this test is actually checking. Closed in practice
+    // today (no keys, no other clients touch this shard during this Await), but not by
+    // construction -- reading here removes the window entirely instead of relying on that holding.
+    LSN true_next_lsn = journal::GetLsn();  // ground truth: the ONE thing this test does not
+                                            // derive from any formula shared with the code under
+                                            // test, on either the sender or the receiver side.
+
+    streamer.Cancel();
+
+    base::IoBuf buf;
+    io::BufSink sink{&buf};
+    sink.Write(io::Buffer(socket.captured));
+    io::BufSource source{&buf};
+    JournalReader reader{&source, 0};
+    TransactionReader tx_reader{base - 1, /*peer_mode=*/true};
+    ExecutionState read_cntx;
+    TransactionData tx_data;
+
+    ASSERT_TRUE(tx_reader.NextTxData(&reader, &read_cntx, &tx_data));  // SET a
+    ASSERT_EQ(journal::Op::COMMAND, tx_data.opcode);
+
+    ASSERT_TRUE(tx_reader.NextTxData(&reader, &read_cntx, &tx_data));  // the real drop-path marker
+    ASSERT_EQ(journal::Op::LSN, tx_data.opcode);
+
+    // drakeydb: Phase 3 T6b fix-round-1 (Q1) -- ObservedJournalExecutedAfterAdopt is a genuine
+    // member of DflyShardReplicaPeerModeTest (see that class's own comment): this lambda is a
+    // separate, unrelated closure type, not a member of the friended class itself, so it cannot
+    // touch DflyShardReplica's private members (or the protected ServerContext) directly --
+    // constructing a DflyShardReplica right here, inline, does not compile.
+    uint64_t observed = ObservedJournalExecutedAfterAdopt(tx_data.lsn);  // the decoded value --
+                                                                         // not a literal.
+
+    // The composition: the sender's drop-path marker carries the dropped entry's own true LSN
+    // (streamer.cc); adopting it (+1) must land exactly on the next LSN the master has not
+    // assigned yet.
+    EXPECT_EQ(true_next_lsn, observed);
   });
 }
 

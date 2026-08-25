@@ -19,6 +19,7 @@
 #include "server/engine_shard.h"
 #include "server/journal/cmd_serializer.h"
 #include "server/journal/serializer.h"
+#include "server/multi_master.h"  // drakeydb: Phase 3 T5 -- PeerRegistry::kSelfIdx for ShouldWrite.
 #include "server/rdb_save.h"
 #include "server/server_state.h"
 #include "util/fibers/synchronization.h"
@@ -116,6 +117,15 @@ JournalStreamer::JournalStreamer(ExecutionState* cntx, JournalStreamer::Config c
   migration_buckets_sleep_usec_cached = absl::GetFlag(FLAGS_migration_buckets_sleep_usec);
   replication_dispatch_threshold = absl::GetFlag(FLAGS_replication_dispatch_threshold);
   last_async_write_time_ = base::CycleClock::Now();
+  // drakeydb: Phase 3 T6b fix-round-1 (minor) -- seed last_lsn_writen_ from the partial-sync
+  // starting point instead of always 0, so ConsumeJournalChange's gap check does not treat the
+  // very first entry of a resume as a gap merely because it isn't LSN 1 -- a reconnecting peer
+  // almost never resumes from LSN 1. Harmless either way (the resulting marker is a correct,
+  // redundant confirmation of the same starting point -- see ConsumeJournalChange), just
+  // wasteful; a no-op when start_partial_sync_at is 0 (live-only start) or 1.
+  if (config_.start_partial_sync_at > 0) {
+    last_lsn_writen_ = config_.start_partial_sync_at - 1;
+  }
 }
 
 JournalStreamer::~JournalStreamer() {
@@ -127,21 +137,124 @@ JournalStreamer::~JournalStreamer() {
 
 void JournalStreamer::ConsumeJournalChange(const JournalChangeItem& item) {
   if (!ShouldWrite(item)) {
+    // drakeydb: Phase 3 T6b fix-round-1 (C2) -- a peer link whose entries are ALL dropped (e.g.
+    // read-mostly while its peer writes heavily -- the steady state for many mesh topologies, not
+    // a corner case) would otherwise never reach either marker block below: both live only on the
+    // write path, past this early return. Left uncorrected, journal_rec_executed_ never advances
+    // while the master's true LSN races ahead, and the eventual reconnect (or ring-buffer
+    // eviction before it) forces a full resync whose last-loaded-wins merge (rdb_load.cc) can
+    // resurrect stale values.
+    //
+    // A dropped entry is, by definition, already fully resolved (this link correctly chose not
+    // to forward it) -- so on the SAME timer as the write-path periodic marker below (reusing
+    // last_lsn_time_, not a separate timer fiber: emitting off a fiber other than the one
+    // ConsumeJournalChange itself runs on would reintroduce the cross-fiber ordering question
+    // this design otherwise avoids -- see AdoptAuthoritativeLsn's correctness argument, which
+    // depends on markers and the entries around them being strictly ordered on one call path),
+    // emit Op::LSN carrying this entry's own LSN directly -- not LSN - 1: unlike the write-path
+    // marker, there is no following write whose own +1 increment this marker needs to set up for;
+    // the receiver's adoption (master_lsn + 1) already names the correct next-expected value on
+    // its own, since this dropped entry itself is the last thing resolved so far.
+    // last_lsn_writen_ is kept in sync too, so a later real write's own gap check below does not
+    // re-flag a gap this marker already closed.
+    if (config_.peer_mode && cntx_->IsRunning()) {
+      time_t now = time(nullptr);
+      // drakeydb: Phase 3 T6b fix-round-2 -- config_.lsn_marker_throttle_sec == 0 bypasses the
+      // real-clock comparison entirely (see its doc comment in streamer.h) rather than comparing
+      // "now - last_lsn_time_ > 0": time_t truncates to whole seconds, so two calls made within
+      // the same wall-clock second -- as happens in a fast-running test with no sleep between
+      // them -- would otherwise both see a 0 delta and the second marker would silently not fire.
+      if (config_.lsn_marker_throttle_sec == 0 ||
+          now - last_lsn_time_ > config_.lsn_marker_throttle_sec) {
+        last_lsn_time_ = now;
+        io::StringSink drop_sink;
+        JournalWriter drop_writer(&drop_sink);
+        drop_writer.Write(Entry{journal::Op::LSN, item.journal_item.lsn});
+        Write(std::move(drop_sink).str());
+        last_lsn_writen_ = item.journal_item.lsn;
+      }
+    }
     return;
   }
 
   DCHECK_GT(item.journal_item.lsn, last_lsn_writen_);
+
+  // drakeydb: Phase 3 T6b -- peer-mode gap correction. ShouldWrite() above may have silently
+  // dropped one or more entries (non-self-origin, expiry DELs, Op::ORIGIN) since the last entry
+  // this stream actually wrote -- their LSNs were consumed on the sender (every AddLogRecord call
+  // advances the shard's real journal LSN by exactly 1, dropped or not -- see
+  // JournalSlice::AddLogRecord) but never reached this peer. Left uncorrected, the receiver's
+  // position -- which it derives purely by COUNTING received records, see
+  // TransactionReader::NextTxData -- falls behind the master's true LSN by exactly the number of
+  // entries dropped since the last write.
+  //
+  // Detect the gap by comparing this entry's real LSN to the last one actually written: a run of
+  // any number of consecutive drops (regardless of why each was dropped) coalesces into exactly
+  // one marker here, since last_lsn_writen_ only advances on a real write. The marker carries the
+  // true LSN as of immediately before this entry (item.journal_item.lsn - 1), i.e. "everything up
+  // to here is resolved -- applied or correctly skipped -- next up is this entry", and is placed
+  // on the wire strictly before it (both Write() calls below only ever append to pending_buf_, a
+  // FIFO, so program order here is wire order regardless of how AsyncWrite's completion is timed).
+  // See tx_executor.cc's peer-mode handling of Op::LSN (NextTxData) and replica.cc's
+  // AdoptAuthoritativeLsn for the receiving half, and why adopting this value can never run the
+  // resume LSN ahead of what was actually applied.
+  //
+  // Gated on config_.peer_mode: a full-stream (non-peer) consumer never has ShouldWrite drop
+  // anything (see ShouldWrite below), so item.journal_item.lsn == last_lsn_writen_ + 1 always
+  // holds for it and this block would be a provable no-op even if left ungated -- but gating it
+  // explicitly keeps non-peer behavior byte-identical to upstream on inspection, not just in
+  // practice.
+  if (config_.peer_mode && item.journal_item.lsn != last_lsn_writen_ + 1) {
+    io::StringSink gap_sink;
+    JournalWriter gap_writer(&gap_sink);
+    gap_writer.Write(Entry{journal::Op::LSN, item.journal_item.lsn - 1});
+    Write(std::move(gap_sink).str());
+  }
+
   Write(item.journal_item.data);
   time_t now = time(nullptr);
   last_lsn_writen_ = item.journal_item.lsn;
   // TODO: to chain it to the previous Write call.
-  if (config_.should_sent_lsn && now - last_lsn_time_ > 3) {
+  // drakeydb: Phase 3 T6b fix-round-2 -- see the drop-path block above for why
+  // lsn_marker_throttle_sec == 0 is special-cased rather than folded into the real-clock compare.
+  if (config_.should_sent_lsn && (config_.lsn_marker_throttle_sec == 0 ||
+                                  now - last_lsn_time_ > config_.lsn_marker_throttle_sec)) {
     last_lsn_time_ = now;
     io::StringSink sink;
     JournalWriter writer(&sink);
     writer.Write(Entry{journal::Op::LSN, last_lsn_writen_});
     Write(std::move(sink).str());
   }
+}
+
+// drakeydb: Phase 3 T5 -- peer-echo filter. In an N-node active-replica mesh, each of the
+// N*(N-1) one-way peer streams must carry only its sender's own writes, or an applied write
+// reflects back to its origin and re-amplifies around the mesh (PLAN.md Risk #1/#7: an echo
+// storm). Covers both the live path (ConsumeJournalChange, called directly off the journal
+// callback) and the partial-replay path (MaybePartialStreamLSNs below), since both call this via
+// ConsumeJournalChange -- see MaybePartialStreamLSNs's comment for why populating the metadata
+// this filter reads is the important part of that path.
+//
+// A full-stream (non-peer) consumer -- config_.peer_mode == false, e.g. a plain replica or
+// RestoreStreamer's own override (which does not call this base at all) -- gets everything: all
+// origins, expiry DELs, and Op::ORIGIN dictionary entries. A plain replica needs the ORIGIN
+// entries to resolve origin_idx tags on the regular entries it receives, since (unlike a mesh
+// peer) it has no direct connection of its own to learn those uuids from.
+//
+// drakeydb: Phase 3 T7b -- the actual drop rule (and why each condition exists) now lives in ONE
+// place, journal::PassesPeerEchoFilter (types.h/.cc), shared with SliceSnapshot's full-sync
+// concurrent journal blob filter (snapshot.cc's ConsumeJournalChange) -- see that function's own
+// doc comment for the per-condition rationale (origin_idx/kEntryFlagExpired/Op::ORIGIN, and why
+// Op::LSN/Op::PING are never dropped by opcode). Do not re-derive the rule here; update
+// PassesPeerEchoFilter instead so both consumers move together.
+bool JournalStreamer::ShouldWrite(const journal::JournalChangeItem& item) const {
+  if (!cntx_->IsRunning())
+    return false;
+
+  if (!config_.peer_mode)
+    return true;
+
+  return journal::PassesPeerEchoFilter(item.journal_item);
 }
 
 void JournalStreamer::Start(util::FiberSocketBase* dest) {
@@ -214,8 +327,27 @@ bool JournalStreamer::MaybePartialStreamLSNs() {
     // The replica sends the LSN of the next entry is wants to receive.
     while (cntx_->IsRunning() && journal::IsLSNInBuffer(lsn)) {
       JournalChangeItem item;
-      item.journal_item.data = journal::GetEntry(lsn);
-      item.journal_item.lsn = lsn;
+      // drakeydb: Phase 3 T5 -- populate origin_idx/entry_flags/opcode from the ring buffer via
+      // GetEntryMeta, not just `data`+`lsn` as before. ShouldWrite() (the peer-echo filter) reads
+      // those fields; a bare JournalChangeItem left them at their zero-value defaults (self
+      // origin, no flags, Op::COMMAND), which would have made every entry pass a peer filter --
+      // the exact echo-storm bug this task exists to close, and the reason a reconnecting peer's
+      // partial-resync is the most important case to get right (see PLAN.md Risk #1/#7).
+      //
+      // GetEntryMeta returns a reference into the ring buffer (see its contract in
+      // journal_slice.h): copy every field out here, inside this scope, before calling
+      // ConsumeJournalChange below -- which can preempt (Write -> AsyncWrite may yield) -- so the
+      // reference is never held across a point where a concurrent AddLogRecord could invalidate
+      // it (ring-buffer overwrite, CleanEntries eviction, or set_capacity growth).
+      {
+        const JournalItem& meta = journal::GetEntryMeta(lsn);
+        item.journal_item.data = meta.data;
+        item.journal_item.lsn = meta.lsn;
+        item.journal_item.time_ms = meta.time_ms;
+        item.journal_item.origin_idx = meta.origin_idx;
+        item.journal_item.entry_flags = meta.entry_flags;
+        item.journal_item.opcode = meta.opcode;
+      }
       ConsumeJournalChange(item);
       lsn++;
     }

@@ -21,7 +21,7 @@ bool PeerIdentityClaims::TryClaim(uint64_t owner_id, std::string_view uuid) {
   util::fb2::LockGuard lk(mu_);
 
   auto claim = owners_by_uuid_.find(uuid);
-  if (claim != owners_by_uuid_.end() && claim->second != owner_id) {
+  if (claim != owners_by_uuid_.end() && claim->second.owner_id != owner_id) {
     ReleaseLocked(owner_id);
     return false;
   }
@@ -33,7 +33,8 @@ bool PeerIdentityClaims::TryClaim(uint64_t owner_id, std::string_view uuid) {
   } else if (previous == uuids_by_owner_.end()) {
     uuids_by_owner_.try_emplace(owner_id, uuid);
   }
-  owners_by_uuid_.insert_or_assign(std::string(uuid), owner_id);
+  // Always (re)starts as not-established -- see this method's own doc comment (peer_replication.h).
+  owners_by_uuid_.insert_or_assign(std::string(uuid), Claim{owner_id, false});
   return true;
 }
 
@@ -48,9 +49,30 @@ void PeerIdentityClaims::ReleaseLocked(uint64_t owner_id) {
     return;
 
   auto claim = owners_by_uuid_.find(owner->second);
-  if (claim != owners_by_uuid_.end() && claim->second == owner_id)
+  if (claim != owners_by_uuid_.end() && claim->second.owner_id == owner_id)
     owners_by_uuid_.erase(claim);
   uuids_by_owner_.erase(owner);
+}
+
+void PeerIdentityClaims::MarkEstablished(uint64_t owner_id) {
+  util::fb2::LockGuard lk(mu_);
+  auto owner = uuids_by_owner_.find(owner_id);
+  if (owner == uuids_by_owner_.end())
+    return;
+  auto claim = owners_by_uuid_.find(owner->second);
+  if (claim != owners_by_uuid_.end() && claim->second.owner_id == owner_id)
+    claim->second.established = true;
+}
+
+bool PeerIdentityClaims::HasUnestablishedClaim(std::string_view uuid) const {
+  util::fb2::LockGuard lk(mu_);
+  auto claim = owners_by_uuid_.find(uuid);
+  return claim != owners_by_uuid_.end() && !claim->second.established;
+}
+
+bool ShouldRefuseReciprocalPeer(bool has_unestablished_own_link, std::string_view self_uuid,
+                                std::string_view peer_uuid) {
+  return has_unestablished_own_link && self_uuid < peer_uuid;
 }
 
 SyncGate::SyncGate(ExternalLoadingFn external_loading)
@@ -74,11 +96,18 @@ SyncGate::Lease::~Lease() {
     gate_->Release();
 }
 
+// ABSL_NO_THREAD_SAFETY_ANALYSIS is on this method's declaration (peer_replication.h): see that
+// declaration's own comment for why std::unique_lock is required here instead of LockGuard.
 SyncGate::Lease SyncGate::Acquire(absl::FunctionRef<bool()> cancelled) {
   std::unique_lock lk(mu_);
   const uint64_t ticket = next_ticket_++;
   waiters_.push_back(ticket);
-  auto ready = [&] {
+  // ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_): Clang's thread-safety analysis gives a lambda's
+  // operator() its own empty lockset, so this function-level ABSL_NO_THREAD_SAFETY_ANALYSIS
+  // (peer_replication.h) does not cover it -- same reasoning as PeerReplicationManager::Add()'s
+  // has_endpoint lambda further below. Satisfied here: mu_ is held via std::unique_lock for this
+  // whole function, and ready() is only ever called below, still within that same scope.
+  auto ready = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
     return !held_ && waiters_.front() == ticket && !(external_loading_ && external_loading_());
   };
   while (true) {
@@ -99,7 +128,7 @@ SyncGate::Lease SyncGate::Acquire(absl::FunctionRef<bool()> cancelled) {
 }
 
 void SyncGate::Release() {
-  std::lock_guard lk(mu_);
+  util::fb2::LockGuard lk(mu_);
   held_ = false;
   // fb2::CondVarAny has no internal mutex (unlike std::condition_variable_any): notify_all() must
   // be called while still holding mu_, or it races the wait queue it touches.
@@ -107,12 +136,12 @@ void SyncGate::Release() {
 }
 
 bool SyncGate::IsHeld() const {
-  std::lock_guard lk(mu_);
+  util::fb2::LockGuard lk(mu_);
   return held_;
 }
 
 size_t SyncGate::NumWaiting() const {
-  std::lock_guard lk(mu_);
+  util::fb2::LockGuard lk(mu_);
   return waiters_.size();
 }
 
@@ -174,8 +203,34 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
                                      ReplicaPeerMode{&gate_, registry_, &identity_claims_});
   if (mode == StartMode::kBlockingHandshake) {
     GenericError ec = r->Start();
-    if (ec || r->IsContextCancelled())
-      return ec ? ec : GenericError{"replication cancelled"};
+    if (ec || r->IsContextCancelled()) {
+      // drakeydb D-7 (review round 2): a blocking REPLICAOF's one and only Start() attempt can
+      // fail for two known-transient reasons instead of a real one: it lost the
+      // reciprocal-connect uuid tiebreak (ShouldRefuseReciprocalPeer,
+      // HasUnestablishedPeerWithUuid -- device_or_resource_busy), or the target is itself
+      // transiently LOADING from a third, unrelated peer, which rejects even our PING before
+      // our own admission check is ever reached (Greet()'s own comment --
+      // resource_unavailable_try_again). Neither is a real failure, and both are expected to
+      // clear themselves within a retry or two (round-2 review: reproduced this exact second
+      // case losing to the first fix alone -- see task-8-report.md). Falling straight through
+      // to `return ec` below would surface "-ERR replication cancelled" indistinguishable from
+      // a DNS failure or an own-uuid refusal (GenericError(std::string)'s std::error_code
+      // member is always default-constructed -- see Replica::LastGreetEc()'s own doc comment,
+      // replica.h -- so `ec` itself cannot carry the specific errc here; LastGreetEc() is the
+      // one channel that does) -- strictly worse than pre-task behavior, where this would have
+      // just succeeded. Recognized *only* by these two specific errcs: every other reason
+      // Start() can fail (unreachable host, own uuid, a uuid already claimed by another live
+      // peer, ...) still fails the command exactly as before -- silently backgrounding those
+      // would hide a real misconfiguration.
+      std::error_code greet_ec = r->LastGreetEc();
+      if (greet_ec == std::errc::device_or_resource_busy ||
+          greet_ec == std::errc::resource_unavailable_try_again) {
+        r->EnableReplication();         // fresh state_mask_/fiber; Start() never touched sync_fb_.
+        mode = StartMode::kBackground;  // Step 3 below must not re-start the fiber.
+      } else {
+        return ec ? ec : GenericError{"replication cancelled"};
+      }
+    }
   } else {
     r->EnableReplication();
   }
@@ -283,6 +338,18 @@ std::vector<PeerReplicationManager::Endpoint> PeerReplicationManager::Endpoints(
   for (auto& pl : peers_)
     out.push_back(pl.ep);
   return out;
+}
+
+bool PeerReplicationManager::HasUnestablishedPeerWithUuid(std::string_view uuid) const {
+  {
+    util::fb2::LockGuard lk(mu_);
+    if (closed_)
+      return false;
+  }
+  // Deliberately outside the lock above and answered by identity_claims_ alone: see this method's
+  // own doc comment (peer_replication.h) and the PeerIdentityClaims class comment for why that
+  // registry's lock is kept independent of mu_.
+  return identity_claims_.HasUnestablishedClaim(uuid);
 }
 
 size_t PeerReplicationManager::Size() const {

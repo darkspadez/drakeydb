@@ -185,8 +185,15 @@ class RdbSaver {
   // if align_writes is true - writes data in aligned chunks of 4KB to fit direct I/O requirements.
   // snapshot_id - allows to identify that group of files belongs to the same snapshot
   // replica_dfly_version - upper bound for conditional serialization of new features.
+  // drakeydb: Phase 3 T7b -- peer_mode: true only for a full sync serving an admitted peer of an
+  // active node (see DflyCmd::StartFullSyncInThread, dflycmd.cc); threaded down to the
+  // SliceSnapshot this RdbSaver owns, gating the full-sync window's concurrent journal blob
+  // filter (see SliceSnapshot::ConsumeJournalChange, snapshot.cc). Defaults false so the OTHER
+  // RdbSaver call site (detail/save_stages_controller.cc's local backup/.rdb-file save, which is
+  // never a peer full sync) needs no change.
   explicit RdbSaver(::io::Sink* sink, SaveMode save_mode, bool align_writes,
-                    std::string snapshot_id, DflyVersion replica_dfly_version);
+                    std::string snapshot_id, DflyVersion replica_dfly_version,
+                    bool peer_mode = false);
 
   ~RdbSaver();
 

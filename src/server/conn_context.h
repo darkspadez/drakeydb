@@ -182,6 +182,12 @@ struct ConnectionState {
     std::string repl_ip_address;
     uint32_t repl_listening_port = 0;
     std::string repl_node_uuid;  // set by REPLCONF UUID; empty if the peer never sent one
+    // drakeydb: fork protocol version and peer-mode request, set by REPLCONF DRAKEY-VERSION /
+    // REPLCONF PEER (server_family.cc ReplConf). Populated unconditionally for any drakeydb
+    // consumer; only an active node's admission check (ReplConf's CAPA dragonfly case) and
+    // DflyCmd::CreateSyncSession act on the values. See node_identity.h for kDrakeydbReplVersion.
+    unsigned repl_drakey_version = 0;
+    bool repl_is_peer = false;
   };
 
   struct SquashingInfo {
@@ -351,6 +357,17 @@ class ConnectionContext : public facade::ConnectionContext {
   // This flag is true only on replica side, where we need to setup a special ConnectionContext
   // instance that helps applying commands coming from master.
   bool is_replicating = false;
+
+  // drakeydb: Phase 3 apply-origin metadata. Set once via JournalExecutor::SetApplyOrigin() at
+  // flow setup for a peer replication link (see journal/executor.h); stays at the kSelfIdx
+  // default for an ordinary client connection. Never reset per command (see
+  // CommandContext::ReuseInternal, conn_context.cc), so this persists for the connection's
+  // lifetime, matching a peer link's origin being constant. Copied onto the Transaction in
+  // PrepareTransaction (main_service.cc), which is what actually stamps journal entries.
+  // 0 == PeerRegistry::kSelfIdx (server/multi_master.h); a literal, not the named constant, to
+  // avoid pulling that header into one of the most widely-included headers in the tree.
+  uint32_t repl_origin_idx = 0;
+  uint64_t repl_mvcc = 0;
 
   bool monitor = false;  // when a monitor command is sent over a given connection, we need to aware
                          // of it as a state for the connection

@@ -788,7 +788,12 @@ void OpScanAndDelete(const OpArgs& op_args, const ScanOpts& scan_opts, uint64_t*
       continue;
     db_slice.Del(op_args.db_cntx, it);
     if (op_args.shard->journal()) {
-      RecordDelete(op_args.db_cntx.db_index, key);
+      // drakeydb: Phase 3 -- op_args.db_cntx carries this transaction's replication-apply origin
+      // (see DbContext::repl_origin_idx). Note RmGeneric (this op's only caller) builds its own
+      // OpArgs with tx=nullptr and a DbContext hand-rolled from connection state, bypassing the
+      // transaction system entirely -- so RM's DELs are always self-originated regardless of this
+      // overload; there is no transaction here to inherit an origin from.
+      RecordDelete(op_args.db_cntx, key);
     }
     ++count;
   }

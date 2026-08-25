@@ -1652,7 +1652,10 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
   if (auto res = db_slice.FindMutable(db_cntx, key, OBJ_SET); res) {
     db_slice.DelMutable(db_cntx, std::move(*res));
     if (db_slice.shard_owner()->journal()) {
-      RecordDelete(db_cntx.db_index, key);
+      // drakeydb: Phase 3 -- db_cntx carries the causing transaction's replication-apply origin
+      // (see DbContext::repl_origin_idx), so this derived DEL inherits it rather than always
+      // being attributed to this node.
+      RecordDelete(db_cntx, key);
     }
     return true;
   }

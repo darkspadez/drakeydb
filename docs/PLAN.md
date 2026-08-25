@@ -3,15 +3,16 @@
 > **Continue here.** This is the approved, living plan and canonical copy for the drakeydb fork.
 > Update the status block below as phases land.
 
-## Current status (last updated 2026-08-22)
+## Current status (last updated 2026-08-25)
 
 | Phase | Status | Where |
 |---|---|---|
 | **P0 — Repo hygiene + rename** | ✅ **complete, verified** | PR [#1](https://github.com/darkspadez/drakeydb/pull/1), branch `feat/phase0-drakeydb-rename`, commit `7ca99f4c` |
 | **P1 — Identity foundations** | ✅ **complete, verified** | branch `feat/phase1-identity`, commits `9e653ab3..9c491fac` |
-| **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3), branch `feat/phase2-fanin` — see [Phase 2](#phase-2--writable-multi-source-replica-fan-in) |
-| **P3 — Origin-tagged journal + active pair/mesh** | ⏭️ **next up** | see [Phase 3](#phase-3--origin-tagged-journal--active-pairmesh) |
-| P4–P9 | not started | — |
+| **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3) **merged** as `cd8e0602` — see [Phase 2](#phase-2) |
+| **P3 — Origin-tagged journal + active pair/mesh** | ✅ **complete, verified** | PR [#4](https://github.com/darkspadez/drakeydb/pull/4), branch `feat/phase3-origin-journal`, 30 commits `6b0c995a..7bddd7fe` — see [Phase 3](#phase-3) |
+| **P4 — MVCC store + stamping + wire** | ⏭️ **next up** | see [Phase 4](#phase-4--mvcc-store--stamping--wire) |
+| P5–P9 | not started | — |
 
 **P0 verification record** (Ubuntu 24.04 arm64 container, OrbStack): debug build produces
 `build-dbg/drakeydb` + `dragonfly` compat symlink; `--version` → `drakeydb dev-…`; live server
@@ -190,7 +191,18 @@ untracked in `KeyDB/` (local reference only, gitignored). The goals:
   suppressed (`db.cpp:1988-1990`), gated on `capa activeExpire` (`replication.cpp:1798`);
   FAILOVER rejected in active mode.
 - KeyDB things NOT ported: dead `mvccLastSync`/`staleKeyMap` machinery (verified never fires);
-  arrival-order-only streaming (we add an LWW guard); per-boot UUID regeneration (we persist).
+  KeyDB's **reciprocal-connect tiebreak is also dead code** (`replication.cpp:1575-1588`): it
+  guards on `FSameUuidNoNil` (true only when the two uuids are equal, `:92-98`) and then
+  `memcmp`s those same two buffers, so the result is always 0 and `freeClientAsync` never
+  fires — the comparison was meant to be against `cserver.uuid`. P3 ports the intent, fixed;
+  arrival-order-only streaming (we add an LWW guard); per-boot UUID regeneration (we persist);
+  `processReplconfUuid`'s reciprocal-connect tiebreak (`replication.cpp:1557-1599`) is also dead
+  code -- it guards on `FSameUuidNoNil(mi->master_uuid, c->uuid)`, true only when the two uuids
+  are *equal* (`replication.cpp:92-98`), so the following `memcmp(mi->master_uuid, c->uuid, ...)
+  < 0` compares a value with itself and is always `0`; `freeClientAsync` never fires. D-7 ports
+  the *intent* (self uuid vs. peer uuid), not the code: `ShouldRefuseReciprocalPeer`
+  (`peer_replication.{h,cc}`) plus `PeerReplicationManager::HasUnestablishedPeerWithUuid`, called
+  from the admission check in `server_family.cc`'s `ReplConf`.
 - Auto-update pings dragonflydb.io on `v`-prefixed tags (`dfly_main.cc:481`); `DflyVersion`
   (`version.h`, VER6) is the upstream replication protocol version — leave to upstream.
 
@@ -260,7 +272,7 @@ tiering, and `--experimental_cascaded_partial_sync`.
 | `journal/types.h` | `EntryBase` += `origin_idx`, `mvcc`, `entry_flags`; `JournalItem` += `origin_idx` (ring-buffer filtering without reparse) |
 | `journal/serializer.cc` (~57-85, 205-235) | COMMAND case: header `2` + ext fields in active mode, else byte-identical `1`; reader accepts both |
 | `journal/journal_slice.cc` (~107-134) | thread origin into `JournalItem`/`JournalChangeItem` |
-| `journal/streamer.h/.cc` | `Config` += `{peer_uuid, peer_mode}`; live + partial-replay paths drop non-self-origin and expiry-flagged entries for peer consumers |
+| `journal/streamer.h/.cc` | `Config` += `{peer_mode}` (**as built** — a `peer_uuid` field was added then removed in the P3 fix wave: it was never read, since the filter keys on `origin_idx`, not on the peer's uuid); live + partial-replay paths drop non-self-origin and expiry-flagged entries for peer consumers, via the shared `journal::PassesPeerEchoFilter` |
 | `journal/executor.h/.cc` (~36-74) | set/clear apply-context around `Execute`; P5 streaming-LWW pre-check for classified commands |
 | `transaction.cc` (~1622-1663) | `LogJournalOnShard` reads origin/mvcc from context (default self + clock tick) |
 | `tx_base.cc` (~55-70) | manual `RecordJournal` helpers read origin context; expiry `DEL` sets entry-flag bit0 |
@@ -333,6 +345,8 @@ wiring task and +12/-0 in the ReplConf task.
 Note: inside `slaveN:`, `node_uuid` is inserted **before** `lag`, not appended last. `lag` must
 stay the trailing field — `replication_test.py` and `cluster_test.py` both parse it with a
 `lag=([0-9]+)\r\n` regex that anchors on the line ending.
+
+<a id="phase-2"></a>
 
 ## Phase 2 — Writable multi-source replica (fan-in) ✅ (branch `feat/phase2-fanin`)
 Flags + validation; peer-mode `Replica` (no read-only flip; skip flush; override-load merge,
@@ -418,7 +432,9 @@ the Phase 2 suite added to `multimaster_test.py`.
     rename) succeed — the loser keeps running with a uuid that no longer matches the file a
     restart would load.
 
-## Phase 3 — Origin-tagged journal + active pair/mesh
+<a id="phase-3"></a>
+
+## Phase 3 — Origin-tagged journal + active pair/mesh ✅ (branch `feat/phase3-origin-journal`)
 Journal v2 framing; origin on `JournalItem`/`JournalChangeItem`; apply-context plumbing
 (ConnectionContext → Transaction → auto + manual journal paths); streamer peer filter
 (self-origin only, expiry-DELs suppressed to peers, full stream to plain sub-replicas); consumer
@@ -427,6 +443,76 @@ UUID/version gating in `DflyCmd`; expiry entry-flag.
 load (hash-compare via `replication_utils`), echo-storm absence (write counters plateau),
 FLUSHALL flood parity, plain sub-replica of A sees B-origin writes + expiry DELs; 3-node mesh
 convergence; node kill/restart. Manual: 3-container compose, cross-writes, `DEBUG` digest compare.
+
+
+**Delivered.** All gated on `--active_replica`; with the flag off, **journal bytes are
+byte-identical to upstream** (proved by a golden-buffer test, not by inspection). `journal/types.h`:
+`Op::ORIGIN=16`, `EntryBase` += `origin_idx`/`mvcc`/`entry_flags` (+`kEntryFlagExpired`), and —
+load-bearing — `JournalItem` += `origin_idx`/`entry_flags`/`opcode`, because the ring buffer stores
+`JournalItem` and the partial-replay path rebuilds a bare `JournalChangeItem` from `data` alone.
+`serializer.{h,cc}`: `extended_framing` ctor flag; the deprecated varint becomes `1` (legacy) or `2`
++ `{origin_idx, mvcc, entry_flags}`; reader is version-agnostic and now **errors** on an unknown
+header instead of silently misparsing it as COMMAND. Apply-context rides `ConnectionContext` →
+`Transaction`, hooked once at `PrepareTransaction`, plus `dist_trans` (EXEC) and the non-atomic
+squash stub. `RecordExpiryBlocking` sets the expiry flag; a `DbContext`-carried origin gives derived
+DELs (`DeleteIfEmpty`/`DeleteSetIfEmpty`) the originating peer's identity. `journal::PassesPeerEchoFilter`
+is the single shared predicate used by **both** `JournalStreamer::ShouldWrite` and
+`SliceSnapshot::ConsumeJournalChange`, so stable sync and the full-sync window cannot drift apart.
+Peer admission replaces P2's blanket refusal: `REPLCONF DRAKEY-VERSION` + `REPLCONF PEER`, sent in
+`Greet()` before `capa dragonfly` so the master sees them at admission time. Peer-mode LSN accounting
+(`Op::LSN` markers on filtered gaps, adopted authoritatively) keeps a filtered peer's resume offset
+correct. Reciprocal-connect uuid tiebreak with a background fallback for interactive `REPLICAOF`.
+
+**Verified:** full `ninja` warning-free; `ctest -L DFLY`; pytest `multimaster_test.py` **41 passed**,
+`replication_test.py` **43 passed / 0 failed**, `replication_specific_test.py` **61 passed / 0 failed**.
+Timing-adjacent tests were each run 10-15x to establish a pass rate rather than trusting a single
+green run. `clang++ -Wthread-safety` run over all 11 concurrency-relevant TUs: **0 diagnostics** —
+worth knowing because `CMakeLists.txt:77-79` gates that analysis on Clang and the local container
+builds with g++, so it never runs in the ordinary local gate.
+
+**Decisions and behaviour changes to know about:**
+- **D2b — an active node now REFUSES a peer-mode source that does not identify itself.** P2
+  accepted fan-in from a stock Dragonfly master (uuid simply absent). Without a uuid there is no
+  origin, and stamping such writes self-origin would forward them to peers. On the consumer side,
+  the UUID requirement is likewise scoped to `PEER 1`: a fork-versioned non-PEER consumer remains
+  a plain full-stream replica even without a UUID. Missing or old `DRAKEY-VERSION` is a separate
+  refusal condition. KeyDB masters do reply with a uuid, so P7 onboarding is unaffected; what stops
+  working is peer-mode fan-in from **stock Dragonfly or plain Redis** while `--active_replica` is on.
+- **The replica handshake is no longer wire-identical to upstream** (two additive REPLCONF pairs,
+  which pre-fork masters reject harmlessly). It must be unconditional, because admission requires
+  `DRAKEY-VERSION` even from a plain sub-replica of an active node. **Journal bytes** — the property
+  that protects upstream mergeability and stock interop — are untouched.
+- The spec's earlier claim that the `PrepareTransaction` hook covers *every* journaling path was
+  **false**: EXEC's `dist_trans` and the non-atomic squash `local_tx` bypass it. Both now inherit
+  origin explicitly.
+- `SetOverrideExistingKeys(true)` is **behaviourally inert** — `rdb_load.cc:3273` gates only a
+  `LOG(WARNING)` on it; `AddOrUpdate` overwrites regardless. **P6's merge-LWW must implement that
+  behaviour rather than assume it exists.**
+
+**Known limitations carried forward (P4+):**
+- **Blocker on enabling `--active_replica` by default:** a *locally* issued command whose lazy field
+  expiry empties a collection (`hset_family.cc:996`, `set_family.cc:1178`, and the background index
+  path `search_family.cc:4295` → `doc_accessors.cc:220`) emits an **unflagged, self-originated** DEL
+  that the peer filter forwards. `hset_family.cc:996` sits on a **read** command's path, so a plain
+  `HTTL` on a lazily-expired collection can delete the key on a peer whose copy still holds unexpired
+  fields under clock skew. Needs a "why is this empty" signal threaded through ~a dozen call sites.
+- A peer link whose traffic is entirely filtered emits markers only on the drop-path throttle; after a
+  *failed apply* the sticky `apply_failed_` flag stops adoption, so the counter drifts and a reconnect
+  likely forces a full resync rather than replaying the failed entry. Safe (never ahead of applied),
+  but layering `ReportError` on the peer-mode apply failure would make it prompt.
+- `replica.cc:635`'s legacy Redis/KeyDB-protocol loader is peer-*aware* but never gets
+  `SetApplyOrigin`. Unreachable today (a redis-protocol master emits no `RDB_OPCODE_JOURNAL_BLOB`) —
+  **but P7 is exactly the phase that would make it carry real data.**
+- The plain-replica misconfiguration guard is a `DCHECK`, so its loud failure protects debug/CI only;
+  a release build degrades to a warning plus silent drops.
+
+**Testing lesson worth keeping.** A **convergence assertion cannot detect an echo storm.** With the
+origin filter reverted, two nodes still converge: symmetric amplification makes every node replay the
+same bounced ops, and `@assert_eventually`'s retry loop then finds a moment where they coincide — so
+convergence-under-load is *structurally incapable* of catching it, not merely unlucky. The load-bearing
+detector is the command-counter check (`assert_no_command_storm`); its bound is topology-dependent and
+decomposes as `3 x (shard_flows x peers x 1/s REPLCONF ACK) + 1 self-INFO` (measured 4 for 2 nodes,
+7 for 3 — both matching prediction exactly). Recalibrate it when the topology changes.
 
 ## Phase 4 — MVCC store + stamping + wire
 `MvccClock`; side table (mirror all `mcflag` touch-points incl. Del/flush); stamp local writes

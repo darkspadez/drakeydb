@@ -44,8 +44,12 @@ taking either side blindly:
 
 | File | drakeydb change |
 |---|---|
-| `src/server/journal/serializer.cc` | journal v2 framing (origin/mvcc extension) |
-| `src/server/journal/types.h`, `journal_slice.cc`, `streamer.*`, `executor.*` | origin tagging + peer filtering |
+| `src/server/journal/serializer.cc` | journal v2 framing (origin/mvcc extension). **Hazard:** the reader HARD-ERRORS on a framing version outside `{1, 2}` (`errc::illegal_byte_sequence`) — if upstream ever repurposes that deprecated varint field with a `3`, every drakeydb replica fails to connect to it until this reader is updated to recognize the new value |
+| `src/server/journal/types.h`, `types.cc`, `journal_slice.cc`, `streamer.*`, `executor.*` | origin tagging + peer filtering; `journal::PassesPeerEchoFilter` is the SINGLE shared predicate — if upstream churn forces a copy, the copies must stay identical or stable sync and full sync silently diverge |
+| `src/server/main_service.cc` | `PrepareTransaction` origin hook (P3) — note EXEC's `dist_trans` and the non-atomic squash stub bypass it and inherit origin separately |
+| `src/server/snapshot.cc`, `rdb_save.*`, `rdb_load.*` | full-sync window: peer filter on the concurrent journal blob, and `SetApplyOrigin` on the loader |
+| `src/server/journal/tx_executor.cc` | peer-mode authoritative `Op::LSN` adoption (filtered streams desync a counting receiver) |
+| `src/server/node_identity.cc` | uuid persistence via `link()` for atomic EEXIST — do NOT "simplify" to `O_CREAT\|O_EXCL`+write, which exposes a zero-length uuid file to a concurrent reader and turns into `exit(1)` |
 | `src/server/replica.cc` | peer-mode (writable, no-flush) sync path; hooks: no shard flip/flush, sync gate, self/duplicate uuid guard + claim release |
 | `src/server/main_service.h`, `main_service.cc` | exclusive LOADING reservation for peer full sync |
 | `src/server/dflycmd.cc` | peer version/UUID gating; `DFLY TAKEOVER` refusal in active mode |

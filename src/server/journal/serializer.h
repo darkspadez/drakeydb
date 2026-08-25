@@ -17,7 +17,13 @@ namespace dfly {
 // It automatically keeps track of the current database index.
 class JournalWriter {
  public:
-  JournalWriter(io::Sink* sink);
+  // drakeydb: `extended_framing` selects Phase 3 journal wire format v2 (adds
+  // origin_idx/mvcc/entry_flags to Op::COMMAND and enables Op::ORIGIN). Defaults to false so
+  // every existing call site stays byte-identical to upstream unless it opts in explicitly.
+  // The serializer never reads global/flag state itself -- callers (typically gated on
+  // IsActiveReplica(), see multi_master.h) decide and pass it in, so tests can drive both
+  // framing modes directly.
+  JournalWriter(io::Sink* sink, bool extended_framing = false);
 
   // Write single entry to sink.
   void Write(const journal::Entry& entry);
@@ -30,6 +36,7 @@ class JournalWriter {
  private:
   io::Sink* sink_;
   std::optional<DbIndex> cur_dbid_{};
+  bool extended_framing_;
 };
 
 // JournalReader allows deserializing journal entries from a source.

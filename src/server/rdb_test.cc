@@ -19,12 +19,15 @@ extern "C" {
 #include "base/logging.h"
 #include "core/bloom.h"
 #include "core/cuckoo.h"
+#include "core/intent_lock.h"
 #include "facade/facade_test.h"  // needed to find operator== for RespExpr.
 #include "io/file.h"
 #include "io/file_util.h"
 #include "server/engine_shard_set.h"
+#include "server/journal/journal.h"
 #include "server/journal/serializer.h"
 #include "server/journal/types.h"
+#include "server/multi_master.h"
 #include "server/rdb_extensions.h"
 #include "server/rdb_load.h"
 #include "server/rdb_save.h"
@@ -2018,6 +2021,111 @@ TEST_F(RdbTest, JournalDelWaitsForShardLoads) {
   ASSERT_FALSE(ec) << ec.message();
 
   EXPECT_THAT(Run({"GET", key}), ArgType(RespExpr::NIL));
+}
+
+// drakeydb: Phase 3 T7b -- a peer's full sync must filter its CONCURRENT journal blob (writes
+// racing the snapshot) exactly like JournalStreamer::ShouldWrite filters the stable-sync stream
+// (journal::PassesPeerEchoFilter, journal/types.h); a plain replica's full sync must keep
+// receiving that blob completely unfiltered -- filtering it would be silent data loss. Drives the
+// REAL send side (RdbSaver -> SliceSnapshot::ConsumeJournalChange, snapshot.cc) via
+// journal::RecordEntry -- not a reimplementation of it -- capturing a peer-mode and a
+// plain-replica full sync of the same three concurrent writes, then observes the filtering effect
+// through the REAL receive side (a fresh RdbLoader) rather than hand-decoding the wire bytes.
+//
+// Op::ORIGIN's own drop condition is intentionally NOT exercised here (it would need
+// --active_replica live before this fixture's shard set initializes, purely so the entry's WIRE
+// BYTES satisfy an unrelated DCHECK on extended framing -- the filter DECISION itself reads only
+// the JournalItem struct fields journal::RecordEntry populates directly, never the wire bytes);
+// PassesPeerEchoFilterTest (journal_test.cc) covers that condition exhaustively on the shared
+// predicate directly, without needing that machinery.
+//
+// Falsifying (verified by hand -- see task-7b-report.md): gating the filter out of
+// SliceSnapshot::ConsumeJournalChange entirely (reverting to an unconditional
+// serializer_->WriteJournalEntry(...), no peer_mode check) makes the peer_mode=true load ALSO
+// show "foreignkey"=="foreignval" and "expirykey"==NIL -- identical to the plain-replica load; the
+// two capture results become indistinguishable, and the two EXPECT lines that currently fail
+// (foreignkey, expirykey) both flip. Reverting only RdbSaver::Impl::CreateSliceSnapshot's
+// peer_mode forwarding (passing a hard-coded false into SliceSnapshot's constructor there instead
+// of peer_mode_) reproduces the identical failure for the peer_mode=true case alone, proving the
+// plumbing itself -- not just the shared predicate, which PassesPeerEchoFilterTest covers on its
+// own -- is load-bearing here.
+TEST_F(RdbTest, PeerFullSyncFiltersConcurrentJournalPlainReplicaUnaffected) {
+  auto capture = [&](bool peer_mode) {
+    io::StringSink sink;
+    return pp_->at(0)->Await([&]() -> std::string {
+      // drakeydb: Phase 3 T7b -- journal::RecordEntry below DCHECKs the ring buffer has a
+      // non-zero capacity, which is only true once journaling has actually been engaged on this
+      // shard (normally the first time a replica connects; a fresh BaseFamilyTest boot never
+      // does that on its own). journal::StartInThread's Init() call is idempotent (an early
+      // return once already initialized), so calling it here on every capture() invocation is
+      // harmless on the second call.
+      journal::StartInThread();
+
+      RdbSaver saver(&sink, SaveMode::SINGLE_SHARD_WITH_SUMMARY, /*align_writes=*/false, "",
+                     DflyVersion::CURRENT_VER, peer_mode);
+      ExecutionState cntx;
+      EngineShard* shard = EngineShard::tlocal();
+      CHECK(!saver.SaveHeader(RdbSaver::GetGlobalData(service_.get(), true)));
+
+      // drakeydb: Phase 3 T7b -- DbSlice::RegisterOnChange (SliceSnapshot::Start's own
+      // RegisterChangeListener call, inside StartSnapshotInShard below) DCHECKs the shard's
+      // intent lock is held: in production, DFLY SYNC is a GLOBAL_TRANS command, so ordinary
+      // command scheduling already holds it for the whole StartFullSyncInThread call (see
+      // DflyCmd::Sync's Transaction::Guard, which is a SEPARATE, additional expiry-disabling
+      // mechanism -- not what holds this lock). This test drives RdbSaver directly, off the
+      // command-dispatch path, so it must satisfy that same precondition explicitly.
+      shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+      saver.StartSnapshotInShard(/*stream_journal=*/true, &cntx, shard);
+
+      // Self-origin write: passes the filter for both a peer and a plain replica.
+      array<string_view, 2> self_kv{"selfkey", "selfval"};
+      journal::RecordEntry(0, journal::Op::COMMAND, 0, std::nullopt,
+                           journal::Entry::Payload{"SET", ArgSlice{self_kv.data(), self_kv.size()}},
+                           PeerRegistry::kSelfIdx);
+
+      // Foreign-origin write: dropped for a peer, kept for a plain replica.
+      constexpr uint32_t kPeerIdx = 9;  // some peer's PeerRegistry index; != kSelfIdx.
+      array<string_view, 2> foreign_kv{"foreignkey", "foreignval"};
+      journal::RecordEntry(
+          0, journal::Op::COMMAND, 0, std::nullopt,
+          journal::Entry::Payload{"SET", ArgSlice{foreign_kv.data(), foreign_kv.size()}}, kPeerIdx);
+
+      // Self-origin, expiry-flagged DEL: dropped for a peer, kept for a plain replica.
+      array<string_view, 1> del_key{"expirykey"};
+      journal::RecordEntry(0, journal::Op::COMMAND, 0, std::nullopt,
+                           journal::Entry::Payload{"DEL", ArgSlice{del_key.data(), del_key.size()}},
+                           PeerRegistry::kSelfIdx, /*mvcc=*/0, journal::kEntryFlagExpired);
+
+      CHECK(!saver.StopFullSyncInShard(shard));
+      shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+      return std::move(sink).str();
+    });
+  };
+
+  std::string peer_bytes = capture(/*peer_mode=*/true);
+  std::string full_bytes = capture(/*peer_mode=*/false);
+
+  auto load_and_check = [&](const std::string& bytes) {
+    ASSERT_EQ(Run({"FLUSHALL"}), "OK");
+    ASSERT_EQ(Run({"SET", "expirykey", "baseline"}), "OK");
+    io::BytesSource src{io::Buffer(bytes)};
+    RdbLoadContext load_context;
+    auto ec = pp_->at(0)->Await([&] {
+      RdbLoader loader(service_.get(), &load_context);
+      return loader.Load(&src);
+    });
+    ASSERT_FALSE(ec) << ec.message();
+  };
+
+  load_and_check(peer_bytes);
+  EXPECT_EQ(Run({"GET", "selfkey"}), "selfval");
+  EXPECT_THAT(Run({"GET", "foreignkey"}), ArgType(RespExpr::NIL));
+  EXPECT_EQ(Run({"GET", "expirykey"}), "baseline");
+
+  load_and_check(full_bytes);
+  EXPECT_EQ(Run({"GET", "selfkey"}), "selfval");
+  EXPECT_EQ(Run({"GET", "foreignkey"}), "foreignval");
+  EXPECT_THAT(Run({"GET", "expirykey"}), ArgType(RespExpr::NIL));
 }
 
 // Test that an unsupported module type is skipped, and that the keys before and after it are

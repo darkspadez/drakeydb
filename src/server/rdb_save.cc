@@ -1263,8 +1263,10 @@ class RdbSaver::Impl final : public SliceSnapshot::SnapshotDataConsumerInterface
  public:
   // We pass K=sz to say how many producers are pushing data in order to maintain
   // correct closing semantics - channel is closing when K producers marked it as closed.
+  // drakeydb: Phase 3 T7b -- peer_mode forwarded to every SliceSnapshot this Impl creates; see
+  // RdbSaver's own constructor comment (rdb_save.h).
   Impl(bool align_writes, unsigned producers_len, CompressionMode compression_mode,
-       SaveMode save_mode, io::Sink* sink, DflyVersion replica_dfly_version);
+       SaveMode save_mode, io::Sink* sink, DflyVersion replica_dfly_version, bool peer_mode);
 
   ~Impl();
 
@@ -1330,12 +1332,14 @@ class RdbSaver::Impl final : public SliceSnapshot::SnapshotDataConsumerInterface
   CompressionMode compression_mode_;
   SaveMode save_mode_;
   DflyVersion replica_dfly_version_ = DflyVersion::CURRENT_VER;
+  // drakeydb: Phase 3 T7b -- see RdbSaver's constructor comment (rdb_save.h).
+  bool peer_mode_ = false;
 };
 
 // We pass K=sz to say how many producers are pushing data in order to maintain
 // correct closing semantics - channel is closing when K producers marked it as closed.
 RdbSaver::Impl::Impl(bool align_writes, unsigned producers_len, CompressionMode compression_mode,
-                     SaveMode sm, io::Sink* sink, DflyVersion replica_dfly_version)
+                     SaveMode sm, io::Sink* sink, DflyVersion replica_dfly_version, bool peer_mode)
     : sink_(sink),
       shard_snapshots_(producers_len),
       meta_serializer_(CompressionMode::NONE),  // Note: I think there is not need for compression
@@ -1350,6 +1354,7 @@ RdbSaver::Impl::Impl(bool align_writes, unsigned producers_len, CompressionMode 
   }
   save_mode_ = sm;
   replica_dfly_version_ = replica_dfly_version;
+  peer_mode_ = peer_mode;
 }
 
 void RdbSaver::Impl::CleanShardSnapshots() {
@@ -1452,7 +1457,7 @@ void RdbSaver::Impl::StartSnapshotting(bool stream_journal, ExecutionState* cntx
 SnapshotPtr RdbSaver::Impl::CreateSliceSnapshot(EngineShard* shard, DbSlice* db_slice,
                                                 ExecutionState* cntx) {
   return SnapshotPtr(
-      new SliceSnapshot(compression_mode_, db_slice, this, cntx, replica_dfly_version_),
+      new SliceSnapshot(compression_mode_, db_slice, this, cntx, replica_dfly_version_, peer_mode_),
       OwnerThreadDeleter::FromShard(shard));
 }
 
@@ -1658,7 +1663,7 @@ SnapshotPtr& RdbSaver::Impl::GetSnapshot(EngineShard* shard) {
 }
 
 RdbSaver::RdbSaver(::io::Sink* sink, SaveMode save_mode, bool align_writes, std::string snapshot_id,
-                   DflyVersion replica_dfly_version)
+                   DflyVersion replica_dfly_version, bool peer_mode)
     : replica_dfly_version_(replica_dfly_version), snapshot_id_(std::move(snapshot_id)) {
   CHECK_NOTNULL(sink);
   CompressionMode compression_mode = GetDefaultCompressionMode();
@@ -1688,7 +1693,7 @@ RdbSaver::RdbSaver(::io::Sink* sink, SaveMode save_mode, bool align_writes, std:
   }
   VLOG(1) << "Rdb save using compression mode:" << uint32_t(compression_mode_);
   impl_.reset(new Impl(align_writes, producer_count, compression_mode_, save_mode, sink,
-                       replica_dfly_version_));
+                       replica_dfly_version_, peer_mode));
   save_mode_ = save_mode;
 }
 

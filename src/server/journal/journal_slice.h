@@ -50,6 +50,34 @@ class JournalSlice {
   /// from the buffer.
   bool IsLSNInBuffer(LSN lsn) const;
   std::string_view GetEntry(LSN lsn) const;
+  // drakeydb: Phase 3 metadata accessor. Returns the full buffered JournalItem -- including
+  // origin_idx/entry_flags -- so a later peer-echo filter can inspect them without reparsing
+  // `data`. Added alongside GetEntry() (rather than widening it) so a caller that only wants the
+  // raw bytes isn't forced to pull in the rest of JournalItem.
+  //
+  // drakeydb: fix-round-1 -- GetEntry()/GetEntryMeta() were sibling accessors when this comment
+  // was first written, because GetEntry() had a caller in streamer.cc that stayed on raw bytes
+  // only. T5's own MaybePartialStreamLSNs fix switched that call site to GetEntryMeta() (it needs
+  // origin_idx/entry_flags/opcode, not just `data`), so GetEntry() currently has no callers left
+  // anywhere in this tree -- noted here rather than removing GetEntry(), since it's still a
+  // reasonable narrower accessor for a future raw-bytes-only caller.
+  //
+  // drakeydb: Phase 3 T5 -- contract (undocumented until now; this task is GetEntryMeta's first
+  // caller outside JournalSlice itself, via journal::GetEntryMeta -> JournalStreamer::ShouldWrite
+  // / MaybePartialStreamLSNs):
+  //  - IsLSNInBuffer(lsn) is a MANDATORY precondition. It is checked only via DCHECK here (like
+  //    GetEntry() above), so it is NOT enforced in release builds -- callers must check it
+  //    themselves first, exactly as MaybePartialStreamLSNs's `while (... && IsLSNInBuffer(lsn))`
+  //    loop guard does.
+  //  - The returned reference points INTO the ring buffer and is invalidated by any subsequent
+  //    call that mutates it: AddLogRecord's push_back once the buffer is full (overwrites the
+  //    oldest slot), CleanEntries's rerase (age/byte-limit eviction), or set_capacity (growth).
+  //    Since AddLogRecord can run from another fiber that preempts the caller (e.g. between two
+  //    statements, or inside a callback the caller invokes while still holding the reference),
+  //    the safe pattern is: take the reference, copy out the fields you need, and let it go out
+  //    of scope before doing anything that might preempt -- never store it in a variable that
+  //    outlives that copy.
+  const JournalItem& GetEntryMeta(LSN lsn) const;
   // SetFlushMode with allow_flush=false is used to disable preemptions during
   // subsequent calls to AddLogRecord.
   // SetFlushMode with allow_flush=true flushes all log records aggregated
@@ -93,6 +121,10 @@ class JournalSlice {
 
   uint32_t max_age_ms_ = 0;
   size_t max_bytes_ = 0;
+
+  // drakeydb: cached once in Init() (--active_replica is boot-only), like max_age_ms_/
+  // max_bytes_ above, rather than reading the flag on every AddLogRecord call.
+  bool extended_framing_ = false;
 
   size_t ring_buffer_bytes_ = 0;
 };

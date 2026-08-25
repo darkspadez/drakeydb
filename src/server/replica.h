@@ -96,6 +96,19 @@ class Replica : ProtocolClient {
     return !exec_st_.IsRunning();
   }
 
+  // drakeydb D-7: the raw std::error_code Greet() returned during this Replica's most recent
+  // Start() call. Start()'s own check_connection_error lambda coerces any Greet() failure into a
+  // string-only GenericError -- GenericError(std::string) default-constructs its std::error_code
+  // member (execution_state.h), so Start()'s return value alone cannot tell a caller *which*
+  // errc Greet() actually produced. This is the one place a blocking Start() caller can recover
+  // it -- PeerReplicationManager::Add uses it to recognize the reciprocal-connect uuid tiebreak
+  // (device_or_resource_busy) specifically, among Start()'s many other possible failure reasons,
+  // without this class needing to know anything about the tiebreak itself. Default-constructed
+  // (empty/no-error) if Start() succeeded, was never called, or failed before reaching Greet().
+  std::error_code LastGreetEc() const {
+    return last_greet_ec_;
+  }
+
  private: /* Main standalone mode functions */
   // Coordinate state transitions. Spawned by start.
   void MainReplicationFb(std::optional<LastMasterSyncData> data);
@@ -215,6 +228,9 @@ class Replica : ProtocolClient {
   size_t repl_offs_ = 0, ack_offs_ = 0, initial_repl_offs_ = 0;
   unsigned state_mask_ = 0;  // see State enum above.
 
+  // drakeydb D-7: see LastGreetEc()'s own doc comment.
+  std::error_code last_greet_ec_;
+
   // When replica starts full sync it is set to false and true when it completes the full sync.
   // Disconnects do not reset this, so this variable is still true if the master
   // is not connected and the state_mask_ is cleared.
@@ -240,16 +256,51 @@ class Replica : ProtocolClient {
 
   // drakeydb: set iff this Replica is a peer-mode replica of an active node (see IsPeerMode()).
   std::optional<ReplicaPeerMode> peer_mode_;
+
+  // drakeydb: Phase 3 T6 -- the PeerRegistry origin index for master_context_.master_node_uuid,
+  // captured by Greet() from PeerRegistry::AddOrGet(). Threaded down to each DflyShardReplica
+  // (see InitiateDflySync) and to ConsumeRedisStream's own ConnectionContext, so writes applied
+  // from this peer are journaled with its origin instead of kSelfIdx. Stays at its default for a
+  // non-peer Replica, since Greet()'s peer-only branches never run for one.
+  // 0 == PeerRegistry::kSelfIdx (server/multi_master.h); a literal, not the named constant,
+  // matching ConnectionContext::repl_origin_idx's own convention (conn_context.h) to avoid
+  // pulling that header into this one just for a constant.
+  uint32_t peer_origin_idx_ = 0;
 };
 
 class RdbLoader;
 // This class implements a single shard replication flow from a Dragonfly master instance.
 // Multiple DflyShardReplica objects are managed by a Replica object.
 class DflyShardReplica : public ProtocolClient {
+  // drakeydb: Phase 3 T6 -- lets DflyShardReplicaOriginTest (peer_replication_test.cc)
+  // construct a flow directly (no socket) and inspect that the origin idx passed at
+  // construction reaches executor_'s ConnectionContext.
+  friend class DflyShardReplicaOriginTest;
+
+  // drakeydb: Phase 3 T6b -- lets DflyShardReplicaPeerModeTest (peer_replication_test.cc)
+  // construct a flow directly (no socket) and drive AdoptAuthoritativeLsn() to observe its effect
+  // on journal_rec_executed_, the same way DflyShardReplicaOriginTest above drives origin_idx.
+  friend class DflyShardReplicaPeerModeTest;
+
  public:
+  // `origin_idx`: this flow's PeerRegistry origin index (Replica::Greet() obtains it from
+  // PeerRegistry::AddOrGet()); PeerRegistry::kSelfIdx (0) for a non-peer flow. Threaded straight
+  // to executor_->SetApplyOrigin() at construction -- see that method's doc comment
+  // (journal/executor.h) for why this is set once here rather than reaching back into Replica.
+  // drakeydb: Phase 3 T7b -- also threaded to rdb_loader_->SetApplyOrigin() at construction, the
+  // same way and for the same reason: this flow's OTHER apply path (the full sync's embedded
+  // journal blob, RdbLoaderBase::HandleJournalBlob) must stamp this flow's origin too, not
+  // kSelfIdx by default.
+  //
+  // `peer_mode`: drakeydb: Phase 3 T6b -- true iff this flow belongs to a peer-mode Replica (see
+  // Replica::IsPeerMode()). Threaded in at construction the same way origin_idx is -- this class
+  // has no way to reach back into the owning Replica -- but, unlike origin_idx, kept as a member
+  // (see peer_mode_ below) rather than forwarded once and forgotten: it is consulted repeatedly,
+  // later, by StableSyncDflyReadFb, both to select TransactionReader's adopt-vs-compare behavior
+  // for Op::LSN and to gate AdoptAuthoritativeLsn().
   DflyShardReplica(ServerContext server_context, MasterContext master_context, uint32_t flow_id,
                    Service* service, std::shared_ptr<MultiShardExecution> multi_shard_exe,
-                   class RdbLoadContext* load_context);
+                   class RdbLoadContext* load_context, uint32_t origin_idx, bool peer_mode);
   ~DflyShardReplica();
 
   void Cancel();
@@ -291,6 +342,12 @@ class DflyShardReplica : public ProtocolClient {
   void Pause(bool pause);
 
  private:
+  // drakeydb: Phase 3 T6b -- adopts `master_lsn` (an incoming Op::LSN marker's payload) as
+  // journal_rec_executed_'s new authoritative value; a no-op outside peer mode. See the .cc
+  // definition for the full correctness argument (why this can never run the resume LSN ahead of
+  // what was actually applied) and StableSyncDflyReadFb for its one call site.
+  void AdoptAuthoritativeLsn(uint64_t master_lsn);
+
   Service& service_;
   MasterContext master_context_;
 
@@ -310,6 +367,31 @@ class DflyShardReplica : public ProtocolClient {
   // run out-of-order on the master instance.
   // Atomic, because JournalExecutedCount() can be called from any thread.
   std::atomic_uint64_t journal_rec_executed_ = 1;
+
+  // drakeydb: Phase 3 T6b -- see the constructor's doc comment for `peer_mode`. Named the same as
+  // (but independent of, and a different type than) Replica::peer_mode_ -- both classes already
+  // duplicate MasterContext master_context_ the same way; each keeps its own copy of what it
+  // needs rather than reaching back into the other.
+  bool peer_mode_ = false;
+
+  // drakeydb: Phase 3 T6b fix-round-1 (C1) -- set (peer mode only) by StableSyncDflyReadFb when
+  // ExecuteTx returns false while the link is still running (e.g. a local OOM on this replica --
+  // facade::DispatchResult::OOM is a normal operational outcome, not a can't-happen; see
+  // ExecuteTx's caller). journal_rec_executed_ is deliberately NOT advanced for that entry (see
+  // the comment on ExecuteTx's success branch below), so it still correctly names the un-applied
+  // entry as "still needed" -- but a LATER, authoritative Op::LSN marker (this task's own
+  // gap-correction marker, the fully-filtered-link resolution marker, or the pre-existing
+  // periodic heartbeat -- dflycmd.cc enables should_sent_lsn for peer links) would otherwise
+  // silently overwrite journal_rec_executed_ past that unresolved entry the moment it next fires,
+  // permanently losing it: a reconnect would never re-offer an LSN the counter claims is already
+  // resolved. Sticky (never cleared) for this flow's lifetime once set: the single scalar counter
+  // this class uses cannot represent "entry K failed but K+1..N succeeded", so once one entry's
+  // fate is unknown there is no way back to precise tracking short of a fresh full sync (a new
+  // DflyShardReplica, with a fresh journal_rec_executed_ seed from the RDB cut) -- which is
+  // exactly what a sufficiently stale journal_rec_executed_ (this flow having stopped advancing
+  // it via markers, however far behind the master's true LSN by the time of the next reconnect)
+  // naturally triggers. See AdoptAuthoritativeLsn's use of this flag.
+  bool apply_failed_ = false;
 
   util::fb2::Fiber sync_fb_, acks_fb_;
   size_t ack_offs_ = 0;
