@@ -11,6 +11,7 @@ import pytest
 import redis
 
 from .instance import DflyInstanceFactory, DflyStartException
+from .seeder import Seeder as SeederV2
 from .utility import assert_eventually, wait_available_async
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -1188,3 +1189,176 @@ async def test_active_replica_rejects_cluster_mode(df_factory: DflyInstanceFacto
     await assert_start_fails(
         df_factory.create(proactor_threads=1, active_replica="true", cluster_mode="emulated")
     )
+
+
+# ---- Phase 3: origin journal (T10) ----
+#
+# End-to-end proof, at seeder scale, that Phase 3's origin-echo guard (JournalStreamer::
+# ShouldWrite -> journal::PassesPeerEchoFilter, journal/types.cc) holds up once a mesh carries
+# realistic mixed-type load, not just the small explicit key sets the rest of this file uses.
+# Both tests below gate on wait_for_peers, never on check_all_replicas_finished: the latter is
+# master->replica shaped (it polls a replica's master_repl_offset against ITS master) and does
+# not describe a reciprocal mesh, where both sides are simultaneously master and replica.
+
+
+async def _total_commands_processed(c) -> int:
+    return int((await c.info("stats"))["total_commands_processed"])
+
+
+# drakeydb: measured healthy baseline (idle 2-node reciprocal peer mesh, proactor_threads=2 each
+# side, the pytest harness's default of 1 shard, 3s sample) was a rock-steady delta of 4 on BOTH
+# sides across every repeated measurement taken while developing this test (see task-10-report.md
+# for the full repetition log) -- dominated by the single shard's REPLCONF ACK flow
+# (DflyShardReplica::StableSyncDflyAcksFb, replica.cc: one ACK per shard flow per
+# FLAGS_replication_acks_interval, default 1000ms) plus this helper's own two INFO stats samples.
+# A real echo storm is a different order of magnitude:
+# test_peer_mesh_own_writes_not_echoed_back's docstring records an unbounded-amplification revert
+# climbing ~80 ops/s (240+ growth over 3s) from a single INCR. This bound sits well above the
+# measured idle baseline (comfortable room for scheduler jitter/CI noise) and well below any real
+# storm, so it is decisive without racing the clock.
+STORM_BOUND = 60
+
+
+async def assert_no_command_storm(*clients, settle=3.0, bound=STORM_BOUND):
+    """Sample each client's INFO stats total_commands_processed twice `settle` seconds apart and
+    assert the delta on every node stays under `bound`. See STORM_BOUND above for the measured
+    healthy baseline this bound is calibrated against.
+
+    Deterministic, not timing-fragile: idle mesh traffic (REPLCONF ACK keepalives, this helper's
+    own two INFO samples) is small and roughly constant regardless of scheduler jitter, while an
+    echo storm grows without limit -- so a generous bound a healthy mesh cannot approach is still
+    decisive against a real storm, without racing the clock or the storm's own growth rate.
+    """
+    before = [await _total_commands_processed(c) for c in clients]
+    await asyncio.sleep(settle)
+    after = [await _total_commands_processed(c) for c in clients]
+    for idx, (b, a) in enumerate(zip(before, after)):
+        delta = a - b
+        assert delta < bound, (
+            f"client[{idx}] total_commands_processed grew by {delta} in {settle}s (bound "
+            f"{bound}) -- looks like an echo storm, not idle keepalive traffic"
+        )
+
+
+async def test_bidirectional_seeder_load_converges_without_echo_storm(
+    df_factory: DflyInstanceFactory,
+):
+    """T10 items 1+2. Every other fan-in/echo test in this file drives a handful of explicit
+    keys; nothing yet drives realistic mixed-type load (strings, lists, sets, hashes, zsets,
+    JSON, streams, bloom/cuckoo/count-min structures) across a live reciprocal mesh. This test
+    seeds BOTH sides of an A<->B mesh concurrently with the harness's own Seeder (SeederV2,
+    aliased per replication_utils.assert_replica_data_matches's own pattern) and checks the two
+    things that matter once load stops: the datasets actually converge, and the mesh does not
+    keep churning on its own afterwards.
+
+    Convergence alone is not automatically meaningful here -- an earlier P3 task found a test
+    where a bare "does it converge" assertion passed even with the feature disabled, because a
+    redundant *full sync* merge of idempotent single-key SETs tolerates being applied twice.
+    Falsifying this test (below) found the same trap wearing a different disguise: with the
+    origin-echo guard disabled, BOTH A and B keep re-forwarding everything they receive back and
+    forth to each other symmetrically, so -- even though the amplification is real and unbounded
+    -- both sides end up replaying the exact same bounced multiset of operations in lockstep and
+    the convergence assertion still passes. So convergence is confirmed here to NOT be sufficient
+    on its own to catch this bug; it is kept as a real, meaningful assertion in its own right (a
+    mesh that cannot even agree on its data past a load burst is broken regardless of storms), but
+    the command-counter check below -- which is what actually caught the injected bug -- is the
+    one this test depends on for the echo-storm guarantee specifically. That is the T10 item 2
+    finding in miniature: an echo storm can be entirely invisible to a value/dataset assertion.
+
+    Falsifying (verified by hand; exact numbers in task-10-report.md): commenting out the
+    `item.origin_idx != PeerRegistry::kSelfIdx` branch in journal::PassesPeerEchoFilter
+    (journal/types.cc) -- the single shared gate both JournalStreamer::ShouldWrite and the
+    full-sync concurrent-journal-blob path call -- lets every peer forward everything it receives
+    right back to its origin. Observed: the convergence retry loop and the dbsize floor both still
+    passed (see above), but assert_no_command_storm failed with
+    `total_commands_processed grew by 36784 in 3.0s (bound 60)` on the first client sampled --
+    roughly 12,000 ops/s, far past any idle mesh and past even the ~80 ops/s single-INCR storm
+    test_peer_mesh_own_writes_not_echoed_back's docstring records (this test's storm is worse
+    because the seeder keeps many operations bouncing concurrently, not just one).
+    """
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    # Sequential, not concurrent: see test_peer_mesh_own_writes_not_echoed_back's docstring --
+    # a node mid full-sync-load answers PING with -LOADING, which fails the other side's Greet.
+    await attach(c_a, b)
+    await wait_for_peers(c_a, 1)
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+
+    seeder_a = SeederV2(key_target=1000)
+    seeder_b = SeederV2(key_target=1000)
+    await asyncio.gather(
+        seeder_a.run(c_a, target_deviation=0.1),
+        seeder_b.run(c_b, target_deviation=0.1),
+    )
+
+    @assert_eventually(times=300)
+    async def converged():
+        cap_a, cap_b = await asyncio.gather(SeederV2.capture(c_a), SeederV2.capture(c_b))
+        assert cap_a == cap_b
+
+    await converged()
+    # Not vacuous: both sides fed real, disjoint-prefixed data, so a match here is the union of
+    # both, not two empty datasets agreeing by default.
+    assert await c_a.dbsize() >= 1500
+    assert await c_b.dbsize() >= 1500
+
+    # Let any last legitimate catch-up (the tail of the seeder-driven relay) settle before
+    # sampling -- a real echo storm keeps growing well past this, so a short settle here cannot
+    # mask one, it only keeps normal catch-up from being mistaken for one.
+    await asyncio.sleep(1.0)
+    await assert_no_command_storm(c_a, c_b)
+
+
+async def test_flushall_propagates_mesh_wide_without_storm(df_factory: DflyInstanceFactory):
+    """T10 item 3. FLUSHALL on an active node propagating mesh-wide is deliberate KeyDB-parity
+    behaviour, not a bug, and a real, documented operational hazard (a stray FLUSHALL on any peer
+    empties the whole mesh) -- this test is not trying to stop that propagation, only proving it
+    (a) actually happens and (b) does not loop. FLUSHALL is journaled and forwarded like any other
+    write (journal/tx_executor.cc treats it as a global command, not a special case in the
+    peer-echo path -- journal::PassesPeerEchoFilter, journal/types.cc, has no FLUSHALL-specific
+    branch), so it is subject to the exact same origin-echo guard as every other write.
+
+    A dataset-equality check cannot catch a FLUSHALL echo by itself: flushing an already-empty
+    database is a content no-op, so a self-relayed FLUSHALL would be invisible to a dbsize/capture
+    check even though it is still real, unbounded wire and CPU traffic. assert_no_command_storm
+    is what actually catches it here.
+
+    Falsifying (verified by hand): the same origin_idx revert in journal::PassesPeerEchoFilter as
+    test_bidirectional_seeder_load_converges_without_echo_storm's docstring documents. Observed:
+    FLUSHALL still reached B and the `flushed` retry loop above still passed (propagation is not
+    what's broken by this revert), but assert_no_command_storm failed with
+    `total_commands_processed grew by 450 in 3.0s (bound 60)` -- a single FLUSHALL bouncing
+    indefinitely between the two nodes, each bounce a full (if trivial, on an empty db) journaled
+    command.
+    """
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    await attach(c_a, b)
+    await wait_for_peers(c_a, 1)
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+
+    await c_a.set("a:before", "1")
+    await c_b.set("b:before", "1")
+    await wait_for_value(c_a, "b:before", "1")
+    await wait_for_value(c_b, "a:before", "1")
+    assert await c_a.dbsize() == 2 and await c_b.dbsize() == 2
+
+    assert await c_a.flushall()
+
+    @assert_eventually(times=300)
+    async def flushed():
+        assert await c_a.dbsize() == 0
+        assert await c_b.dbsize() == 0
+
+    await flushed()
+    # Mirrors the settle rationale in test_bidirectional_seeder_load_converges_without_echo_storm.
+    await asyncio.sleep(1.0)
+    await assert_no_command_storm(c_a, c_b)
