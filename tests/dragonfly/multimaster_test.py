@@ -524,8 +524,10 @@ async def attach(c_a, *nodes):
 
 async def test_peer_clock_skew_reported(df_factory):
     """Both nodes run on one host, so real skew is ~0; the assertion is that the field
-    exists and is small. Falsified by removing the RenderPeerReplicationInfo line --
-    the KeyError names the missing field."""
+    exists and is small. Falsified by removing the RenderPeerReplicationInfo line -- the
+    resulting AssertionError's sorted(info["master0"]) diagnostic names the missing field
+    (clock_skew_ms absent from the list; see test_peer_clock_skew_reflects_injected_offset
+    below for a falsification that exercises the value itself, not just its presence)."""
     a = df_factory.create(**active_args())
     b = df_factory.create(**active_args())
     df_factory.start_all([a, b])
@@ -536,6 +538,52 @@ async def test_peer_clock_skew_reported(df_factory):
     info = await c_b.info("replication")
     assert "clock_skew_ms" in info["master0"], sorted(info["master0"])
     assert abs(int(info["master0"]["clock_skew_ms"])) < 250
+
+
+@pytest.mark.parametrize("offset_ms", [5000, -5000], ids=["ahead", "behind"])
+async def test_peer_clock_skew_reflects_injected_offset(
+    df_factory: DflyInstanceFactory, redis_server, proxy_factory, tmp_path, offset_ms
+):
+    """test_peer_clock_skew_reported only proves the field exists and is small -- both nodes run
+    on one host, so it can't distinguish a correct ~0 skew from clock_skew_ms_ never having been
+    written at all (it defaults to {0}). The Greet() -> clock_skew_ms_ -> GetSummary() ->
+    ReplicaSummary -> render hop is otherwise covered by nothing that can fail: deleting Greet()'s
+    whole skew-computation block, or swapping the two static_cast arguments in the
+    ComputeClockSkewMs call (inverting the sign), would leave that test green.
+
+    This test proxies real Redis's REPLCONF UUID reply with a synthetic uuid and a wall-clock
+    deliberately offset from local time -- the same technique as
+    test_active_replica_merges_redis_full_sync_via_synthetic_uuid above, chosen over a second
+    drakeydb node because the injected reply *is* the clock, entirely under this test's control,
+    so both the magnitude and (parametrized, over a positive and a negative offset) the sign of
+    the reported skew can be asserted -- a sign inversion is the mutation that most misleads an
+    operator, since it would report a slow peer as fast or vice versa. REPLICAOF blocks until
+    Greet() completes (see test_configure_dfly_master_sends_and_tolerates_drakey_version_and_peer
+    above), so the skew is already sampled by the time it returns "OK" -- no polling needed.
+
+    Falsifying: deleting replica.cc's skew-computation block in Greet() leaves clock_skew_ms_ at
+    its {0} default, so the assertion below (skew within 2s of the injected +/-5s offset) fails
+    with the observed skew reported as 0 regardless of parametrization. Verified by hand; see
+    task-2-report.md's fix-round-1 section for the exact command and output.
+    """
+    SYNTHETIC_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    node = df_factory.create(
+        proactor_threads=2, dir=str(tmp_path / "clock-skew-proxy"), active_replica="true"
+    )
+    node.start()
+    c = node.client()
+    proxy = await proxy_factory(redis_server.port)
+
+    peer_ms = int(time.time() * 1000) + offset_ms
+    await proxy.override_next_response(
+        b"REPLCONF UUID ", f"+{SYNTHETIC_UUID} {peer_ms}\r\n".encode()
+    )
+    assert await c.execute_command(f"REPLICAOF localhost {proxy.port}") == "OK"
+
+    info = await c.info("replication")
+    assert info["master0"]["node_uuid"] == SYNTHETIC_UUID
+    skew = int(info["master0"]["clock_skew_ms"])
+    assert abs(skew - offset_ms) < 2000, info["master0"]
 
 
 async def test_fanin_merges_two_masters_and_stays_writable(df_factory: DflyInstanceFactory):

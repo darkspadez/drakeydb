@@ -4,6 +4,7 @@
 #include "server/replica.h"
 
 #include <chrono>
+#include <cstdint>
 
 #include "absl/strings/match.h"
 #include "facade/service_interface.h"
@@ -427,9 +428,16 @@ error_code Replica::Greet() {
 
   // drakeydb: node identity exchange (KeyDB-compatible; KeyDB sends uuid right after its capa
   // batch). Clear the previous connection's identity before the exchange so an unsupported reply
-  // after reconnect cannot leave stale data in INFO.
+  // after reconnect cannot leave stale data in INFO. clock_skew_ms_ (P4-0) is reset alongside
+  // master_clock_ms for the same reason: Greet() can return early below (RETURN_ON_ERR /
+  // PC_RETURN_ON_BAD_RESPONSE) before ever reaching the store further down, and the reconnect
+  // loop re-enters Greet() on this same Replica, so without this a stale skew from a prior
+  // successful exchange would keep rendering on this peer's INFO line -- and unlike node_uuid,
+  // clock_skew_ms is rendered unconditionally (multi_master.cc), so it would not even have the
+  // courtesy of vanishing.
   master_context_.master_node_uuid.clear();
   master_context_.master_clock_ms = 0;
+  clock_skew_ms_.store(0, std::memory_order_relaxed);
   RETURN_ON_ERR(
       SendCommandAndReadResponse(StrCat("REPLCONF UUID ", service_.server_family().node_uuid())));
   if (!LastResponseArgs().empty() && LastResponseArgs()[0].type == RespExpr::ERROR) {
@@ -448,17 +456,30 @@ error_code Replica::Greet() {
     } else {
       PC_RETURN_ON_BAD_RESPONSE(status == ReplconfUuidReplyStatus::kSuccess);
       master_context_.master_node_uuid = std::move(master_uuid);
-      master_context_.master_clock_ms = master_ms;
+      // drakeydb: P4-0 -- master_ms is peer-controlled and unbounded (ParseReplconfUuidReply
+      // parses it into a uint64_t with no upper bound, node_identity.cc). A value >= 2^63 would
+      // reinterpret as negative under the static_cast<int64_t> below, and the subsequent
+      // ComputeClockSkewMs subtraction could then underflow int64_t -- UB, and CI's UBSAN matrix
+      // would catch it. Treat an implausible clock the same as the existing "no clock" sentinel
+      // (0) rather than rejecting the whole handshake over it: the uuid is still valid even when
+      // the clock isn't.
+      master_context_.master_clock_ms =
+          master_ms <= static_cast<uint64_t>(INT64_MAX) ? master_ms : 0;
 
       // drakeydb: P4-0 -- the handshake clock echo is the only cross-node clock sample we get.
       const int64_t skew_ms =
           ComputeClockSkewMs(static_cast<int64_t>(GetCurrentTimeMs()),
                              static_cast<int64_t>(master_context_.master_clock_ms));
       clock_skew_ms_.store(skew_ms, std::memory_order_relaxed);
-      LOG_IF(WARNING, IsClockSkewConcerning(skew_ms))
-          << "Peer " << master_context_.master_node_uuid << " clock differs by " << skew_ms
-          << " ms (threshold " << kClockSkewWarnMs
-          << " ms). Last-write-wins resolution degrades with clock skew; check NTP.";
+      // drakeydb: P4-0 -- Greet() re-runs on every reconnect attempt (see the LOG_FIRST_N /
+      // LOG_EVERY_T neighbors above/below for the same concern); a genuinely skewed peer on a
+      // flapping link must not log unboundedly.
+      if (IsClockSkewConcerning(skew_ms)) {
+        LOG_EVERY_T(WARNING, 60)
+            << "Peer " << master_context_.master_node_uuid << " clock differs by " << skew_ms
+            << " ms (threshold " << kClockSkewWarnMs
+            << " ms). Last-write-wins resolution degrades with clock skew; check NTP.";
+      }
     }
   }
 

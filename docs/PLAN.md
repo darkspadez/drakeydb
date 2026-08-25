@@ -60,7 +60,10 @@ logged, replication continued), but **watch CI for it**.
 
 **P1 note for P2/P3:** `MasterContext::master_node_uuid` and `master_clock_ms` are cleared before
 each UUID exchange, so reconnecting to a build that lacks the exchange cannot leave stale INFO
-data. `master_clock_ms` is otherwise read nowhere yet (a P8 clock-skew seed). Peer registration
+data; `Replica::clock_skew_ms_` (P4-0) is reset alongside them for the same reason. P4-0 reads
+`master_clock_ms` for its clock-skew warning/metric (`ComputeClockSkewMs`,
+`src/server/multi_master.h`, surfaced via `Replica::GetSummary()`); it was otherwise unread
+through P3. Peer registration
 is deliberately deferred until a later phase defines trusted peer admission: `REPLCONF` and sync
 session creation are both reachable without authentication when `requirepass` is unset, while
 `PeerRegistry` has no reclamation API. It remains initialized with only the local node in P1, so

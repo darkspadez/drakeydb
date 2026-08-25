@@ -35,7 +35,7 @@ struct ReplicaSummary {
   // drakeydb: P4-0 -- signed skew (peer - local, ms) sampled from the REPLCONF UUID handshake
   // clock echo; see Replica::GetSummary() / multi_master.h's ComputeClockSkewMs. 0 when the peer
   // never sent a clock (pre-exchange, or a plain Redis/old KeyDB master).
-  int64_t clock_skew_ms;
+  int64_t clock_skew_ms = 0;
 };
 
 struct LastMasterSyncData {
