@@ -59,6 +59,9 @@ bool PassesPeerEchoFilter(const JournalItem& item) {
   if (item.entry_flags & kEntryFlagExpired)
     return false;
 
+  if (item.entry_flags & kEntryFlagDerived)
+    return false;
+
   if (item.opcode == Op::ORIGIN)
     return false;
 

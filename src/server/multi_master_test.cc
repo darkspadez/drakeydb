@@ -966,7 +966,84 @@ TEST_F(OriginJournalFamilyTest, DerivedDeleteInheritsCausingTransactionOrigin) {
   const CapturedEntry* del = LastDel(consumer.entries);
   ASSERT_NE(nullptr, del);
   EXPECT_EQ(kPeerOrigin, del->origin_idx);
-  EXPECT_EQ(0, del->entry_flags);  // A derived DEL, not an expiry DEL.
+  // drakeydb: P4-0 -- HSetFamily::DeleteIfEmpty now records this DEL via RecordDerivedDelete,
+  // which sets kEntryFlagDerived (see journal/types.h) so PassesPeerEchoFilter keeps it off
+  // mesh-peer links; it is still not an expiry DEL (that flag is reserved for the whole-key
+  // TTL path, RecordExpiryBlocking).
+  EXPECT_TRUE(del->entry_flags & journal::kEntryFlagDerived);
+  EXPECT_FALSE(del->entry_flags & journal::kEntryFlagExpired);
+}
+
+// drakeydb: P4-0 acceptance case. A DEL derived from a collection command emptying its key must
+// carry kEntryFlagDerived so PassesPeerEchoFilter (journal/types.cc) keeps it off mesh-peer
+// links -- see task-1-brief.md's Step 1 for why every one of the 25 DeleteIfEmpty/
+// DeleteSetIfEmpty call sites (hset_family.cc/set_family.cc/generic_family.cc/zset_family.cc/
+// debugcmd.cc/search/doc_accessors.cc) is safe to suppress this way.
+//
+// Deliberately triggered via FIELDEXPIRE/FIELDTTL, not SREM: SREM's own OpRem (set_family.cc)
+// deletes an emptied set directly (db_slice.Del) and journals only "SREM" -- it never calls
+// SetFamily::DeleteSetIfEmpty, so it cannot exercise this code path at all. FIELDTTL, on the
+// other hand, lazily discovers the member-TTL'd field already expired (via
+// SetFamily::FieldExpireTime -> GetExpiry) and, finding the set now empty, calls
+// SetFamily::DeleteSetIfEmpty (set_family.cc) -- a real, shipped read path (the same one HTTL
+// exercises for hashes in DerivedDeleteInheritsCausingTransactionOrigin above).
+//
+// Falsifying: reverting the RecordDerivedDelete switch at set_family.cc's DeleteSetIfEmpty makes
+// the derived DEL come back with entry_flags == 0 (see task-1-report.md's Step 10 section for
+// the observed failure text).
+TEST_F(OriginJournalFamilyTest, EmptiedCollectionDeleteCarriesDerivedFlag) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  // A set with one member carrying a short TTL, set up as ordinary self-originated client
+  // commands. FIELDTTL below lazily discovers the member expired and, finding the set now
+  // empty, calls SetFamily::DeleteSetIfEmpty.
+  EXPECT_EQ(Run({"sadd", "s", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "s", "1", "m"});
+  AdvanceTime(1100);
+  Run({"fieldttl", "s", "m"});
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+
+  // Guard against a vacuous pass: the set must have actually been cleaned up.
+  EXPECT_EQ(Run({"exists", "s"}).GetInt(), 0);
+
+  const CapturedEntry* del = LastDel(consumer.entries);
+  ASSERT_NE(nullptr, del);
+  EXPECT_TRUE(del->entry_flags & journal::kEntryFlagDerived)
+      << "derived DEL must be flagged or the peer filter forwards it";
+  EXPECT_FALSE(del->entry_flags & journal::kEntryFlagExpired)
+      << "a FIELDTTL-caused empty is not a whole-key expiry";
+}
+
+// drakeydb: P4-0 -- the counterpart to the acceptance case above: an ordinary client-issued DEL
+// (never touching DeleteIfEmpty/DeleteSetIfEmpty at all) must NOT carry kEntryFlagDerived, or a
+// mesh peer would silently stop receiving real user deletes.
+TEST_F(OriginJournalFamilyTest, UserIssuedDeleteIsNotFlaggedDerived) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  Run({"set", "k", "v"});
+  Run({"del", "k"});
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+
+  const CapturedEntry* del = LastDel(consumer.entries);
+  ASSERT_NE(nullptr, del);
+  EXPECT_FALSE(del->entry_flags & journal::kEntryFlagDerived)
+      << "a client DEL must still reach peers";
 }
 
 namespace {

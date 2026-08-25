@@ -244,6 +244,12 @@ void RecordDelete(DbIndex dbid, std::string_view key);
 // RecordExpiryBlocking below, which does not go through RecordDelete.
 void RecordDelete(const DbContext& db_cntx, std::string_view key);
 
+// drakeydb: P4-0 -- records a DEL derived from a collection becoming empty. Identical to
+// RecordDelete(const DbContext&, ...) except it sets journal::kEntryFlagDerived, which
+// journal::PassesPeerEchoFilter uses to keep the entry off peer links. Plain (full-stream)
+// replicas still receive it, exactly as they do today.
+void RecordDerivedDelete(const DbContext& db_cntx, std::string_view key);
+
 // Record expiry in journal with independent transaction.
 // Must be called from shard thread owning key.
 // Might block the calling fiber unless journal::SetFlushMode(false) is called.

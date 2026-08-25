@@ -1655,7 +1655,9 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
       // drakeydb: Phase 3 -- db_cntx carries the causing transaction's replication-apply origin
       // (see DbContext::repl_origin_idx), so this derived DEL inherits it rather than always
       // being attributed to this node.
-      RecordDelete(db_cntx, key);
+      // drakeydb: P4-0 -- RecordDerivedDelete (not RecordDelete) sets journal::kEntryFlagDerived
+      // so PassesPeerEchoFilter keeps this DEL off mesh-peer links; see task-1-brief.md.
+      RecordDerivedDelete(db_cntx, key);
     }
     return true;
   }

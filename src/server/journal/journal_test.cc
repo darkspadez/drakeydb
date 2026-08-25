@@ -772,6 +772,30 @@ TEST(PassesPeerEchoFilterTest, DropsForeignOriginExpiryDelAndOriginOpcodeOnly) {
   EXPECT_EQ(1u, violation_logs) << "the peer-protocol diagnostic must be rate-limited";
 }
 
+// drakeydb: P4-0 -- a DEL derived from a collection command emptying its key (e.g. HTTL
+// discovering a hash field's TTL has lazily expired) must never reach a mesh peer: the peer
+// either replays the causing command and derives the same DEL itself, or expires the same data
+// on its own clock. See kEntryFlagDerived's own comment (types.h) for the full argument, and
+// task-1-brief.md's Step 1 for the per-call-site enumeration that backs it. Distinct from
+// kEntryFlagExpired (a *whole-key* TTL expiry) so diagnostics can tell the two apart.
+TEST(PassesPeerEchoFilterTest, DerivedDeleteIsSuppressedToPeers) {
+  JournalItem item;
+  item.opcode = journal::Op::COMMAND;
+  item.origin_idx = PeerRegistry::kSelfIdx;  // self-originated, so origin alone passes it
+  item.entry_flags = journal::kEntryFlagDerived;
+  EXPECT_FALSE(journal::PassesPeerEchoFilter(item))
+      << "a derived DEL must never reach a peer -- the peer derives its own";
+}
+
+TEST(PassesPeerEchoFilterTest, DerivedAndExpiredAreDistinctFlags) {
+  EXPECT_NE(journal::kEntryFlagDerived, journal::kEntryFlagExpired);
+  JournalItem item;
+  item.opcode = journal::Op::COMMAND;
+  item.origin_idx = PeerRegistry::kSelfIdx;
+  item.entry_flags = journal::kEntryFlagExpired | journal::kEntryFlagDerived;
+  EXPECT_FALSE(journal::PassesPeerEchoFilter(item));
+}
+
 // drakeydb: Phase 3 T6b fix-round-1 (Q1) -- CapturingFiberSocket now lives in
 // test_capturing_socket.h, shared with peer_replication_test.cc's
 // AdoptAuthoritativeLsnComposesWithRealSenderMarker (see that test's own comment).

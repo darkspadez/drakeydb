@@ -1215,6 +1215,12 @@ async def _total_commands_processed(c) -> int:
     return int((await c.info("stats"))["total_commands_processed"])
 
 
+# drakeydb: P4-0 -- used by test_derived_delete_reaches_plain_replica_but_not_peer (end of file)
+# to observe whether a key exists on a given node without caring about its value/type.
+async def _exists(client, key) -> bool:
+    return bool(await client.execute_command("exists", key))
+
+
 # drakeydb: measured healthy baseline (idle 2-node reciprocal peer mesh, proactor_threads=2 each
 # side, the pytest harness's default of 1 shard, 3s sample) was a rock-steady delta of 4 on BOTH
 # sides across every repeated measurement taken while developing this test (see task-10-report.md
@@ -1697,3 +1703,108 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
 
     await asyncio.sleep(1.0)
     await assert_no_command_storm(c_a, c_b, c_c2, bound=MESH3_STORM_BOUND)
+
+
+# ---- Phase 4: MVCC / LWW (P4-0) ----
+
+
+# drakeydb: P4-0 acceptance case (Task 1). A set command that empties its key via a lazily-
+# expired member (SetFamily::DeleteSetIfEmpty, set_family.cc) derives a DEL. A plain (full-
+# stream) replica must still see that DEL; a mesh peer must not -- the peer instead derives its
+# own DEL by independently replaying the same causing command (FIELDEXPIRE) and discovering the
+# same member already expired on its own clock. journal::PassesPeerEchoFilter (journal/types.cc)
+# is what enforces this, gated on the new journal::kEntryFlagDerived flag.
+#
+# Convergence alone cannot see this bug -- both b and plain end up without every key either way
+# -- so this asserts the *differential* between the peer link and the plain replica, which is
+# what the flag actually changes.
+#
+# Uses N independent sets, not one: a single leaked DEL is only 1 extra command, and is not
+# reliably distinguishable from this mesh's own idle REPLCONF-ACK traffic (see STORM_BOUND's own
+# comment above -- a healthy idle 2-node mesh already shows a background delta of ~4 per 3s).
+# N leaked DELs is a clear, unmistakable signal against that same background noise.
+#
+# Deliberately triggered via FIELDEXPIRE, not SREM: SREM's own OpRem (set_family.cc) deletes an
+# emptied set directly (db_slice.Del) and journals only "SREM" -- it never calls
+# SetFamily::DeleteSetIfEmpty, so it cannot exercise this code path at all (see
+# task-1-report.md's Step 1 call-site table).
+#
+# Falsified by reverting RecordDerivedDelete in set_family.cc's DeleteSetIfEmpty: the peer's
+# command counter then also picks up one forwarded DEL per key (see task-1-report.md's Step 12
+# section for the measured before/after delta).
+async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: DflyInstanceFactory):
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    plain = df_factory.create()
+    df_factory.start_all([a, b, plain])
+    c_a, c_b, c_plain = a.client(), b.client(), plain.client()
+
+    await attach(c_b, a)  # b <- a, peer link
+    assert await c_plain.execute_command("replicaof", "localhost", a.port) == "OK"
+    await wait_for_peers(c_b, 1)
+    await wait_available_async(c_plain)
+
+    n = 20
+    keys = [f"derived-del-{i}" for i in range(n)]
+
+    pipe = c_a.pipeline(transaction=False)
+    for key in keys:
+        pipe.execute_command("sadd", key, "m")
+        pipe.execute_command("fieldexpire", key, "1", "m")
+    await pipe.execute()
+
+    @assert_eventually(timeout=30)
+    async def setup_converged():
+        for key in keys:
+            assert await _exists(c_b, key)
+            assert await _exists(c_plain, key)
+
+    await setup_converged()
+
+    await asyncio.sleep(1.2)  # let every member's 1s TTL elapse on every node's own clock
+
+    # Measurement window starts here: from this point until the deltas are read below, nothing
+    # may run against b/plain except the trigger and a fixed idle wait -- an incidental command
+    # (e.g. a convergence-polling EXISTS) would itself inflate the very counters being measured.
+    before_b = await _total_commands_processed(c_b)
+    before_plain = await _total_commands_processed(c_plain)
+
+    # Re-probing each already-expired member causes SetFieldsExpireTime to discover it lazily
+    # expired and flush it -- each set empties -> SetFamily::DeleteSetIfEmpty derives a DEL on a.
+    pipe = c_a.pipeline(transaction=False)
+    for key in keys:
+        pipe.execute_command("fieldexpire", key, "1", "m")
+    await pipe.execute()
+
+    # Fixed idle wait, not a polling loop: polling b/plain directly here (e.g. via _exists, as an
+    # earlier version of this test did) would add commands to the very counters measured below,
+    # swamping the signal -- measured in practice as delta_b jumping to ~2n even with the fix
+    # applied, entirely from convergence-check EXISTS traffic (see task-1-report.md's Step 12
+    # section). 2s is comfortably more than this mesh needs to propagate ~2n small commands.
+    await asyncio.sleep(2.0)
+
+    # The load-bearing assertion: b applied only the n replayed FIELDEXPIREs, nothing else -- a
+    # forwarded derived DEL per key would show up here as n extra commands, roughly doubling the
+    # delta. plain, unaffected by the peer filter, legitimately sees both the FIELDEXPIRE and the
+    # derived DEL for every key.
+    delta_b = await _total_commands_processed(c_b) - before_b
+    delta_plain = await _total_commands_processed(c_plain) - before_plain
+
+    # Convergence check runs after the measurement above, so its own EXISTS traffic cannot
+    # contaminate it. Guards against a vacuous pass if the trigger above did not actually land.
+    @assert_eventually(timeout=30)
+    async def emptied_converged():
+        for key in keys:
+            assert not await _exists(c_b, key)
+            assert not await _exists(c_plain, key)
+
+    await emptied_converged()
+
+    assert delta_b < 1.5 * n, (
+        f"peer applied {delta_b} commands for {n} replayed writes (expected close to {n}, well "
+        f"under {1.5 * n}) -- looks like the derived DELs leaked through to the peer"
+    )
+    assert delta_plain >= 2 * n, (
+        f"plain replica applied {delta_plain} commands, expected at least {2 * n} (the "
+        f"FIELDEXPIRE plus the derived DEL for each of {n} keys)"
+    )
