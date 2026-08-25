@@ -1,6 +1,7 @@
 """Multi-master identity and active-replica fan-in tests."""
 
 import asyncio
+import logging
 import re
 import time
 
@@ -742,18 +743,32 @@ async def test_peer_mesh_own_writes_not_echoed_back(df_factory: DflyInstanceFact
 TIEBREAK_UUID_LO = "10000000-0000-4000-8000-000000000000"
 TIEBREAK_UUID_HI = "20000000-0000-4000-8000-000000000000"
 
+# D-7 review round 3, item 1: a single reciprocal-attach attempt only observes the tiebreak
+# firing 70-100% of the time (round 3 measured 9/10 and 10/10 on two different scenarios; see
+# task-8-report.md) -- narrowing the "unestablished" window to the handshake alone (round 2's
+# fix 1) also narrows how often two independently-timed handshakes happen to overlap enough for
+# either side to observe the race at all. Bounding a retry loop at this many attempts keeps the
+# whole loop's miss probability under 1% even at the pessimistic 70% single-attempt rate:
+# 0.3 ** MAX_TIEBREAK_ATTEMPTS ~= 0.24%.
+MAX_TIEBREAK_ATTEMPTS = 5
 
-def _assert_tiebreak_correct_if_observed(a, b):
-    """D-7 review round 3: narrowing the tiebreak's "unestablished" window to the handshake
-    alone (round 2's fix 1) also narrows how long the reciprocal race lasts -- both sides'
-    handshakes are a handful of small, fast REPLCONF round trips, so it is common (observed
-    ~1-in-4 to ~1-in-3 across repeated runs on a plain asyncio.gather of two REPLICAOFs) for
-    NEITHER side's own claim to still be unestablished when the other's admission check runs:
-    both connections are simply admitted, and the tiebreak never fires at all. That is not a
-    bug -- ShouldRefuseReciprocalPeer is still correct whenever both sides do observe the race
-    (see its own C++ unit test, which pins the predicate directly and deterministically), and
-    D-7 explicitly tolerates this exact case ("if both sides check before either has started
-    serving, the retry path still resolves it").
+
+def _assert_tiebreak_correct_if_observed(a, b) -> bool:
+    """Checks the reciprocal-connect uuid tiebreak's *direction* whenever there is log evidence
+    to check on this attempt, and returns whether it fired at all (on either side) so callers can
+    track that separately across repeated attempts -- see
+    test_simultaneous_reciprocal_replicaof_converges's bounded observe-loop and
+    MAX_TIEBREAK_ATTEMPTS above.
+
+    Narrowing the tiebreak's "unestablished" window to the handshake alone (round 2's fix 1) also
+    narrows how long the reciprocal race lasts -- both sides' handshakes are a handful of small,
+    fast REPLCONF round trips, so it is common (round 3 measured ~1-in-4 to ~1-in-3 across
+    repeated single-shot runs) for NEITHER side's own claim to still be unestablished when the
+    other's admission check runs: both connections are simply admitted, and the tiebreak never
+    fires at all. That is not a bug -- ShouldRefuseReciprocalPeer is still correct whenever both
+    sides do observe the race (see its own C++ unit test, which pins the predicate directly and
+    deterministically), and D-7 explicitly tolerates this exact case ("if both sides check before
+    either has started serving, the retry path still resolves it").
 
     An earlier version of these tests tried to force the race deterministically with a
     byte-delaying TCP relay in front of one side's connection. That approach was abandoned: it
@@ -762,25 +777,44 @@ def _assert_tiebreak_correct_if_observed(a, b):
     every per-shard flow connection dialed to the same target -- so bounding the delay to a
     fixed chunk count still could not cleanly separate "delay the handshake" from "delay the
     sync data" without much deeper protocol-aware interception than a generic relay can safely
-    do). Forcing the determinism this checker declines to demand is the concrete follow-up that
-    would make these tests unconditionally exercise the tiebreak -- see task-8-report.md for the
-    fuller writeup this asks for.
+    do). See task-8-report.md for the fuller writeup.
 
-    What IS deterministic, and checked unconditionally by both callers of this helper: the mesh
-    converges either way (asserted by the caller before this runs), and correctness of the
-    predicate's direction is checked whenever there is evidence to check -- b (the larger uuid)
-    must never be the one that admitted while a (the smaller uuid) logged a refusal; that
-    specific combination can only mean ShouldRefuseReciprocalPeer's operands are swapped.
+    Hard, unconditional assertion whenever fired=True -- this IS the "if observed" conditional
+    the name promises (an earlier body only ever computed a_deferred, never read b, and had no
+    branch at all; fixed here to read both a and b and to actually branch on whether either
+    fired): b (the larger uuid) must be the one that deferred, and a (the smaller uuid) must not
+    have. That specific wrong-direction combination can only mean ShouldRefuseReciprocalPeer's
+    operands are swapped -- a real regression, never a timing artifact -- so it is never silently
+    tolerated, fired or not, on any attempt.
     """
     a_deferred = bool(a.find_in_logs("reciprocal-connect uuid tiebreak"))
-    # a (the smaller uuid) is never eligible to be the one refused -- ShouldRefuseReciprocalPeer
-    # refuses iff self_uuid < peer_uuid, so only b's own outbound link (self_uuid = the larger
-    # uuid) can ever be the refused side. a deferring at all -- whether or not b also did -- can
-    # only mean the operands are swapped.
-    assert not a_deferred, (
-        "the smaller uuid (a) was refused -- ShouldRefuseReciprocalPeer's operands must be "
-        "swapped (b, the larger uuid, should be the one that can be refused)"
-    )
+    b_deferred = bool(b.find_in_logs("reciprocal-connect uuid tiebreak"))
+    fired = a_deferred or b_deferred
+    if fired:
+        # a (the smaller uuid) is never eligible to be the one refused -- ShouldRefuseReciprocalPeer
+        # refuses iff self_uuid < peer_uuid, so only b's own outbound link (self_uuid = the larger
+        # uuid) can ever be the refused side.
+        assert b_deferred and not a_deferred, (
+            "reciprocal-connect uuid tiebreak fired in the wrong direction -- "
+            f"a_deferred={a_deferred} b_deferred={b_deferred}; ShouldRefuseReciprocalPeer's "
+            "operands must be swapped (b, the larger uuid, should be the one that can be "
+            "refused, never a)"
+        )
+        # D-7 review round 3, item 2: make a firing run distinguishable in the log from a
+        # non-firing one (see the else branch) instead of both looking silently identical.
+        # logging.warning (not info) so this shows under pytest.ini's default log_cli level
+        # regardless of -q/-v.
+        logging.warning(
+            "reciprocal-connect uuid tiebreak fired correctly this attempt (b deferred, a did "
+            "not)"
+        )
+    else:
+        logging.warning(
+            "reciprocal-connect uuid tiebreak did NOT fire on either side this attempt -- both "
+            "connections were naturally admitted (D-7 tolerates this on any single attempt; see "
+            "this function's own docstring)"
+        )
+    return fired
 
 
 async def test_simultaneous_reciprocal_replicaof_converges(
@@ -805,35 +839,69 @@ async def test_simultaneous_reciprocal_replicaof_converges(
     (Replica::MainReplicationFb) directly, and is also the natural way "two active nodes
     REPLICAOF each other simultaneously" actually happens when bringing up a mesh from static
     config. df_factory.start_all() launches both processes back to back (not
-    one-after-the-other-and-wait), so both sides' outbound connection attempts genuinely race --
-    see _assert_tiebreak_correct_if_observed's own docstring for why this test does not force
-    (and does not require) the tiebreak to actually fire on any given run.
+    one-after-the-other-and-wait), so both sides' outbound connection attempts genuinely race.
+
+    D-7 review round 3, item 1: a single attempt does not reliably observe the race (see
+    _assert_tiebreak_correct_if_observed's own docstring -- ~70-100% per attempt), so this test
+    repeats the whole boot-attach-converge-teardown scenario -- a fresh node pair and fresh ports
+    every time -- up to MAX_TIEBREAK_ATTEMPTS times, stopping as soon as one attempt observes the
+    tiebreak firing. This is a bounded OBSERVE-loop, not a retry-until-pass loop: every attempt's
+    mesh convergence is asserted unconditionally (a convergence failure fails the test immediately,
+    full stop, no retry), and every attempt that DOES observe the tiebreak firing has its
+    direction asserted hard and immediately via _assert_tiebreak_correct_if_observed -- a
+    wrong-direction firing fails on the attempt it happens, unconditionally, and is never "tried
+    again" away. The only thing the loop tolerates across attempts is the race's own absence,
+    which round 3 established is an expected, bounded-probability outcome of narrowing the window
+    to the handshake, not a failure. If the tiebreak is never observed in MAX_TIEBREAK_ATTEMPTS
+    attempts, the test fails: this restores (in a form that tolerates the race's genuine
+    non-determinism instead of flaking on it) the positive assertion that a plain
+    `assert b.find_in_logs(...)` used to provide before round 3 weakened this test to purely
+    conditional -- with the tiebreak call site itself deleted, no attempt can ever observe it, so
+    this test fails deterministically regardless of the attempt budget.
 
     Falsifying: see task-8-report.md.
     """
-    a_port = port_picker.get_available_port()
-    b_port = port_picker.get_available_port()
-    a = df_factory.create(
-        **active_args(port=a_port, replicaof=f"localhost:{b_port}", node_uuid=TIEBREAK_UUID_LO)
+    observed_tiebreak = False
+    for attempt in range(1, MAX_TIEBREAK_ATTEMPTS + 1):
+        a_port = port_picker.get_available_port()
+        b_port = port_picker.get_available_port()
+        a = df_factory.create(
+            **active_args(port=a_port, replicaof=f"localhost:{b_port}", node_uuid=TIEBREAK_UUID_LO)
+        )
+        b = df_factory.create(
+            **active_args(port=b_port, replicaof=f"localhost:{a_port}", node_uuid=TIEBREAK_UUID_HI)
+        )
+        df_factory.start_all([a, b])
+        c_a, c_b = a.client(), b.client()
+
+        await asyncio.gather(wait_for_peers(c_a, 1), wait_for_peers(c_b, 1))
+
+        # The mesh actually converges both ways, not just link_status flipping to up --
+        # unconditional, every attempt, regardless of whether the tiebreak fires on it.
+        assert await c_a.incr("cnt") == 1
+        await wait_for_value(c_b, "cnt", "1")
+        assert await c_b.incr("cnt2") == 1
+        await wait_for_value(c_a, "cnt2", "1")
+
+        a.stop()
+        b.stop()
+        # Hard, unconditional per-attempt check: if the tiebreak fired, it must have fired in the
+        # correct direction. Only "did it fire at all" is allowed to vary across attempts.
+        if _assert_tiebreak_correct_if_observed(a, b):
+            observed_tiebreak = True
+            logging.warning(
+                "reciprocal-connect uuid tiebreak observed on attempt %d/%d",
+                attempt,
+                MAX_TIEBREAK_ATTEMPTS,
+            )
+            break
+
+    assert observed_tiebreak, (
+        f"reciprocal-connect uuid tiebreak was never observed in {MAX_TIEBREAK_ATTEMPTS} "
+        "attempts -- either the admission wiring (server_family.cc's ReplConf tiebreak call) is "
+        "broken/missing, or this is an astronomically unlucky run at the measured 70-100% "
+        "per-attempt firing rate"
     )
-    b = df_factory.create(
-        **active_args(port=b_port, replicaof=f"localhost:{a_port}", node_uuid=TIEBREAK_UUID_HI)
-    )
-    df_factory.start_all([a, b])
-    c_a, c_b = a.client(), b.client()
-
-    await asyncio.gather(wait_for_peers(c_a, 1), wait_for_peers(c_b, 1))
-
-    # The mesh actually converges both ways, not just link_status flipping to up -- unconditional,
-    # regardless of whether the tiebreak happened to fire on this particular run.
-    assert await c_a.incr("cnt") == 1
-    await wait_for_value(c_b, "cnt", "1")
-    assert await c_b.incr("cnt2") == 1
-    await wait_for_value(c_a, "cnt2", "1")
-
-    a.stop()
-    b.stop()
-    _assert_tiebreak_correct_if_observed(a, b)
 
 
 async def test_narrowed_window_admits_peer_during_winners_full_sync(
@@ -851,20 +919,41 @@ async def test_narrowed_window_admits_peer_during_winners_full_sync(
     winner's own full sync from loser takes a real, observable amount of time -- during which
     winner has long since passed its own handshake with loser (R_GREETED) but not yet R_SYNC_OK.
     While winner is confirmed still mid-sync, `loser` issues REPLICAOF winner (the reciprocal
-    direction: loser pulling from winner) and must be admitted immediately -- winner is the
-    smaller uuid's peer, so under the old wide window winner would still be "unestablished" here
-    and would refuse it.
+    direction: loser pulling from winner). Under the old wide window, winner's own claim on loser
+    would still read "unestablished" here, so the tiebreak would incorrectly refuse loser's
+    REPLICAOF for the sync's entire duration -- an ordinary sequential attach, not a race.
 
     D-7 review round 3: winner being genuinely mid full sync also means winner's own process is
     in GlobalState::LOADING for that whole window (SyncGate/RequestExclusiveLoadingState), which
     independently rejects even loser's very first PING (main_service.cc's LOADING gate has no
     exemption for a not-yet-established connection) -- a real, reproduced failure mode entirely
     unrelated to the tiebreak that surfaced through the exact same generic "-ERR replication
-    cancelled" coercion (see Greet()'s own PING-time LOADING check and task-8-report.md). This
-    test does not need to (and does not) distinguish which of the two transient causes applies
-    on a given run: both are covered by PeerReplicationManager::Add's fallback, and neither logs
-    the tiebreak-specific message this test's own assertion checks for, so a real regression in
-    either one still fails this test loudly.
+    cancelled" coercion (see Greet()'s own PING-time LOADING check and task-8-report.md). Both
+    the tiebreak's own narrowed-window fallback and this LOADING fallback make
+    PeerReplicationManager::Add reply OK from the same code path (round 2 fix 2), so the
+    `== "OK"` assertion below no longer means "admitted immediately, without hitting either
+    transient" -- it did in round 2, but round 3's LOADING fallback removed that guarantee. All
+    `== "OK"` proves now is that the command did not hard-fail; that is satisfied equally by true
+    immediate admission and by either fallback silently backstopping it. The assertion that
+    actually targets THIS test's own regression (a reverted, wide "unestablished" window) is the
+    negative log check after teardown, not the `== "OK"` check.
+
+    That negative log check is itself only a DETERMINISTIC catch of a wide-window regression for
+    the slice of R_SYNCING before winner calls EnterLoadingState(): once winner's process has
+    actually flipped to GlobalState::LOADING, loser's PING is rejected by the LOADING gate before
+    the connection ever reaches REPLCONF capa dragonfly (where the tiebreak itself lives), so a
+    reverted wide window would produce no tiebreak log line in that (later, and likely more
+    common) slice either -- indistinguishable in this test from the fix being correct. The
+    `sync_in_progress == 1` poll below does not (and cannot cheaply) pin down which slice of
+    R_SYNCING loser's REPLICAOF actually lands in. This test does not need to (and does not)
+    distinguish which of the two transient causes applies on a given run: both are covered by
+    PeerReplicationManager::Add's fallback, and a real regression in either one still fails this
+    test loudly via convergence or via the log check. But this test's regression coverage for a
+    wide-window revert specifically is PROBABILISTIC, not deterministic -- it depends on loser's
+    connection landing in the pre-EnterLoadingState sliver of the race, the same kind of
+    non-determinism (for a different underlying reason) that
+    _assert_tiebreak_correct_if_observed's own docstring documents for the other two tests in
+    this file.
 
     Falsifying: see task-8-report.md.
     """
@@ -890,15 +979,17 @@ async def test_narrowed_window_admits_peer_during_winners_full_sync(
                 break
             await asyncio.sleep(0.02)
 
-    # The reciprocal direction, started while winner is still mid-sync, must be admitted
-    # immediately -- not refused-then-backgrounded (that would still eventually converge via the
-    # round-2 background fallback, but would defeat the point of this test: proving the window
-    # itself is narrow, not just that the mesh eventually comes up regardless).
+    # This must not hard-fail -- but see the docstring: OK alone no longer proves immediate
+    # admission, since round 3's LOADING fallback replies OK the same way the tiebreak's own
+    # narrowed-window fallback does. Convergence is confirmed below regardless; the log check
+    # after teardown is what actually targets a wide-window regression (see docstring for that
+    # check's own, narrower, probabilistic guarantee).
     assert await c_loser.execute_command(f"REPLICAOF localhost {winner_port}") == "OK"
     await wait_for_peers(c_loser, 1)
 
     winner.stop()
     loser.stop()
+    # Deterministic only for the pre-EnterLoadingState slice of the race -- see docstring.
     assert not loser.find_in_logs("reciprocal-connect uuid tiebreak"), (
         "loser's REPLICAOF was refused while winner was still mid full sync -- the "
         "'unestablished' window is still too wide"
