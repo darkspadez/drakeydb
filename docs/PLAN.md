@@ -10,7 +10,7 @@
 | **P0 — Repo hygiene + rename** | ✅ **complete, verified** | PR [#1](https://github.com/darkspadez/drakeydb/pull/1), branch `feat/phase0-drakeydb-rename`, commit `7ca99f4c` |
 | **P1 — Identity foundations** | ✅ **complete, verified** | branch `feat/phase1-identity`, commits `9e653ab3..9c491fac` |
 | **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3) **merged** as `cd8e0602` — see [Phase 2](#phase-2--writable-multi-source-replica-fan-in) |
-| **P3 — Origin-tagged journal + active pair/mesh** | ✅ **complete, verified** | branch `feat/phase3-origin-journal`, 27 commits `6b0c995a..4dd55e8c` — see [Phase 3](#phase-3--origin-tagged-journal--active-pairmesh) |
+| **P3 — Origin-tagged journal + active pair/mesh** | ✅ **complete, verified** | PR [#4](https://github.com/darkspadez/drakeydb/pull/4), branch `feat/phase3-origin-journal`, 30 commits `6b0c995a..7bddd7fe` — see [Phase 3](#phase-3--origin-tagged-journal--active-pairmesh) |
 | **P4 — MVCC store + stamping + wire** | ⏭️ **next up** | see [Phase 4](#phase-4--mvcc-store--stamping--wire) |
 | P5–P9 | not started | — |
 
