@@ -45,13 +45,13 @@ uint32_t SetFamily::MaxIntsetEntries() {
 }
 
 bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std::string_view key,
-                                 const PrimeValue& pv) {
+                                 const PrimeValue& pv, bool derived) {
   Fail();
   return false;
 }
 
 bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std::string_view key,
-                               const PrimeValue& pv) {
+                               const PrimeValue& pv, bool derived) {
   Fail();
   return false;
 }

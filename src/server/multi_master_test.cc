@@ -1022,6 +1022,51 @@ TEST_F(OriginJournalFamilyTest, EmptiedCollectionDeleteCarriesDerivedFlag) {
       << "a FIELDTTL-caused empty is not a whole-key expiry";
 }
 
+// drakeydb: P4-0 fix-round-1 -- the counterpart to the acceptance case above: OpFieldExpire
+// (generic_family.cc) passes derived=false to DeleteSetIfEmpty/DeleteIfEmpty, because unlike
+// FIELDTTL (or any of the other 23 call sites), its own replay on a peer is clock-dependent -- a
+// lagging peer can *arm* an already-expired member's new TTL instead of also discovering it
+// expired, so key_deleted stays false there and the partial-expiry compensation just above that
+// call site never fires either (every field "succeeded"). Nothing on that peer converges it
+// without the forwarded, non-suppressed DEL this test pins. Same helper
+// (SetFamily::DeleteSetIfEmpty), a different caller, a different flag -- this test and the one
+// above are the point.
+//
+// Falsifying: reverting either `false` argument at generic_family.cc's OpFieldExpire call sites
+// back to the default makes this DEL come back flagged kEntryFlagDerived (see
+// task-1-report.md's fix-round-1 section for the observed failure text).
+TEST_F(OriginJournalFamilyTest, FieldExpireCausedDeleteIsNotFlaggedDerived) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  // A set with one member whose TTL has already elapsed. Re-probing it via FIELDEXPIRE (not
+  // FIELDTTL) causes SetFieldsExpireTime to discover it lazily expired and flush it while trying
+  // to re-arm it -- the set empties -> SetFamily::DeleteSetIfEmpty derives a DEL, this time
+  // through the derived=false path.
+  EXPECT_EQ(Run({"sadd", "feset", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "feset", "1", "m"});
+  AdvanceTime(1100);
+  Run({"fieldexpire", "feset", "1", "m"});
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+
+  // Guard against a vacuous pass: the set must have actually been cleaned up.
+  EXPECT_EQ(Run({"exists", "feset"}).GetInt(), 0);
+
+  const CapturedEntry* del = LastDel(consumer.entries);
+  ASSERT_NE(nullptr, del);
+  EXPECT_FALSE(del->entry_flags & journal::kEntryFlagDerived)
+      << "FIELDEXPIRE's own derived DEL must reach peers -- its replay is clock-dependent";
+  EXPECT_FALSE(del->entry_flags & journal::kEntryFlagExpired)
+      << "a FIELDEXPIRE-caused empty is not a whole-key expiry";
+}
+
 // drakeydb: P4-0 -- the counterpart to the acceptance case above: an ordinary client-issued DEL
 // (never touching DeleteIfEmpty/DeleteSetIfEmpty at all) must NOT carry kEntryFlagDerived, or a
 // mesh peer would silently stop receiving real user deletes.

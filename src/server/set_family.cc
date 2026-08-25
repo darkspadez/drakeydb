@@ -1642,7 +1642,7 @@ void CmdSAddEx(CmdArgParser parser, CommandContext* cmd_cntx) {
 }  // namespace
 
 bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, string_view key,
-                                 const PrimeValue& pv) {
+                                 const PrimeValue& pv, bool derived) {
   if (!IsDenseEncoding(pv))
     return false;
 
@@ -1656,8 +1656,17 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
       // (see DbContext::repl_origin_idx), so this derived DEL inherits it rather than always
       // being attributed to this node.
       // drakeydb: P4-0 -- RecordDerivedDelete (not RecordDelete) sets journal::kEntryFlagDerived
-      // so PassesPeerEchoFilter keeps this DEL off mesh-peer links; see task-1-brief.md.
-      RecordDerivedDelete(db_cntx, key);
+      // so PassesPeerEchoFilter keeps this DEL off mesh-peer links; see task-1-brief.md. `derived`
+      // (see set_family.h) lets OpFieldExpire (generic_family.cc) opt out: its own replay is
+      // clock-dependent (a lagging peer can arm an already-expired member instead of also
+      // discovering it expired), so that one caller needs the forwarded, non-suppressed DEL to
+      // force convergence. Echo-safe regardless -- see that call site's comment for the full
+      // argument. Every other caller relies on the default and is unaffected.
+      if (derived) {
+        RecordDerivedDelete(db_cntx, key);
+      } else {
+        RecordDelete(db_cntx, key);
+      }
     }
     return true;
   }

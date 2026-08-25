@@ -1710,28 +1710,37 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
 
 # drakeydb: P4-0 acceptance case (Task 1). A set command that empties its key via a lazily-
 # expired member (SetFamily::DeleteSetIfEmpty, set_family.cc) derives a DEL. A plain (full-
-# stream) replica must still see that DEL; a mesh peer must not -- the peer instead derives its
-# own DEL by independently replaying the same causing command (FIELDEXPIRE) and discovering the
-# same member already expired on its own clock. journal::PassesPeerEchoFilter (journal/types.cc)
-# is what enforces this, gated on the new journal::kEntryFlagDerived flag.
+# stream) replica must still see that DEL; a mesh peer must not -- journal::PassesPeerEchoFilter
+# (journal/types.cc) drops it, gated on the new journal::kEntryFlagDerived flag.
 #
-# Convergence alone cannot see this bug -- both b and plain end up without every key either way
-# -- so this asserts the *differential* between the peer link and the plain replica, which is
-# what the flag actually changes.
+# Triggered via FIELDTTL, not FIELDEXPIRE: a fix-round-1 ruling (see task-1-report.md) carved
+# FIELDEXPIRE's own full-empty case OUT of this suppression -- SetFamily::DeleteSetIfEmpty /
+# HSetFamily::DeleteIfEmpty now take a `derived` parameter, and OpFieldExpire
+# (generic_family.cc) passes false, because its own replay is clock-dependent: a lagging peer
+# can *arm* an already-expired member's new TTL instead of also discovering it expired, and
+# nothing else then converges it. So FIELDEXPIRE's derived DEL is now a normal, forwarded
+# RecordDelete that legitimately reaches b too (empirically confirmed: reusing FIELDEXPIRE as
+# this test's trigger now makes b's command counter match plain's exactly, both ~2n -- see
+# task-1-report.md's fix-round-1 section for the measured numbers). FIELDTTL (read-only,
+# generic_family.cc:951) is a different, unaffected call site -- still the default `derived =
+# true` -- so it is the correct trigger for what this test is actually about: the *general*
+# suppression rule, not FIELDEXPIRE's carve-out (that one has its own pair of C++ tests,
+# EmptiedCollectionDeleteCarriesDerivedFlag / FieldExpireCausedDeleteIsNotFlaggedDerived in
+# multi_master_test.cc).
 #
-# Uses N independent sets, not one: a single leaked DEL is only 1 extra command, and is not
-# reliably distinguishable from this mesh's own idle REPLCONF-ACK traffic (see STORM_BOUND's own
-# comment above -- a healthy idle 2-node mesh already shows a background delta of ~4 per 3s).
-# N leaked DELs is a clear, unmistakable signal against that same background noise.
+# Deliberately not SREM either: SREM's own OpRem (set_family.cc) deletes an emptied set directly
+# (db_slice.Del) and journals only "SREM" -- it never calls SetFamily::DeleteSetIfEmpty, so it
+# cannot exercise this code path at all (see task-1-report.md's Step 1 call-site table).
 #
-# Deliberately triggered via FIELDEXPIRE, not SREM: SREM's own OpRem (set_family.cc) deletes an
-# emptied set directly (db_slice.Del) and journals only "SREM" -- it never calls
-# SetFamily::DeleteSetIfEmpty, so it cannot exercise this code path at all (see
-# task-1-report.md's Step 1 call-site table).
-#
-# Falsified by reverting RecordDerivedDelete in set_family.cc's DeleteSetIfEmpty: the peer's
-# command counter then also picks up one forwarded DEL per key (see task-1-report.md's Step 12
-# section for the measured before/after delta).
+# Convergence is the differential here, not a command-count delta: FIELDTTL is read-only and is
+# never itself journaled (auto-journaling only ever applies to write commands), so unlike
+# FIELDEXPIRE there is no separate "causing command" that replays on b and drives its own
+# independent re-derivation. b's copy only converges if b's own traffic happens to touch the
+# same lazily-expired member (this codebase has no background sweep for member-level TTLs --
+# confirmed absent in the original Task 1 investigation) -- which nothing in this test causes, by
+# design, so b's copy is expected to keep existing. plain has no such dependency: it receives a's
+# derived DEL outright, because the peer filter that drops it for b does not apply to a plain
+# full-stream replica.
 async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: DflyInstanceFactory):
     a = df_factory.create(**active_args())
     b = df_factory.create(**active_args())
@@ -1763,48 +1772,47 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
 
     await asyncio.sleep(1.2)  # let every member's 1s TTL elapse on every node's own clock
 
-    # Measurement window starts here: from this point until the deltas are read below, nothing
-    # may run against b/plain except the trigger and a fixed idle wait -- an incidental command
-    # (e.g. a convergence-polling EXISTS) would itself inflate the very counters being measured.
+    # Measurement window starts here: from this point until delta_b is read below, nothing may
+    # run against b except the fixed idle wait -- an incidental command (e.g. a convergence-
+    # polling EXISTS) would itself inflate the very counter being measured. b is deliberately
+    # never probed at all in this test (see the module comment above for why), so this is mostly
+    # a formality here, but keeping the same discipline as the sibling FIELDEXPIRE-based
+    # assertions above avoids relying on that by accident.
     before_b = await _total_commands_processed(c_b)
-    before_plain = await _total_commands_processed(c_plain)
 
-    # Re-probing each already-expired member causes SetFieldsExpireTime to discover it lazily
-    # expired and flush it -- each set empties -> SetFamily::DeleteSetIfEmpty derives a DEL on a.
+    # Re-probing each already-expired member via FIELDTTL (read-only) on a causes
+    # SetFamily::FieldExpireTime to discover it lazily expired and flush it -- each set empties
+    # -> SetFamily::DeleteSetIfEmpty derives a DEL on a (derived=true, the default), suppressed
+    # for the peer link but forwarded to the plain replica.
     pipe = c_a.pipeline(transaction=False)
     for key in keys:
-        pipe.execute_command("fieldexpire", key, "1", "m")
+        pipe.execute_command("fieldttl", key, "m")
     await pipe.execute()
 
-    # Fixed idle wait, not a polling loop: polling b/plain directly here (e.g. via _exists, as an
-    # earlier version of this test did) would add commands to the very counters measured below,
-    # swamping the signal -- measured in practice as delta_b jumping to ~2n even with the fix
-    # applied, entirely from convergence-check EXISTS traffic (see task-1-report.md's Step 12
-    # section). 2s is comfortably more than this mesh needs to propagate ~2n small commands.
-    await asyncio.sleep(2.0)
-
-    # The load-bearing assertion: b applied only the n replayed FIELDEXPIREs, nothing else -- a
-    # forwarded derived DEL per key would show up here as n extra commands, roughly doubling the
-    # delta. plain, unaffected by the peer filter, legitimately sees both the FIELDEXPIRE and the
-    # derived DEL for every key.
-    delta_b = await _total_commands_processed(c_b) - before_b
-    delta_plain = await _total_commands_processed(c_plain) - before_plain
-
-    # Convergence check runs after the measurement above, so its own EXISTS traffic cannot
-    # contaminate it. Guards against a vacuous pass if the trigger above did not actually land.
+    # The load-bearing assertion: plain converges (it received a's derived DEL outright); b does
+    # not, because that DEL was suppressed and nothing else ever told b to clean up its copy.
     @assert_eventually(timeout=30)
-    async def emptied_converged():
+    async def plain_converged():
         for key in keys:
-            assert not await _exists(c_b, key)
             assert not await _exists(c_plain, key)
 
-    await emptied_converged()
+    await plain_converged()
 
+    await asyncio.sleep(1.0)  # give a leaked DEL, if any, time to arrive before checking b
+
+    for key in keys:
+        assert await _exists(c_b, key), (
+            f"{key} no longer exists on the peer -- a's derived DEL must have leaked through "
+            f"(SetFamily::DeleteSetIfEmpty's default -- not FIELDEXPIRE's carve-out -- is the "
+            f"one under test here)"
+        )
+
+    # Belt-and-suspenders on the command-count channel used by the sibling FIELDEXPIRE-vs-peer
+    # comparisons above: b's own counter should reflect nothing beyond idle mesh noise -- b was
+    # never itself probed, so there is no legitimate traffic at all to account for here, unlike
+    # the FIELDTTL-issued-directly-against-b variant this test does NOT use (see module comment).
+    delta_b = await _total_commands_processed(c_b) - before_b
     assert delta_b < 1.5 * n, (
-        f"peer applied {delta_b} commands for {n} replayed writes (expected close to {n}, well "
-        f"under {1.5 * n}) -- looks like the derived DELs leaked through to the peer"
-    )
-    assert delta_plain >= 2 * n, (
-        f"plain replica applied {delta_plain} commands, expected at least {2 * n} (the "
-        f"FIELDEXPIRE plus the derived DEL for each of {n} keys)"
+        f"peer applied {delta_b} commands with nothing legitimately sent to it (expected close "
+        f"to 0, well under {1.5 * n}) -- looks like a's derived DELs leaked through to the peer"
     )

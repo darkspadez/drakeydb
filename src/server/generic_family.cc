@@ -903,16 +903,33 @@ OpResult<vector<long>> OpFieldExpire(const OpArgs& op_args, string_view key, uin
 
   vector<long> result;
   bool key_deleted;
+  // drakeydb: P4-0 -- `derived = false` here (both branches): unlike every other
+  // DeleteSetIfEmpty/DeleteIfEmpty caller, THIS command's own replay on a peer is
+  // clock-dependent. FIELDEXPIRE re-arms the TTL of the fields it names; if a peer's clock is
+  // behind, it can find those fields NOT yet expired and arm them with the new TTL instead of
+  // also discovering them expired -- key_deleted stays false there, and the partial-expiry
+  // compensation just below (missing.size() > 1) never fires either, because every field
+  // "succeeded". That peer is left holding a live key indefinitely; nothing it does locally
+  // converges it. Passing false makes this DEL a plain, forwarded RecordDelete instead of a
+  // suppressed RecordDerivedDelete, so it reaches the peer and forces convergence -- exactly the
+  // corrective role the plain-replica DEL already plays today.
+  //
+  // Echo-safe: when a peer applies this same replicated FIELDEXPIRE and its own copy empties too
+  // (the ordinary, no-skew case), the DEL IT derives inherits db_cntx.repl_origin_idx from that
+  // peer-tagged transaction (not kSelfIdx) -- see the Phase 3 comment on RecordDelete's
+  // DbContext overload, tx_base.cc. PassesPeerEchoFilter's origin_idx check (not this flag) is
+  // what stops that reflection from being forwarded again, so this does not create an echo
+  // storm. Do not "simplify" this back to the default.
   if (is_set) {
     result = SetFamily::SetFieldsExpireTime(op_args, ttl_sec, values, pv);
     // Finalize memory accounting before potential deletion.
     auto_updater.Run();
-    key_deleted = SetFamily::DeleteSetIfEmpty(db_slice, op_args.db_cntx, key, *pv);
+    key_deleted = SetFamily::DeleteSetIfEmpty(db_slice, op_args.db_cntx, key, *pv, false);
   } else {
     result = HSetFamily::SetFieldsExpireTime(op_args, ttl_sec, ExpireFlags::EXPIRE_ALWAYS, key,
                                              values, pv);
     auto_updater.Run();
-    key_deleted = HSetFamily::DeleteIfEmpty(db_slice, op_args.db_cntx, key, *pv);
+    key_deleted = HSetFamily::DeleteIfEmpty(db_slice, op_args.db_cntx, key, *pv, false);
   }
 
   // A member probed while lazily expired is still alive on a lagging replica and the replayed
