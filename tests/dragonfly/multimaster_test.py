@@ -733,6 +733,16 @@ async def test_peer_mesh_own_writes_not_echoed_back(df_factory: DflyInstanceFact
     assert await c_b.get("cnt2") == "1"
 
 
+# D-7 review round 2: fixed, ordered uuids so the test knows in advance which side MUST defer --
+# ShouldRefuseReciprocalPeer refuses iff self_uuid < peer_uuid (peer_replication.h/.cc), so the
+# larger uuid's own outbound link is always the one that can be refused. Summing both sides'
+# find_in_logs results (as an earlier version of this test did) cannot tell "the right side
+# deferred" apart from "the wrong side deferred, by a swapped-operand bug" -- both produce one
+# non-empty match. Asserting the specific side closes that gap.
+TIEBREAK_UUID_LO = "10000000-0000-4000-8000-000000000000"
+TIEBREAK_UUID_HI = "20000000-0000-4000-8000-000000000000"
+
+
 async def test_simultaneous_reciprocal_replicaof_converges(
     df_factory: DflyInstanceFactory, port_picker
 ):
@@ -741,28 +751,32 @@ async def test_simultaneous_reciprocal_replicaof_converges(
     (server_family.cc's ReplConf admission check, backed by
     PeerReplicationManager::HasUnestablishedPeerWithUuid / ShouldRefuseReciprocalPeer in
     peer_replication.{h,cc}) settles this deterministically: the side whose own uuid sorts later
-    refuses the other's inbound connection with a retryable error while its own outbound link to
-    that uuid is still unestablished, so only one direction pays for the first full sync; the
-    refused side's Greet() (replica.cc) retries on its normal 500ms loop and is admitted normally
-    once the winner's link is up.
+    (`b`, TIEBREAK_UUID_HI) has its outbound link refused with a retryable error while `a`'s
+    outbound link to it is still unestablished, so only one direction pays for the first full
+    sync; the refused side's Greet() (replica.cc) retries on its normal 500ms loop and is
+    admitted normally once the winner's link is up.
 
     Two boot-time --replicaof flags (StartMode::kBackground), not two interactive REPLICAOF
     commands gathered via asyncio.gather: an interactive REPLICAOF is a *single* blocking
-    handshake attempt (PeerReplicationManager::Add's kBlockingHandshake) with no retry of its
-    own, so losing the tiebreak on that one attempt would fail the command outright instead of
-    quietly retrying. The 500ms retry loop this task's tiebreak is a determinism layer on top of
-    is background-mode-only (Replica::MainReplicationFb) -- which boot's --replicaof uses -- and
-    is also the natural way "two active nodes REPLICAOF each other simultaneously" actually
-    happens when bringing up a mesh from static config. df_factory.start_all() launches both
-    processes back to back (not one-after-the-other-and-wait), so both sides' outbound connection
-    attempts genuinely race.
+    handshake attempt (PeerReplicationManager::Add's kBlockingHandshake); losing the tiebreak on
+    that one attempt now falls back to the background and still returns OK (D-7 review round 2 --
+    see test_reciprocal_blocking_replicaof_falls_back_to_background_and_converges below for that
+    path specifically). Boot-time --replicaof exercises the plain 500ms retry loop
+    (Replica::MainReplicationFb) directly, and is also the natural way "two active nodes
+    REPLICAOF each other simultaneously" actually happens when bringing up a mesh from static
+    config. df_factory.start_all() launches both processes back to back (not
+    one-after-the-other-and-wait), so both sides' outbound connection attempts genuinely race.
 
     Falsifying: see task-8-report.md.
     """
     a_port = port_picker.get_available_port()
     b_port = port_picker.get_available_port()
-    a = df_factory.create(**active_args(port=a_port, replicaof=f"localhost:{b_port}"))
-    b = df_factory.create(**active_args(port=b_port, replicaof=f"localhost:{a_port}"))
+    a = df_factory.create(
+        **active_args(port=a_port, replicaof=f"localhost:{b_port}", node_uuid=TIEBREAK_UUID_LO)
+    )
+    b = df_factory.create(
+        **active_args(port=b_port, replicaof=f"localhost:{a_port}", node_uuid=TIEBREAK_UUID_HI)
+    )
     df_factory.start_all([a, b])
     c_a, c_b = a.client(), b.client()
 
@@ -776,13 +790,148 @@ async def test_simultaneous_reciprocal_replicaof_converges(
 
     a.stop()
     b.stop()
-    # The tiebreak actually fired on (at least) one side -- this is what makes the test genuinely
-    # about the tiebreak, rather than merely re-proving that a merge-not-flush full sync converges
-    # even when done redundantly in both directions at once (which it may well do on its own).
-    refused = a.find_in_logs("reciprocal-connect uuid tiebreak") + b.find_in_logs(
-        "reciprocal-connect uuid tiebreak"
+    # The tiebreak fired on the SPECIFIC side the predicate says must defer (b, the larger uuid)
+    # -- not just "some side, somewhere" (summing both sides' find_in_logs, as an earlier version
+    # of this test did, would still pass if the predicate's operands were swapped and the wrong
+    # side deferred instead). This is also what makes the test genuinely about the tiebreak,
+    # rather than merely re-proving that a merge-not-flush full sync converges even when done
+    # redundantly in both directions at once (which it may well do on its own).
+    assert b.find_in_logs("reciprocal-connect uuid tiebreak"), (
+        "the larger uuid (b) never logged a reciprocal-connect tiebreak refusal -- it should "
+        "have deferred to a"
     )
-    assert refused, "neither side ever logged a reciprocal-connect tiebreak refusal"
+    assert not a.find_in_logs("reciprocal-connect uuid tiebreak"), (
+        "the smaller uuid (a) was refused -- ShouldRefuseReciprocalPeer's operands must be "
+        "swapped"
+    )
+
+
+async def test_narrowed_window_admits_peer_during_winners_full_sync(
+    df_factory: DflyInstanceFactory, port_picker
+):
+    """D-7 review round 2 (fix 1): the reciprocal-connect tiebreak's "unestablished" window is
+    scoped to the handshake only (Replica::Greet(), R_GREETED) -- not the full sync that follows
+    it (R_SYNC_OK). Before this fix, a peer link stayed "unestablished" (eligible to refuse a
+    reciprocal connect) for the sync's *entire* duration, so an ordinary, non-racing REPLICAOF
+    issued on the peer while the winner was still mid-sync would lose a uuid coin flip and get
+    refused -- turning sequential mesh bring-up into an intermittent failure over seconds to
+    minutes, not settling a genuine microsecond handshake-time race.
+
+    `winner` (TIEBREAK_UUID_LO) pulls a large dataset from `loser` (TIEBREAK_UUID_HI), so
+    winner's own full sync from loser takes a real, observable amount of time -- during which
+    winner has long since passed its own handshake with loser (R_GREETED) but not yet R_SYNC_OK.
+    While winner is confirmed still mid-sync, `loser` issues REPLICAOF winner (the reciprocal
+    direction: loser pulling from winner) and must be admitted immediately -- winner is the
+    smaller uuid's peer, so under the old wide window winner would still be "unestablished" here
+    and would refuse it.
+
+    Falsifying: see task-8-report.md.
+    """
+    winner_port = port_picker.get_available_port()
+    loser_port = port_picker.get_available_port()
+    winner = df_factory.create(**active_args(port=winner_port, node_uuid=TIEBREAK_UUID_LO))
+    loser = df_factory.create(**active_args(port=loser_port, node_uuid=TIEBREAK_UUID_HI))
+    df_factory.start_all([winner, loser])
+    c_winner, c_loser = winner.client(), loser.client()
+
+    # Enough data that winner's full sync from loser takes multiple seconds, not milliseconds.
+    await c_loser.execute_command("DEBUG POPULATE 700000 k 500")
+
+    assert await c_winner.execute_command(f"REPLICAOF localhost {loser_port}") == "OK"
+
+    # Confirm winner is genuinely mid full sync -- not accidentally already done, which would
+    # make this test pass even with the old, wide window too.
+    async with async_timeout.timeout(30):
+        while True:
+            info = await c_winner.info("replication")
+            m0 = info.get("master0")
+            if m0 and m0.get("sync_in_progress") == 1:
+                break
+            await asyncio.sleep(0.02)
+
+    # The reciprocal direction, started while winner is still mid-sync, must be admitted
+    # immediately -- not refused-then-backgrounded (that would still eventually converge via the
+    # round-2 background fallback, but would defeat the point of this test: proving the window
+    # itself is narrow, not just that the mesh eventually comes up regardless).
+    assert await c_loser.execute_command(f"REPLICAOF localhost {winner_port}") == "OK"
+    await wait_for_peers(c_loser, 1)
+
+    winner.stop()
+    loser.stop()
+    assert not loser.find_in_logs("reciprocal-connect uuid tiebreak"), (
+        "loser's REPLICAOF was refused while winner was still mid full sync -- the "
+        "'unestablished' window is still too wide"
+    )
+
+
+async def test_reciprocal_blocking_replicaof_falls_back_to_background_and_converges(
+    df_factory: DflyInstanceFactory,
+):
+    """D-7 review round 2 (fix 2): an interactive (blocking) REPLICAOF that loses the
+    reciprocal-connect uuid tiebreak on its one-shot PeerReplicationManager::Add
+    kBlockingHandshake attempt must NOT fail the command -- it must publish the peer, fall back
+    to the background retry loop, and reply OK, exactly as if EnableReplication() (kBackground)
+    had been used from the start. Before this fix, the losing side's REPLICAOF got
+    "-ERR replication cancelled" back -- byte-identical to a DNS failure or an own-uuid refusal,
+    and strictly worse than pre-task behavior (both used to just succeed).
+
+    Both interactive REPLICAOFs are gathered concurrently -- the literal "two active nodes
+    REPLICAOF each other simultaneously" scenario -- which only became testable this way once
+    this fallback existed (see test_simultaneous_reciprocal_replicaof_converges's own docstring
+    for why a bare kBlockingHandshake gather could not be used before this fix).
+
+    Falsifying: see task-8-report.md.
+    """
+    a = df_factory.create(**active_args(node_uuid=TIEBREAK_UUID_LO))
+    b = df_factory.create(**active_args(node_uuid=TIEBREAK_UUID_HI))
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    results = await asyncio.gather(
+        c_a.execute_command(f"REPLICAOF localhost {b.port}"),
+        c_b.execute_command(f"REPLICAOF localhost {a.port}"),
+    )
+    assert results == ["OK", "OK"], (
+        "both interactive REPLICAOFs must return OK even when one loses the tiebreak -- got "
+        f"{results}"
+    )
+
+    await asyncio.gather(wait_for_peers(c_a, 1), wait_for_peers(c_b, 1))
+    assert await c_a.incr("cnt") == 1
+    await wait_for_value(c_b, "cnt", "1")
+    assert await c_b.incr("cnt2") == 1
+    await wait_for_value(c_a, "cnt2", "1")
+
+    a.stop()
+    b.stop()
+    # b (the larger uuid) is the one expected to have lost the tiebreak and fallen back.
+    assert b.find_in_logs(
+        "reciprocal-connect uuid tiebreak"
+    ), "b never hit the tiebreak refusal this test means to exercise the fallback for"
+
+
+async def test_non_tiebreak_blocking_replicaof_failure_still_fails_command(
+    df_factory: DflyInstanceFactory,
+):
+    """D-7 review round 2: the background fallback in PeerReplicationManager::Add must trigger
+    ONLY on the reciprocal-connect tiebreak's specific errc (Replica::LastGreetEc() ==
+    std::errc::device_or_resource_busy). An unrelated blocking-handshake failure -- here, an
+    unreachable host, so Start() fails during DNS resolution and never even reaches Greet() --
+    must still fail the REPLICAOF command outright and leave no peer attached, exactly as before
+    this task. Silently backgrounding a genuine misconfiguration (bad host, own uuid, a uuid
+    already claimed by another live peer) would hide it from the operator instead of reporting it.
+
+    Falsifying: see task-8-report.md.
+    """
+    node = df_factory.create(**active_args())
+    node.start()
+    c = node.client()
+
+    with pytest.raises(redis.exceptions.ResponseError):
+        await c.execute_command("REPLICAOF invalidhost 1")
+
+    info = await c.info("replication")
+    assert info.get("connected_masters", 0) == 0
 
 
 async def test_drakey_handshake_pairs_no_longer_log_parse_errors(df_factory: DflyInstanceFactory):

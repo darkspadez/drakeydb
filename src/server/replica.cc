@@ -157,6 +157,10 @@ GenericError Replica::Start() {
   VLOG(1) << "Greeting";
   state_mask_ = R_ENABLED | R_TCP_CONNECTED;
   ec = Greet();
+  // drakeydb D-7: captured before check_connection_error below coerces any failure into a
+  // string-only GenericError (see LastGreetEc()'s own doc comment, replica.h) -- this is the one
+  // place a blocking Start() caller can recover the specific errc.
+  last_greet_ec_ = ec;
   RETURN_ON_ERR(check_connection_error(ec, "could not greet master "));
 
   return {};
@@ -348,12 +352,6 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
         continue;
       }
       state_mask_ |= R_SYNC_OK;
-      // drakeydb D-7: this link has reached stable sync -- tell identity_claims_ so
-      // PeerReplicationManager::HasUnestablishedPeerWithUuid stops treating it as a
-      // reciprocal-connect candidate (the tiebreak must never fire against an already-established
-      // link -- see that method's own doc comment). A no-op outside peer mode.
-      if (peer_mode_ && peer_mode_->identity_claims)
-        peer_mode_->identity_claims->MarkEstablished(client_id_);
       continue;
     }
 
@@ -527,6 +525,18 @@ error_code Replica::Greet() {
   }
 
   state_mask_ |= R_GREETED;
+  // drakeydb D-7: this link has passed the identity handshake -- tell identity_claims_ so
+  // PeerReplicationManager::HasUnestablishedPeerWithUuid stops treating it as a
+  // reciprocal-connect candidate. Deliberately at R_GREETED, not later at R_SYNC_OK (full sync
+  // done): the tiebreak exists to settle the brief handshake-time race where both sides are
+  // scrambling to reach REPLCONF capa dragonfly first (review finding, T8 round 2) -- once our
+  // own handshake with this peer has itself resolved, that race is over for this connection
+  // attempt, regardless of how long the data transfer that follows takes. Marking established
+  // only at R_SYNC_OK made the "unestablished" window span the *entire* full sync (seconds to
+  // minutes), so any REPLICAOF issued on the peer while we were mid-sync -- ordinary sequential
+  // mesh bring-up, not a race at all -- lost a 50/50 uuid coin flip. A no-op outside peer mode.
+  if (peer_mode_ && peer_mode_->identity_claims)
+    peer_mode_->identity_claims->MarkEstablished(client_id_);
   return error_code{};
 }
 

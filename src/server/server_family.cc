@@ -3732,9 +3732,12 @@ void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
           // nodes evaluate ShouldRefuseReciprocalPeer with the operands swapped -- see its own doc
           // comment, peer_replication.h, for why that can never both-defer or neither-defer). The
           // refused side's Greet() (replica.cc) fails with a retryable error and retries on its
-          // normal 500ms loop -- by then this link should be established and no longer eligible.
-          // HasUnestablishedPeerWithUuid excludes an already-established link by construction, so
-          // a healthy mesh edge is never torn down by this check.
+          // normal 500ms loop -- typically well under that, since "established" here means past
+          // the handshake (Replica::Greet(), R_GREETED), not past the full sync that follows it
+          // (an earlier, wider-window version of this check refused for the sync's entire
+          // duration, turning ordinary sequential mesh bring-up into a uuid coin flip -- see
+          // Greet()'s own comment). HasUnestablishedPeerWithUuid excludes an already-established
+          // link by construction, so a healthy mesh edge is never torn down by this check.
           if (rinfo.repl_is_peer &&
               ShouldRefuseReciprocalPeer(peers_->HasUnestablishedPeerWithUuid(rinfo.repl_node_uuid),
                                          node_uuid(), rinfo.repl_node_uuid)) {

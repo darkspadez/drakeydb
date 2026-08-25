@@ -96,6 +96,19 @@ class Replica : ProtocolClient {
     return !exec_st_.IsRunning();
   }
 
+  // drakeydb D-7: the raw std::error_code Greet() returned during this Replica's most recent
+  // Start() call. Start()'s own check_connection_error lambda coerces any Greet() failure into a
+  // string-only GenericError -- GenericError(std::string) default-constructs its std::error_code
+  // member (execution_state.h), so Start()'s return value alone cannot tell a caller *which*
+  // errc Greet() actually produced. This is the one place a blocking Start() caller can recover
+  // it -- PeerReplicationManager::Add uses it to recognize the reciprocal-connect uuid tiebreak
+  // (device_or_resource_busy) specifically, among Start()'s many other possible failure reasons,
+  // without this class needing to know anything about the tiebreak itself. Default-constructed
+  // (empty/no-error) if Start() succeeded, was never called, or failed before reaching Greet().
+  std::error_code LastGreetEc() const {
+    return last_greet_ec_;
+  }
+
  private: /* Main standalone mode functions */
   // Coordinate state transitions. Spawned by start.
   void MainReplicationFb(std::optional<LastMasterSyncData> data);
@@ -214,6 +227,9 @@ class Replica : ProtocolClient {
   // repl_offs_ to derive bytes read since this connection was established.
   size_t repl_offs_ = 0, ack_offs_ = 0, initial_repl_offs_ = 0;
   unsigned state_mask_ = 0;  // see State enum above.
+
+  // drakeydb D-7: see LastGreetEc()'s own doc comment.
+  std::error_code last_greet_ec_;
 
   // When replica starts full sync it is set to false and true when it completes the full sync.
   // Disconnects do not reset this, so this variable is still true if the master

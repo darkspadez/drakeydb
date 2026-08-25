@@ -196,8 +196,27 @@ GenericError PeerReplicationManager::Add(const Endpoint& ep, std::string_view se
                                      ReplicaPeerMode{&gate_, registry_, &identity_claims_});
   if (mode == StartMode::kBlockingHandshake) {
     GenericError ec = r->Start();
-    if (ec || r->IsContextCancelled())
-      return ec ? ec : GenericError{"replication cancelled"};
+    if (ec || r->IsContextCancelled()) {
+      // drakeydb D-7 (review round 2): a blocking REPLICAOF's one and only Start() attempt can
+      // lose the reciprocal-connect uuid tiebreak (ShouldRefuseReciprocalPeer,
+      // HasUnestablishedPeerWithUuid) -- not a real failure, just this side deferring to the
+      // other for now. Unlike every other Start() failure, this one is expected to clear itself
+      // within a retry or two. Falling straight through to `return ec` below would surface
+      // "-ERR replication cancelled" indistinguishable from a DNS failure or an own-uuid
+      // refusal (GenericError(std::string)'s std::error_code member is always default-
+      // constructed -- see Replica::LastGreetEc()'s own doc comment, replica.h -- so `ec` itself
+      // cannot carry the specific errc here; LastGreetEc() is the one channel that does) --
+      // strictly worse than pre-task behavior, where this would have just succeeded. Recognized
+      // *only* by that specific errc: every other reason Start() can fail (unreachable host,
+      // own uuid, a uuid already claimed by another live peer, ...) still fails the command
+      // exactly as before -- silently backgrounding those would hide a real misconfiguration.
+      if (r->LastGreetEc() == std::errc::device_or_resource_busy) {
+        r->EnableReplication();         // fresh state_mask_/fiber; Start() never touched sync_fb_.
+        mode = StartMode::kBackground;  // Step 3 below must not re-start the fiber.
+      } else {
+        return ec ? ec : GenericError{"replication cancelled"};
+      }
+    }
   } else {
     r->EnableReplication();
   }

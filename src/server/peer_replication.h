@@ -43,17 +43,20 @@ class PeerIdentityClaims {
   // Always (re)starts the claim as not-established -- see MarkEstablished/HasUnestablishedClaim
   // below. TryClaim is only ever called once per connection attempt (Replica::Greet(), right
   // after the peer's uuid becomes known), so a fresh call here always represents a handshake that
-  // has not yet reached stable sync, even when it is re-confirming the same uuid an earlier
+  // has not itself completed yet, even when it is re-confirming the same uuid an earlier
   // (now-dropped) connection to the same owner already held.
   bool TryClaim(uint64_t owner_id, std::string_view uuid);
 
   // Releases the claim held by `owner_id`, if any. Idempotent.
   void Release(uint64_t owner_id);
 
-  // drakeydb D-7: marks `owner_id`'s current claim, if any, as established (its link has reached
-  // stable sync -- Replica's R_SYNC_OK). A no-op if `owner_id` holds no claim, e.g. it raced a
-  // Release(). Never resets to false on its own; only a fresh TryClaim (a new connection attempt)
-  // does that -- see TryClaim's own comment.
+  // drakeydb D-7: marks `owner_id`'s current claim, if any, as established. A no-op if
+  // `owner_id` holds no claim, e.g. it raced a Release(). Never resets to false on its own; only
+  // a fresh TryClaim (a new connection attempt) does that -- see TryClaim's own comment.
+  //
+  // Called from Replica::Greet() (R_GREETED), not later at full-sync completion (R_SYNC_OK):
+  // see that call site's own comment for why the window this leaves "unestablished" must be the
+  // handshake only, not the whole sync that follows it.
   void MarkEstablished(uint64_t owner_id);
 
   // drakeydb D-7: true iff some live owner currently claims `uuid` and MarkEstablished has not
@@ -189,8 +192,10 @@ class PeerReplicationManager {
   };
 
   // REPLICAOF <host> <port> in active mode. kBlockingHandshake: connect+greet synchronously like
-  // upstream REPLICAOF -- on failure nothing changes and the error is returned. kBackground: boot
-  // time (--replicaof); starts the reconnect loop and returns immediately.
+  // upstream REPLICAOF -- on failure nothing changes and the error is returned, with one D-7
+  // exception: losing the reciprocal-connect uuid tiebreak on this one attempt falls back to
+  // publishing the peer and continuing in the background instead (see Add()'s own comment).
+  // kBackground: boot time (--replicaof); starts the reconnect loop and returns immediately.
   enum class StartMode { kBlockingHandshake, kBackground };  // REPLICAOF vs boot --replicaof
 
   PeerReplicationManager(Service* service, PeerRegistry* registry);
@@ -202,6 +207,12 @@ class PeerReplicationManager {
   // that is already attached is a no-op: *already_attached is set and Add() returns success. A
   // different endpoint presenting an attached UUID fails a blocking handshake; a background link
   // stays down/retrying until that UUID is released. Fails once Shutdown() has been called.
+  //
+  // drakeydb D-7: a kBlockingHandshake that loses the reciprocal-connect uuid tiebreak on its
+  // one Start() attempt (Replica::LastGreetEc() == std::errc::device_or_resource_busy) is the
+  // one case that does NOT fail: the peer is published and continues in the background exactly
+  // as kBackground would, and Add() returns success. Every other blocking-handshake failure is
+  // unaffected.
   GenericError Add(const Endpoint& ep, std::string_view self_replid, StartMode mode,
                    bool* already_attached);
 
@@ -227,7 +238,10 @@ class PeerReplicationManager {
   std::vector<Endpoint> Endpoints() const;
 
   // drakeydb D-7: true iff one of our own peer links currently claims `uuid` and has not yet
-  // reached stable sync. Backs the reciprocal-connect tiebreak (server_family.cc's ReplConf) --
+  // finished its handshake with that peer (Replica::Greet()) -- established the moment the
+  // handshake resolves, not once the full sync that follows it finishes; see Replica::Greet()'s
+  // own comment for why the window must stay this narrow. Backs the reciprocal-connect tiebreak
+  // (server_family.cc's ReplConf) --
   // called from a connection fiber mid another peer's own admission handshake, so, unlike
   // Summaries(), this deliberately never hops into a Replica's own proactor: it answers from
   // identity_claims_ alone, which (see PeerIdentityClaims's class comment) keeps its own lock

@@ -321,6 +321,13 @@ using StartMode = PeerReplicationManager::StartMode;
 constexpr char kReplid[] = "0123456789abcdef0123456789abcdef01234567";
 constexpr char kUnresolvableHost[] = "invalid host";
 
+// drakeydb D-7 round 2: also stands as discrimination coverage for the reciprocal-connect
+// tiebreak's background fallback (PeerReplicationManager::Add, gated on Replica::LastGreetEc()
+// == std::errc::device_or_resource_busy): a DNS failure never reaches Greet() at all, so
+// LastGreetEc() can never read as the tiebreak's errc, and this Add() must still fail outright
+// and register nothing -- exactly as before that fallback existed. See
+// LastGreetEcStaysEmptyForNonGreetFailure below for the same guarantee pinned directly on
+// Replica::LastGreetEc() itself, in isolation from PeerReplicationManager.
 TEST_F(PeerManagerFamilyTest, BlockingAddToUnreachablePortFailsAndLeavesNoPeer) {
   PeerRegistry reg;
   reg.Init(GenerateNodeUuid());
@@ -335,6 +342,28 @@ TEST_F(PeerManagerFamilyTest, BlockingAddToUnreachablePortFailsAndLeavesNoPeer) 
     EXPECT_TRUE(mgr.Summaries().empty());
     mgr.Shutdown();
   });
+}
+
+// drakeydb D-7 round 2: pins Replica::LastGreetEc()'s own contract directly -- the signal
+// PeerReplicationManager::Add's background fallback discriminates on. A DNS failure fails
+// Start() before Greet() is ever called, so last_greet_ec_ must stay at its default-constructed
+// (no error) value; in particular it must never equal std::errc::device_or_resource_busy, which
+// would make Add() wrongly treat an unrelated failure as the reciprocal-connect tiebreak and
+// silently background it instead of failing the command.
+//
+// Falsifying (verified by hand -- see task-8-report.md): setting last_greet_ec_ unconditionally
+// in Start() (e.g. right after entering the function, instead of after `ec = Greet();`) to some
+// non-empty placeholder makes EXPECT_FALSE(r.LastGreetEc()) fail.
+TEST_F(PeerManagerFamilyTest, LastGreetEcStaysEmptyForNonGreetFailure) {
+  pp_->at(0)->Await(
+      [&] {
+        Replica r(kUnresolvableHost, 1, service_.get(), kReplid, std::nullopt);
+        GenericError ec = r.Start();
+        EXPECT_TRUE(ec) << "the invalid host must fail DNS resolution, before Greet() ever runs";
+        EXPECT_FALSE(r.LastGreetEc())
+            << "DNS resolution fails before Greet() is ever called, so LastGreetEc() must stay at "
+               "its default (no error) value -- never mistaken for the reciprocal-connect tiebreak";
+      });
 }
 
 TEST_F(PeerManagerFamilyTest, BackgroundAddRemoveNoOneAndDuplicate) {
