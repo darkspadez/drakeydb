@@ -1419,6 +1419,28 @@ async def attach_full_mesh(c_a, a, c_b, b, c_c, c):
     await wait_for_peers(c_c, 2)
 
 
+async def wait_until_not_loading(c, timeout=30):
+    """Wait until INFO persistence's `loading` flag clears, or fail with a message naming that
+    specific symptom.
+
+    wait_for_peers only confirms a peer LINK is up and past its own full-sync handshake
+    (link_status/sync_in_progress) -- it does not confirm the node's global state has actually
+    left LOADING, which can lag behind if the node is still draining a backlog. A node stuck in
+    LOADING answers -LOADING to most commands, including the SCRIPT LOAD inside
+    SeederV2.capture(); without this check, a genuine regression here would only surface many
+    retries later as a generic, deeply-buried `redis.exceptions.BusyLoadingError` raised from
+    inside capture() -- which reads as "the seeder blew up", not "the restarted node never left
+    LOADING" (see test_three_node_mesh_reconverges_after_kill_and_restart's docstring for the
+    real, once-confusing failure this replaces).
+    """
+    try:
+        async with async_timeout.timeout(timeout):
+            while int((await c.info("persistence"))["loading"]):
+                await asyncio.sleep(0.2)
+    except asyncio.TimeoutError:
+        pytest.fail(f"node still LOADING (INFO persistence) {timeout}s after restart")
+
+
 # drakeydb: measured healthy baseline (idle 3-node reciprocal mesh, proactor_threads=2 each side,
 # the pytest harness's default of 1 shard, 3s sample) was a rock-steady delta of 7 on EVERY node
 # across 5 repeated 3s samples taken while developing this test (see task-11-report.md for the
@@ -1558,16 +1580,30 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
     never which one -- so nobody "fixes" this test into asserting newest-wins before P6 lands.
 
     Falsifying (verified by hand; full transcript in task-11-report.md): same revert as
-    test_three_node_mesh_converges_without_forwarding's docstring. Observed: a DIFFERENT failure
-    mode than the mesh test above, and arguably a worse one -- the restarted node never finished
-    coming back up at all. reconverged()'s capture() call on c2 raised
-    `redis.exceptions.BusyLoadingError: Dragonfly is loading the dataset in memory` after 7
-    retry-loop attempts and 163.67s (vs. this test's normal ~9s full run), i.e. c2 was still
-    stuck in LOADING deep into what should have been a small, fast catch-up sync. This never
-    even reached the mutual-convergence or storm-bound assertions: with every peer-mode stream
-    unfiltered, C's boot-time full syncs from A and B (and A's/B's own reciprocal syncs from
-    C) get caught in the same unbounded relay storm the mesh test's docstring describes, and the
-    ordinary-sized catch-up this test expects never drains.
+    test_three_node_mesh_converges_without_forwarding's docstring. Round 1 (before
+    wait_until_not_loading existed) observed a DIFFERENT failure mode than the mesh test above,
+    and a poor one for CI -- the restarted node never finished coming back up at all.
+    reconverged()'s capture() call on c2 raised `redis.exceptions.BusyLoadingError: Dragonfly is
+    loading the dataset in memory` after 7 retry-loop attempts and 163.67s (vs. this test's
+    normal ~9s full run), which reads as "the seeder blew up", not "the restarted node never
+    left LOADING". wait_until_not_loading (see its own docstring) exists specifically to name
+    that symptom directly and fail long before capture() is ever reached.
+
+    Round 2 (same revert, wait_until_not_loading now in place) observed something instructive:
+    with EVERY gate in this test now consistently bounded (review round 1 also bounded the
+    previously-untimed asyncio.gather(task_a, task_b)), the storm is severe enough --
+    reproduced identically twice -- to blow the EARLIER `wait_for_value(c_b, "conflict-key",
+    "a-while-c-down")` call's own 30s budget first, well before the restart/LOADING phase is
+    ever reached: `TimeoutError` raised from that wait_for_value call, total run 33.95-34.65s (vs. round
+    1's 163.67s). This is still exactly the outcome review round 1 asked for -- fast, and naming
+    a concrete symptom (a specific key never reached a specific value on a specific node) --
+    it simply is not THIS bound specifically that fires first once every gate is bounded, because
+    PassesPeerEchoFilter is one shared, destination-agnostic check: the same revert floods the
+    still-healthy A<->B pair too, and that is simply the earliest bounded assertion in program
+    order. wait_until_not_loading's own message was independently confirmed correct and
+    reachable by driving it directly (a stub whose `info("persistence")` always reports
+    `loading: 1`): `Failed: node still LOADING (INFO persistence) 0.3s after restart`, 0.42s
+    total -- see task-11-report.md for the full transcript of both rounds.
     """
     c_port = port_picker.get_available_port()
     a = df_factory.create(**active_args())
@@ -1599,7 +1635,7 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
     await asyncio.sleep(1.0)  # let real, interleaved writes flow on all three before the kill
     c.stop(kill=True)  # SIGKILL: ungraceful death mid-load, no clean shutdown snapshot from here
     task_c.cancel()
-    with contextlib.suppress(asyncio.CancelledError, Exception):
+    with contextlib.suppress(asyncio.CancelledError, redis.exceptions.ConnectionError):
         await task_c  # the kill above breaks c_c's connection; swallow whatever surfaces
 
     # A and B keep converging with each other while C is gone; overwrite the shared key so C's
@@ -1607,7 +1643,8 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
     await c_a.set("conflict-key", "a-while-c-down")
     await wait_for_value(c_b, "conflict-key", "a-while-c-down")
 
-    await asyncio.gather(task_a, task_b)  # let a/b's bounded seeders finish naturally
+    async with async_timeout.timeout(30):
+        await asyncio.gather(task_a, task_b)  # let a/b's bounded seeders finish naturally
 
     c2 = df_factory.create(**c_args, replicaof=f"localhost:{a.port},localhost:{b.port}")
     c2.start()
@@ -1616,6 +1653,9 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
     await wait_for_peers(c_c2, 2)  # c2's own two boot-time REPLICAOF links land
     await wait_for_peers(c_a, 2)  # a's pre-existing link to c auto-reconnects, unassisted
     await wait_for_peers(c_b, 2)  # ditto for b
+    # Explicit and separately bounded from reconverged() below -- see wait_until_not_loading's
+    # docstring for why wait_for_peers above cannot substitute for this.
+    await wait_until_not_loading(c_c2)
 
     @assert_eventually(times=300)
     async def reconverged():
