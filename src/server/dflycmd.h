@@ -344,11 +344,11 @@ class DflyCmd {
   // Stop full sync in thread. Run state switch cleanup.
   facade::OpStatus StopFullSyncInThread(FlowInfo* flow, ExecutionState* cntx, EngineShard* shard);
 
-  // Start stable sync in thread. Called for each flow. peer_mode/peer_uuid come from the
-  // replica's ReplicaInfo (IsPeer()/GetNodeUuid()) and configure the peer-echo filter -- see
-  // JournalStreamer::Config in journal/streamer.h.
+  // Start stable sync in thread. Called for each flow. peer_mode comes from the replica's
+  // ReplicaInfo (IsPeer()) and configures the peer-echo filter -- see JournalStreamer::Config in
+  // journal/streamer.h.
   void StartStableSyncInThread(FlowInfo* flow, ExecutionState* cntx, EngineShard* shard,
-                               bool peer_mode, std::string_view peer_uuid);
+                               bool peer_mode);
 
   // Get ReplicaInfo by sync_id.
   std::shared_ptr<ReplicaInfo> GetReplicaInfo(uint32_t sync_id) ABSL_LOCKS_EXCLUDED(mu_);

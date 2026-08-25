@@ -51,6 +51,10 @@ bool ValidateMultiMasterFlags() {
     LOG(ERROR) << "--active_replica is incompatible with --experimental_cascaded_partial_sync";
     return false;
   }
+  LOG(WARNING) << "--active_replica: known limitations -- a local read (e.g. HTTL) can lazily "
+                  "expire and delete a peer's not-yet-expired key under clock skew, and full-sync "
+                  "merge is last-loaded-wins until P6 (a peer sync can overwrite newer local "
+                  "writes); see docs/PLAN.md";
   return true;
 }
 

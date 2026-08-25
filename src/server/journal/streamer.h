@@ -31,10 +31,8 @@ class JournalStreamer : public journal::JournalConsumerInterface {
     // drops entries that are not this node's own writes (origin_idx != PeerRegistry::kSelfIdx),
     // expiry-flagged DELs, and Op::ORIGIN dictionary entries -- see journal::PassesPeerEchoFilter
     // (journal/types.h), the single shared definition of that rule (T7b) -- streamer.cc's
-    // ShouldWrite is one of its two callers. peer_uuid names which peer this streamer feeds; the
-    // filter does not consult it (reserved for future diagnostics).
+    // ShouldWrite is one of its two callers.
     bool peer_mode = false;
-    std::string peer_uuid;
 
     // drakeydb: Phase 3 T6b fix-round-2 -- throttle (seconds) shared by the write-path periodic
     // Op::LSN heartbeat (should_sent_lsn) and the peer-mode drop-path resolution marker -- see

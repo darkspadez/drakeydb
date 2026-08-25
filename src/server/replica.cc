@@ -692,8 +692,17 @@ error_code Replica::InitiatePSync() {
     RdbLoadContext load_context;
     RdbLoader loader(NULL, &load_context);
     loader.SetLoadUnownedSlots(true);
-    if (IsPeerMode())
+    if (IsPeerMode()) {
       loader.SetOverrideExistingKeys(true);  // drakeydb: merge
+      // drakeydb: Phase 3 fix wave -- this legacy Redis/KeyDB-protocol loader is peer-aware
+      // (merge above) but was missing the origin tag on its embedded journal-blob apply path.
+      // Unreachable today (a redis-protocol master emits no RDB_OPCODE_JOURNAL_BLOB), but P7
+      // (KeyDB onboarding) makes this path carry real data, and without this it would silently
+      // reproduce the echo defect T7b closed -- mirrors DflyShardReplica's constructor
+      // (rdb_loader_->SetApplyOrigin(origin_idx), above) and ConsumeRedisStream's
+      // conn_context.repl_origin_idx assignment for the command-stream side of this same link.
+      loader.SetApplyOrigin(peer_origin_idx_);
+    }
     loader.set_source_limit(snapshot_size);
     // TODO: to allow registering callbacks within loader to send '\n' pings back to master.
     // Also to allow updating last_io_time_.

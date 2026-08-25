@@ -752,6 +752,9 @@ TIEBREAK_UUID_HI = "20000000-0000-4000-8000-000000000000"
 # either side to observe the race at all. Bounding a retry loop at this many attempts keeps the
 # whole loop's miss probability under 1% even at the pessimistic 70% single-attempt rate:
 # 0.3 ** MAX_TIEBREAK_ATTEMPTS ~= 0.24%.
+# P3 fix wave: at the measured 70-100% per-attempt firing rate, that ~0.24% is an INHERENT flake
+# floor for this loop, not a bug -- an occasional failure here is expected background noise, not
+# by itself evidence of a regression.
 MAX_TIEBREAK_ATTEMPTS = 5
 
 
@@ -1217,6 +1220,13 @@ async def _total_commands_processed(c) -> int:
 # climbing ~80 ops/s (240+ growth over 3s) from a single INCR. This bound sits well above the
 # measured idle baseline (comfortable room for scheduler jitter/CI noise) and well below any real
 # storm, so it is decisive without racing the clock.
+#
+# SCALING WARNING (P3 fix wave): this bound is topology-dependent (see the decomposition above --
+# 3 x (shard_flows x peers x 1/s REPLCONF ACK) + 1 self-INFO) and does NOT auto-scale. E.g. at 4
+# shard flows x 7 peers the HEALTHY baseline is already 3*(4*7*1)+1 = 85, well over this bound.
+# Recalibrate both STORM_BOUND and MESH3_STORM_BOUND (below) whenever a test's topology (shard
+# count, proactor_threads, peer count) changes -- do not assume either constant still holds. See
+# docs/PLAN.md's "Testing lesson worth keeping" (Phase 3) for the same warning.
 STORM_BOUND = 60
 
 
@@ -1454,6 +1464,8 @@ async def wait_until_not_loading(c, timeout=30):
 # no-forward check (a much smaller, single-write storm, closer in kind to
 # test_peer_mesh_own_writes_not_echoed_back's ~80 ops/s single-INCR echo) is independently
 # decisive regardless of this bound -- see that test's docstring's Falsifying section.
+#
+# SCALING WARNING: does not auto-scale with topology either -- see STORM_BOUND's comment above.
 MESH3_STORM_BOUND = 100
 
 

@@ -469,8 +469,7 @@ void DflyCmd::StartStable(CmdArgParser parser, CommandContext* cmd_cntx) {
         }
       }
 
-      StartStableSyncInThread(flow, &replica_ptr->GetExecState(), shard, replica_ptr->IsPeer(),
-                              replica_ptr->GetNodeUuid());
+      StartStableSyncInThread(flow, &replica_ptr->GetExecState(), shard, replica_ptr->IsPeer());
     };
     shard_set->RunBlockingInParallel(std::move(cb));
 
@@ -759,20 +758,19 @@ OpStatus DflyCmd::StopFullSyncInThread(FlowInfo* flow, ExecutionState* exec_st,
 }
 
 void DflyCmd::StartStableSyncInThread(FlowInfo* flow, ExecutionState* exec_st, EngineShard* shard,
-                                      bool peer_mode, std::string_view peer_uuid) {
+                                      bool peer_mode) {
   // Create streamer for shard flows.
   DCHECK(shard);
   DCHECK(flow->conn);
 
   LSN partial_lsn = flow->start_partial_sync_at.value_or(0);
-  // drakeydb: peer_mode/peer_uuid come from the replica's ReplicaInfo (IsPeer()/GetNodeUuid(),
-  // set at CreateSyncSession time) so the peer-echo filter (streamer.cc's ShouldWrite) activates
-  // only for an admitted peer of an active node -- see the StartStable call site.
+  // drakeydb: peer_mode comes from the replica's ReplicaInfo (IsPeer(), set at CreateSyncSession
+  // time) so the peer-echo filter (streamer.cc's ShouldWrite) activates only for an admitted peer
+  // of an active node -- see the StartStable call site.
   JournalStreamer::Config config{.should_sent_lsn = true,
                                  .init_from_stable_sync = true,
                                  .start_partial_sync_at = partial_lsn,
-                                 .peer_mode = peer_mode,
-                                 .peer_uuid = std::string(peer_uuid)};
+                                 .peer_mode = peer_mode};
   flow->streamer.reset(new JournalStreamer(exec_st, config));
   flow->streamer->Start(flow->conn->socket());
 

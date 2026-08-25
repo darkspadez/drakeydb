@@ -44,7 +44,7 @@ taking either side blindly:
 
 | File | drakeydb change |
 |---|---|
-| `src/server/journal/serializer.cc` | journal v2 framing (origin/mvcc extension) |
+| `src/server/journal/serializer.cc` | journal v2 framing (origin/mvcc extension). **Hazard:** the reader HARD-ERRORS on a framing version outside `{1, 2}` (`errc::illegal_byte_sequence`) — if upstream ever repurposes that deprecated varint field with a `3`, every drakeydb replica fails to connect to it until this reader is updated to recognize the new value |
 | `src/server/journal/types.h`, `types.cc`, `journal_slice.cc`, `streamer.*`, `executor.*` | origin tagging + peer filtering; `journal::PassesPeerEchoFilter` is the SINGLE shared predicate — if upstream churn forces a copy, the copies must stay identical or stable sync and full sync silently diverge |
 | `src/server/main_service.cc` | `PrepareTransaction` origin hook (P3) — note EXEC's `dist_trans` and the non-atomic squash stub bypass it and inherit origin separately |
 | `src/server/snapshot.cc`, `rdb_save.*`, `rdb_load.*` | full-sync window: peer filter on the concurrent journal blob, and `SetApplyOrigin` on the loader |
