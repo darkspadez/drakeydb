@@ -1441,13 +1441,23 @@ Maintain `mvcc_table_memory_` alongside the existing `table_memory_` updates in
 
 - [ ] **Step 5: Surface the stats**
 
-Add `size_t mvcc_table_bytes = 0; size_t mvcc_entries = 0; size_t mvcc_tombstones = 0;`
-to `DbStats` in `db_slice.h`, sum them in `DbStats::operator+=`, fill them in
-`DbSlice::GetStats` (`db_slice.cc:493-514`), and merge them in `Metrics::Merge`
-(`metrics.cc:773` area) beside `lsn_buffer_bytes`.
+Put the **counters** on `DbTableStats` (`table.h:54`), not on `DbStats`:
 
-`mvcc_tombstones` stays 0 until P4-5; add the field now so the invariant in Task 10
-and the metric plumbing do not have to change later.
+```cpp
+  size_t mvcc_entries = 0;
+  size_t mvcc_tombstones = 0;  // stays 0 until P4-5; declared now so Task 10's invariant compiles
+```
+
+`DbStats : public DbTableStats` (`db_slice.h:43`), so the aggregate inherits both, and
+Task 10's `DCHECK` can read `db.stats.mvcc_tombstones` — `db.stats` is a `DbTableStats`
+(`table.h:136`), so declaring these on `DbStats` instead would not compile. Maintain
+`mvcc_entries` in `SetMvcc`/`EraseMvcc`.
+
+Add `size_t mvcc_table_bytes = 0;` to `DbStats` **only** — it is computed in
+`DbSlice::GetStats` (`db_slice.cc:493-514`) from `mvcc_table_memory()` rather than
+maintained as a counter, mirroring how `table_memory` is already handled. Sum all three
+in `DbStats::operator+=` and merge them in `Metrics::Merge` (`metrics.cc:773` area)
+beside `lsn_buffer_bytes`.
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
@@ -1693,28 +1703,37 @@ At the end of `DbSlice::PostUpdate` (`db_slice.cc:1426`):
 
 - [ ] **Step 4: Mint and commit in `RecordEntry`**
 
-In `src/server/journal/journal.cc:90`, `RecordEntry`, after the entry's fields are set
-and **after** `AddLogRecord`:
+In `src/server/journal/journal.cc:90`, `RecordEntry`. **Order matters and the two halves
+split around `AddLogRecord`:** mint **before** it, so the wire carries the same value the
+side table will store; commit **after** it, so a key is only stamped once its entry is
+durable. Getting this backwards puts mvcc 0 on the wire and makes every applier mint its
+own stamp.
+
+```cpp
+  // drakeydb: Phase 4 -- mint BEFORE AddLogRecord so the wire carries this exact value.
+  if (MvccEnabled() && opcode == Op::COMMAND && entry.mvcc == 0)
+    entry.mvcc = MvccStamper::tlocal()->HopStamp();
+```
+
+then, immediately **after** `AddLogRecord(entry)`:
 
 ```cpp
   // drakeydb: Phase 4. Mint locally when the caller supplied no stamp; a non-zero mvcc is an
   // applied write's author stamp and is kept verbatim, or stamps would inflate on every hop.
   // 0 is unreachable for a real stamp (ms << 20, ms ~ 1.77e12).
+  // drakeydb: Phase 4 -- commit AFTER the entry is durable. A non-zero mvcc arriving from a
+  // peer is that author's stamp and is stored verbatim, or stamps inflate on every hop.
   if (MvccEnabled() && opcode == Op::COMMAND) {
-    MvccStamper* stamper = MvccStamper::tlocal();
-    if (entry.mvcc == 0)
-      entry.mvcc = stamper->HopStamp();
-    stamper->Commit(entry.mvcc, entry.origin_idx,
-                    [](DbIndex db, std::string_view key, const MvccStamp& st) {
-                      EngineShard::tlocal()->db_slice().SetMvcc(db, PrimeKey{key}, st);
-                    });
+    MvccStamper::tlocal()->Commit(entry.mvcc, entry.origin_idx,
+                                  [](DbIndex db, std::string_view key, const MvccStamp& st) {
+                                    EngineShard::tlocal()->db_slice().SetMvcc(db, PrimeKey{key},
+                                                                             st);
+                                  });
   }
 ```
 
-The mint must happen **before** `AddLogRecord` so the wire carries the same value —
-reorder if needed and re-read the function to confirm. Gating on `Op::COMMAND`
-excludes `SELECT`/`PING`/`LSN`/`ORIGIN`. `MvccEnabled()` is a thin
-`IsActiveReplica()` wrapper local to this TU.
+Gating on `Op::COMMAND` excludes `SELECT`/`PING`/`LSN`/`ORIGIN`. `MvccEnabled()` is a
+thin `IsActiveReplica()` wrapper local to this TU.
 
 - [ ] **Step 5: End the epoch in the right place**
 
@@ -1851,8 +1870,9 @@ git add -A && git commit -m "feat: stamp keys via arm/commit tied to journal emi
 - Test: `src/server/multi_master_test.cc`
 
 **Interfaces:**
-- Consumes: `DbSlice::EraseMvcc` (Task 5); `MvccStamper::Disarm` (Task 4);
-  `DbContext::repl_mvcc` (Task 6).
+- Consumes: `DbSlice::EraseMvcc` (Task 5); `MvccStamper::Disarm` (Task 4).
+  (`DbContext::repl_mvcc` from Task 6 is **not** used here — it is a P4-5 dependency,
+  for applied deletes reproducing a peer's tombstone stamp.)
 - Produces: `enum class DeleteReason : uint8_t { kExplicit, kExpired, kEvicted, kSlotFlush };`
   in `db_slice.h`; `DbSlice::Del` and `PerformDeletionAtomic` gain a trailing
   `DeleteReason reason = DeleteReason::kExplicit`.
@@ -2184,10 +2204,13 @@ side table holds its own key copy.
 TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
   for (int i = 0; i < 200; ++i) {
     Run({"set", absl::StrCat("k", i), "v"});
-    if (i % 3 == 0)
+    if (i % 7 == 0) {
+      // Rename the key just written -- renaming k(i-1) would hit one the i%3 branch deleted,
+      // and RENAME on a missing key errors.
+      Run({"rename", absl::StrCat("k", i), absl::StrCat("r", i)});
+    } else if (i % 3 == 0) {
       Run({"del", absl::StrCat("k", i)});
-    if (i % 7 == 0)
-      Run({"rename", absl::StrCat("k", i - 1), absl::StrCat("r", i)});
+    }
   }
   size_t mismatches = 0;
   shard_set->AwaitFiberOnAll([&](auto*, EngineShard* shard) {
