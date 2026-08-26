@@ -238,8 +238,7 @@ async def test_peer_clock_skew_cleared_on_reconnect_refusal(
     at its stale ~+5000 value (the atomic is never re-zeroed before the refused exchange, and the
     refused exchange's kUnsupported/error-reply branches never re-store it either), so the poll
     loop below never observes clock_skew_ms==0 alongside an absent node_uuid and times out.
-    Verified by hand; see task-2-report.md's fix-round-2 section for the exact command and
-    output.
+    Verified by hand during development.
     """
     offset_ms = 5000
     master = df_factory.create(proactor_threads=2, dir=str(tmp_path / "m"))
@@ -612,6 +611,15 @@ async def attach(c_a, *nodes):
         assert await c_a.execute_command(f"REPLICAOF localhost {n.port}") == "OK"
 
 
+# drakeydb: P4-0 fix-wave -- deliberately NOT coupled to kClockSkewWarnMs (replica.h/.cc): this is
+# a tolerance on how much clock drift a real localhost mesh actually exhibits between two
+# processes sampling their own clocks a few milliseconds apart, not a threshold for when skew
+# becomes operationally concerning. Coupling them would be actively wrong -- raising the warn
+# threshold for a WAN mesh (a legitimate future change) would silently raise this tolerance too,
+# and the test would stop asserting anything meaningful about actual measured skew.
+LOCALHOST_SKEW_TOLERANCE_MS = 250
+
+
 async def test_peer_clock_skew_reported(df_factory):
     """Both nodes run on one host, so real skew is ~0; the assertion is that the field
     exists and is small. Falsified by removing the RenderPeerReplicationInfo line -- the
@@ -627,7 +635,7 @@ async def test_peer_clock_skew_reported(df_factory):
 
     info = await c_b.info("replication")
     assert "clock_skew_ms" in info["master0"], sorted(info["master0"])
-    assert abs(int(info["master0"]["clock_skew_ms"])) < 250
+    assert abs(int(info["master0"]["clock_skew_ms"])) < LOCALHOST_SKEW_TOLERANCE_MS
 
 
 @pytest.mark.parametrize("offset_ms", [5000, -5000], ids=["ahead", "behind"])
@@ -653,8 +661,8 @@ async def test_peer_clock_skew_reflects_injected_offset(
 
     Falsifying: deleting replica.cc's skew-computation block in Greet() leaves clock_skew_ms_ at
     its {0} default, so the assertion below (skew within 2s of the injected +/-5s offset) fails
-    with the observed skew reported as 0 regardless of parametrization. Verified by hand; see
-    task-2-report.md's fix-round-1 section for the exact command and output.
+    with the observed skew reported as 0 regardless of parametrization. Verified by hand during
+    development.
     """
     SYNTHETIC_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
     node = df_factory.create(
@@ -1867,24 +1875,24 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
 # stream) replica must still see that DEL; a mesh peer must not -- journal::PassesPeerEchoFilter
 # (journal/types.cc) drops it, gated on the new journal::kEntryFlagDerived flag.
 #
-# Triggered via FIELDTTL, not FIELDEXPIRE: a fix-round-1 ruling (see task-1-report.md) carved
-# FIELDEXPIRE's own full-empty case OUT of this suppression -- SetFamily::DeleteSetIfEmpty /
-# HSetFamily::DeleteIfEmpty now take a `derived` parameter, and OpFieldExpire
+# Triggered via FIELDTTL, not FIELDEXPIRE: a fix-round-1 ruling (see docs/PLAN.md's Phase 4
+# section) carved FIELDEXPIRE's own full-empty case OUT of this suppression -- SetFamily::
+# DeleteSetIfEmpty / HSetFamily::DeleteIfEmpty now take a `derived` parameter, and OpFieldExpire
 # (generic_family.cc) passes false, because its own replay is clock-dependent: a lagging peer
 # can *arm* an already-expired member's new TTL instead of also discovering it expired, and
 # nothing else then converges it. So FIELDEXPIRE's derived DEL is now a normal, forwarded
 # RecordDelete that legitimately reaches b too (empirically confirmed: reusing FIELDEXPIRE as
-# this test's trigger now makes b's command counter match plain's exactly, both ~2n -- see
-# task-1-report.md's fix-round-1 section for the measured numbers). FIELDTTL (read-only,
-# generic_family.cc:951) is a different, unaffected call site -- still the default `derived =
-# true` -- so it is the correct trigger for what this test is actually about: the *general*
-# suppression rule, not FIELDEXPIRE's carve-out (that one has its own pair of C++ tests,
-# EmptiedCollectionDeleteCarriesDerivedFlag / FieldExpireCausedDeleteIsNotFlaggedDerived in
-# multi_master_test.cc).
+# this test's trigger now makes b's command counter match plain's exactly, both ~2n -- verified
+# by hand during development). FIELDTTL (read-only, generic_family.cc:951) is a different,
+# unaffected call site -- still the default `derived = true` -- so it is the correct trigger for
+# what this test is actually about: the *general* suppression rule, not FIELDEXPIRE's carve-out
+# (that one has its own pair of C++ tests, EmptiedCollectionDeleteCarriesDerivedFlag /
+# FieldExpireCausedDeleteIsNotFlaggedDerived in multi_master_test.cc).
 #
 # Deliberately not SREM either: SREM's own OpRem (set_family.cc) deletes an emptied set directly
 # (db_slice.Del) and journals only "SREM" -- it never calls SetFamily::DeleteSetIfEmpty, so it
-# cannot exercise this code path at all (see task-1-report.md's Step 1 call-site table).
+# cannot exercise this code path at all (see docs/PLAN.md's Phase 4 section for the call-site
+# enumeration this is drawn from).
 #
 # Convergence is the differential here, not a command-count delta: FIELDTTL is read-only and is
 # never itself journaled (auto-journaling only ever applies to write commands), so unlike

@@ -773,10 +773,12 @@ TEST(PassesPeerEchoFilterTest, DropsForeignOriginExpiryDelAndOriginOpcodeOnly) {
 }
 
 // drakeydb: P4-0 -- a DEL derived from a collection command emptying its key (e.g. HTTL
-// discovering a hash field's TTL has lazily expired) must never reach a mesh peer: the peer
-// either replays the causing command and derives the same DEL itself, or expires the same data
-// on its own clock. See kEntryFlagDerived's own comment (types.h) for the full argument, and
-// task-1-brief.md's Step 1 for the per-call-site enumeration that backs it. Distinct from
+// discovering a hash field's TTL has lazily expired) must never reach a mesh peer, except where
+// the causing command's own replay there cannot be relied on to reproduce it (FIELDEXPIRE, SORT
+// -- see the RecordDerivedDelete `derived` parameter, tx_base.h): ordinarily, the peer either
+// replays the causing command and derives the same DEL itself, or expires the same data on its
+// own clock. See kEntryFlagDerived's own comment (types.h) for the full argument, and
+// docs/PLAN.md's Phase 4 section for the per-call-site enumeration that backs it. Distinct from
 // kEntryFlagExpired (a *whole-key* TTL expiry) so diagnostics can tell the two apart.
 TEST(PassesPeerEchoFilterTest, DerivedDeleteIsSuppressedToPeers) {
   JournalItem item;

@@ -32,7 +32,7 @@ inline constexpr uint8_t kEntryFlagExpired = 1 << 0;
 // directly. Never forwarded to a peer: a command-caused empty propagates via the causing
 // command (the peer derives its own DEL), and an expiry-caused empty is the peer's own
 // clock's business. Distinct from kEntryFlagExpired so diagnostics can tell them apart.
-constexpr uint8_t kEntryFlagDerived = 1 << 1;
+inline constexpr uint8_t kEntryFlagDerived = 1 << 1;
 
 struct EntryBase {
   TxId txid;
@@ -45,7 +45,7 @@ struct EntryBase {
   // upstream, and placed after `lsn` so the aggregate-init constructors below keep compiling.
   uint32_t origin_idx{0};  // PeerRegistry index of this entry's author; kSelfIdx (0) == self.
   uint64_t mvcc{0};        // Reserved for future conflict resolution; not yet threaded further.
-  uint8_t entry_flags{0};  // Bitmask; bit0 == kEntryFlagExpired.
+  uint8_t entry_flags{0};  // Bitmask; bit0 == kEntryFlagExpired, bit1 == kEntryFlagDerived.
 };
 
 // This struct represents a single journal entry.

@@ -370,6 +370,7 @@ TEST(ClockSkew, ComputesSignedSkewAndThreshold) {
 
   EXPECT_FALSE(IsClockSkewConcerning(0));
   EXPECT_FALSE(IsClockSkewConcerning(-kClockSkewWarnMs + 1));
+  EXPECT_FALSE(IsClockSkewConcerning(kClockSkewWarnMs - 1));
   EXPECT_TRUE(IsClockSkewConcerning(kClockSkewWarnMs));
   EXPECT_TRUE(IsClockSkewConcerning(-kClockSkewWarnMs)) << "skew is concerning in both directions";
 }
@@ -993,9 +994,9 @@ TEST_F(OriginJournalFamilyTest, DerivedDeleteInheritsCausingTransactionOrigin) {
 
 // drakeydb: P4-0 acceptance case. A DEL derived from a collection command emptying its key must
 // carry kEntryFlagDerived so PassesPeerEchoFilter (journal/types.cc) keeps it off mesh-peer
-// links -- see task-1-brief.md's Step 1 for why every one of the 25 DeleteIfEmpty/
+// links -- see docs/PLAN.md's Phase 4 section for why every one of the ~25 DeleteIfEmpty/
 // DeleteSetIfEmpty call sites (hset_family.cc/set_family.cc/generic_family.cc/zset_family.cc/
-// debugcmd.cc/search/doc_accessors.cc) is safe to suppress this way.
+// debugcmd.cc/search/doc_accessors.cc) is safe to suppress this way, and for the two exceptions.
 //
 // Deliberately triggered via FIELDEXPIRE/FIELDTTL, not SREM: SREM's own OpRem (set_family.cc)
 // deletes an emptied set directly (db_slice.Del) and journals only "SREM" -- it never calls
@@ -1006,8 +1007,7 @@ TEST_F(OriginJournalFamilyTest, DerivedDeleteInheritsCausingTransactionOrigin) {
 // exercises for hashes in DerivedDeleteInheritsCausingTransactionOrigin above).
 //
 // Falsifying: reverting the RecordDerivedDelete switch at set_family.cc's DeleteSetIfEmpty makes
-// the derived DEL come back with entry_flags == 0 (see task-1-report.md's Step 10 section for
-// the observed failure text).
+// the derived DEL come back with entry_flags == 0 -- verified by hand during development.
 TEST_F(OriginJournalFamilyTest, EmptiedCollectionDeleteCarriesDerivedFlag) {
   OriginFlagCapturingConsumer consumer;
   uint32_t consumer_id = 0;
@@ -1050,8 +1050,8 @@ TEST_F(OriginJournalFamilyTest, EmptiedCollectionDeleteCarriesDerivedFlag) {
 // above are the point.
 //
 // Falsifying: reverting either `false` argument at generic_family.cc's OpFieldExpire call sites
-// back to the default makes this DEL come back flagged kEntryFlagDerived (see
-// task-1-report.md's fix-round-1 section for the observed failure text).
+// back to the default makes this DEL come back flagged kEntryFlagDerived -- verified by hand
+// during development.
 TEST_F(OriginJournalFamilyTest, FieldExpireCausedDeleteIsNotFlaggedDerived) {
   OriginFlagCapturingConsumer consumer;
   uint32_t consumer_id = 0;
@@ -1082,6 +1082,60 @@ TEST_F(OriginJournalFamilyTest, FieldExpireCausedDeleteIsNotFlaggedDerived) {
       << "FIELDEXPIRE's own derived DEL must reach peers -- its replay is clock-dependent";
   EXPECT_FALSE(del->entry_flags & journal::kEntryFlagExpired)
       << "a FIELDEXPIRE-caused empty is not a whole-key expiry";
+}
+
+// drakeydb: P4-0 fix-wave -- SORT is the same defect class as FIELDEXPIRE above, caught by an
+// adversarial review pass: SORT (CO::JOURNALED, no NO_AUTOJOURNAL, generic_family.cc) auto-
+// journals verbatim just like FIELDEXPIRE, so OpFetchContainerElements/OpFetchSortEntries'
+// derived DEL must also reach peers -- same hazard, same fix (WillAutoJournalVerbatim,
+// generic_family.cc, keyed off the transaction's own CommandId, not a hardcoded name). SORT_RO
+// shares those exact call sites but is CO::READONLY and never auto-journals, so it must keep the
+// suppressed default -- this is the "cannot be a literal false" requirement the predicate exists
+// for. One consumer registration spans both halves; LastDel isolates each half's own DEL because
+// the two halves use disjoint keys run strictly in sequence.
+//
+// Falsifying: hardcoding WillAutoJournalVerbatim to always return false (or reverting either
+// SORT call site's `!WillAutoJournalVerbatim(...)` back to the derived=true default) makes
+// SORT's DEL come back flagged kEntryFlagDerived -- verified by hand during development.
+TEST_F(OriginJournalFamilyTest, SortDerivedDeleteReachesPeersButSortRoStaysSuppressed) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  // A set with one member whose TTL has already elapsed. "SORT ... BY nosort STORE" forces
+  // OpFetchContainerElements to run (the fetch_unsorted branch), which lazily discovers "m"
+  // expired and, finding the set now empty, calls SetFamily::DeleteSetIfEmpty through SORT's own
+  // auto-journaling path.
+  EXPECT_EQ(Run({"sadd", "sort-s", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "sort-s", "1", "m"});
+  AdvanceTime(1100);
+  Run({"sort", "sort-s", "by", "nosort", "store", "sort-dest"});
+
+  EXPECT_EQ(Run({"exists", "sort-s"}).GetInt(), 0);
+  const CapturedEntry* sort_del = LastDel(consumer.entries);
+  ASSERT_NE(nullptr, sort_del);
+  EXPECT_FALSE(sort_del->entry_flags & journal::kEntryFlagDerived)
+      << "SORT auto-journals verbatim, so its derived DEL must reach peers";
+
+  // Same call sites, SORT_RO this time (a fresh key -- the SORT above already deleted sort-s):
+  // SORT_RO never auto-journals, so it must keep the suppressed default.
+  EXPECT_EQ(Run({"sadd", "sortro-s", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "sortro-s", "1", "m"});
+  AdvanceTime(1100);
+  Run({"sort_ro", "sortro-s", "by", "nosort"});
+
+  EXPECT_EQ(Run({"exists", "sortro-s"}).GetInt(), 0);
+  const CapturedEntry* sortro_del = LastDel(consumer.entries);
+  ASSERT_NE(nullptr, sortro_del);
+  EXPECT_TRUE(sortro_del->entry_flags & journal::kEntryFlagDerived)
+      << "SORT_RO never auto-journals, so its derived DEL must stay suppressed";
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
 }
 
 // drakeydb: P4-0 -- the counterpart to the acceptance case above: an ordinary client-issued DEL

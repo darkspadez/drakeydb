@@ -910,9 +910,18 @@ OpResult<vector<long>> OpFieldExpire(const OpArgs& op_args, string_view key, uin
   // also discovering them expired -- key_deleted stays false there, and the partial-expiry
   // compensation just below (missing.size() > 1) never fires either, because every field
   // "succeeded". That peer is left holding a live key indefinitely; nothing it does locally
-  // converges it. Passing false makes this DEL a plain, forwarded RecordDelete instead of a
-  // suppressed RecordDerivedDelete, so it reaches the peer and forces convergence -- exactly the
-  // corrective role the plain-replica DEL already plays today.
+  // converges it. This is not a new exception: OpHExpire (HEXPIRE/HPEXPIRE,
+  // hset_family.cc:724-728) and the HGETEX/HSETEX path (hset_family.cc:1102-1106) already
+  // bypass DeleteIfEmpty for this exact reason and journal a plain forwarded DEL, commented "The
+  // replayed command re-applies a relative TTL against the replica clock and cannot reproduce
+  // this deletion; journal it explicitly." `derived = false` restores that same consistency for
+  // FIELDEXPIRE's own generic (SET-and-HASH) field-TTL path.
+  //
+  // Residual cost, accepted for this phase: the forwarded DEL is unconditional, so if the peer's
+  // copy holds additional members from a write concurrent with this FIELDEXPIRE (members this
+  // node never saw), the DEL destroys those too -- the exact hazard this whole PR closes,
+  // reopened for one command. Same exposure OpHExpire's forwarded DEL above already carries; an
+  // MVCC-stamped DEL (a later phase) is what actually closes it for all of them.
   //
   // Echo-safe: when a peer applies this same replicated FIELDEXPIRE and its own copy empties too
   // (the ordinary, no-skew case), the DEL IT derives inherits db_cntx.repl_origin_idx from that
@@ -1753,6 +1762,22 @@ template <typename F> bool Iterate(const PrimeValue& pv, F&& func) {
   }
 }
 
+// drakeydb: P4-0 fix-wave -- true iff this transaction's causing command will auto-journal
+// itself verbatim (Transaction::LogAutoJournalOnShard, transaction.cc), the predicate that
+// distinguishes SORT (CO::JOURNALED, no NO_AUTOJOURNAL -- auto-journals) from SORT_RO
+// (CO::READONLY -- never auto-journals), the two commands reaching OpFetchSortEntries /
+// OpFetchContainerElements below through the same call sites. Derived from the transaction's own
+// CommandId rather than a hardcoded command name, so it stays correct if either command's
+// registration changes. Deliberately omits LogAutoJournalOnShard's re_enabled_auto_journal_
+// check: that only matters for a CO::NO_AUTOJOURNAL command that opts back in via
+// Transaction::ReviveAutoJournal(), and every command reaching this predicate today is either
+// CO::JOURNALED without CO::NO_AUTOJOURNAL (SORT) or CO::READONLY (SORT_RO) -- neither can ever
+// call ReviveAutoJournal(), which DCHECKs CO::NO_AUTOJOURNAL is set on the command.
+bool WillAutoJournalVerbatim(const Transaction* tx) {
+  const CommandId* cid = tx->GetCId();
+  return cid->IsJournaled() && !(cid->opt_mask() & CO::NO_AUTOJOURNAL);
+}
+
 // Create a SortEntryList from given key
 OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_view key,
                                             SortEntryList* dest) {
@@ -1784,8 +1809,14 @@ OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_v
 
   // IterateSet may trigger lazy member expiry on sets with member-level TTL.
   // If all members expired, delete the now-empty key.
+  //
+  // drakeydb: P4-0 fix-wave -- derived=false for SORT (see WillAutoJournalVerbatim above): SORT
+  // auto-journals verbatim, so a peer replays it against its own, still-populated copy instead
+  // of independently deriving this DEL -- the exact FIELDEXPIRE hazard, same fix. SORT_RO shares
+  // this call site but never auto-journals, so it still gets derived=true (the default).
   if (obj_type == OBJ_SET && it->second.Size() == 0) {
-    SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second);
+    SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
+                                /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
   }
 
   return obj_type;
@@ -1820,8 +1851,14 @@ OpResult<pair<vector<string>, CompactObjType>> OpFetchContainerElements(const Op
   });
 
   // IterateSet may trigger lazy member expiry.  Clean up empty set.
+  //
+  // drakeydb: P4-0 fix-wave -- derived=false for SORT (see WillAutoJournalVerbatim above): SORT
+  // auto-journals verbatim, so a peer replays it against its own, still-populated copy instead
+  // of independently deriving this DEL -- the exact FIELDEXPIRE hazard, same fix. SORT_RO shares
+  // this call site but never auto-journals, so it still gets derived=true (the default).
   if (obj_type == OBJ_SET && it->second.Size() == 0) {
-    SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second);
+    SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
+                                /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
   }
 
   return std::make_pair(std::move(elements), obj_type);

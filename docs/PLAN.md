@@ -493,12 +493,10 @@ builds with g++, so it never runs in the ordinary local gate.
   behaviour rather than assume it exists.**
 
 **Known limitations carried forward (P4+):**
-- **Blocker on enabling `--active_replica` by default:** a *locally* issued command whose lazy field
-  expiry empties a collection (`hset_family.cc:996`, `set_family.cc:1178`, and the background index
-  path `search_family.cc:4295` → `doc_accessors.cc:220`) emits an **unflagged, self-originated** DEL
-  that the peer filter forwards. `hset_family.cc:996` sits on a **read** command's path, so a plain
-  `HTTL` on a lazily-expired collection can delete the key on a peer whose copy still holds unexpired
-  fields under clock skew. Needs a "why is this empty" signal threaded through ~a dozen call sites.
+- **Fixed in P4-0 Task 1** (see Phase 4's own section below for what shipped): a *locally* issued
+  command whose lazy field expiry empties a collection used to emit an unflagged, self-originated
+  DEL that the peer filter forwarded, and a plain `HTTL` on a lazily-expired collection could
+  delete the key on a peer whose copy still held unexpired fields under clock skew.
 - A peer link whose traffic is entirely filtered emits markers only on the drop-path throttle; after a
   *failed apply* the sticky `apply_failed_` flag stops adoption, so the counter drifts and a reconnect
   likely forces a full resync rather than replaying the failed entry. Safe (never ahead of applied),
@@ -508,6 +506,23 @@ builds with g++, so it never runs in the ordinary local gate.
   **but P7 is exactly the phase that would make it carry real data.**
 - The plain-replica misconfiguration guard is a `DCHECK`, so its loud failure protects debug/CI only;
   a release build degrades to a warning plus silent drops.
+- **Phantom containers on a read-asymmetric mesh (P4-0 Task 1 fix-wave finding).** There is no
+  active member-expiry reaper: `DbSlice::FindInternal` (`db_slice.cc:673-687`) checks only
+  whole-key `HasExpire()`; member-level (hash-field/set-member) expiry is reaped exclusively by
+  the ~25 `DeleteIfEmpty`/`DeleteSetIfEmpty` call sites enumerated for the P4-0 fix, and every one
+  of them needs a command to touch the key to run at all. For the read-path call sites — whose
+  causing command is never journaled, by design (see Phase 4's "P4-0 Task 1 delivered" note
+  above) — a peer keeps a logically-empty container **indefinitely** until *it* is asked to read
+  that same key. `EXISTS`/`DBSIZE`/`SCAN`/`KEYS` do not decode the collection, so none of them
+  notice or clear it; a mesh where reads land asymmetrically across nodes can carry these phantom
+  containers forever. It escalates from cosmetic to a real divergence: a later replicated
+  `SETNX`/`INCR`/`LPUSH` against that key runs on the peer's still-present (but logically empty)
+  collection and returns `WRONGTYPE`, while the author — which already reaped the key — applies
+  the command as a plain string/list write. Same root cause, corollary regression: `DEBUG
+  OBJHIST`/`DEBUG STRINGS` used to be an inadvertent **mesh-wide** phantom-container sweep (every
+  node's derived DEL reached every peer); they now only clean up the node they run on. P4-2's
+  tombstone GC and the design spec's D-4 full-scan invariant both have to account for these
+  keys explicitly — neither can assume "logically empty" and "absent from the peer" coincide.
 
 **Testing lesson worth keeping.** A **convergence assertion cannot detect an echo storm.** With the
 origin filter reverted, two nodes still converge: symmetric amplification makes every node replay the
@@ -522,6 +537,25 @@ decomposes as `3 x (shard_flows x peers x 1/s REPLCONF ACK) + 1 self-INFO` (meas
 (clock tick) and applied writes (context mvcc); journal v2 mvcc field live; `DFLY MVCC <key>`;
 INFO `mvcc_table_bytes`.
 **Verify:** C++ stamping unit; pytest — replicated key's stamp on B equals A's origin stamp.
+
+**P4-0 Task 1 delivered** (resolves the "Blocker on enabling `--active_replica` by default" noted
+against Phase 3, above): `journal::kEntryFlagDerived` (`journal/types.h`) marks a DEL derived from
+`HSetFamily::DeleteIfEmpty`/`SetFamily::DeleteSetIfEmpty` emptying a collection;
+`journal::PassesPeerEchoFilter` (`journal/types.cc`) drops it for peer links exactly as it already
+does for `kEntryFlagExpired`, while a plain full-stream replica still receives it.
+`dfly::RecordDerivedDelete` (`tx_base.h`/`.cc`) sets the flag; both helpers default to it via a
+trailing `derived = true` parameter.
+
+Two call sites pass `derived = false` (forward the DEL like any other command-caused one) because
+their causing command auto-journals verbatim and a peer's own replay of it cannot be relied on to
+reproduce the same emptying: `OpFieldExpire`'s two branches (`generic_family.cc`) — a lagging peer
+can *arm* an already-expired field/member with the command's own new TTL instead of also
+discovering it expired — and `OpFetchSortEntries`/`OpFetchContainerElements`'s `SORT` case
+(`generic_family.cc`, keyed off the transaction's own `CommandId` via `WillAutoJournalVerbatim`,
+not a hardcoded command name, so `SORT_RO` — which shares the same call sites but never
+auto-journals — still gets the suppressed default). Both carve-outs mirror `OpHExpire`'s
+pre-existing plain-forwarded-DEL precedent for HEXPIRE/HPEXPIRE (`hset_family.cc`) rather than
+inventing a new exception shape.
 
 ## Phase 5 — Streaming LWW guard
 Command classifier + pre-exec compare/drop in `JournalExecutor`; `multimaster_lww_dropped`
