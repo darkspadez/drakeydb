@@ -571,7 +571,7 @@ of 41 plus the two added here; `replication_test.py` 43 passed.
 
 ---
 
-### Task 3: Member-expiry reaper -- make the peer actually derive its own DEL
+### Task 2b: Member-expiry reaper -- make the peer actually derive its own DEL
 
 **Why this task exists.** P4-0's adversarial review **refuted** the convergence claim that
 Tasks 1-2 rest on. The claim's second bullet -- "the peer expires on its own clock" -- is
