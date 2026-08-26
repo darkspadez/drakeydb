@@ -1894,15 +1894,41 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
 # cannot exercise this code path at all (see docs/PLAN.md's Phase 4 section for the call-site
 # enumeration this is drawn from).
 #
-# Convergence is the differential here, not a command-count delta: FIELDTTL is read-only and is
-# never itself journaled (auto-journaling only ever applies to write commands), so unlike
-# FIELDEXPIRE there is no separate "causing command" that replays on b and drives its own
-# independent re-derivation. b's copy only converges if b's own traffic happens to touch the
-# same lazily-expired member (this codebase has no background sweep for member-level TTLs --
-# confirmed absent in the original Task 1 investigation) -- which nothing in this test causes, by
-# design, so b's copy is expected to keep existing. plain has no such dependency: it receives a's
-# derived DEL outright, because the peer filter that drops it for b does not apply to a plain
-# full-stream replica.
+# drakeydb: P4-0 Task 2b -- what this test can actually observe changed once the member-expiry
+# reaper landed (below, same file), and the comments above and below predate that; read them
+# together with this one. `a` is itself an active node, so by the time the FIELDTTL burst below
+# runs, `a`'s *own* heartbeat reaper has typically already independently discovered and derived
+# DELs for most or all of these same now-expired sets, on the same ~1s timescale FIELDTTL is
+# trying to observe -- confirmed empirically (task-2b-report.md section 14/15): with zero
+# FIELDTTL calls issued at all, `a` alone derived 15 of 20 equivalent DELs within 1.5s, purely
+# from its own heartbeat. FIELDTTL and the reaper are therefore no longer separable causes on
+# the wire at this timescale -- either one (or both) may be what actually produces the DEL `a`
+# derives here, and there is no practical way to make FIELDTTL "win the race" against a 100Hz
+# heartbeat without an inherently fragile exact-timing trick, which this project has been burned
+# by before and which was deliberately NOT attempted here (see the report).
+#
+# What this test still honestly proves: in active mode, a peer receives *neither* the
+# read-derived DEL nor the reaper-derived DEL, because journal::kEntryFlagDerived suppresses
+# both identically -- one property (derived DELs don't leak to mesh peers), observed here via
+# whichever of two triggers happens to fire first, which is no longer distinguishable from b's
+# side. The read-path mechanism specifically (SetFamily::DeleteSetIfEmpty's `derived` flag, as
+# opposed to the reaper's use of the same flag) is still pinned deterministically in C++ by
+# EmptiedCollectionDeleteCarriesDerivedFlag / FieldExpireCausedDeleteIsNotFlaggedDerived
+# (multi_master_test.cc): their fixture, OriginJournalFamilyTest, never sets --active_replica,
+# so the reaper's own gate (IsActiveReplica()) keeps it inert there even though the shard
+# heartbeat fiber itself still runs mechanically in every C++ unit test (confirmed by reading
+# EngineShardSet::Init, which unconditionally starts it) -- those two tests are not racing
+# anything. This pytest is the (now weaker, and now honestly documented as such) end-to-end
+# check that the suppression behavior also holds when driven by real client traffic across real
+# processes, not a claim about which specific code path produced the DEL it observes.
+#
+# The differential below is the command-count delta on b, not existence: b is itself active with
+# its own reaper, so "key gone on b" is consistent with either a leaked DEL (the bug this test
+# exists to catch) or b's own correct, local self-healing (not a bug) -- the observable outcome
+# coincides either way, so existence cannot discriminate between them (see the comment further
+# below, at the assertion itself, for the full reasoning). b's own reaper acts entirely locally
+# and is not a command dispatched from a, so it does not move b's total_commands_processed,
+# while a leaked, forwarded DEL would -- that delta is what still discriminates.
 async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: DflyInstanceFactory):
     a = df_factory.create(**active_args())
     b = df_factory.create(**active_args())
@@ -1937,14 +1963,16 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
     # Measurement window starts here: from this point until delta_b is read below, nothing runs
     # against b except the fixed idle wait a few lines down -- an incidental command (e.g. a
     # convergence-polling EXISTS) would itself inflate the very counter being measured. b is not
-    # probed at all until after delta_b is captured -- the existence check further below runs
-    # strictly after, precisely so its own EXISTS traffic cannot contaminate this counter.
+    # probed at all until after delta_b is captured below.
     before_b = await _total_commands_processed(c_b)
 
     # Re-probing each already-expired member via FIELDTTL (read-only) on a causes
     # SetFamily::FieldExpireTime to discover it lazily expired and flush it -- each set empties
     # -> SetFamily::DeleteSetIfEmpty derives a DEL on a (derived=true, the default), suppressed
-    # for the peer link but forwarded to the plain replica.
+    # for the peer link but forwarded to the plain replica. See the module-level comment above
+    # this test: a's own reaper is very likely racing this and may have derived (and suppressed)
+    # some or all of these DELs on its own before this call ever runs -- this call is issued
+    # regardless, since the property under test (suppression) holds either way.
     pipe = c_a.pipeline(transaction=False)
     for key in keys:
         pipe.execute_command("fieldttl", key, "m")
@@ -1960,32 +1988,20 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
 
     await asyncio.sleep(1.0)  # give a leaked DEL, if any, time to arrive before measuring b
 
-    # The load-bearing assertion: b applied nothing beyond idle mesh noise over this window (~2-4,
-    # per STORM_BOUND's own measured baseline above) -- a derived DEL leaking through for every
-    # key would show up here as ~n extra commands, an unmistakable jump against that baseline.
-    # Measured here, before the existence check below ever touches b, is what makes the "b is not
-    # probed at all until after delta_b is captured" comment above actually true.
+    # The load-bearing assertion, and the only one this test makes: b applied nothing beyond idle
+    # mesh noise over this window (~2-4, per STORM_BOUND's own measured baseline above) -- a
+    # derived DEL leaking through for every key would show up here as ~n extra commands, an
+    # unmistakable jump against that baseline. This is a command-count delta, not an existence
+    # check, deliberately: see the module-level comment above this test for why existence can no
+    # longer discriminate "a leaked DEL" from "b's own reaper already got there" now that the
+    # reaper exists, and why this delta still can (b's own reaper is local and never dispatches a
+    # command against b, so it cannot move this counter; a forwarded DEL would).
     delta_b = await _total_commands_processed(c_b) - before_b
     assert delta_b < 10, (
         f"peer applied {delta_b} commands with nothing legitimately sent to it (expected only "
         f"idle mesh noise, comfortably under 10; a {n}-key leak would show ~{n}) -- looks like "
         f"a's derived DELs leaked through to the peer"
     )
-
-    # drakeydb: P4-0 Task 2b -- there used to be a corroborating existence check here ("b's copy
-    # of every key should still exist, since nothing was ever forwarded to tell it to clean up").
-    # That stopped being discriminating once the member-expiry reaper landed (below, same file):
-    # b is itself an active node with its own reaper on its own clock, and by this point in the
-    # test b's own heartbeat has had ample time (the setup convergence wait plus the 1.2s member-
-    # TTL sleep above) to have *independently* reaped these same now-empty sets on its own --
-    # legitimately, per that task's whole design, with no DEL ever forwarded from a. So "key no
-    # longer exists on b" is now consistent with BOTH a leaked DEL (the bug this test exists to
-    # catch) AND b's own correct self-healing (not a bug at all) -- the observable outcome
-    # coincides either way, exactly the lesson this project already learned about convergence
-    # assertions elsewhere. delta_b above is what still discriminates: b's own reaper acts
-    # entirely locally and is not itself a command dispatched from a, so it does not move that
-    # counter, while a leaked, forwarded DEL would. delta_b is therefore the only assertion this
-    # test needs or should make.
 
 
 # drakeydb: P4-0 Task 2b -- the member-expiry reaper. The test above proves half of Task 1's
