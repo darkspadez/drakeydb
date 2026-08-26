@@ -506,23 +506,47 @@ builds with g++, so it never runs in the ordinary local gate.
   **but P7 is exactly the phase that would make it carry real data.**
 - The plain-replica misconfiguration guard is a `DCHECK`, so its loud failure protects debug/CI only;
   a release build degrades to a warning plus silent drops.
-- **Phantom containers on a read-asymmetric mesh (P4-0 Task 1 fix-wave finding).** There is no
-  active member-expiry reaper: `DbSlice::FindInternal` (`db_slice.cc:673-687`) checks only
-  whole-key `HasExpire()`; member-level (hash-field/set-member) expiry is reaped exclusively by
-  the ~25 `DeleteIfEmpty`/`DeleteSetIfEmpty` call sites enumerated for the P4-0 fix, and every one
-  of them needs a command to touch the key to run at all. For the read-path call sites — whose
-  causing command is never journaled, by design (see Phase 4's "P4-0 Task 1 delivered" note
-  below) — a peer keeps a logically-empty container **indefinitely** until *it* is asked to read
-  that same key. `EXISTS`/`DBSIZE`/`SCAN`/`KEYS` do not decode the collection, so none of them
-  notice or clear it; a mesh where reads land asymmetrically across nodes can carry these phantom
-  containers forever. It escalates from cosmetic to a real divergence: a later replicated
-  `SETNX`/`INCR`/`LPUSH` against that key runs on the peer's still-present (but logically empty)
-  collection and returns `WRONGTYPE`, while the author — which already reaped the key — applies
-  the command as a plain string/list write. Same root cause, corollary regression: `DEBUG
-  OBJHIST`/`DEBUG STRINGS` used to be an inadvertent **mesh-wide** phantom-container sweep (every
-  node's derived DEL reached every peer); they now only clean up the node they run on. P4-2's
-  tombstone GC and the design spec's D-4 full-scan invariant both have to account for these
-  keys explicitly — neither can assume "logically empty" and "absent from the peer" coincide.
+- **Phantom containers on a read-asymmetric mesh (P4-0 Task 1 fix-wave finding; closed for the
+  default namespace by Task 2b's member-expiry reaper, fix rounds 2-6 — see known limitations
+  below for what remains open).** `DbSlice::FindInternal` (`db_slice.cc:673-687`) checks only
+  whole-key `HasExpire()`; member-level (hash-field/set-member) expiry used to be reaped
+  exclusively by the ~25 `DeleteIfEmpty`/`DeleteSetIfEmpty` call sites enumerated for the P4-0
+  fix, every one of which needs a command to touch the key to run at all — for the read-path call
+  sites, whose causing command is never journaled by design, a peer kept a logically-empty
+  container **indefinitely** until *it* was asked to read that same key. Task 2b's reaper
+  (`DbSlice::DeleteExpiredStep`, `db_slice.cc`) adds a proactive walk: on `--active_replica`
+  nodes, the heartbeat's existing prime-table traversal also force-expires and reaps any
+  container with a live member TTL (`HasMemberExpiration()`), bounded per container
+  (`--reaper_member_walk_budget`, resumable across ticks), so a peer that is never itself asked to
+  read the key still converges on its own clock. Every node derives its own DEL
+  (`journal::kEntryFlagDerived`, suppressed from peer links exactly like the read-path carve-outs
+  above), so this does not change what crosses the wire, only how promptly each node's own copy
+  converges — including a container that also carries a not-yet-due whole-key TTL (fix round 6
+  Critical 1: an earlier version of the reaper skipped exactly that shape, since it lived entirely
+  inside the "no whole-key TTL" arm of the heartbeat's existing dispatch, reopening this same
+  phantom-container divergence, up to permanent divergence after a recreate, for the ordinary
+  session/cache-hash pattern of a member TTL plus a key-level TTL).
+  **Known limitations, not yet closed:**
+  - **Default-namespace-only scope.** The reaper piggybacks on
+    `EngineShard::RetireExpiredAndEvict` (`engine_shard.cc:863-864`), which only iterates the
+    default namespace (upstream's own `// TODO: iterate over all namespaces`) — this leg is false
+    outside it, by the same read-triggered-only mechanism as before Task 2b, for any non-default
+    namespace. Not fixed; upstream's own TODO, not this task's to close.
+  - **`HSetFamily::DeleteHw`** (`hset_family.cc:204`), reached from the generic `HMapWrap` wrapper
+    and `HSETEX` — essentially every hash command — is a third, previously-undocumented DEL
+    derivation path distinct from `DeleteIfEmpty`: it journals a plain, unflagged, self-origin DEL
+    (`RecordJournal(..., "DEL", ...)`, no `kEntryFlagDerived`), so it forwards to peers rather than
+    being suppressed. Pre-existing Phase 3 behaviour, left unchanged deliberately: it
+    over-converges (every peer redundantly re-derives the same DEL upstream would have suppressed)
+    rather than diverging, and flagging it derived would require every peer to independently
+    derive its own DEL for the same container, which the default-namespace-only gap above shows
+    the reaper cannot yet unconditionally guarantee everywhere.
+  Same root cause, corollary regression, unaffected by the above: `DEBUG OBJHIST`/`DEBUG STRINGS`
+  used to be an inadvertent **mesh-wide** phantom-container sweep (every node's derived DEL
+  reached every peer); they now only clean up the node they run on. P4-2's tombstone GC and the
+  design spec's D-4 full-scan invariant both have to account for these keys explicitly — neither
+  can assume "logically empty" and "absent from the peer" coincide, especially outside the default
+  namespace.
 - **SORT's partial-expiry gap (pre-existing, not introduced by P4-0 Task 1; documentation only,
   not fixed).** `OpFetchSortEntries`/`OpFetchContainerElements` call `DeleteSetIfEmpty` only when
   `it->second.Size() == 0` after iteration, so the carve-out (and `DeleteSetIfEmpty` itself) only

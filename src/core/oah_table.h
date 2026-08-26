@@ -387,7 +387,7 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
   // the SIMD affiliation-window/extension-vector logic exactly as ScanHomeBucket already has it
   // (not reimplemented) -- only the two `cb(...)` call sites differ, passing e.HasExpiry() too.
   bool ReaperScanHomeBucket(uint32_t bucket_id, const ReaperItemCb& cb) {
-    const uint32_t part = std::min(capacity_log_, kShiftLog);
+    const uint32_t part = std::min<uint32_t>(capacity_log_, kShiftLog);
     assert(part > 0u);
     const uint32_t shift = 64 - part;
     const uint64_t target = bucket_id & ((uint64_t{1} << part) - 1);
@@ -724,7 +724,7 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
   // Scans one stable-SCAN home bucket window and reports live affiliated entries. Templated on
   // Expire: no-TTL sets skip the per-entry lazy expiration and the post-expiry empty re-check.
   template <bool Expire> bool ScanHomeBucket(uint32_t bucket_id, const ItemCb& cb) {
-    const uint32_t part = std::min(capacity_log_, kShiftLog);
+    const uint32_t part = std::min<uint32_t>(capacity_log_, kShiftLog);
     assert(part > 0u);
     // ScanWindowMask drops empty lanes, so `cand` holds only affiliated non-empty single entries.
     const uint32_t shift = 64 - part;
@@ -887,16 +887,28 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
   mutable size_t obj_alloc_used_ = 0;
   mutable size_t ptr_vectors_alloc_used_ = 0;
 
-  std::uint32_t capacity_log_ = 0;
   std::uint32_t size_ = 0;  // number of elements in the set.
   std::uint32_t time_now_ = 0;
-  bool expiration_used_ = false;
-  Buckets entries_;
-
   // drakeydb: P4-0 Task 2b Important A/C -- reaper-only resume state; see DenseSet's identical
   // fields (dense_set.h) for the full rationale, mirrored here for OAHTable.
   std::uint32_t reaper_cursor_ = 0;
+
+  // drakeydb: P4-0 Task 2b, fix round 6 Important 3 -- capacity_log_ narrowed from uint32_t to
+  // uint8_t, and this whole tail regrouped by size (three uint32_t fields above, three 1-byte
+  // fields here, entries_ last), to close a sizeof(OAHSet) regression: this task's reaper fields
+  // had grown it 56 -> 64 bytes in the default build (--use_oah_set defaults true, so this was
+  // +8 bytes on every dense-encoded SET key even with --active_replica off), unlike DenseSet/
+  // StringMap, which stayed at 64 because their own reaper fields were deliberately packed into
+  // existing tail padding (dense_set.h). Safe to narrow: capacity_log_ is a shift amount (bucket
+  // count is 1 << capacity_log_) used only in expressions like `32 - capacity_log_` and
+  // `1 << capacity_log_`, where a uint8_t operand promotes to int/unsigned before the operation
+  // -- no behavior change -- and no realistic table ever approaches 256 for it (that would mean
+  // 2^256 buckets). Measured before/after with a scratch sizeof probe: 64 -> 56, confirmed.
+  std::uint8_t capacity_log_ = 0;
+  bool expiration_used_ = false;
   bool reaper_any_ttl_seen_ = false;
+
+  Buckets entries_;
 };
 
 }  // namespace dfly

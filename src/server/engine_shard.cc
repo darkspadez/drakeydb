@@ -70,6 +70,9 @@ ABSL_FLAG(double, eviction_memory_budget_threshold, 0.1,
           "eviction_memory_budget_threshold * max_memory_limit.");
 ABSL_FLAG(bool, background_heartbeat, false, "Whether to run heartbeat as a background fiber");
 ABSL_DECLARE_FLAG(uint32_t, max_eviction_per_heartbeat);
+// drakeydb: P4-0 Task 2b, fix round 6 Important 6 -- declared here (defined in db_slice.cc) so
+// the traversal-gate fix a few lines below can read it; see that fix's own comment.
+ABSL_DECLARE_FLAG(uint32_t, reaper_member_walk_budget);
 
 namespace dfly {
 
@@ -912,9 +915,23 @@ void EngineShard::RetireExpiredAndEvict() {
       // entirely and shrink the ratio below for every upstream-configured (non-active) node --
       // exactly the config the byte-identical-to-upstream constraint is about. Gating keeps the
       // inactive path bit-for-bit upstream.
+      //
+      // drakeydb: P4-0 Task 2b, fix round 6 Important 6 -- ALSO gated on
+      // reaper_member_walk_budget != 0: db_slice.cc's reap_member_expiry alone is not enough,
+      // because the reaper branch being reachable (IsActiveReplica() true) does not mean it does
+      // anything -- a 0 budget makes DeleteExpiredStep's own gate skip every member-TTL key
+      // without examining it (see that flag's own comment). Without this, an active node with the
+      // budget set to 0 still counted member-TTL keys into ttl_key_count for pure waste (opening
+      // the traversal gate and inflating the dilution ratio for keys the reaper would immediately
+      // skip anyway) AND still diluted db_ttl_delete_target below for whole-key expiry, making it
+      // less aggressive than upstream for a configuration an operator can legitimately select
+      // (budget=0, deliberately disabling the proactive member reaper while keeping whole-key
+      // expiry at full upstream throughput). Same condition closes both halves at once.
+      const bool member_reap_active =
+          IsActiveReplica() && absl::GetFlag(FLAGS_reaper_member_walk_budget) != 0;
       uint64_t ttl_key_count =
           expire_count +
-          (IsActiveReplica() ? db_slice.GetDBTable(i)->stats.member_expire_count : uint64_t{0});
+          (member_reap_active ? db_slice.GetDBTable(i)->stats.member_expire_count : uint64_t{0});
       if (ttl_key_count > 0) {
         // Scale traversal count to compensate for TTL key dilution in the prime table.
         // Since we now scan the prime table (not a dedicated expire table), most entries

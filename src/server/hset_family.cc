@@ -201,6 +201,26 @@ struct HMapWrap {
 };
 
 // Delete if length is zero
+//
+// drakeydb: P4-0 Task 2b, fix round 6 Important 4 -- a THIRD DEL-derivation path, distinct from
+// DeleteIfEmpty (below) and pre-existing Phase 3 behaviour, not something this task introduced.
+// Reached from the generic HMapWrap wrapper (this file's caller of `f` in the CbVariant helper)
+// and HSETEX -- essentially every hash command that can empty a hash -- a materially wider
+// surface than DeleteIfEmpty's own two documented carve-outs (OpFieldExpire;
+// OpFetchSortEntries/OpFetchContainerElements's SORT case, see docs/PLAN.md). Unlike
+// DeleteIfEmpty, this always journals a plain, unflagged, self-origin DEL
+// (RecordJournal(..., "DEL", ...), no journal::kEntryFlagDerived) -- so journal::
+// PassesPeerEchoFilter does NOT suppress it, and it forwards to every mesh peer, not just plain
+// (full-stream) replicas. Any comment elsewhere that reads as "derived DELs are uniformly flagged
+// and suppressed" is describing DeleteIfEmpty/DeleteSetIfEmpty specifically, not this function.
+//
+// Deliberately left unchanged: it over-converges (every peer redundantly re-derives the same DEL
+// this node already forwarded) rather than diverging, so it is not the class of bug this task
+// exists to fix. Flagging it derived instead would suppress it and require every peer to
+// independently derive its own DEL for the same now-empty container on its own clock -- exactly
+// what the member-expiry reaper (db_slice.cc's DeleteExpiredStep) provides, but only inside the
+// default namespace (see docs/PLAN.md's "Phantom containers" entry) -- so making that change here
+// would trade a redundant-but-safe forward for a real divergence outside the default namespace.
 void DeleteHw(HMapWrap& hw, const OpArgs& op_args, std::string_view key) {
   auto& db_slice = op_args.GetDbSlice();
   if (auto del_it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_HASH); del_it) {
