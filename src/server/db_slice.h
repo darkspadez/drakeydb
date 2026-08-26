@@ -456,14 +456,9 @@ class DbSlice {
   void FlushChangeToEarlierCallbacks(DbIndex db_ind, Iterator it, uint64_t upper_bound);
 
   struct DeleteExpiredStats {
-    uint32_t deleted = 0;        // number of deleted items due to expiry.
-    uint32_t deleted_bytes = 0;  // total bytes of deleted items.
-    uint32_t traversed = 0;      // total number of traversed entries in the prime table.
-    // drakeydb: P4-0 Task 2b -- keys deleted by the member-expiry reaper (a now-empty
-    // container, reaped on a timer rather than by a read). Counted separately from `deleted`
-    // (whole-key TTL) so the strong-deletion-rate heuristic in DeleteExpiredStep -- which decides
-    // whether to keep traversing aggressively this heartbeat -- is not skewed by reaper work.
-    uint32_t reaped = 0;
+    uint32_t deleted = 0;                 // number of deleted items due to expiry.
+    uint32_t deleted_bytes = 0;           // total bytes of deleted items.
+    uint32_t traversed = 0;               // total number of traversed entries in the prime table.
     std::vector<std::string> key_events;  // expired key names for keyspace notifications.
   };
 

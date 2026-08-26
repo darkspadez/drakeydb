@@ -1304,9 +1304,11 @@ class ReaperJournalFamilyTest : public ActiveReplicaFamilyTest {
 };
 
 // drakeydb: P4-0 Task 2b acceptance case. DbSlice::DeleteExpiredStep's member-expiry reaper must
-// derive its own DEL exactly like a read would -- through SetFamily::DeleteSetIfEmpty, which
-// sets kEntryFlagDerived so PassesPeerEchoFilter (types.cc; exhaustively pinned on the pure
-// function by PassesPeerEchoFilterTest in journal_test.cc) keeps it off mesh-peer links -- while
+// derive its own DEL exactly like a read would -- through the three-arg Del()+RecordDerivedDelete
+// path (fix round 1's redesign; DeleteExpiredStep no longer touches SetFamily::DeleteSetIfEmpty
+// at all -- see task-2b-report.md section 14), which sets kEntryFlagDerived so
+// PassesPeerEchoFilter (types.cc; exhaustively pinned on the pure function by
+// PassesPeerEchoFilterTest in journal_test.cc) keeps it off mesh-peer links -- while
 // a plain consumer, standing in for a plain replica, still sees it: the peer filter is applied
 // only when streaming to a mesh peer specifically (JournalStreamer::ShouldWrite, streamer.cc),
 // never at journal::RegisterConsumer's point of capture, so this test's consumer (like
@@ -1373,7 +1375,21 @@ class BlockingSnapshotConsumer : public SliceSnapshot::SnapshotDataConsumerInter
  public:
   void ConsumeData(std::string /*data*/, ExecutionState* /*cntx*/) override {
     entered_.Notify();
-    release_.Wait();
+    // drakeydb: P4-0 Task 2b, fix round 1 -- bounded, not release_.Wait() unconditionally. If
+    // the hazard this test exists to catch regresses in a RELEASE build (where Preempt's
+    // LOG(DFATAL) only logs and still yields, rather than aborting -- see the test's own comment
+    // below), the reaper's DeleteExpiredStep call blocks on stream_mu_, which THIS fiber holds
+    // while waiting right here for that same call to return and release() us -- a genuine,
+    // unrecoverable circular wait between the two fibers, not merely a slow test. Left
+    // unbounded, that hangs until ctest's global timeout with no indication of why. Bounding it
+    // lets this fiber give up, return, and release stream_mu_, which unblocks the reaper's
+    // fiber in turn -- converting a silent multi-minute hang into a readable failure in seconds.
+    if (!release_.WaitFor(std::chrono::seconds(15))) {
+      ADD_FAILURE() << "BlockingSnapshotConsumer::ConsumeData timed out waiting to be released -- "
+                    << "the reaper's DeleteExpiredStep call likely deadlocked on stream_mu_ "
+                    << "against this fiber (see this class's own comment); a regression, not a "
+                    << "slow run";
+    }
   }
   void Finalize() override {
   }

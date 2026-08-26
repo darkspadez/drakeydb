@@ -62,6 +62,18 @@ ABSL_FLAG(bool, journal_omit_redundant_writes, true,
           "If true, omit journal writes for keys during full sync that are yet to be reached by "
           "the serialization loop. Reduces full sync overhead");
 
+// drakeydb: P4-0 Task 2b, fix round 1 -- bounds the member-expiry reaper's per-container walk.
+// quota_remains() is only checked before a container walk starts, never during it, and the walk
+// itself is a single non-interruptible step (allow_yield=false, required -- see the reaper's own
+// comment in DeleteExpiredStep). Without a member-count cap, one large container (a 100k-field
+// hash is the canonical HEXPIRE workload) can stall the shard thread for the whole walk with the
+// journal flush disabled and no client able to run, regardless of the 1ms heartbeat budget. A
+// partial walk still reaps whatever it touched before the budget ran out; the remainder is
+// re-visited on a later tick. 0 disables the cap (walks fully, the pre-fix behavior).
+ABSL_FLAG(uint32_t, reaper_member_walk_budget, 2000,
+          "Maximum number of container members the member-expiry reaper walks in a single "
+          "container per heartbeat tick before deferring the remainder to a later tick.");
+
 namespace dfly {
 
 using namespace std;
@@ -1686,6 +1698,23 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
           return;
         }
 
+        Iterator wrapped_it(it, StringOrView::FromView(key));
+
+        // drakeydb: P4-0 Task 2b, fix round 1 -- captures MallocUsed()/ObjType()/
+        // HasMemberExpiration() baseline BEFORE the walk below shrinks the container, exactly
+        // mirroring generic_family.cc's OpFieldExpire ("Finalize memory accounting before
+        // potential deletion"), the command path's own lazy-member-expiry-shrinks-a-container
+        // case. Constructing an AutoUpdater is a pure baseline snapshot with no side effects
+        // (no FindMutable/PreUpdateBlocking/OnChange -- those already ran, if at all, before
+        // this callback was ever invoked); Run() below reconciles obj_memory_usage/
+        // memory_usage_by_type/SlotStats::memory_bytes via AccountObjectMemory, which the walk
+        // does not do on its own. Without this, every reap (and every partial reap where the
+        // container survives) leaves permanent residue: the container's footprint shrinks but
+        // the DB-wide counters that were incremented when it grew are never correspondingly
+        // decremented, only clamped at their floor by AddTypeMemoryUsage (table.cc) -- silent,
+        // permanent memory-accounting drift on a long-running active node.
+        AutoUpdater auto_updater(cntx.db_index, key, wrapped_it, this);
+
         // Force lazy member expiry the same way a read would: set the container's logical "now",
         // then walk every member so the underlying set/map can drop stale ones in place (see
         // e.g. generic_family.cc's OpFetchContainerElements for the same two-step pattern on a
@@ -1694,17 +1723,45 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
         // journal::DisableFlushGuard -- a fiber-atomic section for its whole scope. Yielding here
         // would let a concurrent mutation invalidate the in-flight traversal cursor.
         it->second.SetMemberTime(MemberTimeSeconds(cntx.time_now_ms));
+
+        // drakeydb: P4-0 Task 2b, fix round 1 -- bounds the walk itself, not just how often it
+        // runs: quota_remains() is only checked before a container walk starts, never during
+        // it, and allow_yield=false (required, see above) makes the walk one non-interruptible
+        // step. Without this cap, one large container (a 100k-field hash is the canonical
+        // HEXPIRE workload) can stall the shard thread -- journal flush disabled, no client able
+        // to run -- for the whole walk regardless of the heartbeat's nominal 1ms budget.
+        // Returning false from the iterate callback stops the walk early (container_utils::
+        // IterateSet/IterateMap's own contract, confirmed by reading both implementations); a
+        // partial walk still reaps whatever members it reached before the cap, and the
+        // remainder is revisited on a later heartbeat tick, same as a container the traversal
+        // hasn't reached yet at all.
+        const uint32_t walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+        uint32_t walked = 0;
+        auto within_budget = [&]() {
+          ++walked;
+          return walk_budget == 0 || walked <= walk_budget;
+        };
         if (it->second.ObjType() == OBJ_SET) {
           container_utils::IterateSet(
-              it->second, [](container_utils::ContainerEntry) { return true; },
+              it->second, [&](container_utils::ContainerEntry) { return within_budget(); },
               /*allow_yield=*/false);
         } else {
           DCHECK_EQ(OBJ_HASH, it->second.ObjType());
           container_utils::IterateMap(
               it->second,
-              [](container_utils::ContainerEntry, container_utils::ContainerEntry) { return true; },
+              [&](container_utils::ContainerEntry, container_utils::ContainerEntry) {
+                return within_budget();
+              },
               /*allow_yield=*/false);
         }
+
+        // Reconcile memory accounting for the walk's shrinkage unconditionally -- i.e. before
+        // checking whether the container is now empty, not inside that branch -- so a partial
+        // reap (container survives, still has other members, possibly still with the sticky
+        // HasMemberExpiration() flag from having once carried a TTL -- see this function's
+        // caller-side comment in engine_shard.cc for that flag's own separate cost) is corrected
+        // too, not just a full one.
+        auto_updater.Run();
 
         if (it->second.Size() == 0) {
           size_t freed = it->first.MallocUsed() + it->second.MallocUsed();
@@ -1720,14 +1777,17 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
 
           // Route through the same three-arg Del() ExpireIfNeeded uses -- see this branch's
           // opening comment for why: it never calls FindMutable/OnChange, unlike the
-          // DeleteSetIfEmpty/DeleteIfEmpty helpers this used to call.
-          Del(cntx, Iterator(it, StringOrView::FromView(key)), db_arr_[cntx.db_index].get());
+          // DeleteSetIfEmpty/DeleteIfEmpty helpers this used to call. Reuses wrapped_it (no
+          // intervening yield since it was constructed, so it's still valid) rather than
+          // constructing a second Iterator over the same entry.
+          Del(cntx, wrapped_it, db_arr_[cntx.db_index].get());
 
-          // Counted separately from result.deleted (not folded in): result.deleted feeds the
-          // "strong deletion rate" heuristic below, which is about whole-key TTL density, not
-          // reaper work.
+          // freed bytes are folded into deleted_bytes (engine_shard.cc's eviction-goal
+          // accounting already consumes it correctly, unconditionally), but NOT into
+          // result.deleted: that field feeds the "strong deletion rate" heuristic below, which
+          // is about whole-key TTL density, not reaper work, and folding reaper deletions into
+          // it would skew that heuristic.
           result.deleted_bytes += freed;
-          ++result.reaped;
         }
       }
       return;

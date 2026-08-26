@@ -1958,13 +1958,22 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
 
     await setup_converged()
 
-    await asyncio.sleep(1.2)  # let every member's 1s TTL elapse on every node's own clock
-
-    # Measurement window starts here: from this point until delta_b is read below, nothing runs
-    # against b except the fixed idle wait a few lines down -- an incidental command (e.g. a
-    # convergence-polling EXISTS) would itself inflate the very counter being measured. b is not
-    # probed at all until after delta_b is captured below.
+    # Measurement window starts here -- deliberately BEFORE the sleep below, not after it. a's
+    # own reaper derives (and, if suppression is working, correctly suppresses) its DELs for
+    # these same keys during that sleep, on its own clock, the instant each member's TTL elapses
+    # -- not during the FIELDTTL burst further down. A window opened after the sleep (the
+    # original bug here, closed during whole-branch review: see task-2b-report.md section 16)
+    # covers only the FIELDTTL burst, by which point the reaper has typically already derived
+    # everything there was to derive, leaving nothing for a broken suppression to leak -- the
+    # test passed even with PassesPeerEchoFilter's kEntryFlagDerived check disabled outright.
+    # Opening the window here covers the reaper's own derivation, which is where the suppression
+    # this test exists to catch is actually exercised. From this point until delta_b is read
+    # below, nothing runs against b except the fixed idle wait a few lines down -- an incidental
+    # command (e.g. a convergence-polling EXISTS) would itself inflate the very counter being
+    # measured. b is not probed at all until after delta_b is captured below.
     before_b = await _total_commands_processed(c_b)
+
+    await asyncio.sleep(1.2)  # let every member's 1s TTL elapse on every node's own clock
 
     # Re-probing each already-expired member via FIELDTTL (read-only) on a causes
     # SetFamily::FieldExpireTime to discover it lazily expired and flush it -- each set empties

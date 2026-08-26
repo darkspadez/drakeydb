@@ -24,6 +24,7 @@ extern "C" {
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/journal.h"
+#include "server/multi_master.h"
 #include "server/namespaces.h"
 #include "server/search/doc_index.h"
 #include "server/server_state.h"
@@ -903,7 +904,17 @@ void EngineShard::RetireExpiredAndEvict() {
       // budget, so DeleteExpiredStep's reaper extension never actually runs. Authorized
       // exception to the "engine_shard stays untouched" constraint, confined to this one `if`
       // block; see task-2b-report.md.
-      uint64_t ttl_key_count = expire_count + db_slice.GetDBTable(i)->stats.member_expire_count;
+      //
+      // drakeydb: P4-0 Task 2b, fix round 1 -- the member term is gated on IsActiveReplica():
+      // with --active_replica off, DeleteExpiredStep's reaper branch is itself inert
+      // (db_slice.cc's reap_member_expiry), so member-TTL keys are pure dilution there, not
+      // reap targets. Counting them unconditionally would open this gate for DBs upstream skips
+      // entirely and shrink the ratio below for every upstream-configured (non-active) node --
+      // exactly the config the byte-identical-to-upstream constraint is about. Gating keeps the
+      // inactive path bit-for-bit upstream.
+      uint64_t ttl_key_count =
+          expire_count +
+          (IsActiveReplica() ? db_slice.GetDBTable(i)->stats.member_expire_count : uint64_t{0});
       if (ttl_key_count > 0) {
         // Scale traversal count to compensate for TTL key dilution in the prime table.
         // Since we now scan the prime table (not a dedicated expire table), most entries
