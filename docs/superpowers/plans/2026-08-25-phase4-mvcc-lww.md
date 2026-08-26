@@ -569,6 +569,146 @@ git add -A && git commit -m "feat: warn and report on peer clock skew (P4)"
 Expected: `ctest` 87/87 plus the new cases; `multimaster_test.py` at its P3 baseline
 of 41 plus the two added here; `replication_test.py` 43 passed.
 
+---
+
+### Task 3: Member-expiry reaper -- make the peer actually derive its own DEL
+
+**Why this task exists.** P4-0's adversarial review **refuted** the convergence claim that
+Tasks 1-2 rest on. The claim's second bullet -- "the peer expires on its own clock" -- is
+false: there is **no active member-expiry reaper in this tree**. `DbSlice::FindInternal`
+(`db_slice.cc:673-687`) checks only whole-key `HasExpire()`, and member-level TTLs are reaped
+**exclusively** by the 25 `Delete*IfEmpty` call sites, every one of which needs a command to
+touch the key. So once Task 1 suppresses a read-derived DEL, a peer that is not itself asked
+to read that key keeps a logically-empty container indefinitely.
+
+Reproduced on real binaries: `A: SADD s m1` / `FIELDEXPIRE s 1 m1` / sleep / `SMEMBERS s`
+(A reaps and suppresses the DEL) / `SETNX s hello` -- A ends holding `string 'hello'`, B ends
+holding a `set` and answers `WRONGTYPE`. The only asymmetry required is *"A serves a read and
+B does not"*, which is the normal state of a read-scaled active-active deployment.
+
+This task closes it at the root rather than documenting it: **make every node reap its own
+expired members on a timer, so "the peer derives its own DEL" becomes true instead of
+assumed.** Task 1's suppression is then correct as designed.
+
+Note this does NOT subsume Task 1's SORT carve-out. The reaper eventually reaps the peer's
+phantom container, but `SORT ... STORE dest` fabricates `dest` on the peer at replay time and
+nothing un-fabricates it. Both fixes are needed.
+
+**Files:**
+- Modify: `src/server/db_slice.{h,cc}` (`DeleteExpiredStep` callback; `member_expire_count`
+  maintenance)
+- Modify: `src/server/table.h` (`DbTableStats::member_expire_count`)
+- Modify: `src/server/engine_shard.cc` (**one line**: widen the heartbeat gate -- see Step 3)
+- Test: `src/server/multi_master_test.cc`, `tests/dragonfly/multimaster_test.py`
+
+**Interfaces:**
+- Consumes: `CompactObj::HasMemberExpiration()` (`compact_object.h:354`);
+  `container_utils::IterateSet`; `SetFamily::DeleteSetIfEmpty` / `HSetFamily::DeleteIfEmpty`
+  (Task 1's `derived` parameter defaults to `true`, which is what this path wants);
+  `DbSlice::DeleteExpiredStep`'s existing `quota_remains()` budget.
+- Produces: `DbTableStats::member_expire_count`; reaper counters on
+  `DbSlice::DeleteExpiredStats`.
+
+**The design, already scouted -- do not re-derive it:**
+
+`DeleteExpiredStep` (`db_slice.cc:1597`) **already traverses the prime table**, not a
+dedicated expire table -- see the upstream comment at `engine_shard.cc:902-904` ("Since we now
+scan the prime table (not a dedicated expire table), most entries may not have TTLs"). Its
+callback early-returns on `!it->first.HasExpire()`. So the reaper is an extension of a
+traversal that already visits every key, and it lives in `db_slice.cc`, which this plan's
+Global Constraints explicitly permit.
+
+- [ ] **Step 1: Write the failing pytest first -- the adversarial counterexample, verbatim**
+
+In `tests/dragonfly/multimaster_test.py`. This is the load-bearing test; write it before any
+production code and confirm it fails.
+
+Two active nodes in a mutual mesh. `A: SADD s m1`; `A: FIELDEXPIRE s 1 m1`; wait past the TTL;
+`A: SMEMBERS s` (A reaps, derives a DEL, suppresses it to the peer). Then assert **B
+self-heals within a bounded wait** -- `EXISTS s` on B goes to 0 without B ever having read `s`.
+
+Do **not** write this as a convergence poll and stop there. Assert the escalation too, because
+that is what makes it a data-correctness bug rather than a hygiene leak: after B has healed,
+`A: SETNX s hello` must leave **both** nodes holding `string 'hello'`, with neither answering
+`WRONGTYPE`.
+
+Expected before the fix: B keeps `s` as a set forever, and the `SETNX` assertion fails with a
+type mismatch.
+
+- [ ] **Step 2: Extend the traversal callback**
+
+In `DbSlice::DeleteExpiredStep`'s `cb` (`db_slice.cc:1605-1629`), handle the entries the
+existing early-return skips: `!it->first.HasExpire()` **and** `it->second.HasMemberExpiration()`.
+
+For those, do what a read would have done -- walk the container so its lazy member expiry
+fires, then, if it is now empty, delete it through the **existing** `DeleteSetIfEmpty` /
+`DeleteIfEmpty` helpers with `derived` left at its default `true`.
+
+Leaving `derived = true` is the point of the task, not an oversight: every node runs this
+reaper, so every node derives its own DEL, and suppressing it on peer links is exactly right.
+Say so in a comment -- a future reader will otherwise "fix" it to forward.
+
+Respect the existing `CheckLock(IntentLock::EXCLUSIVE, ...)` guard the whole-key path uses
+before deleting, and count reaped keys separately from `result.deleted` so the existing
+"strong deletion rate" heuristic at `db_slice.cc:1642` is not skewed by reaper work.
+
+- [ ] **Step 3: Widen the heartbeat gate -- the one permitted constraint exception**
+
+`engine_shard.cc:900` gates the whole call on `if (expire_count > 0)`, where `expire_count`
+counts **whole-key** TTLs only. A DB holding only member-TTL containers -- precisely the
+phantom case -- has `expire_count == 0`, so `DeleteExpiredStep` is never called and the reaper
+would never run.
+
+Add `member_expire_count` to `DbTableStats` (`table.h:54`, alongside `expire_count`), maintain
+it in `db_slice.cc` beside the existing `expire_count` maintenance (`:1146`, `:1167`, `:2039`),
+and widen the gate to `if (expire_count > 0 || member_expire_count > 0)`.
+
+**This one line in `engine_shard.cc` is the only permitted departure from the "engine_shard
+stays untouched" constraint, and it is authorised for this task only.** Do not make any other
+change to that file. If you find yourself needing a second one, stop and report it.
+
+- [ ] **Step 4: Gate the reaper on active mode**
+
+The reaper must run only when `--active_replica` is on. The Global Constraint that the journal
+wire stays **byte-identical to upstream with active mode off** is binding, and a reaper that
+deletes keys and emits DELs on a timer changes what reaches the wire. Gate it on the same
+`mvcc_enabled_`-style boot-time check the rest of the phase uses.
+
+(The phantom is a genuine upstream bug and the reaper would be worth contributing ungated --
+but that is an upstream PR, not this one.)
+
+- [ ] **Step 5: Bound the cost, and prove you bounded it**
+
+Walking a container to force member expiry is O(members). Reaping is therefore materially more
+expensive per entry than the whole-key check it sits beside, and it runs inside a 1ms fiber
+budget shared with whole-key expiry and eviction.
+
+Do not let reaper work starve whole-key expiry: check the existing `quota_remains()` before
+each container walk, not just once per traversal batch. Report a measurement in your report --
+heartbeat time with a DB of large member-TTL containers, against the same DB without the
+reaper. If it is materially worse, say so plainly rather than tuning until the number looks
+acceptable.
+
+- [ ] **Step 6: Run the pytest from Step 1 and verify it now passes; falsify it**
+
+Revert only Step 2's callback extension, rebuild, re-run, and record the **verbatim** failure
+text in your report. Restore.
+
+- [ ] **Step 7: C++ coverage for the journal shape**
+
+In `src/server/multi_master_test.cc`: assert the reaper's DEL carries `kEntryFlagDerived` (so
+`PassesPeerEchoFilter` keeps it off peer links) and that a plain replica still receives it.
+Falsify and record.
+
+- [ ] **Step 8: Prove no regression in the paths this touches**
+
+The reaper shares a callback and a budget with whole-key expiry, so run the whole-key expiry
+tests explicitly, not just the new ones: `ctest -V -L DFLY` in full, plus
+`tests/dragonfly/multimaster_test.py` and `tests/dragonfly/replication_test.py`. Report actual
+numbers against the P4-0 baseline (ctest 87/87, multimaster 46, replication 43/21 deselected).
+
+---
+
 **P4-0 is now complete and independently mergeable.** Open it as its own PR before
 starting Task 3.
 
