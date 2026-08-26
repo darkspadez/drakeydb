@@ -428,4 +428,104 @@ TEST_F(StringMapTest, ExtractMultiple) {
   }
 }
 
+// drakeydb: P4-0 Task 2b Important A -- falsifies the exact defect the whole-branch review found
+// in fix round 1: a callback-based walk (container_utils::IterateSet/IterateMap, the reaper's
+// original mechanism) only ever sees SURVIVING members reaching its callback, but
+// DenseSet::IteratorBase::Advance skips ALREADY-EXPIRED entries internally without ever invoking
+// it -- so a container whose members had ALL already expired (the canonical HEXPIRE-workload
+// case: a large hash, uniform TTL, all elapsed) walked completely unbounded regardless of any
+// cap on the callback's own invocation count. ReaperExpireStep must genuinely stop after
+// max_slots RAW SLOTS examined, survivors and already-expired-and-skipped alike.
+//
+// Falsifying: reverting ReaperExpireStep's loop to only count survivors (e.g. incrementing a
+// budget counter inside the `if (!ptr.IsEmpty() && ...)` branch instead of once per slot
+// unconditionally) reproduces fix round 1's bug -- this test's kBudget-vs-kCount gap would then
+// collapse to zero work done per call, the opposite failure, or (with the original
+// container_utils-based walk swapped back in) all 5000 members expiring in the single first
+// call, which the assertions below catch either way.
+TEST_F(StringMapTest, ReaperExpireStepBoundsMassExpiry) {
+  constexpr int kCount = 5000;
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(sm_->AddOrUpdate(absl::StrCat("k", i), "v", 1));
+  }
+  ASSERT_EQ(sm_->UpperBoundSize(), size_t(kCount));
+  sm_->set_time(2);  // every member's TTL (1) has now elapsed -- all of them, at once.
+
+  constexpr uint32_t kBudget = 100;
+  bool complete = sm_->ReaperExpireStep(kBudget);
+
+  EXPECT_FALSE(complete) << "a single bounded call must not complete a full pass over a "
+                            "container this much larger than its budget";
+  // A budget of 100 slots must not let this one call expire anywhere close to all 5000 members
+  // -- if it did, the walk is not actually bounded (fix round 1's exact bug).
+  EXPECT_GT(sm_->UpperBoundSize(), kCount / 2)
+      << "far more than kBudget members were expired in a single bounded call -- the walk is "
+         "not actually bounded";
+  EXPECT_LT(sm_->UpperBoundSize(), size_t(kCount))
+      << "the call examined nothing at all -- the walk made no progress";
+
+  // Repeated calls (the resume cursor) must still reach every member eventually, bounded by a
+  // sane number of calls (~kCount/kBudget), not stall on the same prefix forever.
+  int calls = 1;
+  while (!complete) {
+    ASSERT_LT(calls, 500) << "resume cursor is not making progress -- re-walking the same prefix";
+    complete = sm_->ReaperExpireStep(kBudget);
+    ++calls;
+  }
+  EXPECT_EQ(sm_->UpperBoundSize(), 0u);
+  // ReaperExpireStep reports whether clearing is safe; it does not clear on its own (matching
+  // db_slice.cc's actual caller, which only invokes ReaperClearMemberExpiration() when told to).
+  ASSERT_TRUE(complete);
+  sm_->ReaperClearMemberExpiration();
+  EXPECT_FALSE(sm_->ExpirationUsed())
+      << "a complete pass finding zero remaining member TTLs must allow clearing the sticky flag";
+}
+
+// drakeydb: P4-0 Task 2b Important C -- falsifies the interaction the coordinator flagged as
+// worse than the bug it fixes: clearing HasMemberExpiration()/ExpirationUsed() on a container
+// whose UNEXAMINED tail still holds member TTLs would strand those members permanently, since
+// with the flag cleared nothing would ever walk this container again. A single call over a
+// container far bigger than the budget must report an incomplete pass, and the flag must stay
+// set -- verified directly, not inferred from the return value alone.
+TEST_F(StringMapTest, ReaperExpireStepTruncatedPassDoesNotClearFlag) {
+  constexpr int kCount = 5000;
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(sm_->AddOrUpdate(absl::StrCat("k", i), "v", 1));
+  }
+  ASSERT_TRUE(sm_->ExpirationUsed());
+  sm_->set_time(2);  // all elapsed, same setup as the bounding test above.
+
+  bool complete = sm_->ReaperExpireStep(100);  // budget far smaller than kCount
+  ASSERT_FALSE(complete);
+  EXPECT_TRUE(sm_->ExpirationUsed())
+      << "a truncated pass must never look like a safe-to-clear pass";
+  EXPECT_GT(sm_->UpperBoundSize(), 0u);
+}
+
+// drakeydb: P4-0 Task 2b Important C -- the companion case: a FULL pass (covers every slot) that
+// is not CLEAN (some member still carries a live, not-yet-due TTL) must also not clear the flag
+// -- "examined everything" alone is not sufficient, only "examined everything and found no
+// remaining TTL" is. Falsifies clearing on `end >= entries_.size()` alone, without the
+// `!reaper_any_ttl_seen_` conjunct.
+TEST_F(StringMapTest, ReaperExpireStepFullButLiveTtlPassDoesNotClearFlag) {
+  constexpr int kCount = 50;
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(sm_->AddOrUpdate(absl::StrCat("k", i), "v", 100));  // far in the future
+  }
+  ASSERT_TRUE(sm_->ExpirationUsed());
+  sm_->set_time(1);  // nothing is due yet.
+
+  // A budget comfortably covering the whole (small) table in one call, so this pass is
+  // structurally complete (examines every slot) -- ReaperExpireStep's return value still comes
+  // back false, though, because "complete" alone is not "safe to clear": it also requires no
+  // remaining member TTL, which this container still has (every one, none yet due).
+  bool complete = sm_->ReaperExpireStep(10000);
+  EXPECT_FALSE(complete)
+      << "a complete pass that still found live, not-yet-due member TTLs must not report itself "
+         "safe to clear -- those members would never be swept again if it did";
+  EXPECT_TRUE(sm_->ExpirationUsed()) << "the flag must still be set; nothing calls "
+                                        "ReaperClearMemberExpiration() when complete is false";
+  EXPECT_EQ(sm_->UpperBoundSize(), size_t(kCount)) << "nothing should have been expired yet";
+}
+
 }  // namespace dfly

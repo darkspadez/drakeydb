@@ -8,6 +8,7 @@
 
 #include "core/dense_set.h"
 #include "core/oah_set.h"
+#include "core/string_map.h"
 #include "strings/human_readable.h"
 
 extern "C" {
@@ -62,16 +63,25 @@ ABSL_FLAG(bool, journal_omit_redundant_writes, true,
           "If true, omit journal writes for keys during full sync that are yet to be reached by "
           "the serialization loop. Reduces full sync overhead");
 
-// drakeydb: P4-0 Task 2b, fix round 1 -- bounds the member-expiry reaper's per-container walk.
+// drakeydb: P4-0 Task 2b, fix round 2 -- bounds the member-expiry reaper's per-container walk.
 // quota_remains() is only checked before a container walk starts, never during it, and the walk
 // itself is a single non-interruptible step (allow_yield=false, required -- see the reaper's own
-// comment in DeleteExpiredStep). Without a member-count cap, one large container (a 100k-field
-// hash is the canonical HEXPIRE workload) can stall the shard thread for the whole walk with the
-// journal flush disabled and no client able to run, regardless of the 1ms heartbeat budget. A
-// partial walk still reaps whatever it touched before the budget ran out; the remainder is
-// re-visited on a later tick. 0 disables the cap (walks fully, the pre-fix behavior).
-ABSL_FLAG(uint32_t, reaper_member_walk_budget, 2000,
-          "Maximum number of container members the member-expiry reaper walks in a single "
+// comment in DeleteExpiredStep). Without a cap, one large container (a 100k-field hash is the
+// canonical HEXPIRE workload) can stall the shard thread for the whole walk with the journal
+// flush disabled and no client able to run, regardless of the 1ms heartbeat budget. A truncated
+// walk still expires whatever it examined before the budget ran out; the remainder resumes from
+// where it left off on a later tick (DenseSet::ReaperExpireStep/OAHTable::ReaperExpireStep's own
+// persisted cursor -- fix round 1's version of this comment claimed resumption without actually
+// implementing it; this round closes that gap for real). 0 disables the cap (walks fully).
+//
+// Default deliberately well under the 1ms heartbeat quota, not comparable to it: fix round 1's
+// default of 2000 (~1.3ms at the ~0.66us/member measured cost) could by itself exceed the whole
+// per-tick budget in a single container, and quota_remains() is only checked before entering a
+// container walk, not during one -- so an overlarge budget defeats its own purpose. 300 keeps a
+// single container's worst case to a clear fraction of the quota (~200us) while still making
+// meaningful progress per tick.
+ABSL_FLAG(uint32_t, reaper_member_walk_budget, 300,
+          "Maximum number of container slots the member-expiry reaper examines in a single "
           "container per heartbeat tick before deferring the remainder to a later tick.");
 
 namespace dfly {
@@ -1700,68 +1710,105 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
 
         Iterator wrapped_it(it, StringOrView::FromView(key));
 
-        // drakeydb: P4-0 Task 2b, fix round 1 -- captures MallocUsed()/ObjType()/
+        // drakeydb: P4-0 Task 2b, fix round 2 -- captures MallocUsed()/ObjType()/
         // HasMemberExpiration() baseline BEFORE the walk below shrinks the container, exactly
         // mirroring generic_family.cc's OpFieldExpire ("Finalize memory accounting before
         // potential deletion"), the command path's own lazy-member-expiry-shrinks-a-container
-        // case. Constructing an AutoUpdater is a pure baseline snapshot with no side effects
-        // (no FindMutable/PreUpdateBlocking/OnChange -- those already ran, if at all, before
-        // this callback was ever invoked); Run() below reconciles obj_memory_usage/
-        // memory_usage_by_type/SlotStats::memory_bytes via AccountObjectMemory, which the walk
-        // does not do on its own. Without this, every reap (and every partial reap where the
-        // container survives) leaves permanent residue: the container's footprint shrinks but
-        // the DB-wide counters that were incremented when it grew are never correspondingly
-        // decremented, only clamped at their floor by AddTypeMemoryUsage (table.cc) -- silent,
-        // permanent memory-accounting drift on a long-running active node.
-        AutoUpdater auto_updater(cntx.db_index, key, wrapped_it, this);
+        // case. Reconciled directly via AccountObjectMemory below, NOT DbSlice::AutoUpdater::Run()
+        // (fix round 1's choice): Run() also fires PostUpdate (db_slice.cc), which marks every
+        // WATCH registration on this key dirty, wakes blocked transactions, bumps
+        // slots_stats[...].total_writes, and inflates rdb_changes_since_last_success_save -- side
+        // effects meant for a real command-path mutation a client can observe, not a background
+        // sweep that (from any client's perspective) touched nothing. A client WATCHing a key the
+        // reaper merely walked -- with the sticky flag (see the core-level fix below), potentially
+        // forever -- must not see a spurious EXEC abort with no write having occurred.
+        CompactObjType orig_obj_type = it->second.ObjType();
+        size_t orig_value_heap_size = it->second.MallocUsed();
+        bool orig_has_member_expiry = it->second.HasMemberExpiration();
 
         // Force lazy member expiry the same way a read would: set the container's logical "now",
-        // then walk every member so the underlying set/map can drop stale ones in place (see
+        // then walk the container so the underlying set/map can drop stale ones in place (see
         // e.g. generic_family.cc's OpFetchContainerElements for the same two-step pattern on a
-        // read path). allow_yield=false is deliberate, not a default: this callback runs inside
-        // PrimeTable::Traverse, which engine_shard.cc's heartbeat invokes from within a
-        // journal::DisableFlushGuard -- a fiber-atomic section for its whole scope. Yielding here
-        // would let a concurrent mutation invalidate the in-flight traversal cursor.
+        // read path).
         it->second.SetMemberTime(MemberTimeSeconds(cntx.time_now_ms));
 
-        // drakeydb: P4-0 Task 2b, fix round 1 -- bounds the walk itself, not just how often it
-        // runs: quota_remains() is only checked before a container walk starts, never during
-        // it, and allow_yield=false (required, see above) makes the walk one non-interruptible
-        // step. Without this cap, one large container (a 100k-field hash is the canonical
-        // HEXPIRE workload) can stall the shard thread -- journal flush disabled, no client able
-        // to run -- for the whole walk regardless of the heartbeat's nominal 1ms budget.
-        // Returning false from the iterate callback stops the walk early (container_utils::
-        // IterateSet/IterateMap's own contract, confirmed by reading both implementations); a
-        // partial walk still reaps whatever members it reached before the cap, and the
-        // remainder is revisited on a later heartbeat tick, same as a container the traversal
-        // hasn't reached yet at all.
+        // drakeydb: P4-0 Task 2b, fix round 2 -- bounds the walk itself via DenseSet:: /
+        // OAHTable::ReaperExpireStep, not container_utils::IterateSet/IterateMap (fix round 1's
+        // approach, which only bounded surviving members reaching its callback -- but
+        // DenseSet::IteratorBase::Advance and OAHTable's per-entry expiry both skip ALREADY-
+        // EXPIRED entries internally without ever invoking the delivered-entry callback, so a
+        // container whose members had ALL already expired walked unbounded, exactly the
+        // canonical HEXPIRE-workload case this budget exists to bound). ReaperExpireStep counts
+        // every slot/bucket EXAMINED, survivors and skipped-because-already-expired alike, and
+        // persists a resume cursor on the container itself so a container bigger than one call's
+        // budget makes genuine forward progress across heartbeat ticks instead of re-examining
+        // the same prefix forever. Returns whether THIS call completed a full, clean logical pass
+        // (see ReaperExpireStep's own comment) -- the only condition safe to clear the sticky
+        // HasMemberExpiration() flag under (Important C: see ReaperClearMemberExpiration below).
         const uint32_t walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
-        uint32_t walked = 0;
-        auto within_budget = [&]() {
-          ++walked;
-          return walk_budget == 0 || walked <= walk_budget;
-        };
+        bool complete_clean_pass = false;
         if (it->second.ObjType() == OBJ_SET) {
-          container_utils::IterateSet(
-              it->second, [&](container_utils::ContainerEntry) { return within_budget(); },
-              /*allow_yield=*/false);
+          DCHECK_EQ(kEncodingStrMap2, it->second.Encoding())
+              << "HasMemberExpiration() implies the dense encoding; intset carries no per-member "
+                 "metadata and can never report true here";
+          VisitSet(it->second.RObjPtr(),
+                   [&](auto* set) { complete_clean_pass = set->ReaperExpireStep(walk_budget); });
         } else {
           DCHECK_EQ(OBJ_HASH, it->second.ObjType());
-          container_utils::IterateMap(
-              it->second,
-              [&](container_utils::ContainerEntry, container_utils::ContainerEntry) {
-                return within_budget();
-              },
-              /*allow_yield=*/false);
+          DCHECK_EQ(kEncodingStrMap2, it->second.Encoding())
+              << "HasMemberExpiration() implies the dense encoding; listpack carries no "
+                 "per-member metadata and can never report true here";
+          auto* sm = static_cast<StringMap*>(it->second.RObjPtr());
+          complete_clean_pass = sm->ReaperExpireStep(walk_budget);
+        }
+
+        // drakeydb: P4-0 Task 2b Important C -- clears the sticky HasMemberExpiration() flag
+        // (dense_set.h/oah_table.h: ExpirationUsed() is never cleared by ordinary mutation once
+        // set, in EITHER encoding -- ClearStep's expiration_used_ = false at dense_set.cc:229
+        // fires only when the whole container becomes empty via a full Clear(), a path the
+        // reaper's own delete below does not take) so a container that once carried a member TTL
+        // but no longer has ANY -- due or not-yet-due -- stops being re-walked on every future
+        // heartbeat tick for zero benefit (measured, pre-clear: ~465us/tick, ~46% of the nominal
+        // 1ms budget, indefinitely -- see task-2b-report.md). Gated strictly on
+        // complete_clean_pass: a truncated pass (budget ran out) or one that found a live,
+        // not-yet-due TTL must never clear this, or the unexamined tail's member TTLs (truncated
+        // case) or the live TTL itself (not-yet-due case) would never be swept again by anything.
+        // Also correct for RDB: HasMemberExpiration() drives the TTL-aware type at rdb_save.cc
+        // (:179/:192/:494), and a container with no TTL-carrying members left serializes
+        // correctly as a plain SET/HASH.
+        if (complete_clean_pass) {
+          if (it->second.ObjType() == OBJ_SET) {
+            VisitSet(it->second.RObjPtr(), [](auto* set) { set->ReaperClearMemberExpiration(); });
+          } else {
+            static_cast<StringMap*>(it->second.RObjPtr())->ReaperClearMemberExpiration();
+          }
         }
 
         // Reconcile memory accounting for the walk's shrinkage unconditionally -- i.e. before
         // checking whether the container is now empty, not inside that branch -- so a partial
-        // reap (container survives, still has other members, possibly still with the sticky
-        // HasMemberExpiration() flag from having once carried a TTL -- see this function's
-        // caller-side comment in engine_shard.cc for that flag's own separate cost) is corrected
-        // too, not just a full one.
-        auto_updater.Run();
+        // reap (container survives, still has other members) is corrected too, not just a full
+        // one. Direct AccountObjectMemory call (not AutoUpdater::Run(), see this block's opening
+        // comment) plus the same member_expire_count transition-tracking AutoUpdater::Run()
+        // would have done (unaffected by which mechanism does it).
+        {
+          DbTable* table = db_arr_[cntx.db_index].get();
+          CompactObjType current_type = it->second.ObjType();
+          int64_t current_size = static_cast<int64_t>(it->second.MallocUsed());
+          if (current_type != orig_obj_type) {
+            AccountObjectMemory(key, orig_obj_type, -static_cast<int64_t>(orig_value_heap_size),
+                                table);
+            AccountObjectMemory(key, current_type, current_size, table);
+          } else {
+            AccountObjectMemory(key, current_type,
+                                current_size - static_cast<int64_t>(orig_value_heap_size), table);
+          }
+          bool current_has_member_expiry = it->second.HasMemberExpiration();
+          if (current_has_member_expiry && !orig_has_member_expiry) {
+            ++table->stats.member_expire_count;
+          } else if (!current_has_member_expiry && orig_has_member_expiry) {
+            --table->stats.member_expire_count;
+          }
+        }
 
         if (it->second.Size() == 0) {
           size_t freed = it->first.MallocUsed() + it->second.MallocUsed();

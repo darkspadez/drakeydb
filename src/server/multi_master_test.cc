@@ -1503,4 +1503,88 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
       << "the concurrent snapshot itself must have completed undisturbed";
 }
 
+// drakeydb: P4-0 Task 2b, fix round 2, Important B/3 -- the reaper's memory-accounting
+// reconciliation, exercised end to end through the real DeleteExpiredStep call (matching
+// engine_shard.cc's heartbeat), not just at the DenseSet/OAHTable unit level (string_map_test.cc/
+// oah_set_test.cc cover ReaperExpireStep's own correctness in isolation). A PARTIAL reap --
+// container survives, only some fields drop -- must shrink obj_memory_usage; leaving it
+// unchanged (fix round 1's AutoUpdater::Run() bug notwithstanding -- that one WAS reconciling,
+// just with an unwanted side effect, see the WATCH test below) would mean this test's whole
+// point: a background sweep that touched nothing from any client's perspective still correctly
+// unwinds the DB-wide byte counters it perturbed.
+//
+// Falsifying: commenting out the AccountObjectMemory block in DeleteExpiredStep's reaper branch
+// (verified by hand -- see task-2b-report.md) makes `after` come back equal to `before`, since
+// nothing else in the reap path touches obj_memory_usage for a surviving container.
+TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
+  constexpr int kFields = 2000;
+  vector<string> hset_args{"hset", "bighash"};
+  for (int i = 0; i < kFields; ++i) {
+    hset_args.push_back(absl::StrCat("f", i));
+    hset_args.push_back(string(200, 'x'));  // padding so the shrink is measurable
+  }
+  Run(hset_args);
+
+  // Field-expire half the fields; the other half keeps the container alive (partial reap).
+  vector<string> fieldexpire_args{"fieldexpire", "bighash", "1"};
+  for (int i = 0; i < kFields; i += 2)
+    fieldexpire_args.push_back(absl::StrCat("f", i));
+  Run(fieldexpire_args);
+
+  AdvanceTime(1100);
+
+  size_t before = GetMetrics().db_stats[0].obj_memory_usage;
+
+  shard_set->RunBriefInParallel([](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    DbContext db_cntx;
+    db_cntx.db_index = 0;
+    db_cntx.time_now_ms = TEST_current_time_ms;
+    db_slice.DeleteExpiredStep(db_cntx, 100000);  // budget large enough to finish in one call
+  });
+
+  size_t after = GetMetrics().db_stats[0].obj_memory_usage;
+
+  // Guard against a vacuous pass: half the fields must actually be gone (a real partial reap,
+  // not a no-op), and the container must have survived (the other half remains).
+  ASSERT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields / 2);
+  EXPECT_LT(after, before) << "reaping half the fields shrank the container's MallocUsed(), but "
+                              "obj_memory_usage was not correspondingly reconciled";
+}
+
+// drakeydb: P4-0 Task 2b, fix round 2, Important B -- fix round 1's AutoUpdater::Run() also
+// fired PostUpdate (db_slice.cc), which marks every WATCH registration on the key dirty. A
+// client WATCHing a set/hash that the reaper merely walks (a background sweep invisible to any
+// client, not a write) must not see a spurious EXEC abort with no write having occurred.
+//
+// Falsifying: reverting the reaper's accounting call back to AutoUpdater::Run() (verified by
+// hand -- see task-2b-report.md) makes the EXEC below come back kExecFail instead of
+// kExecSuccess, purely from the reaper's own heartbeat-driven walk.
+TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotSpuriouslyAbortWatch) {
+  auto kExecSuccess = ArgType(RespExpr::ARRAY);
+
+  ASSERT_EQ(Run({"sadd", "ws", "keep", "gone"}).GetInt(), 2);
+  Run({"fieldexpire", "ws", "1", "gone"});
+  AdvanceTime(1100);
+
+  EXPECT_EQ(Run({"watch", "ws"}), "OK");
+
+  shard_set->RunBriefInParallel([](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    DbContext db_cntx;
+    db_cntx.db_index = 0;
+    db_cntx.time_now_ms = TEST_current_time_ms;
+    db_slice.DeleteExpiredStep(db_cntx, 100000);
+  });
+
+  // Guard against a vacuous pass: the reaper must have actually walked/shrunk "ws" (a real
+  // partial reap -- "keep" survives, "gone" doesn't), not merely left it untouched.
+  ASSERT_EQ(Run({"scard", "ws"}).GetInt(), 1);
+
+  Run({"multi"});
+  Run({"get", "unrelated-key"});
+  EXPECT_THAT(Run({"exec"}), kExecSuccess)
+      << "the reaper's own walk of a WATCHed key must not abort an unrelated EXEC";
+}
+
 }  // namespace dfly
