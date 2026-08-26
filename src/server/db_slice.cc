@@ -100,7 +100,9 @@ ABSL_FLAG(uint32_t, reaper_member_walk_budget, 300,
           "Maximum number of container slots the member-expiry reaper examines in a single "
           "container per heartbeat tick before deferring the remainder to a later tick. 0 "
           "disables the proactive reaper entirely (member TTLs are still enforced lazily on "
-          "access).");
+          "access). On a --multi_master node, 0 also re-opens the peer DEL-suppression "
+          "divergence this reaper exists to close: a peer that never itself reads a key can "
+          "keep a logically-empty container forever.");
 
 namespace dfly {
 
@@ -417,7 +419,7 @@ template <typename F> struct CallbackConsumer : public DbSlice::ChangeConsumerIn
 
 namespace {
 
-void UpdateSlotStat(string_view key, int64_t delta, DbTable* db, uint64_t SlotStats::* stat,
+void UpdateSlotStat(string_view key, int64_t delta, DbTable* db, uint64_t SlotStats::*stat,
                     string_view name, std::optional<unsigned> obj_type = std::nullopt) {
   if (delta == 0 || !db->slots_stats)
     return;
@@ -1672,6 +1674,13 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
   // per-entry callback since it cannot change mid-traversal.
   const bool reap_member_expiry = IsActiveReplica();
 
+  // drakeydb: P4-0 Task 2b, fix round 5 -- hoisted out of the per-entry callback for the same
+  // reason reap_member_expiry is above it: fix round 4's version read this flag unconditionally
+  // inside the callback, for every prime-table key without a whole-key TTL, on every heartbeat --
+  // including with --active_replica off, where reap_member_expiry is already false and the read
+  // is pure waste on the common path. Reading it once per call instead of once per key.
+  const uint32_t walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+
   auto cb = [&](PrimeTable::iterator it) {
     result.traversed++;
 
@@ -1715,11 +1724,10 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
       // container walk itself was already confirmed non-preempting (ReaperExpireStep below calls
       // only plain synchronous C++, no fiber-aware call anywhere in DenseSet/StringMap's
       // lazy-expiry-on-iterate path) -- only the delete mechanism needed to change.
-      // drakeydb: P4-0 Task 2b, fix round 4 -- walk_budget read up front (not just before the
-      // ReaperExpireStep call below, as fix round 2 had it) so a 0 budget (the reaper explicitly
-      // disabled -- see the flag's own comment) skips CheckLock/Iterator/SetMemberTime for this
-      // key entirely, instead of paying that cost every tick and then still doing nothing.
-      const uint32_t walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+      // drakeydb: P4-0 Task 2b, fix round 4 -- checked before CheckLock/Iterator/SetMemberTime
+      // so a 0 budget (the reaper explicitly disabled -- see the flag's own comment) skips all of
+      // that for this key entirely, instead of paying the cost every tick and then doing nothing.
+      // walk_budget itself is read once per call, not once per key -- see its declaration above.
       if (reap_member_expiry && walk_budget != 0 && it->second.HasMemberExpiration() &&
           quota_remains()) {
         string_view key = it->first.GetSlice(&stash);
@@ -1769,8 +1777,9 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
         // the same prefix forever. Returns whether THIS call completed a full, clean logical pass
         // (see ReaperExpireStep's own comment) -- the only condition safe to clear the sticky
         // HasMemberExpiration() flag under (Important C: see ReaperClearMemberExpiration below).
-        // walk_budget itself was already read above, before CheckLock (fix round 4) -- guaranteed
-        // nonzero here since that's part of this block's entry condition.
+        // walk_budget itself was already read once per call, hoisted above the callback
+        // entirely (fix round 5) -- guaranteed nonzero here since that's part of this block's
+        // entry condition.
         bool complete_clean_pass = false;
         if (it->second.ObjType() == OBJ_SET) {
           DCHECK_EQ(kEncodingStrMap2, it->second.Encoding())

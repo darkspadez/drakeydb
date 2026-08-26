@@ -624,6 +624,28 @@ void DenseSet::AddUnique(void* obj, bool has_ttl, uint64_t hashcode) {
    * unlink it and repeat the steps
    */
 
+  // drakeydb: P4-0 Task 2b Important B -- this cascade relocates pre-existing entries (possibly
+  // whole link chains, via PopPtrFront/PushFront(DensePtr) below) across bucket indices without
+  // changing entries_.size(), so ReaperExpireStep's resize-based guard (dense_set.h) can't see
+  // it. A displaced entry can move from an index >= reaper_cursor_ (not yet examined by an
+  // in-flight pass) to one < reaper_cursor_ (already examined), hiding it for the rest of that
+  // pass -- or vice versa, causing (harmless) re-examination. Invalidate any in-flight pass here
+  // so it restarts from scratch rather than risk the former. Cheap: displacement is rare, and a
+  // restarted pass just re-walks slots, it doesn't re-do the work those slots already caused.
+  //
+  // Deliberately BEFORE the has_ttl block below (fix round 5): that block also sets
+  // reaper_any_ttl_seen_ = true when the entry being inserted here carries a TTL (Important A,
+  // same mirroring every other TTL-arming call site does). Checking displacement first means the
+  // two writes to reaper_any_ttl_seen_ can never land in the wrong order and cancel each other
+  // out -- an earlier version of this fix had them reversed, which happened to still be correct
+  // only because resetting reaper_cursor_ to 0 forces a full re-walk that re-discovers this same
+  // entry once inserted, an undocumented and untested dependency between two independently
+  // motivated fixes. This ordering removes that dependency instead of relying on it.
+  if (!entries_[bucket_id].IsEmpty() && entries_[bucket_id].IsDisplaced()) {
+    reaper_cursor_ = 0;
+    reaper_any_ttl_seen_ = false;
+  }
+
   DensePtr to_insert(obj);
   if (has_ttl) {
     to_insert.SetTtl(true);
@@ -631,18 +653,6 @@ void DenseSet::AddUnique(void* obj, bool has_ttl, uint64_t hashcode) {
     reaper_any_ttl_seen_ = true;
   }
 
-  // drakeydb: P4-0 Task 2b Important B -- this cascade relocates pre-existing entries (possibly
-  // whole link chains, via PopPtrFront/PushFront(DensePtr) above) across bucket indices without
-  // changing entries_.size(), so ReaperExpireStep's resize-based guard (dense_set.h) can't see
-  // it. A displaced entry can move from an index >= reaper_cursor_ (not yet examined by an
-  // in-flight pass) to one < reaper_cursor_ (already examined), hiding it for the rest of that
-  // pass -- or vice versa, causing (harmless) re-examination. Invalidate any in-flight pass here
-  // so it restarts from scratch rather than risk the former. Cheap: displacement is rare, and a
-  // restarted pass just re-walks slots, it doesn't re-do the work those slots already caused.
-  if (!entries_[bucket_id].IsEmpty() && entries_[bucket_id].IsDisplaced()) {
-    reaper_cursor_ = 0;
-    reaper_any_ttl_seen_ = false;
-  }
   while (!entries_[bucket_id].IsEmpty() && entries_[bucket_id].IsDisplaced()) {
     DensePtr unlinked = PopPtrFront(entries_.begin() + bucket_id);
 

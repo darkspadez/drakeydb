@@ -329,13 +329,23 @@ class DenseSet {
     // examined by this pass". Grow()/Shrink() (table resize) and AddUnique()'s displacement
     // cascade (dense_set.cc) can both relocate an entry across that boundary -- resize always
     // changes capacity_log_ (Grow increments it, Shrink recomputes it -- both always in lockstep
-    // with entries_.size(), which is why comparing capacity_log_ is equivalent to comparing
-    // entries_.size() here without needing a second copy of it), which this catches directly;
-    // AddUnique's same-size displacement is caught separately where it happens (see
-    // reaper_cursor_ = 0 there). Either way, bucket indices from before the change no longer mean
-    // "already examined" / "not yet examined", so resuming at the old cursor could silently skip
-    // an entry that moved below it. Restart the pass from scratch rather than risk that --
-    // correctness over avoiding a re-walk.
+    // with entries_.size()), which this catches directly; AddUnique's same-size displacement is
+    // caught separately where it happens (see reaper_cursor_ = 0 there). Either way, bucket
+    // indices from before the change no longer mean "already examined" / "not yet examined", so
+    // resuming at the old cursor could silently skip an entry that moved below it. Restart the
+    // pass from scratch rather than risk that -- correctness over avoiding a re-walk.
+    //
+    // Known narrow gap, not closed: comparing capacity_log_ (or, equivalently, entries_.size() --
+    // they're in lockstep, so neither is more "airtight" than the other here) is a snapshot
+    // comparison, not a monotonic one. A SHRINK immediately followed by regrowth back to exactly
+    // the prior capacity, both within a single in-flight pass, leaves capacity_log_ reading the
+    // same value on the next resumed call despite the table having been rebuilt in between --
+    // this check would not fire, and a relocated entry could still be missed. Needs an operator
+    // SHRINK plus regrowth inside one heartbeat interval to reach, so narrow. Closing it airtight
+    // would need a monotonically-increasing generation counter bumped inside Grow()/Shrink()
+    // themselves, which would cost back the sizeof(DenseSet) savings the byte-sized snapshot
+    // below was chosen for (a uint32_t generation counter re-grows this class from 64 to 72
+    // bytes, the same regression closed above) -- judged not worth it for a gap this narrow.
     if (reaper_cursor_ != 0 && capacity_log_ != reaper_pass_capacity_log_) {
       reaper_cursor_ = 0;
       reaper_any_ttl_seen_ = false;
@@ -570,13 +580,13 @@ class DenseSet {
   mutable bool expiration_used_ = false;
   mutable bool reaper_any_ttl_seen_ = false;
   // drakeydb: P4-0 Task 2b Important B -- reaper-only. capacity_log_ as of the last
-  // ReaperExpireStep call that left a pass in flight (reaper_cursor_ != 0). Grow()/Shrink()
-  // always update capacity_log_ in lockstep with entries_.size(), so comparing this snapshot
-  // against the live capacity_log_ on the next call detects a resize without needing a second
-  // full copy of entries_.size(); see ReaperExpireStep's own comment for what this guards
-  // against. A uint8_t (not the mutable uint32_t reaper_cursor_ is) so this and the two mutable
-  // bools above it fit into tail padding that already existed before this task, rather than
-  // growing sizeof(DenseSet).
+  // ReaperExpireStep call that left a pass in flight (reaper_cursor_ != 0), detecting a resize
+  // between resumed calls without needing a second full copy of entries_.size() (Grow()/Shrink()
+  // always update capacity_log_ in lockstep with it). A uint8_t (not the mutable uint32_t
+  // reaper_cursor_ is) so this and the two mutable bools above it fit into tail padding that
+  // already existed before this task, rather than growing sizeof(DenseSet). This is a snapshot
+  // comparison, not a monotonic one, and has a known narrow gap -- see ReaperExpireStep's own
+  // comment for what it does and does not guard against.
   mutable uint8_t reaper_pass_capacity_log_ = 0;
 };
 
