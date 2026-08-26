@@ -532,7 +532,7 @@ builds with g++, so it never runs in the ordinary local gate.
     default namespace (upstream's own `// TODO: iterate over all namespaces`) — this leg is false
     outside it, by the same read-triggered-only mechanism as before Task 2b, for any non-default
     namespace. Not fixed; upstream's own TODO, not this task's to close.
-  - **`HSetFamily::DeleteHw`** (`hset_family.cc:204`), reached from the generic `HMapWrap` wrapper
+  - **`HSetFamily::DeleteHw`** (`hset_family.cc`), reached from the generic `HMapWrap` wrapper
     and `HSETEX` — essentially every hash command — is a third, previously-undocumented DEL
     derivation path distinct from `DeleteIfEmpty`: it journals a plain, unflagged, self-origin DEL
     (`RecordJournal(..., "DEL", ...)`, no `kEntryFlagDerived`), so it forwards to peers rather than

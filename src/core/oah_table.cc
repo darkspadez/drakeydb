@@ -80,7 +80,10 @@ template <typename Entry> size_t OAHTable<Entry>::SizeSlow() {
 template <typename Entry> void OAHTable<Entry>::GrowCapacity(size_t bucket_capacity) {
   bucket_capacity = std::max(kMinBucketCount, absl::bit_ceil(bucket_capacity));
   if (bucket_capacity > entries_.size()) {
-    capacity_log_ = uint32_t(absl::bit_width(bucket_capacity) - 1);
+    // drakeydb: P4-0 Task 2b, fix round 8 (minor) -- cast directly to capacity_log_'s own
+    // type (uint8_t since fix round 6's OAHSet sizeof regroup), not to uint32_t first: the
+    // old cast read as if the field were still 32-bit, which it hasn't been since that fix.
+    capacity_log_ = static_cast<uint8_t>(absl::bit_width(bucket_capacity) - 1);
     size_t prev_size = entries_.size();
     entries_.resize(Capacity());
     Rehash(prev_size);

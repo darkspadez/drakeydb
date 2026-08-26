@@ -1451,10 +1451,17 @@ class BlockingSnapshotConsumer : public SliceSnapshot::SnapshotDataConsumerInter
     // lets this fiber give up, return, and release stream_mu_, which unblocks the reaper's
     // fiber in turn -- converting a silent multi-minute hang into a readable failure in seconds.
     if (!release_.WaitFor(std::chrono::seconds(15))) {
+      // drakeydb: P4-0 Task 2b, fix round 8 -- the specific mechanism this message used to name
+      // (the reaper's DeleteExpiredStep call deadlocking on stream_mu_ via OnChange) is no
+      // longer reachable: HasRegisteredCallbacks() (db_slice.cc) skips the reap entirely while
+      // this consumer is registered, before the reap path ever reaches any delete mechanism, old
+      // or new. A timeout here now most likely means Release() was never called (a bug in this
+      // test itself) or a genuinely different, new hang -- not the original stream_mu_ hazard.
       ADD_FAILURE() << "BlockingSnapshotConsumer::ConsumeData timed out waiting to be released -- "
-                    << "the reaper's DeleteExpiredStep call likely deadlocked on stream_mu_ "
-                    << "against this fiber (see this class's own comment); a regression, not a "
-                    << "slow run";
+                    << "either this test never called Release(), or something new is stuck; the "
+                    << "original stream_mu_/OnChange hazard this class was built to catch is no "
+                    << "longer reachable (HasRegisteredCallbacks() skips the reap before it can "
+                    << "touch stream_mu_ at all -- see the test below for why)";
     }
   }
   void Finalize() override {
@@ -1473,9 +1480,9 @@ class BlockingSnapshotConsumer : public SliceSnapshot::SnapshotDataConsumerInter
 };
 }  // namespace
 
-// drakeydb: P4-0 Task 2b redesign -- regression test for the fiber-atomic-section hazard the
-// coordinator's review surfaced (task-2b-report.md): the reaper's delete used to route through
-// SetFamily::DeleteSetIfEmpty/HSetFamily::DeleteIfEmpty -> DbSlice::FindMutable ->
+// drakeydb: P4-0 Task 2b redesign -- ORIGINAL regression test for the fiber-atomic-section
+// hazard the coordinator's review surfaced (task-2b-report.md): the reaper's delete used to
+// route through SetFamily::DeleteSetIfEmpty/HSetFamily::DeleteIfEmpty -> DbSlice::FindMutable ->
 // PreUpdateBlocking -> CallChangeCallbacks -> SerializerBase::OnChange, which can synchronously
 // block on stream_mu_ whenever a concurrent BGSAVE/full-sync is mid-way through serializing a
 // large value on this same shard. Forces that exact contention -- not a synthetic stand-in --
@@ -1487,26 +1494,36 @@ class BlockingSnapshotConsumer : public SliceSnapshot::SnapshotDataConsumerInter
 // blocking on stream_mu_ here would hit Scheduler::Preempt's IsFiberAtomicSection() check for
 // real, not hypothetically.
 //
-// Falsifying (verified by hand -- see task-2b-report.md §14): reverting only the delete mechanism
-// in DbSlice::DeleteExpiredStep back to DeleteSetIfEmpty/DeleteIfEmpty makes this test abort the
-// *entire test process* -- LOG(DFATAL) is FATAL in a debug build -- via Scheduler::Preempt's
-// "Preempting inside of atomic section" check firing for a real preemption attempt. That is not a
-// normal EXPECT/ASSERT failure; the verbatim crash text is recorded in the report rather than
-// reproduced as ordinary gtest output, since the process does not survive to print one.
-//
 // drakeydb: P4-0 Task 2b, fix round 6 Critical 2 (coordinator's own correction of fix round 1's
-// redirect) -- this test proves the reaper does not BLOCK a concurrent snapshot, which turned out
-// to be a different question from whether skipping OnChange's wait is SAFE: OnChange's second
-// role (BucketDependencies::Wait, serializer_base.cc) is what made every other mutation path safe
-// against a mid-entry snapshot, and bypassing it (to fix the preemption this test's own comment
-// above describes) reopened a data race the non-blocking property alone cannot see -- see
-// MemberExpiryReaperSkipsContainerDuringConcurrentSnapshot below for the fix and its own
-// falsification. The fix (skip the reap entirely while any snapshot/streamer consumer is
-// registered, HasRegisteredCallbacks()) changes this test's own expected outcome: "rs" is no
-// longer reaped WHILE the snapshot is registered -- it survives this call and is reaped on the
-// next one, after Release()/WaitSnapshotting() unregister the consumer. Updated below to match;
-// this test's own remaining purpose (proving no block/crash happens) is unaffected by the fix,
-// since skipping the reap entirely trivially cannot block on anything.
+// redirect) -- OnChange's SECOND role (BucketDependencies::Wait, serializer_base.cc) is what made
+// every other mutation path safe against a mid-entry snapshot, and bypassing it (to fix the
+// preemption the paragraph above describes) reopened a data race the non-blocking property this
+// test proves cannot see. Fixed by skipping the reap entirely while any snapshot/streamer
+// consumer is registered (HasRegisteredCallbacks(), db_slice.cc) -- see
+// MemberExpiryReaperSkipsContainerDuringConcurrentSnapshot below for that fix's own regression
+// test and falsification.
+//
+// drakeydb: P4-0 Task 2b, fix round 8 -- both this test's falsification claim and
+// BlockingSnapshotConsumer::ConsumeData's timeout message above used to say that reverting the
+// delete mechanism to DeleteSetIfEmpty/DeleteIfEmpty makes this test abort the entire process via
+// Scheduler::Preempt's atomic-section check. That claim is no longer reproducible and has been
+// removed: with the HasRegisteredCallbacks() gate in place, the reap is skipped before it ever
+// reaches ANY delete mechanism -- old or new -- while this consumer is registered, so neither
+// path can be exercised by this test anymore, regardless of which one production code uses. This
+// test's remaining, still-live purpose is exactly what its name says: prove the reaper does not
+// block a concurrent snapshot -- true unconditionally now, since skipping trivially cannot block
+// on anything.
+//
+// Consequence worth knowing, not a defect: the round-1 redirect away from DeleteSetIfEmpty/
+// DeleteIfEmpty to the three-arg Del() -- what originally fixed the preemption hazard this test's
+// first paragraph describes -- no longer has a regression test of its own. The
+// HasRegisteredCallbacks() gate makes the OnChange path unreachable from the reaper by
+// construction, so nothing here still exercises "does the reaper's OWN delete mechanism avoid
+// stream_mu_" the way this test originally did; it now only proves the reap is skipped before
+// reaching either mechanism. That is defense-in-depth, not redundant coverage: a future change
+// that removes or narrows the HasRegisteredCallbacks() gate would silently re-expose the original
+// preemption hazard with no test here to catch it. Flagging this rather than leaving a
+// falsification claim standing that no longer runs.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave) {
   // Activates SerializerBase::stream_mu_ (server/serializer_base.cc: `stream_mu_(!absl::GetFlag(
   // FLAGS_serialization_tagged_chunks))`) -- inactive (a no-op OptionalMutex) under the tagged-
@@ -1532,6 +1549,19 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
   ASSERT_EQ(Run({"sadd", "rs", "m"}).GetInt(), 1);
   Run({"fieldexpire", "rs", "1", "m"});
   AdvanceTime(1100);
+
+  // drakeydb: P4-0 Task 2b, fix round 8 (minor, coordinator's own flag) -- pin the reaper off by
+  // default for this whole test, flipping it on only for the two explicit calls that want it
+  // active. Without this, the server's REAL background heartbeat -- which keeps running
+  // throughout this test -- can reap "rs" on its own at any point after AdvanceTime, including
+  // before the Await() block below even starts, or during any yield inside a later Run() call;
+  // narrowed by ordering assertions right after Await() returns (fix round 6), but not closed,
+  // since Run() itself can yield. Restored to its original value on scope exit.
+  const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+  absl::SetFlag(&FLAGS_reaper_member_walk_budget, 0);
+  absl::Cleanup restore_walk_budget = [saved_walk_budget] {
+    absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+  };
 
   BlockingSnapshotConsumer consumer;
   ExecutionState exec_state;
@@ -1559,18 +1589,20 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
     consumer.WaitEntered();
 
     // Trigger the reaper concurrently, from this fiber, inside the real heartbeat's atomic
-    // section. On the old (DeleteSetIfEmpty/DeleteIfEmpty) code this would try to also lock
-    // stream_mu_ and block -- inside DisableFlushGuard, that is the hazard. On the redesigned
-    // code (three-arg Del(), bypassing OnChange entirely) it cannot reach stream_mu_ at all.
+    // section -- restoring the walk budget just for this one synchronous call (no yield between
+    // the two SetFlag calls, so the real heartbeat cannot observe a nonzero budget from any
+    // other fiber). See MemberExpiryReaperSkipsContainerDuringConcurrentSnapshot below for what
+    // this call is and is not expected to do now.
     {
       journal::DisableFlushGuard guard(shard->journal());
+      absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
       DbContext db_cntx;
       db_cntx.db_index = 0;
       db_cntx.time_now_ms = TEST_current_time_ms;
       db_slice.DeleteExpiredStep(db_cntx, 100);
+      absl::SetFlag(&FLAGS_reaper_member_walk_budget, 0);
     }
 
-    // Only reached if DeleteExpiredStep returned without blocking -- i.e. the redesigned code.
     consumer.Release();
     snapshot.WaitSnapshotting();
     shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
@@ -1579,7 +1611,10 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
   // drakeydb: P4-0 Task 2b, fix round 6 Critical 2 -- "rs" must NOT have been reaped: a
   // registered snapshot consumer was present for the entire DeleteExpiredStep call above, so the
   // HasRegisteredCallbacks() gate must have skipped it (deferral, not vacuous inaction -- see the
-  // follow-up reap below, which proves it resumes correctly once the consumer is gone).
+  // follow-up reap below, which proves it resumes correctly once the consumer is gone). The
+  // walk-budget pin above (fix round 8) rules out the real background heartbeat as an
+  // alternative explanation for "rs" being gone here, closing the flake window this assertion
+  // used to have.
   EXPECT_EQ(Run({"exists", "rs"}).GetInt(), 1)
       << "the reaper reaped a container while a snapshot consumer was registered -- the "
          "HasRegisteredCallbacks() gate did not skip it";
@@ -1587,7 +1622,9 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
       << "the concurrent snapshot itself must have completed undisturbed";
 
   // The skip must be a deferral, not a permanent miss: with the consumer now unregistered, the
-  // very next reap call must clean "rs" up normally.
+  // very next reap call must clean "rs" up normally. Budget restored just for this one call, for
+  // the same reason as the one inside Await() above.
+  absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
     DbContext db_cntx;
@@ -1650,6 +1687,16 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
   Run(fieldexpire_args);
   AdvanceTime(1100);
 
+  // drakeydb: P4-0 Task 2b, fix round 8 (minor, coordinator's own flag) -- same reasoning as
+  // MemberExpiryReaperDoesNotBlockOnConcurrentBgsave above: pin the reaper off by default so the
+  // real background heartbeat cannot be an alternative explanation for any assertion below,
+  // flipping it on only for the explicit calls that want it active. Restored on scope exit.
+  const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+  absl::SetFlag(&FLAGS_reaper_member_walk_budget, 0);
+  absl::Cleanup restore_walk_budget = [saved_walk_budget] {
+    absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+  };
+
   BlockingSnapshotConsumer consumer;
   ExecutionState exec_state;
 
@@ -1666,12 +1713,15 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
 
     {
       journal::DisableFlushGuard guard(shard->journal());
+      // Restored just for this one synchronous call (no yield between the two SetFlag calls, so
+      // no other fiber can observe a nonzero budget) -- this call must still skip "bighash"
+      // entirely, since a snapshot consumer is registered for its whole duration.
+      absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
       DbContext db_cntx;
       db_cntx.db_index = 0;
       db_cntx.time_now_ms = TEST_current_time_ms;
-      // With the fix, this must skip "bighash" entirely -- there is a registered snapshot
-      // consumer for the whole duration of this call.
       db_slice.DeleteExpiredStep(db_cntx, 100);
+      absl::SetFlag(&FLAGS_reaper_member_walk_budget, 0);
     }
 
     consumer.Release();
@@ -1681,7 +1731,9 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
 
   // The reaper must not have touched "bighash" while the snapshot was registered: still all
   // kFields present immediately after the race window, nothing reaped by the manual
-  // DeleteExpiredStep call made while the consumer was registered.
+  // DeleteExpiredStep call made while the consumer was registered. The walk-budget pin above
+  // (fix round 8) rules out the real background heartbeat as an alternative explanation, closing
+  // the flake window this assertion used to have.
   ASSERT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields)
       << "the reaper reaped members from a container mid-snapshot -- HasRegisteredCallbacks() "
          "gate did not skip it";
@@ -1691,28 +1743,19 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
   EXPECT_EQ(Run({"hget", "bighash", "f1"}), string(200, 'x'))
       << "a surviving field's value was corrupted by the race this fix closes";
 
-  // The concurrently-serialized container must remain internally consistent: a subsequent,
-  // ordinary save+reload exercises the real save path again and would surface any corruption
-  // (a dangling/collapsed chain, a freed sds object, a declared-length mismatch) left behind by
-  // the race this fix closes. The round-tripped count is kFields/2, not kFields: the due
-  // (even-indexed) fields' TTL has already elapsed by reload time, and rdb_load.cc's own
-  // lazy-expiry check on load drops them independent of whether the reaper itself ever ran --
-  // same as it would for any other already-due member TTL. What this checks is that the count
-  // lands EXACTLY there (the odd-indexed fields survive, the even-indexed ones are gone), not
-  // some other value a race could produce (a dropped survivor, a duplicate, a crash).
-  BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("reaper_snapshot_race_", getpid()));
-  ASSERT_EQ(Run({"debug", "reload"}), "OK");
-  EXPECT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields / 2)
-      << "round-tripped member count is not exactly the never-expired half -- data corruption "
-         "from the race this fix closes, or an unrelated regression in due-field handling";
-  EXPECT_EQ(Run({"hget", "bighash", "f1"}), string(200, 'x'))
-      << "a surviving field's value was corrupted by the race this fix closes";
-  EXPECT_THAT(Run({"hget", "bighash", "f0"}), ArgType(RespExpr::NIL))
-      << "an already-due field survived the round trip -- it should have been dropped";
-
-  // The skip must be a deferral, not a permanent miss: confirm the reaper itself (not just
-  // load-time lazy expiry) also correctly reaps this container once no snapshot consumer is
-  // registered -- driving it directly, matching the real heartbeat's own call.
+  // drakeydb: P4-0 Task 2b, fix round 7 -- moved BEFORE the debug-reload round trip below
+  // (deliberately, was after it): the coordinator's scoped re-review found that, run after
+  // reload, this block cannot fail regardless of whether the reaper itself works -- by the time
+  // it runs, rdb_load.cc's own lazy-expiry check has already dropped the due fields on load
+  // (see the reload comment below), so the reloaded hash no longer reports
+  // HasMemberExpiration() and the reaper's gate (db_slice.cc) skips it outright; the assertion
+  // held whether or not DeleteExpiredStep did anything. Here, before any reload has happened,
+  // the only thing that can have reaped "bighash" down to kFields / 2 is this explicit
+  // DeleteExpiredStep call itself -- the skip above was a deferral, not a permanent miss, and
+  // this is what actually distinguishes that from a stuck/broken resume. Budget restored just
+  // for this call (fix round 8) -- everything after this point no longer needs the pin, since
+  // there is no more "must not have been touched" assertion left to protect.
+  absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
     DbContext db_cntx;
@@ -1720,8 +1763,25 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
     db_cntx.time_now_ms = TEST_current_time_ms;
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
-  EXPECT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields / 2)
+  ASSERT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields / 2)
       << "the reaper must resume and reap the due fields once the snapshot consumer unregisters";
+
+  // The concurrently-serialized container must remain internally consistent: a subsequent,
+  // ordinary save+reload exercises the real save path again and would surface any corruption
+  // (a dangling/collapsed chain, a freed sds object, a declared-length mismatch) left behind by
+  // the race this fix closes. By this point the reaper above has already reaped the container
+  // down to kFields / 2 -- this checks the round trip preserves that state faithfully, not
+  // whether the due fields get dropped (that was already checked, non-vacuously, above).
+  BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("reaper_snapshot_race_", getpid()));
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+  EXPECT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields / 2)
+      << "round-tripped member count changed across the save -- data corruption from the race "
+         "this fix closes, or an unrelated regression in the save/load path";
+  EXPECT_EQ(Run({"hget", "bighash", "f1"}), string(200, 'x'))
+      << "a surviving field's value was corrupted by the race this fix closes, or by the "
+         "round trip";
+  EXPECT_THAT(Run({"hget", "bighash", "f0"}), ArgType(RespExpr::NIL))
+      << "an already-due field survived (or reappeared after) the round trip";
 }
 
 // drakeydb: P4-0 Task 2b, fix round 2, Important B/3 -- the reaper's memory-accounting
