@@ -1980,3 +1980,90 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
             f"(SetFamily::DeleteSetIfEmpty's default -- not FIELDEXPIRE's carve-out -- is the "
             f"one under test here)"
         )
+
+
+# drakeydb: P4-0 Task 2b -- the member-expiry reaper. The test above proves half of Task 1's
+# convergence claim: a's derived DEL never reaches b. The other half -- "the peer expires on its
+# own clock" -- was false until this task: there was no active member-expiry reaper anywhere in
+# this tree. DbSlice::FindInternal only checks whole-key HasExpire(); member-level TTLs were
+# reaped exclusively by the ~25 DeleteSetIfEmpty/DeleteIfEmpty read call sites, every one of which
+# needs a command to touch the key. So once the derived DEL above is (correctly) suppressed, a
+# peer that is never itself asked to read the key kept a logically-empty container forever.
+#
+# This is the adversarial counterexample from the task brief, reproduced against real binaries:
+# A: SADD s m1 / FIELDEXPIRE s 1 m1 / sleep / A: SMEMBERS s (a reaps and suppresses its own
+# derived DEL, per the test above) -- then b must self-heal on its own heartbeat, without b ever
+# being asked to read `s`, and a later SETNX must not leave the two nodes holding different types.
+#
+# Expected before the fix (DbSlice::DeleteExpiredStep's reaper extension, Step 2): b_healed()
+# below times out after 30s -- b keeps `s` alive as a set forever. See task-2b-report.md for the
+# verbatim failure text (recorded by reverting Step 2 only, per Step 6) and for what the SETNX
+# assertions further down report on an unpatched tree (WRONGTYPE on b).
+async def test_member_expiry_reaper_self_heals_peer_without_read(df_factory: DflyInstanceFactory):
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    await attach(c_a, b)  # A REPLICAOF B
+    await wait_for_peers(c_a, 1)
+    await attach(c_b, a)  # B REPLICAOF A
+    await wait_for_peers(c_b, 1)
+
+    assert await c_a.execute_command("sadd", "s", "m1") == 1
+    await c_a.execute_command("fieldexpire", "s", "1", "m1")
+
+    # Ordinary setup traffic (SADD/FIELDEXPIRE) replicates normally; wait for it to land on b
+    # before starting the measurement window below -- this convergence poll is setup, not the
+    # load-bearing assertion.
+    @assert_eventually(timeout=30)
+    async def setup_converged():
+        assert await _exists(c_b, "s")
+
+    await setup_converged()
+
+    await asyncio.sleep(1.2)  # let the 1s member TTL elapse on every node's own clock
+
+    # Measurement window starts here: b is never sent a read for `s` between this point and
+    # b_healed() returning True below -- EXISTS is the only thing polled against it, and
+    # DbSlice::FindInternal never looks at member-level TTLs (see the task brief), so polling
+    # existence cannot itself trigger the lazy member expiry under test.
+    before_b = await _total_commands_processed(c_b)
+
+    # a's own read triggers a's lazy member expiry, deriving a DEL that is suppressed on the peer
+    # link (proven unconditionally by the test above). Nothing about this call touches b.
+    await c_a.execute_command("smembers", "s")
+
+    # The load-bearing assertion: b converges to `s` gone on its OWN heartbeat, despite nothing
+    # arriving from a to tell it to. A bounded wait, not a busy poll racing the clock.
+    @assert_eventually(timeout=30)
+    async def b_healed():
+        assert not await _exists(c_b, "s")
+
+    await b_healed()
+
+    # Corroborates b_healed without relying on a's silence alone: if a's derived DEL had somehow
+    # leaked through (a Task 1 regression -- not what this task is testing, and already pinned
+    # unconditionally by the test above), it would show up here as extra traffic. b's own reaper
+    # acts entirely locally and is not itself a command dispatched from a, so this stays at
+    # idle-mesh-noise levels either way -- a corroboration, not the proof that b healed itself.
+    delta_b = await _total_commands_processed(c_b) - before_b
+    assert delta_b < 10, (
+        f"b processed {delta_b} commands during a's read and the healing wait (expected only "
+        f"idle mesh noise) -- unexpected traffic reached b"
+    )
+
+    # The escalation that makes this a data-correctness bug, not a hygiene leak: with `s` gone on
+    # both nodes, a later SETNX on the same key must leave BOTH holding the same string -- neither
+    # answering WRONGTYPE because it still thinks `s` is a set.
+    assert await c_a.execute_command("setnx", "s", "hello") == 1
+
+    @assert_eventually(timeout=30)
+    async def setnx_converged():
+        assert await c_b.execute_command("get", "s") == "hello"
+
+    await setnx_converged()
+
+    assert await c_a.execute_command("get", "s") == "hello"
+    assert await c_a.execute_command("type", "s") == "string"
+    assert await c_b.execute_command("type", "s") == "string"

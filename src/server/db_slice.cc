@@ -24,12 +24,17 @@ extern "C" {
 #include "server/blocking_controller.h"
 #include "server/channel_store.h"
 #include "server/cluster/slot_set.h"
+#include "server/common.h"
 #include "server/conn_context.h"
+#include "server/container_utils.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
+#include "server/hset_family.h"
 #include "server/journal/journal.h"
+#include "server/multi_master.h"
 #include "server/namespaces.h"
 #include "server/server_state.h"
+#include "server/set_family.h"
 #include "server/tiered_storage.h"
 #include "strings/human_readable.h"
 #include "util/fibers/fibers.h"
@@ -585,6 +590,20 @@ void DbSlice::AutoUpdater::Run() {
                         current_size - static_cast<int64_t>(fields_.orig_value_heap_size), table);
   }
 
+  // drakeydb: P4-0 Task 2b -- member_expire_count tracks how many keys in this DbTable currently
+  // have member-level TTLs, independent of whole-key HasExpire() (see table.h). This is the one
+  // generic chokepoint every PrimeValue mutation funnels through -- both an ordinary command's
+  // FindMutable, and AddOrFind/AddOrUpdateInternal's insert-then-assign for a freshly loaded
+  // value (RDB/full-sync) alike, since the swapped-in value's member-expiry state is compared
+  // against the baseline captured at construction time, before the assignment happened -- so no
+  // family-specific call site needs to maintain it directly.
+  bool current_has_member_expiry = pv.HasMemberExpiration();
+  if (current_has_member_expiry && !fields_.orig_has_member_expiry) {
+    ++table->stats.member_expire_count;
+  } else if (!current_has_member_expiry && fields_.orig_has_member_expiry) {
+    --table->stats.member_expire_count;
+  }
+
   fields_.db_slice->PostUpdate(fields_.db_ind, fields_.key);
   Cancel();  // Reset to not run again
 }
@@ -600,7 +619,8 @@ DbSlice::AutoUpdater::AutoUpdater(DbIndex db_ind, std::string_view key, const It
               .it = it,
               .key = key,
               .orig_value_heap_size = it->second.MallocUsed(),
-              .orig_obj_type = it->second.ObjType()} {
+              .orig_obj_type = it->second.ObjType(),
+              .orig_has_member_expiry = it->second.HasMemberExpiration()} {
   DCHECK(IsValid(it));
 }
 
@@ -1601,11 +1621,88 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
   std::string stash;
 
   unsigned checked = 0;
+
+  auto quota_remains = [] {
+    // Break out of traversal if we spent more than 1ms
+    return base::CycleClock::ToUsec(ThisFiber::GetRunningTimeCycles()) < 1000;
+  };
+
+  // drakeydb: P4-0 Task 2b -- gates the member-expiry reaper below on active mode. The Global
+  // Constraint that the journal wire stays byte-identical to upstream with --active_replica off
+  // is binding, and a reaper that deletes keys and emits DELs on a timer changes what reaches the
+  // wire, so it must not run at all when inactive. A boot-only flag read; hoisted out of the
+  // per-entry callback since it cannot change mid-traversal.
+  const bool reap_member_expiry = IsActiveReplica();
+
   auto cb = [&](PrimeTable::iterator it) {
     result.traversed++;
 
-    if (!it->first.HasExpire())
+    if (!it->first.HasExpire()) {
+      // drakeydb: P4-0 Task 2b -- member-expiry reaper. DeleteExpiredStep already walks every key
+      // in the prime table (see the upstream comment at this function's call site,
+      // engine_shard.cc, on why: "we now scan the prime table, not a dedicated expire table").
+      // Entries with ONLY a member-level TTL (SADD+FIELDEXPIRE, HSET+HEXPIRE, ...) fail the
+      // HasExpire() check above -- that flag is whole-key only -- and used to be skipped here
+      // entirely: member TTLs were reaped exclusively by the ~25 read-triggered
+      // DeleteSetIfEmpty/DeleteIfEmpty call sites in the family code. That meant a peer that
+      // suppresses a read-derived DEL (Task 1's mesh-peer suppression, which assumes "the peer
+      // expires the same data on its own clock") but is never itself asked to read the key kept a
+      // logically-empty container forever -- the exact hazard this reaper closes.
+      //
+      // Do what a read would have done: force lazy member expiry by walking the container, then,
+      // if it is now empty, delete it through the same DeleteSetIfEmpty/DeleteIfEmpty helpers a
+      // read uses -- with `derived` left at its default `true`. That is deliberate, not an
+      // oversight: every node in the mesh runs this same reaper on its own clock, so every node
+      // derives its own DEL, and PassesPeerEchoFilter suppressing it on peer links is exactly
+      // right -- forwarding it would reopen the hazard Task 1 closed. Do not "fix" this to
+      // forward.
+      if (reap_member_expiry && it->second.HasMemberExpiration() && quota_remains()) {
+        string_view key = it->first.GetSlice(&stash);
+
+        if (!CheckLock(IntentLock::EXCLUSIVE, cntx.db_index, key)) {
+          // Mirrors the whole-key path below: a client blocked on this key holds the lock
+          // itself, so we can never reap it here. Wake it instead.
+          if (auto* bc = ns_->GetBlockingController(owner_->shard_id()); bc)
+            bc->Awaken(cntx.db_index, key);
+          return;
+        }
+
+        // Force lazy member expiry the same way a read would: set the container's logical "now",
+        // then walk every member so the underlying set/map can drop stale ones in place (see
+        // e.g. generic_family.cc's OpFetchContainerElements for the same two-step pattern on a
+        // read path). allow_yield=false is deliberate, not a default: this callback runs inside
+        // PrimeTable::Traverse, which engine_shard.cc's heartbeat invokes from within a
+        // journal::DisableFlushGuard -- a fiber-atomic section for its whole scope. Yielding here
+        // would let a concurrent mutation invalidate the in-flight traversal cursor.
+        it->second.SetMemberTime(MemberTimeSeconds(cntx.time_now_ms));
+        if (it->second.ObjType() == OBJ_SET) {
+          container_utils::IterateSet(
+              it->second, [](container_utils::ContainerEntry) { return true; },
+              /*allow_yield=*/false);
+        } else {
+          DCHECK_EQ(OBJ_HASH, it->second.ObjType());
+          container_utils::IterateMap(
+              it->second,
+              [](container_utils::ContainerEntry, container_utils::ContainerEntry) { return true; },
+              /*allow_yield=*/false);
+        }
+
+        if (it->second.Size() == 0) {
+          size_t freed = it->first.MallocUsed() + it->second.MallocUsed();
+          bool key_deleted = it->second.ObjType() == OBJ_SET
+                                 ? SetFamily::DeleteSetIfEmpty(*this, cntx, key, it->second)
+                                 : HSetFamily::DeleteIfEmpty(*this, cntx, key, it->second);
+          if (key_deleted) {
+            // Counted separately from result.deleted (not folded in): result.deleted feeds the
+            // "strong deletion rate" heuristic below, which is about whole-key TTL density, not
+            // reaper work.
+            result.deleted_bytes += freed;
+            ++result.reaped;
+          }
+        }
+      }
       return;
+    }
 
     checked++;
 
@@ -1629,11 +1726,6 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
   };
 
   unsigned i = 0;
-
-  auto quota_remains = [] {
-    // Break out of traversal if we spent more than 1ms
-    return base::CycleClock::ToUsec(ThisFiber::GetRunningTimeCycles()) < 1000;
-  };
 
   for (; i < count / 3 && quota_remains(); ++i) {
     db.expire_cursor = db.prime.Traverse(db.expire_cursor, cb);
@@ -2037,6 +2129,12 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
 
   if (del_it->first.HasExpire())
     --stats.expire_count;
+
+  // drakeydb: P4-0 Task 2b -- the complement to AutoUpdater::Run()'s transition-based tracking
+  // above: a key deleted while it still carries member-level TTLs must release its
+  // member_expire_count credit here, since deletion does not go back through Run()'s comparison.
+  if (del_it->second.HasMemberExpiration())
+    --stats.member_expire_count;
 
   PrimeValue& pv = del_it->second;
 

@@ -1288,4 +1288,78 @@ TEST_F(MultiShardOriginJournalFamilyTest, AddOrGetEmitsOriginOnNewIndexOnly) {
       [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
 }
 
+// drakeydb: P4-0 Task 2b -- boots with active_replica=true (ActiveReplicaFamilyTest, above) so
+// DbSlice::DeleteExpiredStep's member-expiry reaper -- gated on IsActiveReplica(), Step 4 of the
+// task brief -- actually runs; OriginJournalFamilyTest does not set the flag. Also
+// single-shard/single-thread (OriginJournalFamilyTest's own reason, mirrored here) so one
+// consumer registered on shard 0 is guaranteed to observe the reaper's DEL regardless of key
+// hashing.
+class ReaperJournalFamilyTest : public ActiveReplicaFamilyTest {
+ protected:
+  ReaperJournalFamilyTest() {
+    num_threads_ = 1;
+    absl::SetFlag(&FLAGS_num_shards, 1);
+  }
+};
+
+// drakeydb: P4-0 Task 2b acceptance case. DbSlice::DeleteExpiredStep's member-expiry reaper must
+// derive its own DEL exactly like a read would -- through SetFamily::DeleteSetIfEmpty, which
+// sets kEntryFlagDerived so PassesPeerEchoFilter (types.cc; exhaustively pinned on the pure
+// function by PassesPeerEchoFilterTest in journal_test.cc) keeps it off mesh-peer links -- while
+// a plain consumer, standing in for a plain replica, still sees it: the peer filter is applied
+// only when streaming to a mesh peer specifically (JournalStreamer::ShouldWrite, streamer.cc),
+// never at journal::RegisterConsumer's point of capture, so this test's consumer (like
+// EmptiedCollectionDeleteCarriesDerivedFlag's above) sees the entry unconditionally. `rs` is
+// never read by anything in this test -- no SMEMBERS/FIELDTTL/etc. -- only the manually-driven
+// DeleteExpiredStep call below (the same call engine_shard.cc's heartbeat makes) can be
+// responsible for the cleanup.
+//
+// Falsifying: reverting Step 2's callback extension in DbSlice::DeleteExpiredStep leaves `rs`
+// alive as a set forever -- EXPECT_EQ(Run({"exists", "rs"}).GetInt(), 0) fails first, before the
+// DEL is ever captured. Verbatim text recorded in the P4 task-2b report.
+TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteCarriesDerivedFlag) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  EXPECT_EQ(Run({"sadd", "rs", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "rs", "1", "m"});
+  AdvanceTime(1100);
+
+  // Drive the reaper the same way engine_shard.cc's heartbeat does (see
+  // generic_family_test.cc's KeyspaceNotificationNoAtomicSectionOnExpiry for the same pattern
+  // applied to whole-key expiry).
+  shard_set->RunBriefInParallel([](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    DbContext db_cntx;
+    db_cntx.db_index = 0;
+    db_cntx.time_now_ms = TEST_current_time_ms;
+    db_slice.DeleteExpiredStep(db_cntx, 100);
+  });
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+
+  // Guard against a vacuous pass: the set must have actually been cleaned up by the reaper.
+  EXPECT_EQ(Run({"exists", "rs"}).GetInt(), 0);
+
+  const CapturedEntry* del = LastDel(consumer.entries);
+  ASSERT_NE(nullptr, del);
+  EXPECT_TRUE(del->entry_flags & journal::kEntryFlagDerived)
+      << "reaper DEL must be flagged derived or the peer filter forwards it";
+
+  // Directly exercises the real filter with the real captured flags, rather than only citing
+  // PassesPeerEchoFilterTest's generic coverage: a mesh peer must drop this exact entry.
+  journal::JournalItem peer_check{};
+  peer_check.opcode = journal::Op::COMMAND;
+  peer_check.origin_idx = del->origin_idx;
+  peer_check.entry_flags = del->entry_flags;
+  EXPECT_FALSE(journal::PassesPeerEchoFilter(peer_check))
+      << "reaper DEL must never reach a mesh peer -- the peer derives its own";
+}
+
 }  // namespace dfly

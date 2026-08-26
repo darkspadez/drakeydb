@@ -211,6 +211,9 @@ class DbSlice {
       // The following fields are calculated at init time
       size_t orig_value_heap_size = 0;
       CompactObjType orig_obj_type = 0;
+      // drakeydb: P4-0 Task 2b -- baseline for DbTableStats::member_expire_count maintenance;
+      // compared against the current value in Run(). See that field's own comment (table.h).
+      bool orig_has_member_expiry = false;
     };
 
     AutoUpdater(DbIndex db_ind, std::string_view key, const Iterator& it, DbSlice* db_slice);
@@ -453,9 +456,14 @@ class DbSlice {
   void FlushChangeToEarlierCallbacks(DbIndex db_ind, Iterator it, uint64_t upper_bound);
 
   struct DeleteExpiredStats {
-    uint32_t deleted = 0;                 // number of deleted items due to expiry.
-    uint32_t deleted_bytes = 0;           // total bytes of deleted items.
-    uint32_t traversed = 0;               // total number of traversed entries in the prime table.
+    uint32_t deleted = 0;        // number of deleted items due to expiry.
+    uint32_t deleted_bytes = 0;  // total bytes of deleted items.
+    uint32_t traversed = 0;      // total number of traversed entries in the prime table.
+    // drakeydb: P4-0 Task 2b -- keys deleted by the member-expiry reaper (a now-empty
+    // container, reaped on a timer rather than by a read). Counted separately from `deleted`
+    // (whole-key TTL) so the strong-deletion-rate heuristic in DeleteExpiredStep -- which decides
+    // whether to keep traversing aggressively this heartbeat -- is not skewed by reaper work.
+    uint32_t reaped = 0;
     std::vector<std::string> key_events;  // expired key names for keyspace notifications.
   };
 

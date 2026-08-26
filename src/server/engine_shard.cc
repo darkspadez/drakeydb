@@ -897,7 +897,9 @@ void EngineShard::RetireExpiredAndEvict() {
       db_cntx.db_index = i;
       auto* pt = db_slice.GetTables(i);
       uint64_t expire_count = db_slice.GetDBTable(i)->stats.expire_count;
-      if (expire_count > 0) {
+      // drakeydb: P4-0 Task 2b -- also fire for member-only-TTL DBs, so the reaper in
+      // DbSlice::DeleteExpiredStep actually runs (expire_count alone only counts whole-key TTLs).
+      if (expire_count > 0 || db_slice.GetDBTable(i)->stats.member_expire_count > 0) {
         // Scale traversal count to compensate for TTL key dilution in the prime table.
         // Since we now scan the prime table (not a dedicated expire table), most entries
         // may not have TTLs. We need more bucket traversals to check the same number of
