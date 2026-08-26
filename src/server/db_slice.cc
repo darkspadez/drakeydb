@@ -29,12 +29,10 @@ extern "C" {
 #include "server/container_utils.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
-#include "server/hset_family.h"
 #include "server/journal/journal.h"
 #include "server/multi_master.h"
 #include "server/namespaces.h"
 #include "server/server_state.h"
-#include "server/set_family.h"
 #include "server/tiered_storage.h"
 #include "strings/human_readable.h"
 #include "util/fibers/fibers.h"
@@ -1650,12 +1648,33 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
       // logically-empty container forever -- the exact hazard this reaper closes.
       //
       // Do what a read would have done: force lazy member expiry by walking the container, then,
-      // if it is now empty, delete it through the same DeleteSetIfEmpty/DeleteIfEmpty helpers a
-      // read uses -- with `derived` left at its default `true`. That is deliberate, not an
-      // oversight: every node in the mesh runs this same reaper on its own clock, so every node
-      // derives its own DEL, and PassesPeerEchoFilter suppressing it on peer links is exactly
-      // right -- forwarding it would reopen the hazard Task 1 closed. Do not "fix" this to
-      // forward.
+      // if it is now empty, delete it. Every node in the mesh runs this same reaper on its own
+      // clock, so every node derives its own DEL; RecordDerivedDelete (below) sets
+      // journal::kEntryFlagDerived so PassesPeerEchoFilter keeps it off peer links -- forwarding
+      // it would reopen the hazard Task 1 closed. Do not "fix" this to forward.
+      //
+      // drakeydb: P4-0 Task 2b, redesigned after review -- this used to delete through
+      // SetFamily::DeleteSetIfEmpty/HSetFamily::DeleteIfEmpty, the same command-path helpers a
+      // read uses. Those route through FindMutable -> PreUpdateBlocking -> CallChangeCallbacks ->
+      // SerializerBase::OnChange, which can synchronously block (ThreadLocalMutex::lock's
+      // cond_var_.wait, reached via SerializeBucketLocked; or BucketDependencies::Wait) whenever a
+      // BGSAVE/full-sync SliceSnapshot is concurrently serializing this shard -- a genuine yield
+      // inside this callback's DisableFlushGuard atomic section (engine_shard.cc), whose own
+      // comment says it exists "to prevent preemption". Confirmed by tracing every link in that
+      // chain against the real source, not inferred.
+      //
+      // Whole-key expiry never has this problem: DbSlice::ExpireIfNeeded deletes through the
+      // three-arg Del(cntx, Iterator, DbTable*) overload, which reaches PerformDeletionAtomic
+      // directly and never calls FindMutable/OnChange at all -- see snapshot.cc's stream_mu_
+      // comment ("expiry paths emit DEL via RecordDelete directly, bypassing OnChange"). Reaping
+      // is an expiry, not a command, so it belongs on that same path: RecordDerivedDelete (the
+      // expiry-path journal primitive, sharing RecordExpiryBlocking's "safe under
+      // DisableFlushGuard because SetFlushMode(false) prevents AddLogRecord from preempting"
+      // guarantee -- see journal_slice.h) followed by the three-arg Del(), exactly mirroring
+      // ExpireIfNeeded's own record-then-delete pattern a few dozen lines above in this file. The
+      // container walk itself was already confirmed non-preempting (allow_yield=false below, plus
+      // no fiber-aware call anywhere in DenseSet/StringMap's lazy-expiry-on-iterate path) -- only
+      // the delete mechanism needed to change.
       if (reap_member_expiry && it->second.HasMemberExpiration() && quota_remains()) {
         string_view key = it->first.GetSlice(&stash);
 
@@ -1689,16 +1708,26 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
 
         if (it->second.Size() == 0) {
           size_t freed = it->first.MallocUsed() + it->second.MallocUsed();
-          bool key_deleted = it->second.ObjType() == OBJ_SET
-                                 ? SetFamily::DeleteSetIfEmpty(*this, cntx, key, it->second)
-                                 : HSetFamily::DeleteIfEmpty(*this, cntx, key, it->second);
-          if (key_deleted) {
-            // Counted separately from result.deleted (not folded in): result.deleted feeds the
-            // "strong deletion rate" heuristic below, which is about whole-key TTL density, not
-            // reaper work.
-            result.deleted_bytes += freed;
-            ++result.reaped;
-          }
+
+          // Journal the derived DEL before deleting, mirroring ExpireIfNeeded's own
+          // record-then-delete order a few dozen lines above. kEntryFlagDerived (not
+          // kEntryFlagExpired) is deliberate: this is conceptually "a read would have deleted
+          // this too", the same category DeleteSetIfEmpty/DeleteIfEmpty's default `derived=true`
+          // already covers -- see those functions' own comments (set_family.cc, hset_family.cc)
+          // for why kEntryFlagExpired is reserved for whole-key TTL specifically.
+          if (owner_->journal())
+            RecordDerivedDelete(cntx, key);
+
+          // Route through the same three-arg Del() ExpireIfNeeded uses -- see this branch's
+          // opening comment for why: it never calls FindMutable/OnChange, unlike the
+          // DeleteSetIfEmpty/DeleteIfEmpty helpers this used to call.
+          Del(cntx, Iterator(it, StringOrView::FromView(key)), db_arr_[cntx.db_index].get());
+
+          // Counted separately from result.deleted (not folded in): result.deleted feeds the
+          // "strong deletion rate" heuristic below, which is about whole-key TTL density, not
+          // reaper work.
+          result.deleted_bytes += freed;
+          ++result.reaped;
         }
       }
       return;

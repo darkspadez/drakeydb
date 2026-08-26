@@ -30,6 +30,7 @@
 #include "server/journal/types.h"
 #include "server/node_identity.h"
 #include "server/server_family.h"
+#include "server/snapshot.h"
 #include "server/test_utils.h"
 #include "util/fibers/fibers.h"
 #include "util/fibers/pool.h"
@@ -1360,6 +1361,130 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteCarriesDerivedFlag) {
   peer_check.entry_flags = del->entry_flags;
   EXPECT_FALSE(journal::PassesPeerEchoFilter(peer_check))
       << "reaper DEL must never reach a mesh peer -- the peer derives its own";
+}
+
+namespace {
+// drakeydb: P4-0 Task 2b redesign -- a SliceSnapshot data consumer that deterministically proves
+// the traversal fiber is stuck holding SerializerBase::stream_mu_ (mid big-value chunk push,
+// RdbSerializer::PushToConsumerIfNeeded's "preempt point") before the test triggers the reaper
+// concurrently. No sleep, no timing race: ConsumeData signals `entered_` the instant it's called
+// (i.e. the instant stream_mu_ is held) and then blocks on `release_` until the test says so.
+class BlockingSnapshotConsumer : public SliceSnapshot::SnapshotDataConsumerInterface {
+ public:
+  void ConsumeData(std::string /*data*/, ExecutionState* /*cntx*/) override {
+    entered_.Notify();
+    release_.Wait();
+  }
+  void Finalize() override {
+  }
+
+  void WaitEntered() {
+    entered_.Wait();
+  }
+  void Release() {
+    release_.Notify();
+  }
+
+ private:
+  util::fb2::Done entered_;
+  util::fb2::Done release_;
+};
+}  // namespace
+
+// drakeydb: P4-0 Task 2b redesign -- regression test for the fiber-atomic-section hazard the
+// coordinator's review surfaced (task-2b-report.md): the reaper's delete used to route through
+// SetFamily::DeleteSetIfEmpty/HSetFamily::DeleteIfEmpty -> DbSlice::FindMutable ->
+// PreUpdateBlocking -> CallChangeCallbacks -> SerializerBase::OnChange, which can synchronously
+// block on stream_mu_ whenever a concurrent BGSAVE/full-sync is mid-way through serializing a
+// large value on this same shard. Forces that exact contention -- not a synthetic stand-in --
+// deterministically: a real SliceSnapshot (the same class RdbSaver/full-sync drive in production)
+// serializes a value larger than serialization_max_chunk_size, and BlockingSnapshotConsumer above
+// lets the test know, without polling or sleeping, the instant that snapshot's traversal fiber is
+// genuinely stuck holding stream_mu_. Only then does the test trigger the reaper -- wrapped in the
+// same journal::DisableFlushGuard atomic section engine_shard.cc's real heartbeat uses -- so any
+// blocking on stream_mu_ here would hit Scheduler::Preempt's IsFiberAtomicSection() check for
+// real, not hypothetically.
+//
+// Falsifying (verified by hand -- see task-2b-report.md §14): reverting only the delete mechanism
+// in DbSlice::DeleteExpiredStep back to DeleteSetIfEmpty/DeleteIfEmpty makes this test abort the
+// *entire test process* -- LOG(DFATAL) is FATAL in a debug build -- via Scheduler::Preempt's
+// "Preempting inside of atomic section" check firing for a real preemption attempt. That is not a
+// normal EXPECT/ASSERT failure; the verbatim crash text is recorded in the report rather than
+// reproduced as ordinary gtest output, since the process does not survive to print one.
+TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave) {
+  // Activates SerializerBase::stream_mu_ (server/serializer_base.cc: `stream_mu_(!absl::GetFlag(
+  // FLAGS_serialization_tagged_chunks))`) -- inactive (a no-op OptionalMutex) under the tagged-
+  // chunks default, which is exactly why this test must set it explicitly to exercise the hazard.
+  BaseFamilyTest::SetTestFlag("serialization_tagged_chunks", "false");
+
+  // drakeydb: journal::StartInThread() (needed for RecordDerivedDelete's ring-buffer DCHECK, per
+  // the existing MemberExpiryReaperDeleteCarriesDerivedFlag test above) must run on the shard's
+  // own thread, matching every other journal::StartInThread() call site in this file.
+  pp_->at(0)->LaunchFiber([&] { journal::StartInThread(); }).Join();
+
+  // Many large keys, not one: PrimeTable::Traverse's bucket order is a deterministic function of
+  // key hashes (fixed-seed XXH64, LockTag::Fingerprint), not insertion order, so a single "big"
+  // key might land in a bucket the traversal reaches only after "rs"'s -- in which case "rs"
+  // would already be marked serialized (stale) by the time the reaper runs, and the reaper's
+  // OnChange call would take the cheap BucketDependencies::Wait fast-path instead of contending
+  // stream_mu_. Enough large keys spread across the table make it overwhelmingly likely (and, for
+  // this fixed key set and fixed hash seed, deterministically repeatable either way) that the
+  // traversal is already stuck before it ever reaches "rs"'s bucket.
+  for (int i = 0; i < 32; ++i) {
+    ASSERT_EQ(Run({"set", absl::StrCat("big", i), string(200000, 'x')}), "OK");
+  }
+  ASSERT_EQ(Run({"sadd", "rs", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "rs", "1", "m"});
+  AdvanceTime(1100);
+
+  BlockingSnapshotConsumer consumer;
+  ExecutionState exec_state;
+
+  pp_->at(0)->Await([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+
+    // ServerState::tlocal()->serialization_max_chunk_size is cached at shard-thread init from
+    // the flag of the same name; the pytest/production default (64KB, or 300000 in the pytest
+    // harness) is already smaller than "big"'s 200000 bytes, so no override is needed here.
+    // DbSlice::RegisterOnChange (SliceSnapshot::Start's own RegisterChangeListener call)
+    // DCHECKs the shard's intent lock is held -- in production DFLY SYNC's GLOBAL_TRANS command
+    // scheduling already holds it; this test drives SliceSnapshot directly, off the
+    // command-dispatch path, so it must satisfy that same precondition explicitly (mirrors
+    // RdbTest.PeerFullSyncFiltersConcurrentJournalPlainReplicaUnaffected, rdb_test.cc).
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+
+    SliceSnapshot snapshot(CompressionMode::NONE, &db_slice, &consumer, &exec_state,
+                           DflyVersion::CURRENT_VER);
+    snapshot.Start(/*stream_journal=*/false, SliceSnapshot::SnapshotFlush::kAllow);
+
+    // Blocks this fiber until the background traversal fiber is inside ConsumeData for "big"'s
+    // chunk -- i.e. genuinely holding stream_mu_ -- guaranteed, not merely likely.
+    consumer.WaitEntered();
+
+    // Trigger the reaper concurrently, from this fiber, inside the real heartbeat's atomic
+    // section. On the old (DeleteSetIfEmpty/DeleteIfEmpty) code this would try to also lock
+    // stream_mu_ and block -- inside DisableFlushGuard, that is the hazard. On the redesigned
+    // code (three-arg Del(), bypassing OnChange entirely) it cannot reach stream_mu_ at all.
+    {
+      journal::DisableFlushGuard guard(shard->journal());
+      DbContext db_cntx;
+      db_cntx.db_index = 0;
+      db_cntx.time_now_ms = TEST_current_time_ms;
+      db_slice.DeleteExpiredStep(db_cntx, 100);
+    }
+
+    // Only reached if DeleteExpiredStep returned without blocking -- i.e. the redesigned code.
+    consumer.Release();
+    snapshot.WaitSnapshotting();
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+  });
+
+  // Guard against a vacuous pass: the reaper must have actually reaped "rs" while the concurrent
+  // snapshot was in progress, not merely avoided crashing.
+  EXPECT_EQ(Run({"exists", "rs"}).GetInt(), 0);
+  EXPECT_EQ(Run({"get", "big0"}), string(200000, 'x'))
+      << "the concurrent snapshot itself must have completed undisturbed";
 }
 
 }  // namespace dfly

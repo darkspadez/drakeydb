@@ -1972,14 +1972,20 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
         f"a's derived DELs leaked through to the peer"
     )
 
-    # Corroborates the count above semantically: b's copy of every key should still exist, since
-    # nothing was ever forwarded to tell it to clean up. Runs after delta_b on purpose (see above).
-    for key in keys:
-        assert await _exists(c_b, key), (
-            f"{key} no longer exists on the peer -- a's derived DEL must have leaked through "
-            f"(SetFamily::DeleteSetIfEmpty's default -- not FIELDEXPIRE's carve-out -- is the "
-            f"one under test here)"
-        )
+    # drakeydb: P4-0 Task 2b -- there used to be a corroborating existence check here ("b's copy
+    # of every key should still exist, since nothing was ever forwarded to tell it to clean up").
+    # That stopped being discriminating once the member-expiry reaper landed (below, same file):
+    # b is itself an active node with its own reaper on its own clock, and by this point in the
+    # test b's own heartbeat has had ample time (the setup convergence wait plus the 1.2s member-
+    # TTL sleep above) to have *independently* reaped these same now-empty sets on its own --
+    # legitimately, per that task's whole design, with no DEL ever forwarded from a. So "key no
+    # longer exists on b" is now consistent with BOTH a leaked DEL (the bug this test exists to
+    # catch) AND b's own correct self-healing (not a bug at all) -- the observable outcome
+    # coincides either way, exactly the lesson this project already learned about convergence
+    # assertions elsewhere. delta_b above is what still discriminates: b's own reaper acts
+    # entirely locally and is not itself a command dispatched from a, so it does not move that
+    # counter, while a leaked, forwarded DEL would. delta_b is therefore the only assertion this
+    # test needs or should make.
 
 
 # drakeydb: P4-0 Task 2b -- the member-expiry reaper. The test above proves half of Task 1's
