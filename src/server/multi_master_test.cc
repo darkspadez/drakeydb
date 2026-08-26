@@ -1587,4 +1587,93 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotSpuriouslyAbortWatch) {
       << "the reaper's own walk of a WATCHed key must not abort an unrelated EXEC";
 }
 
+// drakeydb: P4-0 Task 2b, fix round 3, Important C round-trip coverage -- the coordinator's
+// review flagged that no rdb_test case exercised member-TTL-container -> reaper-cleared-flag ->
+// save -> reload, and that the existing SaveLoadExpiredValuesHmap/SSet-style tests
+// (rdb_test.cc) don't cover it: those never drive the reaper, so the sticky flag stays set
+// throughout and RDB save's own per-member expiry filtering (not the flag) is what's under test
+// there. This is the positive half: a container whose member TTLs ALL expired and whose flag
+// the reaper genuinely cleared (a complete, clean ReaperExpireStep pass) must still round-trip
+// correctly -- right surviving members, right plain type, nothing silently corrupted by the new
+// clear.
+//
+// Falsifying: forcing ReaperClearMemberExpiration() to fire unconditionally instead of only on
+// complete_clean_pass (verified by hand -- see task-2b-report.md) does not break this specific
+// test (a genuinely clean pass looks the same either way) -- it's the companion test below,
+// MemberExpiryReaperUnclearedFlagPreservesTtlAcrossRdbRoundTrip, that catches an incorrect
+// clear; see that test's own falsification.
+TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperClearedFlagSurvivesRdbRoundTrip) {
+  // debug reload needs a dbfilename (BaseFamilyTest's default fixtures leave it unset; only
+  // RdbTest's own SetUp calls InitWithDbFilename() to arrange this) -- read live by DoSave, so
+  // setting it here (no full service reset needed) is sufficient. Unique per test to avoid
+  // collisions with any other test in this binary that also sets it.
+  BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("reaper_rdb_test_cleared_", getpid()));
+  ASSERT_EQ(Run({"hset", "rdbhash", "keep", "v1", "gone", "v2"}).GetInt(), 2);
+  Run({"fieldexpire", "rdbhash", "1", "gone"});
+  AdvanceTime(1100);
+
+  // Drive the reaper directly, matching the real heartbeat's call, with a budget large enough
+  // to finish in one pass -- so this call reports (and acts on) a complete, clean pass.
+  shard_set->RunBriefInParallel([](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    DbContext db_cntx;
+    db_cntx.db_index = 0;
+    db_cntx.time_now_ms = TEST_current_time_ms;
+    db_slice.DeleteExpiredStep(db_cntx, 100000);
+  });
+
+  // Guard against a vacuous pass: "gone" must actually be gone, "keep" must survive -- a real
+  // partial reap, and (since there is no live member TTL left anywhere in the container) one
+  // that should have cleared the sticky flag.
+  ASSERT_EQ(Run({"hlen", "rdbhash"}).GetInt(), 1);
+  ASSERT_EQ(Run({"hget", "rdbhash", "keep"}), "v1");
+
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+
+  EXPECT_EQ(Run({"type", "rdbhash"}), "hash");
+  EXPECT_EQ(Run({"hget", "rdbhash", "keep"}), "v1");
+  EXPECT_EQ(Run({"hlen", "rdbhash"}).GetInt(), 1);
+}
+
+// drakeydb: P4-0 Task 2b, fix round 3, Important C round-trip coverage -- the negative half,
+// which is the one that actually catches a wrong clear: a container whose flag the reaper does
+// NOT clear (because a live, not-yet-due member TTL survives the pass) must still preserve that
+// TTL across an RDB round trip. If ReaperClearMemberExpiration() fired here anyway, the
+// container would serialize as plain (no TTL-aware RDB opcode -- rdb_save.cc:179/:192/:494), and
+// "later"'s TTL would be silently lost on reload -- the exact silent-data-corruption failure
+// mode the coordinator's review named, not a wrong metric.
+TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperUnclearedFlagPreservesTtlAcrossRdbRoundTrip) {
+  // See the sibling test above for why this is needed.
+  BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("reaper_rdb_test_uncleared_", getpid()));
+  ASSERT_EQ(Run({"hset", "rdbhash2", "soon", "v1", "later", "v2"}).GetInt(), 2);
+  Run({"fieldexpire", "rdbhash2", "1", "soon"});      // due almost immediately
+  Run({"fieldexpire", "rdbhash2", "1000", "later"});  // stays live for a long time
+  AdvanceTime(1100);  // "soon" now due; "later" still has ~998s left
+
+  shard_set->RunBriefInParallel([](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    DbContext db_cntx;
+    db_cntx.db_index = 0;
+    db_cntx.time_now_ms = TEST_current_time_ms;
+    db_slice.DeleteExpiredStep(db_cntx, 100000);
+  });
+
+  // Guard against a vacuous pass: "soon" must actually be gone (a real, complete pass ran), but
+  // "later" must survive WITH its TTL still armed -- this is the case that must leave the sticky
+  // flag set, since one live member TTL remains.
+  ASSERT_EQ(Run({"hlen", "rdbhash2"}).GetInt(), 1);
+  ASSERT_GT(Run({"fieldttl", "rdbhash2", "later"}).GetInt(), 0)
+      << "guard against a vacuous pass: later's TTL must still be armed before the round "
+         "trip";
+
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+
+  EXPECT_EQ(Run({"type", "rdbhash2"}), "hash");
+  EXPECT_EQ(Run({"hget", "rdbhash2", "later"}), "v2");
+  EXPECT_GT(Run({"fieldttl", "rdbhash2", "later"}).GetInt(), 0)
+      << "later's member TTL must survive the RDB round trip -- FIELDTTL returning -1 "
+         "here means it was lost, i.e. the container was incorrectly saved as a plain "
+         "(no-TTL) type";
+}
+
 }  // namespace dfly
