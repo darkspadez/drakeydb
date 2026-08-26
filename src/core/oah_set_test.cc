@@ -1736,7 +1736,9 @@ TEST_F(OAHSetTest, ReaperExpireStepBoundsMassExpiry) {
 
 // drakeydb: P4-0 Task 2b Important C -- OAHTable counterpart to StringMapTest's identically-named
 // test; see that test's comment for the full rationale (clearing on a truncated pass would
-// strand the unexamined tail's member TTLs permanently).
+// strand the unexamined tail's member TTLs permanently) and for why this calls
+// ReaperClearMemberExpiration() itself (mirroring db_slice.cc's real caller) rather than only
+// asserting ExpirationUsed(), which nothing here would otherwise ever change.
 TEST_F(OAHSetTest, ReaperExpireStepTruncatedPassDoesNotClearFlag) {
   constexpr int kCount = 5000;
   for (int i = 0; i < kCount; ++i) {
@@ -1746,7 +1748,9 @@ TEST_F(OAHSetTest, ReaperExpireStepTruncatedPassDoesNotClearFlag) {
   ss_->set_time(2);
 
   bool complete = ss_->ReaperExpireStep(20);  // budget far smaller than the table
-  ASSERT_FALSE(complete);
+  if (complete)
+    ss_->ReaperClearMemberExpiration();
+  EXPECT_FALSE(complete);
   EXPECT_TRUE(ss_->ExpirationUsed())
       << "a truncated pass must never look like a safe-to-clear pass";
   EXPECT_GT(ss_->UpperBoundSize(), 0u);
@@ -1755,7 +1759,8 @@ TEST_F(OAHSetTest, ReaperExpireStepTruncatedPassDoesNotClearFlag) {
 // drakeydb: P4-0 Task 2b Important C -- OAHTable counterpart to StringMapTest's identically-named
 // test: a structurally complete pass (covers every bucket) that still found live, not-yet-due
 // member TTLs must not report itself safe to clear either -- "examined everything" alone isn't
-// sufficient.
+// sufficient. Calls ReaperClearMemberExpiration() itself (mirroring db_slice.cc's real caller,
+// gated on `complete`) so a wrongly-true `complete` would actually clear the flag here.
 TEST_F(OAHSetTest, ReaperExpireStepFullButLiveTtlPassDoesNotClearFlag) {
   constexpr int kCount = 50;
   for (int i = 0; i < kCount; ++i) {
@@ -1765,6 +1770,8 @@ TEST_F(OAHSetTest, ReaperExpireStepFullButLiveTtlPassDoesNotClearFlag) {
   ss_->set_time(1);  // nothing is due yet.
 
   bool complete = ss_->ReaperExpireStep(10000);  // comfortably covers the whole (small) table
+  if (complete)
+    ss_->ReaperClearMemberExpiration();
   EXPECT_FALSE(complete)
       << "a complete pass that still found live, not-yet-due member TTLs must not report itself "
          "safe to clear -- those members would never be swept again if it did";

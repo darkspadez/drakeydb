@@ -481,12 +481,104 @@ TEST_F(StringMapTest, ReaperExpireStepBoundsMassExpiry) {
       << "a complete pass finding zero remaining member TTLs must allow clearing the sticky flag";
 }
 
+// drakeydb: P4-0 Task 2b, fix round 4 -- falsifies the terminal-node-only chain-walk bug: an
+// earlier version of ReaperExpireStep checked HasTtl() exactly once, on whatever node the
+// chain-walk loop ended up at after following every `.next` link (the chain's TAIL -- PushFront
+// always inserts at the head, so the earliest-ever occupant of a bucket ends up furthest from
+// it, at the end of the chain). But SetExpiryTime stamps the TTL bit on whichever DensePtr the
+// iterator is CURRENTLY positioned at -- the head slot, or any interior link -- independent of
+// where the chain's tail happens to be. A TTL armed on the head or an interior node was
+// therefore invisible to that tail-only check.
+//
+// Getting a field onto a genuine non-tail position isn't just "insert it late": empirically (see
+// this test's own development), MOST fields -- even ones inserted very late into a large,
+// fairly-loaded table -- land as the sole occupant of their bucket (DenseSet's displacement
+// mechanism, FindEmptyAround, resolves most collisions into a nearby empty slot rather than a
+// real `.next` chain -- see dense_set.cc). For a lone occupant, head IS the tail, so arming it
+// would be trivially caught by even the buggy code, masking whatever this test is trying to
+// isolate. This test instead inserts a large field population, then uses Find()'s iterator to
+// directly identify fields whose position IS mid-chain (curr_entry_->IsLink() == true, meaning
+// something else still follows via `.next` -- i.e. this position is provably not the tail) and
+// arms ONLY those -- guaranteeing every armed TTL sits somewhere the buggy tail-only check
+// cannot see, rather than hoping insertion order makes it statistically likely.
+//
+// Falsifying: reverting ReaperExpireStep to check HasTtl() only once, after the chain-walk loop
+// (fix round 3's version), reproduces the exact bug this closes -- verified below with the
+// falsification's own verbatim output.
+//
+// Two ReaperExpireStep calls, not one: SetExpiryTime itself now also sets reaper_any_ttl_seen_
+// directly (Important A, same round -- see dense_set.cc), independent of any walk, so a single
+// call right after arming would pass even with the terminal-node-only bug reintroduced, for the
+// wrong reason (the mutation-mirror masking the walk's own miss). The first call below is a
+// "wash": it covers the whole table in one shot and, on returning (this function's own contract
+// -- see its comment), unconditionally resets reaper_any_ttl_seen_ to false regardless of what
+// it found, consuming Important A's side effect. Nothing mutates the container between the two
+// calls, so the second call starts with reaper_any_ttl_seen_ genuinely false -- the only way it
+// can become true again is the walk itself finding a HasTtl() node, which is exactly what this
+// test needs to isolate.
+TEST_F(StringMapTest, ReaperExpireStepChecksTtlOnEveryChainNode) {
+  constexpr int kCount = 50000;
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(sm_->AddOrUpdate(absl::StrCat("k", i), "v"));  // no ttl yet
+  }
+  ASSERT_FALSE(sm_->ExpirationUsed());
+
+  // Scan a large trailing slice, arming ONLY fields whose Find() position is mid-chain (provably
+  // non-tail -- see comment above). Skips the (majority) unchained fields entirely: arming one of
+  // those would be trivially detected by even the buggy code (head == tail for a lone occupant),
+  // which would mask the very thing this test needs to isolate.
+  int armed = 0;
+  for (int i = kCount - 5000; i < kCount && armed < 25; ++i) {
+    auto it = sm_->Find(absl::StrCat("k", i));
+    ASSERT_TRUE(it != sm_->end());
+    if (!it.DebugCurrIsLink())
+      continue;                 // lone occupant of its bucket -- not useful, see comment above.
+    it.SetExpiryTime(1000000);  // far in the future -- never due during this test
+    ++armed;
+  }
+  ASSERT_GT(armed, 0) << "no mid-chain field found in this slice to arm -- widen the scan range";
+  ASSERT_TRUE(sm_->ExpirationUsed());
+
+  sm_->set_time(1);  // nothing armed above is due; nothing else has a TTL at all.
+
+  // A budget comfortably covering the whole table in a single call, like
+  // ReaperExpireStepFullButLiveTtlPassDoesNotClearFlag below -- NOT a bounded-budget multi-call
+  // drain like ReaperExpireStepBoundsMassExpiry above: this test's armed TTLs are never due, so
+  // reaper_any_ttl_seen_ is (correctly, once fixed) true on every single pass forever; looping
+  // "until complete" the way that test does would simply never terminate here.
+  sm_->ReaperExpireStep(1000000);  // wash call -- see this test's comment above.
+
+  bool complete = sm_->ReaperExpireStep(1000000);  // the actual call under test.
+  // Mirrors db_slice.cc's real caller (gated on `complete`) before asserting on ExpirationUsed()
+  // -- see the TruncatedPass/FullButLiveTtl tests above for why that matters for falsifiability:
+  // with the terminal-node-only bug, `complete` comes back wrongly true here, this call actually
+  // clears the flag, and the assertion below catches it.
+  if (complete)
+    sm_->ReaperClearMemberExpiration();
+
+  // The actual assertion: a live (not-yet-due) member TTL survived the full pass on a field that
+  // is provably not at any chain's tail -- ReaperExpireStep must not have reported this pass
+  // clean, so ReaperClearMemberExpiration() above must not have run, and ExpirationUsed() must
+  // still be true.
+  EXPECT_FALSE(complete)
+      << "a live, not-yet-due member TTL survived the walk but was reported as a clean pass";
+  EXPECT_TRUE(sm_->ExpirationUsed())
+      << "a live member TTL on a non-tail chain node was missed by the walk -- see this test's "
+         "comment for why the terminal-node-only bug this falsifies specifically hides here";
+  EXPECT_EQ(sm_->UpperBoundSize(), size_t(kCount)) << "nothing should have been expired yet";
+}
+
 // drakeydb: P4-0 Task 2b Important C -- falsifies the interaction the coordinator flagged as
 // worse than the bug it fixes: clearing HasMemberExpiration()/ExpirationUsed() on a container
 // whose UNEXAMINED tail still holds member TTLs would strand those members permanently, since
 // with the flag cleared nothing would ever walk this container again. A single call over a
 // container far bigger than the budget must report an incomplete pass, and the flag must stay
-// set -- verified directly, not inferred from the return value alone.
+// set. Falsifiable, not just asserting a fact `ExpirationUsed()` alone can never disprove (fix
+// round 3's version of this test only checked ExpirationUsed() without ever calling
+// ReaperClearMemberExpiration(), so it would pass even if `complete` came back wrongly true --
+// nothing in the test would have acted on that): mirrors db_slice.cc's actual caller, gating
+// ReaperClearMemberExpiration() on `complete`, so a wrongly-true `complete` here would actually
+// clear the flag and this assertion would catch it.
 TEST_F(StringMapTest, ReaperExpireStepTruncatedPassDoesNotClearFlag) {
   constexpr int kCount = 5000;
   for (int i = 0; i < kCount; ++i) {
@@ -496,7 +588,13 @@ TEST_F(StringMapTest, ReaperExpireStepTruncatedPassDoesNotClearFlag) {
   sm_->set_time(2);  // all elapsed, same setup as the bounding test above.
 
   bool complete = sm_->ReaperExpireStep(100);  // budget far smaller than kCount
-  ASSERT_FALSE(complete);
+  // Mirrors db_slice.cc's actual caller (gated on `complete`) BEFORE asserting anything about
+  // `complete` itself -- an EXPECT (not ASSERT) below, and this call, must both run even if
+  // `complete` unexpectedly came back true, or the flag-clearing bug this test exists to catch
+  // would never actually happen inside the test.
+  if (complete)
+    sm_->ReaperClearMemberExpiration();
+  EXPECT_FALSE(complete);
   EXPECT_TRUE(sm_->ExpirationUsed())
       << "a truncated pass must never look like a safe-to-clear pass";
   EXPECT_GT(sm_->UpperBoundSize(), 0u);
@@ -520,6 +618,11 @@ TEST_F(StringMapTest, ReaperExpireStepFullButLiveTtlPassDoesNotClearFlag) {
   // back false, though, because "complete" alone is not "safe to clear": it also requires no
   // remaining member TTL, which this container still has (every one, none yet due).
   bool complete = sm_->ReaperExpireStep(10000);
+  // Mirrors db_slice.cc's actual caller (gated on `complete`), run before asserting anything
+  // about `complete` itself, so a wrongly-true `complete` actually exercises the flag-clearing
+  // bug this test exists to catch instead of the assertion below passing vacuously.
+  if (complete)
+    sm_->ReaperClearMemberExpiration();
   EXPECT_FALSE(complete)
       << "a complete pass that still found live, not-yet-due member TTLs must not report itself "
          "safe to clear -- those members would never be swept again if it did";

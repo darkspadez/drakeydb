@@ -68,6 +68,10 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
       owner_->At(bucket_)[pos_].SetExpiry(owner_->EntryTTL(ttl_sec));
       owner_->obj_alloc_used_ += entry.AllocSize();
       owner_->expiration_used_ = true;
+      // drakeydb: P4-0 Task 2b Important A -- mirror into the reaper's in-flight-pass
+      // accumulator; see ReaperExpireStep's comment for why every expiration_used_ = true site
+      // must also poison an in-flight pass's clean verdict.
+      owner_->reaper_any_ttl_seen_ = true;
     }
 
     iterator& operator++() {

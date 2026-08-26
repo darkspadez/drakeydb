@@ -108,6 +108,9 @@ class StringMap : public DenseSet {
     using IteratorBase::ExpiryTime;
     using IteratorBase::HasExpiry;
     using IteratorBase::SetExpiryTime;
+    // drakeydb: P4-0 Task 2b, fix round 4 -- test-only, see IteratorBase::DebugCurrIsLink's own
+    // comment (dense_set.h).
+    using IteratorBase::DebugCurrIsLink;
   };
 
   // Adds a new field or updates its value. Returns true if added, false if updated.

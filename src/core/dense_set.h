@@ -193,6 +193,16 @@ class DenseSet {
       return curr_entry_->HasTtl();
     }
 
+    // drakeydb: P4-0 Task 2b, fix round 4 -- test-only. Whether the position this iterator is
+    // CURRENTLY at is itself tagged as a link (i.e. something else still follows via `.next`),
+    // meaning this position is provably NOT the chain's tail. Used by
+    // ReaperExpireStepChecksTtlOnEveryChainNode (string_map_test.cc) to deterministically select
+    // a field to arm at a non-tail chain position, rather than relying on insertion-order
+    // heuristics that turned out not to reliably land there in practice.
+    bool DebugCurrIsLink() const {
+      return curr_entry_->IsLink();
+    }
+
    protected:
     IteratorBase() : owner_(nullptr), curr_entry_(nullptr) {
     }
@@ -272,16 +282,30 @@ class DenseSet {
 
   // drakeydb: P4-0 Task 2b Important A/C -- reaper-only. Bounds a member-expiry sweep to at most
   // max_slots RAW entries_ slots per call (entries_[reaper_cursor_..]), resuming from where a
-  // previous call left off. Each occupied slot is force-expired via ExpireIfNeeded(nullptr,
-  // &entries_[i]) -- the exact same call IteratorBase::Advance makes for a top-level slot
-  // (dense_set.cc). That single call is correct and complete for whatever chain is rooted at
-  // the slot, not just its head: ExpireIfNeededInternal's own internal `while (node->HasTtl())`
-  // loop (dense_set.cc) already walks forward through the chain via Delete's "*node updates to
-  // the next item" contract, and its node_in_prev_link early-break (the one case that requires
-  // watching prev) can never trigger here because prev is always nullptr for a top-level slot --
-  // exactly Advance()'s own precondition for this call shape. No separate chain-hopping logic
-  // needed; this deliberately does not reimplement DenseSet's link-chasing, it reuses the one
-  // piece already proven correct.
+  // previous call left off. Each occupied slot's own direct content is force-expired first via
+  // ExpireIfNeeded(nullptr, &entries_[i]) -- the same call IteratorBase::Advance makes for a
+  // top-level slot (dense_set.cc). Any attached chain is then walked explicitly, one link at a
+  // time, mirroring Advance()'s own link-stepping branch (a tail deletion can collapse `node`
+  // out of being a link in place, in which case it must be re-examined rather than stepped past
+  // -- see the loop below).
+  //
+  // HasTtl() is checked at EVERY node this walk visits -- the head slot and every interior link
+  // -- not just once at the end. The tag bit is per-node (DensePtr, above): IteratorBase::
+  // SetExpiryTime stamps whichever DensePtr the iterator currently sits on, so a live TTL can
+  // land on the head, on an interior link, or on the chain's tail, independently. An earlier
+  // version of this function checked only the node the walk happened to end on (the terminal
+  // element), which silently missed a live TTL sitting anywhere earlier in the chain and could
+  // let ReaperClearMemberExpiration() below fire while real, still-armed TTLs remained -- those
+  // entries would then be dropped from the next RDB save, since rdb_save.cc picks the plain
+  // (non-TTL) encoding once the sticky flag this clears is false. That is why every node is
+  // checked here, not just the one the walk finishes on.
+  //
+  // reaper_any_ttl_seen_ also accumulates writes made by ordinary mutation while a pass is in
+  // flight: every call site that arms a TTL (PushFront, AddUnique, AddOrReplaceObj, the iterator
+  // SetExpiryTime path -- dense_set.cc) also sets reaper_any_ttl_seen_ = true directly, so a TTL
+  // armed on an already-examined slot mid-pass still poisons this pass's "clean" verdict even
+  // though the walk itself will never revisit that slot. See those call sites for the mirrored
+  // write.
   //
   // Unlike a callback-based walk (container_utils::IterateSet/IterateMap), which only ever sees
   // *surviving* members and therefore cannot bound a container whose members have ALL already
@@ -289,16 +313,34 @@ class DenseSet {
   // budget, survivors and skipped-because-already-expired alike.
   //
   // Returns true iff this call completed a full logical pass over the whole table (reaper_cursor_
-  // wrapped back to 0) AND no surviving entry anywhere in that pass still carries a TTL --
-  // together, the only condition under which ReaperClearMemberExpiration() below is safe to
-  // call. A pass that is truncated (budget ran out before reaching the end) or that found a
-  // live-but-not-yet-due TTL always returns false, regardless of how much was expired.
+  // wrapped back to 0) AND no node visited during that pass, nor any mutation that raced with it,
+  // ever carried a live TTL -- together, the only condition under which
+  // ReaperClearMemberExpiration() below is safe to call. A pass that is truncated (budget ran out
+  // before reaching the end) or that found a live-but-not-yet-due TTL always returns false,
+  // regardless of how much was expired.
   bool ReaperExpireStep(uint32_t max_slots) {
     if (entries_.empty()) {
       reaper_cursor_ = 0;
       reaper_any_ttl_seen_ = false;
+      reaper_pass_capacity_log_ = 0;
       return true;
     }
+    // A resumed pass (reaper_cursor_ != 0) treats entries_[reaper_cursor_..] as "not yet
+    // examined by this pass". Grow()/Shrink() (table resize) and AddUnique()'s displacement
+    // cascade (dense_set.cc) can both relocate an entry across that boundary -- resize always
+    // changes capacity_log_ (Grow increments it, Shrink recomputes it -- both always in lockstep
+    // with entries_.size(), which is why comparing capacity_log_ is equivalent to comparing
+    // entries_.size() here without needing a second copy of it), which this catches directly;
+    // AddUnique's same-size displacement is caught separately where it happens (see
+    // reaper_cursor_ = 0 there). Either way, bucket indices from before the change no longer mean
+    // "already examined" / "not yet examined", so resuming at the old cursor could silently skip
+    // an entry that moved below it. Restart the pass from scratch rather than risk that --
+    // correctness over avoiding a re-walk.
+    if (reaper_cursor_ != 0 && capacity_log_ != reaper_pass_capacity_log_) {
+      reaper_cursor_ = 0;
+      reaper_any_ttl_seen_ = false;
+    }
+    reaper_pass_capacity_log_ = static_cast<uint8_t>(capacity_log_);
     size_t end = std::min<size_t>(entries_.size(), size_t{reaper_cursor_} + max_slots);
     for (size_t i = reaper_cursor_; i < end; ++i) {
       DensePtr* node = &entries_[i];
@@ -312,8 +354,6 @@ class DenseSet {
       // one) but that also links to further, ALREADY-EXPIRED chained entries needs the loop
       // below too, or those entries are silently never examined.
       ExpireIfNeeded(nullptr, node);
-      if (node->IsEmpty())
-        continue;
       // Walk any attached chain exactly as Advance()'s link-stepping branch does: while
       // positioned on a link, check/expire the NEXT entry in the chain (using the link itself
       // as `prev`, since deleting a tail object can free `prev`'s own LinkKey -- see
@@ -322,19 +362,33 @@ class DenseSet {
       // case just described), in which case `node` now directly holds the surviving value and
       // must be re-examined in place, not stepped past -- exactly what re-testing the while
       // condition on `node` (not on a separately-advanced pointer) does here.
-      while (node->IsLink()) {
+      //
+      // HasTtl() is a per-node tag bit (DensePtr, above), settable independently on the head
+      // slot OR on any interior `.next` link along the chain (IteratorBase::SetExpiryTime just
+      // stamps whatever DensePtr it currently sits on -- dense_set.cc). So the check must happen
+      // at EVERY position this loop visits, not only once after the walk exits: checking only
+      // the terminal node (as an earlier version of this function did) misses a live TTL on the
+      // head or on any interior link, which then gets this pass wrongly counted "clean".
+      while (true) {
+        if (node->IsEmpty())
+          break;
+        if (node->HasTtl())
+          reaper_any_ttl_seen_ = true;
+        if (!node->IsLink())
+          break;
         DenseLinkKey* plink = node->AsLink();
         ExpireIfNeeded(node, &plink->next);
         if (node->IsLink())
           node = &plink->next;
+        // else: the tail deletion above collapsed `node` in place (it now directly holds the
+        // survivor); loop back and re-check it without stepping past it.
       }
-      if (!node->IsEmpty() && node->HasTtl())
-        reaper_any_ttl_seen_ = true;
     }
     if (end >= entries_.size()) {
       bool clean_pass = !reaper_any_ttl_seen_;
       reaper_cursor_ = 0;
       reaper_any_ttl_seen_ = false;
+      reaper_pass_capacity_log_ = 0;
       return clean_pass;
     }
     reaper_cursor_ = static_cast<uint32_t>(end);
@@ -504,8 +558,6 @@ class DenseSet {
 
   uint32_t time_now_ = 0;
 
-  mutable bool expiration_used_ = false;
-
   // drakeydb: P4-0 Task 2b Important A/C -- reaper-only resume state for ReaperExpireStep. Not
   // used by any other DenseSet caller; persists a bounded walk's progress across heartbeat
   // ticks so a container bigger than one call's budget makes genuine forward progress instead
@@ -514,7 +566,18 @@ class DenseSet {
   // is what ReaperExpireStep uses to decide whether a just-completed pass was clean (safe to
   // clear expiration_used_) or found a still-live member TTL (must not).
   mutable uint32_t reaper_cursor_ = 0;
+
+  mutable bool expiration_used_ = false;
   mutable bool reaper_any_ttl_seen_ = false;
+  // drakeydb: P4-0 Task 2b Important B -- reaper-only. capacity_log_ as of the last
+  // ReaperExpireStep call that left a pass in flight (reaper_cursor_ != 0). Grow()/Shrink()
+  // always update capacity_log_ in lockstep with entries_.size(), so comparing this snapshot
+  // against the live capacity_log_ on the next call detects a resize without needing a second
+  // full copy of entries_.size(); see ReaperExpireStep's own comment for what this guards
+  // against. A uint8_t (not the mutable uint32_t reaper_cursor_ is) so this and the two mutable
+  // bools above it fit into tail padding that already existed before this task, rather than
+  // growing sizeof(DenseSet).
+  mutable uint8_t reaper_pass_capacity_log_ = 0;
 };
 
 inline void* DenseSet::FindInternal(const void* obj, uint64_t hashcode, uint32_t cookie) const {

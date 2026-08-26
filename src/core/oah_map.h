@@ -141,8 +141,12 @@ class OAHMap : public OAHTable<OAHPair> {
 
   // Creates a pair blob for key/value with a relative ttl, flagging expiry use.
   TaggedPtr MakePair(std::string_view content, uint32_t len, std::string_view value, uint32_t ttl) {
-    if (ttl != UINT32_MAX)
+    if (ttl != UINT32_MAX) {
       expiration_used_ = true;
+      // drakeydb: P4-0 Task 2b Important A -- mirror into the reaper's in-flight-pass
+      // accumulator; see OAHTable::ReaperExpireStep's comment.
+      reaper_any_ttl_seen_ = true;
+    }
     return OAHPair::Create(content, len, value, EntryTTL(ttl));
   }
 

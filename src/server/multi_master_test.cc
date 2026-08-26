@@ -3,6 +3,7 @@
 
 #include "server/multi_master.h"
 
+#include <absl/cleanup/cleanup.h>
 #include <absl/container/flat_hash_set.h>
 #include <absl/strings/ascii.h>
 #include <absl/strings/str_cat.h>
@@ -43,6 +44,7 @@ ABSL_DECLARE_FLAG(std::string, cluster_mode);
 ABSL_DECLARE_FLAG(std::string, tiered_prefix);
 ABSL_DECLARE_FLAG(bool, experimental_cascaded_partial_sync);
 ABSL_DECLARE_FLAG(uint32_t, num_shards);
+ABSL_DECLARE_FLAG(uint32_t, reaper_member_walk_budget);
 
 namespace dfly {
 
@@ -1516,8 +1518,26 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
 // Falsifying: commenting out the AccountObjectMemory block in DeleteExpiredStep's reaper branch
 // (verified by hand -- see task-2b-report.md) makes `after` come back equal to `before`, since
 // nothing else in the reap path touches obj_memory_usage for a surviving container.
+//
+// drakeydb: P4-0 Task 2b, fix round 4 -- the `100000` passed to DeleteExpiredStep below is its
+// own `count` parameter, bounding how many PRIME TABLE keys this call's outer traversal visits
+// -- a fix round 2 version of this comment called it "budget large enough to finish in one call"
+// as if it were the reaper's OWN per-container walk budget (FLAGS_reaper_member_walk_budget,
+// db_slice.cc), a completely different quantity: how many slots ReaperExpireStep examines
+// WITHIN one container. Conflating the two meant this test's "enough shrinkage happened"
+// actually rode on whatever the ambient flag default (300) happened to be, well under kFields --
+// no correctness bug (any nonzero shrinkage still satisfies EXPECT_LT below), but a machine- and
+// default-speed-dependent test rather than a deliberately-provisioned one, and liable to break
+// silently if the default is ever retuned again. Pin it explicitly here, comfortably above
+// kFields, so this test asserts what it says it asserts regardless of the flag's current default.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
   constexpr int kFields = 2000;
+  const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+  absl::SetFlag(&FLAGS_reaper_member_walk_budget, 100000);
+  absl::Cleanup restore_walk_budget = [saved_walk_budget] {
+    absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+  };
+
   vector<string> hset_args{"hset", "bighash"};
   for (int i = 0; i < kFields; ++i) {
     hset_args.push_back(absl::StrCat("f", i));
@@ -1540,7 +1560,9 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
     DbContext db_cntx;
     db_cntx.db_index = 0;
     db_cntx.time_now_ms = TEST_current_time_ms;
-    db_slice.DeleteExpiredStep(db_cntx, 100000);  // budget large enough to finish in one call
+    // count=100000 bounds the outer prime-table traversal, not the reaper's own per-container
+    // walk -- see this test's comment above for why that distinction matters here.
+    db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 
   size_t after = GetMetrics().db_stats[0].obj_memory_usage;

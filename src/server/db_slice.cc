@@ -65,14 +65,30 @@ ABSL_FLAG(bool, journal_omit_redundant_writes, true,
 
 // drakeydb: P4-0 Task 2b, fix round 2 -- bounds the member-expiry reaper's per-container walk.
 // quota_remains() is only checked before a container walk starts, never during it, and the walk
-// itself is a single non-interruptible step (allow_yield=false, required -- see the reaper's own
-// comment in DeleteExpiredStep). Without a cap, one large container (a 100k-field hash is the
+// itself is a single non-interruptible step -- DenseSet::ReaperExpireStep/OAHTable::
+// ReaperExpireStep call only plain, synchronous C++ (ExpireIfNeeded/Delete), no fiber-aware call
+// that could yield, unlike container_utils::IterateSet/IterateMap's own allow_yield parameter
+// (container_utils.h), which the reaper does NOT use (see the redesign comment in
+// DeleteExpiredStep below for why). Without a cap, one large container (a 100k-field hash is the
 // canonical HEXPIRE workload) can stall the shard thread for the whole walk with the journal
 // flush disabled and no client able to run, regardless of the 1ms heartbeat budget. A truncated
 // walk still expires whatever it examined before the budget ran out; the remainder resumes from
 // where it left off on a later tick (DenseSet::ReaperExpireStep/OAHTable::ReaperExpireStep's own
 // persisted cursor -- fix round 1's version of this comment claimed resumption without actually
-// implementing it; this round closes that gap for real). 0 disables the cap (walks fully).
+// implementing it; this round closes that gap for real).
+//
+// drakeydb: P4-0 Task 2b, fix round 4 -- 0 does NOT mean "unlimited" (fix round 3's claim here
+// was wrong: ReaperExpireStep(0) makes end == reaper_cursor_, so the walk loop runs zero
+// iterations, the pass can never complete, and HasMemberExpiration() is therefore never cleared
+// -- the reaper spins on every affected container forever without examining a single slot,
+// which is worse than doing nothing). Restoring an actual "walk the whole container in one
+// call" semantics for 0 would reintroduce exactly the unbounded-stall hazard this budget exists
+// to prevent (see above -- the walk cannot be preempted mid-container). Instead 0 explicitly
+// disables the proactive per-tick reaper below (DeleteExpiredStep skips the walk/clear entirely
+// for containers with a member TTL when this is 0); member TTLs are still enforced correctly on
+// access via each container's own lazy ExpireIfNeeded, this only turns off the proactive sweep
+// that lets a container converge and stop being walked, and that a mesh peer's DEL-suppression
+// (Task 1) relies on eventually happening on every node's own clock.
 //
 // Default deliberately well under the 1ms heartbeat quota, not comparable to it: fix round 1's
 // default of 2000 (~1.3ms at the ~0.66us/member measured cost) could by itself exceed the whole
@@ -82,7 +98,9 @@ ABSL_FLAG(bool, journal_omit_redundant_writes, true,
 // meaningful progress per tick.
 ABSL_FLAG(uint32_t, reaper_member_walk_budget, 300,
           "Maximum number of container slots the member-expiry reaper examines in a single "
-          "container per heartbeat tick before deferring the remainder to a later tick.");
+          "container per heartbeat tick before deferring the remainder to a later tick. 0 "
+          "disables the proactive reaper entirely (member TTLs are still enforced lazily on "
+          "access).");
 
 namespace dfly {
 
@@ -399,7 +417,7 @@ template <typename F> struct CallbackConsumer : public DbSlice::ChangeConsumerIn
 
 namespace {
 
-void UpdateSlotStat(string_view key, int64_t delta, DbTable* db, uint64_t SlotStats::*stat,
+void UpdateSlotStat(string_view key, int64_t delta, DbTable* db, uint64_t SlotStats::* stat,
                     string_view name, std::optional<unsigned> obj_type = std::nullopt) {
   if (delta == 0 || !db->slots_stats)
     return;
@@ -1694,10 +1712,16 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
       // DisableFlushGuard because SetFlushMode(false) prevents AddLogRecord from preempting"
       // guarantee -- see journal_slice.h) followed by the three-arg Del(), exactly mirroring
       // ExpireIfNeeded's own record-then-delete pattern a few dozen lines above in this file. The
-      // container walk itself was already confirmed non-preempting (allow_yield=false below, plus
-      // no fiber-aware call anywhere in DenseSet/StringMap's lazy-expiry-on-iterate path) -- only
-      // the delete mechanism needed to change.
-      if (reap_member_expiry && it->second.HasMemberExpiration() && quota_remains()) {
+      // container walk itself was already confirmed non-preempting (ReaperExpireStep below calls
+      // only plain synchronous C++, no fiber-aware call anywhere in DenseSet/StringMap's
+      // lazy-expiry-on-iterate path) -- only the delete mechanism needed to change.
+      // drakeydb: P4-0 Task 2b, fix round 4 -- walk_budget read up front (not just before the
+      // ReaperExpireStep call below, as fix round 2 had it) so a 0 budget (the reaper explicitly
+      // disabled -- see the flag's own comment) skips CheckLock/Iterator/SetMemberTime for this
+      // key entirely, instead of paying that cost every tick and then still doing nothing.
+      const uint32_t walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+      if (reap_member_expiry && walk_budget != 0 && it->second.HasMemberExpiration() &&
+          quota_remains()) {
         string_view key = it->first.GetSlice(&stash);
 
         if (!CheckLock(IntentLock::EXCLUSIVE, cntx.db_index, key)) {
@@ -1745,7 +1769,8 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
         // the same prefix forever. Returns whether THIS call completed a full, clean logical pass
         // (see ReaperExpireStep's own comment) -- the only condition safe to clear the sticky
         // HasMemberExpiration() flag under (Important C: see ReaperClearMemberExpiration below).
-        const uint32_t walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+        // walk_budget itself was already read above, before CheckLock (fix round 4) -- guaranteed
+        // nonzero here since that's part of this block's entry condition.
         bool complete_clean_pass = false;
         if (it->second.ObjType() == OBJ_SET) {
           DCHECK_EQ(kEncodingStrMap2, it->second.Encoding())
@@ -1764,7 +1789,7 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
 
         // drakeydb: P4-0 Task 2b Important C -- clears the sticky HasMemberExpiration() flag
         // (dense_set.h/oah_table.h: ExpirationUsed() is never cleared by ordinary mutation once
-        // set, in EITHER encoding -- ClearStep's expiration_used_ = false at dense_set.cc:229
+        // set, in EITHER encoding -- DenseSet::ClearStep's expiration_used_ = false (dense_set.cc)
         // fires only when the whole container becomes empty via a full Clear(), a path the
         // reaper's own delete below does not take) so a container that once carried a member TTL
         // but no longer has ANY -- due or not-yet-due -- stops being re-walked on every future
