@@ -1768,14 +1768,23 @@ template <typename F> bool Iterate(const PrimeValue& pv, F&& func) {
 // (CO::READONLY -- never auto-journals), the two commands reaching OpFetchSortEntries /
 // OpFetchContainerElements below through the same call sites. Derived from the transaction's own
 // CommandId rather than a hardcoded command name, so it stays correct if either command's
-// registration changes. Deliberately omits LogAutoJournalOnShard's re_enabled_auto_journal_
-// check: that only matters for a CO::NO_AUTOJOURNAL command that opts back in via
-// Transaction::ReviveAutoJournal(), and every command reaching this predicate today is either
-// CO::JOURNALED without CO::NO_AUTOJOURNAL (SORT) or CO::READONLY (SORT_RO) -- neither can ever
-// call ReviveAutoJournal(), which DCHECKs CO::NO_AUTOJOURNAL is set on the command.
+// registration changes: mirrors LogAutoJournalOnShard's full gate, `(IsJournaled() ||
+// NO_KEY_TRANSACTIONAL) && !NO_AUTOJOURNAL`, not just its JOURNALED/NO_AUTOJOURNAL half. Omitting
+// the NO_KEY_TRANSACTIONAL disjunct would be the dangerous direction: a NO_KEY_TRANSACTIONAL,
+// non-JOURNALED command still auto-journals there, so a predicate that missed it would return
+// false while the command actually auto-journals verbatim -- silently reopening the exact
+// divergence this PR closes, for whichever future call site trusted the predicate. No behavior
+// change for either current caller: SORT and SORT_RO are both keyed (firstkey=1) and neither sets
+// NO_KEY_TRANSACTIONAL, so this disjunct is a no-op for both today. Deliberately omits
+// LogAutoJournalOnShard's re_enabled_auto_journal_ check: that only matters for a
+// CO::NO_AUTOJOURNAL command that opts back in via Transaction::ReviveAutoJournal(), and every
+// command reaching this predicate today is either CO::JOURNALED without CO::NO_AUTOJOURNAL
+// (SORT) or CO::READONLY (SORT_RO) -- neither can ever call ReviveAutoJournal(), which DCHECKs
+// CO::NO_AUTOJOURNAL is set on the command.
 bool WillAutoJournalVerbatim(const Transaction* tx) {
   const CommandId* cid = tx->GetCId();
-  return cid->IsJournaled() && !(cid->opt_mask() & CO::NO_AUTOJOURNAL);
+  bool auto_journals = cid->IsJournaled() || (cid->opt_mask() & CO::NO_KEY_TRANSACTIONAL);
+  return auto_journals && !(cid->opt_mask() & CO::NO_AUTOJOURNAL);
 }
 
 // Create a SortEntryList from given key
@@ -1813,7 +1822,11 @@ OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_v
   // drakeydb: P4-0 fix-wave -- derived=false for SORT (see WillAutoJournalVerbatim above): SORT
   // auto-journals verbatim, so a peer replays it against its own, still-populated copy instead
   // of independently deriving this DEL -- the exact FIELDEXPIRE hazard, same fix. SORT_RO shares
-  // this call site but never auto-journals, so it still gets derived=true (the default).
+  // this call site but never auto-journals, so it still gets derived=true (the default). Same
+  // accepted cost as FIELDEXPIRE's carve-out (see OpFieldExpire's comment above): the forwarded
+  // DEL is unconditional, so it destroys any members a concurrent peer write added that this
+  // node never saw -- arguably wider exposure here, since plain `SORT key` (no STORE) is a
+  // read-shaped use of a command CO::JOURNALED still classifies as a write.
   if (obj_type == OBJ_SET && it->second.Size() == 0) {
     SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
                                 /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
@@ -1855,7 +1868,11 @@ OpResult<pair<vector<string>, CompactObjType>> OpFetchContainerElements(const Op
   // drakeydb: P4-0 fix-wave -- derived=false for SORT (see WillAutoJournalVerbatim above): SORT
   // auto-journals verbatim, so a peer replays it against its own, still-populated copy instead
   // of independently deriving this DEL -- the exact FIELDEXPIRE hazard, same fix. SORT_RO shares
-  // this call site but never auto-journals, so it still gets derived=true (the default).
+  // this call site but never auto-journals, so it still gets derived=true (the default). Same
+  // accepted cost as FIELDEXPIRE's carve-out (see OpFieldExpire's comment above): the forwarded
+  // DEL is unconditional, so it destroys any members a concurrent peer write added that this
+  // node never saw -- arguably wider exposure here, since plain `SORT key` (no STORE) is a
+  // read-shaped use of a command CO::JOURNALED still classifies as a write.
   if (obj_type == OBJ_SET && it->second.Size() == 0) {
     SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
                                 /*derived=*/!WillAutoJournalVerbatim(op_args.tx));

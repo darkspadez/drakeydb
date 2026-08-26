@@ -512,7 +512,7 @@ builds with g++, so it never runs in the ordinary local gate.
   the ~25 `DeleteIfEmpty`/`DeleteSetIfEmpty` call sites enumerated for the P4-0 fix, and every one
   of them needs a command to touch the key to run at all. For the read-path call sites — whose
   causing command is never journaled, by design (see Phase 4's "P4-0 Task 1 delivered" note
-  above) — a peer keeps a logically-empty container **indefinitely** until *it* is asked to read
+  below) — a peer keeps a logically-empty container **indefinitely** until *it* is asked to read
   that same key. `EXISTS`/`DBSIZE`/`SCAN`/`KEYS` do not decode the collection, so none of them
   notice or clear it; a mesh where reads land asymmetrically across nodes can carry these phantom
   containers forever. It escalates from cosmetic to a real divergence: a later replicated
@@ -523,6 +523,19 @@ builds with g++, so it never runs in the ordinary local gate.
   node's derived DEL reached every peer); they now only clean up the node they run on. P4-2's
   tombstone GC and the design spec's D-4 full-scan invariant both have to account for these
   keys explicitly — neither can assume "logically empty" and "absent from the peer" coincide.
+- **SORT's partial-expiry gap (pre-existing, not introduced by P4-0 Task 1; documentation only,
+  not fixed).** `OpFetchSortEntries`/`OpFetchContainerElements` call `DeleteSetIfEmpty` only when
+  `it->second.Size() == 0` after iteration, so the carve-out (and `DeleteSetIfEmpty` itself) only
+  ever fires when SORT's own lazy member-expiry pass empties the set completely. If some members
+  expire during that pass and others survive, `DeleteSetIfEmpty` never runs, no DEL is emitted at
+  all, and the replayed SORT — including its `STORE` destination — runs verbatim against a peer
+  that still holds the surviving-on-this-node-but-actually-expired members, diverging the result.
+  `OpFieldExpire` compensates for exactly this shape with an explicit re-journal of just the
+  expired members (`RecordJournal(op_args, "SREM"/"HDEL", missing)`, `generic_family.cc`), and
+  `OpHExpire` does the same (`hset_family.cc`); SORT has no equivalent. Not a regression: before
+  this fix, the partial-empty path emitted no DEL either — `DeleteSetIfEmpty` was, and still is,
+  only reached in the full-empty case. A future fix would take the same shape: an explicit `SREM`
+  re-journal of the members SORT's own iteration lazily expired.
 
 **Testing lesson worth keeping.** A **convergence assertion cannot detect an echo storm.** With the
 origin filter reverted, two nodes still converge: symmetric amplification makes every node replay the
@@ -544,7 +557,11 @@ against Phase 3, above): `journal::kEntryFlagDerived` (`journal/types.h`) marks 
 `journal::PassesPeerEchoFilter` (`journal/types.cc`) drops it for peer links exactly as it already
 does for `kEntryFlagExpired`, while a plain full-stream replica still receives it.
 `dfly::RecordDerivedDelete` (`tx_base.h`/`.cc`) sets the flag; both helpers default to it via a
-trailing `derived = true` parameter.
+trailing `derived = true` parameter. Safe as the default: every enumerated call site other than
+the two carve-outs named below is reached only when the transaction's own causing command is
+itself never journaled (read-only, or DEBUG-only and non-propagating), so the peer replays
+nothing there and instead reaches the same empty-collection conclusion independently, via its own
+lazy member expiry.
 
 Two call sites pass `derived = false` (forward the DEL like any other command-caused one) because
 their causing command auto-journals verbatim and a peer's own replay of it cannot be relied on to
