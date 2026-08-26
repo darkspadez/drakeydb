@@ -1499,7 +1499,7 @@ TEST_F(SearchFamilyTest, HnswKnnInt8) {
 }
 
 TEST_F(SearchFamilyTest, BufferedHnswFullDeleteRemovesOldGlobalId) {
-  auto exercise = [&](std::string_view index_name, std::string_view key, size_t dim,
+  auto exercise = [&](std::string_view index_name, std::string_view prefix, size_t dim,
                       bool use_json) {
     if (use_json) {
       ASSERT_EQ(Run({"FT.CREATE",
@@ -1508,7 +1508,7 @@ TEST_F(SearchFamilyTest, BufferedHnswFullDeleteRemovesOldGlobalId) {
                      "JSON",
                      "PREFIX",
                      "1",
-                     key,
+                     prefix,
                      "SCHEMA",
                      "$.v",
                      "AS",
@@ -1532,7 +1532,7 @@ TEST_F(SearchFamilyTest, BufferedHnswFullDeleteRemovesOldGlobalId) {
                      "HASH",
                      "PREFIX",
                      "1",
-                     key,
+                     prefix,
                      "SCHEMA",
                      "v",
                      "VECTOR",
@@ -1550,31 +1550,75 @@ TEST_F(SearchFamilyTest, BufferedHnswFullDeleteRemovesOldGlobalId) {
     }
     WaitForIndexReady(index_name);
 
-    std::vector<float> query(dim, 1.0f);
-    std::string blob(reinterpret_cast<const char*>(query.data()), query.size() * sizeof(float));
-    if (use_json)
-      ASSERT_EQ(Run({"JSON.SET", key, "$", R"({"v":[1.0]})"}), "OK");
-    else {
-      ASSERT_EQ(Run({"HSET", key, "v", blob}).GetInt(), 1);
-      // A newly-created hash starts as a listpack even when its first value is large. A second
-      // mutation applies the configured encoding limits and converts it to StringMap, which is
-      // the storage borrowed HNSW vectors require.
-      ASSERT_EQ(Run({"HSET", key, "marker", "x"}).GetInt(), 1);
+    const std::string old_key = absl::StrCat(prefix, "old");
+    std::string replacement_key;
+    for (unsigned i = 0; replacement_key.empty(); ++i) {
+      std::string candidate = absl::StrCat(prefix, "replacement-", i);
+      if (Shard(candidate, shard_set->size()) == Shard(old_key, shard_set->size()))
+        replacement_key = std::move(candidate);
     }
+    std::vector<float> old_vector(dim, 1.0f);
+    std::vector<float> replacement_vector(dim, 9.0f);
+
+    auto set_document = [&](std::string_view key, const std::vector<float>& vector) {
+      if (use_json) {
+        ASSERT_EQ(dim, 1u);
+        ASSERT_EQ(Run({"JSON.SET", key, "$", absl::StrCat(R"({"v":[)", vector.front(), "]}")}),
+                  "OK");
+      } else {
+        std::string blob(reinterpret_cast<const char*>(vector.data()),
+                         vector.size() * sizeof(float));
+        ASSERT_EQ(Run({"HSET", key, "v", blob}).GetInt(), 1);
+        // A newly-created hash starts as a listpack even when its first value is large. A second
+        // mutation applies the configured encoding limits and converts it to StringMap, which is
+        // the storage borrowed HNSW vectors require.
+        ASSERT_EQ(Run({"HSET", key, "marker", "x"}).GetInt(), 1);
+      }
+    };
+    set_document(old_key, old_vector);
 
     auto hnsw = GlobalHnswIndexRegistry::Instance().Get(index_name, "v");
     ASSERT_TRUE(hnsw);
     ASSERT_EQ(hnsw->IsVectorCopied(), use_json);
-    ASSERT_EQ(hnsw->Knn(query.data(), 1, std::nullopt).size(), 1u);
+    ASSERT_EQ(hnsw->Knn(old_vector.data(), 1, std::nullopt).size(), 1u);
 
+    std::optional<search::DocId> old_doc_id;
+    std::optional<ShardId> old_shard_id;
     shard_set->AwaitRunningOnShardQueue([&](EngineShard* shard) {
-      if (auto* index = shard->search_indices()->GetIndex(index_name))
+      if (auto* index = shard->search_indices()->GetIndex(index_name)) {
+        if (auto doc_id = index->key_index().Find(old_key); doc_id) {
+          old_doc_id = *doc_id;
+          old_shard_id = shard->shard_id();
+        }
         index->SetHnswSerializing();
+      }
     });
+    ASSERT_TRUE(old_doc_id);
+    ASSERT_TRUE(old_shard_id);
 
-    ASSERT_EQ(Run({"DEL", key}).GetInt(), 1);
-    ASSERT_EQ(hnsw->Knn(query.data(), 1, std::nullopt).size(), 1u)
+    ASSERT_EQ(Run({"DEL", old_key}).GetInt(), 1);
+    set_document(replacement_key, replacement_vector);
+
+    std::optional<search::DocId> replacement_doc_id;
+    std::optional<ShardId> replacement_shard_id;
+    shard_set->AwaitRunningOnShardQueue([&](EngineShard* shard) {
+      if (auto* index = shard->search_indices()->GetIndex(index_name)) {
+        if (auto doc_id = index->key_index().Find(replacement_key); doc_id) {
+          replacement_doc_id = *doc_id;
+          replacement_shard_id = shard->shard_id();
+        }
+      }
+    });
+    ASSERT_TRUE(replacement_doc_id);
+    ASSERT_TRUE(replacement_shard_id);
+    EXPECT_EQ(*replacement_shard_id, *old_shard_id);
+    EXPECT_EQ(*replacement_doc_id, *old_doc_id) << "the regression must exercise DocId reuse";
+
+    auto buffered = hnsw->Knn(old_vector.data(), 1, std::nullopt);
+    ASSERT_EQ(buffered.size(), 1u)
         << "the global removal should remain buffered until serialization drains";
+    const auto reused_global_id = search::CreateGlobalDocId(*old_shard_id, *old_doc_id);
+    EXPECT_EQ(buffered.front().second, reused_global_id);
 
     shard_set->AwaitRunningOnShardQueue([&](EngineShard* shard) {
       if (auto* index = shard->search_indices()->GetIndex(index_name)) {
@@ -1584,8 +1628,16 @@ TEST_F(SearchFamilyTest, BufferedHnswFullDeleteRemovesOldGlobalId) {
       }
     });
 
-    EXPECT_TRUE(hnsw->Knn(query.data(), 1, std::nullopt).empty())
-        << "drain must remove the old global ID even after key_index_ released its DocId";
+    auto replacement_result = hnsw->Knn(replacement_vector.data(), 1, std::nullopt);
+    ASSERT_EQ(replacement_result.size(), 1u);
+    EXPECT_EQ(replacement_result.front().second, reused_global_id);
+    EXPECT_FLOAT_EQ(replacement_result.front().first, 0.0f);
+
+    auto stale_result = hnsw->Knn(old_vector.data(), 1, std::nullopt);
+    ASSERT_EQ(stale_result.size(), 1u);
+    EXPECT_EQ(stale_result.front().second, reused_global_id);
+    EXPECT_GT(stale_result.front().first, 0.0f)
+        << "the reused global ID must point at the replacement vector, not the deleted vector";
     EXPECT_EQ(Run({"FT.DROPINDEX", index_name}), "OK");
   };
 

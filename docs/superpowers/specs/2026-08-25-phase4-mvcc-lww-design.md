@@ -817,6 +817,8 @@ local namespace and DB with independent incremental round-robin cursors. The con
 budget advances home slots/buckets; collision chains and extension vectors remain whole
 work units, so it is not a hard latency bound under adversarial collisions. Non-default
 namespace cleanup stays local because the replication wire has no namespace identity.
+Consequently D-11 and the proactive reaper are one merge unit: derived-DEL suppression
+must not land on an active replica without the reaper already integrated.
 
 SORT partial expiry is compensated explicitly with `SREM` before the verbatim SORT
 entry; a failed numeric parse completes the source walk and journals only members actually
@@ -921,7 +923,7 @@ the derived-DEL fix — so they never land together.
 
 | PR | Scope |
 |---|---|
-| **P4-0** | D-11 derived-DEL fix + D-12 clock-skew warning/metric. Independent hardening; separately mergeable to main. |
+| **P4-0** | Proactive member-expiry reaper + D-11 derived-DEL fix + D-12 clock-skew warning/metric. Mergeable independently of P4-1...P4-5 only as this complete unit; D-11 must not land without its reaper prerequisite. |
 | **P4-1** | **T0 inbound plumbing** (`TransactionData.mvcc`, `SetApplyMvcc`, `peer_origin_hash_`, widened `SetReplOrigin`), D-2 stamp, D-3 clock, D-4 side table, D-5 stamping, D-6 wire, D-13 `DEBUG MVCC` + `mvcc_table_bytes`, memory benchmark. No behaviour change beyond memory. |
 | **P4-2** | D-7 RDB persistence (`RDB_OPCODE_DF_MVCC` save + load, KeyDB read branch). |
 | **P4-3** | D-8 merge-on-full-sync LWW. First real behaviour change. |
