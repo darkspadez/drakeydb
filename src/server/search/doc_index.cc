@@ -424,6 +424,7 @@ void ShardDocIndex::Rebuild(const OpArgs& op_args, PMR_NS::memory_resource* mr, 
     // Full rebuild handles all documents — discard any buffered state from LOADING.
     hnsw_state_ = HnswState::kBuilding;
     pending_vector_updates_.clear();
+    pending_vector_removals_.clear();
   } else {
     // Restored path: buffer journal-driven mutations until PerformPostLoad drains
     // them after all shards complete vector restoration.
@@ -532,8 +533,9 @@ std::optional<ShardDocIndex::DocId> ShardDocIndex::AddDoc(string_view key, const
   return id;
 }
 
-void ShardDocIndex::RemoveDoc(DocId id, const DbContext& db_cntx, const PrimeValue& pv) {
-  auto accessor = GetAccessor(db_cntx, pv);
+void ShardDocIndex::RemoveDoc(DocId id, const DbContext& db_cntx, const PrimeValue& pv,
+                              MemberTimePolicy member_time_policy) {
+  auto accessor = GetAccessor(db_cntx, pv, {}, member_time_policy);
   key_index_.Remove(id);
   indices_->Remove(id, *accessor);
 }
@@ -623,6 +625,7 @@ void ShardDocIndex::RemoveDocFromGlobalVectorIndex(
   if (hnsw_state_ != HnswState::kBuilding) {
     std::string_view key = key_index_.Get(doc_id);
     pending_vector_updates_.emplace(key);
+    pending_vector_removals_.emplace(doc_id);
 
     // Preserve old sds so HNSW pointers set by UpdateVectorData stay valid.
     for (auto& hnsw : hnsw_shard_indices_)
@@ -762,13 +765,20 @@ void ShardDocIndex::DrainPendingVectorUpdates(const OpArgs& op_args) {
   // Allow normal HNSW operations (used after restoration or serialization).
   hnsw_state_ = HnswState::kBuilding;
 
-  if (pending_vector_updates_.empty())
+  if (pending_vector_updates_.empty() && pending_vector_removals_.empty())
     return;
 
   auto& db_slice = op_args.GetDbSlice();
 
-  LOG(INFO) << "Draining " << pending_vector_updates_.size() << " pending vector updates on shard "
+  LOG(INFO) << "Draining " << pending_vector_updates_.size() << " pending vector updates and "
+            << pending_vector_removals_.size() << " removals on shard "
             << EngineShard::tlocal()->shard_id();
+
+  // key_index_ releases an ID as soon as the regular index entry is removed, and may reuse it
+  // before this drain. Remove all old global nodes first; final key states are added below, so an
+  // ID reused by another key cannot leave either the stale node or the new node missing.
+  for (DocId doc_id : pending_vector_removals_)
+    RemoveFromAllHnswIndices(doc_id);
 
   for (const auto& key : pending_vector_updates_) {
     auto local_id = key_index_.Find(key);
@@ -792,6 +802,7 @@ void ShardDocIndex::DrainPendingVectorUpdates(const OpArgs& op_args) {
     }
   }
   pending_vector_updates_.clear();
+  pending_vector_removals_.clear();
   ClearAllHnswPreservedData();
 }
 
@@ -1391,7 +1402,8 @@ void ShardDocIndices::AddDoc(string_view key, const DbContext& db_cntx, PrimeVal
 }
 
 void ShardDocIndices::RemoveDoc(string_view key, const DbContext& db_cntx, PrimeValue& pv,
-                                absl::Span<const std::string_view> modified_fields) {
+                                absl::Span<const std::string_view> modified_fields,
+                                MemberTimePolicy member_time_policy) {
   DCHECK(IsIndexedKeyType(pv));
 
   // Shared extraction cache: when multiple search indices reference the same hash field,
@@ -1404,7 +1416,7 @@ void ShardDocIndices::RemoveDoc(string_view key, const DbContext& db_cntx, Prime
       if (doc_id) {
         index->RemoveDocFromGlobalVectorIndex(*doc_id, db_cntx, pv, modified_fields,
                                               &extraction_cache);
-        index->RemoveDoc(*doc_id, db_cntx, pv);
+        index->RemoveDoc(*doc_id, db_cntx, pv, member_time_policy);
       }
     }
   }

@@ -30,6 +30,7 @@ class SlotSet;
 }  // namespace cluster
 
 class BlockingController;
+class ReaperJournalFamilyTest;
 
 using facade::OpResult;
 
@@ -457,13 +458,27 @@ class DbSlice {
 
   struct DeleteExpiredStats {
     uint32_t deleted = 0;                 // number of deleted items due to expiry.
-    uint32_t deleted_bytes = 0;           // total bytes of deleted items.
+    size_t deleted_bytes = 0;             // total bytes of deleted items.
     uint32_t traversed = 0;               // total number of traversed entries in the prime table.
     std::vector<std::string> key_events;  // expired key names for keyspace notifications.
   };
 
+  struct DeleteExpiredOptions {
+    // Production heartbeat calls guarantee at least one member slot is examined in active mode,
+    // even when the tuning flag is zero. Direct tests may leave this false to pause the reaper.
+    bool ensure_member_reaping = false;
+    // Namespace identity is not encoded in the journal wire. Non-default namespace sweeps must
+    // therefore remain local instead of emitting a DEL that would target the default namespace.
+    bool journal_deletions = true;
+    // The default sweep shares the heartbeat fiber's existing one-millisecond quota. A later
+    // round-robin namespace needs a fresh local quota or a busy default namespace starves it.
+    bool reset_time_quota = false;
+  };
+
   // Deletes some amount of possible expired items.
   DeleteExpiredStats DeleteExpiredStep(const Context& cntx, unsigned count);
+  DeleteExpiredStats DeleteExpiredStep(const Context& cntx, unsigned count,
+                                       DeleteExpiredOptions options);
 
   // Evicts items with dynamically allocated data from the primary table.
   // Does not shrink tables.
@@ -573,6 +588,8 @@ class DbSlice {
   void DefragTableSegments(DbIndex db_ind, PageUsage* page_usage);
 
  private:
+  friend class ReaperJournalFamilyTest;
+
   void PreUpdateBlocking(DbIndex db_ind, const Iterator& it);
   void PostUpdate(DbIndex db_ind, std::string_view key);
 
@@ -595,6 +612,10 @@ class DbSlice {
                                                const DbTableArray& db_arr) const;
 
   void PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async = false);
+  // Reaper deletion intentionally bypasses FindMutable/OnChange. Its caller must already have
+  // established that no snapshot consumer can race the container mutation.
+  void DeleteReapedContainer(const Context& cntx, std::string_view key, Iterator it,
+                             bool journal_deletion);
 
   // Queues invalidation message to the clients that are tracking the change to a key.
   void QueueInvalidationTrackingMessageAtomic(std::string_view key);
@@ -614,7 +635,8 @@ class DbSlice {
   // events: if non-null, the expired key is appended to it (caller is in an atomic section and
   // will send notifications later). If null, the notification is sent immediately (read path).
   PrimeIterator ExpireIfNeeded(const Context& cntx, PrimeIterator it,
-                               std::vector<std::string>* events = nullptr) const;
+                               std::vector<std::string>* events = nullptr,
+                               bool journal_expiry = true) const;
 
   OpResult<ItAndUpdater> AddOrFindInternal(const Context& cntx, std::string_view key,
                                            std::optional<unsigned> req_obj_type);

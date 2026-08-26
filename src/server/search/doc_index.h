@@ -31,6 +31,8 @@ namespace dfly {
 
 using StringVec = std::vector<std::string>;
 
+enum class MemberTimePolicy : uint8_t { kUpdate, kPreserve };
+
 namespace search {
 struct IndexBuilder;
 }  // namespace search
@@ -441,7 +443,8 @@ class ShardDocIndex {
   std::optional<ShardDocIndex::DocId> AddDoc(std::string_view key, const DbContext& db_cntx,
                                              const PrimeValue& pv);
 
-  void RemoveDoc(DocId id, const DbContext& db_cntx, const PrimeValue& pv);
+  void RemoveDoc(DocId id, const DbContext& db_cntx, const PrimeValue& pv,
+                 MemberTimePolicy member_time_policy = MemberTimePolicy::kUpdate);
 
   DocIndexInfo GetInfo() const;
 
@@ -476,9 +479,9 @@ class ShardDocIndex {
   void AddDocToGlobalVectorIndex(ShardDocIndex::DocId doc_id, const DbContext& db_cntx,
                                  PrimeValue* pv);
 
-  // Remove doc from all HNSW indices. When hnsw_state_ != kBuilding, the remove
-  // is buffered in pending_vector_updates_ and old sds entries are preserved so
-  // HNSW pointers remain valid until the buffer is drained.
+  // Remove doc from all HNSW indices. When hnsw_state_ != kBuilding, both the key update and the
+  // old DocId removal are buffered, and old sds entries are preserved so HNSW pointers remain
+  // valid until the buffer is drained.
   // modified_fields: when non-empty, only preserve fields being mutated.
   // cache: shared across search indices so each sds field is extracted at most once.
   void RemoveDocFromGlobalVectorIndex(ShardDocIndex::DocId doc_id, const DbContext& db_cntx,
@@ -608,6 +611,9 @@ class ShardDocIndex {
   enum class HnswState : uint8_t { kProhibit, kRestoring, kSerializing, kBuilding };
 
   absl::flat_hash_set<std::string> pending_vector_updates_;
+  // Buffered removals retain the old DocId after key_index_ releases it. Drain removes every old
+  // global ID before replaying final key states, which is also safe if a local DocId was reused.
+  absl::flat_hash_set<DocId> pending_vector_removals_;
   HnswState hnsw_state_ = HnswState::kProhibit;
 };
 
@@ -650,9 +656,11 @@ class ShardDocIndices {
   // Remove doc from all matching indices. When HNSW ops are buffered
   // (serializing/restoring), external vector data is preserved so HNSW
   // pointers remain valid until the buffer is drained.
-  // pv is non-const because preservation swaps sds entries in StringMap.
+  // pv is non-const because preservation swaps sds entries in StringMap. kPreserve keeps a
+  // caller-selected physical view instead of resetting the hash clock from db_cnt.
   void RemoveDoc(std::string_view key, const DbContext& db_cnt, PrimeValue& pv,
-                 absl::Span<const std::string_view> modified_fields = {});
+                 absl::Span<const std::string_view> modified_fields = {},
+                 MemberTimePolicy member_time_policy = MemberTimePolicy::kUpdate);
 
   size_t GetUsedMemory() const;
   SearchStats GetStats() const;  // combines stats for all indices

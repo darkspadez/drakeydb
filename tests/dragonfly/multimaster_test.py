@@ -1898,7 +1898,7 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
 # reaper landed (below, same file), and the comments above and below predate that; read them
 # together with this one. `a` is itself an active node, so by the time the FIELDTTL burst below
 # runs, `a`'s *own* heartbeat reaper has typically already independently discovered and derived
-# DELs for most or all of these same now-expired sets, on the same ~1s timescale FIELDTTL is
+# DELs for most or all of these same now-expired sets, on the same TTL timescale FIELDTTL is
 # trying to observe -- confirmed empirically (task-2b-report.md section 14/15): with zero
 # FIELDTTL calls issued at all, `a` alone derived 15 of 20 equivalent DELs within 1.5s, purely
 # from its own heartbeat. FIELDTTL and the reaper are therefore no longer separable causes on
@@ -1941,13 +1941,14 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
     await wait_for_peers(c_b, 1)
     await wait_available_async(c_plain)
 
-    n = 20
+    # A broken filter adds one peer command per key. Keep that signal above the same calibrated
+    # three-second noise bound used by assert_no_command_storm.
+    n = STORM_BOUND * 2
     keys = [f"derived-del-{i}" for i in range(n)]
 
     pipe = c_a.pipeline(transaction=False)
     for key in keys:
         pipe.execute_command("sadd", key, "m")
-        pipe.execute_command("fieldexpire", key, "1", "m")
     await pipe.execute()
 
     @assert_eventually(timeout=30)
@@ -1957,6 +1958,21 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
             assert await _exists(c_plain, key)
 
     await setup_converged()
+
+    # Arm TTLs only after the larger key set has replicated. Otherwise the short TTL can
+    # elapse during setup verification and make that verification race the reaper.
+    pipe = c_a.pipeline(transaction=False)
+    for key in keys:
+        pipe.execute_command("fieldexpire", key, "3", "m")
+    await pipe.execute()
+
+    @assert_eventually(timeout=30)
+    async def ttl_setup_converged():
+        # Journal order makes the last TTL entry a barrier for all earlier entries in the burst.
+        assert await c_b.execute_command("fieldttl", keys[-1], "m") > 0
+        assert await c_plain.execute_command("fieldttl", keys[-1], "m") > 0
+
+    await ttl_setup_converged()
 
     # Measurement window starts here -- deliberately BEFORE the sleep below, not after it. a's
     # own reaper derives (and, if suppression is working, correctly suppresses) its DELs for
@@ -1973,7 +1989,7 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
     # measured. b is not probed at all until after delta_b is captured below.
     before_b = await _total_commands_processed(c_b)
 
-    await asyncio.sleep(1.2)  # let every member's 1s TTL elapse on every node's own clock
+    await asyncio.sleep(3.2)  # let every member's 3s TTL elapse on every node's own clock
 
     # Re-probing each already-expired member via FIELDTTL (read-only) on a causes
     # SetFamily::FieldExpireTime to discover it lazily expired and flush it -- each set empties
@@ -1987,14 +2003,6 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
         pipe.execute_command("fieldttl", key, "m")
     await pipe.execute()
 
-    # plain converges (it received a's derived DEL outright); this does not touch b.
-    @assert_eventually(timeout=30)
-    async def plain_converged():
-        for key in keys:
-            assert not await _exists(c_plain, key)
-
-    await plain_converged()
-
     await asyncio.sleep(1.0)  # give a leaked DEL, if any, time to arrive before measuring b
 
     # The load-bearing assertion, and the only one this test makes: b applied nothing beyond idle
@@ -2006,11 +2014,20 @@ async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: Dfl
     # reaper exists, and why this delta still can (b's own reaper is local and never dispatches a
     # command against b, so it cannot move this counter; a forwarded DEL would).
     delta_b = await _total_commands_processed(c_b) - before_b
-    assert delta_b < 10, (
+    assert delta_b < STORM_BOUND, (
         f"peer applied {delta_b} commands with nothing legitimately sent to it (expected only "
-        f"idle mesh noise, comfortably under 10; a {n}-key leak would show ~{n}) -- looks like "
+        f"idle mesh noise, below {STORM_BOUND}; a {n}-key leak would show ~{n}) -- looks like "
         f"a's derived DELs leaked through to the peer"
     )
+
+    # A plain replica receives derived DELs. Check it after closing b's bounded measurement
+    # window so this potentially 30-second convergence poll cannot inflate that window.
+    @assert_eventually(timeout=30)
+    async def plain_converged():
+        for key in keys:
+            assert not await _exists(c_plain, key)
+
+    await plain_converged()
 
 
 # drakeydb: P4-0 Task 2b -- the member-expiry reaper. The test above proves half of Task 1's
@@ -2055,12 +2072,6 @@ async def test_member_expiry_reaper_self_heals_peer_without_read(df_factory: Dfl
 
     await asyncio.sleep(1.2)  # let the 1s member TTL elapse on every node's own clock
 
-    # Measurement window starts here: b is never sent a read for `s` between this point and
-    # b_healed() returning True below -- EXISTS is the only thing polled against it, and
-    # DbSlice::FindInternal never looks at member-level TTLs (see the task brief), so polling
-    # existence cannot itself trigger the lazy member expiry under test.
-    before_b = await _total_commands_processed(c_b)
-
     # a's own read triggers a's lazy member expiry, deriving a DEL that is suppressed on the peer
     # link (proven unconditionally by the test above). Nothing about this call touches b.
     await c_a.execute_command("smembers", "s")
@@ -2072,17 +2083,6 @@ async def test_member_expiry_reaper_self_heals_peer_without_read(df_factory: Dfl
         assert not await _exists(c_b, "s")
 
     await b_healed()
-
-    # Corroborates b_healed without relying on a's silence alone: if a's derived DEL had somehow
-    # leaked through (a Task 1 regression -- not what this task is testing, and already pinned
-    # unconditionally by the test above), it would show up here as extra traffic. b's own reaper
-    # acts entirely locally and is not itself a command dispatched from a, so this stays at
-    # idle-mesh-noise levels either way -- a corroboration, not the proof that b healed itself.
-    delta_b = await _total_commands_processed(c_b) - before_b
-    assert delta_b < 10, (
-        f"b processed {delta_b} commands during a's read and the healing wait (expected only "
-        f"idle mesh noise) -- unexpected traffic reached b"
-    )
 
     # The escalation that makes this a data-correctness bug, not a hygiene leak: with `s` gone on
     # both nodes, a later SETNX on the same key must leave BOTH holding the same string -- neither
@@ -2098,3 +2098,69 @@ async def test_member_expiry_reaper_self_heals_peer_without_read(df_factory: Dfl
     assert await c_a.execute_command("get", "s") == "hello"
     assert await c_a.execute_command("type", "s") == "string"
     assert await c_b.execute_command("type", "s") == "string"
+
+
+async def test_member_expiry_reaper_covers_namespaces_and_zero_budget(
+    df_factory: DflyInstanceFactory,
+):
+    node = df_factory.create(**active_args(reaper_member_walk_budget=0))
+    node.start()
+    admin = node.client()
+
+    assert (
+        await admin.execute_command(
+            "FT.CREATE",
+            "reaper-namespace-index",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "reaper-index:",
+            "SCHEMA",
+            "tag",
+            "TAG",
+        )
+        == "OK"
+    )
+    assert await admin.hset("reaper-index:shared", mapping={"tag": "red"}) == 1
+
+    tenants = []
+    for namespace in ("reaper-ns-a", "reaper-ns-b"):
+        username = f"{namespace}-user"
+        await admin.execute_command(
+            "ACL", "SETUSER", username, f"NAMESPACE:{namespace}", "ON", ">pass", "+@all", "~*"
+        )
+        for db in (0, 1):
+            tenant = node.client(username=username, password="pass", db=db)
+            assert await tenant.ping()
+            key = f"tenant-set-db-{db}"
+            assert await tenant.execute_command("SADD", key, "member") == 1
+            assert await tenant.execute_command("FIELDEXPIRE", key, "1", "member") == [1]
+            tenants.append((tenant, key))
+            if db == 0:
+                # Search indices belong to the default namespace, but their internal key map has
+                # no namespace dimension. A named-namespace reap of the same physical key must
+                # not remove the default document's postings.
+                assert await tenant.hset("reaper-index:shared", mapping={"tag": "blue"}) == 1
+                assert await tenant.execute_command(
+                    "HEXPIRE", "reaper-index:shared", "1", "FIELDS", "1", "tag"
+                ) == [1]
+                tenants.append((tenant, "reaper-index:shared"))
+
+    await asyncio.sleep(1.2)
+
+    # EXISTS does not perform member-level expiry. Only the heartbeat can make this false without
+    # a collection read. Two namespaces with TTL-bearing keys in two DBs also pin independent DB
+    # cursors: a shared cursor can permanently pair one namespace with only even DBs and the other
+    # with odd DBs. The configured zero budget must still make progress as an effective one.
+    @assert_eventually(timeout=30)
+    async def tenants_reaped():
+        for tenant, key in tenants:
+            assert not await _exists(tenant, key)
+
+    await tenants_reaped()
+
+    default_search = await admin.execute_command(
+        "FT.SEARCH", "reaper-namespace-index", "@tag:{red}", "NOCONTENT"
+    )
+    assert default_search[0] == 1

@@ -19,6 +19,7 @@
 #include "facade/facade_test.h"
 #include "facade/resp_parser.h"
 #include "server/search/doc_index.h"
+#include "server/search/global_hnsw_index.h"
 #include "server/test_utils.h"
 
 using namespace testing;
@@ -1495,6 +1496,103 @@ TEST_F(SearchFamilyTest, HnswKnnInt8) {
   auto resp = Run({"FT.SEARCH", "idx", "*=>[KNN 1 @v $q AS dist]", "RETURN", "1", "dist", "PARAMS",
                    "2", "q", q, "DIALECT", "2"});
   EXPECT_THAT(resp, MatchEntry("d:a", "dist", "0"));
+}
+
+TEST_F(SearchFamilyTest, BufferedHnswFullDeleteRemovesOldGlobalId) {
+  auto exercise = [&](std::string_view index_name, std::string_view key, size_t dim,
+                      bool use_json) {
+    if (use_json) {
+      ASSERT_EQ(Run({"FT.CREATE",
+                     index_name,
+                     "ON",
+                     "JSON",
+                     "PREFIX",
+                     "1",
+                     key,
+                     "SCHEMA",
+                     "$.v",
+                     "AS",
+                     "v",
+                     "VECTOR",
+                     "HNSW",
+                     "8",
+                     "TYPE",
+                     "FLOAT32",
+                     "DIM",
+                     absl::StrCat(dim),
+                     "DISTANCE_METRIC",
+                     "L2",
+                     "M",
+                     "16"}),
+                "OK");
+    } else {
+      ASSERT_EQ(Run({"FT.CREATE",
+                     index_name,
+                     "ON",
+                     "HASH",
+                     "PREFIX",
+                     "1",
+                     key,
+                     "SCHEMA",
+                     "v",
+                     "VECTOR",
+                     "HNSW",
+                     "8",
+                     "TYPE",
+                     "FLOAT32",
+                     "DIM",
+                     absl::StrCat(dim),
+                     "DISTANCE_METRIC",
+                     "L2",
+                     "M",
+                     "16"}),
+                "OK");
+    }
+    WaitForIndexReady(index_name);
+
+    std::vector<float> query(dim, 1.0f);
+    std::string blob(reinterpret_cast<const char*>(query.data()), query.size() * sizeof(float));
+    if (use_json)
+      ASSERT_EQ(Run({"JSON.SET", key, "$", R"({"v":[1.0]})"}), "OK");
+    else {
+      ASSERT_EQ(Run({"HSET", key, "v", blob}).GetInt(), 1);
+      // A newly-created hash starts as a listpack even when its first value is large. A second
+      // mutation applies the configured encoding limits and converts it to StringMap, which is
+      // the storage borrowed HNSW vectors require.
+      ASSERT_EQ(Run({"HSET", key, "marker", "x"}).GetInt(), 1);
+    }
+
+    auto hnsw = GlobalHnswIndexRegistry::Instance().Get(index_name, "v");
+    ASSERT_TRUE(hnsw);
+    ASSERT_EQ(hnsw->IsVectorCopied(), use_json);
+    ASSERT_EQ(hnsw->Knn(query.data(), 1, std::nullopt).size(), 1u);
+
+    shard_set->AwaitRunningOnShardQueue([&](EngineShard* shard) {
+      if (auto* index = shard->search_indices()->GetIndex(index_name))
+        index->SetHnswSerializing();
+    });
+
+    ASSERT_EQ(Run({"DEL", key}).GetInt(), 1);
+    ASSERT_EQ(hnsw->Knn(query.data(), 1, std::nullopt).size(), 1u)
+        << "the global removal should remain buffered until serialization drains";
+
+    shard_set->AwaitRunningOnShardQueue([&](EngineShard* shard) {
+      if (auto* index = shard->search_indices()->GetIndex(index_name)) {
+        OpArgs op_args{shard, nullptr,
+                       DbContext{&namespaces->GetDefaultNamespace(), 0, GetCurrentTimeMs()}};
+        index->DrainSerializationUpdates(op_args);
+      }
+    });
+
+    EXPECT_TRUE(hnsw->Knn(query.data(), 1, std::nullopt).empty())
+        << "drain must remove the old global ID even after key_index_ released its DocId";
+    EXPECT_EQ(Run({"FT.DROPINDEX", index_name}), "OK");
+  };
+
+  exercise("buffered-copied", "copy:", 1, true);
+  // Vectors larger than the listpack threshold use borrowed keyspace storage. This also proves
+  // the preserved backing data stays alive until the old global ID is removed during drain.
+  exercise("buffered-borrowed", "borrow:", 1024, false);
 }
 
 TEST_F(SearchFamilyTest, HnswKnnFloat16) {

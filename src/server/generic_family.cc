@@ -4,6 +4,7 @@
 
 #include "server/generic_family.h"
 
+#include <absl/container/flat_hash_set.h>
 #include <absl/container/inlined_vector.h>
 #include <absl/strings/ascii.h>
 #include <absl/strings/str_cat.h>
@@ -1787,6 +1788,52 @@ bool WillAutoJournalVerbatim(const Transaction* tx) {
   return auto_journals && !(cid->opt_mask() & CO::NO_AUTOJOURNAL);
 }
 
+// SORT mutates a TTL-bearing set while fetching it: DenseSet iteration removes expired members.
+// A peer can execute the verbatim SORT at a different wall-clock instant, so preserve the source
+// effect as SREM when only part of the set expires. Full expiry continues to use the existing DEL
+// path. SORT_RO never journals and therefore does not need compensation.
+absl::flat_hash_set<string> CaptureSortMembersBeforeExpiry(const OpArgs& op_args,
+                                                           const PrimeValue* pv) {
+  absl::flat_hash_set<string> members;
+  if (!op_args.shard->journal() || !WillAutoJournalVerbatim(op_args.tx) ||
+      pv->ObjType() != OBJ_SET || !pv->HasMemberExpiration()) {
+    return members;
+  }
+
+  pv->SetMemberTime(0);  // expose TTL-bearing members without expiring them during this pass
+  Iterate(*pv, [&members](const container_utils::ContainerEntry& entry) {
+    if (entry.IsString())
+      members.emplace(entry.ToString());
+    else
+      members.emplace(absl::StrCat(entry.as_long()));
+    return true;
+  });
+  pv->SetMemberTime(MemberTimeSeconds(op_args.db_cntx.time_now_ms));
+  return members;
+}
+
+void MarkSortMemberSurviving(const container_utils::ContainerEntry& entry,
+                             absl::flat_hash_set<string>* possible_expired) {
+  if (possible_expired->empty())
+    return;
+  if (entry.IsString())
+    possible_expired->erase(entry.ToString());
+  else
+    possible_expired->erase(absl::StrCat(entry.as_long()));
+}
+
+void JournalSortPartialExpiry(const OpArgs& op_args, string_view key,
+                              const absl::flat_hash_set<string>& expired, bool key_deleted) {
+  if (key_deleted || expired.empty())
+    return;
+
+  absl::InlinedVector<string_view, 8> args{key};
+  args.reserve(expired.size() + 1);
+  for (const string& member : expired)
+    args.push_back(member);
+  RecordJournal(op_args, "SREM"sv, args);
+}
+
 // Create a SortEntryList from given key
 OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_view key,
                                             SortEntryList* dest) {
@@ -1800,19 +1847,26 @@ OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_v
     return OpStatus::WRONG_TYPE;
   }
 
+  auto possible_expired = CaptureSortMembersBeforeExpiry(op_args, &it->second);
+  it->second.SetMemberTime(MemberTimeSeconds(op_args.db_cntx.time_now_ms));
+
   bool success = std::visit(
-      [&pv = it->second](auto& entries) {
+      [&pv = it->second, &possible_expired](auto& entries) {
         entries.reserve(pv.Size());
-        return Iterate(pv, [&entries](const ContainerEntry& entry) {
-          if (entry.IsString())
-            return entries.emplace_back().Parse(entry.ToString());
-          else
-            return entries.emplace_back().Parse(entry.as_long());
-        });
+        bool parsed_all = true;
+        bool iterated_all =
+            Iterate(pv, [&entries, &possible_expired, &parsed_all](const ContainerEntry& entry) {
+              MarkSortMemberSurviving(entry, &possible_expired);
+              bool parsed = entry.IsString() ? entries.emplace_back().Parse(entry.ToString())
+                                             : entries.emplace_back().Parse(entry.as_long());
+              parsed_all &= parsed;
+              // Finish the physical walk after a parse error so possible_expired contains only
+              // members actually removed by lazy expiry, never unvisited live members.
+              return true;
+            });
+        return iterated_all && parsed_all;
       },
       *dest);
-  if (!success)
-    return OpStatus::INVALID_NUMERIC_RESULT;
 
   auto obj_type = it->second.ObjType();
 
@@ -1827,10 +1881,14 @@ OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_v
   // DEL is unconditional, so it destroys any members a concurrent peer write added that this
   // node never saw -- arguably wider exposure here, since plain `SORT key` (no STORE) is a
   // read-shaped use of a command CO::JOURNALED still classifies as a write.
-  if (obj_type == OBJ_SET && it->second.Size() == 0) {
-    SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
-                                /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
-  }
+  bool key_deleted =
+      obj_type == OBJ_SET && it->second.Size() == 0 &&
+      SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
+                                  /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
+  JournalSortPartialExpiry(op_args, key, possible_expired, key_deleted);
+
+  if (!success)
+    return OpStatus::INVALID_NUMERIC_RESULT;
 
   return obj_type;
 }
@@ -1853,12 +1911,15 @@ OpResult<pair<vector<string>, CompactObjType>> OpFetchContainerElements(const Op
 
   auto obj_type = it->second.ObjType();
 
+  auto possible_expired = CaptureSortMembersBeforeExpiry(op_args, &it->second);
+
   // Enable lazy per-member expiry before iterating dense sets.  Without this,
   // IterateSet would skip expiry entirely and empty-set cleanup below would
   // depend on a prior command having set time_now_.
   it->second.SetMemberTime(MemberTimeSeconds(op_args.db_cntx.time_now_ms));
 
-  Iterate(it->second, [&elements](const ContainerEntry& entry) {
+  Iterate(it->second, [&elements, &possible_expired](const ContainerEntry& entry) {
+    MarkSortMemberSurviving(entry, &possible_expired);
     elements.emplace_back(entry.ToString());
     return true;
   });
@@ -1873,10 +1934,11 @@ OpResult<pair<vector<string>, CompactObjType>> OpFetchContainerElements(const Op
   // DEL is unconditional, so it destroys any members a concurrent peer write added that this
   // node never saw -- arguably wider exposure here, since plain `SORT key` (no STORE) is a
   // read-shaped use of a command CO::JOURNALED still classifies as a write.
-  if (obj_type == OBJ_SET && it->second.Size() == 0) {
-    SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
-                                /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
-  }
+  bool key_deleted =
+      obj_type == OBJ_SET && it->second.Size() == 0 &&
+      SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
+                                  /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
+  JournalSortPartialExpiry(op_args, key, possible_expired, key_deleted);
 
   return std::make_pair(std::move(elements), obj_type);
 }
@@ -2297,6 +2359,10 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
         // in case of SORT option, we fetch only on the source shard
         if (shard->shard_id() == source_sid) {
           fetch_result = OpFetchSortEntries(t->GetOpArgs(shard), key, &sorted_entries);
+          // A failed SORT may still have journaled an SREM for members removed by lazy expiry,
+          // but the failed SORT itself must not be auto-journaled. Propagate the operation status
+          // to Transaction::LogAutoJournalOnShard instead of masking it with OK.
+          return fetch_result.status();
         }
         return OpStatus::OK;
       };

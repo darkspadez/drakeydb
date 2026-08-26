@@ -112,10 +112,12 @@ struct JsonAccessor : public BaseAccessor {
       path_cache_;
 };
 
-// Get accessor for value
+// Get accessor for value. kPreserve keeps the container's existing logical clock, allowing
+// callers to inspect the physical pre-expiry hash contents.
 // If cleanup_key is non-empty, the returned StringMapAccessor (if any) will
 // delete the DB key in its destructor when the hash has become empty.
-std::unique_ptr<BaseAccessor> GetAccessor(const DbContext& db_cntx, const PrimeValue& pv,
-                                          std::string_view cleanup_key = {});
+std::unique_ptr<BaseAccessor> GetAccessor(
+    const DbContext& db_cntx, const PrimeValue& pv, std::string_view cleanup_key = {},
+    MemberTimePolicy member_time_policy = MemberTimePolicy::kUpdate);
 
 }  // namespace dfly

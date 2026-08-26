@@ -386,6 +386,9 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
 }
 
 error_code Replica::Greet() {
+  // A reconnect attempt represents a new observation window. Clear the previous connection's
+  // skew before the first operation can fail so INFO never reports data from an older handshake.
+  clock_skew_ms_.store(0, std::memory_order_relaxed);
   ResetParser(RedisParser::Mode::CLIENT);
   VLOG(1) << "greeting message handling";
   // Corresponds to server.repl_state == REPL_STATE_CONNECTING state in redis
@@ -428,16 +431,9 @@ error_code Replica::Greet() {
 
   // drakeydb: node identity exchange (KeyDB-compatible; KeyDB sends uuid right after its capa
   // batch). Clear the previous connection's identity before the exchange so an unsupported reply
-  // after reconnect cannot leave stale data in INFO. clock_skew_ms_ (P4-0) is reset alongside
-  // master_clock_ms for the same reason: Greet() can return early below (RETURN_ON_ERR /
-  // PC_RETURN_ON_BAD_RESPONSE) before ever reaching the store further down, and the reconnect
-  // loop re-enters Greet() on this same Replica, so without this a stale skew from a prior
-  // successful exchange would keep rendering on this peer's INFO line -- and unlike node_uuid,
-  // clock_skew_ms is rendered unconditionally (multi_master.cc), so it would not even have the
-  // courtesy of vanishing.
+  // after reconnect cannot leave stale identity data in INFO.
   master_context_.master_node_uuid.clear();
   master_context_.master_clock_ms = 0;
-  clock_skew_ms_.store(0, std::memory_order_relaxed);
   RETURN_ON_ERR(
       SendCommandAndReadResponse(StrCat("REPLCONF UUID ", service_.server_family().node_uuid())));
   if (!LastResponseArgs().empty() && LastResponseArgs()[0].type == RespExpr::ERROR) {

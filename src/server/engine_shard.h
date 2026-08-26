@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include "core/intent_lock.h"
 #include "core/mi_memory_resource.h"
 #include "core/page_usage/page_usage_stats.h"
@@ -17,6 +19,7 @@ typedef char* sds;
 namespace dfly {
 
 class EngineShardSet;
+class Namespace;
 class TieredStorage;
 class ShardDocIndices;
 
@@ -345,6 +348,8 @@ class EngineShard {
 
   uint32_t defrag_task_id_ = UINT32_MAX, huffman_check_task_id_ = UINT32_MAX;
   EvictionTaskState eviction_state_;  // Used on eviction fiber
+  size_t namespace_reaper_cursor_ = 0;
+  std::unordered_map<const Namespace*, size_t> namespace_reaper_db_cursors_;
   util::fb2::Fiber fiber_heartbeat_periodic_;
   util::fb2::Done fiber_heartbeat_periodic_done_;
 

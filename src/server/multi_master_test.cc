@@ -995,6 +995,68 @@ TEST_F(OriginJournalFamilyTest, DerivedDeleteInheritsCausingTransactionOrigin) {
   EXPECT_FALSE(del->entry_flags & journal::kEntryFlagExpired);
 }
 
+// HMapWrap's generic read wrapper has a separate empty-hash deletion path from
+// HSetFamily::DeleteIfEmpty. It must carry the same derived flag now that the reaper guarantees
+// independent convergence in every namespace and DB.
+TEST_F(OriginJournalFamilyTest, HMapWrapDeleteCarriesDerivedFlag) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  EXPECT_EQ(Run({"hset", "hmap-wrap", "field", "value"}).GetInt(), 1);
+  Run({"hexpire", "hmap-wrap", "1", "FIELDS", "1", "field"});
+  AdvanceTime(1100);
+
+  consumer.entries.clear();
+  EXPECT_THAT(Run({"hget", "hmap-wrap", "field"}), ArgType(RespExpr::NIL));
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+
+  EXPECT_EQ(Run({"exists", "hmap-wrap"}).GetInt(), 0);
+  const CapturedEntry* del = LastDel(consumer.entries);
+  ASSERT_NE(del, nullptr);
+  EXPECT_TRUE(del->entry_flags & journal::kEntryFlagDerived);
+}
+
+// HSETEX FNX/FXX is the HMapWrap exception: a peer with a lagging member-expiry clock can choose
+// the opposite conditional branch. Its explicit DEL must therefore reach the peer before the
+// verbatim HSETEX entry instead of relying on eventual reaping to repair a skipped conditional.
+TEST_F(OriginJournalFamilyTest, HSetExConditionalDeleteStaysForwarded) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  EXPECT_EQ(Run({"hset", "hsetex-condition", "field", "old"}).GetInt(), 1);
+  Run({"hexpire", "hsetex-condition", "1", "FIELDS", "1", "field"});
+  AdvanceTime(1100);
+
+  consumer.entries.clear();
+  EXPECT_THAT(Run({"hsetex", "hsetex-condition", "FNX", "FIELDS", "1", "field", "new"}), IntArg(1));
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+
+  EXPECT_EQ(Run({"hget", "hsetex-condition", "field"}), "new");
+  const CapturedEntry* del = LastDel(consumer.entries);
+  ASSERT_NE(del, nullptr);
+  EXPECT_FALSE(del->entry_flags & journal::kEntryFlagDerived);
+  auto del_it = std::ranges::find_if(consumer.entries,
+                                     [](const CapturedEntry& entry) { return entry.cmd == "DEL"; });
+  auto hsetex_it = std::ranges::find_if(
+      consumer.entries, [](const CapturedEntry& entry) { return entry.cmd == "HSETEX"; });
+  ASSERT_NE(hsetex_it, consumer.entries.end());
+  EXPECT_LT(del_it, hsetex_it);
+}
+
 // drakeydb: P4-0 acceptance case. A DEL derived from a collection command emptying its key must
 // carry kEntryFlagDerived so PassesPeerEchoFilter (journal/types.cc) keeps it off mesh-peer
 // links -- see docs/PLAN.md's Phase 4 section for why every one of the ~25 DeleteIfEmpty/
@@ -1137,6 +1199,65 @@ TEST_F(OriginJournalFamilyTest, SortDerivedDeleteReachesPeersButSortRoStaysSuppr
   ASSERT_NE(nullptr, sortro_del);
   EXPECT_TRUE(sortro_del->entry_flags & journal::kEntryFlagDerived)
       << "SORT_RO never auto-journals, so its derived DEL must stay suppressed";
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+}
+
+// Partial lazy expiry must be journaled as SREM before SORT itself. Otherwise a peer whose clock
+// has not expired the same member computes a different STORE destination when replaying SORT.
+// Exercise both source-fetch implementations: the ordinary sorted path and BY nosort.
+TEST_F(OriginJournalFamilyTest, SortPartialExpiryJournalsSourceEffectBeforeDestinationEffect) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  auto exercise = [&](string_view key, string_view dest, bool no_sort) {
+    EXPECT_EQ(Run({"sadd", key, "1", "2"}).GetInt(), 2);
+    Run({"fieldexpire", key, "1", "1"});
+    AdvanceTime(1100);
+
+    consumer.entries.clear();
+    if (no_sort)
+      Run({"sort", key, "by", "nosort", "store", dest});
+    else
+      Run({"sort", key, "store", dest});
+
+    EXPECT_EQ(Run({"scard", key}).GetInt(), 1);
+    EXPECT_EQ(Run({"sismember", key, "2"}).GetInt(), 1);
+    EXPECT_EQ(Run({"llen", dest}).GetInt(), 1);
+    EXPECT_EQ(Run({"lindex", dest, "0"}), "2");
+
+    auto srem = std::ranges::find_if(
+        consumer.entries, [](const CapturedEntry& entry) { return entry.cmd == "SREM"; });
+    auto sort = std::ranges::find_if(
+        consumer.entries, [](const CapturedEntry& entry) { return entry.cmd == "SORT"; });
+    ASSERT_NE(srem, consumer.entries.end()) << "partial expiry must emit SREM";
+    ASSERT_NE(sort, consumer.entries.end()) << "SORT must still auto-journal";
+    EXPECT_LT(srem, sort) << "the peer must remove expired source members before replaying SORT";
+  };
+
+  exercise("sort-partial", "sort-partial-dest", false);
+  exercise("sort-nosort-partial", "sort-nosort-partial-dest", true);
+
+  EXPECT_EQ(Run({"sadd", "sort-error-partial", "expired", "not-a-number"}).GetInt(), 2);
+  Run({"fieldexpire", "sort-error-partial", "1", "expired"});
+  AdvanceTime(1100);
+  consumer.entries.clear();
+
+  EXPECT_THAT(Run({"sort", "sort-error-partial"}), ErrArg("can't be converted into double"));
+  EXPECT_THAT(Run({"smembers", "sort-error-partial"}), RespElementsAre("not-a-number"));
+  auto srem = std::ranges::find_if(consumer.entries,
+                                   [](const CapturedEntry& entry) { return entry.cmd == "SREM"; });
+  auto sort = std::ranges::find_if(consumer.entries,
+                                   [](const CapturedEntry& entry) { return entry.cmd == "SORT"; });
+  ASSERT_NE(srem, consumer.entries.end())
+      << "an errored SORT must still replicate the lazy source expiry it performed";
+  EXPECT_EQ(sort, consumer.entries.end()) << "the failed SORT itself must not be journaled";
 
   pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
 }
@@ -1303,6 +1424,14 @@ class ReaperJournalFamilyTest : public ActiveReplicaFamilyTest {
     num_threads_ = 1;
     absl::SetFlag(&FLAGS_num_shards, 1);
   }
+
+  void DeleteReapedContainerForTest(DbSlice& db_slice, const DbContext& cntx, string_view key) {
+    PrimeTable* table = db_slice.GetTables(cntx.db_index);
+    auto it = table->Find(key);
+    ASSERT_NE(it, table->end());
+    db_slice.DeleteReapedContainer(cntx, key, DbSlice::Iterator(it, StringOrView::FromView(key)),
+                                   true);
+  }
 };
 
 // drakeydb: P4-0 Task 2b acceptance case. DbSlice::DeleteExpiredStep's member-expiry reaper must
@@ -1365,6 +1494,81 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteCarriesDerivedFlag) {
   peer_check.entry_flags = del->entry_flags;
   EXPECT_FALSE(journal::PassesPeerEchoFilter(peer_check))
       << "reaper DEL must never reach a mesh peer -- the peer derives its own";
+}
+
+TEST_F(ReaperJournalFamilyTest, LocalOnlyReaperDoesNotJournalNamespaceBlindDelete) {
+  OriginFlagCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        journal::StartInThread();
+        consumer_id = journal::RegisterConsumer(&consumer);
+      })
+      .Join();
+
+  EXPECT_EQ(Run({"sadd", "local-only-reap", "member"}).GetInt(), 1);
+  Run({"fieldexpire", "local-only-reap", "1", "member"});
+  AdvanceTime(1100);
+  consumer.entries.clear();
+
+  shard_set->RunBriefInParallel([](EngineShard* shard) {
+    Namespace& ns = namespaces->GetDefaultNamespace();
+    DbSlice& db_slice = ns.GetDbSlice(shard->shard_id());
+    DbContext cntx{&ns, 0, TEST_current_time_ms};
+    journal::DisableFlushGuard guard(shard->journal());
+    db_slice.DeleteExpiredStep(cntx, 100000,
+                               {.ensure_member_reaping = true, .journal_deletions = false});
+  });
+
+  pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+
+  EXPECT_EQ(Run({"exists", "local-only-reap"}).GetInt(), 0);
+  EXPECT_EQ(LastDel(consumer.entries), nullptr)
+      << "a namespace-local reap cannot emit a wire DEL without namespace identity";
+}
+
+// Pins the direct delete mechanism independently from the snapshot gate. A registered inert
+// consumer makes an accidental return to FindMutable/DeleteSetIfEmpty observable through
+// OnChange, while remaining safe to invoke directly because it serializes no data.
+TEST_F(ReaperJournalFamilyTest, ReaperDeleteBypassesChangeCallbacks) {
+  class CountingChangeConsumer final : public DbSlice::ChangeConsumerInterface {
+   public:
+    void OnChange(DbIndex, const ChangeReq&) override {
+      ++calls;
+    }
+    unsigned calls = 0;
+  } change_consumer;
+
+  OriginFlagCapturingConsumer journal_consumer;
+  uint32_t journal_consumer_id = 0;
+  EXPECT_EQ(Run({"sadd", "direct-reaper-delete", "member"}).GetInt(), 1);
+
+  pp_->at(0)->Await([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    journal::StartInThread();
+    journal_consumer_id = journal::RegisterConsumer(&journal_consumer);
+
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    db_slice.RegisterOnChange(&change_consumer);
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+
+    DbContext cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+    {
+      journal::DisableFlushGuard guard(shard->journal());
+      DeleteReapedContainerForTest(db_slice, cntx, "direct-reaper-delete");
+    }
+
+    EXPECT_TRUE(db_slice.UnregisterOnChange(&change_consumer));
+    journal::UnregisterConsumer(journal_consumer_id);
+  });
+
+  EXPECT_EQ(change_consumer.calls, 0u)
+      << "the direct reaper delete must not enter OnChange inside the atomic section";
+  EXPECT_EQ(Run({"exists", "direct-reaper-delete"}).GetInt(), 0);
+  const CapturedEntry* del = LastDel(journal_consumer.entries);
+  ASSERT_NE(del, nullptr);
+  EXPECT_TRUE(del->entry_flags & journal::kEntryFlagDerived);
 }
 
 // drakeydb: P4-0 Task 2b, fix round 6 Critical 1 -- the whole member-reap block used to live
@@ -1514,16 +1718,10 @@ class BlockingSnapshotConsumer : public SliceSnapshot::SnapshotDataConsumerInter
 // block a concurrent snapshot -- true unconditionally now, since skipping trivially cannot block
 // on anything.
 //
-// Consequence worth knowing, not a defect: the round-1 redirect away from DeleteSetIfEmpty/
-// DeleteIfEmpty to the three-arg Del() -- what originally fixed the preemption hazard this test's
-// first paragraph describes -- no longer has a regression test of its own. The
-// HasRegisteredCallbacks() gate makes the OnChange path unreachable from the reaper by
-// construction, so nothing here still exercises "does the reaper's OWN delete mechanism avoid
-// stream_mu_" the way this test originally did; it now only proves the reap is skipped before
-// reaching either mechanism. That is defense-in-depth, not redundant coverage: a future change
-// that removes or narrows the HasRegisteredCallbacks() gate would silently re-expose the original
-// preemption hazard with no test here to catch it. Flagging this rather than leaving a
-// falsification claim standing that no longer runs.
+// ReaperDeleteBypassesChangeCallbacks independently pins the round-1 direct-delete redirect with
+// an inert registered consumer. This test remains responsible only for the real snapshot gate:
+// a serializing consumer makes container mutation unsafe even when the delete itself cannot
+// preempt.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave) {
   // Activates SerializerBase::stream_mu_ (server/serializer_base.cc: `stream_mu_(!absl::GetFlag(
   // FLAGS_serialization_tagged_chunks))`) -- inactive (a no-op OptionalMutex) under the tagged-
@@ -1548,20 +1746,16 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
   }
   ASSERT_EQ(Run({"sadd", "rs", "m"}).GetInt(), 1);
   Run({"fieldexpire", "rs", "1", "m"});
-  AdvanceTime(1100);
 
-  // drakeydb: P4-0 Task 2b, fix round 8 (minor, coordinator's own flag) -- pin the reaper off by
-  // default for this whole test, flipping it on only for the two explicit calls that want it
-  // active. Without this, the server's REAL background heartbeat -- which keeps running
-  // throughout this test -- can reap "rs" on its own at any point after AdvanceTime, including
-  // before the Await() block below even starts, or during any yield inside a later Run() call;
-  // narrowed by ordering assertions right after Await() returns (fix round 6), but not closed,
-  // since Run() itself can yield. Restored to its original value on scope exit.
-  const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
-  absl::SetFlag(&FLAGS_reaper_member_walk_budget, 0);
-  absl::Cleanup restore_walk_budget = [saved_walk_budget] {
-    absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+  // Pause the production heartbeat reaper before advancing past the TTL. A zero walk budget
+  // cannot do this because the heartbeat deliberately clamps it to one. Explicit synchronous
+  // reap calls flip active mode on only while no fiber can yield.
+  const bool saved_active_replica = absl::GetFlag(FLAGS_active_replica);
+  absl::SetFlag(&FLAGS_active_replica, false);
+  absl::Cleanup restore_active_replica = [saved_active_replica] {
+    absl::SetFlag(&FLAGS_active_replica, saved_active_replica);
   };
+  AdvanceTime(1100);
 
   BlockingSnapshotConsumer consumer;
   ExecutionState exec_state;
@@ -1589,18 +1783,17 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
     consumer.WaitEntered();
 
     // Trigger the reaper concurrently, from this fiber, inside the real heartbeat's atomic
-    // section -- restoring the walk budget just for this one synchronous call (no yield between
-    // the two SetFlag calls, so the real heartbeat cannot observe a nonzero budget from any
-    // other fiber). See MemberExpiryReaperSkipsContainerDuringConcurrentSnapshot below for what
-    // this call is and is not expected to do now.
+    // section -- enabling active mode only for this synchronous call. See
+    // MemberExpiryReaperSkipsContainerDuringConcurrentSnapshot below for what this call is and
+    // is not expected to do now.
     {
       journal::DisableFlushGuard guard(shard->journal());
-      absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+      absl::SetFlag(&FLAGS_active_replica, true);
       DbContext db_cntx;
       db_cntx.db_index = 0;
       db_cntx.time_now_ms = TEST_current_time_ms;
       db_slice.DeleteExpiredStep(db_cntx, 100);
-      absl::SetFlag(&FLAGS_reaper_member_walk_budget, 0);
+      absl::SetFlag(&FLAGS_active_replica, false);
     }
 
     consumer.Release();
@@ -1612,9 +1805,8 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
   // registered snapshot consumer was present for the entire DeleteExpiredStep call above, so the
   // HasRegisteredCallbacks() gate must have skipped it (deferral, not vacuous inaction -- see the
   // follow-up reap below, which proves it resumes correctly once the consumer is gone). The
-  // walk-budget pin above (fix round 8) rules out the real background heartbeat as an
-  // alternative explanation for "rs" being gone here, closing the flake window this assertion
-  // used to have.
+  // active-mode pause above rules out the real background heartbeat as an alternative
+  // explanation for "rs" being gone here.
   EXPECT_EQ(Run({"exists", "rs"}).GetInt(), 1)
       << "the reaper reaped a container while a snapshot consumer was registered -- the "
          "HasRegisteredCallbacks() gate did not skip it";
@@ -1622,9 +1814,8 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
       << "the concurrent snapshot itself must have completed undisturbed";
 
   // The skip must be a deferral, not a permanent miss: with the consumer now unregistered, the
-  // very next reap call must clean "rs" up normally. Budget restored just for this one call, for
-  // the same reason as the one inside Await() above.
-  absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+  // very next reap call must clean "rs" up normally.
+  absl::SetFlag(&FLAGS_active_replica, true);
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
     DbContext db_cntx;
@@ -1632,6 +1823,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
     db_cntx.time_now_ms = TEST_current_time_ms;
     db_slice.DeleteExpiredStep(db_cntx, 100);
   });
+  absl::SetFlag(&FLAGS_active_replica, false);
   EXPECT_EQ(Run({"exists", "rs"}).GetInt(), 0)
       << "the reaper did not resume once the snapshot consumer unregistered";
 }
@@ -1685,17 +1877,15 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
   for (int i = 0; i < kFields; i += 2)
     fieldexpire_args.push_back(absl::StrCat("f", i));
   Run(fieldexpire_args);
-  AdvanceTime(1100);
 
-  // drakeydb: P4-0 Task 2b, fix round 8 (minor, coordinator's own flag) -- same reasoning as
-  // MemberExpiryReaperDoesNotBlockOnConcurrentBgsave above: pin the reaper off by default so the
-  // real background heartbeat cannot be an alternative explanation for any assertion below,
-  // flipping it on only for the explicit calls that want it active. Restored on scope exit.
-  const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
-  absl::SetFlag(&FLAGS_reaper_member_walk_budget, 0);
-  absl::Cleanup restore_walk_budget = [saved_walk_budget] {
-    absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+  // A zero walk budget is clamped to one by the production heartbeat. Disable active mode before
+  // advancing past the TTL, then enable it only around the explicit synchronous calls.
+  const bool saved_active_replica = absl::GetFlag(FLAGS_active_replica);
+  absl::SetFlag(&FLAGS_active_replica, false);
+  absl::Cleanup restore_active_replica = [saved_active_replica] {
+    absl::SetFlag(&FLAGS_active_replica, saved_active_replica);
   };
+  AdvanceTime(1100);
 
   BlockingSnapshotConsumer consumer;
   ExecutionState exec_state;
@@ -1713,15 +1903,14 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
 
     {
       journal::DisableFlushGuard guard(shard->journal());
-      // Restored just for this one synchronous call (no yield between the two SetFlag calls, so
-      // no other fiber can observe a nonzero budget) -- this call must still skip "bighash"
-      // entirely, since a snapshot consumer is registered for its whole duration.
-      absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+      // This call must still skip "bighash" entirely, since a snapshot consumer is registered
+      // for its whole duration.
+      absl::SetFlag(&FLAGS_active_replica, true);
       DbContext db_cntx;
       db_cntx.db_index = 0;
       db_cntx.time_now_ms = TEST_current_time_ms;
       db_slice.DeleteExpiredStep(db_cntx, 100);
-      absl::SetFlag(&FLAGS_reaper_member_walk_budget, 0);
+      absl::SetFlag(&FLAGS_active_replica, false);
     }
 
     consumer.Release();
@@ -1731,9 +1920,8 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
 
   // The reaper must not have touched "bighash" while the snapshot was registered: still all
   // kFields present immediately after the race window, nothing reaped by the manual
-  // DeleteExpiredStep call made while the consumer was registered. The walk-budget pin above
-  // (fix round 8) rules out the real background heartbeat as an alternative explanation, closing
-  // the flake window this assertion used to have.
+  // DeleteExpiredStep call made while the consumer was registered. The active-mode pause above
+  // rules out the real background heartbeat as an alternative explanation.
   ASSERT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields)
       << "the reaper reaped members from a container mid-snapshot -- HasRegisteredCallbacks() "
          "gate did not skip it";
@@ -1752,10 +1940,8 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
   // held whether or not DeleteExpiredStep did anything. Here, before any reload has happened,
   // the only thing that can have reaped "bighash" down to kFields / 2 is this explicit
   // DeleteExpiredStep call itself -- the skip above was a deferral, not a permanent miss, and
-  // this is what actually distinguishes that from a stuck/broken resume. Budget restored just
-  // for this call (fix round 8) -- everything after this point no longer needs the pin, since
-  // there is no more "must not have been touched" assertion left to protect.
-  absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+  // this is what actually distinguishes that from a stuck/broken resume.
+  absl::SetFlag(&FLAGS_active_replica, true);
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
     DbContext db_cntx;
@@ -1763,6 +1949,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
     db_cntx.time_now_ms = TEST_current_time_ms;
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
+  absl::SetFlag(&FLAGS_active_replica, false);
   ASSERT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields / 2)
       << "the reaper must resume and reap the due fields once the snapshot consumer unregisters";
 
@@ -1834,14 +2021,15 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
 
   size_t before = GetMetrics().db_stats[0].obj_memory_usage;
 
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
+  size_t reported_deleted_bytes = 0;
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
     DbContext db_cntx;
     db_cntx.db_index = 0;
     db_cntx.time_now_ms = TEST_current_time_ms;
     // count=100000 bounds the outer prime-table traversal, not the reaper's own per-container
     // walk -- see this test's comment above for why that distinction matters here.
-    db_slice.DeleteExpiredStep(db_cntx, 100000);
+    reported_deleted_bytes = db_slice.DeleteExpiredStep(db_cntx, 100000).deleted_bytes;
   });
 
   size_t after = GetMetrics().db_stats[0].obj_memory_usage;
@@ -1851,6 +2039,38 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
   ASSERT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields / 2);
   EXPECT_LT(after, before) << "reaping half the fields shrank the container's MallocUsed(), but "
                               "obj_memory_usage was not correspondingly reconciled";
+  EXPECT_EQ(reported_deleted_bytes, before - after)
+      << "partial member expiry must contribute reclaimed bytes to eviction accounting";
+}
+
+// A partial hash reap is a real document mutation even though it bypasses command callbacks.
+// Search postings must be removed before expired fields are freed and rebuilt from survivors.
+TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperRefreshesHashSearchIndex) {
+  EXPECT_EQ(Run({"FT.CREATE", "reaper-index", "ON", "HASH", "PREFIX", "1", "reaper-doc:", "SCHEMA",
+                 "tag", "TAG"}),
+            "OK");
+  EXPECT_EQ(Run({"hset", "reaper-doc:1", "tag", "red", "keep", "alive"}).GetInt(), 2);
+
+  auto before = Run({"FT.SEARCH", "reaper-index", "@tag:{red}", "NOCONTENT"});
+  ASSERT_THAT(before, ArgType(RespExpr::ARRAY));
+  ASSERT_FALSE(before.GetVec().empty());
+  EXPECT_THAT(before.GetVec().front(), IntArg(1));
+
+  Run({"hexpire", "reaper-doc:1", "1", "FIELDS", "1", "tag"});
+  AdvanceTime(1100);
+  shard_set->RunBriefInParallel([](EngineShard* shard) {
+    Namespace& ns = namespaces->GetDefaultNamespace();
+    DbSlice& db_slice = ns.GetDbSlice(shard->shard_id());
+    DbContext db_cntx{&ns, 0, TEST_current_time_ms};
+    db_slice.DeleteExpiredStep(db_cntx, 100000);
+  });
+
+  EXPECT_EQ(Run({"hget", "reaper-doc:1", "keep"}), "alive");
+  EXPECT_THAT(Run({"hget", "reaper-doc:1", "tag"}), ArgType(RespExpr::NIL));
+  auto after = Run({"FT.SEARCH", "reaper-index", "@tag:{red}", "NOCONTENT"});
+  ASSERT_THAT(after, ArgType(RespExpr::ARRAY));
+  ASSERT_FALSE(after.GetVec().empty());
+  EXPECT_THAT(after.GetVec().front(), IntArg(0));
 }
 
 // drakeydb: P4-0 Task 2b, fix round 2, Important B -- fix round 1's AutoUpdater::Run() also
@@ -1862,7 +2082,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
 // hand -- see task-2b-report.md) makes the EXEC below come back kExecFail instead of
 // kExecSuccess, purely from the reaper's own heartbeat-driven walk.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotSpuriouslyAbortWatch) {
-  auto kExecSuccess = ArgType(RespExpr::ARRAY);
+  const auto kExecSuccess = ArgType(RespExpr::ARRAY);
 
   ASSERT_EQ(Run({"sadd", "ws", "keep", "gone"}).GetInt(), 2);
   Run({"fieldexpire", "ws", "1", "gone"});

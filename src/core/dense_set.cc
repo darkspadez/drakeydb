@@ -437,6 +437,13 @@ void DenseSet::Shrink(size_t new_size) {
   DCHECK_GE(new_size, kMinSize);
   DCHECK_LT(new_size, entries_.size());
 
+  // Every bucket is rebuilt below. Invalidate the resume position at the mutation site so a
+  // shrink followed by regrowth to the original capacity cannot hide the relocation from the
+  // next reaper step.
+  reaper_cursor_ = 0;
+  reaper_any_ttl_seen_ = false;
+  reaper_pass_capacity_log_ = 0;
+
   size_t prev_size = entries_.size();
   capacity_log_ = absl::bit_width(new_size) - 1;
 
@@ -487,6 +494,13 @@ void DenseSet::Fill(DenseSet* other) const {
 }
 
 void DenseSet::Grow(size_t prev_size) {
+  // Grow rehashes existing entries. Reset here (rather than relying only on a later capacity
+  // comparison) so multiple rebuilds that end at the original capacity still invalidate an
+  // in-flight reaper pass.
+  reaper_cursor_ = 0;
+  reaper_any_ttl_seen_ = false;
+  reaper_pass_capacity_log_ = 0;
+
   DensePtr first;
 
   // Corner case. Usually elements are moved to higher buckets during rehashing.

@@ -43,7 +43,7 @@ closed.
 | D1 | Stored value is **16 bytes, `{u64 mvcc, u64 origin_hash}`**, compared lexicographically | KeyDB's `dbMerge` is `if (old_mvcc <= incoming) overwrite` (`KeyDB/src/db.cpp:384`) — incoming wins ties. In a mesh, A takes B's value and B takes A's: they swap, permanently. Ties are **common, not rare** — the 20-bit counter sits at 0 under light load, so two nodes writing in the same millisecond collide. `origin_hash` is a stable 64-bit hash of the **author** node's uuid (never the sender's) and makes the order total. |
 | D2 | Side `DashTable<PrimeKey, MvccStamp>` on `DbTable`, mcflag-style, constructed only in active mode | Follows the one existing per-key-metadata precedent (`table.h:128`). `CompactObj` must not grow — `sizeof(CompactObj) == 18` is a hard static_assert (`core/compact_object.cc:613`). |
 | D3 | Local stamp = **`max(clock_tick(), stored.mvcc + 1)`** | A backward-skewed node otherwise stamps a local write *below* the stored remote value: its client sees `OK`, every peer drops the write as stale, and nothing detects it. Per-key `max` repairs it exactly. Deliberately **not** a per-shard HLC ratchet — that lets one fast-clock peer poison a whole shard's clock permanently. |
-| D4 | Stamp persists per key via a **new flag bit on `RDB_OPCODE_DF_MASK`**; loader also accepts KeyDB's bare-u64 `mvcc-tstamp` | Dragonfly has **no per-key aux facility** — `RDB_OPCODE_AUX` is file-level — so PLAN.md's KeyDB-borrowed "per-key aux" cannot be built as written. DF_MASK is already per-key, variable-length, and flag-extensible. "One codepath serves DF↔DF and KeyDB ingest" is retired on the **save** side only; P7 onboarding still works because the loader reads both forms. |
+| D4 | Stamp persists per key via **`RDB_OPCODE_DF_MVCC = 221`**; loader also accepts KeyDB's bare-u64 `mvcc-tstamp` | Dragonfly has no per-key aux facility, and extending DF_MASK would make older readers skip the flag without consuming its payload. A dedicated opcode fails deterministically on an unsupported loader. P7 onboarding still works because the loader reads both forms. |
 | D5 | Multi-key commands are **split per key** | `MSET` and multi-key `DEL` are on the guard's own command list. All-or-nothing silently drops fresh updates to non-stale keys; single-key-only exempts a whole command class. Highest-risk piece of the phase. |
 | D6 | **Bounded tombstones in scope**, persisted in the RDB, **GC'd at save time** | Closes delete-resurrection (risk register #7). Memory-only tombstones miss the headline scenario — a node restarting and full-syncing from a peer that still holds the deleted key. |
 | D7 | **Stacked PRs on one branch**; the branch merges to main only when the whole stack is green | Keeps each PR P3-sized and independently reviewable while the final whole-branch review still sees the complete convergence story. |
@@ -397,16 +397,17 @@ is correct and required.
 
 #### Does every `AutoUpdater::Run()` correspond to a journaled write? **No.**
 
-The over-stamp paths, in decreasing severity. Note `Run()` is reached both
+The over-arm paths, in decreasing severity. Note `Run()` is reached both
 explicitly (~35 sites) and via the destructor (`db_slice.cc:538`), so "the caller
 didn't call Run()" is not a defence.
 
-1. **`GETEX <key>` with no options — a pure read that stamps.** Registered
+1. **`GETEX <key>` with no options — a pure read that over-arms.** Registered
    `CO::JOURNALED | ... | CO::NO_AUTOJOURNAL` (`string_family.cc:1850`); `CmdGetEx`
    calls `FindMutable` unconditionally (`:1425`) but journals only inside
    `if (shard->journal() && exp_params.IsDefined())` (`:1436`). Reachable from any
-   client. **This also kills the idea of gating on `cid_->IsJournaled()`** — GETEX
-   *is* journaled.
+   client. No `RecordEntry` follows, so the arm is discarded at epoch end rather
+   than committed as a stamp. **This still kills the idea of gating on
+   `cid_->IsJournaled()`** — GETEX *is* journaled even though this form emits no entry.
 2. **`EXPIRE key ttl {XX|NX|GT|LT}` that is not satisfied.** `OpExpire` runs
    `post_updater.Run()` (`generic_family.cc:847`) *before* `UpdateExpire`, which
    returns `SKIPPED` when the predicate fails; the journal block is gated on
@@ -457,34 +458,34 @@ beside `repl_origin_idx` (`tx_base.h:76`) and copy it in
 
 - **Author**: `entry.mvcc = HopStamp()`, `origin_idx = kSelfIdx` -> stores `{S, H_A}`.
 - **Applier**: the parsed entry's mvcc reaches `repl_mvcc`, so `RecordEntry` sees a
-  non-zero value and does **not** re-mint; `origin_idx` resolves through
-  `PeerRegistry` to A's uuid hash -> stores `{S, H_A}`. Identical.
+  non-zero value and does **not** re-mint; the authenticated link's
+  `peer_origin_hash_` supplies A's uuid hash -> stores `{S, H_A}`. Identical.
 - **Lumping**: if one author callback arms `k1` and `k2` and then emits entries X and
   Y, the author's first commit flushes both arms with X's mvcc while the applier
   stamps `k1` from X and `k2` from Y. Because X and Y were minted from the *same
   memoised hop stamp*, `X.mvcc == Y.mvcc` and both sides agree. Without the hop memo
   this design would be off by one counter tick on every effect-rewriting command.
 
-`origin_hash` must be the **author's**, never the sender's. `PeerRegistry` gains a
-parallel append-only `idx_to_hash_` vector; because indices are dense, monotonic,
-and never reclaimed, the per-thread cache is a plain vector and the registry mutex
-is touched once per peer per thread, never per write.
+`origin_hash` must be the **author's**, never a receiver-local interpretation of a
+wire index. Peer-applied streaming entries use `origin_idx = kSelfIdx`, so author
+identity comes from the authenticated link UUID already stored as
+`peer_origin_hash_`; `PeerRegistry` indices are not portable across nodes.
 
 #### The residual, made visible
 
 `mvcc_unstamped_writes` (incremented by the discarded arm count at each epoch end)
 is the falsifier for the whole list above and the canary to watch when enabling
 `--active_replica`: it must stay **0** on a pure write workload, and moves by 1 for
-each `GETEX k`, unsatisfied `EXPIRE ... XX`, or `HTTL` on a hash with expired
-fields. This is strictly better than a `DCHECK`, because case 3 makes a hard
-assertion impossible.
+each discarded over-arm such as `GETEX k`, unsatisfied `EXPIRE ... XX`, or `HTTL`
+on a hash with expired fields. These operations do not leave a stamp behind. This
+is strictly better than a `DCHECK`, because case 3 makes a hard assertion impossible.
 
 ### D-6. Wire
 
 Populate `EntryBase::mvcc` from the transaction's allocated stamp. No framing
-change (D-1.1). The `origin_hash` is **not** added to the wire — the entry already
-carries `origin_idx`, which the receiver resolves through `PeerRegistry`. Adding a
-second identity field would be redundant and would widen every entry.
+change (D-1.1). The `origin_hash` is **not** added to the wire: a peer receiver uses
+the authenticated link UUID's `peer_origin_hash_`. Adding a second identity field
+would be redundant and would widen every entry.
 
 ### D-7. RDB persistence
 
@@ -518,17 +519,13 @@ string pair. `HandleAux` (`rdb_load.cc:3012`) already warns-and-ignores unknown 
 verified against `KeyDB/src/rdb.cpp:1164-1168` at implementation time**; the KeyDB
 tree is gitignored and lives only in the main checkout, not in this worktree.
 
-**Stamp for a key with no aux** — neither obvious value is safe, so use neither.
-`mvcc = 0` makes the whole loaded dataset lose to anything (data loss on the first
-merge after an upgrade); `mvcc = now` makes it beat everything, suppressing
-genuinely newer remote writes for a full clock period. Use **the snapshot's own
-`ctime` aux**: `mvcc = ctime_ms << 20`, `origin_hash = NodeUuidHash(own uuid)`,
-falling back to `{0,0}` only if `ctime` is absent. `ctime` is written at
-`rdb_save.cc:1768` and appears in `SaveAux` before any key, so it is always
-available in time. It is a true upper bound on every write in that snapshot and a
-lower bound on "now" — so a stale snapshot loses to live peer traffic while still
-beating genuinely older data. It is the only choice that is both honest and
-convergent.
+**Stamp for a key with no aux.** An unversioned snapshot has no sound ordering
+relative to stamped live data. In particular, its `ctime` can be ahead of the
+loader after a wall-clock rollback, so synthesizing `ctime_ms << 20` can make an
+old snapshot overwrite newer live writes. Use the conservative `{0,0}` fallback:
+an absent destination still loads normally, while any stamped resident value wins
+a merge. This may prefer resident data during the first mixed-version merge, but it
+never fabricates authority the snapshot does not contain and is rollback-safe.
 
 **Compatibility matrix.**
 
@@ -555,7 +552,7 @@ writing them to immediately expire.
 Hook in `RdbLoader::CreateObjectOnShard` (`rdb_load.cc:3173`), immediately before
 the unconditional `AddOrUpdate` at **`rdb_load.cc:3258`** — after chunked-value
 reassembly, so it runs exactly once per key, on the target shard's thread. Read the
-incoming stamp (or the `ctime` fallback), compare against the stored stamp
+incoming stamp (or the `{0,0}` unversioned fallback), compare against the stored stamp
 **including tombstones**, and `return` without writing when the stored value wins;
 otherwise `AddOrUpdate` as today and then `SetStamp`.
 
@@ -800,27 +797,32 @@ from the non-cache case.
 
 ### D-11. Derived-DEL fix (the P3 carry-forward blocker)
 
-PLAN.md describes this as "a 'why is this empty' signal threaded through ~a dozen
-call sites." There are in fact **16** call sites, but all funnel through two helper
-implementations: `HSetFamily::DeleteIfEmpty` (`hset_family.cc:1637`) and
-`SetFamily::DeleteSetIfEmpty` (`set_family.cc:1644`).
+PLAN.md describes this as "a 'why is this empty' signal" threaded through the collection
+cleanup sites. There are **28** current call sites funneled through two helper implementations,
+`HSetFamily::DeleteIfEmpty` and `SetFamily::DeleteSetIfEmpty`, plus the generic hash wrapper's
+distinct `DeleteHw` path. All three record derived DELs by default after this phase;
+clock-dependent conditional callers retain explicit forwarded-DEL carve-outs.
 
-**Hypothesis to test before writing any call-site churn: every derived DEL from
-these helpers should be peer-suppressed unconditionally**, reducing the fix to a
-flag set inside two functions.
+The adversarial call-site inventory disproved the original two-leg argument. No
+default-suppressed helper or wrapper call is backed by a source-effect command that a peer can
+replay: the callers are read-only, or (SORT) journal only a destination effect and
+therefore use the explicit non-derived carve-out. Peer-applied commands do not
+repair a source mutation that was never sent.
 
-- *Command-caused* emptiness (`SREM k lastmember`, `HDEL`): the causing command is
-  itself journaled and propagates; the peer applies it, its collection empties, and
-  its own helper derives the same DEL locally. Forwarding ours is redundant.
-- *Expiry-caused* emptiness (`HTTL` on a lazily-expired hash, `hset_family.cc:996` —
-  a **read** path; and the search doc-accessor cleanup at `doc_accessors.cc:212-220`,
-  confirmed lazy-field-expiry): the peer expires on its own clock, which is the
-  established semantic already encoded by `kEntryFlagExpired`.
-- *Peer-applied* commands already carry peer origin and are filtered today.
+Therefore peer suppression is safe only because the proactive member-expiry reaper
+is a **correctness mechanism**: every active node independently walks TTL-bearing
+containers and derives the same local deletion on its own clock. Its active-mode
+budget cannot be disabled (`0` is an effective `1`), and the heartbeat visits every
+local namespace and DB with independent incremental round-robin cursors. The container
+budget advances home slots/buckets; collision chains and extension vectors remain whole
+work units, so it is not a hard latency bound under adversarial collisions. Non-default
+namespace cleanup stays local because the replication wire has no namespace identity.
 
-This is a claim about a distributed invariant, so it is **the first thing the
-adversarial reviewer (D8) is pointed at**. If it fails, fall back to PLAN.md's
-per-call-site signal.
+SORT partial expiry is compensated explicitly with `SREM` before the verbatim SORT
+entry; a failed numeric parse completes the source walk and journals only members actually
+expired, while full expiry retains the forwarded DEL carve-out. Focused regressions pin both
+fetch implementations, the error path, `DeleteHw`, and the reaper's direct non-preempting
+deletion helper.
 
 This must precede tombstones: an incorrectly forwarded DEL would otherwise create a
 *persistent* tombstone on a peer that still holds live data.
@@ -829,7 +831,7 @@ This must precede tombstones: an incorrectly forwarded DEL would otherwise creat
 
 `master_clock_ms` has been exchanged in the handshake since P1 and read nowhere.
 Compare it against local time, `LOG(WARNING)` past a threshold, and expose
-`mvcc_clock_skew_ms`. Small, and it makes the phase's central assumption observable
+`clock_skew_ms`. Small, and it makes the phase's central assumption observable
 instead of assumed — including the fabricated-future-timestamp consequence of D3.
 
 ### D-13. Observability
@@ -869,7 +871,7 @@ the full-scan invariant (D-4).
 `INFO memory`: `mvcc_table_bytes`, `mvcc_entries`, `mvcc_tombstones`.
 `INFO replication` (inside the existing active block): `mvcc_clock_ahead_ms`,
 `mvcc_unstamped_writes`, `mvcc_tombstones_dropped`, `mvcc_stale_epoch`,
-`mvcc_clock_skew_ms`, `multimaster_lww_dropped`.
+`clock_skew_ms`, `multimaster_lww_dropped`.
 
 Two matter operationally above the rest: **`mvcc_unstamped_writes`** tells you a
 read-mutation path is over-arming, and **`mvcc_clock_ahead_ms`** tells you NTP has
@@ -905,8 +907,9 @@ Required pytest coverage (`tests/dragonfly/multimaster_test.py`, reusing
 | **Stamp identity**: a replicated key's stamp on B equals A's origin stamp exactly | Applying `max()` on the replica path instead of taking the wire value verbatim |
 
 C++ coverage: `MvccClock` monotonicity and overflow; `MvccStamp` comparison
-totality; side-table mirror invariant across every touch-point in D-4; DF_MASK
-round-trip incl. the no-flag and KeyDB-form paths (`rdb_test.cc`); classifier
+totality; side-table mirror invariant across every touch-point in D-4;
+`RDB_OPCODE_DF_MVCC` round-trip incl. the absent-opcode and KeyDB-form paths
+(`rdb_test.cc`); classifier
 membership. The P3 golden-buffer journal test is extended, not replaced, to prove
 `--active_replica` off still produces byte-identical journal output.
 
@@ -919,8 +922,8 @@ the derived-DEL fix — so they never land together.
 | PR | Scope |
 |---|---|
 | **P4-0** | D-11 derived-DEL fix + D-12 clock-skew warning/metric. Independent hardening; separately mergeable to main. |
-| **P4-1** | **T0 inbound plumbing** (`TransactionData.mvcc`, `SetApplyMvcc`, `peer_origin_hash_`, widened `SetReplOrigin`), D-2 stamp, D-3 clock, D-4 side table, D-5 stamping, D-6 wire, D-13 `DFLY MVCC` + `mvcc_table_bytes`, memory benchmark. No behaviour change beyond memory. |
-| **P4-2** | D-7 RDB persistence (DF_MASK flag, save + load, KeyDB read branch). |
+| **P4-1** | **T0 inbound plumbing** (`TransactionData.mvcc`, `SetApplyMvcc`, `peer_origin_hash_`, widened `SetReplOrigin`), D-2 stamp, D-3 clock, D-4 side table, D-5 stamping, D-6 wire, D-13 `DEBUG MVCC` + `mvcc_table_bytes`, memory benchmark. No behaviour change beyond memory. |
+| **P4-2** | D-7 RDB persistence (`RDB_OPCODE_DF_MVCC` save + load, KeyDB read branch). |
 | **P4-3** | D-8 merge-on-full-sync LWW. First real behaviour change. |
 | **P4-4** | D-9 streaming guard + per-key split, `--multi_master_stream_lww`, `multimaster_lww_dropped`. Highest risk; lands on a foundation already proven by P4-1..3. |
 | **P4-5** | D-10 tombstones. Last: touches both compare paths and the RDB format the earlier PRs established. |
@@ -938,9 +941,9 @@ the derived-DEL fix — so they never land together.
 | `src/server/tx_base.{h,cc}` | `DbContext` += `repl_mvcc` | P4-1 |
 | `src/server/transaction.{h,cc}` | Allocate the shard-transaction stamp; populate `EntryBase::mvcc` | P4-1 |
 | `src/server/journal/executor.{h,cc}` | Apply-context mvcc; streaming guard pre-check and per-key split | P4-1, P4-4 |
-| `src/server/rdb_save.cc` | `DF_MASK_FLAG_MVCC` write; tombstone section + save-time GC | P4-2, P4-5 |
-| `src/server/rdb_load.cc` | `DF_MASK_FLAG_MVCC` read (**unconditional**); KeyDB `mvcc-tstamp` branch; merge-LWW hook at `:3258`; tombstone section | P4-2, P4-3, P4-5 |
-| `src/server/rdb_extensions.h` | `DF_MASK_FLAG_MVCC` constant | P4-2 |
+| `src/server/rdb_save.cc` | `RDB_OPCODE_DF_MVCC` write; tombstone section + save-time GC | P4-2, P4-5 |
+| `src/server/rdb_load.cc` | `RDB_OPCODE_DF_MVCC` read (**unconditional**); KeyDB `mvcc-tstamp` branch; merge-LWW hook at `:3258`; tombstone section | P4-2, P4-3, P4-5 |
+| `src/server/rdb_extensions.h` | `RDB_OPCODE_DF_MVCC = 221` constant | P4-2 |
 | `src/server/hset_family.cc`, `set_family.cc` | Derived-DEL suppression in the two helpers | P4-0 |
 | `src/server/replica.cc`, `server_family.cc` | Clock-skew comparison, warning, metric | P4-0 |
 | `src/server/debugcmd.cc` | `DEBUG MVCC <key>`, `DEBUG MVCC`, `DEBUG MVCC VERIFY` | P4-1 |
@@ -958,7 +961,7 @@ the first phase to touch it; `docs/UPSTREAM-SYNC.md` must gain all of them.
 1. **`--active_replica` off must remain byte-identical to upstream** on the journal
    wire and, as far as the mvcc feature is concerned, in the RDB. Proved by
    extending P3's golden-buffer test, not by inspection.
-2. **The RDB loader's DF_MASK handling is unconditional** — see D-7.
+2. **The RDB loader's `RDB_OPCODE_DF_MVCC` handling is unconditional** — see D-7.
 3. `CompactObj` must not grow. Taking one of the two `unused` mask bits is
    permitted if measurement justifies it, but changes no size.
 4. Fiber-safe primitives only (`util::fb2`); the side table and the tombstone GC
@@ -1017,7 +1020,7 @@ Assertions, so the benchmark is a regression guard and not just a number:
 |---|---|---|
 | 0 | **The `OnCbFinishBlocking` epoch-ordering landmine** (D-5). It runs *before* `LogAutoJournalOnShard`, so the obvious epoch placement drops the stamp on every auto-journaled write — silently, with every convergence test still green. | Called out in D-5 with the verified line numbers, given a dedicated failing gtest (`AutoJournaledCommandStampsKey`), and made the first item in P4-1's task brief. `mvcc_unstamped_writes` catches it in production. |
 | 1 | **Per-key split vs. Dragonfly's transaction model** (D5). Rewriting a journaled command into a partial form may not compose with EXEC, the squasher, or peer-mode LSN accounting. | Isolated in P4-4, landing on a foundation already proven by P4-1..3. Explicit design-agent question. If it proves structurally unworkable, the fallback is single-key-only, which is a documented scope reduction, not a redesign. |
-| 2 | **Missed side-table touch-point** → stale stamps, wrong LWW verdicts, and a slow leak. | Dense debug invariant (mvcc size == prime size + tombstones); exhaustive mirror list in D-4; `DFLY MVCC` for inspection. |
+| 2 | **Missed side-table touch-point** → stale stamps, wrong LWW verdicts, and a slow leak. | Dense debug invariant (mvcc size == prime size + tombstones); exhaustive mirror list in D-4; `DEBUG MVCC` for inspection. |
 | 3 | **Memory.** 16 B/key of payload plus a duplicated key and dash overhead, on a dense table. | Measured, not estimated; `mvcc_table_bytes` metric; active-mode-only allocation. |
 | 4 | **RDB format compatibility.** A non-active build misparsing an active-mode snapshot is silent corruption. | The loader learns the flag unconditionally (D-7) — stated as a global constraint, with a round-trip test in both modes. |
 | 5 | **Tombstone growth** under delete-heavy load. | TTL-bounded, GC'd on expiry and at save time; growth is observable via `mvcc_table_bytes`. |

@@ -1243,12 +1243,12 @@ TEST_F(JournalStreamerPeerFilterTest, PeerModeGapMarkerCoalescesAndTransactionRe
 // *adopts* a mismatched marker instead of flagging it): together they pin that the new branch
 // really is conditioned on peer_mode, not a blanket replacement of the old check.
 //
-// A death test, not a plain assertion: DCHECK_EQ aborts the process in a DCHECK-enabled build
-// (this is one -- see CLAUDE.md's build instructions), so "does the check still fire" can only be
-// observed by expecting that abort; a build with DCHECKs compiled out could not tell a working
-// check apart from a silently-removed one. No fixture/proactor pool is used here (unlike the
-// tests above): gtest's death tests fork() the process, and this statement needs none of that
-// machinery, so avoiding it sidesteps any question about forking a multi-fibered process.
+// A death test, not a plain assertion: DCHECK_EQ aborts the process in a DCHECK-enabled build, so
+// "does the check still fire" can only be observed by expecting that abort. Release builds
+// compile DCHECK out and skip this test instead of treating the expected absence of an abort as
+// a failure. No fixture/proactor pool is used here (unlike the tests above): gtest's death tests
+// fork() the process, and this statement needs none of that machinery, so avoiding it sidesteps
+// any question about forking a multi-fibered process.
 //
 // drakeydb: fix-round-1 (Q2) -- the death-test pattern used to be "" (matches any non-zero exit),
 // which would also have matched the DCHECK_NE(dest->lsn, 0u) two lines above the intended
@@ -1261,6 +1261,9 @@ TEST_F(JournalStreamerPeerFilterTest, PeerModeGapMarkerCoalescesAndTransactionRe
 // peer_mode=true turns this from a crash into a silent, successful adoption -- EXPECT_DEATH then
 // fails because the statement did not die.
 TEST(JournalDeathTest, NonPeerModeStillDchecksMismatchedLsnMarker) {
+#ifdef NDEBUG
+  GTEST_SKIP() << "DCHECK is compiled out in Release builds";
+#else
   StoredSlices slices{};
   auto slice = [v = &slices](auto... ss) { return StoreSlice(v, ss...); };
   using Payload = Entry::Payload;
@@ -1282,6 +1285,7 @@ TEST(JournalDeathTest, NonPeerModeStillDchecksMismatchedLsnMarker) {
   ASSERT_EQ(Op::COMMAND, tx_data.opcode);
 
   EXPECT_DEATH(tx_reader.NextTxData(&reader, &cntx, &tx_data), "Check failed: dest->lsn == ");
+#endif
 }
 
 // drakeydb: Phase 3 T6b fix-round-1 (C2) -- proves a peer link whose entries are ALL dropped

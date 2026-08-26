@@ -48,6 +48,7 @@ constexpr int64_t kClockSkewWarnMs = 250;
 // pre-exchange master (or a plain Redis) reports "no clock" -- never treat that as skew.
 int64_t ComputeClockSkewMs(int64_t local_clock_ms, int64_t peer_clock_ms);
 
+// Returns whether an absolute skew reaches the operational warning threshold above.
 bool IsClockSkewConcerning(int64_t skew_ms);
 
 // INFO replication block for an active node (see D-8).

@@ -275,13 +275,14 @@ tiering, and `--experimental_cascaded_partial_sync`.
 | `journal/types.h` | `EntryBase` += `origin_idx`, `mvcc`, `entry_flags`; `JournalItem` += `origin_idx` (ring-buffer filtering without reparse) |
 | `journal/serializer.cc` (~57-85, 205-235) | COMMAND case: header `2` + ext fields in active mode, else byte-identical `1`; reader accepts both |
 | `journal/journal_slice.cc` (~107-134) | thread origin into `JournalItem`/`JournalChangeItem` |
-| `journal/streamer.h/.cc` | `Config` += `{peer_mode}` (**as built** — a `peer_uuid` field was added then removed in the P3 fix wave: it was never read, since the filter keys on `origin_idx`, not on the peer's uuid); live + partial-replay paths drop non-self-origin and expiry-flagged entries for peer consumers, via the shared `journal::PassesPeerEchoFilter` |
+| `journal/streamer.h/.cc` | `Config` += `{peer_mode}` (**as built** — a `peer_uuid` field was added then removed in the P3 fix wave: it was never read, since the filter keys on `origin_idx`, not on the peer's uuid); live + partial-replay paths drop non-self-origin, expiry-flagged, and derived-delete entries for peer consumers, via the shared `journal::PassesPeerEchoFilter` |
 | `journal/executor.h/.cc` (~36-74) | set/clear apply-context around `Execute`; P5 streaming-LWW pre-check for classified commands |
 | `transaction.cc` (~1622-1663) | `LogJournalOnShard` reads origin/mvcc from context (default self + clock tick) |
-| `tx_base.cc` (~55-70) | manual `RecordJournal` helpers read origin context; expiry `DEL` sets entry-flag bit0 |
+| `tx_base.cc` (~55-70) | manual `RecordJournal` helpers read origin context; expiry `DEL` sets entry-flag bit0; collection-derived `DEL` sets bit1 |
 | `conn_context.h` (~352) | += `repl_origin_id` (u32), `repl_mvcc` (u64) |
 | `replica.h/.cc` | P1 (done): greeting adds `REPLCONF UUID`. **P2 (done):** `ReplicaPeerMode{SyncGate*, PeerRegistry*, PeerIdentityClaims*}` trailing ctor param, `IsPeerMode()`; guards the `SetShardStates` flip (both directions in `MainReplicationFb`), a `SyncGate::Lease` around full sync, and the flush skip in `InitiateDflySync`/`InitiatePSync` (the latter also adds `SetOverrideExistingKeys(true)`; the DF path already had it set), plus self/duplicate UUID refusal, live claim release, and `PeerRegistry::AddOrGet`. P7 (future): `capa activeExpire` on the redis path, `ConsumeRedisStream` RREPLAY unwrap |
-| `dflycmd.cc` | **P2 (done):** `DflyCmd::TakeOver` refuses on an active node. (Future) `ReplicaInfo` stores peer uuid; refuse version <65 / missing UUID while active; additive `DFLY MVCC <key>` debug subcommand |
+| `dflycmd.cc` | **P2 (done):** `DflyCmd::TakeOver` refuses on an active node. (Future) `ReplicaInfo` stores peer uuid; refuse version <65 / missing UUID while active |
+| `debugcmd.cc` | (Future) additive `DEBUG MVCC <key>` debug subcommand |
 | `server_family.cc` | P1 (done): additive `REPLCONF UUID` case. **P2 (done):** `peers_` member; `ReplicaOfInternal` delegates to `ReplicaOfActive` (`PeerReplicationManager`) when active (replace-vs-append by `--multi_master`, `REPLICAOF REMOVE <h> <p>`, NO ONE clears all); `ReplConf` refuses all replication consumers on an active node (single choke point; P3 replaces it with peer admission); `REPLTAKEOVER` refused; INFO block appended after `master_replid`; `Shutdown`/`PauseReplication` route through `peers_`; `--replicaof` now parses a comma-separated peer list (`ParseOneReplicaOf`) and, in active mode, `Init` loads the node's own snapshot before attaching peers |
 | `dfly_main.cc` | banner/usage strings, `version_check` default. **P2 (done):** `ValidateReplicaOfFlags()` and `ValidateMultiMasterFlags()` added to the boot-time validator conjunction, before the proactor pool starts |
 | `main_service.h/.cc` | **P2 (done):** exclusive LOADING reservation for peer full sync, preventing overlap with loaders outside the peer sync gate |
@@ -291,7 +292,8 @@ tiering, and `--experimental_cascaded_partial_sync`.
 | `rdb_save.cc` (~1761) | per-key aux `mvcc-tstamp` in active mode (KeyDB's exact format — one codepath serves DF↔DF and KeyDB ingest) |
 | `rdb_load.cc` (~3024, ~3238) | parse `mvcc-tstamp` aux → seed side table; peer-merge LWW hook at 3238 (skip incoming when stored mvcc newer); log-and-ignore KeyDB `repl-masters` aux |
 
-**Deliberately untouched hot files:** `engine_shard.cc`, `dash.h`, `compact_object.*`.
+**Deliberately untouched hot files:** `dash.h`, `compact_object.*`. `engine_shard.cc` is now
+touched by the active-mode reaper so every namespace and DB receives bounded heartbeat coverage.
 
 ### INFO / protocol surface
 
@@ -311,7 +313,7 @@ origin_idx↔uuid dictionary to full-stream (non-peer) sub-replicas.
   value can resurrect during merge-sync (KeyDB's fix for this is verified dead code; tombstone
   side-table is v2 work).
 - **NTP is a hard requirement** for LWW quality; handshake clock-echo produces a skew warning +
-  `mvcc_clock_skew_ms` metric.
+  `clock_skew_ms` metric.
 - **Initial peer full sync keeps Dragonfly LOADING semantics** (commands blocked during the
   merge-load; steady-state fully writable). KeyDB serves stale reads during load —
   `allow-write-during-load` parity is future work.
@@ -506,9 +508,8 @@ builds with g++, so it never runs in the ordinary local gate.
   **but P7 is exactly the phase that would make it carry real data.**
 - The plain-replica misconfiguration guard is a `DCHECK`, so its loud failure protects debug/CI only;
   a release build degrades to a warning plus silent drops.
-- **Phantom containers on a read-asymmetric mesh (P4-0 Task 1 fix-wave finding; closed for the
-  default namespace by Task 2b's member-expiry reaper, fix rounds 2-6 — see known limitations
-  below for what remains open).** `DbSlice::FindInternal` (`db_slice.cc:673-687`) checks only
+- **Phantom containers on a read-asymmetric mesh (P4-0 Task 1 fix-wave finding; closed by
+  Task 2b's member-expiry reaper).** `DbSlice::FindInternal` (`db_slice.cc:673-687`) checks only
   whole-key `HasExpire()`; member-level (hash-field/set-member) expiry used to be reaped
   exclusively by the ~25 `DeleteIfEmpty`/`DeleteSetIfEmpty` call sites enumerated for the P4-0
   fix, every one of which needs a command to touch the key to run at all — for the read-path call
@@ -516,50 +517,38 @@ builds with g++, so it never runs in the ordinary local gate.
   container **indefinitely** until *it* was asked to read that same key. Task 2b's reaper
   (`DbSlice::DeleteExpiredStep`, `db_slice.cc`) adds a proactive walk: on `--active_replica`
   nodes, the heartbeat's existing prime-table traversal also force-expires and reaps any
-  container with a live member TTL (`HasMemberExpiration()`), bounded per container
-  (`--reaper_member_walk_budget`, resumable across ticks), so a peer that is never itself asked to
-  read the key still converges on its own clock. Every node derives its own DEL
+  container with a live member TTL (`HasMemberExpiration()`), incrementally per container
+  (`--reaper_member_walk_budget`, resumable across ticks; collision chains/extension vectors are
+  visited as a unit rather than hard-latency-bounded), so a peer that is never itself asked to
+  read the key still converges on its own clock. This reaper is load-bearing for correctness, not
+  hygiene: the adversarial call-site inventory found no suppressed helper call whose source
+  effect is reproduced by a journaled command. Active mode therefore treats a configured budget
+  of 0 as 1. Every node derives its own DEL
   (`journal::kEntryFlagDerived`, suppressed from peer links exactly like the read-path carve-outs
   above), so this does not change what crosses the wire, only how promptly each node's own copy
   converges — including a container that also carries a not-yet-due whole-key TTL (fix round 6
   Critical 1: an earlier version of the reaper skipped exactly that shape, since it lived entirely
   inside the "no whole-key TTL" arm of the heartbeat's existing dispatch, reopening this same
   phantom-container divergence, up to permanent divergence after a recreate, for the ordinary
-  session/cache-hash pattern of a member TTL plus a key-level TTL).
-  **Known limitations, not yet closed:**
-  - **Default-namespace-only scope.** The reaper piggybacks on
-    `EngineShard::RetireExpiredAndEvict` (`engine_shard.cc:863-864`), which only iterates the
-    default namespace (upstream's own `// TODO: iterate over all namespaces`) — this leg is false
-    outside it, by the same read-triggered-only mechanism as before Task 2b, for any non-default
-    namespace. Not fixed; upstream's own TODO, not this task's to close.
-  - **`HSetFamily::DeleteHw`** (`hset_family.cc`), reached from the generic `HMapWrap` wrapper
-    and `HSETEX` — essentially every hash command — is a third, previously-undocumented DEL
-    derivation path distinct from `DeleteIfEmpty`: it journals a plain, unflagged, self-origin DEL
-    (`RecordJournal(..., "DEL", ...)`, no `kEntryFlagDerived`), so it forwards to peers rather than
-    being suppressed. Pre-existing Phase 3 behaviour, left unchanged deliberately: it
-    over-converges (every peer redundantly re-derives the same DEL upstream would have suppressed)
-    rather than diverging, and flagging it derived would require every peer to independently
-    derive its own DEL for the same container, which the default-namespace-only gap above shows
-    the reaper cannot yet unconditionally guarantee everywhere.
+  session/cache-hash pattern of a member TTL plus a key-level TTL). The default namespace is
+  visited every tick; one additional namespace and one of its DBs are visited per tick, each with
+  an independent round-robin cursor, so the heartbeat stays bounded while every local DB remains
+  reachable. Non-default sweeps are local-only because the journal wire has no namespace identity.
+  `HSetFamily::DeleteHw`, the third derived-DEL path used by the generic `HMapWrap` wrapper and
+  `HSETEX`, now records the same derived flag by default. Its conditional HSETEX caller retains a
+  forwarded-DEL carve-out because a lagging peer can otherwise choose the opposite FNX/FXX branch;
+  focused regressions pin both behaviors and their journal ordering.
   Same root cause, corollary regression, unaffected by the above: `DEBUG OBJHIST`/`DEBUG STRINGS`
   used to be an inadvertent **mesh-wide** phantom-container sweep (every node's derived DEL
   reached every peer); they now only clean up the node they run on. P4-2's tombstone GC and the
   design spec's D-4 full-scan invariant both have to account for these keys explicitly — neither
-  can assume "logically empty" and "absent from the peer" coincide, especially outside the default
-  namespace.
-- **SORT's partial-expiry gap (pre-existing, not introduced by P4-0 Task 1; documentation only,
-  not fixed).** `OpFetchSortEntries`/`OpFetchContainerElements` call `DeleteSetIfEmpty` only when
-  `it->second.Size() == 0` after iteration, so the carve-out (and `DeleteSetIfEmpty` itself) only
-  ever fires when SORT's own lazy member-expiry pass empties the set completely. If some members
-  expire during that pass and others survive, `DeleteSetIfEmpty` never runs, no DEL is emitted at
-  all, and the replayed SORT — including its `STORE` destination — runs verbatim against a peer
-  that still holds the surviving-on-this-node-but-actually-expired members, diverging the result.
-  `OpFieldExpire` compensates for exactly this shape with an explicit re-journal of just the
-  expired members (`RecordJournal(op_args, "SREM"/"HDEL", missing)`, `generic_family.cc`), and
-  `OpHExpire` does the same (`hset_family.cc`); SORT has no equivalent. Not a regression: before
-  this fix, the partial-empty path emitted no DEL either — `DeleteSetIfEmpty` was, and still is,
-  only reached in the full-empty case. A future fix would take the same shape: an explicit `SREM`
-  re-journal of the members SORT's own iteration lazily expired.
+  can assume "logically empty" and "absent from the peer" coincide before the local reaper runs.
+- **SORT partial expiry is compensated.** `OpFetchSortEntries` and
+  `OpFetchContainerElements` capture the TTL-bearing set before lazy expiry, then journal an
+  explicit `SREM` for members removed by a partial pass before SORT's verbatim entry. The walk
+  completes even after a numeric parse failure so an errored SORT also journals exactly the
+  members it actually expired. Full expiry still emits DEL, and SORT_RO remains non-journaled.
+  Tests cover both fetch implementations, the error path, and source-before-destination ordering.
 
 **Testing lesson worth keeping.** A **convergence assertion cannot detect an echo storm.** With the
 origin filter reverted, two nodes still converge: symmetric amplification makes every node replay the
@@ -571,7 +560,7 @@ decomposes as `3 x (shard_flows x peers x 1/s REPLCONF ACK) + 1 self-INFO` (meas
 
 ## Phase 4 — MVCC store + stamping + wire
 `MvccClock`; side table (mirror all `mcflag` touch-points incl. Del/flush); stamp local writes
-(clock tick) and applied writes (context mvcc); journal v2 mvcc field live; `DFLY MVCC <key>`;
+(clock tick) and applied writes (context mvcc); journal v2 mvcc field live; `DEBUG MVCC <key>`;
 INFO `mvcc_table_bytes`.
 **Verify:** C++ stamping unit; pytest — replicated key's stamp on B equals A's origin stamp.
 

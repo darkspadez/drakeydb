@@ -600,6 +600,22 @@ TEST_F(StringMapTest, ReaperExpireStepTruncatedPassDoesNotClearFlag) {
   EXPECT_GT(sm_->UpperBoundSize(), 0u);
 }
 
+TEST_F(StringMapTest, ReaperCursorInvalidatedBySameCapacityRebuild) {
+  for (int i = 0; i < 100; ++i)
+    ASSERT_TRUE(sm_->AddOrUpdate(absl::StrCat("k", i), "v", 1000));
+  sm_->Reserve(512);
+  sm_->set_time(1);
+
+  EXPECT_FALSE(sm_->ReaperExpireStep(1));
+  ASSERT_EQ(sm_->DebugReaperCursor(), 1u);
+
+  sm_->Shrink(256);
+  EXPECT_EQ(sm_->DebugReaperCursor(), 0u);
+  sm_->Reserve(512);
+  EXPECT_EQ(sm_->DebugReaperCursor(), 0u)
+      << "shrink plus regrowth to the old capacity must not resurrect the stale cursor";
+}
+
 // drakeydb: P4-0 Task 2b Important C -- the companion case: a FULL pass (covers every slot) that
 // is not CLEAN (some member still carries a live, not-yet-due TTL) must also not clear the flag
 // -- "examined everything" alone is not sufficient, only "examined everything and found no

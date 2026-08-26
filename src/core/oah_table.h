@@ -377,16 +377,16 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
   // own, used by the SCAN command): also reports whether the delivered entry still carries a
   // TTL, which the reaper needs to decide if ReaperClearMemberExpiration() below is safe, and
   // which ItemCb's string_view-only signature cannot express.
-  using ReaperItemCb = std::function<void(std::string_view, bool has_ttl)>;
+  using ReaperItemCb = std::function<void(std::string_view, bool has_ttl, uint32_t expiry_time)>;
 
-  // drakeydb: P4-0 Task 2b Important A/C -- near-duplicate of ScanHomeBucket<true> (below),
-  // differing only in the callback signature and always expiring (Scan()'s Expire=false path has
-  // no reaper use). Deliberately a separate method rather than an added parameter to
+  // drakeydb: P4-0 Task 2b Important A/C -- near-duplicate of ScanHomeBucket (below), differing
+  // in the callback signature and exposing an Expire template switch for the search preflight.
+  // Deliberately a separate method rather than an added parameter to
   // ScanHomeBucket: the coordinator's ruling was to add a new opt-in method the reaper alone
   // calls, not to change Scan()/the SCAN command's existing, shipped behavior in place. Keeps
   // the SIMD affiliation-window/extension-vector logic exactly as ScanHomeBucket already has it
   // (not reimplemented) -- only the two `cb(...)` call sites differ, passing e.HasExpiry() too.
-  bool ReaperScanHomeBucket(uint32_t bucket_id, const ReaperItemCb& cb) {
+  template <bool Expire> bool ReaperScanHomeBucket(uint32_t bucket_id, const ReaperItemCb& cb) {
     const uint32_t part = std::min<uint32_t>(capacity_log_, kShiftLog);
     assert(part > 0u);
     const uint32_t shift = 64 - part;
@@ -404,11 +404,12 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
       const uint32_t i = std::countr_zero(cand);
       cand &= cand - 1;
       Entry e = At(bucket_id + i)[0];
-      ExpireIfNeeded(e);
+      if constexpr (Expire)
+        ExpireIfNeeded(e);
       if (e.Empty())
         continue;
       const oah::key::Decoded key = DecodeKey(e);
-      cb(key.view(), e.HasExpiry());
+      cb(key.view(), e.HasExpiry(), e.HasExpiry() ? e.GetExpiry() : UINT32_MAX);
       reported = true;
     }
 
@@ -424,11 +425,12 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
           const uint32_t j = std::countr_zero(m);
           m &= m - 1;
           Entry el(raw[b + j]);
-          ExpireIfNeeded(el);
+          if constexpr (Expire)
+            ExpireIfNeeded(el);
           if (el.Empty())
             continue;
           const oah::key::Decoded key = DecodeKey(el);
-          cb(key.view(), el.HasExpiry());
+          cb(key.view(), el.HasExpiry(), el.HasExpiry() ? el.GetExpiry() : UINT32_MAX);
           reported = true;
         }
       }
@@ -442,9 +444,29 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
   // unbounded run of consecutive non-reporting -- i.e. entirely-expired -- buckets before
   // returning, exactly the pathological case this method exists to bound), resuming from
   // reaper_cursor_ so a table bigger than one call's budget makes genuine forward progress
-  // across heartbeat ticks. Returns true iff this call completed a full logical pass (cursor
-  // wrapped back to 0) with no surviving entry anywhere in that pass still carrying a TTL --
-  // the only condition under which ReaperClearMemberExpiration() below is safe to call.
+  // across heartbeat ticks.
+  // Returns whether the next budgeted step contains an already-due member without mutating it.
+  // Search-index maintenance uses this to detach the old document before expiry frees fields.
+  bool ReaperStepHasDue(uint32_t max_buckets) {
+    if (entries_.empty() || time_now_ == 0)
+      return false;
+    uint32_t bucket_id = reaper_cursor_ >> (32 - capacity_log_);
+    bool due = false;
+    auto cb = [this, &due](std::string_view, bool has_ttl, uint32_t expiry_time) {
+      due |= has_ttl && expiry_time <= time_now_;
+    };
+    for (uint32_t examined = 0; bucket_id < BucketCount() && examined < max_buckets;
+         ++bucket_id, ++examined) {
+      ReaperScanHomeBucket<false>(bucket_id, cb);
+      if (due)
+        return true;
+    }
+    return false;
+  }
+
+  // Bounds a member-expiry sweep to max_buckets home buckets and resumes across calls. Returns
+  // true only after a full pass that found no surviving TTL, when clearing the sticky member-
+  // expiration flag is safe.
   bool ReaperExpireStep(uint32_t max_buckets) {
     if (entries_.empty()) {
       reaper_cursor_ = 0;
@@ -453,12 +475,12 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
     }
     uint32_t bucket_id = reaper_cursor_ >> (32 - capacity_log_);
     uint32_t examined = 0;
-    auto cb = [this](std::string_view, bool has_ttl) {
+    auto cb = [this](std::string_view, bool has_ttl, uint32_t) {
       if (has_ttl)
         reaper_any_ttl_seen_ = true;
     };
     for (; bucket_id < BucketCount() && examined < max_buckets; ++bucket_id, ++examined) {
-      ReaperScanHomeBucket(bucket_id, cb);
+      ReaperScanHomeBucket<true>(bucket_id, cb);
     }
     if (bucket_id >= BucketCount()) {
       bool clean_pass = !reaper_any_ttl_seen_;
