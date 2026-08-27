@@ -5,8 +5,12 @@
 #include "server/journal/journal.h"
 
 #include "base/logging.h"
+#include "server/common.h"
+#include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/journal_slice.h"
+#include "server/mvcc.h"
+#include "server/namespaces.h"
 
 namespace dfly {
 namespace journal {
@@ -18,6 +22,14 @@ namespace {
 
 // Active only in shard threads.
 thread_local JournalSlice journal_slice;
+
+// drakeydb: Phase 4 -- cached read (JournalSlice::mvcc_enabled_, cached once in Init(), mirroring
+// extended_framing_ just below it). NOT a bare IsActiveReplica(): that is an uncached
+// absl::GetFlag (multi_master.cc), and RecordEntry below runs once per journal entry -- the
+// hottest shared path in the server. P4-0 shipped a fix for this exact defect class (a5345509).
+bool MvccEnabled() {
+  return journal_slice.mvcc_enabled();
+}
 
 }  // namespace
 
@@ -96,7 +108,37 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
   entry.origin_idx = origin_idx;
   entry.mvcc = mvcc;
   entry.entry_flags = entry_flags;
+
+  // drakeydb: Phase 4 -- mint AFTER entry.mvcc = mvcc above (an assignment from the possibly-zero
+  // caller-supplied parameter, which would otherwise clobber a mint placed earlier straight back
+  // to 0) and BEFORE AddLogRecord below, so the wire carries this exact value. HopStamp takes
+  // now_ms explicitly (Task 4, design point 3): mvcc.cc itself never calls GetCurrentTimeMs(), so
+  // the caller -- here, already deep in EngineShard territory -- does. entry.mvcc == 0 is a safe
+  // "caller supplied no stamp" test: 0 is unreachable for a real stamp (ms << 20, ms ~ 1.77e12).
+  if (MvccEnabled() && opcode == Op::COMMAND && entry.mvcc == 0)
+    entry.mvcc = MvccStamper::tlocal()->HopStamp(GetCurrentTimeMs());
+
   journal_slice.AddLogRecord(entry);
+
+  // drakeydb: Phase 4 -- commit AFTER the entry is durable, so a key is only stamped once its
+  // entry has actually joined the journal on its way to peers. entry.mvcc is always non-zero by
+  // this point (freshly minted just above, or supplied non-zero by the caller -- an applied
+  // write's verbatim author stamp, kept as-is or stamps would inflate on every hop) -- Commit()
+  // DCHECKs this and has no clock of its own, so there is no now_ms to pass here. Gating on
+  // Op::COMMAND excludes SELECT/PING/LSN/ORIGIN. The journal only ever carries the default
+  // namespace (it has no namespace identity on the wire -- see engine_shard.cc's heartbeat
+  // reaper), so the commit target is always GetDefaultNamespace(), matching every other
+  // shard-local DbSlice lookup in this tree (e.g. engine_shard.cc, rdb_load.cc). Looked up once,
+  // not once per armed key inside the CommitFn, since a single journal entry can arm many keys
+  // (e.g. MSET).
+  if (MvccEnabled() && opcode == Op::COMMAND) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    MvccStamper::tlocal()->Commit(
+        entry.mvcc, entry.origin_idx,
+        [&db_slice](DbIndex db, std::string_view key, const MvccStamp& st) {
+          db_slice.SetMvcc(db, PrimeKey{key}, st);
+        });
+  }
 }
 
 void SetFlushMode(bool allow_flush) {

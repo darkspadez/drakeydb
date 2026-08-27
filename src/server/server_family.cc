@@ -68,6 +68,7 @@ extern "C" {
 #include "server/main_service.h"
 #include "server/memory_cmd.h"
 #include "server/multi_command_squasher.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/node_identity.h"
 #include "server/peer_replication.h"
@@ -1339,6 +1340,10 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
   peer_registry_.Init(node_identity_.uuid);
   LOG(INFO) << "Node uuid: " << node_identity_.uuid
             << (node_identity_.ephemeral ? " (ephemeral)" : "");
+
+  // drakeydb: Phase 4 -- every proactor thread needs the self origin hash before the first write.
+  shard_set->pool()->AwaitBrief(
+      [uuid = node_identity_.uuid](unsigned, auto*) { MvccStamper::tlocal()->SetSelfUuid(uuid); });
 
   // --replicaof: a non-active node replicates instead of loading a snapshot; an active node loads
   // its own snapshot first (drakeydb) and then attaches every target.

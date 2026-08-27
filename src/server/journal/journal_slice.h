@@ -33,6 +33,11 @@ class JournalSlice {
     return status_ec_;
   }
 
+  // drakeydb: Phase 4 -- cached copy of IsActiveReplica(), see mvcc_enabled_ below.
+  bool mvcc_enabled() const {
+    return mvcc_enabled_;
+  }
+
   void AddLogRecord(const Entry& entry);
 
   // Register a callback that will be called every time a new entry is
@@ -125,6 +130,12 @@ class JournalSlice {
   // drakeydb: cached once in Init() (--active_replica is boot-only), like max_age_ms_/
   // max_bytes_ above, rather than reading the flag on every AddLogRecord call.
   bool extended_framing_ = false;
+
+  // drakeydb: Phase 4 -- same rationale as extended_framing_ above, cached alongside it in
+  // Init(). journal::RecordEntry (journal.cc) reads this once per journal entry -- the hottest
+  // shared path in the server -- via the mvcc_enabled() accessor below; IsActiveReplica() itself
+  // is an uncached absl::GetFlag (multi_master.cc) and must never be read there directly.
+  bool mvcc_enabled_ = false;
 
   size_t ring_buffer_bytes_ = 0;
 };

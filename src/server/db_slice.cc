@@ -32,6 +32,7 @@ extern "C" {
 #include "server/error.h"
 #include "server/journal/journal.h"
 #include "server/multi_master.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/server_state.h"
 #include "server/tiered_storage.h"
@@ -1053,6 +1054,13 @@ void DbSlice::FlushSlotsFb(const cluster::SlotSet& slot_ids, uint64_t next_versi
   do {
     PrimeTable::Cursor next = pt->TraverseBuckets(cursor, iterate_bucket);
     cursor = next;
+
+    // drakeydb: Phase 4 -- per bucket-batch, before the yield point below: this fiber has no
+    // Transaction epoch of its own, so nothing must carry stray armed state across a preemption.
+    // See server/mvcc.h.
+    if (mvcc_enabled_)
+      MvccStamper::tlocal()->EndOfWriteEpoch();
+
     ThisFiber::Yield();
 
     // Del above only marks the watchers of a deleted stream as awakened; normally the deleting
@@ -1564,6 +1572,12 @@ void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key) {
   if (!client_tracking_map_.empty()) {
     QueueInvalidationTrackingMessageAtomic(key);
   }
+
+  // drakeydb: Phase 4 -- arm this key. journal::RecordEntry commits the entry's stamp to every
+  // armed key; the end of the shard callback discards whatever is still armed. That is what
+  // enforces "a key's stamp advances iff that same stamp is propagated". See server/mvcc.h.
+  if (mvcc_enabled_)
+    MvccStamper::tlocal()->Arm(db_ind, key);
 }
 
 DbSlice::Iterator DbSlice::ExpireIfNeeded(const Context& cntx, Iterator it) const {
@@ -1649,6 +1663,11 @@ void DbSlice::ExpireAllIfNeeded() {
     channel_store->SendMessages(absl::StrCat("__keyevent@", i, "__:expired"), per_db_events[i],
                                 false);
   }
+
+  // drakeydb: Phase 4 -- non-transactional sweep path; ends its own epoch since it never goes
+  // through Transaction::RunCallback. See server/mvcc.h.
+  if (mvcc_enabled_)
+    MvccStamper::tlocal()->EndOfWriteEpoch();
 }
 
 void DbSlice::RegisterOnChange(ChangeConsumerInterface* consumer) {
@@ -2025,6 +2044,11 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count, DeleteExpir
     }
   }
 
+  // drakeydb: Phase 4 -- non-transactional sweep path; ends its own epoch since it never goes
+  // through Transaction::RunCallback. See server/mvcc.h.
+  if (mvcc_enabled_)
+    MvccStamper::tlocal()->EndOfWriteEpoch();
+
   return result;
 }
 
@@ -2056,12 +2080,20 @@ pair<uint64_t, size_t> DbSlice::FreeMemWithEvictionStepAtomic(DbIndex db_ind, co
 
   if (owner_->tiered_storage()) {
     evicted_bytes = owner_->tiered_storage()->ReclaimMemory(increase_goal_bytes);
-    if (evicted_bytes >= increase_goal_bytes)
+    if (evicted_bytes >= increase_goal_bytes) {
+      // drakeydb: Phase 4 -- non-transactional sweep path; ends its own epoch at every exit since
+      // it never goes through Transaction::RunCallback. See server/mvcc.h.
+      if (mvcc_enabled_)
+        MvccStamper::tlocal()->EndOfWriteEpoch();
       return {0, evicted_bytes};
+    }
   }
 
-  if ((!IsCacheMode()) || !expire_allowed_)
+  if ((!IsCacheMode()) || !expire_allowed_) {
+    if (mvcc_enabled_)
+      MvccStamper::tlocal()->EndOfWriteEpoch();
     return {0, 0};
+  }
 
   auto max_eviction_per_hb = GetFlag(FLAGS_max_eviction_per_heartbeat);
   auto max_segment_to_consider = GetFlag(FLAGS_max_segment_to_consider);
@@ -2135,6 +2167,12 @@ finish:
   events_.evicted_keys += evicted_items;
   db_arr_[db_ind]->stats.events.evicted_keys += evicted_items;
   DVLOG(2) << "Eviction time (us): " << (time_finish - time_start) / 1000;
+
+  // drakeydb: Phase 4 -- non-transactional sweep path; ends its own epoch since it never goes
+  // through Transaction::RunCallback. See server/mvcc.h.
+  if (mvcc_enabled_)
+    MvccStamper::tlocal()->EndOfWriteEpoch();
+
   return pair<uint64_t, size_t>{evicted_items, evicted_bytes};
 }
 
@@ -2545,6 +2583,11 @@ void DbSlice::CallChangeCallbacks(DbIndex id, const ChangeReq& cr) const {
 // 4. the snapshot did not reach the bucket yet
 bool DbSlice::IsOmittableWrite(const Context& cntx, const ChangeReq& req) {
   if (!journal_omit_redundant_writes_)
+    return false;
+
+  // drakeydb: Phase 4 -- an omitted write arms but never commits, leaving the key unstamped.
+  // The optimisation only fires during a single full sync anyway, so active mode forgoes it.
+  if (mvcc_enabled_)
     return false;
 
   bool omit_update = false;

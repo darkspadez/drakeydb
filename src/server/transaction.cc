@@ -18,6 +18,7 @@
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/journal.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/server_state.h"
 
@@ -732,6 +733,10 @@ void Transaction::RunCallback(EngineShard* shard) {
   }
 
   shard->set_running_tx(nullptr);
+
+  // drakeydb: Phase 4 -- MUST be after LogAutoJournalOnShard, not inside OnCbFinishBlocking
+  // (above), which runs before the journal entry exists. See server/mvcc.h.
+  MvccStamper::tlocal()->EndOfWriteEpoch();
 }
 
 // TODO: For multi-transactions we should be able to deduce mode() at run-time based
@@ -1545,6 +1550,12 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
 
   if (owns_running_tx)
     shard->set_running_tx(nullptr);
+
+  // drakeydb: Phase 4 -- MUST be after LogAutoJournalOnShard, not inside OnCbFinishBlocking
+  // (above), which runs before the journal entry exists. Unconditional (unlike set_running_tx()
+  // just above): this stub's own callback may have armed keys and emitted its own journal entry
+  // regardless of which Transaction owns running_tx_. See server/mvcc.h.
+  MvccStamper::tlocal()->EndOfWriteEpoch();
 
   DCHECK_EQ(result.flags, 0);  // if it's sophisticated, we shouldn't squash it
   return result;

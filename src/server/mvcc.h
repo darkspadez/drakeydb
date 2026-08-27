@@ -150,15 +150,22 @@ class MvccStamper {
 
   // The caller always supplies a non-zero stamp: the author's freshly minted HopStamp(now_ms), or
   // an applied write's verbatim author stamp -- both under the same MvccEnabled() && COMMAND gate,
-  // so Commit itself never mints (DCHECK'd in the .cc). Clears the arm list.
+  // so Commit itself never mints (DCHECK'd in the .cc). Clears the arm list -- unconditionally,
+  // even if fn throws (RAII in the .cc): a surviving armed_ after a partial failure would either
+  // let EndOfWriteEpoch() over-count already-attempted keys as unstamped, or, worse, let a LATER
+  // Commit() in the same epoch (e.g. a second RecordEntry from one Lua script) stamp these
+  // leftover keys with an unrelated entry's mvcc. Decided and documented in Task 7 -- see the .cc.
   //
-  // fn must not call Arm(), Disarm(), or Commit(): this call is mid-iteration over armed_/arena_,
-  // and any of the three would corrupt that iteration -- Arm()/a nested Commit() by reallocating
-  // arena_ (invalidating the string_view key fn was just handed) and/or armed_ (invalidating the
-  // iterator), Disarm() by erasing from armed_ out from under it. All three are DCHECK'd in the
-  // .cc via commit_depth_.
+  // fn must not call Arm(), Disarm(), Commit(), or EndOfWriteEpoch(): this call is mid-iteration
+  // over armed_/arena_, and any of the four would corrupt that iteration -- Arm()/a nested
+  // Commit() by reallocating arena_ (invalidating the string_view key fn was just handed) and/or
+  // armed_ (invalidating the iterator), Disarm()/EndOfWriteEpoch() by erasing from/clearing
+  // armed_ out from under it. All four are DCHECK'd in the .cc via commit_depth_.
   void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn);
 
+  // The fourth mutator of armed_/arena_ (Task 7 closes the gap: originally not DCHECK'd against
+  // commit_depth_ like Arm()/Disarm()/Commit() above). See Commit()'s comment for why a CommitFn
+  // calling this would corrupt Commit()'s own in-progress iteration.
   void EndOfWriteEpoch();
 
   const Stats& stats() const {

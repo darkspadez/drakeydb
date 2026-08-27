@@ -68,6 +68,7 @@ void JournalSlice::Init() {
   max_age_ms_ = absl::GetFlag(FLAGS_shard_repl_backlog_time_ms);
   max_bytes_ = GetPerShardBacklogMaxBytes();
   extended_framing_ = IsActiveReplica();
+  mvcc_enabled_ = IsActiveReplica();  // drakeydb: Phase 4 -- see mvcc_enabled_'s declaration.
 }
 
 bool JournalSlice::IsLSNInBuffer(LSN lsn) const {

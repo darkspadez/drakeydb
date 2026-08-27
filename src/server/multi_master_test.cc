@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -690,10 +691,28 @@ class MvccStoreTest : public BaseFamilyTest {
   void SetUp() override {
     absl::SetFlag(&FLAGS_active_replica, true);
     BaseFamilyTest::SetUp();
+    // drakeydb: P4-1 Task 7 -- LogAutoJournalOnShard and every command-specific RecordJournal
+    // call site (e.g. SetCmd::RecordJournal) gate on shard->journal() before ever reaching
+    // journal::RecordEntry, and the journal is off by default in tests (production only starts
+    // it via the DFLY FLOW replica handshake). Without this, RecordEntry -- and so Arm/Commit --
+    // never runs for a plain SET/LPUSH, and StampOf() returns nullopt for every write in this
+    // fixture. Broadcast to every shard (this fixture does not pin num_shards=1, unlike
+    // OriginJournalFamilyTest below).
+    shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
   }
   void TearDown() override {
     BaseFamilyTest::TearDown();
     absl::SetFlag(&FLAGS_active_replica, false);
+  }
+
+  // drakeydb: P4-1 Task 7 -- shard-hops to read back the stamp arm/commit left (or didn't leave)
+  // on a key, the same way production code would via DbSlice::GetMvcc.
+  std::optional<MvccStamp> StampOf(std::string_view key) {
+    std::optional<MvccStamp> out;
+    shard_set->Await(Shard(key, shard_set->size()), [&] {
+      out = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, key);
+    });
+    return out;
   }
 };
 
@@ -788,7 +807,7 @@ TEST_F(MvccStoreTest, FlushAllDropsTheSideTable) {
 
 // drakeydb: P4-1 Task 5, fix round 1 -- DbSlice::mvcc_table_memory() (unlike table_memory_, which
 // takes a live delta on every write, e.g. AddOrFind's `table_memory_ += table_increase;` at
-// db_slice.cc:937) is computed on demand from DbTable::mvcc_table_memory() rather than
+// db_slice.cc:946) is computed on demand from DbTable::mvcc_table_memory() rather than
 // accumulated, precisely so it cannot silently stop tracking real growth or underflow on flush.
 // This is the test that would have caught the original accumulator design being wrong: it
 // requires the value to actually move.
@@ -827,6 +846,140 @@ TEST_F(MvccStoreTest, TableMemoryGrowsWithWritesAndDropsOnFlush) {
   });
   EXPECT_EQ(post_flush, before)
       << "flush must drop the grown side table back to a freshly-allocated table's baseline";
+}
+
+// drakeydb: P4-1 Task 7 -- the landmine test. LPUSH is auto-journaled AND mutates in place, so it
+// never calls AddOrUpdate. It is the command that fails if EndOfWriteEpoch is placed at
+// transaction.cc's OnCbFinishBlocking call instead of after LogAutoJournalOnShard -- see the
+// landmine section of task-7-brief.md and this task's report for the falsification run.
+TEST_F(MvccStoreTest, AutoJournaledCommandStampsKey) {
+  Run({"lpush", "mylist", "a"});
+  auto st = StampOf("mylist");
+  ASSERT_TRUE(st.has_value()) << "auto-journaled write left no stamp -- check that "
+                                 "EndOfWriteEpoch runs AFTER LogAutoJournalOnShard";
+  EXPECT_GT(st->Mvcc(), 0u);
+  EXPECT_NE(st->origin_hash, 0u) << "self origin hash must be seeded at boot";
+}
+
+TEST_F(MvccStoreTest, NoAutoJournalCommandStampsKey) {
+  Run({"set", "k", "v"});  // SET is NO_AUTOJOURNAL and journals via SetCmd::RecordJournal
+  ASSERT_TRUE(StampOf("k").has_value());
+}
+
+TEST_F(MvccStoreTest, StampsAreStrictlyIncreasingAcrossWrites) {
+  Run({"set", "k", "v1"});
+  const uint64_t first = StampOf("k")->Mvcc();
+  for (int i = 0; i < 50; ++i) {
+    Run({"set", "k", absl::StrCat("v", i)});
+    const uint64_t cur = StampOf("k")->Mvcc();
+    EXPECT_GT(cur, first) << "iteration " << i;
+  }
+}
+
+TEST_F(MvccStoreTest, MultiKeySameShardCommandSharesOneStamp) {
+  // drakeydb: falsification note -- the brief's comment here claimed "the single-shard test
+  // fixture"; MvccStoreTest does not pin num_shards (BaseFamilyTest's default is num_threads_ - 1
+  // = 2 shards here). "k1"/"k2" simply hash to the same one of those shards, verified empirically
+  // (this test passes reliably run in isolation, and MvccStoreTest's TEST_F's are declared before
+  // any fixture in this file that changes FLAGS_num_shards, so no earlier test can perturb it).
+  Run({"mset", "k1", "v1", "k2", "v2"});
+  auto a = StampOf("k1");
+  auto b = StampOf("k2");
+  ASSERT_TRUE(a.has_value() && b.has_value());
+  EXPECT_EQ(a->Mvcc(), b->Mvcc()) << "one shard callback mints one stamp";
+}
+
+// The over-stamp cases. Each must leave the stamp untouched and bump the counter.
+TEST_F(MvccStoreTest, ReadOnlyGetExDoesNotStampKey) {
+  Run({"set", "k", "v"});
+  const MvccStamp before = *StampOf("k");
+  Run({"getex", "k"});  // no expiry option -> mutates nothing, journals nothing
+  EXPECT_EQ(*StampOf("k"), before)
+      << "a read that runs an AutoUpdater must not advance the stamp -- if it does, this node "
+         "silently rejects peer writes that should have won";
+}
+
+TEST_F(MvccStoreTest, SkippedExpireDoesNotStampKey) {
+  Run({"set", "k", "v"});
+  const MvccStamp before = *StampOf("k");
+  EXPECT_EQ(0, CheckedInt({"expire", "k", "100", "XX"}));  // no TTL set -> predicate fails
+  EXPECT_EQ(*StampOf("k"), before);
+}
+
+// drakeydb: P4-1 Task 7, Step 6 -- IsOmittableWrite's redundant-write optimisation arms but never
+// commits (no journal entry is emitted for the omitted write), so under active mode it must be
+// disabled outright or the key ends up permanently unstamped.
+//
+// Falsification note: the brief's original body (`debug populate` then a plain `set`) never
+// registers a change consumer, so IsOmittableWrite's `change_cb_.size() == 1` branch never
+// engages and omission never actually happens -- confirmed by temporarily disabling this task's
+// `if (mvcc_enabled_) return false;` gate in IsOmittableWrite (db_slice.cc) and re-running: the
+// test still passed. Strengthened to genuinely trigger the omission path IsOmittableWrite
+// targets, mirroring the existing RegisterOnChange-under-shard_lock pattern used by
+// ReaperJournalFamilyTest.ReaperDeleteBypassesChangeCallbacks above: a real eventually-consistent
+// change consumer plus a real journal consumer, registered before "during" (a fresh key, so its
+// bucket version predates the registration) is ever written.
+TEST_F(MvccStoreTest, WritesDuringSnapshotAreStillStamped) {
+  class NoopChangeConsumer final : public DbSlice::ChangeConsumerInterface {
+   public:
+    void OnChange(DbIndex, const ChangeReq&) override {
+    }
+  } change_consumer;
+  change_consumer.eventually_consistent_ = true;  // the flavor of snapshot IsOmittableWrite gates
+
+  class NoopJournalConsumer final : public journal::JournalConsumerInterface {
+   public:
+    void ConsumeJournalChange(const journal::JournalChangeItem&) override {
+    }
+    void ThrottleIfNeeded() override {
+    }
+  } journal_consumer;
+  uint32_t journal_consumer_id = 0;
+
+  const ShardId sid = Shard("during", shard_set->size());
+  shard_set->Await(sid, [&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    journal_consumer_id = journal::RegisterConsumer(&journal_consumer);
+
+    // RegisterOnChange DCHECKs the shard's intent lock is held (see #7153) and stamps
+    // snapshot_version_ = NextVersion() -- higher than any bucket untouched since this call,
+    // "during"'s included, since it has not been written yet.
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    db_slice.RegisterOnChange(&change_consumer);
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+  });
+
+  // A write to a key whose bucket predates the registration above, with exactly one
+  // eventually-consistent change consumer and one journal consumer registered: precisely the
+  // shape IsOmittableWrite requires before it will omit the journal write.
+  Run({"set", "during", "v"});
+
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    EXPECT_TRUE(db_slice.UnregisterOnChange(&change_consumer));
+    journal::UnregisterConsumer(journal_consumer_id);
+  });
+
+  ASSERT_TRUE(StampOf("during").has_value())
+      << "a journal-omitted write must still be stamped, or the key is permanently unstamped";
+}
+
+// drakeydb: P4-1 Task 7, Step 10 -- a pure write workload (no reads-that-mutate, no
+// not-satisfied-predicate skips) must never discard an armed key: every arm this workload creates
+// must reach a commit. mvcc_unstamped_writes only counts arms EndOfWriteEpoch finds still armed,
+// so this is read through a shard hop rather than via INFO (that wiring is Task 11's job).
+TEST_F(MvccStoreTest, PureWriteWorkloadLeavesNoUnstampedWrites) {
+  for (int i = 0; i < 200; ++i)
+    Run({"set", absl::StrCat("k", i), "v"});
+
+  // Summed across every shard, not just shard 0: 200 distinct keys spread across every shard
+  // this fixture runs (BaseFamilyTest's default is more than one), and a bug could plausibly
+  // manifest on only one of them.
+  std::atomic<uint64_t> unstamped{0};
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { unstamped += MvccStamper::tlocal()->stats().unstamped_writes; });
+  EXPECT_EQ(unstamped.load(), 0u) << "a pure write workload must never discard an arm";
 }
 
 // The "off means byte-identical to upstream" guard.

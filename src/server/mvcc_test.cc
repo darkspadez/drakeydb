@@ -310,6 +310,17 @@ TEST(MvccStamperTest, CommitDepthRecoversAfterCommitFnThrows) {
   // If commit_depth_ had leaked at 1 above, this would DCHECK-abort the whole test binary in a
   // debug build -- there is no way to observe a leaked guard other than the process not dying.
   s->Arm(0, "k2");
+
+  // drakeydb: P4-1 Task 7 -- the throw-safety decision parked from Task 4 (see this file's
+  // description above and the Commit() comment in mvcc.cc): armed_/arena_ are cleared
+  // unconditionally, even when fn throws, not just commit_depth_. "k" (armed before the throwing
+  // Commit() above) must not still be sitting in armed_ here -- if it were, this Commit call
+  // would wrongly stamp it with mvcc=99, an entry that never mentioned "k".
+  Recorder rec;
+  s->Commit(99, 0, rec.Fn());
+  ASSERT_EQ(rec.writes.size(), 1u)
+      << "a throwing Commit() must not leak the pre-throw arm list into a later, unrelated commit";
+  EXPECT_EQ(rec.writes[0].key, "k2");
 }
 
 #ifndef NDEBUG

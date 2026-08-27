@@ -84,18 +84,41 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
 
   const MvccStamp stamp{mvcc, OriginHash(origin_idx)};
   ++commit_depth_;
-  // RAII, not a bare decrement after the loop: a throwing fn must still unwind commit_depth_, or
-  // one transient failure (e.g. a side-table insert hitting bad_alloc) leaves every subsequent
-  // Arm()/Disarm()/Commit() DCHECK-aborting forever.
-  absl::Cleanup restore_depth = [this] { --commit_depth_; };
+  // RAII, not bare statements after the loop: a throwing fn (SetMvcc's side-table insert can
+  // hit bad_alloc) must still unwind commit_depth_ AND clear armed_/arena_, or two things break.
+  // First, commit_depth_ stuck positive DCHECK-aborts every subsequent Arm()/Disarm()/Commit()
+  // forever. Second -- the parked decision this closes -- a surviving armed_ would be picked up
+  // by whatever runs next: EndOfWriteEpoch() would silently over-count mvcc_unstamped_writes for
+  // keys this call actually attempted, or -- worse -- a LATER Commit() call within the same
+  // epoch (a second RecordEntry from the same callback, e.g. a Lua script issuing more than one
+  // write) would stamp these leftover keys with THAT entry's mvcc, misattributing them to a
+  // journal entry that never mentioned them. Unconditional clearing means a throw during Commit
+  // instead degrades to: keys fn() reached before the throw are stamped (SetMvcc succeeded);
+  // keys it never reached keep their pre-call stamp -- silently, NOT counted in
+  // stats_.unstamped_writes, since that counter is only touched by EndOfWriteEpoch(), which by
+  // then sees an already-empty armed_ (a known, narrow observability gap: a throw here is already
+  // an exceptional bad_alloc, and the exception itself propagates out of Commit() uncaught by
+  // anything between here and Transaction::RunCallback's tail -- see this task's report). Silent
+  // pre-call-stamp survival is still the SAFE direction for the phase's central invariant (stamp
+  // does not advance without the entry that would justify it), rather than silently corrupting a
+  // future, unrelated commit.
+  absl::Cleanup restore_depth = [this] {
+    --commit_depth_;
+    armed_.clear();
+    arena_.clear();  // keeps capacity
+  };
   for (const Armed& a : armed_)
     fn(a.db_index, ArmedKey(a), stamp);
-
-  armed_.clear();
-  arena_.clear();  // keeps capacity
 }
 
 void MvccStamper::EndOfWriteEpoch() {
+  // The fourth mutator of armed_/arena_ (with Arm/Disarm/Commit, all DCHECK'd above): guards
+  // against a CommitFn that calls back into EndOfWriteEpoch() while Commit() is mid-iteration,
+  // which would clear armed_/arena_ out from under that loop exactly as a nested Arm()/Disarm()/
+  // Commit() would (see Commit()'s comment).
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn ended the write epoch -- Commit() is mid-iteration "
+                                 "over armed_/arena_, which this call would clear out from under "
+                                 "it";
   stats_.unstamped_writes += armed_.size();
   armed_.clear();
   arena_.clear();

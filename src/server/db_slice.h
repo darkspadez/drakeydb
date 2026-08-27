@@ -360,7 +360,7 @@ class DbSlice {
   // drakeydb: P4-1 Task 5, fix round 1 -- computed on demand (sums DbTable::mvcc_table_memory()
   // over db_arr_) rather than maintained as a running accumulator. table_memory_'s accumulator
   // pattern only stays correct because every mutation site (e.g. AddOrFind's
-  // `table_memory_ += table_increase;`, db_slice.cc:937) takes a live growth delta; SetMvcc has
+  // `table_memory_ += table_increase;`, db_slice.cc:946) takes a live growth delta; SetMvcc has
   // no equivalent, so an accumulator here would report the sum of the tables' *initial empty*
   // sizes forever and, worse, underflow (size_t) the first time FlushDbIndexes subtracts a since
   // filled table's live size against a total that was never credited for the growth. Read rarely
