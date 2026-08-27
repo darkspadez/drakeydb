@@ -232,8 +232,10 @@ deterministic; the `mvcc_test` units do not rely on that, because they pass `now
 explicitly (see below).
 
 **The clock is read by the caller, not inside `mvcc.cc`.** `MvccClock::Next`,
-`MvccClock::AheadMs`, `MvccStamper::HopStamp` and `MvccStamper::Commit` all take
-`now_ms` as a parameter; `mvcc.cc` does not include `engine_shard_set.h`. This is a
+`MvccClock::AheadMs` and `MvccStamper::HopStamp` take `now_ms` as a parameter
+(`MvccStamper::Commit` needs no clock at all — it stores the stamp it is given and
+`DCHECK`s that one was given, which is what makes "the stamp in the table is the stamp
+on the wire" structural rather than conventional); `mvcc.cc` does not include `engine_shard_set.h`. This is a
 link-layering requirement, not a style choice: `mvcc.cc` compiles into
 `dfly_transaction`, while `GetCurrentTimeMs()`'s `TEST_current_time_ms` is defined in
 `engine_shard.cc` in `dragonfly_lib`, and only the `dragonfly_lib -> dfly_transaction`
