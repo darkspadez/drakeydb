@@ -3,9 +3,16 @@
 //
 #pragma once
 
+#include <absl/container/inlined_vector.h>
+
 #include <cstdint>
+#include <functional>
+#include <string>
 #include <string_view>
 #include <tuple>
+#include <vector>
+
+#include "server/common.h"  // DbIndex
 
 namespace dfly {
 
@@ -102,5 +109,79 @@ static_assert(alignof(MvccStamp) == 8,
 // Stable across processes, builds and architectures -- the hash is persisted in the RDB and
 // compared against values written by other nodes, so std::hash is unusable here.
 uint64_t NodeUuidHash(std::string_view uuid);
+
+// Thread-local minting and arm/commit bookkeeping. One per proactor thread, which is the right
+// granularity: several DbSlices may share a thread via namespaces, and the clock only has to be
+// monotone, never unique.
+//
+// Contract: DbSlice::PostUpdate ARMS the keys a shard callback touched; journal::RecordEntry
+// COMMITS the entry's stamp to every armed key at the moment the entry is emitted; the end of the
+// callback DISCARDS whatever is still armed. That is what enforces the phase's central invariant:
+//
+//   a key's stamp advances if and only if that same stamp is propagated to peers.
+//
+// Violating it in the "stamp but do not propagate" direction causes permanent, silent divergence:
+// the node then rejects peer writes that should have won, forever.
+class MvccStamper {
+ public:
+  using CommitFn = std::function<void(DbIndex, std::string_view, const MvccStamp&)>;
+
+  // Re-mint the hop stamp if the memo is older than this. A missed EndOfWriteEpoch then degrades
+  // visibly (stats().stale_epoch) instead of silently reusing an ancient stamp.
+  static constexpr uint64_t kMaxEpochMs = 50;
+
+  struct Stats {
+    uint64_t unstamped_writes = 0;  // arms discarded with no journal entry -- see INFO
+    uint64_t stale_epoch = 0;       // hop memo re-minted by the backstop above
+  };
+
+  static MvccStamper* tlocal();
+
+  void SetSelfUuid(std::string_view uuid);
+  void RegisterOriginHash(uint32_t origin_idx, uint64_t hash);
+  uint64_t OriginHash(uint32_t origin_idx) const;
+
+  // Stable for the whole shard callback: repeated calls with a non-decreasing now_ms return the
+  // same value until the memo is older than kMaxEpochMs, or EndOfWriteEpoch() resets it. Takes
+  // the time as a parameter -- like MvccClock::Next/AheadMs -- so dfly_transaction never reaches
+  // up into dragonfly_lib for GetCurrentTimeMs; callers (Task 7's journal.cc) pass it explicitly.
+  uint64_t HopStamp(uint64_t now_ms);
+
+  void Arm(DbIndex db_index, std::string_view key);
+  void Disarm(DbIndex db_index, std::string_view key);
+
+  // mvcc == 0 means "mint locally" via HopStamp(now_ms); a non-zero value is an applied write's
+  // author stamp and is stored verbatim, and now_ms then goes unused. Clears the arm list.
+  void Commit(uint64_t mvcc, uint32_t origin_idx, uint64_t now_ms, const CommitFn& fn);
+
+  void EndOfWriteEpoch();
+
+  const Stats& stats() const {
+    return stats_;
+  }
+  const MvccClock& clock() const {
+    return clock_;
+  }
+
+  void TEST_Reset();
+
+ private:
+  struct Armed {
+    DbIndex db_index;
+    uint32_t off;
+    uint32_t len;
+  };
+
+  std::string_view ArmedKey(const Armed& a) const {
+    return std::string_view(arena_.data() + a.off, a.len);
+  }
+
+  MvccClock clock_;
+  uint64_t hop_stamp_ = 0;
+  std::string arena_;  // cleared, never shrunk, so steady-state arming does not allocate
+  absl::InlinedVector<Armed, 4> armed_;
+  std::vector<uint64_t> origin_hash_cache_;  // dense by origin_idx; index 0 == self
+  Stats stats_;
+};
 
 }  // namespace dfly

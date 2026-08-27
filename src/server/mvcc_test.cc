@@ -3,6 +3,7 @@
 //
 #include "server/mvcc.h"
 
+#include <absl/strings/str_cat.h>
 #include <gmock/gmock.h>
 #include <xxhash.h>
 
@@ -89,9 +90,11 @@ TEST(MvccStampTest, TombstoneBitIsMaskedFromComparison) {
   EXPECT_FALSE(tombstone < value) << "...nor lose";
 
   // Pinning mvcc == 100 on both operands above only observes masking at an exact tie, where an
-  // inflated left operand happens to be harmless. Cross-mvcc probes catch an a-side-only masking
-  // bug that the tie case cannot: without the mask, a tombstone could become order-equivalent to
-  // (neither greater nor less than) a strictly newer or older stamp instead of losing/winning.
+  // inflated left operand happens to be harmless. Below, EXPECT_LT(tombstone, newer) is the probe
+  // that actually catches an a-side-only masking bug: with the tombstone as the left ('a') operand
+  // and a strictly newer stamp as 'b', an unmasked a.packed (bit 63 set) makes the comparison false
+  // when it must be true. EXPECT_LT(older, tombstone) does not catch that same mutation -- older
+  // has no tombstone bit to unmask, so its result is unaffected either way.
   const MvccStamp newer{101, 5};
   EXPECT_LT(tombstone, newer) << "a tombstone must lose to a strictly newer stamp";
   EXPECT_FALSE(newer < tombstone);
@@ -134,6 +137,137 @@ TEST(NodeUuidHashTest, StableAndDistinct) {
   // Must not collide with LockTag::Fingerprint's hash space (tx_base.cc:100), which hashes keys
   // under a different seed (0x1C69B3F74AC4AE35UL) for a different purpose.
   EXPECT_NE(NodeUuidHash(a), XXH64(a.data(), a.size(), 0x1C69B3F74AC4AE35ULL));
+}
+
+namespace {
+// Collects what Commit would have written, so this task needs no DbSlice.
+struct Recorder {
+  std::vector<std::pair<std::string, MvccStamp>> writes;
+
+  MvccStamper::CommitFn Fn() {
+    return [this](DbIndex db, std::string_view key, const MvccStamp& st) {
+      writes.emplace_back(std::string(key), st);
+    };
+  }
+};
+
+MvccStamper* FreshStamper() {
+  MvccStamper* s = MvccStamper::tlocal();
+  s->TEST_Reset();
+  s->SetSelfUuid("6f1c4c3e-0000-4000-8000-00000000000a");
+  return s;
+}
+}  // namespace
+
+TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
+  MvccStamper* s = FreshStamper();
+  Recorder rec;
+  s->Arm(0, "k1");
+  s->Arm(0, "k2");
+  s->Commit(4242, /* origin_idx= */ 0, /* now_ms= */ 1'000, rec.Fn());
+
+  ASSERT_EQ(rec.writes.size(), 2u);
+  EXPECT_EQ(rec.writes[0].first, "k1");
+  EXPECT_EQ(rec.writes[1].first, "k2");
+  EXPECT_EQ(rec.writes[0].second.Mvcc(), 4242u);
+  EXPECT_EQ(rec.writes[0].second.origin_hash, rec.writes[1].second.origin_hash);
+  EXPECT_EQ(s->stats().unstamped_writes, 0u);
+}
+
+TEST(MvccStamperTest, EndOfEpochDropsUncommittedArms) {
+  MvccStamper* s = FreshStamper();
+  Recorder rec;
+  s->Arm(0, "orphan");
+  s->EndOfWriteEpoch();
+  s->Commit(1, 0, /* now_ms= */ 1'000, rec.Fn());
+
+  EXPECT_TRUE(rec.writes.empty()) << "an arm with no journal entry must not be stamped";
+  EXPECT_EQ(s->stats().unstamped_writes, 1u)
+      << "and the drop must be counted -- this is the production canary for read paths "
+         "that mutate without journaling";
+}
+
+TEST(MvccStamperTest, DisarmRemovesOnlyTheNamedKey) {
+  MvccStamper* s = FreshStamper();
+  Recorder rec;
+  s->Arm(0, "keep");
+  s->Arm(0, "drop");
+  s->Disarm(0, "drop");
+  s->Commit(7, 0, /* now_ms= */ 1'000, rec.Fn());
+
+  ASSERT_EQ(rec.writes.size(), 1u);
+  EXPECT_EQ(rec.writes[0].first, "keep");
+}
+
+TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
+  MvccStamper* s = FreshStamper();
+  Recorder rec;
+  s->Arm(0, "k");
+  s->Arm(1, "k");
+  s->Disarm(1, "k");
+  s->Commit(7, 0, /* now_ms= */ 1'000, rec.Fn());
+
+  ASSERT_EQ(rec.writes.size(), 1u);
+  EXPECT_EQ(rec.writes[0].first, "k");
+}
+
+// The bit-identity mechanism: several entries minted inside one callback share a stamp.
+TEST(MvccStamperTest, HopStampIsStableWithinEpochAndAdvancesAfter) {
+  MvccStamper* s = FreshStamper();
+  // Same now_ms on every "stable" call, and well inside kMaxEpochMs of itself, so the backstop
+  // (see HopStampReMintsPastStaleEpochBackstop below) cannot fire and confound this assertion.
+  const uint64_t kNow = 10'000;
+  const uint64_t first = s->HopStamp(kNow);
+  for (int i = 0; i < 5; ++i)
+    EXPECT_EQ(s->HopStamp(kNow), first) << "iteration " << i;
+
+  s->EndOfWriteEpoch();
+  EXPECT_GT(s->HopStamp(kNow), first);
+}
+
+// The stale-epoch backstop: a missed EndOfWriteEpoch must not let a hop stamp be reused forever.
+TEST(MvccStamperTest, HopStampReMintsPastStaleEpochBackstop) {
+  MvccStamper* s = FreshStamper();
+  const uint64_t first = s->HopStamp(10'000);
+  const uint64_t later = s->HopStamp(10'000 + MvccStamper::kMaxEpochMs + 1);
+
+  EXPECT_GT(later, first) << "a memo older than kMaxEpochMs must be re-minted, not reused";
+  EXPECT_EQ(s->stats().stale_epoch, 1u)
+      << "a missed EndOfWriteEpoch must be visible in stats, not silently absorbed";
+}
+
+TEST(MvccStamperTest, PeerMvccIsNeverReminted) {
+  MvccStamper* s = FreshStamper();
+  Recorder rec;
+  s->RegisterOriginHash(3, 0xABCDEF);
+  s->Arm(0, "k");
+  s->Commit(/* mvcc= */ 999, /* origin_idx= */ 3, /* now_ms= */ 1'000, rec.Fn());
+
+  ASSERT_EQ(rec.writes.size(), 1u);
+  EXPECT_EQ(rec.writes[0].second.Mvcc(), 999u) << "an applied write keeps the author's stamp "
+                                                  "verbatim, or stamps inflate on every hop";
+  EXPECT_EQ(rec.writes[0].second.origin_hash, 0xABCDEFu) << "and the author's origin, not ours";
+}
+
+TEST(MvccStamperTest, SelfOriginIsIndexZero) {
+  MvccStamper* s = FreshStamper();
+  EXPECT_EQ(s->OriginHash(0), NodeUuidHash("6f1c4c3e-0000-4000-8000-00000000000a"));
+}
+
+TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
+  // Guards the arena implementation: a reallocating buffer must not corrupt earlier (off, len).
+  MvccStamper* s = FreshStamper();
+  Recorder rec;
+  std::vector<std::string> keys;
+  for (int i = 0; i < 256; ++i) {
+    keys.push_back(absl::StrCat("key-with-a-long-enough-name-to-force-growth-", i));
+    s->Arm(0, keys.back());
+  }
+  s->Commit(5, 0, /* now_ms= */ 1'000, rec.Fn());
+
+  ASSERT_EQ(rec.writes.size(), 256u);
+  for (int i = 0; i < 256; ++i)
+    EXPECT_EQ(rec.writes[i].first, keys[i]) << "arm " << i << " was corrupted by later growth";
 }
 
 }  // namespace dfly

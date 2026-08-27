@@ -1096,9 +1096,9 @@ git add -A && git commit -m "feat: add MvccClock and MvccStamp value types (P4)"
 **Interfaces:**
 - Consumes: Task 3's `MvccClock`, `MvccStamp`, `NodeUuidHash`.
 - Produces: `class MvccStamper` with `static MvccStamper* tlocal()`,
-  `uint64_t HopStamp()`, `void Arm(DbIndex, std::string_view)`,
+  `uint64_t HopStamp(uint64_t now_ms)`, `void Arm(DbIndex, std::string_view)`,
   `void Disarm(DbIndex, std::string_view)`,
-  `void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn&)`,
+  `void Commit(uint64_t mvcc, uint32_t origin_idx, uint64_t now_ms, const CommitFn&)`,
   `void EndOfWriteEpoch()`, `uint64_t OriginHash(uint32_t origin_idx)`,
   `void SetSelfUuid(std::string_view)`,
   `void RegisterOriginHash(uint32_t idx, uint64_t hash)`,
@@ -1108,17 +1108,29 @@ git add -A && git commit -m "feat: add MvccClock and MvccStamp value types (P4)"
 `Commit` takes a callback rather than touching `DbSlice`, so this whole task stays
 testable with no shard set and no database. Task 7 supplies the real callback.
 
-**Two design points that are load-bearing, not stylistic:**
+**Three design points that are load-bearing, not stylistic:**
 
-1. **The hop memo.** `HopStamp()` returns the *same* value for every call within one
-   shard-callback. This is what makes author and applier agree when the author lumps
-   several journal entries into one callback: the applier receives those entries
+1. **The hop memo.** `HopStamp(now_ms)` returns the *same* value for every call within
+   one shard-callback. This is what makes author and applier agree when the author
+   lumps several journal entries into one callback: the applier receives those entries
    separately and stamps each key from its own entry, so the entries must carry an
    identical mvcc. It also means the 20-bit counter is consumed per *hop*, not per
    *key* — a 100-key `MSET` costs one counter value.
 2. **The stale-epoch backstop.** If a code path forgets to call `EndOfWriteEpoch()`,
    reusing an ancient hop stamp would be silent corruption. Instead, re-mint once the
    memo is older than `kMaxEpochMs` and count it, so a missed epoch degrades visibly.
+3. **`now_ms` is a parameter, not read internally via `GetCurrentTimeMs()`.** `mvcc.cc`
+   compiles into `dfly_transaction`, which has no CMake link edge to `dragonfly_lib`
+   (only the reverse edge exists: `dragonfly_lib` -> `dfly_transaction`). Calling
+   `GetCurrentTimeMs()` (`engine_shard_set.h:155`, defined via `dragonfly_lib`'s
+   `engine_shard.cc`) from inside `mvcc.cc` would link only by accident, in binaries
+   whose closure happens to pull in `engine_shard.cc.o` for an unrelated reason (real
+   `EngineShard` use elsewhere). `mvcc_test` has no fixtures and so no such reason —
+   it is the first binary narrow enough to turn that accident into a hard link
+   failure (confirmed: `undefined reference to dfly::TEST_current_time_ms`).
+   `HopStamp`/`Commit` take `now_ms` explicitly instead, matching `MvccClock::Next`/
+   `AheadMs`, which already do; Task 7's `journal.cc` (which legitimately reaches
+   `EngineShard` already) calls `HopStamp(GetCurrentTimeMs())`.
 
 **Arming must not allocate.** libstdc++ SSO holds 15 chars, so a `std::string` per arm
 would allocate on every write to a 16-byte key. Use a reused arena plus `(offset, len)`.
@@ -1153,7 +1165,7 @@ TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
   Recorder rec;
   s->Arm(0, "k1");
   s->Arm(0, "k2");
-  s->Commit(4242, /* origin_idx= */ 0, rec.Fn());
+  s->Commit(4242, /* origin_idx= */ 0, /* now_ms= */ 1'000, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 2u);
   EXPECT_EQ(rec.writes[0].first, "k1");
@@ -1168,7 +1180,7 @@ TEST(MvccStamperTest, EndOfEpochDropsUncommittedArms) {
   Recorder rec;
   s->Arm(0, "orphan");
   s->EndOfWriteEpoch();
-  s->Commit(1, 0, rec.Fn());
+  s->Commit(1, 0, /* now_ms= */ 1'000, rec.Fn());
 
   EXPECT_TRUE(rec.writes.empty()) << "an arm with no journal entry must not be stamped";
   EXPECT_EQ(s->stats().unstamped_writes, 1u)
@@ -1182,7 +1194,7 @@ TEST(MvccStamperTest, DisarmRemovesOnlyTheNamedKey) {
   s->Arm(0, "keep");
   s->Arm(0, "drop");
   s->Disarm(0, "drop");
-  s->Commit(7, 0, rec.Fn());
+  s->Commit(7, 0, /* now_ms= */ 1'000, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
   EXPECT_EQ(rec.writes[0].first, "keep");
@@ -1194,7 +1206,7 @@ TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
   s->Arm(0, "k");
   s->Arm(1, "k");
   s->Disarm(1, "k");
-  s->Commit(7, 0, rec.Fn());
+  s->Commit(7, 0, /* now_ms= */ 1'000, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
   EXPECT_EQ(rec.writes[0].first, "k");
@@ -1203,12 +1215,26 @@ TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
 // The bit-identity mechanism: several entries minted inside one callback share a stamp.
 TEST(MvccStamperTest, HopStampIsStableWithinEpochAndAdvancesAfter) {
   MvccStamper* s = FreshStamper();
-  const uint64_t first = s->HopStamp();
+  // Same now_ms on every "stable" call, and well inside kMaxEpochMs of itself, so the backstop
+  // (see HopStampReMintsPastStaleEpochBackstop below) cannot fire and confound this assertion.
+  const uint64_t kNow = 10'000;
+  const uint64_t first = s->HopStamp(kNow);
   for (int i = 0; i < 5; ++i)
-    EXPECT_EQ(s->HopStamp(), first) << "iteration " << i;
+    EXPECT_EQ(s->HopStamp(kNow), first) << "iteration " << i;
 
   s->EndOfWriteEpoch();
-  EXPECT_GT(s->HopStamp(), first);
+  EXPECT_GT(s->HopStamp(kNow), first);
+}
+
+// The stale-epoch backstop: a missed EndOfWriteEpoch must not let a hop stamp be reused forever.
+TEST(MvccStamperTest, HopStampReMintsPastStaleEpochBackstop) {
+  MvccStamper* s = FreshStamper();
+  const uint64_t first = s->HopStamp(10'000);
+  const uint64_t later = s->HopStamp(10'000 + MvccStamper::kMaxEpochMs + 1);
+
+  EXPECT_GT(later, first) << "a memo older than kMaxEpochMs must be re-minted, not reused";
+  EXPECT_EQ(s->stats().stale_epoch, 1u)
+      << "a missed EndOfWriteEpoch must be visible in stats, not silently absorbed";
 }
 
 TEST(MvccStamperTest, PeerMvccIsNeverReminted) {
@@ -1216,7 +1242,7 @@ TEST(MvccStamperTest, PeerMvccIsNeverReminted) {
   Recorder rec;
   s->RegisterOriginHash(3, 0xABCDEF);
   s->Arm(0, "k");
-  s->Commit(/* mvcc= */ 999, /* origin_idx= */ 3, rec.Fn());
+  s->Commit(/* mvcc= */ 999, /* origin_idx= */ 3, /* now_ms= */ 1'000, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
   EXPECT_EQ(rec.writes[0].second.Mvcc(), 999u) << "an applied write keeps the author's stamp "
@@ -1238,7 +1264,7 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
     keys.push_back(absl::StrCat("key-with-a-long-enough-name-to-force-growth-", i));
     s->Arm(0, keys.back());
   }
-  s->Commit(5, 0, rec.Fn());
+  s->Commit(5, 0, /* now_ms= */ 1'000, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 256u);
   for (int i = 0; i < 256; ++i)
@@ -1299,15 +1325,18 @@ class MvccStamper {
   void RegisterOriginHash(uint32_t origin_idx, uint64_t hash);
   uint64_t OriginHash(uint32_t origin_idx) const;
 
-  // Stable for the whole shard callback. See kMaxEpochMs.
-  uint64_t HopStamp();
+  // Stable for the whole shard callback: repeated calls with a non-decreasing now_ms return the
+  // same value until the memo is older than kMaxEpochMs, or EndOfWriteEpoch() resets it. Takes
+  // the time as a parameter -- like MvccClock::Next/AheadMs -- so dfly_transaction never reaches
+  // up into dragonfly_lib for GetCurrentTimeMs; callers (Task 7's journal.cc) pass it explicitly.
+  uint64_t HopStamp(uint64_t now_ms);
 
   void Arm(DbIndex db_index, std::string_view key);
   void Disarm(DbIndex db_index, std::string_view key);
 
-  // mvcc == 0 means "mint locally"; a non-zero value is an applied write's author stamp and is
-  // stored verbatim. Clears the arm list.
-  void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn);
+  // mvcc == 0 means "mint locally" via HopStamp(now_ms); a non-zero value is an applied write's
+  // author stamp and is stored verbatim, and now_ms then goes unused. Clears the arm list.
+  void Commit(uint64_t mvcc, uint32_t origin_idx, uint64_t now_ms, const CommitFn& fn);
 
   void EndOfWriteEpoch();
 
@@ -1343,10 +1372,8 @@ class MvccStamper {
 - [ ] **Step 4: Implement it in `mvcc.cc`**
 
 ```cpp
-// (add to mvcc.cc)
-#include "server/engine_shard_set.h"  // GetCurrentTimeMs
-
-namespace dfly {
+// (add to mvcc.cc -- no new include: HopStamp takes now_ms as a parameter precisely so this
+// file never needs "server/engine_shard_set.h". See design point 3 above.)
 
 MvccStamper* MvccStamper::tlocal() {
   static thread_local MvccStamper stamper;
@@ -1367,12 +1394,11 @@ uint64_t MvccStamper::OriginHash(uint32_t origin_idx) const {
   return origin_idx < origin_hash_cache_.size() ? origin_hash_cache_[origin_idx] : 0;
 }
 
-uint64_t MvccStamper::HopStamp() {
-  const uint64_t now = GetCurrentTimeMs();
-  if (hop_stamp_ == 0 || (hop_stamp_ >> MvccClock::kCounterBits) + kMaxEpochMs < now) {
+uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
+  if (hop_stamp_ == 0 || (hop_stamp_ >> MvccClock::kCounterBits) + kMaxEpochMs < now_ms) {
     if (hop_stamp_ != 0)
       ++stats_.stale_epoch;
-    hop_stamp_ = clock_.Next(now);
+    hop_stamp_ = clock_.Next(now_ms);
   }
   return hop_stamp_;
 }
@@ -1392,11 +1418,11 @@ void MvccStamper::Disarm(DbIndex db_index, std::string_view key) {
   }
 }
 
-void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn) {
+void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, uint64_t now_ms, const CommitFn& fn) {
   if (armed_.empty())
     return;
 
-  const MvccStamp stamp{mvcc != 0 ? mvcc : HopStamp(), OriginHash(origin_idx)};
+  const MvccStamp stamp{mvcc != 0 ? mvcc : HopStamp(now_ms), OriginHash(origin_idx)};
   for (const Armed& a : armed_)
     fn(a.db_index, ArmedKey(a), stamp);
 
@@ -1429,11 +1455,12 @@ void MvccStamper::TEST_Reset() {
 docker exec drakeydb-p2 sh -c 'cd /src/build-dbg && ninja -j4 mvcc_test && /src/build-dbg/mvcc_test'
 ```
 
-Expected: PASS, all 19 cases.
+Expected: PASS, all 20 cases (includes `HopStampReMintsPastStaleEpochBackstop`, added to
+cover the design point 3 backstop -- previously untested).
 
 - [ ] **Step 6: Falsify the hop memo, per D9**
 
-In `HopStamp()`, drop the memo — return `clock_.Next(GetCurrentTimeMs())` every call.
+In `HopStamp(now_ms)`, drop the memo — return `clock_.Next(now_ms)` every call.
 Rebuild, run `MvccStamperTest.HopStampIsStableWithinEpochAndAdvancesAfter`. Record the
 observed failure, restore. This is the test that protects author/applier bit-identity
 for effect-rewriting commands.
@@ -1924,8 +1951,10 @@ own stamp.
 
 ```cpp
   // drakeydb: Phase 4 -- mint BEFORE AddLogRecord so the wire carries this exact value.
+  // HopStamp takes now_ms explicitly (Task 4, design point 3): mvcc.cc itself never calls
+  // GetCurrentTimeMs(), so the caller -- here, already deep in EngineShard territory -- does.
   if (MvccEnabled() && opcode == Op::COMMAND && entry.mvcc == 0)
-    entry.mvcc = MvccStamper::tlocal()->HopStamp();
+    entry.mvcc = MvccStamper::tlocal()->HopStamp(GetCurrentTimeMs());
 ```
 
 then, immediately **after** `AddLogRecord(entry)`:
@@ -1935,9 +1964,12 @@ then, immediately **after** `AddLogRecord(entry)`:
   // applied write's author stamp and is kept verbatim, or stamps would inflate on every hop.
   // 0 is unreachable for a real stamp (ms << 20, ms ~ 1.77e12).
   // drakeydb: Phase 4 -- commit AFTER the entry is durable. A non-zero mvcc arriving from a
-  // peer is that author's stamp and is stored verbatim, or stamps inflate on every hop.
+  // peer is that author's stamp and is stored verbatim, or stamps inflate on every hop. entry.mvcc
+  // is always non-zero by this point (freshly minted above, or supplied non-zero by the caller),
+  // so Commit's HopStamp(now_ms) fallback never actually runs here -- now_ms is passed because
+  // the signature requires it, not because this call site needs it.
   if (MvccEnabled() && opcode == Op::COMMAND) {
-    MvccStamper::tlocal()->Commit(entry.mvcc, entry.origin_idx,
+    MvccStamper::tlocal()->Commit(entry.mvcc, entry.origin_idx, GetCurrentTimeMs(),
                                   [](DbIndex db, std::string_view key, const MvccStamp& st) {
                                     EngineShard::tlocal()->db_slice().SetMvcc(db, PrimeKey{key},
                                                                              st);
