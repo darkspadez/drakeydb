@@ -2035,6 +2035,19 @@ OpResult<ZSetFamily::AddResult> ZSetFamily::OpAdd(const OpArgs& op_args,
   if (op_status != OpStatus::OK)
     return op_status;
 
+  // drakeydb: Phase 4, P4-1 Task 8 fix round 3 (F5) -- arm before journaling, same reasoning as
+  // hset_family.cc's OpHExpire (:728-731): res_it->post_updater would otherwise not run until
+  // this function returns, after RecordJournal below. Reached with journal_update=true from
+  // ZDIFFSTORE/ZINTERSTORE/ZUNIONSTORE/ZRANGESTORE and GEORADIUS/GEORADIUSBYMEMBER's STORE
+  // variants (all NO_AUTOJOURNAL, this file's Register()), so RecordJournal below is the only
+  // journal entry those commands' destination key gets, and a propagated-but-unstamped key is
+  // exactly what Task 7's invariant forbids. Two journal entries below when zparams.override is
+  // set (DEL then ZADD), same shape as set_family.cc's OpAdd for S*STORE: safe for the same
+  // reason -- MvccStamper::Commit clears the arm list unconditionally on the first call, and
+  // HopStamp is memoised for the epoch, so whichever entry's Commit actually consumes the arm
+  // writes the identical stamp the other would have.
+  res_it->post_updater.Run();
+
   // TODO: consider optimization to record real command if the replica is in stable_sync state
   // and there is no slot migration process going on.
   if (zparams.journal_update && op_args.shard->journal()) {

@@ -1231,6 +1231,28 @@ TEST_F(MvccStoreTest, SunionstoreStampsTheDestination) {
   ASSERT_TRUE(StampOf("dest").has_value()) << "SUNIONSTORE's own journal entry must stamp dest";
 }
 
+// drakeydb: review fix round 3 (F5) -- ZSetFamily::OpAdd is the sixth instance of the same class:
+// PrepareZEntry returns a live ItAndUpdater with no post_updater reference anywhere before the
+// explicit RecordJournal calls (DEL, then ZADD) that NO_AUTOJOURNAL ZDIFFSTORE/ZINTERSTORE/
+// ZUNIONSTORE/ZRANGESTORE and GEORADIUS...STORE rely on. "dest" is pre-set to a plain string (a
+// different type entirely) specifically to force the two-entry DEL-then-ZADD path (zparams.override
+// is unconditionally true for these *STORE commands, so the DEL fires regardless of whether dest
+// previously existed -- but giving it a real prior value makes the test's own setup meaningful,
+// not just incidental). Compares before/after like XtrimStampsTheStream above, for the same
+// reason: a bare has_value() after the command would be satisfied by a stale stamp surviving
+// untouched, not necessarily by ZUNIONSTORE's own commit succeeding.
+TEST_F(MvccStoreTest, ZunionstoreStampsTheDestinationAcrossTwoJournalEntries) {
+  Run({"zadd", "z1", "1", "a"});
+  Run({"set", "dest", "stale"});
+  auto before = StampOf("dest");
+  ASSERT_TRUE(before.has_value());
+  Run({"zunionstore", "dest", "1", "z1"});
+  auto after = StampOf("dest");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_TRUE(*before < *after) << "ZUNIONSTORE's own journal entry must mint a fresh, strictly "
+                                   "newer stamp for dest via its two-entry DEL+ZADD path";
+}
+
 // The "off means byte-identical to upstream" guard.
 TEST_F(BaseFamilyTest, NonActiveModeAllocatesNoMvccTable) {
   Run({"set", "k", "v"});
