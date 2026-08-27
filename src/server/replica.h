@@ -298,6 +298,14 @@ class DflyShardReplica : public ProtocolClient {
   // on journal_rec_executed_, the same way DflyShardReplicaOriginTest above drives origin_idx.
   friend class DflyShardReplicaPeerModeTest;
 
+  // drakeydb: Phase 4 Task 9, fix round (F1) -- lets MvccStoreTest (multi_master_test.cc)
+  // construct a flow directly (no socket) the same way DflyShardReplicaOriginTest above does, to
+  // exercise ExecuteTx's real, per-shard application of an author's mvcc/origin_hash on a
+  // multi-shard configuration. Needed even though ExecuteTx itself is public: ServerContext is
+  // inherited from ProtocolClient::ServerContext, which is protected there, so only a subclass or
+  // friend can name it to build the constructor's first argument.
+  friend class MvccStoreTest;
+
  public:
   // `origin_idx`: this flow's PeerRegistry origin index (Replica::Greet() obtains it from
   // PeerRegistry::AddOrGet()); PeerRegistry::kSelfIdx (0) for a non-peer flow. Threaded straight
@@ -314,17 +322,20 @@ class DflyShardReplica : public ProtocolClient {
   // (see peer_mode_ below) rather than forwarded once and forgotten: it is consulted repeatedly,
   // later, by StableSyncDflyReadFb, both to select TransactionReader's adopt-vs-compare behavior
   // for Op::LSN and to gate AdoptAuthoritativeLsn().
-  // `origin_hash`: drakeydb: Phase 4 -- the AUTHOR's hash for `origin_idx` (Replica's own
-  // peer_origin_hash_; see its doc comment for why this can't come from the wire). Registered
-  // with MvccStamper at construction, beside executor_->SetApplyOrigin(origin_idx) above, so an
-  // applied write's origin_idx resolves back to this hash instead of the unregistered default of
-  // 0. Trailing with a default (unlike origin_idx/peer_mode) so pre-existing direct-construction
-  // callers (peer_replication_test.cc's friended fixtures, which predate this parameter and don't
-  // exercise MvccStamper) do not need updating.
+  // drakeydb: Phase 4, fix round (F1v2) -- this constructor deliberately does NOT also take or
+  // register the flow's author hash (Replica::peer_origin_hash_). An earlier version threaded a
+  // trailing `origin_hash` parameter through here and registered it with MvccStamper at
+  // construction; that crashed (SIGSEGV, reproduced 5/10 runs of
+  // test_active_replica_single_peer_replaces, multimaster_test.py) because it was the first
+  // yield point ever introduced into this constructor -- every other member here does pure,
+  // non-blocking initialization -- and this constructor runs inside InitiateDflySync's tight
+  // per-flow loop, where a new yield point let a concurrent peer-replacement teardown interleave
+  // in ways the original code never had to handle. See task-9-report.md and the registration's
+  // new home, Replica::InitiateDflySync's shard_cb, for the full account and why that point is
+  // safe where this one was not.
   DflyShardReplica(ServerContext server_context, MasterContext master_context, uint32_t flow_id,
                    Service* service, std::shared_ptr<MultiShardExecution> multi_shard_exe,
-                   class RdbLoadContext* load_context, uint32_t origin_idx, bool peer_mode,
-                   uint64_t origin_hash = 0);
+                   class RdbLoadContext* load_context, uint32_t origin_idx, bool peer_mode);
   ~DflyShardReplica();
 
   void Cancel();

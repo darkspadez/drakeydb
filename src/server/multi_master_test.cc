@@ -29,8 +29,11 @@
 #include "server/journal/executor.h"
 #include "server/journal/journal.h"
 #include "server/journal/serializer.h"
+#include "server/journal/tx_executor.h"
 #include "server/journal/types.h"
 #include "server/node_identity.h"
+#include "server/rdb_load.h"
+#include "server/replica.h"
 #include "server/server_family.h"
 #include "server/snapshot.h"
 #include "server/test_utils.h"
@@ -742,6 +745,102 @@ class MvccStoreTest : public BaseFamilyTest {
         .Join();
     return dispatch_result;
   }
+
+  // drakeydb: Phase 4 Task 9, fix round (F1v2) -- constructs a real DflyShardReplica directly, no
+  // socket, exactly mirroring Replica::InitiateDflySync's production construction call
+  // (replica.cc) -- then, for each shard, applies a SET to a key that hashes to that shard
+  // through the flow's real ExecuteTx, and returns the keys for the caller to check the
+  // resulting stamps (see below for why assertions live there, not here). Defined as a genuine
+  // member of this exact friended class (`friend class MvccStoreTest;`, replica.h), not inlined
+  // into a TEST_F body: gtest generates a TEST_F's body as a method of a *derived* class, and
+  // friendship is not inherited (same reasoning as DflyShardReplicaOriginTest in
+  // peer_replication_test.cc).
+  //
+  // The origin_idx -> origin_hash registration is done manually here via
+  // shard_set->pool()->AwaitBrief, the same shape AppliedWriteKeepsAuthorStampVerbatim above
+  // uses -- NOT via DflyShardReplica's constructor. An earlier version of this helper relied on
+  // the constructor to do that registration (mirroring what was, at the time, production
+  // behavior); that production behavior was reverted after it crashed the server (SIGSEGV,
+  // reproduced 5/10 runs of test_active_replica_single_peer_replaces) -- see
+  // DflyShardReplica's constructor and Replica::InitiateDflySync's shard_cb (both replica.cc) for
+  // the full account. The registration now happens in InitiateDflySync's shard_cb, which this
+  // test does not call (it constructs DflyShardReplica directly, bypassing Replica entirely, the
+  // same way DflyShardReplicaOriginTest does for origin_idx) -- so this helper reproduces the
+  // broadcast manually instead. That means this test no longer pins "does flow construction
+  // register the hash automatically" (nothing in this file's reach does, post-fix; that
+  // property now lives in InitiateDflySync, a private Replica method with no no-socket
+  // construction path); what it still genuinely proves is multi-shard correctness of the
+  // CONSUMING side -- ExecuteTx's real, per-shard application of an author's mvcc/origin_hash --
+  // which AppliedWriteKeepsAuthorStampVerbatim above does not cover, since that test only ever
+  // touches one key/shard.
+  //
+  // Construction AND every ExecuteTx call run inside one pp_->at(0)->LaunchFiber(...).Join(),
+  // matching ApplyReplicatedCommand above: Execute() calls into Service::DispatchCommand, which
+  // needs ServerState::tlocal() to resolve on the calling thread, and that's only ever
+  // initialized on the pool's own proactor threads -- confirmed the hard way, by first writing
+  // this without the wrapper and hitting a SIGSEGV in dfly::ServerState::gstate() (see
+  // task-9-report.md for the verbatim crash -- a different crash from the constructor one above,
+  // hit and fixed earlier in the same investigation).
+  //
+  // Assertions on the applied stamps are deliberately NOT inside the LaunchFiber lambda below:
+  // gtest's ASSERT_* macros expand to a bare `return`, which only unwinds the immediately
+  // enclosing function -- here, the lambda -- not ApplyOnePeerWriteToEveryShard itself, so an
+  // in-lambda ASSERT_* failure would silently skip the remaining shards in THIS loop while the
+  // caller carries on regardless, rather than actually stopping the test. Collecting keys here
+  // and asserting on the resulting stamps after .Join() (ordinary control flow, not a lambda)
+  // avoids that trap.
+  std::vector<std::string> ApplyOnePeerWriteToEveryShard(uint32_t origin_idx, uint64_t origin_hash,
+                                                         uint64_t author_mvcc) {
+    const unsigned num_shards = shard_set->size();
+    std::vector<std::string> keys(num_shards);
+    for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+      for (int i = 0;; ++i) {
+        CHECK_LT(i, 10000) << "could not find a key hashing to shard " << target_shard;
+        keys[target_shard] = absl::StrCat("k", i);
+        if (Shard(keys[target_shard], num_shards) == target_shard)
+          break;
+      }
+    }
+
+    shard_set->pool()->AwaitBrief([origin_idx, origin_hash](unsigned, auto*) {
+      MvccStamper::tlocal()->RegisterOriginHash(origin_idx, origin_hash);
+    });
+
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = num_shards;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    std::vector<bool> dispatch_ok(num_shards, false);
+    pp_->at(0)
+        ->LaunchFiber([&] {
+          DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                                &load_context, origin_idx, /*peer_mode=*/true);
+          for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+            TransactionData tx_data;
+            tx_data.dbid = 0;
+            tx_data.mvcc = author_mvcc;
+            std::vector<std::string> parts{"SET", keys[target_shard], "v"};
+            tx_data.command.Assign(parts.begin(), parts.end(), parts.size());
+
+            // A single-key SET is never IsGlobalCmd(), so this takes ExecuteTx's non-global
+            // path -- executor_->SetApplyMvcc(tx_data.mvcc); return executor_->Execute(...) --
+            // the same call this task wires in production (replica.cc, ExecuteTx's first
+            // branch). Fresh ExecutionState per call: IsRunning() must read true at entry, and
+            // nothing here ever cancels or errors it, so reusing one is equally valid; a fresh
+            // one just keeps each iteration visibly independent.
+            ExecutionState exec_st;
+            dispatch_ok[target_shard] = flow.ExecuteTx(std::move(tx_data), &exec_st);
+          }
+        })
+        .Join();
+
+    for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+      EXPECT_TRUE(dispatch_ok[target_shard]) << "ExecuteTx failed for key '" << keys[target_shard]
+                                             << "' (target shard " << target_shard << ")";
+    }
+    return keys;
+  }
 };
 
 TEST_F(MvccStoreTest, SideTableIsAllocatedInActiveMode) {
@@ -1302,6 +1401,54 @@ TEST_F(MvccStoreTest, AppliedWriteKeepsAuthorStampVerbatim) {
   EXPECT_EQ(st->Mvcc(), kAuthorMvcc) << "the applier must not re-mint -- stamps would otherwise "
                                         "inflate on every replication hop";
   EXPECT_EQ(st->origin_hash, peer_hash) << "and must record the AUTHOR, not itself";
+}
+
+// drakeydb: Phase 4 Task 9, fix round (F1v2) -- proves ExecuteTx applies an author's mvcc AND
+// origin_hash correctly regardless of which shard a replicated write's key lands on, which
+// AppliedWriteKeepsAuthorStampVerbatim above cannot: that test touches exactly one key/shard, so
+// it cannot distinguish "correct on every shard" from "correct on whichever shard this key
+// happened to hash to." This test constructs a real DflyShardReplica -- exactly as
+// Replica::InitiateDflySync does -- and applies through one key per shard (not just one key
+// total), asserting the resulting stamp on each.
+//
+// This does NOT pin the origin-hash registration broadcast itself (InitiateDflySync's shard_cb,
+// replica.cc) the way an earlier version of this test did: that version relied on
+// DflyShardReplica's own constructor performing the registration, matching what was, at the
+// time, production behavior. That behavior was reverted -- see the constructor's own comment and
+// task-9-report.md -- after it crashed the server (SIGSEGV, reproduced 5/10 runs of
+// test_active_replica_single_peer_replaces in multimaster_test.py) by introducing the
+// constructor's first-ever fiber yield point inside InitiateDflySync's tight per-flow
+// construction loop. The registration now lives in InitiateDflySync's shard_cb instead, a
+// private Replica method with no no-socket construction path this file can reach the way
+// DflyShardReplicaOriginTest reaches DflyShardReplica's public constructor -- so
+// ApplyOnePeerWriteToEveryShard registers the origin hash manually (shard_set->pool()->AwaitBrief,
+// the same shape AppliedWriteKeepsAuthorStampVerbatim already uses) rather than relying on
+// construction to do it. See ApplyOnePeerWriteToEveryShard's own comment for the full account,
+// including why construction and every apply run on thread 0 specifically (ServerState::tlocal()
+// must resolve on the calling thread).
+//
+// Falsifying (see task-9-report.md for the verbatim run): no-op'ing the body of
+// JournalExecutor::SetApplyMvcc (executor.h) -- the same mutation that falsifies
+// AppliedWriteKeepsAuthorStampVerbatim -- makes every shard's Mvcc() EXPECT below fail with a
+// freshly-minted HopStamp instead of kAuthorMvcc, since ExecuteTx's non-global path calls that
+// same method before every Execute().
+TEST_F(MvccStoreTest, AppliedWriteAppliesCorrectlyOnEveryShard) {
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "this test's entire point is proving correctness on shards OTHER "
+                               "than whichever one a single key would happen to hash to -- with "
+                               "only one shard there is nothing to distinguish it from";
+
+  constexpr uint32_t kPeerIdx = 5;
+  constexpr uint64_t kAuthorMvcc = 0x9999'0000'1111ULL;
+  const uint64_t peer_hash = NodeUuidHash("a1b2c3d4-0000-4000-8000-0000000000aa");
+
+  std::vector<std::string> keys = ApplyOnePeerWriteToEveryShard(kPeerIdx, peer_hash, kAuthorMvcc);
+  for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+    auto st = StampOf(keys[target_shard]);
+    ASSERT_TRUE(st.has_value()) << "key '" << keys[target_shard] << "' on shard " << target_shard;
+    EXPECT_EQ(st->Mvcc(), kAuthorMvcc) << "shard " << target_shard;
+    EXPECT_EQ(st->origin_hash, peer_hash) << "shard " << target_shard;
+  }
 }
 
 // The "off means byte-identical to upstream" guard.

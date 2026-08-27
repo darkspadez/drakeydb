@@ -798,7 +798,7 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
     }
     shard_flows_[i].reset(new DflyShardReplica(server(), master_context_, i, &service_,
                                                multi_shard_exe_, load_context.get(),
-                                               peer_origin_idx_, IsPeerMode(), peer_origin_hash_));
+                                               peer_origin_idx_, IsPeerMode()));
     if (partial_sync_lsn > 0) {
       shard_flows_[i]->SetRecordsExecuted(partial_sync_lsn);
     }
@@ -855,6 +855,57 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
     std::memset(is_full_sync.get(), 0, num_df_flows);
     DCHECK(!last_journal_LSNs_ || last_journal_LSNs_->size() == num_df_flows);
     auto shard_cb = [&](unsigned index, auto*) {
+      // drakeydb: Phase 4, fix round (F1v2) -- registers this Replica's origin_idx -> author hash
+      // mapping (see peer_origin_hash_'s doc comment) so an applied write's Commit
+      // (journal.cc's RecordEntry, via MvccStamper::OriginHash) resolves the real author instead
+      // of the unregistered default of 0.
+      //
+      // Placement: this callback already runs on EVERY proactor thread -- that's what
+      // AwaitFiberOnAll below does -- so this is a genuine per-thread broadcast, unconditional on
+      // whether thread_flow_map_[index] happens to be non-empty for this thread: any shard can
+      // receive a command for any key regardless of which flow (if any) this thread also owns,
+      // via the normal Transaction dispatch. MvccStamper::tlocal() is a `static thread_local`
+      // (mvcc.cc), so a bare, non-broadcast call anywhere else -- e.g. in DflyShardReplica's own
+      // constructor, right beside executor_->SetApplyOrigin(origin_idx) above it, which an
+      // earlier version of this fix used -- only reaches whichever ONE thread happens to run the
+      // constructor (InitiateDflySync's flow-construction loop, driven by MainReplicationFb),
+      // not reliably any of the shard threads that later call Commit()/OriginHash(). This
+      // callback is the first point in the flow's setup where "run once on every shard thread" is
+      // both true and already an established, safe synchronization boundary -- see below.
+      //
+      // Safety: this specific point was chosen deliberately, after an earlier version of this fix
+      // (a shard_set->pool()->AwaitBrief(...) call inside DflyShardReplica's constructor) crashed
+      // the server -- reproduced 5/10 runs of test_active_replica_single_peer_replaces
+      // (multimaster_test.py, which replaces one active peer with another) with SIGSEGV; see the
+      // constructor's own comment and task-9-report.md for the full account. That constructor
+      // had never yielded its calling fiber before (every member it initializes -- JournalExecutor,
+      // RdbLoader -- does pure, non-blocking work), and it runs inside InitiateDflySync's tight
+      // per-flow loop; introducing a yield point there let a concurrent peer-replacement teardown
+      // interleave with flow construction in ways the original code never had to handle. This
+      // callback introduces no NEW yield point: AwaitFiberOnAll already fiber-blocks the caller
+      // (MainReplicationFb) here regardless of this change, and this call runs before that wait
+      // returns, using a synchronization boundary already exercised by every existing caller of
+      // InitiateDflySync.
+      //
+      // Ordering: still happens-before every apply on this thread. StartSyncFlow, called only
+      // after this line within the very same per-thread callback, is what actually starts this
+      // flow applying entries -- so the registration is visible before the first command on this
+      // thread can possibly be dispatched.
+      //
+      // Idempotent: RegisterOriginHash (mvcc.cc) writes one dense-vector slot
+      // (origin_hash_cache_[origin_idx] = hash, resizing on demand); repeated calls with the
+      // same value (every reconnect re-enters InitiateDflySync with the same peer_origin_idx_/
+      // peer_origin_hash_) are a no-op past the first.
+      //
+      // Gated on IsPeerMode(): a non-peer (plain REPLICAOF) Replica always has peer_origin_idx_
+      // == kSelfIdx (0) and peer_origin_hash_ == 0 (Greet()'s peer-only branches never run for
+      // one). An unconditional RegisterOriginHash(0, 0) would reliably overwrite kSelfIdx's real
+      // hash (registered once at boot by SetSelfUuid) on every shard thread, breaking origin
+      // attribution for this node's OWN locally-authored writes on any active node that also
+      // carries a plain replica link. A non-peer Replica has no origin mapping to contribute.
+      if (IsPeerMode()) {
+        MvccStamper::tlocal()->RegisterOriginHash(peer_origin_idx_, peer_origin_hash_);
+      }
       for (auto id : thread_flow_map_[index]) {
         auto ec = shard_flows_[id]->StartSyncFlow(sync_block, &exec_st_,
                                                   last_journal_LSNs_.has_value()
@@ -1540,7 +1591,7 @@ DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext m
                                    uint32_t flow_id, Service* service,
                                    std::shared_ptr<MultiShardExecution> multi_shard_exe,
                                    RdbLoadContext* load_context, uint32_t origin_idx,
-                                   bool peer_mode, uint64_t origin_hash)
+                                   bool peer_mode)
     : ProtocolClient(server_context),
       service_(*service),
       master_context_(master_context),
@@ -1552,11 +1603,23 @@ DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext m
   // here at flow setup, not per entry. Also read back by StableSyncDflyReadFb's PING re-record
   // below, via executor_->connection_context()->repl_origin_idx.
   executor_->SetApplyOrigin(origin_idx);
-  // drakeydb: Phase 4 -- registers this flow's origin_idx -> author hash mapping so an applied
-  // write's Commit (journal.cc's RecordEntry, via MvccStamper::OriginHash) resolves the real
-  // author instead of the unregistered default of 0. See Replica::peer_origin_hash_'s doc
-  // comment for why this must come from the link's own uuid rather than the wire.
-  MvccStamper::tlocal()->RegisterOriginHash(origin_idx, origin_hash);
+  // drakeydb: Phase 4, fix round (F1v2) -- the origin_idx -> author hash registration this flow
+  // needs (see Replica::peer_origin_hash_'s doc comment) is deliberately NOT done here. An
+  // earlier version of this constructor called shard_set->pool()->AwaitBrief(...) at this exact
+  // point, and that crashed: this constructor previously never yielded the calling fiber (every
+  // member here -- JournalExecutor, RdbLoader below -- does pure, non-blocking initialization,
+  // "the constructor performs no I/O" per DflyShardReplicaOriginTest's own comment in
+  // peer_replication_test.cc). AwaitBrief fiber-blocks its caller (FiberBlockingCounter::Wait),
+  // which was the FIRST yield point ever introduced into this constructor -- and this
+  // constructor runs inside InitiateDflySync's tight per-flow loop, driven by MainReplicationFb.
+  // Introducing a yield there let previously-impossible interleaving happen: reproduced by hand
+  // with test_active_replica_single_peer_replaces (multimaster_test.py), which replaces an
+  // active peer (stops the old Replica while starting a new one) -- 5/10 isolated runs crashed
+  // the server with SIGSEGV once this constructor could yield mid-construction, vs. 0/10 on the
+  // pre-this-change code and 0/15 on the fix below. See task-9-report.md for the full before/
+  // after reproduction (isolated re-run counts and the crash log). The registration itself moved
+  // to InitiateDflySync's existing shard_cb (below in this file) -- see the comment there for why
+  // that point is safe where this one was not.
   rdb_loader_ = std::make_unique<RdbLoader>(&service_, load_context);
   rdb_loader_->SetLoadUnownedSlots(true);
   rdb_loader_->SetShardCount(master_context.num_flows);
