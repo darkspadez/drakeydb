@@ -1293,8 +1293,9 @@ void DbSlice::SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stam
 // drakeydb: Phase 4, review fix round 1 (F4) -- journal::RecordEntry's commit callback already
 // holds a plain string_view (the key bytes it armed in DbSlice::PostUpdate); routing it through
 // the PrimeKey overload above cost three allocations per key per write for nothing: PrimeKey{key}
-// (allocates for keys > kMaxInlineLen, table.h), then key.GetSlice(&scratch) to get a string_view
-// straight back out, then db.mvcc->Insert(string_view, ...) re-encoding it a third time inside
+// (allocates for keys > CompactObj::kInlineLen == 16, core/compact_object.h:154), then
+// key.GetSlice(&scratch) to get a string_view straight back out, then
+// db.mvcc->Insert(string_view, ...) re-encoding it a third time inside
 // Dash. This overload skips the PrimeKey round-trip entirely -- Insert already takes a
 // string_view, so there was never a reason to construct one at this call site. The PrimeKey
 // overload above is kept for callers that already have one on hand (e.g. tests).

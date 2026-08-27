@@ -1017,16 +1017,29 @@ TEST_F(MvccStoreTest, PureWriteWorkloadLeavesNoUnstampedWrites) {
 // which momentarily looked exactly like an F1 regression until DIAG prints traced it to Run()'s
 // own reset, confirmed by checking the stored ACL credential directly
 // (ServerState::tlocal()->user_registry->GetCredentials("nsuser").ns == "NS1", i.e. the ACL layer
-// itself was never the problem). RunViaNamespace (test_utils.h/.cc) is Run(id, slice)'s dispatch
-// verbatim with the namespace as a parameter instead of hardcoded, added specifically to route
-// around that reset -- it still goes through the real Transaction/PostUpdate/LogAutoJournalOnShard
-// path via DispatchCommand, only the mechanism for reaching a non-default `cntx->ns` differs from
-// production's ACL path (the ACL layer's own correctness -- MaybeParseNamespace, DoAuth -- is
-// pre-existing, unchanged by this task, and independently confirmed working above).
+// itself was never the problem). RunViaNamespace (test_utils.h/.cc) mirrors Run(id, slice)'s
+// dispatch with the namespace as a parameter instead of hardcoded, added specifically to route
+// around that reset -- it is NOT verbatim (see its own declaration comment in test_utils.h for the
+// two omissions, both harmless for this test's plain SET/GET calls) -- it still goes through the
+// real Transaction/PostUpdate/LogAutoJournalOnShard path via DispatchCommand, only the mechanism
+// for reaching a non-default `cntx->ns` differs from production's ACL path (the ACL layer's own
+// correctness -- MaybeParseNamespace, DoAuth -- is pre-existing, unchanged by this task, and
+// independently confirmed working above).
 //
 // Falsification: temporarily changing PostUpdate's `ns_ == &namespaces->GetDefaultNamespace()`
-// gate to unconditionally arm (the pre-fix-round-1 behavior) makes both assertions below fail --
-// see this task's report for the verbatim run.
+// gate to unconditionally arm (the pre-fix-round-1 behavior) makes the LAST assertion below
+// (`EXPECT_EQ(*after, *original)`) fail -- that is what exercises the shipped gate, since
+// journal.cc's commit callback is only ever reachable with the default namespace's DbSlice
+// (`namespaces->GetDefaultNamespace().GetCurrentDbSlice()`, unconditional), so an unguarded arm
+// stamps the phantom key there, which this assertion catches. The earlier
+// `EXPECT_FALSE(ns1_stamp.has_value())` assertion does NOT fail under that same mutation and does
+// not exercise the shipped gate at all: SetMvcc is never called against ns1's own DbSlice by any
+// code path in this binary, gate present or not, so ns1_stamp is always empty regardless of what
+// PostUpdate does. It is not vacuous -- ns1's DbTable really does allocate an mvcc table
+// (table.cc's constructor gates on the global IsActiveReplica(), not on namespace) -- and it does
+// guard a plausible alternative fix this task did not take (routing the commit back to whichever
+// namespace originally armed the key, instead of always targeting the default namespace). See
+// this task's report for the verbatim falsification run.
 TEST_F(MvccStoreTest, NonDefaultNamespaceWriteLeavesNoStampAnywhere) {
   // A key of the same name, already stamped in the default namespace, to prove the ns1 write
   // below does not perturb it.
