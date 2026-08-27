@@ -103,7 +103,7 @@ docker exec drakeydb-p2 sh -c \
 | `src/server/journal/tx_executor.{h,cc}`, `journal/executor.h`, `replica.{h,cc}` | Inbound mvcc + `peer_origin_hash_` (P4-1). |
 | `src/server/debugcmd.cc` | `DEBUG MVCC` (P4-1). |
 | `src/server/multi_master.{h,cc}` | `PeerRegistry::GetUuidHash` (P4-1). |
-| `src/server/CMakeLists.txt` | `mvcc.cc` into `dragonfly_lib`; `mvcc_test` target. |
+| `src/server/CMakeLists.txt` | `mvcc.cc` into `dfly_transaction`; `mvcc_test` target. |
 | `tests/dragonfly/multimaster_test.py` | P4-0 and P4-1 end-to-end coverage. |
 | `tests/dragonfly/multimaster_memory_test.py` | New: the memory benchmark deliverable. |
 
@@ -860,8 +860,13 @@ TEST(NodeUuidHashTest, StableAndDistinct) {
 - [ ] **Step 2: Run to verify it fails**
 
 Register the target first — in `src/server/CMakeLists.txt`, add `mvcc.cc` to the
-`dragonfly_lib` source list (alphabetically, beside `multi_master.cc`), and add
-beside the other test registrations:
+**`dfly_transaction`** source list (`CMakeLists.txt:42-48`, beside `tx_base.cc`).
+**Not `dragonfly_lib`** — every consumer (`db_slice.cc`, `table.cc`,
+`journal/journal.cc` via `DF_JOURNAL_SRCS`) lives in `dfly_transaction`, and
+`dragonfly_lib` links `dfly_transaction`, so that is the direction that resolves.
+xxhash reaches it transitively (`dfly_core` -> `base` -> `TRDP::xxhash`), already
+proven by `tx_base.cc:100`'s existing `XXH64` call. Then add beside the other test
+registrations:
 
 ```cmake
 helio_cxx_test(mvcc_test dfly_test_lib LABELS DFLY)
@@ -1387,13 +1392,13 @@ git add -A && git commit -m "feat: add MvccStamper arm/commit with per-callback 
 ### Task 5: The side table on `DbTable`
 
 **Files:**
-- Modify: `src/server/table.h:126-176`, `src/server/table.cc:110-132`
+- Modify: `src/server/table.h:135-186`, `src/server/table.cc:111-133`
 - Modify: `src/server/db_slice.h`, `src/server/db_slice.cc`
 - Test: `src/server/multi_master_test.cc`
 
 **Interfaces:**
 - Consumes: `MvccStamp` (Task 3); `IsActiveReplica()` from `server/multi_master.h`;
-  the `mcflag` precedent at `table.h:128` and `db_slice.cc:1171-1197`.
+  the `mcflag` precedent at `table.h:137` and `db_slice.cc:1237-1264`.
 - Produces: `using MvccTable = DashTable<PrimeKey, MvccStamp, detail::ExpireTablePolicy>;`
   and `std::unique_ptr<MvccTable> DbTable::mvcc`;
   `size_t DbTable::mvcc_table_memory() const`;
@@ -1405,11 +1410,11 @@ git add -A && git commit -m "feat: add MvccStamper arm/commit with per-callback 
 Storage only. Nothing writes to it yet.
 
 **The memory metric trap — do not get this wrong.** `DbTable::table_memory()`
-(`table.h:174-176`) returns `prime.mem_usage()` **only**; mcflag has never been counted.
+(`table.h:183-185`) returns `prime.mem_usage()` **only**; mcflag has never been counted.
 So `table_used_memory` in INFO will **not** move when this table fills, and a benchmark
 comparing it reports a ~0 delta. Track a separate `mvcc_table_memory_` accumulator on
 `DbSlice`. **Do not fold `mvcc->mem_usage()` into `table_memory()`** — that breaks
-`DCHECK_EQ(table->table_memory(), table_before)` at `db_slice.cc:2087`, which asserts
+`DCHECK_EQ(table->table_memory(), table_before)` at `db_slice.cc:2435`, which asserts
 deletes do not shrink the prime table.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1490,7 +1495,7 @@ Expected: **compile error**, no member `mvcc_table_bytes` in `DbStats`.
 
 - [ ] **Step 3: Add the table to `DbTable`**
 
-In `src/server/table.h`, beside the `mcflag` declaration at `:128`:
+In `src/server/table.h`, beside the `mcflag` declaration at `:137`:
 
 ```cpp
 // drakeydb: Phase 4. Per-key MVCC stamp, mirroring the mcflag side-table precedent above.
@@ -1521,7 +1526,7 @@ and in `DbTable::Clear()`:
 ```
 
 > `DbTable::Clear()` has no caller today — mirror it for hygiene, but the real flush
-> path is `DbSlice::FlushDbIndexes` (`db_slice.cc:1055-1106`), which moves the whole
+> path is `DbSlice::FlushDbIndexes` (`db_slice.cc:1121-1174`), which moves the whole
 > `DbTable` out and `CreateDb`s a fresh one. That drops the side table for free.
 
 - [ ] **Step 4: Add the `DbSlice` accessors**
@@ -1549,7 +1554,7 @@ and as members, beside `journal_omit_redundant_writes_` (`db_slice.h:690` area):
 
 In `src/server/db_slice.cc`, initialise `mvcc_enabled_(IsActiveReplica())` in the
 constructor initialiser list (beside `journal_omit_redundant_writes_`, `db_slice.cc:477`),
-and implement, modelled on `SetMCFlag`/`GetMCFlag` at `:1171-1197`:
+and implement, modelled on `SetMCFlag`/`GetMCFlag` at **`:1237-1264`**:
 
 ```cpp
 void DbSlice::SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stamp) {
@@ -1582,27 +1587,30 @@ void DbSlice::EraseMvcc(DbIndex db_ind, const PrimeKey& key) {
 ```
 
 Maintain `mvcc_table_memory_` alongside the existing `table_memory_` updates in
-`CreateDb` (`db_slice.cc:1753` area) and `FlushDbIndexes` (`:1070` area).
+`CreateDb` (`db_slice.cc:2095-2101`) and `FlushDbIndexes` (`:1121-1174`, which already
+subtracts at `:1136` and re-adds via the nested `CreateDb`).
 
 - [ ] **Step 5: Surface the stats**
 
-Put the **counters** on `DbTableStats` (`table.h:54`), not on `DbStats`:
+Put the **counters** on `DbTableStats` (`table.h:54-99`), not on `DbStats`:
 
 ```cpp
   size_t mvcc_entries = 0;
   size_t mvcc_tombstones = 0;  // stays 0 until P4-5; declared now so Task 10's invariant compiles
 ```
 
-`DbStats : public DbTableStats` (`db_slice.h:43`), so the aggregate inherits both, and
+`DbStats : public DbTableStats` (`db_slice.h:44`), so the aggregate inherits both, and
 Task 10's `DCHECK` can read `db.stats.mvcc_tombstones` — `db.stats` is a `DbTableStats`
-(`table.h:136`), so declaring these on `DbStats` instead would not compile. Maintain
+(`table.h:145`), so declaring these on `DbStats` instead would not compile. Maintain
 `mvcc_entries` in `SetMvcc`/`EraseMvcc`.
 
 Add `size_t mvcc_table_bytes = 0;` to `DbStats` **only** — it is computed in
-`DbSlice::GetStats` (`db_slice.cc:493-514`) from `mvcc_table_memory()` rather than
+`DbSlice::GetStats` (`db_slice.cc:544-566`) from `mvcc_table_memory()` rather than
 maintained as a counter, mirroring how `table_memory` is already handled. Sum all three
-in `DbStats::operator+=` and merge them in `Metrics::Merge` (`metrics.cc:773` area)
-beside `lsn_buffer_bytes`.
+in `DbStats::operator+=` and merge them in `Metrics::Merge` (`metrics.cc:773`)
+beside `lsn_buffer_bytes`. **`Metrics::Merge` opens with a `sizeof(Metrics)`
+change-detector `static_assert` (`metrics.cc:724`, `:794`) — update its byte accounting
+or the build fails.**
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
@@ -1643,13 +1651,15 @@ git add -A && git commit -m "feat: add per-key MVCC side table on DbTable (P4)"
 ### Task 6: `DbContext::repl_mvcc`
 
 **Files:**
-- Modify: `src/server/tx_base.h:67-76`
-- Modify: `src/server/transaction.h:344-352` (`GetDbContext`)
+- Modify: `src/server/tx_base.h:60-83`
+- Modify: `src/server/transaction.h:346-354` (`GetDbContext`)
 
 **Interfaces:**
 - Consumes: `Transaction::repl_mvcc_` — already exists from P3
-  (`transaction.h:668-675`, passed into `journal::RecordEntry` by
-  `LogJournalOnShard` at `transaction.cc:1668`).
+  (`transaction.h:677`, passed into `journal::RecordEntry` by
+  `LogJournalOnShard` at `transaction.cc:1668-1674`).  `SetReplOrigin(origin_idx, mvcc)`
+  is already widened (`transaction.h:381-384`) and `ConnectionContext::repl_mvcc`
+  already exists (`conn_context.h:370`) — but nothing ever WRITES it. Task 9 does.
 - Produces: `uint64_t DbContext::repl_mvcc`.
 
 Two lines, no behaviour change, shipped as its own commit so a bisect can isolate it.
@@ -1661,7 +1671,7 @@ tombstones. It is an exact mirror of what P3 did for `repl_origin_idx`.
 
 - [ ] **Step 1: Add the field**
 
-In `src/server/tx_base.h`, immediately after `repl_origin_idx`:
+In `src/server/tx_base.h`, immediately after `repl_origin_idx` (`:79`):
 
 ```cpp
   // drakeydb: Phase 4 -- the applied entry's MVCC stamp, mirroring repl_origin_idx above. Lets
@@ -1700,9 +1710,9 @@ git add -A && git commit -m "feat: carry the apply-context MVCC stamp on DbConte
 **This is the risky task in the plan. Read the landmine section before writing code.**
 
 **Files:**
-- Modify: `src/server/db_slice.cc:1426` (`PostUpdate`)
-- Modify: `src/server/journal/journal.cc:90` (`RecordEntry`)
-- Modify: `src/server/transaction.cc:730`, `:1543` (epoch end)
+- Modify: `src/server/db_slice.cc:1492` (`PostUpdate`) — the plan's old `:1426` is stale
+- Modify: `src/server/journal/journal.cc:90-100` (`RecordEntry`; `AddLogRecord` at `:99`)
+- Modify: `src/server/transaction.cc:730`, `:1543` (epoch end) — verified current
 - Modify: `src/server/db_slice.cc` — four sweep paths
 - Modify: `src/server/server_family.cc` (seed the self uuid hash at boot)
 - Test: `src/server/multi_master_test.cc`
@@ -1710,7 +1720,7 @@ git add -A && git commit -m "feat: carry the apply-context MVCC stamp on DbConte
 **Interfaces:**
 - Consumes: `MvccStamper::tlocal()` (Task 4); `DbSlice::SetMvcc` (Task 5);
   `journal::RecordEntry(TxId, Op, DbIndex, optional<SlotId>, Entry::Payload, uint32_t origin_idx = 0, uint64_t mvcc = 0, uint8_t entry_flags = 0)`
-  (`journal/journal.h:50-52`).
+  (`journal/journal.h:52-54`).
 - Produces: after this task, any key written by a journaled command carries a stamp
   equal to that journal entry's `mvcc`.
 
@@ -1848,7 +1858,7 @@ At the end of `DbSlice::PostUpdate` (`db_slice.cc:1426`):
 
 - [ ] **Step 4: Mint and commit in `RecordEntry`**
 
-In `src/server/journal/journal.cc:90`, `RecordEntry`. **Order matters and the two halves
+In `src/server/journal/journal.cc:90-100`, `RecordEntry` (`AddLogRecord` is line `:99`). **Order matters and the two halves
 split around `AddLogRecord`:** mint **before** it, so the wire carries the same value the
 side table will store; commit **after** it, so a key is only stamped once its entry is
 durable. Getting this backwards puts mvcc 0 on the wire and makes every applier mint its
@@ -1877,8 +1887,10 @@ then, immediately **after** `AddLogRecord(entry)`:
   }
 ```
 
-Gating on `Op::COMMAND` excludes `SELECT`/`PING`/`LSN`/`ORIGIN`. `MvccEnabled()` is a
-thin `IsActiveReplica()` wrapper local to this TU.
+Gating on `Op::COMMAND` excludes `SELECT`/`PING`/`LSN`/`ORIGIN`. `MvccEnabled()` must be a **cached** read, not a bare `IsActiveReplica()` —
+that is an uncached `absl::GetFlag` (`multi_master.cc:26-28`) and this runs once per
+journal entry. Mirror `JournalSlice`'s existing `extended_framing_`, which caches the
+same flag at `Init()`. P4-0 shipped a fix for this exact defect class (`a5345509`).
 
 - [ ] **Step 5: End the epoch in the right place**
 
@@ -1901,7 +1913,7 @@ Then the four non-transactional sweep paths in `db_slice.cc`, each at function e
 
 - [ ] **Step 6: Disable the journal-omission optimisation in active mode**
 
-`DbSlice::IsOmittableWrite` (`db_slice.cc:2152-2166`) suppresses a journal entry when
+`DbSlice::IsOmittableWrite` (**`db_slice.cc:2500-2513`**) suppresses a journal entry when
 there is exactly one eventually-consistent snapshot consumer that has not yet reached
 the bucket — the snapshot will carry the value instead. Under arm/commit that write
 **arms but never commits**, so the key ends up with *no stamp at all* and Task 10's
@@ -1936,13 +1948,14 @@ TEST_F(MvccStoreTest, WritesDuringSnapshotAreStillStamped) {
 
 - [ ] **Step 7: Seed the self uuid hash at boot**
 
-In `ServerFamily::Init()`, where the node identity is loaded (P1 code — search for
-`node_identity` / the loaded uuid), broadcast it to every shard thread:
+In `ServerFamily::Init()`, immediately after
+`peer_registry_.Init(node_identity_.uuid)` (`server_family.cc:1339`), broadcast it to
+every shard thread. The member is **`node_identity_.uuid`** — there is no `node_uuid_`:
 
 ```cpp
   // drakeydb: Phase 4 -- every proactor thread needs the self origin hash before the first write.
   shard_set->pool()->AwaitBrief(
-      [uuid = node_uuid_](unsigned, auto*) { MvccStamper::tlocal()->SetSelfUuid(uuid); });
+      [uuid = node_identity_.uuid](unsigned, auto*) { MvccStamper::tlocal()->SetSelfUuid(uuid); });
 ```
 
 - [ ] **Step 8: Run the tests to verify they pass**
@@ -2011,7 +2024,7 @@ git add -A && git commit -m "feat: stamp keys via arm/commit tied to journal emi
 ### Task 8: Delete coverage
 
 **Files:**
-- Modify: `src/server/db_slice.h:351,594`, `src/server/db_slice.cc:906,927,2025`
+- Modify: `src/server/db_slice.h:355,614`, `src/server/db_slice.cc:972,993,2367`
 - Test: `src/server/multi_master_test.cc`
 
 **Interfaces:**
@@ -2026,7 +2039,7 @@ In P4-1 **every reason erases** — tombstones are P4-5. The enum lands now beca
 Task 10's invariant and P4-5's tombstone table both key off it, and threading it later
 would touch the same five call sites twice.
 
-**Why `Disarm` is required.** `OpDelV2` (`generic_family.cc:1273`) runs
+**Why `Disarm` is required.** `OpDelV2` (`generic_family.cc:1291-1321`, `Del` at `:1305`) runs
 `post_updater.Run()` — which arms the key — *before* calling `Del`, and journals
 afterwards. Without a disarm, the subsequent `Commit` would write a stamp for a key
 that no longer exists, and Task 10's invariant would fire.
@@ -2076,8 +2089,9 @@ TEST_F(MvccStoreTest, MultiKeyDeleteErasesEveryStamp) {
 }
 ```
 
-Use whatever time-advance helper `BaseFamilyTest` already provides (`TEST_current_time_ms`
-via the existing `AdvanceTime`/`UpdateTime` helper — grep the fixture and match it).
+The time-advance helper is `AdvanceTime(int64_t ms)` (`test_utils.h:154-156`); there is
+no `UpdateTime`. `Shard(key, n)` is a **free function** (`engine_shard_set.h:148`), not a
+fixture member.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -2096,24 +2110,28 @@ enum class DeleteReason : uint8_t { kExplicit, kExpired, kEvicted, kSlotFlush };
 ```
 
 Add `DeleteReason reason = DeleteReason::kExplicit` as the trailing parameter of both
-`Del` (`db_slice.h:351`) and `PerformDeletionAtomic` (`:594`), and forward it at the
-single call site (`db_slice.cc:927`).
+`Del` (`db_slice.h:355`) and `PerformDeletionAtomic` (`:614`), and forward it at the
+single call site (`db_slice.cc:993`). `PerformDeletionAtomic` has exactly ONE caller —
+`Del` itself — but `Del` has 24 call sites; all keep the `kExplicit` default except the
+seven named below.
 
 Set a non-default reason at exactly these five sites, all inside `db_slice.cc`:
 
 | Line | Reason |
 |---|---|
-| `:249` `PrimeEvictionPolicy::Evict` | `kEvicted` |
-| `:1725` `FreeMemWithEvictionStepAtomic` | `kEvicted` |
-| `:1497` `ExpireIfNeeded` | `kExpired` |
-| `:962` `FlushSlotsFb` | `kSlotFlush` |
-| `:1035` `FlushSlots` on_change | `kSlotFlush` |
+| `:300` `PrimeEvictionPolicy::Evict` | `kEvicted` |
+| `:2065` `FreeMemWithEvictionStepAtomic` | `kEvicted` |
+| `:1563` `ExpireIfNeeded` | `kExpired` |
+| `:1028` `FlushSlotsFb` | `kSlotFlush` |
+| `:1101` `FlushSlots` on_change | `kSlotFlush` |
+| `:1991` `DeleteReapedContainer` (P4-0 reaper; postdates the plan) | `kExpired` |
+| `:1360` `UpdateExpire` already-expired branch (postdates the plan) | `kExpired` |
 
 Everything else keeps the `kExplicit` default.
 
 - [ ] **Step 4: Disarm and erase in `PerformDeletionAtomic`**
 
-Immediately after the existing mcflag block (`db_slice.cc:2029-2035`):
+Immediately after the existing mcflag block (**`db_slice.cc:2371-2376`**):
 
 ```cpp
   // drakeydb: Phase 4. Disarm first: OpDelV2 arms the key via post_updater.Run() before calling
@@ -2155,10 +2173,9 @@ git add -A && git commit -m "feat: erase MVCC stamps on every delete path (P4)"
 ### Task 9: Inbound plumbing — an applied write keeps the author's stamp
 
 **Files:**
-- Modify: `src/server/journal/tx_executor.h:48-54`, `src/server/journal/tx_executor.cc:74-79`
-- Modify: `src/server/journal/executor.h:55-57`
-- Modify: `src/server/replica.h`, `src/server/replica.cc:473,1517,1547,1580`
-- Modify: `src/server/multi_master.h`, `src/server/multi_master.cc`
+- Modify: `src/server/journal/tx_executor.h:42-54`, `src/server/journal/tx_executor.cc:58-83`
+- Modify: `src/server/journal/executor.h:55-57` (verified exact)
+- Modify: `src/server/replica.h`, `src/server/replica.cc:501,1549,1577,1608`
 - Test: `src/server/multi_master_test.cc`, `tests/dragonfly/multimaster_test.py`
 
 **Interfaces:**
@@ -2167,18 +2184,19 @@ git add -A && git commit -m "feat: erase MVCC stamps on every delete path (P4)"
   `MasterContext::master_node_uuid` (P1).
 - Produces: `uint64_t TransactionData::mvcc`;
   `void JournalExecutor::SetApplyMvcc(uint64_t)`;
-  `Replica::peer_origin_hash_`; `uint64_t PeerRegistry::GetUuidHash(uint32_t idx) const`.
+  `Replica::peer_origin_hash_`.
 
 **The counterintuitive part: the origin hash cannot come from the wire.**
-`journal::PassesPeerEchoFilter` (`journal/types.cc:51-66`) forwards only entries whose
-`origin_idx == kSelfIdx`, so **every COMMAND arriving on a peer link carries
+`journal::PassesPeerEchoFilter` (`journal/types.cc:51-69`) requires FOUR conditions, the
+first being `origin_idx == kSelfIdx` (the others reject `kEntryFlagExpired`,
+`kEntryFlagDerived` and `Op::ORIGIN`). Since only self-origin entries are ever forwarded, **every COMMAND arriving on a peer link carries
 `origin_idx == 0`**, meaning "the sender". Resolving that through `PeerRegistry` would
 label every foreign write as self. Under no-forward v1 the sender *is* the author on
 the streaming path, so the correct source is the **link's** peer uuid, which `Replica`
-already derives `peer_origin_idx_` from at `replica.cc:473`.
+already derives `peer_origin_idx_` from at `replica.cc:501`.
 
 **And `mvcc` is dropped inbound today.** `TransactionData::AddEntry`
-(`tx_executor.cc:74-79`) copies only `command`, `dbid` and `txid`;
+(`tx_executor.cc:58-83`) copies only `command`, `dbid` and `txid`;
 `TransactionData` has no `mvcc` field. `ConnectionContext::repl_mvcc` exists and is
 written by nobody. Without this task an applied write mints a *local* stamp and the
 phase's acceptance criterion fails.
@@ -2207,9 +2225,11 @@ TEST_F(MvccStoreTest, AppliedWriteKeepsAuthorStampVerbatim) {
 }
 ```
 
-Add `ApplyReplicatedCommand(args, origin_idx, mvcc)` to the fixture, modelled on how
-`OriginJournalFamilyTest` already drives `JournalExecutor` with `SetApplyOrigin` — read
-that helper and extend it with `SetApplyMvcc`.
+Add `ApplyReplicatedCommand(args, origin_idx, mvcc)` to `MvccStoreTest`. **There is no
+existing helper to reuse** — the `JournalExecutor` drive is inlined at
+`multi_master_test.cc:748-749`, `:829-830` and `:971-972`; copy that shape. Build it on
+`ActiveReplicaFamilyTest`, **not** `OriginJournalFamilyTest`, which never sets
+`FLAGS_active_replica` and would therefore have no side table at all.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -2244,19 +2264,20 @@ In `src/server/journal/executor.h`, beside `SetApplyOrigin`:
 ```
 
 In `src/server/replica.cc`, call `executor_->SetApplyMvcc(tx_data.mvcc)` immediately
-before **both** `Execute` calls in `ExecuteTx` (`:1547` and the global-command path at
-`:1580`), and in `RdbLoaderBase::HandleJournalBlob` (`rdb_load.cc:3006` area) before
-its `Execute`.
+before **both** `Execute` calls in `ExecuteTx` (`:1577` and the global-command path at
+`:1608`), and in `RdbLoaderBase::HandleJournalBlob` (function at `rdb_load.cc:2940`;
+its `Execute` is at `:3006`) before that `Execute`.
 
 - [ ] **Step 4: Resolve the origin hash from the link**
 
-Add `uint64_t GetUuidHash(uint32_t idx) const` to `PeerRegistry` backed by a parallel
-append-only `std::vector<uint64_t> idx_to_hash_`, filled in `Init` and `AddOrGet`
-(`multi_master.cc:104,110`). Indices are dense, monotonic and never reclaimed, so no
-extra synchronisation is needed beyond the existing registry mutex.
+**Do not add `PeerRegistry::GetUuidHash`.** The amended spec (D-6/D-9) states that
+*"PeerRegistry indices are not portable across nodes"* and that author identity comes
+from the authenticated link's `peer_origin_hash_`. The registry already carries
+`idx_to_uuid_` (`multi_master.h:108`) and `GetUuid` (`:100`) if a purely local mapping is
+ever wanted. `multi_master.{h,cc}` are **untouched** by this task.
 
 In `replica.h` add `uint64_t peer_origin_hash_ = 0;` beside `peer_origin_idx_`; set it
-at `replica.cc:473` where `peer_origin_idx_` is derived:
+at `replica.cc:501` where `peer_origin_idx_` is derived:
 
 ```cpp
   // drakeydb: Phase 4 -- the AUTHOR's hash. It cannot come from the wire: PassesPeerEchoFilter
@@ -2265,8 +2286,8 @@ at `replica.cc:473` where `peer_origin_idx_` is derived:
   peer_origin_hash_ = NodeUuidHash(master_context_.master_node_uuid);
 ```
 
-Register it on the shard threads when the flow starts (`replica.cc:1517` area, beside
-`SetApplyOrigin`):
+Register it on the shard threads when the flow starts (`replica.cc:1549`, beside
+`executor_->SetApplyOrigin(origin_idx)` in the `DflyShardReplica` ctor):
 
 ```cpp
   MvccStamper::tlocal()->RegisterOriginHash(peer_origin_idx_, peer_origin_hash_);
@@ -2327,9 +2348,9 @@ git add -A && git commit -m "feat: apply peer MVCC stamps verbatim on the replic
 ### Task 10: Defrag mirror and the leak invariant
 
 **Files:**
-- Modify: `src/server/db_slice.cc:2005-2023` (`DefragTableSegments`)
+- Modify: `src/server/db_slice.cc:2347-2364` (`DefragTableSegments`)
 - Modify: `src/server/table.h` (second cursor)
-- Modify: `src/server/db_slice.h`, `src/server/db_slice.cc:2097` (`OnCbFinishBlocking`)
+- Modify: `src/server/db_slice.h`, `src/server/db_slice.cc:2445` (`OnCbFinishBlocking`)
 - Test: `src/server/multi_master_test.cc`
 
 **Interfaces:**
@@ -2337,7 +2358,9 @@ git add -A && git commit -m "feat: apply peer MVCC stamps verbatim on the replic
 - Produces: `DbTable::mvcc_defrag_cursor`;
   `size_t DbSlice::TEST_VerifyMvccTable(DbIndex) const` returning a mismatch count.
 
-**Why the defrag mirror matters.** `DefragTableSegments` relocates `prime` segments
+**Why the defrag mirror matters.** `DefragTableSegments` (`db_slice.cc:2347`, cursor
+`DbTable::segment_defrag_cursor` at `table.h:148`, sole caller `memory_cmd.cc:346`)
+relocates `prime` segments
 only. Nothing else relocates the side table's, so without a mirror it accumulates
 mimalloc fragmentation for the process's lifetime. The per-object defrag at
 `engine_shard.cc:375` does **not** help — it relocates a `PrimeValue`'s heap, and the
@@ -2371,7 +2394,9 @@ TEST_F(MvccStoreTest, DefragRelocationPreservesStamps) {
     Run({"del", absl::StrCat("k", i)});
 
   const auto before = *StampOf("k1");
-  Run({"debug", "compact-table"});  // match the actual subcommand name in debugcmd.cc
+  Run({"memory", "defragsegments"});  // the ONLY caller of DefragTableSegments
+                                      // (memory_cmd.cc:346). NOT "debug compact-table",
+                                      // which is a different mechanism entirely.
   EXPECT_EQ(*StampOf("k1"), before) << "defrag must not lose or corrupt stamps";
 
   size_t mismatches = 0;
@@ -2398,13 +2423,13 @@ size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
 
   size_t mismatches = 0;
   string scratch;
-  db.prime.CVisit([&](const auto& it) {  // match the actual traversal API in dash.h
+  db.prime.Traverse(Cursor{}, [&](auto it) {  // dash.h:355 -- there is NO CVisit
     if (db.mvcc->Find(it->first.GetSlice(&scratch)).is_done()) {
       LOG(ERROR) << "mvcc: live key with no stamp: " << it->first.ToString();
       ++mismatches;
     }
   });
-  db.mvcc->CVisit([&](const auto& it) {
+  db.mvcc->Traverse(Cursor{}, [&](auto it) {
     if (db.prime.Find(it->first.GetSlice(&scratch)).is_done()) {
       LOG(ERROR) << "mvcc: stamp with no live key: " << it->first.ToString();
       ++mismatches;
@@ -2414,20 +2439,64 @@ size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
 }
 ```
 
-Match `dash.h`'s real traversal API — read it rather than assuming `CVisit`.
+`Traverse(Cursor, Cb)` (`dash.h:355`, impl `:1230`) is the real API: element-granular
+and coverage-guaranteed across resize. `CVisit` does **not** exist. Loop until the
+returned cursor is exhausted.
 
-Add the O(1) form to `OnCbFinishBlocking` (`db_slice.cc:2097`) behind `#ifndef NDEBUG`:
+Add the O(1) form to `OnCbFinishBlocking` (**`db_slice.cc:2445`**) behind `#ifndef NDEBUG`.
+**`OnCbFinishBlocking()` takes no parameters** — there is no `cntx` in scope, so iterate
+`db_arr_`:
 
 ```cpp
 #ifndef NDEBUG
   // drakeydb: Phase 4 -- cheap dense invariant. mvcc_tombstones is 0 until P4-5.
   if (mvcc_enabled_) {
-    auto& db = *db_arr_[cntx.db_index];
-    if (db.mvcc)
-      DCHECK_EQ(db.mvcc->size() - db.stats.mvcc_tombstones, db.prime.size());
+    for (const auto& dbp : db_arr_) {
+      if (!dbp || !dbp->mvcc)
+        continue;
+      DCHECK_EQ(dbp->mvcc->size() - dbp->stats.mvcc_tombstones, dbp->prime.size());
+    }
   }
 #endif
 ```
+
+- [ ] **Step 3b: Stamp RDB-loaded keys `{0,0}` — required for Step 3's invariant**
+
+`rdb_load.cc:3258` inserts loaded keys via `AddOrUpdate`, which does **not** call
+`PostUpdate` (`AddOrUpdateInternal`, `db_slice.cc:1377-1400`). Nothing arms, so nothing
+is stamped, and Step 3's `DCHECK` would abort **every debug build** after a
+`DEBUG RELOAD` or a replica full sync — i.e. the whole `multimaster_test.py` suite.
+
+Immediately beside the existing `SetMCFlag` mirror (`rdb_load.cc:3266-3270`), which is
+the exact precedent:
+
+```cpp
+  // drakeydb: Phase 4 -- an unversioned snapshot carries no stamp, and D-7 specifies
+  // {0,0} as its fallback: it never fabricates authority the snapshot does not contain,
+  // and any stamped resident value beats it on merge. P4-2 overwrites this with the
+  // persisted stamp when the RDB_OPCODE_DF_MVCC record is present.
+  db_slice->SetMvcc(db_cntx.db_index, updater.it->first, MvccStamp{});
+```
+
+Guard it the same way `SetMvcc` already guards itself (no-op when the table is absent),
+so a non-active load costs one predictable branch.
+
+Regression test:
+
+```cpp
+TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
+  for (int i = 0; i < 100; ++i)
+    Run({"set", absl::StrCat("k", i), "v"});
+  Run({"debug", "reload"});
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 100u)
+      << "a reload that leaves keys unstamped trips the dense invariant on the next write";
+  Run({"set", "after", "v"});  // must not DCHECK
+}
+```
+
+The fixture needs `--dbfilename` set or `DEBUG RELOAD` silently no-ops — that exact
+vacuous-test trap was caught on P4-0. Follow `MultiMasterFamilyTest`'s `--dir` handling
+(`multi_master_test.cc:501-517`).
 
 - [ ] **Step 4: Mirror the defrag**
 
@@ -2460,8 +2529,10 @@ git add -A && git commit -m "feat: mirror defrag and add the MVCC table leak inv
 
 **Files:**
 - Modify: `src/server/debugcmd.cc` (`DebugCmd::Run` dispatch + a new handler)
-- Modify: `src/server/server_family.cc:2821` (INFO memory), the active replication block
-- Modify: `src/server/metrics.h`, `src/server/metrics.cc:773`
+- Modify: `src/server/server_family.cc` INFO memory (`append` lambda at `:2712`); the
+  active replication block is `RenderPeerReplicationInfo` at `:3057`
+- Modify: `src/server/metrics.h:68-154`, `src/server/metrics.cc:773` (and the
+  `sizeof(Metrics)` static_assert at `:724`/`:794`)
 - Test: `src/server/multi_master_test.cc`, `tests/dragonfly/multimaster_test.py`
 
 **Interfaces:**
@@ -2472,10 +2543,10 @@ git add -A && git commit -m "feat: mirror defrag and add the MVCC table leak inv
   `mvcc_unstamped_writes`, `mvcc_stale_epoch`.
 
 **`DEBUG`, not `DFLY` — this corrects `docs/PLAN.md`.** `DFLY` is registered
-`CO::ADMIN | CO::GLOBAL_TRANS | CO::HIDDEN` (`server_family.cc:4308`), so a per-key
+`CO::ADMIN | CO::GLOBAL_TRANS | CO::HIDDEN` (`server_family.cc:4308`, verified), so a per-key
 stamp read would take a **global transaction across every shard** — serialising against
 all traffic and perturbing exactly what it measures. `DEBUG` is
-`CO::ADMIN | CO::LOADING` (`:4282`): same admin/ACL posture, one shard hop, and it works
+`CO::ADMIN | CO::LOADING` (`:4282`, verified): same admin/ACL posture, one shard hop, and it works
 during LOADING, which is when you most want to inspect stamps during a merge sync. It
 also has the per-key precedent (`DEBUG OBJECT`, `debugcmd.cc:1202-1261`) and keeps
 replication-critical `dflycmd.cc` untouched.
@@ -2514,8 +2585,9 @@ Expected: an unknown-subcommand error from `DEBUG`.
 
 - [ ] **Step 3: Implement `DEBUG MVCC`**
 
-Add a `MVCC` case to `DebugCmd::Run`'s dispatch (`debugcmd.cc:760-843`) and a handler
-modelled on `DebugCmd::Inspect` (`:1202-1261`) — resolve the shard with
+Add a `MVCC` case to `DebugCmd::Run`'s dispatch (`debugcmd.cc:652-845` — an upper-cased
+linear `if (subcmd == "X")` chain ending in `UnknownSubCmd`; also add a HELP entry) and a
+handler modelled on `DebugCmd::Inspect` (`:1202-1261`, verified exact) — resolve the shard with
 `Shard(key, shard_set->size())` and `ess.Await(sid, cb)`. Return a flat RESP simple
 string:
 
@@ -2532,7 +2604,7 @@ state:absent shard:<n>
 
 - [ ] **Step 4: Add the INFO fields**
 
-`INFO memory` (`server_family.cc:2821`): `mvcc_table_bytes`, `mvcc_entries`,
+`INFO memory` (the `append(a1, a2)` lambda defined at `server_family.cc:2712`): `mvcc_table_bytes`, `mvcc_entries`,
 `mvcc_tombstones`. Inside the active-mode replication block: `mvcc_clock_ahead_ms`,
 `mvcc_unstamped_writes`, `mvcc_stale_epoch`. Aggregate the stamper stats across shard
 threads in `Metrics::Merge`.
@@ -2615,7 +2687,10 @@ async def _mem(client) -> dict:
 @pytest.mark.slow
 @pytest.mark.parametrize("key_len", [8, 16, 24, 32])
 async def test_mvcc_table_memory_cost(df_factory: DflyInstanceFactory, key_len: int):
-    prefix = "k" * (key_len - 8)  # DEBUG POPULATE appends an 8-char numeric suffix
+    # DEBUG POPULATE builds StrCat(prefix, ":", index) with a PLAIN UNPADDED decimal
+    # (debugcmd.cc:1015, :1029) -- there is no fixed-width suffix. For KEY_COUNT=1e6 the
+    # index is 1-7 chars, ~6 on average, plus the ':' separator.
+    prefix = "k" * max(1, key_len - 7)
 
     off = df_factory.create(proactor_threads=4)
     on = df_factory.create(**active_args(multi=False, proactor_threads=4))
@@ -2648,6 +2723,13 @@ async def test_mvcc_table_memory_cost(df_factory: DflyInstanceFactory, key_len: 
           f"({100 * delta / m_off['used_memory']:.1f}% over baseline)")
 ```
 
+Register the marker first — `tests/pytest.ini:9-24` lists only `opt_only`,
+`exclude_epoll`, `debug_only`, `large`, `replication`. Add:
+
+```ini
+    slow: marks tests as slow (deselect with '-m "not slow"')
+```
+
 - [ ] **Step 2: Run it and record the table**
 
 ```bash
@@ -2676,7 +2758,7 @@ Before opening the PR, all of the following, with output pasted into the SDD led
 
 - [ ] `ninja -j4` completes warning-free (CI uses `-Werror`).
 - [ ] `ctest -V -L DFLY` — 87 pre-existing plus `mvcc_test` and the new `multi_master_test` cases.
-- [ ] `multimaster_test.py` at its P3 baseline of 41, plus everything added in P4-0 and P4-1.
+- [ ] `multimaster_test.py` at its current baseline of **44**, plus everything P4-1 adds.
 - [ ] `replication_test.py` 43 passed, `replication_specific_test.py` 61 passed,
       `replication_resilience_test.py` 41 passed + 1 pre-existing xfail.
 - [ ] Timing-adjacent new tests run 10-15x, pass rates recorded.
