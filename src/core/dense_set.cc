@@ -56,6 +56,10 @@ void DenseSet::IteratorBase::SetExpiryTime(uint32_t ttl_sec) {
   // Self-heal: pre-existing TTL entries may have been created before this
   // flag was tracked here.
   owner_->expiration_used_ = true;
+  // drakeydb: P4-0 Task 2b Important A -- mirror into the reaper's in-flight-pass accumulator so
+  // a TTL armed here mid-pass, on a slot the walk may have already examined, still poisons that
+  // pass's "clean" verdict. See ReaperExpireStep's own comment for why.
+  owner_->reaper_any_ttl_seen_ = true;
   if (!HasExpiry()) {
     const size_t old_size = owner_->ObjectAllocSize(ptr->Raw());
     void* new_obj = owner_->ObjectClone(src, false, true);
@@ -135,6 +139,9 @@ size_t DenseSet::PushFront(DenseSet::ChainVectorIterator it, void* data, bool ha
   if (has_ttl) {
     it->SetTtl(true);
     expiration_used_ = true;
+    // drakeydb: P4-0 Task 2b Important A -- see ReaperExpireStep's comment (dense_set.h): every
+    // site that arms expiration_used_ must also poison an in-flight reaper pass's clean verdict.
+    reaper_any_ttl_seen_ = true;
   }
   return ObjectAllocSize(data);
 }
@@ -149,6 +156,7 @@ void DenseSet::PushFront(DenseSet::ChainVectorIterator it, DenseSet::DensePtr pt
     if (ptr.HasTtl()) {
       it->SetTtl(true);
       expiration_used_ = true;
+      reaper_any_ttl_seen_ = true;
     }
     if (ptr.IsLink()) {
       FreeLink(ptr.AsLink());
@@ -166,6 +174,7 @@ void DenseSet::PushFront(DenseSet::ChainVectorIterator it, DenseSet::DensePtr pt
     if (ptr.HasTtl()) {
       it->SetTtl(true);
       expiration_used_ = true;
+      reaper_any_ttl_seen_ = true;
     }
     DCHECK(!it->AsLink()->next.IsEmpty());
   }
@@ -428,6 +437,13 @@ void DenseSet::Shrink(size_t new_size) {
   DCHECK_GE(new_size, kMinSize);
   DCHECK_LT(new_size, entries_.size());
 
+  // Every bucket is rebuilt below. Invalidate the resume position at the mutation site so a
+  // shrink followed by regrowth to the original capacity cannot hide the relocation from the
+  // next reaper step.
+  reaper_cursor_ = 0;
+  reaper_any_ttl_seen_ = false;
+  reaper_pass_capacity_log_ = 0;
+
   size_t prev_size = entries_.size();
   capacity_log_ = absl::bit_width(new_size) - 1;
 
@@ -478,6 +494,13 @@ void DenseSet::Fill(DenseSet* other) const {
 }
 
 void DenseSet::Grow(size_t prev_size) {
+  // Grow rehashes existing entries. Reset here (rather than relying only on a later capacity
+  // comparison) so multiple rebuilds that end at the original capacity still invalidate an
+  // in-flight reaper pass.
+  reaper_cursor_ = 0;
+  reaper_any_ttl_seen_ = false;
+  reaper_pass_capacity_log_ = 0;
+
   DensePtr first;
 
   // Corner case. Usually elements are moved to higher buckets during rehashing.
@@ -615,10 +638,33 @@ void DenseSet::AddUnique(void* obj, bool has_ttl, uint64_t hashcode) {
    * unlink it and repeat the steps
    */
 
+  // drakeydb: P4-0 Task 2b Important B -- this cascade relocates pre-existing entries (possibly
+  // whole link chains, via PopPtrFront/PushFront(DensePtr) below) across bucket indices without
+  // changing entries_.size(), so ReaperExpireStep's resize-based guard (dense_set.h) can't see
+  // it. A displaced entry can move from an index >= reaper_cursor_ (not yet examined by an
+  // in-flight pass) to one < reaper_cursor_ (already examined), hiding it for the rest of that
+  // pass -- or vice versa, causing (harmless) re-examination. Invalidate any in-flight pass here
+  // so it restarts from scratch rather than risk the former. Cheap: displacement is rare, and a
+  // restarted pass just re-walks slots, it doesn't re-do the work those slots already caused.
+  //
+  // Deliberately BEFORE the has_ttl block below (fix round 5): that block also sets
+  // reaper_any_ttl_seen_ = true when the entry being inserted here carries a TTL (Important A,
+  // same mirroring every other TTL-arming call site does). Checking displacement first means the
+  // two writes to reaper_any_ttl_seen_ can never land in the wrong order and cancel each other
+  // out -- an earlier version of this fix had them reversed, which happened to still be correct
+  // only because resetting reaper_cursor_ to 0 forces a full re-walk that re-discovers this same
+  // entry once inserted, an undocumented and untested dependency between two independently
+  // motivated fixes. This ordering removes that dependency instead of relying on it.
+  if (!entries_[bucket_id].IsEmpty() && entries_[bucket_id].IsDisplaced()) {
+    reaper_cursor_ = 0;
+    reaper_any_ttl_seen_ = false;
+  }
+
   DensePtr to_insert(obj);
   if (has_ttl) {
     to_insert.SetTtl(true);
     expiration_used_ = true;
+    reaper_any_ttl_seen_ = true;
   }
 
   while (!entries_[bucket_id].IsEmpty() && entries_[bucket_id].IsDisplaced()) {
@@ -805,8 +851,10 @@ void* DenseSet::AddOrReplaceObj(void* obj, bool has_ttl) {
     // A bit confusing design: ttl bit is located on the wrapping pointer,
     // therefore we must set ttl bit before unwrapping below.
     dptr->SetTtl(has_ttl);
-    if (has_ttl)
+    if (has_ttl) {
       expiration_used_ = true;
+      reaper_any_ttl_seen_ = true;
+    }
 
     if (dptr->IsLink())  // unwrap the pointer.
       dptr = dptr->AsLink();

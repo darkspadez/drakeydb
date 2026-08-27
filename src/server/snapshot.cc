@@ -355,7 +355,8 @@ void SliceSnapshot::ConsumeJournalChange(const journal::JournalChangeItem& item)
   // window's concurrent journal blob. Without this, a peer full-syncing (e.g. because its
   // partial-sync backlog was evicted -- see PendingBuf/CleanEntries) would receive every
   // concurrent write inline and unfiltered through this path instead of streamer.cc's: peer-origin
-  // writes echoed back toward their author, expiry-flagged DELs, and Op::ORIGIN entries alike.
+  // writes echoed back toward their author, expiry-flagged DELs, derived DELs (P4-0's
+  // kEntryFlagDerived), and Op::ORIGIN entries alike.
   //
   // Gated on peer_mode_ (false unless CreateSyncSession admitted this consumer as a peer of an
   // active node -- see dflycmd.cc's StartFullSyncInThread), so a plain replica's or a local

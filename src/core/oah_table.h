@@ -68,6 +68,10 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
       owner_->At(bucket_)[pos_].SetExpiry(owner_->EntryTTL(ttl_sec));
       owner_->obj_alloc_used_ += entry.AllocSize();
       owner_->expiration_used_ = true;
+      // drakeydb: P4-0 Task 2b Important A -- mirror into the reaper's in-flight-pass
+      // accumulator; see ReaperExpireStep's comment for why every expiration_used_ = true site
+      // must also poison an in-flight pass's clean verdict.
+      owner_->reaper_any_ttl_seen_ = true;
     }
 
     iterator& operator++() {
@@ -369,6 +373,132 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
     return expiration_used_;
   }
 
+  // drakeydb: P4-0 Task 2b Important A/C -- reaper-only callback, distinct from ItemCb (Scan()'s
+  // own, used by the SCAN command): also reports whether the delivered entry still carries a
+  // TTL, which the reaper needs to decide if ReaperClearMemberExpiration() below is safe, and
+  // which ItemCb's string_view-only signature cannot express.
+  using ReaperItemCb = std::function<void(std::string_view, bool has_ttl, uint32_t expiry_time)>;
+
+  // drakeydb: P4-0 Task 2b Important A/C -- near-duplicate of ScanHomeBucket (below), differing
+  // in the callback signature and exposing an Expire template switch for the search preflight.
+  // Deliberately a separate method rather than an added parameter to
+  // ScanHomeBucket: the coordinator's ruling was to add a new opt-in method the reaper alone
+  // calls, not to change Scan()/the SCAN command's existing, shipped behavior in place. Keeps
+  // the SIMD affiliation-window/extension-vector logic exactly as ScanHomeBucket already has it
+  // (not reimplemented) -- only the two `cb(...)` call sites differ, passing e.HasExpiry() too.
+  template <bool Expire> bool ReaperScanHomeBucket(uint32_t bucket_id, const ReaperItemCb& cb) {
+    const uint32_t part = std::min<uint32_t>(capacity_log_, kShiftLog);
+    assert(part > 0u);
+    const uint32_t shift = 64 - part;
+    const uint64_t target = bucket_id & ((uint64_t{1} << part) - 1);
+
+    const TaggedPtr* base = &entries_[bucket_id];
+    for (uint32_t i = 0; i < kDisplacementSize; ++i)
+      oah::PrefetchRead(reinterpret_cast<const char*>(base[i] & ~oah::kTagMask));
+
+    uint32_t vec_mask = 0;
+    uint32_t cand = ScanWindowMask(base, target, shift, &vec_mask);
+    bool reported = false;
+
+    while (cand) {
+      const uint32_t i = std::countr_zero(cand);
+      cand &= cand - 1;
+      Entry e = At(bucket_id + i)[0];
+      if constexpr (Expire)
+        ExpireIfNeeded(e);
+      if (e.Empty())
+        continue;
+      const oah::key::Decoded key = DecodeKey(e);
+      cb(key.view(), e.HasExpiry(), e.HasExpiry() ? e.GetExpiry() : UINT32_MAX);
+      reported = true;
+    }
+
+    if (vec_mask) {
+      assert((vec_mask & (vec_mask - 1)) == 0u);
+      const uint32_t vi = std::countr_zero(vec_mask);
+      auto vec = At(bucket_id + vi).AsVector();
+      TaggedPtr* raw = vec.Raw();
+      const size_t vsize = vec.Size();
+      for (size_t b = 0; b < vsize; b += VectorWide::kLanes) {
+        uint32_t m = AffiliationMask<VectorWide>(&raw[b], target, shift);
+        while (m) {
+          const uint32_t j = std::countr_zero(m);
+          m &= m - 1;
+          Entry el(raw[b + j]);
+          if constexpr (Expire)
+            ExpireIfNeeded(el);
+          if (el.Empty())
+            continue;
+          const oah::key::Decoded key = DecodeKey(el);
+          cb(key.view(), el.HasExpiry(), el.HasExpiry() ? el.GetExpiry() : UINT32_MAX);
+          reported = true;
+        }
+      }
+    }
+
+    return reported;
+  }
+
+  // drakeydb: P4-0 Task 2b Important A/C -- reaper-only. Bounds a member-expiry sweep to at most
+  // max_buckets HOME BUCKETS per call (unlike Scan() above, whose outer loop can process an
+  // unbounded run of consecutive non-reporting -- i.e. entirely-expired -- buckets before
+  // returning, exactly the pathological case this method exists to bound), resuming from
+  // reaper_cursor_ so a table bigger than one call's budget makes genuine forward progress
+  // across heartbeat ticks.
+  // Returns whether the next budgeted step contains an already-due member without mutating it.
+  // Search-index maintenance uses this to detach the old document before expiry frees fields.
+  bool ReaperStepHasDue(uint32_t max_buckets) {
+    if (entries_.empty() || time_now_ == 0)
+      return false;
+    uint32_t bucket_id = reaper_cursor_ >> (32 - capacity_log_);
+    bool due = false;
+    auto cb = [this, &due](std::string_view, bool has_ttl, uint32_t expiry_time) {
+      due |= has_ttl && expiry_time <= time_now_;
+    };
+    for (uint32_t examined = 0; bucket_id < BucketCount() && examined < max_buckets;
+         ++bucket_id, ++examined) {
+      ReaperScanHomeBucket<false>(bucket_id, cb);
+      if (due)
+        return true;
+    }
+    return false;
+  }
+
+  // Bounds a member-expiry sweep to max_buckets home buckets and resumes across calls. Returns
+  // true only after a full pass that found no surviving TTL, when clearing the sticky member-
+  // expiration flag is safe.
+  bool ReaperExpireStep(uint32_t max_buckets) {
+    if (entries_.empty()) {
+      reaper_cursor_ = 0;
+      reaper_any_ttl_seen_ = false;
+      return true;
+    }
+    uint32_t bucket_id = reaper_cursor_ >> (32 - capacity_log_);
+    uint32_t examined = 0;
+    auto cb = [this](std::string_view, bool has_ttl, uint32_t) {
+      if (has_ttl)
+        reaper_any_ttl_seen_ = true;
+    };
+    for (; bucket_id < BucketCount() && examined < max_buckets; ++bucket_id, ++examined) {
+      ReaperScanHomeBucket<true>(bucket_id, cb);
+    }
+    if (bucket_id >= BucketCount()) {
+      bool clean_pass = !reaper_any_ttl_seen_;
+      reaper_cursor_ = 0;
+      reaper_any_ttl_seen_ = false;
+      return clean_pass;
+    }
+    reaper_cursor_ = bucket_id << (32 - capacity_log_);
+    return false;
+  }
+
+  // Reaper-only. The caller must have just received `true` from ReaperExpireStep -- a complete,
+  // clean pass -- immediately before calling this; see that method's own comment for why a
+  // truncated or dirty pass must never reach here.
+  void ReaperClearMemberExpiration() {
+    expiration_used_ = false;
+  }
+
   size_t SizeSlow();
 
  protected:
@@ -616,7 +746,7 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
   // Scans one stable-SCAN home bucket window and reports live affiliated entries. Templated on
   // Expire: no-TTL sets skip the per-entry lazy expiration and the post-expiry empty re-check.
   template <bool Expire> bool ScanHomeBucket(uint32_t bucket_id, const ItemCb& cb) {
-    const uint32_t part = std::min(capacity_log_, kShiftLog);
+    const uint32_t part = std::min<uint32_t>(capacity_log_, kShiftLog);
     assert(part > 0u);
     // ScanWindowMask drops empty lanes, so `cand` holds only affiliated non-empty single entries.
     const uint32_t shift = 64 - part;
@@ -779,10 +909,27 @@ template <typename Entry> class OAHTable {  // Open Addressing Hash table
   mutable size_t obj_alloc_used_ = 0;
   mutable size_t ptr_vectors_alloc_used_ = 0;
 
-  std::uint32_t capacity_log_ = 0;
   std::uint32_t size_ = 0;  // number of elements in the set.
   std::uint32_t time_now_ = 0;
+  // drakeydb: P4-0 Task 2b Important A/C -- reaper-only resume state; see DenseSet's identical
+  // fields (dense_set.h) for the full rationale, mirrored here for OAHTable.
+  std::uint32_t reaper_cursor_ = 0;
+
+  // drakeydb: P4-0 Task 2b, fix round 6 Important 3 -- capacity_log_ narrowed from uint32_t to
+  // uint8_t, and this whole tail regrouped by size (three uint32_t fields above, three 1-byte
+  // fields here, entries_ last), to close a sizeof(OAHSet) regression: this task's reaper fields
+  // had grown it 56 -> 64 bytes in the default build (--use_oah_set defaults true, so this was
+  // +8 bytes on every dense-encoded SET key even with --active_replica off), unlike DenseSet/
+  // StringMap, which stayed at 64 because their own reaper fields were deliberately packed into
+  // existing tail padding (dense_set.h). Safe to narrow: capacity_log_ is a shift amount (bucket
+  // count is 1 << capacity_log_) used only in expressions like `32 - capacity_log_` and
+  // `1 << capacity_log_`, where a uint8_t operand promotes to int/unsigned before the operation
+  // -- no behavior change -- and no realistic table ever approaches 256 for it (that would mean
+  // 2^256 buckets). Measured before/after with a scratch sizeof probe: 64 -> 56, confirmed.
+  std::uint8_t capacity_log_ = 0;
   bool expiration_used_ = false;
+  bool reaper_any_ttl_seen_ = false;
+
   Buckets entries_;
 };
 

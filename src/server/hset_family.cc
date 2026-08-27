@@ -201,13 +201,22 @@ struct HMapWrap {
 };
 
 // Delete if length is zero
-void DeleteHw(HMapWrap& hw, const OpArgs& op_args, std::string_view key) {
+//
+// This is a third DEL-derivation path, distinct from DeleteIfEmpty below. Most callers can
+// suppress this local conclusion on mesh-peer links because the active-mode reaper guarantees
+// convergence in every namespace and DB. A condition whose replay can change under clock skew
+// must opt out so its peer sees the deletion before evaluating the condition.
+void DeleteHw(HMapWrap& hw, const OpArgs& op_args, std::string_view key,
+              bool suppress_peer = true) {
   auto& db_slice = op_args.GetDbSlice();
   if (auto del_it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_HASH); del_it) {
     del_it->post_updater.Run();
     db_slice.Del(op_args.db_cntx, del_it->it);
     if (op_args.shard->journal()) {
-      RecordJournal(op_args, "DEL"sv, {key});
+      if (suppress_peer)
+        RecordDerivedDelete(op_args.db_cntx, key);
+      else
+        RecordDelete(op_args.db_cntx, key);
     }
   }
 }
@@ -777,7 +786,9 @@ OpResult<bool> CheckHSetExCondition(const OpArgs& op_args, string_view key,
     }
   }
   if (hw.Length() == 0) {  // Find() may have lazily expired fields and emptied the hash.
-    DeleteHw(hw, op_args, key);
+    // A lagging peer can still see the field and choose the opposite FNX/FXX branch. Forward the
+    // DEL so it evaluates the replayed HSETEX against the same absence decision as this node.
+    DeleteHw(hw, op_args, key, /*suppress_peer=*/false);
   } else if (missing.size() > 1 && op_args.shard->journal()) {
     // A field probed while lazily expired is still alive on a lagging replica and the
     // replayed condition would decide differently there; delete it explicitly first.
@@ -1635,7 +1646,7 @@ int32_t HSetFamily::FieldExpireTime(const DbContext& db_context, const PrimeValu
 }
 
 bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std::string_view key,
-                               const PrimeValue& pv) {
+                               const PrimeValue& pv, bool derived) {
   if (pv.Encoding() != kEncodingStrMap2)
     return false;
 
@@ -1648,7 +1659,21 @@ bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std:
       // drakeydb: Phase 3 -- db_cntx carries the causing transaction's replication-apply origin
       // (see DbContext::repl_origin_idx), so this derived DEL inherits it rather than always
       // being attributed to this node.
-      RecordDelete(db_cntx, key);
+      // drakeydb: P4-0 -- RecordDerivedDelete (not RecordDelete) sets journal::kEntryFlagDerived
+      // so PassesPeerEchoFilter keeps this DEL off mesh-peer links; see docs/PLAN.md's Phase 4
+      // section. `derived` (see hset_family.h) lets OpFieldExpire (generic_family.cc) opt out:
+      // its own replay is clock-dependent (a lagging peer can arm an already-expired field
+      // instead of also discovering it expired), so that one caller needs the forwarded,
+      // non-suppressed DEL to force convergence. Echo-safe regardless -- see that call site's
+      // comment for the full argument. Every other caller relies on the default and is
+      // unaffected. (SetFamily::DeleteSetIfEmpty, set_family.cc, has an analogous second
+      // carve-out for SORT -- OBJ_HASH is not one of SORT's sortable types, so it never reaches
+      // this helper.)
+      if (derived) {
+        RecordDerivedDelete(db_cntx, key);
+      } else {
+        RecordDelete(db_cntx, key);
+      }
     }
     return true;
   }

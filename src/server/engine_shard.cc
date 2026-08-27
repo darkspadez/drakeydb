@@ -24,6 +24,7 @@ extern "C" {
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/journal.h"
+#include "server/multi_master.h"
 #include "server/namespaces.h"
 #include "server/search/doc_index.h"
 #include "server/server_state.h"
@@ -860,8 +861,8 @@ void EngineShard::Heartbeat() {
 }
 
 void EngineShard::RetireExpiredAndEvict() {
-  // TODO: iterate over all namespaces
-  DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard_id());
+  Namespace& default_ns = namespaces->GetDefaultNamespace();
+  DbSlice& db_slice = default_ns.GetDbSlice(shard_id());
   constexpr double kTtlDeleteLimit = 200;
 
   uint32_t traversed = GetMovingSum6(TTL_TRAVERSE);
@@ -877,6 +878,7 @@ void EngineShard::RetireExpiredAndEvict() {
   }
 
   DbContext db_cntx;
+  db_cntx.ns = &default_ns;
   db_cntx.time_now_ms = GetCurrentTimeMs();
 
   size_t deleted_bytes = 0;
@@ -890,26 +892,57 @@ void EngineShard::RetireExpiredAndEvict() {
     // which may suspend on backpressure, runs outside the atomic section.
     journal::DisableFlushGuard journal_flush_guard(journal_);
 
-    for (unsigned i = 0; i < db_slice.db_array_size(); ++i) {
+    const unsigned db_count = db_slice.db_array_size();
+    const bool rotate_default_db = IsActiveReplica() && db_count != 0;
+    size_t default_db_start = 0;
+    if (rotate_default_db)
+      default_db_start = namespace_reaper_db_cursors_[&default_ns]++ % db_count;
+
+    for (unsigned offset = 0; offset < db_count; ++offset) {
+      unsigned i = rotate_default_db ? (default_db_start + offset) % db_count : offset;
       if (!db_slice.IsDbValid(i))
         continue;
 
       db_cntx.db_index = i;
       auto* pt = db_slice.GetTables(i);
       uint64_t expire_count = db_slice.GetDBTable(i)->stats.expire_count;
-      if (expire_count > 0) {
+      // drakeydb: P4-0 Task 2b -- member-TTL keys are TTL-bearing too: they gate the traversal
+      // AND count toward the dilution ratio below, or a member-only DB (expire_count == 0)
+      // divides by zero a few lines down and (on ARM64, silently) zeroes its own traversal
+      // budget, so DeleteExpiredStep's reaper extension never actually runs. Authorized
+      // exception to the "engine_shard stays untouched" constraint, confined to this one `if`
+      // block; see task-2b-report.md.
+      //
+      // drakeydb: P4-0 Task 2b, fix round 1 -- the member term is gated on IsActiveReplica():
+      // with --active_replica off, DeleteExpiredStep's reaper branch is itself inert
+      // (db_slice.cc's reap_member_expiry), so member-TTL keys are pure dilution there, not
+      // reap targets. Counting them unconditionally would open this gate for DBs upstream skips
+      // entirely and shrink the ratio below for every upstream-configured (non-active) node --
+      // exactly the config the byte-identical-to-upstream constraint is about. Gating keeps the
+      // inactive path bit-for-bit upstream.
+      //
+      // The reaper is part of the active-replica convergence invariant, so an operator-provided
+      // zero is an effective budget of one rather than a correctness-disabling switch.
+      const bool member_reap_active = IsActiveReplica();
+      uint64_t ttl_key_count =
+          expire_count +
+          (member_reap_active ? db_slice.GetDBTable(i)->stats.member_expire_count : uint64_t{0});
+      if (ttl_key_count > 0) {
         // Scale traversal count to compensate for TTL key dilution in the prime table.
         // Since we now scan the prime table (not a dedicated expire table), most entries
         // may not have TTLs. We need more bucket traversals to check the same number of
         // TTL keys, but cap to avoid excessive work when TTL keys are extremely sparse.
         unsigned db_ttl_delete_target = ttl_delete_target;
 
-        if (pt->size() >= expire_count * 2) {
-          unsigned ratio = std::min<uint64_t>(pt->size() / expire_count, 7);
+        if (pt->size() >= ttl_key_count * 2) {
+          unsigned ratio = std::min<uint64_t>(pt->size() / ttl_key_count, 7);
           db_ttl_delete_target = ttl_delete_target * ratio;
         }
         DbSlice::DeleteExpiredStats stats =
-            db_slice.DeleteExpiredStep(db_cntx, db_ttl_delete_target);
+            db_slice.DeleteExpiredStep(db_cntx, db_ttl_delete_target,
+                                       {.ensure_member_reaping = member_reap_active,
+                                        .journal_deletions = true,
+                                        .reset_time_quota = false});
 
         if (!stats.key_events.empty())
           per_db_events[i] = std::move(stats.key_events);
@@ -942,6 +975,61 @@ void EngineShard::RetireExpiredAndEvict() {
     }
   }  // journal_flush_guard destroyed here — atomic section ends before SendMessages
 
+  // Upstream's heartbeat only visits the default namespace. Active mode cannot inherit that
+  // limitation because a logically empty member-TTL container must eventually disappear even
+  // when no client reads it. Visit one additional namespace per tick in round-robin order to
+  // keep the heartbeat bounded. The journal wire carries no namespace identity, so these local
+  // sweeps deliberately do not emit DELs that a receiver would misapply to its default namespace.
+  Namespace* extra_ns = nullptr;
+  if (IsActiveReplica())
+    extra_ns = namespaces->GetNext(&namespace_reaper_cursor_, &default_ns);
+
+  optional<unsigned> extra_event_db;
+  vector<string> extra_events;
+  if (extra_ns) {
+    DbSlice& extra_slice = extra_ns->GetDbSlice(shard_id());
+    db_cntx.ns = extra_ns;
+
+    journal::DisableFlushGuard journal_flush_guard(journal_);
+    // Process at most one DB from this namespace per tick. Combined with the namespace cursor,
+    // this bounds added heartbeat work while guaranteeing eventual coverage of every DB.
+    size_t& db_cursor = namespace_reaper_db_cursors_[extra_ns];
+    for (unsigned attempts = 0; attempts < extra_slice.db_array_size(); ++attempts) {
+      unsigned i = db_cursor++ % extra_slice.db_array_size();
+      if (!extra_slice.IsDbValid(i))
+        continue;
+
+      db_cntx.db_index = i;
+      auto* pt = extra_slice.GetTables(i);
+      uint64_t ttl_key_count = extra_slice.GetDBTable(i)->stats.expire_count +
+                               extra_slice.GetDBTable(i)->stats.member_expire_count;
+      if (ttl_key_count == 0)
+        continue;
+
+      unsigned db_ttl_delete_target = ttl_delete_target;
+      if (pt->size() >= ttl_key_count * 2) {
+        unsigned ratio = std::min<uint64_t>(pt->size() / ttl_key_count, 7);
+        db_ttl_delete_target = ttl_delete_target * ratio;
+      }
+
+      DbSlice::DeleteExpiredStats stats = extra_slice.DeleteExpiredStep(
+          db_cntx, db_ttl_delete_target,
+          {.ensure_member_reaping = true, .journal_deletions = false, .reset_time_quota = true});
+      if (!stats.key_events.empty()) {
+        extra_event_db = i;
+        extra_events = std::move(stats.key_events);
+      }
+
+      deleted_bytes += stats.deleted_bytes;
+      counter_[TTL_TRAVERSE].IncBy(stats.traversed);
+      counter_[TTL_DELETE].IncBy(stats.deleted);
+      stats_.total_heartbeat_expired_keys += stats.deleted;
+      stats_.total_heartbeat_expired_bytes += stats.deleted_bytes;
+      ++stats_.total_heartbeat_expired_calls;
+      break;
+    }
+  }
+
   // Send keyspace notifications for expired/evicted keys outside the atomic section
   // because SendMessages may suspend on connection backpressure (see issue #7052).
   for (unsigned i = 0; i < per_db_events.size(); ++i) {
@@ -950,6 +1038,9 @@ void EngineShard::RetireExpiredAndEvict() {
     channel_store->SendMessages(absl::StrCat("__keyevent@", i, "__:expired"), per_db_events[i],
                                 false);
   }
+  if (extra_event_db)
+    channel_store->SendMessages(absl::StrCat("__keyevent@", *extra_event_db, "__:expired"),
+                                extra_events, false);
 
   // Track deleted bytes only if we expect to lower memory
   if (eviction_state_.track_deleted_bytes) {
@@ -958,9 +1049,12 @@ void EngineShard::RetireExpiredAndEvict() {
 
   // Expiry/eviction above only marks watchers as awakened. Dispatch here, outside the atomic
   // section, because readiness checks read the db slice and may preempt.
-  if (auto* bc = namespaces->GetDefaultNamespace().GetBlockingController(shard_id());
-      bc && GetContTx() == nullptr) {
+  if (auto* bc = default_ns.GetBlockingController(shard_id()); bc && GetContTx() == nullptr) {
     bc->NotifyPending();
+  }
+  if (extra_ns) {
+    if (auto* bc = extra_ns->GetBlockingController(shard_id()); bc && GetContTx() == nullptr)
+      bc->NotifyPending();
   }
 }
 

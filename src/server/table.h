@@ -58,6 +58,15 @@ struct DbTableStats {
   // number of keys with ttls set.
   uint64_t expire_count = 0;
 
+  // drakeydb: P4-0 Task 2b -- number of keys with at least one member-level TTL
+  // (CompactObj::HasMemberExpiration(), e.g. via HEXPIRE/FIELDEXPIRE), independent of
+  // expire_count above (whole-key TTL). Gates the heartbeat's member-expiry reaper traversal
+  // (engine_shard.cc) for member-only-TTL containers, which otherwise have expire_count == 0 and
+  // would never be walked. Maintained in db_slice.cc: DbSlice::AutoUpdater::Run() (the generic
+  // post-mutation chokepoint every PrimeValue write funnels through, including RDB/full-sync
+  // loads) and DbSlice::PerformDeletionAtomic (key deleted while still carrying member TTLs).
+  uint64_t member_expire_count = 0;
+
   // Object memory usage besides hash-table capacity.
   // Applies for any non-inline objects.
   size_t obj_memory_usage = 0;

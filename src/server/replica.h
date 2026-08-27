@@ -266,6 +266,12 @@ class Replica : ProtocolClient {
   // matching ConnectionContext::repl_origin_idx's own convention (conn_context.h) to avoid
   // pulling that header into this one just for a constant.
   uint32_t peer_origin_idx_ = 0;
+
+  // drakeydb: P4-0 -- signed skew (peer - local, ms) computed in Greet() from
+  // master_context_.master_clock_ms right after the handshake sets it; see ComputeClockSkewMs
+  // (multi_master.h). Atomic: read from the INFO fiber via GetSummary(), written from the
+  // replication fiber running Greet().
+  std::atomic<int64_t> clock_skew_ms_{0};
 };
 
 class RdbLoader;

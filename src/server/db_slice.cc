@@ -8,6 +8,7 @@
 
 #include "core/dense_set.h"
 #include "core/oah_set.h"
+#include "core/string_map.h"
 #include "strings/human_readable.h"
 
 extern "C" {
@@ -24,10 +25,13 @@ extern "C" {
 #include "server/blocking_controller.h"
 #include "server/channel_store.h"
 #include "server/cluster/slot_set.h"
+#include "server/common.h"
 #include "server/conn_context.h"
+#include "server/container_utils.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/journal/journal.h"
+#include "server/multi_master.h"
 #include "server/namespaces.h"
 #include "server/server_state.h"
 #include "server/tiered_storage.h"
@@ -58,6 +62,53 @@ ABSL_FLAG(bool, replica_delete_expired, true,
 ABSL_FLAG(bool, journal_omit_redundant_writes, true,
           "If true, omit journal writes for keys during full sync that are yet to be reached by "
           "the serialization loop. Reduces full sync overhead");
+
+// drakeydb: P4-0 Task 2b, fix round 2 -- makes the member-expiry reaper incremental per container.
+// quota_remains() is only checked before a container walk starts, never during it, and the walk
+// itself is a single non-interruptible step -- DenseSet::ReaperExpireStep/OAHTable::
+// ReaperExpireStep call only plain, synchronous C++ (ExpireIfNeeded/Delete), no fiber-aware call
+// that could yield, unlike container_utils::IterateSet/IterateMap's own allow_yield parameter
+// (container_utils.h), which the reaper does NOT use (see the redesign comment in
+// DeleteExpiredStep below for why). Without a cap, one large container (a 100k-field hash is the
+// canonical HEXPIRE workload) can stall the shard thread for the whole walk with the journal
+// flush disabled and no client able to run, regardless of the 1ms heartbeat budget. A truncated
+// walk still expires whatever it examined before the budget ran out; the remainder resumes from
+// where it left off on a later tick (DenseSet::ReaperExpireStep/OAHTable::ReaperExpireStep's own
+// persisted cursor -- fix round 1's version of this comment claimed resumption without actually
+// implementing it; this round closes that gap for real).
+//
+// drakeydb: P4-0 Task 2b, fix round 4 -- 0 does NOT mean "unlimited" (fix round 3's claim here
+// was wrong: ReaperExpireStep(0) makes end == reaper_cursor_, so the walk loop runs zero
+// iterations, the pass can never complete, and HasMemberExpiration() is therefore never cleared
+// -- the reaper spins on every affected container forever without examining a single slot,
+// which is worse than doing nothing). Restoring an actual "walk the whole container in one
+// call" semantics for 0 would reintroduce exactly the unbounded-stall hazard this budget exists
+// to prevent (see above -- the walk cannot be preempted mid-container). Production active-mode
+// heartbeat calls therefore clamp 0 to 1 via DeleteExpiredOptions::ensure_member_reaping: the
+// sweep is part of peer convergence and cannot be disabled. Direct test calls may leave that
+// option false and still use 0 to pause background-independent reaper exercises.
+//
+// Default deliberately well under the 1ms heartbeat quota, not comparable to it: quota_remains()
+// is only checked before entering a container walk, not during one, so an overlarge budget
+// defeats its own purpose -- one call at this budget can, on its own, already consume a large
+// fraction of a single tick's quota.
+//
+// drakeydb: P4-0 Task 2b, fix round 6 -- correcting the retracted cost model this comment used to
+// cite. Fix round 5's own re-measurement (task-2b-report.md, "The §17.5 outlier, explained")
+// found ReaperExpireStep(300) calls averaging ~557us with a max of ~1495us in that run (and up to
+// ~13ms in an earlier one) -- i.e. a SINGLE bounded call has been observed consuming more than
+// the entire nominal per-tick quota by itself. The per-call cost at this budget is NOT currently
+// predicted by any model this task has been able to establish; the root cause of that variance is
+// still an open question (see the report). The budget counts DenseSet home slots and OAH home
+// buckets; a collision chain or extension vector rooted there is visited as a unit. It therefore
+// guarantees resumable table progress, not a hard upper bound on work or latency under adversarial
+// collision concentration. Do not read "300" as implying a specific worst-case time.
+ABSL_FLAG(uint32_t, reaper_member_walk_budget, 300,
+          "Maximum number of container home slots/buckets the member-expiry reaper advances in "
+          "one container per heartbeat tick before deferring the remainder. Collision "
+          "chains/extension vectors are processed as a unit. Active replica heartbeats treat 0 "
+          "as 1 because proactive reaping is required for peer convergence; inactive nodes "
+          "retain upstream behavior.");
 
 namespace dfly {
 
@@ -585,6 +636,20 @@ void DbSlice::AutoUpdater::Run() {
                         current_size - static_cast<int64_t>(fields_.orig_value_heap_size), table);
   }
 
+  // drakeydb: P4-0 Task 2b -- member_expire_count tracks how many keys in this DbTable currently
+  // have member-level TTLs, independent of whole-key HasExpire() (see table.h). This is the one
+  // generic chokepoint every PrimeValue mutation funnels through -- both an ordinary command's
+  // FindMutable, and AddOrFind/AddOrUpdateInternal's insert-then-assign for a freshly loaded
+  // value (RDB/full-sync) alike, since the swapped-in value's member-expiry state is compared
+  // against the baseline captured at construction time, before the assignment happened -- so no
+  // family-specific call site needs to maintain it directly.
+  bool current_has_member_expiry = pv.HasMemberExpiration();
+  if (current_has_member_expiry && !fields_.orig_has_member_expiry) {
+    ++table->stats.member_expire_count;
+  } else if (!current_has_member_expiry && fields_.orig_has_member_expiry) {
+    --table->stats.member_expire_count;
+  }
+
   fields_.db_slice->PostUpdate(fields_.db_ind, fields_.key);
   Cancel();  // Reset to not run again
 }
@@ -600,7 +665,8 @@ DbSlice::AutoUpdater::AutoUpdater(DbIndex db_ind, std::string_view key, const It
               .it = it,
               .key = key,
               .orig_value_heap_size = it->second.MallocUsed(),
-              .orig_obj_type = it->second.ObjType()} {
+              .orig_obj_type = it->second.ObjType(),
+              .orig_has_member_expiry = it->second.HasMemberExpiration()} {
   DCHECK(IsValid(it));
 }
 
@@ -1458,8 +1524,8 @@ DbSlice::Iterator DbSlice::ExpireIfNeeded(const Context& cntx, Iterator it) cons
   return Iterator::FromPrime(ExpireIfNeeded(cntx, it.GetInnerIt()));
 }
 
-PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it,
-                                      vector<string>* events) const {
+PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vector<string>* events,
+                                      bool journal_expiry) const {
   if (!it->first.HasExpire()) {
     LOG(DFATAL) << "Invalid call to ExpireIfNeeded";
     return it;
@@ -1478,7 +1544,7 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it,
   string_view key = it->first.GetSlice(&scratch);
 
   // Replicate expiry
-  if (auto journal = owner_->journal(); journal) {
+  if (auto journal = owner_->journal(); journal && journal_expiry) {
     RecordExpiryBlocking(cntx.db_index, key);
   }
 
@@ -1595,23 +1661,295 @@ void DbSlice::FlushChangeToEarlierCallbacks(DbIndex db_ind, Iterator it, uint64_
 }
 
 auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteExpiredStats {
+  return DeleteExpiredStep(cntx, count, {});
+}
+
+auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count, DeleteExpiredOptions options)
+    -> DeleteExpiredStats {
   auto& db = *db_arr_[cntx.db_index];
   DeleteExpiredStats result;
 
   std::string stash;
 
   unsigned checked = 0;
+
+  const uint64_t quota_start =
+      options.reset_time_quota ? ThisFiber::GetRunningTimeCycles() : uint64_t{0};
+  auto quota_remains = [quota_start] {
+    // Break out of traversal if we spent more than 1ms
+    return base::CycleClock::ToUsec(ThisFiber::GetRunningTimeCycles() - quota_start) < 1000;
+  };
+
+  // drakeydb: P4-0 Task 2b -- gates the member-expiry reaper below on active mode. The Global
+  // Constraint that the journal wire stays byte-identical to upstream with --active_replica off
+  // is binding, and a reaper that deletes keys and emits DELs on a timer changes what reaches the
+  // wire, so it must not run at all when inactive. A boot-only flag read; hoisted out of the
+  // per-entry callback since it cannot change mid-traversal.
+  const bool reap_member_expiry = IsActiveReplica();
+
+  // drakeydb: P4-0 Task 2b, fix round 5 -- hoisted out of the per-entry callback for the same
+  // reason reap_member_expiry is above it: fix round 4's version read this flag unconditionally
+  // inside the callback, for every prime-table key without a whole-key TTL, on every heartbeat --
+  // including with --active_replica off, where reap_member_expiry is already false and the read
+  // is pure waste on the common path. Reading it once per call instead of once per key.
+  const uint32_t configured_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+  const uint32_t walk_budget = options.ensure_member_reaping && reap_member_expiry
+                                   ? std::max(configured_walk_budget, uint32_t{1})
+                                   : configured_walk_budget;
+
   auto cb = [&](PrimeTable::iterator it) {
     result.traversed++;
 
-    if (!it->first.HasExpire())
+    // drakeydb: P4-0 Task 2b, fix round 6 (Critical 1) -- computed once, up front, so the member
+    // walk below can run in BOTH arms of the old `if (!it->first.HasExpire())` split. That split
+    // used to gate the ENTIRE member-reap block on "this key has no whole-key TTL at all" --
+    // meaning a key that also carries a whole-key TTL (SADD+FIELDEXPIRE+EXPIRE, the ordinary way
+    // to bound a session/cache hash, or EXPIRE added later to an existing HEXPIRE'd hash) fell
+    // into the other arm and was NEVER walked or reaped, on any node: the reaper did not cover
+    // it, and Task 1's mesh-peer phantom-container divergence (this reaper's whole reason to
+    // exist) returned intact for exactly that shape, up to and including permanent divergence
+    // after a recreate -- see task-2b-report.md for the demonstrated repro. Skip the member walk
+    // only when the whole key is ALREADY due: reaping members of a container about to be deleted
+    // outright is wasted work (not incorrect, just pointless), and ordering it this way means the
+    // member walk never runs against a container this same callback is about to Del() below.
+    const bool has_whole_key_ttl = it->first.HasExpire();
+    const int64_t ttl = has_whole_key_ttl ? it->first.GetExpireTime() - cntx.time_now_ms : 0;
+    const bool whole_key_due = has_whole_key_ttl && ttl <= 0;
+
+    if (!whole_key_due) {
+      // drakeydb: P4-0 Task 2b -- member-expiry reaper. DeleteExpiredStep already walks every key
+      // in the prime table (see the upstream comment at this function's call site,
+      // engine_shard.cc, on why: "we now scan the prime table, not a dedicated expire table").
+      // Entries with a member-level TTL (SADD+FIELDEXPIRE, HSET+HEXPIRE, ...) but no whole-key
+      // TTL, or with one that is not yet due, used to be skipped here entirely: member TTLs were
+      // reaped exclusively by the ~25 read-triggered DeleteSetIfEmpty/DeleteIfEmpty call sites in
+      // the family code. That meant a peer that suppresses a read-derived DEL (Task 1's
+      // mesh-peer suppression, which assumes "the peer expires the same data on its own clock")
+      // but is never itself asked to read the key kept a logically-empty container forever -- the
+      // exact hazard this reaper closes.
+      //
+      // Do what a read would have done: force lazy member expiry by walking the container, then,
+      // if it is now empty, delete it. Every node in the mesh runs this same reaper on its own
+      // clock, so every node derives its own DEL; RecordDerivedDelete (below) sets
+      // journal::kEntryFlagDerived so PassesPeerEchoFilter keeps it off peer links -- forwarding
+      // it would reopen the hazard Task 1 closed. Do not "fix" this to forward.
+      //
+      // drakeydb: P4-0 Task 2b, redesigned after review -- this used to delete through
+      // SetFamily::DeleteSetIfEmpty/HSetFamily::DeleteIfEmpty, the same command-path helpers a
+      // read uses. Those route through FindMutable -> PreUpdateBlocking -> CallChangeCallbacks ->
+      // SerializerBase::OnChange, which can synchronously block (ThreadLocalMutex::lock's
+      // cond_var_.wait, reached via SerializeBucketLocked; or BucketDependencies::Wait) whenever a
+      // BGSAVE/full-sync SliceSnapshot is concurrently serializing this shard -- a genuine yield
+      // inside this callback's DisableFlushGuard atomic section (engine_shard.cc), whose own
+      // comment says it exists "to prevent preemption". Confirmed by tracing every link in that
+      // chain against the real source, not inferred.
+      //
+      // Whole-key expiry never has this problem: DbSlice::ExpireIfNeeded deletes through the
+      // three-arg Del(cntx, Iterator, DbTable*) overload, which reaches PerformDeletionAtomic
+      // directly and never calls FindMutable/OnChange at all -- see snapshot.cc's stream_mu_
+      // comment ("expiry paths emit DEL via RecordDelete directly, bypassing OnChange"). Reaping
+      // is an expiry, not a command, so it belongs on that same path: RecordDerivedDelete (the
+      // expiry-path journal primitive, sharing RecordExpiryBlocking's "safe under
+      // DisableFlushGuard because SetFlushMode(false) prevents AddLogRecord from preempting"
+      // guarantee -- see journal_slice.h) followed by the three-arg Del(), exactly mirroring
+      // ExpireIfNeeded's own record-then-delete pattern a few dozen lines above in this file. The
+      // container walk itself was already confirmed non-preempting (ReaperExpireStep below calls
+      // only plain synchronous C++, no fiber-aware call anywhere in DenseSet/StringMap's
+      // lazy-expiry-on-iterate path) -- only the delete mechanism needed to change.
+      //
+      // drakeydb: P4-0 Task 2b, fix round 6 (Critical 2, coordinator's own correction of fix
+      // round 1's redirect) -- "the walk doesn't yield" is necessary but was NOT sufficient. The
+      // command-path helpers (SetFamily::DeleteSetIfEmpty/HSetFamily::DeleteIfEmpty) that fix
+      // round 1 redirected away from route through FindMutable -> PreUpdateBlocking ->
+      // CallChangeCallbacks -> SerializerBase::OnChange, which has a SECOND role besides the
+      // preemption fix round 1 was right to avoid: OnChange -> ProcessBucket(on_update=true) ->
+      // BucketDependencies::Wait(bucket_address) (serializer_base.cc) blocks the MUTATOR until a
+      // concurrently-serializing SliceSnapshot finishes that bucket. That wait is what makes
+      // every other mutation path safe against a mid-entry snapshot; going around OnChange (as
+      // this reap path does, by design, to avoid the preemption) also goes around that wait.
+      // SaveSetObject/SaveHSetObject (rdb_save.cc) call set_time(0) ("disables lazy expiry
+      // during serialization"), then SaveLen(UpperBoundSize()), then iterate with an explicit
+      // preempt point (PushToConsumerIfNeeded, rdb_save.cc) -- in that window, without the wait,
+      // this reap path could on the same key: undo the serializer's set_time(0) via
+      // SetMemberTime below (racing the declared length against the reaper's own drops); free
+      // sds objects and collapse chains under the serializer's live iterator; or Del() the
+      // container the serializer is mid-iteration over.
+      //
+      // Fix: skip the sweep entirely while ANY snapshot/streamer consumer is registered
+      // (HasRegisteredCallbacks(), db_slice.h) rather than trying to make the race safe by
+      // argument. Costs nothing -- the reap resumes on the very next tick once the consumer
+      // unregisters -- and removes the race by construction: with no registered consumer, there
+      // is nothing for this path's un-awaited mutation to race against.
+      //
+      // Checked before CheckLock/Iterator/SetMemberTime so a zero budget on a direct test call
+      // skips all work. Production heartbeat calls clamp that value to one above.
+      if (reap_member_expiry && walk_budget != 0 && !HasRegisteredCallbacks() &&
+          it->second.HasMemberExpiration() && quota_remains()) {
+        string_view key = it->first.GetSlice(&stash);
+
+        if (!CheckLock(IntentLock::EXCLUSIVE, cntx.db_index, key)) {
+          // Mirrors the whole-key path below: a client blocked on this key holds the lock
+          // itself, so we can never reap it here. Wake it instead.
+          if (auto* bc = ns_->GetBlockingController(owner_->shard_id()); bc)
+            bc->Awaken(cntx.db_index, key);
+          return;
+        }
+
+        Iterator wrapped_it(it, StringOrView::FromView(key));
+
+        // drakeydb: P4-0 Task 2b, fix round 2 -- captures MallocUsed()/ObjType()/
+        // HasMemberExpiration() baseline BEFORE the walk below shrinks the container, exactly
+        // mirroring generic_family.cc's OpFieldExpire ("Finalize memory accounting before
+        // potential deletion"), the command path's own lazy-member-expiry-shrinks-a-container
+        // case. Reconciled directly via AccountObjectMemory below, NOT DbSlice::AutoUpdater::Run()
+        // (fix round 1's choice): Run() also fires PostUpdate (db_slice.cc), which marks every
+        // WATCH registration on this key dirty, wakes blocked transactions, bumps
+        // slots_stats[...].total_writes, and inflates rdb_changes_since_last_success_save -- side
+        // effects meant for a real command-path mutation a client can observe, not a background
+        // sweep that (from any client's perspective) touched nothing. A client WATCHing a key the
+        // reaper merely walked -- with the sticky flag (see the core-level fix below), potentially
+        // forever -- must not see a spurious EXEC abort with no write having occurred.
+        CompactObjType orig_obj_type = it->second.ObjType();
+        size_t orig_value_heap_size = it->second.MallocUsed();
+        bool orig_has_member_expiry = it->second.HasMemberExpiration();
+
+        // Force lazy member expiry the same way a read would: set the container's logical "now",
+        // then walk the container so the underlying set/map can drop stale ones in place (see
+        // e.g. generic_family.cc's OpFetchContainerElements for the same two-step pattern on a
+        // read path).
+        it->second.SetMemberTime(MemberTimeSeconds(cntx.time_now_ms));
+
+        // drakeydb: P4-0 Task 2b, fix round 2 -- bounds the walk itself via DenseSet:: /
+        // OAHTable::ReaperExpireStep, not container_utils::IterateSet/IterateMap (fix round 1's
+        // approach, which only bounded surviving members reaching its callback -- but
+        // DenseSet::IteratorBase::Advance and OAHTable's per-entry expiry both skip ALREADY-
+        // EXPIRED entries internally without ever invoking the delivered-entry callback, so a
+        // container whose members had ALL already expired walked unbounded, exactly the
+        // canonical HEXPIRE-workload case this budget exists to bound). ReaperExpireStep counts
+        // every slot/bucket EXAMINED, survivors and skipped-because-already-expired alike, and
+        // persists a resume cursor on the container itself so a container bigger than one call's
+        // budget makes genuine forward progress across heartbeat ticks instead of re-examining
+        // the same prefix forever. Returns whether THIS call completed a full, clean logical pass
+        // (see ReaperExpireStep's own comment) -- the only condition safe to clear the sticky
+        // HasMemberExpiration() flag under (Important C: see ReaperClearMemberExpiration below).
+        // walk_budget itself was already read once per call, hoisted above the callback
+        // entirely (fix round 5) -- guaranteed nonzero here since that's part of this block's
+        // entry condition.
+        bool complete_clean_pass = false;
+        bool refresh_search_index = false;
+        if (orig_obj_type == OBJ_HASH && ns_ == &namespaces->GetDefaultNamespace() &&
+            owner_->search_indices()->HasHashIndexes()) {
+          auto* sm = static_cast<StringMap*>(it->second.RObjPtr());
+          if (sm->ReaperStepHasDue(walk_budget)) {
+            // Search removal must see the old physical document, including fields about to
+            // expire. Disabling lazy expiry also lets buffered non-copy HNSW indices preserve
+            // their sds data before the reaper can free it.
+            it->second.SetMemberTime(0);
+            owner_->search_indices()->RemoveDoc(key, cntx, it->second, {},
+                                                MemberTimePolicy::kPreserve);
+            it->second.SetMemberTime(MemberTimeSeconds(cntx.time_now_ms));
+            refresh_search_index = true;
+          }
+        }
+        if (it->second.ObjType() == OBJ_SET) {
+          DCHECK_EQ(kEncodingStrMap2, it->second.Encoding())
+              << "HasMemberExpiration() implies the dense encoding; intset carries no per-member "
+                 "metadata and can never report true here";
+          VisitSet(it->second.RObjPtr(),
+                   [&](auto* set) { complete_clean_pass = set->ReaperExpireStep(walk_budget); });
+        } else {
+          DCHECK_EQ(OBJ_HASH, it->second.ObjType());
+          DCHECK_EQ(kEncodingStrMap2, it->second.Encoding())
+              << "HasMemberExpiration() implies the dense encoding; listpack carries no "
+                 "per-member metadata and can never report true here";
+          auto* sm = static_cast<StringMap*>(it->second.RObjPtr());
+          complete_clean_pass = sm->ReaperExpireStep(walk_budget);
+        }
+
+        if (refresh_search_index && it->second.Size() != 0)
+          owner_->search_indices()->AddDoc(key, cntx, &it->second);
+
+        // drakeydb: P4-0 Task 2b Important C -- clears the sticky HasMemberExpiration() flag
+        // (dense_set.h/oah_table.h: ExpirationUsed() is never cleared by ordinary mutation once
+        // set, in EITHER encoding -- DenseSet::ClearStep's expiration_used_ = false (dense_set.cc)
+        // fires only when the whole container becomes empty via a full Clear(), a path the
+        // reaper's own delete below does not take) so a container that once carried a member TTL
+        // but no longer has ANY -- due or not-yet-due -- stops being re-walked on every future
+        // heartbeat tick for zero benefit (measured, pre-clear: ~465us/tick, ~46% of the nominal
+        // 1ms budget, indefinitely -- see task-2b-report.md). Gated strictly on
+        // complete_clean_pass: a truncated pass (budget ran out) or one that found a live,
+        // not-yet-due TTL must never clear this, or the unexamined tail's member TTLs (truncated
+        // case) or the live TTL itself (not-yet-due case) would never be swept again by anything.
+        // Also correct for RDB: HasMemberExpiration() drives the TTL-aware type at rdb_save.cc
+        // (:179/:192/:494), and a container with no TTL-carrying members left serializes
+        // correctly as a plain SET/HASH.
+        if (complete_clean_pass) {
+          if (it->second.ObjType() == OBJ_SET) {
+            VisitSet(it->second.RObjPtr(), [](auto* set) { set->ReaperClearMemberExpiration(); });
+          } else {
+            static_cast<StringMap*>(it->second.RObjPtr())->ReaperClearMemberExpiration();
+          }
+        }
+
+        // Reconcile memory accounting for the walk's shrinkage unconditionally -- i.e. before
+        // checking whether the container is now empty, not inside that branch -- so a partial
+        // reap (container survives, still has other members) is corrected too, not just a full
+        // one. Direct AccountObjectMemory call (not AutoUpdater::Run(), see this block's opening
+        // comment) plus the same member_expire_count transition-tracking AutoUpdater::Run()
+        // would have done (unaffected by which mechanism does it).
+        {
+          DbTable* table = db_arr_[cntx.db_index].get();
+          CompactObjType current_type = it->second.ObjType();
+          int64_t current_size = static_cast<int64_t>(it->second.MallocUsed());
+          if (orig_value_heap_size > static_cast<size_t>(current_size))
+            result.deleted_bytes += orig_value_heap_size - static_cast<size_t>(current_size);
+          if (current_type != orig_obj_type) {
+            AccountObjectMemory(key, orig_obj_type, -static_cast<int64_t>(orig_value_heap_size),
+                                table);
+            AccountObjectMemory(key, current_type, current_size, table);
+          } else {
+            AccountObjectMemory(key, current_type,
+                                current_size - static_cast<int64_t>(orig_value_heap_size), table);
+          }
+          bool current_has_member_expiry = it->second.HasMemberExpiration();
+          if (current_has_member_expiry && !orig_has_member_expiry) {
+            ++table->stats.member_expire_count;
+          } else if (!current_has_member_expiry && orig_has_member_expiry) {
+            --table->stats.member_expire_count;
+          }
+        }
+
+        if (it->second.Size() == 0) {
+          size_t freed = it->first.MallocUsed() + it->second.MallocUsed();
+
+          // Journal the derived DEL before deleting, mirroring ExpireIfNeeded's own
+          // record-then-delete order a few dozen lines above. kEntryFlagDerived (not
+          // kEntryFlagExpired) is deliberate: this is conceptually "a read would have deleted
+          // this too", the same category DeleteSetIfEmpty/DeleteIfEmpty's default `derived=true`
+          // already covers -- see those functions' own comments (set_family.cc, hset_family.cc)
+          // for why kEntryFlagExpired is reserved for whole-key TTL specifically.
+          DeleteReapedContainer(cntx, key, wrapped_it, options.journal_deletions);
+
+          // freed bytes are folded into deleted_bytes (engine_shard.cc's eviction-goal
+          // accounting already consumes it correctly, unconditionally), but NOT into
+          // result.deleted: that field feeds the "strong deletion rate" heuristic below, which
+          // is about whole-key TTL density, not reaper work, and folding reaper deletions into
+          // it would skew that heuristic.
+          result.deleted_bytes += freed;
+          // Del() above invalidated `it` -- it now points at a freed prime-table slot. Must not
+          // touch it (or anything derived from it) again in this callback.
+          return;
+        }
+      }
+    }
+
+    if (!has_whole_key_ttl)
       return;
 
     checked++;
 
     string_view key = it->first.GetSlice(&stash);
 
-    int64_t ttl = it->first.GetExpireTime() - cntx.time_now_ms;
     if (ttl > 0)
       return;
 
@@ -1624,16 +1962,11 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
     }
 
     result.deleted_bytes += it->first.MallocUsed() + it->second.MallocUsed();
-    ExpireIfNeeded(cntx, it, &result.key_events);
+    ExpireIfNeeded(cntx, it, &result.key_events, options.journal_deletions);
     ++result.deleted;
   };
 
   unsigned i = 0;
-
-  auto quota_remains = [] {
-    // Break out of traversal if we spent more than 1ms
-    return base::CycleClock::ToUsec(ThisFiber::GetRunningTimeCycles()) < 1000;
-  };
 
   for (; i < count / 3 && quota_remains(); ++i) {
     db.expire_cursor = db.prime.Traverse(db.expire_cursor, cb);
@@ -1647,6 +1980,15 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count) -> DeleteEx
   }
 
   return result;
+}
+
+void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterator it,
+                                    bool journal_deletion) {
+  // Record before deletion, matching whole-key expiry. Do not route through FindMutable or the
+  // family helpers: their OnChange callback can preempt inside the heartbeat's atomic section.
+  if (owner_->journal() && journal_deletion)
+    RecordDerivedDelete(cntx, key);
+  Del(cntx, it, db_arr_[cntx.db_index].get());
 }
 
 int32_t DbSlice::GetNextSegmentForEviction(int32_t segment_id, DbIndex db_ind) const {
@@ -2037,6 +2379,12 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
 
   if (del_it->first.HasExpire())
     --stats.expire_count;
+
+  // drakeydb: P4-0 Task 2b -- the complement to AutoUpdater::Run()'s transition-based tracking
+  // above: a key deleted while it still carries member-level TTLs must release its
+  // member_expire_count credit here, since deletion does not go back through Run()'s comparison.
+  if (del_it->second.HasMemberExpiration())
+    --stats.member_expire_count;
 
   PrimeValue& pv = del_it->second;
 

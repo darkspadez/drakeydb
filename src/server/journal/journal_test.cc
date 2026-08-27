@@ -772,6 +772,32 @@ TEST(PassesPeerEchoFilterTest, DropsForeignOriginExpiryDelAndOriginOpcodeOnly) {
   EXPECT_EQ(1u, violation_logs) << "the peer-protocol diagnostic must be rate-limited";
 }
 
+// drakeydb: P4-0 -- a DEL derived from a collection command emptying its key (e.g. HTTL
+// discovering a hash field's TTL has lazily expired) must never reach a mesh peer, except where
+// the causing command's own replay there cannot be relied on to reproduce it (FIELDEXPIRE, SORT
+// -- see the RecordDerivedDelete `derived` parameter, tx_base.h): ordinarily, the peer either
+// replays the causing command and derives the same DEL itself, or expires the same data on its
+// own clock. See kEntryFlagDerived's own comment (types.h) for the full argument, and
+// docs/PLAN.md's Phase 4 section for the per-call-site enumeration that backs it. Distinct from
+// kEntryFlagExpired (a *whole-key* TTL expiry) so diagnostics can tell the two apart.
+TEST(PassesPeerEchoFilterTest, DerivedDeleteIsSuppressedToPeers) {
+  JournalItem item;
+  item.opcode = journal::Op::COMMAND;
+  item.origin_idx = PeerRegistry::kSelfIdx;  // self-originated, so origin alone passes it
+  item.entry_flags = journal::kEntryFlagDerived;
+  EXPECT_FALSE(journal::PassesPeerEchoFilter(item))
+      << "a derived DEL must never reach a peer -- the peer derives its own";
+}
+
+TEST(PassesPeerEchoFilterTest, DerivedAndExpiredAreDistinctFlags) {
+  EXPECT_NE(journal::kEntryFlagDerived, journal::kEntryFlagExpired);
+  JournalItem item;
+  item.opcode = journal::Op::COMMAND;
+  item.origin_idx = PeerRegistry::kSelfIdx;
+  item.entry_flags = journal::kEntryFlagExpired | journal::kEntryFlagDerived;
+  EXPECT_FALSE(journal::PassesPeerEchoFilter(item));
+}
+
 // drakeydb: Phase 3 T6b fix-round-1 (Q1) -- CapturingFiberSocket now lives in
 // test_capturing_socket.h, shared with peer_replication_test.cc's
 // AdoptAuthoritativeLsnComposesWithRealSenderMarker (see that test's own comment).
@@ -1217,12 +1243,12 @@ TEST_F(JournalStreamerPeerFilterTest, PeerModeGapMarkerCoalescesAndTransactionRe
 // *adopts* a mismatched marker instead of flagging it): together they pin that the new branch
 // really is conditioned on peer_mode, not a blanket replacement of the old check.
 //
-// A death test, not a plain assertion: DCHECK_EQ aborts the process in a DCHECK-enabled build
-// (this is one -- see CLAUDE.md's build instructions), so "does the check still fire" can only be
-// observed by expecting that abort; a build with DCHECKs compiled out could not tell a working
-// check apart from a silently-removed one. No fixture/proactor pool is used here (unlike the
-// tests above): gtest's death tests fork() the process, and this statement needs none of that
-// machinery, so avoiding it sidesteps any question about forking a multi-fibered process.
+// A death test, not a plain assertion: DCHECK_EQ aborts the process in a DCHECK-enabled build, so
+// "does the check still fire" can only be observed by expecting that abort. Release builds
+// compile DCHECK out and skip this test instead of treating the expected absence of an abort as
+// a failure. No fixture/proactor pool is used here (unlike the tests above): gtest's death tests
+// fork() the process, and this statement needs none of that machinery, so avoiding it sidesteps
+// any question about forking a multi-fibered process.
 //
 // drakeydb: fix-round-1 (Q2) -- the death-test pattern used to be "" (matches any non-zero exit),
 // which would also have matched the DCHECK_NE(dest->lsn, 0u) two lines above the intended
@@ -1235,6 +1261,9 @@ TEST_F(JournalStreamerPeerFilterTest, PeerModeGapMarkerCoalescesAndTransactionRe
 // peer_mode=true turns this from a crash into a silent, successful adoption -- EXPECT_DEATH then
 // fails because the statement did not die.
 TEST(JournalDeathTest, NonPeerModeStillDchecksMismatchedLsnMarker) {
+#ifdef NDEBUG
+  GTEST_SKIP() << "DCHECK is compiled out in Release builds";
+#else
   StoredSlices slices{};
   auto slice = [v = &slices](auto... ss) { return StoreSlice(v, ss...); };
   using Payload = Entry::Payload;
@@ -1256,6 +1285,7 @@ TEST(JournalDeathTest, NonPeerModeStillDchecksMismatchedLsnMarker) {
   ASSERT_EQ(Op::COMMAND, tx_data.opcode);
 
   EXPECT_DEATH(tx_reader.NextTxData(&reader, &cntx, &tx_data), "Check failed: dest->lsn == ");
+#endif
 }
 
 // drakeydb: Phase 3 T6b fix-round-1 (C2) -- proves a peer link whose entries are ALL dropped

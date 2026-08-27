@@ -39,6 +39,18 @@ struct PeerReplicaOfCmd {
 nonstd::expected<PeerReplicaOfCmd, facade::ErrorReply> ParsePeerReplicaOfArgs(
     facade::ParsedArgs args);
 
+// drakeydb: P4-0 -- LWW quality depends entirely on synchronised clocks, and P4's local-stamp
+// repair (max(tick, stored + 1)) deliberately fabricates timestamps up to the skew ahead of
+// true time. Both are only acceptable if the skew is observable.
+constexpr int64_t kClockSkewWarnMs = 250;
+
+// Signed difference peer - local, in ms. Returns 0 when peer_clock_ms is 0, which is how a
+// pre-exchange master (or a plain Redis) reports "no clock" -- never treat that as skew.
+int64_t ComputeClockSkewMs(int64_t local_clock_ms, int64_t peer_clock_ms);
+
+// Returns whether an absolute skew reaches the operational warning threshold above.
+bool IsClockSkewConcerning(int64_t skew_ms);
+
 // INFO replication block for an active node (see D-8).
 std::string RenderPeerReplicationInfo(const std::vector<ReplicaSummary>& peers, bool multi_master,
                                       bool show_peer_lines);

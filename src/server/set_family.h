@@ -44,8 +44,16 @@ class SetFamily {
   // After iterating a StringSet with set_time(), lazy member expiry may have emptied it.
   // Per Redis semantics empty collections must not exist as keys, so delete the stale key.
   // Returns true if the key was deleted.
+  //
+  // drakeydb: P4-0 -- `derived` selects which journal helper records the resulting DEL
+  // (RecordDerivedDelete when true, suppressed on peer links; plain RecordDelete when false,
+  // forwarded like any other command-caused DEL). Defaults to true, safe for every caller except
+  // OpFieldExpire (generic_family.cc), which passes false unconditionally, and SORT's own call
+  // sites in OpFetchSortEntries/OpFetchContainerElements (generic_family.cc, gated on
+  // WillAutoJournalVerbatim -- SORT_RO shares the same call sites but keeps the default) -- see
+  // each call site's comment for why.
   static bool DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std::string_view key,
-                               const PrimeValue& pv);
+                               const PrimeValue& pv, bool derived = true);
 };
 
 }  // namespace dfly

@@ -494,7 +494,8 @@ struct EmptyAccessor : public BaseAccessor {
 }  // namespace
 
 unique_ptr<BaseAccessor> GetAccessor(const DbContext& db_cntx, const PrimeValue& pv,
-                                     std::string_view cleanup_key) {
+                                     std::string_view cleanup_key,
+                                     MemberTimePolicy member_time_policy) {
   DCHECK(pv.ObjType() == OBJ_HASH || pv.ObjType() == OBJ_JSON);
 
   if (pv.ObjType() == OBJ_JSON) {
@@ -513,7 +514,9 @@ unique_ptr<BaseAccessor> GetAccessor(const DbContext& db_cntx, const PrimeValue&
     auto ptr = reinterpret_cast<uint8_t*>(pv.RObjPtr());
     return make_unique<ListPackAccessor>(ptr);
   } else {
-    auto* sm = container_utils::GetStringMap(pv, db_cntx);
+    auto* sm = member_time_policy == MemberTimePolicy::kUpdate
+                   ? container_utils::GetStringMap(pv, db_cntx)
+                   : static_cast<StringMap*>(pv.RObjPtr());
     if (cleanup_key.empty())
       return make_unique<StringMapAccessor>(sm);
     return make_unique<StringMapAccessor>(sm, std::string{cleanup_key}, db_cntx, &pv);

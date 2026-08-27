@@ -76,6 +76,12 @@ void RecordDelete(const DbContext& db_cntx, string_view key) {
                        Payload("DEL", ArgSlice{key}), db_cntx.repl_origin_idx);
 }
 
+void RecordDerivedDelete(const DbContext& db_cntx, string_view key) {
+  journal::RecordEntry(0, journal::Op::COMMAND, db_cntx.db_index, KeySlot(key),
+                       Payload("DEL", ArgSlice{key}), db_cntx.repl_origin_idx,
+                       /* mvcc= */ 0, journal::kEntryFlagDerived);
+}
+
 void RecordExpiryBlocking(DbIndex dbid, string_view key) {
   // drakeydb: Phase 3 -- see the declaration in tx_base.h. origin_idx stays default (0 ==
   // kSelfIdx; an expiry is always a local decision); entry_flags carries kEntryFlagExpired.

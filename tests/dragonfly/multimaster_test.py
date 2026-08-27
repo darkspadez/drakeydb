@@ -194,6 +194,95 @@ async def test_uuid_cleared_when_reconnect_master_lacks_exchange(
         pytest.fail("replica did not reconnect without stale UUID state")
 
 
+async def test_peer_clock_skew_cleared_on_reconnect_refusal(
+    df_factory: DflyInstanceFactory, tmp_path, proxy_factory
+):
+    """Sibling to test_uuid_cleared_when_reconnect_master_lacks_exchange above, not an extension
+    of it: --active_replica is a boot-time, process-wide flag (ReplicaOfInternal branches on
+    IsActiveReplica() before even parsing REPLICAOF's arguments), so clock_skew_ms is only ever
+    observable via a masterN: block (RenderPeerReplicationInfo, gated on IsActiveReplica()) --
+    which requires the node under test to be active-mode from the start. Flipping that test's
+    plain replica to active mode would invalidate every one of its assertions (top-level
+    master_node_uuid/master_link_status don't exist for an active node; it always reports
+    role=master), tangling two genuinely different configurations into one test.
+
+    Active/peer mode also changes the *outcome* of an unsupported reconnect, not just its INFO
+    shape: D2b (replica.cc, `else if (IsPeerMode())`) refuses a peer-mode Greet() outright once
+    the uuid comes back empty, where plain mode tolerates it and settles. So unlike the sibling
+    above, this state does not converge and stay -- the normal 500ms reconnect loop
+    (MainReplicationFb, replica.cc) retries and lands a fresh, valid exchange shortly after.
+    Hence a tight poll for a real-but-brief window, synchronized to start right after the
+    unsupported reply is actually consumed, rather than the sibling's converge-and-stay pattern.
+
+    The reset this covers (replica.cc's `clock_skew_ms_.store(0, ...)`, beside the existing
+    master_node_uuid/master_clock_ms reset) needs two things test_peer_clock_skew_reflects_
+    injected_offset (previous review round) doesn't provide: a *nonzero* baseline -- two real
+    instances on one host have a genuine skew of ~0 regardless of whether the reset fires, so a
+    reconnect back to ~0 would prove nothing -- and the *same* Replica C++ object surviving the
+    reconnect. MainReplicationFb loops on `this`, calling Greet() repeatedly on one object across
+    reconnects (confirmed by reading replica.cc) -- unlike that offset test's freshly-constructed
+    node, whose first-ever Greet() cannot distinguish the reset firing from clock_skew_ms_'s own
+    atomic {0} default.
+
+    So: the first exchange keeps the real master's actual uuid (peer-mode admission requires one)
+    but overrides the ms token to inject a +5s offset, giving a distinguishable nonzero baseline.
+    The second exchange gets the same "unsupported" reply the sibling test already covers, which
+    peer mode refuses instead of tolerating -- Greet() fails right after storing the reset, and
+    the retry loop has not yet landed a fresh answer. Arming a third, harmless override (the
+    __unused_probe_marker__ idiom from test_configure_dfly_master_sends_and_tolerates_drakey_
+    version_and_peer below) is used purely as a synchronization signal: it only succeeds once the
+    "unsupported" override has actually been consumed off the wire, the earliest safe moment to
+    start polling.
+
+    Falsifying: deleting replica.cc's `clock_skew_ms_.store(0, ...)` reset leaves clock_skew_ms_
+    at its stale ~+5000 value (the atomic is never re-zeroed before the refused exchange, and the
+    refused exchange's kUnsupported/error-reply branches never re-store it either), so the poll
+    loop below never observes clock_skew_ms==0 alongside an absent node_uuid and times out.
+    Verified by hand during development.
+    """
+    offset_ms = 5000
+    master = df_factory.create(proactor_threads=2, dir=str(tmp_path / "m"))
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "n"), active_replica="true")
+    df_factory.start_all([master, node])
+    c_master, c_node = master.client(), node.client()
+    master_uuid = (await c_master.info("replication"))["node_uuid"]
+    proxy = await proxy_factory(master.port)
+
+    peer_ms = int(time.time() * 1000) + offset_ms
+    await proxy.override_next_response(b"REPLCONF UUID ", f"+{master_uuid} {peer_ms}\r\n".encode())
+    assert await c_node.execute_command(f"REPLICAOF localhost {proxy.port}") == "OK"
+    info = await c_node.info("replication")
+    assert info["master0"]["node_uuid"] == master_uuid, info["master0"]
+    baseline_skew = int(info["master0"]["clock_skew_ms"])
+    assert abs(baseline_skew - offset_ms) < 2000, info["master0"]
+
+    await proxy.override_next_response(b"REPLCONF UUID ", b"-ERR unknown REPLCONF option\r\n")
+    await proxy.close()
+    await proxy.start_serving()
+
+    # Wait for the "unsupported" override to actually be consumed off the wire -- see the
+    # docstring above and test_configure_dfly_master_sends_and_tolerates_drakey_version_and_peer
+    # below for the same idiom.
+    async with async_timeout.timeout(30):
+        while True:
+            try:
+                await proxy.override_next_response(b"__unused_probe_marker__", b"+PONG\r\n")
+                break
+            except RuntimeError:
+                await asyncio.sleep(0.02)
+
+    # The refused-exchange state is real but brief (the 500ms reconnect loop then lands a fresh
+    # valid exchange), so poll tightly rather than sleep-then-check-once.
+    async with async_timeout.timeout(2):
+        while True:
+            info = await c_node.info("replication")
+            m0 = info.get("master0")
+            if m0 and "node_uuid" not in m0:
+                assert int(m0["clock_skew_ms"]) == 0, m0
+                return
+            await asyncio.sleep(0.02)
+
+
 async def test_configure_dfly_master_sends_and_tolerates_drakey_version_and_peer(
     df_factory: DflyInstanceFactory, proxy_factory
 ):
@@ -520,6 +609,79 @@ async def wait_for_value(c, key, value, timeout=30):
 async def attach(c_a, *nodes):
     for n in nodes:
         assert await c_a.execute_command(f"REPLICAOF localhost {n.port}") == "OK"
+
+
+# drakeydb: P4-0 fix-wave -- deliberately NOT coupled to kClockSkewWarnMs (replica.h/.cc): this is
+# a tolerance on how much clock drift a real localhost mesh actually exhibits between two
+# processes sampling their own clocks a few milliseconds apart, not a threshold for when skew
+# becomes operationally concerning. Coupling them would be actively wrong -- raising the warn
+# threshold for a WAN mesh (a legitimate future change) would silently raise this tolerance too,
+# and the test would stop asserting anything meaningful about actual measured skew.
+LOCALHOST_SKEW_TOLERANCE_MS = 250
+
+
+async def test_peer_clock_skew_reported(df_factory):
+    """Both nodes run on one host, so real skew is ~0; the assertion is that the field
+    exists and is small. Falsified by removing the RenderPeerReplicationInfo line -- the
+    resulting AssertionError's sorted(info["master0"]) diagnostic names the missing field
+    (clock_skew_ms absent from the list; see test_peer_clock_skew_reflects_injected_offset
+    below for a falsification that exercises the value itself, not just its presence)."""
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_b = b.client()
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+
+    info = await c_b.info("replication")
+    assert "clock_skew_ms" in info["master0"], sorted(info["master0"])
+    assert abs(int(info["master0"]["clock_skew_ms"])) < LOCALHOST_SKEW_TOLERANCE_MS
+
+
+@pytest.mark.parametrize("offset_ms", [5000, -5000], ids=["ahead", "behind"])
+async def test_peer_clock_skew_reflects_injected_offset(
+    df_factory: DflyInstanceFactory, redis_server, proxy_factory, tmp_path, offset_ms
+):
+    """test_peer_clock_skew_reported only proves the field exists and is small -- both nodes run
+    on one host, so it can't distinguish a correct ~0 skew from clock_skew_ms_ never having been
+    written at all (it defaults to {0}). The Greet() -> clock_skew_ms_ -> GetSummary() ->
+    ReplicaSummary -> render hop is otherwise covered by nothing that can fail: deleting Greet()'s
+    whole skew-computation block, or swapping the two static_cast arguments in the
+    ComputeClockSkewMs call (inverting the sign), would leave that test green.
+
+    This test proxies real Redis's REPLCONF UUID reply with a synthetic uuid and a wall-clock
+    deliberately offset from local time -- the same technique as
+    test_active_replica_merges_redis_full_sync_via_synthetic_uuid above, chosen over a second
+    drakeydb node because the injected reply *is* the clock, entirely under this test's control,
+    so both the magnitude and (parametrized, over a positive and a negative offset) the sign of
+    the reported skew can be asserted -- a sign inversion is the mutation that most misleads an
+    operator, since it would report a slow peer as fast or vice versa. REPLICAOF blocks until
+    Greet() completes (see test_configure_dfly_master_sends_and_tolerates_drakey_version_and_peer
+    above), so the skew is already sampled by the time it returns "OK" -- no polling needed.
+
+    Falsifying: deleting replica.cc's skew-computation block in Greet() leaves clock_skew_ms_ at
+    its {0} default, so the assertion below (skew within 2s of the injected +/-5s offset) fails
+    with the observed skew reported as 0 regardless of parametrization. Verified by hand during
+    development.
+    """
+    SYNTHETIC_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    node = df_factory.create(
+        proactor_threads=2, dir=str(tmp_path / "clock-skew-proxy"), active_replica="true"
+    )
+    node.start()
+    c = node.client()
+    proxy = await proxy_factory(redis_server.port)
+
+    peer_ms = int(time.time() * 1000) + offset_ms
+    await proxy.override_next_response(
+        b"REPLCONF UUID ", f"+{SYNTHETIC_UUID} {peer_ms}\r\n".encode()
+    )
+    assert await c.execute_command(f"REPLICAOF localhost {proxy.port}") == "OK"
+
+    info = await c.info("replication")
+    assert info["master0"]["node_uuid"] == SYNTHETIC_UUID
+    skew = int(info["master0"]["clock_skew_ms"])
+    assert abs(skew - offset_ms) < 2000, info["master0"]
 
 
 async def test_fanin_merges_two_masters_and_stays_writable(df_factory: DflyInstanceFactory):
@@ -1215,6 +1377,12 @@ async def _total_commands_processed(c) -> int:
     return int((await c.info("stats"))["total_commands_processed"])
 
 
+# drakeydb: P4-0 -- used by test_derived_delete_reaches_plain_replica_but_not_peer (end of file)
+# to observe whether a key exists on a given node without caring about its value/type.
+async def _exists(client, key) -> bool:
+    return bool(await client.execute_command("exists", key))
+
+
 # drakeydb: measured healthy baseline (idle 2-node reciprocal peer mesh, proactor_threads=2 each
 # side, the pytest harness's default of 1 shard, 3s sample) was a rock-steady delta of 4 on BOTH
 # sides across every repeated measurement taken while developing this test (see task-10-report.md
@@ -1697,3 +1865,302 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
 
     await asyncio.sleep(1.0)
     await assert_no_command_storm(c_a, c_b, c_c2, bound=MESH3_STORM_BOUND)
+
+
+# ---- Phase 4: MVCC / LWW (P4-0) ----
+
+
+# drakeydb: P4-0 acceptance case (Task 1). A set command that empties its key via a lazily-
+# expired member (SetFamily::DeleteSetIfEmpty, set_family.cc) derives a DEL. A plain (full-
+# stream) replica must still see that DEL; a mesh peer must not -- journal::PassesPeerEchoFilter
+# (journal/types.cc) drops it, gated on the new journal::kEntryFlagDerived flag.
+#
+# Triggered via FIELDTTL, not FIELDEXPIRE: a fix-round-1 ruling (see docs/PLAN.md's Phase 4
+# section) carved FIELDEXPIRE's own full-empty case OUT of this suppression -- SetFamily::
+# DeleteSetIfEmpty / HSetFamily::DeleteIfEmpty now take a `derived` parameter, and OpFieldExpire
+# (generic_family.cc) passes false, because its own replay is clock-dependent: a lagging peer
+# can *arm* an already-expired member's new TTL instead of also discovering it expired, and
+# nothing else then converges it. So FIELDEXPIRE's derived DEL is now a normal, forwarded
+# RecordDelete that legitimately reaches b too (empirically confirmed: reusing FIELDEXPIRE as
+# this test's trigger now makes b's command counter match plain's exactly, both ~2n -- verified
+# by hand during development). FIELDTTL (read-only, generic_family.cc:951) is a different,
+# unaffected call site -- still the default `derived = true` -- so it is the correct trigger for
+# what this test is actually about: the *general* suppression rule, not FIELDEXPIRE's carve-out
+# (that one has its own pair of C++ tests, EmptiedCollectionDeleteCarriesDerivedFlag /
+# FieldExpireCausedDeleteIsNotFlaggedDerived in multi_master_test.cc).
+#
+# Deliberately not SREM either: SREM's own OpRem (set_family.cc) deletes an emptied set directly
+# (db_slice.Del) and journals only "SREM" -- it never calls SetFamily::DeleteSetIfEmpty, so it
+# cannot exercise this code path at all (see docs/PLAN.md's Phase 4 section for the call-site
+# enumeration this is drawn from).
+#
+# drakeydb: P4-0 Task 2b -- what this test can actually observe changed once the member-expiry
+# reaper landed (below, same file), and the comments above and below predate that; read them
+# together with this one. `a` is itself an active node, so by the time the FIELDTTL burst below
+# runs, `a`'s *own* heartbeat reaper has typically already independently discovered and derived
+# DELs for most or all of these same now-expired sets, on the same TTL timescale FIELDTTL is
+# trying to observe -- confirmed empirically (task-2b-report.md section 14/15): with zero
+# FIELDTTL calls issued at all, `a` alone derived 15 of 20 equivalent DELs within 1.5s, purely
+# from its own heartbeat. FIELDTTL and the reaper are therefore no longer separable causes on
+# the wire at this timescale -- either one (or both) may be what actually produces the DEL `a`
+# derives here, and there is no practical way to make FIELDTTL "win the race" against a 100Hz
+# heartbeat without an inherently fragile exact-timing trick, which this project has been burned
+# by before and which was deliberately NOT attempted here (see the report).
+#
+# What this test still honestly proves: in active mode, a peer receives *neither* the
+# read-derived DEL nor the reaper-derived DEL, because journal::kEntryFlagDerived suppresses
+# both identically -- one property (derived DELs don't leak to mesh peers), observed here via
+# whichever of two triggers happens to fire first, which is no longer distinguishable from b's
+# side. The read-path mechanism specifically (SetFamily::DeleteSetIfEmpty's `derived` flag, as
+# opposed to the reaper's use of the same flag) is still pinned deterministically in C++ by
+# EmptiedCollectionDeleteCarriesDerivedFlag / FieldExpireCausedDeleteIsNotFlaggedDerived
+# (multi_master_test.cc): their fixture, OriginJournalFamilyTest, never sets --active_replica,
+# so the reaper's own gate (IsActiveReplica()) keeps it inert there even though the shard
+# heartbeat fiber itself still runs mechanically in every C++ unit test (confirmed by reading
+# EngineShardSet::Init, which unconditionally starts it) -- those two tests are not racing
+# anything. This pytest is the (now weaker, and now honestly documented as such) end-to-end
+# check that the suppression behavior also holds when driven by real client traffic across real
+# processes, not a claim about which specific code path produced the DEL it observes.
+#
+# The differential below is the command-count delta on b, not existence: b is itself active with
+# its own reaper, so "key gone on b" is consistent with either a leaked DEL (the bug this test
+# exists to catch) or b's own correct, local self-healing (not a bug) -- the observable outcome
+# coincides either way, so existence cannot discriminate between them (see the comment further
+# below, at the assertion itself, for the full reasoning). b's own reaper acts entirely locally
+# and is not a command dispatched from a, so it does not move b's total_commands_processed,
+# while a leaked, forwarded DEL would -- that delta is what still discriminates.
+async def test_derived_delete_reaches_plain_replica_but_not_peer(df_factory: DflyInstanceFactory):
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    plain = df_factory.create()
+    df_factory.start_all([a, b, plain])
+    c_a, c_b, c_plain = a.client(), b.client(), plain.client()
+
+    await attach(c_b, a)  # b <- a, peer link
+    assert await c_plain.execute_command("replicaof", "localhost", a.port) == "OK"
+    await wait_for_peers(c_b, 1)
+    await wait_available_async(c_plain)
+
+    # A broken filter adds one peer command per key. Keep that signal above the same calibrated
+    # three-second noise bound used by assert_no_command_storm.
+    n = STORM_BOUND * 2
+    keys = [f"derived-del-{i}" for i in range(n)]
+
+    pipe = c_a.pipeline(transaction=False)
+    for key in keys:
+        pipe.execute_command("sadd", key, "m")
+    await pipe.execute()
+
+    @assert_eventually(timeout=30)
+    async def setup_converged():
+        for key in keys:
+            assert await _exists(c_b, key)
+            assert await _exists(c_plain, key)
+
+    await setup_converged()
+
+    # Arm TTLs only after the larger key set has replicated. Otherwise the short TTL can
+    # elapse during setup verification and make that verification race the reaper.
+    pipe = c_a.pipeline(transaction=False)
+    for key in keys:
+        pipe.execute_command("fieldexpire", key, "3", "m")
+    await pipe.execute()
+
+    @assert_eventually(timeout=30)
+    async def ttl_setup_converged():
+        # Journal order makes the last TTL entry a barrier for all earlier entries in the burst.
+        assert await c_b.execute_command("fieldttl", keys[-1], "m") > 0
+        assert await c_plain.execute_command("fieldttl", keys[-1], "m") > 0
+
+    await ttl_setup_converged()
+
+    # Measurement window starts here -- deliberately BEFORE the sleep below, not after it. a's
+    # own reaper derives (and, if suppression is working, correctly suppresses) its DELs for
+    # these same keys during that sleep, on its own clock, the instant each member's TTL elapses
+    # -- not during the FIELDTTL burst further down. A window opened after the sleep (the
+    # original bug here, closed during whole-branch review: see task-2b-report.md section 16)
+    # covers only the FIELDTTL burst, by which point the reaper has typically already derived
+    # everything there was to derive, leaving nothing for a broken suppression to leak -- the
+    # test passed even with PassesPeerEchoFilter's kEntryFlagDerived check disabled outright.
+    # Opening the window here covers the reaper's own derivation, which is where the suppression
+    # this test exists to catch is actually exercised. From this point until delta_b is read
+    # below, nothing runs against b except the fixed idle wait a few lines down -- an incidental
+    # command (e.g. a convergence-polling EXISTS) would itself inflate the very counter being
+    # measured. b is not probed at all until after delta_b is captured below.
+    before_b = await _total_commands_processed(c_b)
+
+    await asyncio.sleep(3.2)  # let every member's 3s TTL elapse on every node's own clock
+
+    # Re-probing each already-expired member via FIELDTTL (read-only) on a causes
+    # SetFamily::FieldExpireTime to discover it lazily expired and flush it -- each set empties
+    # -> SetFamily::DeleteSetIfEmpty derives a DEL on a (derived=true, the default), suppressed
+    # for the peer link but forwarded to the plain replica. See the module-level comment above
+    # this test: a's own reaper is very likely racing this and may have derived (and suppressed)
+    # some or all of these DELs on its own before this call ever runs -- this call is issued
+    # regardless, since the property under test (suppression) holds either way.
+    pipe = c_a.pipeline(transaction=False)
+    for key in keys:
+        pipe.execute_command("fieldttl", key, "m")
+    await pipe.execute()
+
+    await asyncio.sleep(1.0)  # give a leaked DEL, if any, time to arrive before measuring b
+
+    # The load-bearing assertion, and the only one this test makes: b applied nothing beyond idle
+    # mesh noise over this window (~2-4, per STORM_BOUND's own measured baseline above) -- a
+    # derived DEL leaking through for every key would show up here as ~n extra commands, an
+    # unmistakable jump against that baseline. This is a command-count delta, not an existence
+    # check, deliberately: see the module-level comment above this test for why existence can no
+    # longer discriminate "a leaked DEL" from "b's own reaper already got there" now that the
+    # reaper exists, and why this delta still can (b's own reaper is local and never dispatches a
+    # command against b, so it cannot move this counter; a forwarded DEL would).
+    delta_b = await _total_commands_processed(c_b) - before_b
+    assert delta_b < STORM_BOUND, (
+        f"peer applied {delta_b} commands with nothing legitimately sent to it (expected only "
+        f"idle mesh noise, below {STORM_BOUND}; a {n}-key leak would show ~{n}) -- looks like "
+        f"a's derived DELs leaked through to the peer"
+    )
+
+    # A plain replica receives derived DELs. Check it after closing b's bounded measurement
+    # window so this potentially 30-second convergence poll cannot inflate that window.
+    @assert_eventually(timeout=30)
+    async def plain_converged():
+        for key in keys:
+            assert not await _exists(c_plain, key)
+
+    await plain_converged()
+
+
+# drakeydb: P4-0 Task 2b -- the member-expiry reaper. The test above proves half of Task 1's
+# convergence claim: a's derived DEL never reaches b. The other half -- "the peer expires on its
+# own clock" -- was false until this task: there was no active member-expiry reaper anywhere in
+# this tree. DbSlice::FindInternal only checks whole-key HasExpire(); member-level TTLs were
+# reaped exclusively by the ~25 DeleteSetIfEmpty/DeleteIfEmpty read call sites, every one of which
+# needs a command to touch the key. So once the derived DEL above is (correctly) suppressed, a
+# peer that is never itself asked to read the key kept a logically-empty container forever.
+#
+# This is the adversarial counterexample from the task brief, reproduced against real binaries:
+# A: SADD s m1 / FIELDEXPIRE s 1 m1 / sleep / A: SMEMBERS s (a reaps and suppresses its own
+# derived DEL, per the test above) -- then b must self-heal on its own heartbeat, without b ever
+# being asked to read `s`, and a later SETNX must not leave the two nodes holding different types.
+#
+# Expected before the fix (DbSlice::DeleteExpiredStep's reaper extension, Step 2): b_healed()
+# below times out after 30s -- b keeps `s` alive as a set forever. See task-2b-report.md for the
+# verbatim failure text (recorded by reverting Step 2 only, per Step 6) and for what the SETNX
+# assertions further down report on an unpatched tree (WRONGTYPE on b).
+async def test_member_expiry_reaper_self_heals_peer_without_read(df_factory: DflyInstanceFactory):
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    await attach(c_a, b)  # A REPLICAOF B
+    await wait_for_peers(c_a, 1)
+    await attach(c_b, a)  # B REPLICAOF A
+    await wait_for_peers(c_b, 1)
+
+    assert await c_a.execute_command("sadd", "s", "m1") == 1
+    await c_a.execute_command("fieldexpire", "s", "1", "m1")
+
+    # Ordinary setup traffic (SADD/FIELDEXPIRE) replicates normally; wait for it to land on b
+    # before starting the measurement window below -- this convergence poll is setup, not the
+    # load-bearing assertion.
+    @assert_eventually(timeout=30)
+    async def setup_converged():
+        assert await _exists(c_b, "s")
+
+    await setup_converged()
+
+    await asyncio.sleep(1.2)  # let the 1s member TTL elapse on every node's own clock
+
+    # a's own read triggers a's lazy member expiry, deriving a DEL that is suppressed on the peer
+    # link (proven unconditionally by the test above). Nothing about this call touches b.
+    await c_a.execute_command("smembers", "s")
+
+    # The load-bearing assertion: b converges to `s` gone on its OWN heartbeat, despite nothing
+    # arriving from a to tell it to. A bounded wait, not a busy poll racing the clock.
+    @assert_eventually(timeout=30)
+    async def b_healed():
+        assert not await _exists(c_b, "s")
+
+    await b_healed()
+
+    # The escalation that makes this a data-correctness bug, not a hygiene leak: with `s` gone on
+    # both nodes, a later SETNX on the same key must leave BOTH holding the same string -- neither
+    # answering WRONGTYPE because it still thinks `s` is a set.
+    assert await c_a.execute_command("setnx", "s", "hello") == 1
+
+    @assert_eventually(timeout=30)
+    async def setnx_converged():
+        assert await c_b.execute_command("get", "s") == "hello"
+
+    await setnx_converged()
+
+    assert await c_a.execute_command("get", "s") == "hello"
+    assert await c_a.execute_command("type", "s") == "string"
+    assert await c_b.execute_command("type", "s") == "string"
+
+
+async def test_member_expiry_reaper_covers_namespaces_and_zero_budget(
+    df_factory: DflyInstanceFactory,
+):
+    node = df_factory.create(**active_args(reaper_member_walk_budget=0))
+    node.start()
+    admin = node.client()
+
+    assert (
+        await admin.execute_command(
+            "FT.CREATE",
+            "reaper-namespace-index",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "reaper-index:",
+            "SCHEMA",
+            "tag",
+            "TAG",
+        )
+        == "OK"
+    )
+    assert await admin.hset("reaper-index:shared", mapping={"tag": "red"}) == 1
+
+    tenants = []
+    for namespace in ("reaper-ns-a", "reaper-ns-b"):
+        username = f"{namespace}-user"
+        await admin.execute_command(
+            "ACL", "SETUSER", username, f"NAMESPACE:{namespace}", "ON", ">pass", "+@all", "~*"
+        )
+        for db in (0, 1):
+            tenant = node.client(username=username, password="pass", db=db)
+            assert await tenant.ping()
+            key = f"tenant-set-db-{db}"
+            assert await tenant.execute_command("SADD", key, "member") == 1
+            assert await tenant.execute_command("FIELDEXPIRE", key, "1", "member") == [1]
+            tenants.append((tenant, key))
+            if db == 0:
+                # Search indices belong to the default namespace, but their internal key map has
+                # no namespace dimension. A named-namespace reap of the same physical key must
+                # not remove the default document's postings.
+                assert await tenant.hset("reaper-index:shared", mapping={"tag": "blue"}) == 1
+                assert await tenant.execute_command(
+                    "HEXPIRE", "reaper-index:shared", "1", "FIELDS", "1", "tag"
+                ) == [1]
+                tenants.append((tenant, "reaper-index:shared"))
+
+    await asyncio.sleep(1.2)
+
+    # EXISTS does not perform member-level expiry. Only the heartbeat can make this false without
+    # a collection read. Two namespaces with TTL-bearing keys in two DBs also pin independent DB
+    # cursors: a shared cursor can permanently pair one namespace with only even DBs and the other
+    # with odd DBs. The configured zero budget must still make progress as an effective one.
+    @assert_eventually(timeout=30)
+    async def tenants_reaped():
+        for tenant, key in tenants:
+            assert not await _exists(tenant, key)
+
+    await tenants_reaped()
+
+    default_search = await admin.execute_command(
+        "FT.SEARCH", "reaper-namespace-index", "@tag:{red}", "NOCONTENT"
+    )
+    assert default_search[0] == 1

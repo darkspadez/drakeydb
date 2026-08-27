@@ -28,6 +28,12 @@ enum class Op : uint8_t {
 // on the write side; this bit is its Phase 3 replacement carrier.
 inline constexpr uint8_t kEntryFlagExpired = 1 << 0;
 
+// drakeydb: P4-0 -- a DEL derived from a collection becoming empty, rather than issued
+// directly. Never forwarded to a peer: a command-caused empty propagates via the causing
+// command (the peer derives its own DEL), and an expiry-caused empty is the peer's own
+// clock's business. Distinct from kEntryFlagExpired so diagnostics can tell them apart.
+inline constexpr uint8_t kEntryFlagDerived = 1 << 1;
+
 struct EntryBase {
   TxId txid;
   Op opcode;
@@ -39,7 +45,7 @@ struct EntryBase {
   // upstream, and placed after `lsn` so the aggregate-init constructors below keep compiling.
   uint32_t origin_idx{0};  // PeerRegistry index of this entry's author; kSelfIdx (0) == self.
   uint64_t mvcc{0};        // Reserved for future conflict resolution; not yet threaded further.
-  uint8_t entry_flags{0};  // Bitmask; bit0 == kEntryFlagExpired.
+  uint8_t entry_flags{0};  // Bitmask; bit0 == kEntryFlagExpired, bit1 == kEntryFlagDerived.
 };
 
 // This struct represents a single journal entry.

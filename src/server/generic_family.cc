@@ -4,6 +4,7 @@
 
 #include "server/generic_family.h"
 
+#include <absl/container/flat_hash_set.h>
 #include <absl/container/inlined_vector.h>
 #include <absl/strings/ascii.h>
 #include <absl/strings/str_cat.h>
@@ -903,16 +904,42 @@ OpResult<vector<long>> OpFieldExpire(const OpArgs& op_args, string_view key, uin
 
   vector<long> result;
   bool key_deleted;
+  // drakeydb: P4-0 -- `derived = false` here (both branches): unlike every other
+  // DeleteSetIfEmpty/DeleteIfEmpty caller, THIS command's own replay on a peer is
+  // clock-dependent. FIELDEXPIRE re-arms the TTL of the fields it names; if a peer's clock is
+  // behind, it can find those fields NOT yet expired and arm them with the new TTL instead of
+  // also discovering them expired -- key_deleted stays false there, and the partial-expiry
+  // compensation just below (missing.size() > 1) never fires either, because every field
+  // "succeeded". That peer is left holding a live key indefinitely; nothing it does locally
+  // converges it. This is not a new exception: OpHExpire (HEXPIRE/HPEXPIRE,
+  // hset_family.cc:724-728) and the HGETEX/HSETEX path (hset_family.cc:1102-1106) already
+  // bypass DeleteIfEmpty for this exact reason and journal a plain forwarded DEL, commented "The
+  // replayed command re-applies a relative TTL against the replica clock and cannot reproduce
+  // this deletion; journal it explicitly." `derived = false` restores that same consistency for
+  // FIELDEXPIRE's own generic (SET-and-HASH) field-TTL path.
+  //
+  // Residual cost, accepted for this phase: the forwarded DEL is unconditional, so if the peer's
+  // copy holds additional members from a write concurrent with this FIELDEXPIRE (members this
+  // node never saw), the DEL destroys those too -- the exact hazard this whole PR closes,
+  // reopened for one command. Same exposure OpHExpire's forwarded DEL above already carries; an
+  // MVCC-stamped DEL (a later phase) is what actually closes it for all of them.
+  //
+  // Echo-safe: when a peer applies this same replicated FIELDEXPIRE and its own copy empties too
+  // (the ordinary, no-skew case), the DEL IT derives inherits db_cntx.repl_origin_idx from that
+  // peer-tagged transaction (not kSelfIdx) -- see the Phase 3 comment on RecordDelete's
+  // DbContext overload, tx_base.cc. PassesPeerEchoFilter's origin_idx check (not this flag) is
+  // what stops that reflection from being forwarded again, so this does not create an echo
+  // storm. Do not "simplify" this back to the default.
   if (is_set) {
     result = SetFamily::SetFieldsExpireTime(op_args, ttl_sec, values, pv);
     // Finalize memory accounting before potential deletion.
     auto_updater.Run();
-    key_deleted = SetFamily::DeleteSetIfEmpty(db_slice, op_args.db_cntx, key, *pv);
+    key_deleted = SetFamily::DeleteSetIfEmpty(db_slice, op_args.db_cntx, key, *pv, false);
   } else {
     result = HSetFamily::SetFieldsExpireTime(op_args, ttl_sec, ExpireFlags::EXPIRE_ALWAYS, key,
                                              values, pv);
     auto_updater.Run();
-    key_deleted = HSetFamily::DeleteIfEmpty(db_slice, op_args.db_cntx, key, *pv);
+    key_deleted = HSetFamily::DeleteIfEmpty(db_slice, op_args.db_cntx, key, *pv, false);
   }
 
   // A member probed while lazily expired is still alive on a lagging replica and the replayed
@@ -1736,6 +1763,77 @@ template <typename F> bool Iterate(const PrimeValue& pv, F&& func) {
   }
 }
 
+// drakeydb: P4-0 fix-wave -- true iff this transaction's causing command will auto-journal
+// itself verbatim (Transaction::LogAutoJournalOnShard, transaction.cc), the predicate that
+// distinguishes SORT (CO::JOURNALED, no NO_AUTOJOURNAL -- auto-journals) from SORT_RO
+// (CO::READONLY -- never auto-journals), the two commands reaching OpFetchSortEntries /
+// OpFetchContainerElements below through the same call sites. Derived from the transaction's own
+// CommandId rather than a hardcoded command name, so it stays correct if either command's
+// registration changes: mirrors LogAutoJournalOnShard's full gate, `(IsJournaled() ||
+// NO_KEY_TRANSACTIONAL) && !NO_AUTOJOURNAL`, not just its JOURNALED/NO_AUTOJOURNAL half. Omitting
+// the NO_KEY_TRANSACTIONAL disjunct would be the dangerous direction: a NO_KEY_TRANSACTIONAL,
+// non-JOURNALED command still auto-journals there, so a predicate that missed it would return
+// false while the command actually auto-journals verbatim -- silently reopening the exact
+// divergence this PR closes, for whichever future call site trusted the predicate. No behavior
+// change for either current caller: SORT and SORT_RO are both keyed (firstkey=1) and neither sets
+// NO_KEY_TRANSACTIONAL, so this disjunct is a no-op for both today. Deliberately omits
+// LogAutoJournalOnShard's re_enabled_auto_journal_ check: that only matters for a
+// CO::NO_AUTOJOURNAL command that opts back in via Transaction::ReviveAutoJournal(), and every
+// command reaching this predicate today is either CO::JOURNALED without CO::NO_AUTOJOURNAL
+// (SORT) or CO::READONLY (SORT_RO) -- neither can ever call ReviveAutoJournal(), which DCHECKs
+// CO::NO_AUTOJOURNAL is set on the command.
+bool WillAutoJournalVerbatim(const Transaction* tx) {
+  const CommandId* cid = tx->GetCId();
+  bool auto_journals = cid->IsJournaled() || (cid->opt_mask() & CO::NO_KEY_TRANSACTIONAL);
+  return auto_journals && !(cid->opt_mask() & CO::NO_AUTOJOURNAL);
+}
+
+// SORT mutates a TTL-bearing set while fetching it: DenseSet iteration removes expired members.
+// A peer can execute the verbatim SORT at a different wall-clock instant, so preserve the source
+// effect as SREM when only part of the set expires. Full expiry continues to use the existing DEL
+// path. SORT_RO never journals and therefore does not need compensation.
+absl::flat_hash_set<string> CaptureSortMembersBeforeExpiry(const OpArgs& op_args,
+                                                           const PrimeValue* pv) {
+  absl::flat_hash_set<string> members;
+  if (!op_args.shard->journal() || !WillAutoJournalVerbatim(op_args.tx) ||
+      pv->ObjType() != OBJ_SET || !pv->HasMemberExpiration()) {
+    return members;
+  }
+
+  pv->SetMemberTime(0);  // expose TTL-bearing members without expiring them during this pass
+  Iterate(*pv, [&members](const container_utils::ContainerEntry& entry) {
+    if (entry.IsString())
+      members.emplace(entry.ToString());
+    else
+      members.emplace(absl::StrCat(entry.as_long()));
+    return true;
+  });
+  pv->SetMemberTime(MemberTimeSeconds(op_args.db_cntx.time_now_ms));
+  return members;
+}
+
+void MarkSortMemberSurviving(const container_utils::ContainerEntry& entry,
+                             absl::flat_hash_set<string>* possible_expired) {
+  if (possible_expired->empty())
+    return;
+  if (entry.IsString())
+    possible_expired->erase(entry.ToString());
+  else
+    possible_expired->erase(absl::StrCat(entry.as_long()));
+}
+
+void JournalSortPartialExpiry(const OpArgs& op_args, string_view key,
+                              const absl::flat_hash_set<string>& expired, bool key_deleted) {
+  if (key_deleted || expired.empty())
+    return;
+
+  absl::InlinedVector<string_view, 8> args{key};
+  args.reserve(expired.size() + 1);
+  for (const string& member : expired)
+    args.push_back(member);
+  RecordJournal(op_args, "SREM"sv, args);
+}
+
 // Create a SortEntryList from given key
 OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_view key,
                                             SortEntryList* dest) {
@@ -1749,27 +1847,48 @@ OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_v
     return OpStatus::WRONG_TYPE;
   }
 
+  auto possible_expired = CaptureSortMembersBeforeExpiry(op_args, &it->second);
+  it->second.SetMemberTime(MemberTimeSeconds(op_args.db_cntx.time_now_ms));
+
   bool success = std::visit(
-      [&pv = it->second](auto& entries) {
+      [&pv = it->second, &possible_expired](auto& entries) {
         entries.reserve(pv.Size());
-        return Iterate(pv, [&entries](const ContainerEntry& entry) {
-          if (entry.IsString())
-            return entries.emplace_back().Parse(entry.ToString());
-          else
-            return entries.emplace_back().Parse(entry.as_long());
-        });
+        bool parsed_all = true;
+        bool iterated_all =
+            Iterate(pv, [&entries, &possible_expired, &parsed_all](const ContainerEntry& entry) {
+              MarkSortMemberSurviving(entry, &possible_expired);
+              bool parsed = entry.IsString() ? entries.emplace_back().Parse(entry.ToString())
+                                             : entries.emplace_back().Parse(entry.as_long());
+              parsed_all &= parsed;
+              // Finish the physical walk after a parse error so possible_expired contains only
+              // members actually removed by lazy expiry, never unvisited live members.
+              return true;
+            });
+        return iterated_all && parsed_all;
       },
       *dest);
-  if (!success)
-    return OpStatus::INVALID_NUMERIC_RESULT;
 
   auto obj_type = it->second.ObjType();
 
   // IterateSet may trigger lazy member expiry on sets with member-level TTL.
   // If all members expired, delete the now-empty key.
-  if (obj_type == OBJ_SET && it->second.Size() == 0) {
-    SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second);
-  }
+  //
+  // drakeydb: P4-0 fix-wave -- derived=false for SORT (see WillAutoJournalVerbatim above): SORT
+  // auto-journals verbatim, so a peer replays it against its own, still-populated copy instead
+  // of independently deriving this DEL -- the exact FIELDEXPIRE hazard, same fix. SORT_RO shares
+  // this call site but never auto-journals, so it still gets derived=true (the default). Same
+  // accepted cost as FIELDEXPIRE's carve-out (see OpFieldExpire's comment above): the forwarded
+  // DEL is unconditional, so it destroys any members a concurrent peer write added that this
+  // node never saw -- arguably wider exposure here, since plain `SORT key` (no STORE) is a
+  // read-shaped use of a command CO::JOURNALED still classifies as a write.
+  bool key_deleted =
+      obj_type == OBJ_SET && it->second.Size() == 0 &&
+      SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
+                                  /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
+  JournalSortPartialExpiry(op_args, key, possible_expired, key_deleted);
+
+  if (!success)
+    return OpStatus::INVALID_NUMERIC_RESULT;
 
   return obj_type;
 }
@@ -1792,20 +1911,34 @@ OpResult<pair<vector<string>, CompactObjType>> OpFetchContainerElements(const Op
 
   auto obj_type = it->second.ObjType();
 
+  auto possible_expired = CaptureSortMembersBeforeExpiry(op_args, &it->second);
+
   // Enable lazy per-member expiry before iterating dense sets.  Without this,
   // IterateSet would skip expiry entirely and empty-set cleanup below would
   // depend on a prior command having set time_now_.
   it->second.SetMemberTime(MemberTimeSeconds(op_args.db_cntx.time_now_ms));
 
-  Iterate(it->second, [&elements](const ContainerEntry& entry) {
+  Iterate(it->second, [&elements, &possible_expired](const ContainerEntry& entry) {
+    MarkSortMemberSurviving(entry, &possible_expired);
     elements.emplace_back(entry.ToString());
     return true;
   });
 
   // IterateSet may trigger lazy member expiry.  Clean up empty set.
-  if (obj_type == OBJ_SET && it->second.Size() == 0) {
-    SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second);
-  }
+  //
+  // drakeydb: P4-0 fix-wave -- derived=false for SORT (see WillAutoJournalVerbatim above): SORT
+  // auto-journals verbatim, so a peer replays it against its own, still-populated copy instead
+  // of independently deriving this DEL -- the exact FIELDEXPIRE hazard, same fix. SORT_RO shares
+  // this call site but never auto-journals, so it still gets derived=true (the default). Same
+  // accepted cost as FIELDEXPIRE's carve-out (see OpFieldExpire's comment above): the forwarded
+  // DEL is unconditional, so it destroys any members a concurrent peer write added that this
+  // node never saw -- arguably wider exposure here, since plain `SORT key` (no STORE) is a
+  // read-shaped use of a command CO::JOURNALED still classifies as a write.
+  bool key_deleted =
+      obj_type == OBJ_SET && it->second.Size() == 0 &&
+      SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
+                                  /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
+  JournalSortPartialExpiry(op_args, key, possible_expired, key_deleted);
 
   return std::make_pair(std::move(elements), obj_type);
 }
@@ -2226,6 +2359,10 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
         // in case of SORT option, we fetch only on the source shard
         if (shard->shard_id() == source_sid) {
           fetch_result = OpFetchSortEntries(t->GetOpArgs(shard), key, &sorted_entries);
+          // A failed SORT may still have journaled an SREM for members removed by lazy expiry,
+          // but the failed SORT itself must not be auto-journaled. Propagate the operation status
+          // to Transaction::LogAutoJournalOnShard instead of masking it with OK.
+          return fetch_result.status();
         }
         return OpStatus::OK;
       };

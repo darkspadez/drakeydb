@@ -79,12 +79,28 @@ void Namespaces::Clear() {
     }
   });
 
+  namespace_index_.clear();
   namespaces_.clear();
 }
 
 Namespace& Namespaces::GetDefaultNamespace() const {
   CHECK(default_namespace_ != nullptr);
   return *default_namespace_;
+}
+
+Namespace* Namespaces::GetNext(size_t* cursor, const Namespace* skip) {
+  dfly::SharedLock guard(mu_);
+  if (namespace_index_.empty())
+    return nullptr;
+
+  // At most one entry is skipped, so a populated non-default registry needs no more than two
+  // probes. The loop also handles the default-only case without special casing the index.
+  for (size_t attempts = 0; attempts < namespace_index_.size(); ++attempts) {
+    Namespace* candidate = namespace_index_[(*cursor)++ % namespace_index_.size()];
+    if (candidate != skip)
+      return candidate;
+  }
+  return nullptr;
 }
 
 void Namespaces::SetExpiredEventsRecording(bool enable) {
@@ -124,6 +140,7 @@ Namespace& Namespaces::GetOrInsert(std::string_view ns) {
     for (ShardId sid = 0; sid < shard_set->size(); ++sid) {
       new_ns.GetDbSlice(sid).SetExpiredEventsRecording(expired_events_recording_default_);
     }
+    namespace_index_.push_back(&new_ns);
     return new_ns;
   }
 }

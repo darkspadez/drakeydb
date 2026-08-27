@@ -44,9 +44,11 @@ void UnregisterConsumer(uint32_t id);
 // == 0), so every pre-existing call site (PING/DEL/cluster control entries) is unaffected.
 // Transaction::LogJournalOnShard is the only caller that passes a non-default origin_idx/mvcc,
 // forwarding a transaction's replication-apply origin so entries applied from a peer are tagged
-// with that peer's origin instead of self. tx_base.cc's RecordExpiryBlocking is the only caller
-// that passes a non-default entry_flags, tagging expiry/eviction-triggered DELs with
-// kEntryFlagExpired so a later peer-echo filter (T5) can suppress them.
+// with that peer's origin instead of self. Two tx_base.cc callers pass a non-default entry_flags:
+// RecordExpiryBlocking tags expiry/eviction-triggered DELs with kEntryFlagExpired, and (P4-0)
+// RecordDerivedDelete tags a DEL derived from a collection command emptying its key with
+// kEntryFlagDerived -- both so a later peer-echo filter (journal::PassesPeerEchoFilter) can
+// suppress them.
 void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
                  Entry::Payload payload, uint32_t origin_idx = 0, uint64_t mvcc = 0,
                  uint8_t entry_flags = 0);

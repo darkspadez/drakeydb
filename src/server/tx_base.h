@@ -238,11 +238,21 @@ void RecordDelete(DbIndex dbid, std::string_view key);
 
 // drakeydb: Phase 3 -- transaction-aware overload. Reads the replication-apply origin off
 // db_cntx (see DbContext::repl_origin_idx above) so a DEL derived from a collection command
-// emptying its key (HSetFamily::DeleteIfEmpty, SetFamily::DeleteSetIfEmpty, generic_family.cc's
-// OpScanAndDelete) inherits the origin of the command that caused it, instead of always being
-// attributed to this node. Never sets kEntryFlagExpired -- that flag is reserved for
-// RecordExpiryBlocking below, which does not go through RecordDelete.
+// emptying its key inherits the origin of the command that caused it, instead of always being
+// attributed to this node. generic_family.cc's OpScanAndDelete (:796) is the accurate example of
+// an unconditional user. HSetFamily::DeleteIfEmpty/SetFamily::DeleteSetIfEmpty (P4-0) default to
+// RecordDerivedDelete instead -- see that function's own comment below -- and only fall back to
+// this overload for the two callers (OpFieldExpire; OpFetchSortEntries/
+// OpFetchContainerElements's SORT case) whose own carve-out comments (generic_family.cc) explain
+// why. Never sets kEntryFlagExpired -- that flag is reserved for RecordExpiryBlocking below,
+// which does not go through RecordDelete.
 void RecordDelete(const DbContext& db_cntx, std::string_view key);
+
+// drakeydb: P4-0 -- records a DEL derived from a collection becoming empty. Identical to
+// RecordDelete(const DbContext&, ...) except it sets journal::kEntryFlagDerived, which
+// journal::PassesPeerEchoFilter uses to keep the entry off peer links. Plain (full-stream)
+// replicas still receive it, exactly as they do today.
+void RecordDerivedDelete(const DbContext& db_cntx, std::string_view key);
 
 // Record expiry in journal with independent transaction.
 // Must be called from shard thread owning key.

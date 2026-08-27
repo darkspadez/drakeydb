@@ -1642,7 +1642,7 @@ void CmdSAddEx(CmdArgParser parser, CommandContext* cmd_cntx) {
 }  // namespace
 
 bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, string_view key,
-                                 const PrimeValue& pv) {
+                                 const PrimeValue& pv, bool derived) {
   if (!IsDenseEncoding(pv))
     return false;
 
@@ -1655,7 +1655,23 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
       // drakeydb: Phase 3 -- db_cntx carries the causing transaction's replication-apply origin
       // (see DbContext::repl_origin_idx), so this derived DEL inherits it rather than always
       // being attributed to this node.
-      RecordDelete(db_cntx, key);
+      // drakeydb: P4-0 -- RecordDerivedDelete (not RecordDelete) sets journal::kEntryFlagDerived
+      // so PassesPeerEchoFilter keeps this DEL off mesh-peer links; see docs/PLAN.md's Phase 4
+      // section. `derived` (see set_family.h) lets two callers opt out because their own replay
+      // on a peer cannot be relied on to reproduce this emptying: OpFieldExpire
+      // (generic_family.cc) -- a lagging peer can arm an already-expired member instead of also
+      // discovering it expired -- and OpFetchSortEntries/OpFetchContainerElements's SORT case
+      // (generic_family.cc, keyed off WillAutoJournalVerbatim, not a hardcoded command name) --
+      // SORT auto-journals verbatim, so a peer replays it against its own still-populated copy
+      // instead of deriving this DEL; SORT_RO shares the call site but never auto-journals, so it
+      // still gets the suppressed default. Echo-safe regardless -- see each call site's own
+      // comment for the full argument. Every other caller relies on the default and is
+      // unaffected.
+      if (derived) {
+        RecordDerivedDelete(db_cntx, key);
+      } else {
+        RecordDelete(db_cntx, key);
+      }
     }
     return true;
   }

@@ -1699,4 +1699,84 @@ TEST_F(OAHSetTest, ScanWithShrinkBetweenCalls) {
   EXPECT_EQ(seen.size(), must_see.size()) << "Should see exactly all original elements";
 }
 
+// drakeydb: P4-0 Task 2b Important A -- OAHTable counterpart to StringMapTest's identically-named
+// test (string_map_test.cc); see that test's comment for the full falsification rationale. Scan()
+// (unlike ReaperScanHomeBucket/ReaperExpireStep) can itself process an unbounded run of
+// consecutive non-reporting (all-expired) buckets before returning, which is exactly why the
+// reaper needed its own bounded method rather than reusing Scan() as-is.
+TEST_F(OAHSetTest, ReaperExpireStepBoundsMassExpiry) {
+  constexpr int kCount = 5000;
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(ss_->Add(absl::StrCat("k", i), 1));
+  }
+  ss_->set_time(2);  // every member's TTL (1) has now elapsed -- all of them, at once.
+
+  constexpr uint32_t kBudget = 20;  // home buckets, not members -- a small slice of BucketCount()
+  bool complete = ss_->ReaperExpireStep(kBudget);
+
+  EXPECT_FALSE(complete) << "a single bounded call must not complete a full pass over a table "
+                            "this much larger than its budget";
+  EXPECT_GT(ss_->UpperBoundSize(), size_t(kCount) / 2)
+      << "far more than kBudget buckets' worth of members were expired in a single bounded "
+         "call -- the walk is not actually bounded";
+  EXPECT_LT(ss_->UpperBoundSize(), size_t(kCount)) << "the call examined nothing at all";
+
+  int calls = 1;
+  while (!complete) {
+    ASSERT_LT(calls, 2000) << "resume cursor is not making progress";
+    complete = ss_->ReaperExpireStep(kBudget);
+    ++calls;
+  }
+  EXPECT_EQ(ss_->UpperBoundSize(), 0u);
+  ASSERT_TRUE(complete);
+  ss_->ReaperClearMemberExpiration();
+  EXPECT_FALSE(ss_->ExpirationUsed())
+      << "a complete pass finding zero remaining member TTLs must allow clearing the sticky flag";
+}
+
+// drakeydb: P4-0 Task 2b Important C -- OAHTable counterpart to StringMapTest's identically-named
+// test; see that test's comment for the full rationale (clearing on a truncated pass would
+// strand the unexamined tail's member TTLs permanently) and for why this calls
+// ReaperClearMemberExpiration() itself (mirroring db_slice.cc's real caller) rather than only
+// asserting ExpirationUsed(), which nothing here would otherwise ever change.
+TEST_F(OAHSetTest, ReaperExpireStepTruncatedPassDoesNotClearFlag) {
+  constexpr int kCount = 5000;
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(ss_->Add(absl::StrCat("k", i), 1));
+  }
+  ASSERT_TRUE(ss_->ExpirationUsed());
+  ss_->set_time(2);
+
+  bool complete = ss_->ReaperExpireStep(20);  // budget far smaller than the table
+  if (complete)
+    ss_->ReaperClearMemberExpiration();
+  EXPECT_FALSE(complete);
+  EXPECT_TRUE(ss_->ExpirationUsed())
+      << "a truncated pass must never look like a safe-to-clear pass";
+  EXPECT_GT(ss_->UpperBoundSize(), 0u);
+}
+
+// drakeydb: P4-0 Task 2b Important C -- OAHTable counterpart to StringMapTest's identically-named
+// test: a structurally complete pass (covers every bucket) that still found live, not-yet-due
+// member TTLs must not report itself safe to clear either -- "examined everything" alone isn't
+// sufficient. Calls ReaperClearMemberExpiration() itself (mirroring db_slice.cc's real caller,
+// gated on `complete`) so a wrongly-true `complete` would actually clear the flag here.
+TEST_F(OAHSetTest, ReaperExpireStepFullButLiveTtlPassDoesNotClearFlag) {
+  constexpr int kCount = 50;
+  for (int i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(ss_->Add(absl::StrCat("k", i), 100));  // far in the future
+  }
+  ASSERT_TRUE(ss_->ExpirationUsed());
+  ss_->set_time(1);  // nothing is due yet.
+
+  bool complete = ss_->ReaperExpireStep(10000);  // comfortably covers the whole (small) table
+  if (complete)
+    ss_->ReaperClearMemberExpiration();
+  EXPECT_FALSE(complete)
+      << "a complete pass that still found live, not-yet-due member TTLs must not report itself "
+         "safe to clear -- those members would never be swept again if it did";
+  EXPECT_TRUE(ss_->ExpirationUsed());
+  EXPECT_EQ(ss_->UpperBoundSize(), size_t(kCount)) << "nothing should have been expired yet";
+}
+
 }  // namespace dfly

@@ -45,10 +45,11 @@ void DbTableStats::AddTypeMemoryUsage(unsigned type, int64_t delta) {
 
 DbTableStats& DbTableStats::operator+=(const DbTableStats& o) {
   constexpr size_t kDbSz = sizeof(DbTableStats) - sizeof(memory_usage_by_type);
-  static_assert(kDbSz == 72);
+  static_assert(kDbSz == 80);  // drakeydb: P4-0 Task 2b -- +8 for member_expire_count.
 
   ADD(inline_keys);
   ADD(expire_count);
+  ADD(member_expire_count);
   ADD(obj_memory_usage);
   ADD(tiered_entries);
   ADD(tiered_used_bytes);

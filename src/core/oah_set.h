@@ -65,8 +65,12 @@ class OAHSet : public OAHTable<OAHEntry> {
     const ssize_t mem_before = zmalloc_used_memory_tl;
     TaggedPtr entry_tagged_ptr = OAHEntry::Create(content, len, EntryTTL(ttl_sec));
     OAHEntry(entry_tagged_ptr).SetShiftedExtHash(shifted_ext_hash);  // reuse the shifted value
-    if (ttl_sec != UINT32_MAX)
+    if (ttl_sec != UINT32_MAX) {
       expiration_used_ = true;
+      // drakeydb: P4-0 Task 2b Important A -- mirror into the reaper's in-flight-pass
+      // accumulator; see OAHTable::ReaperExpireStep's comment.
+      reaper_any_ttl_seen_ = true;
+    }
     const size_t entry_alloc_size = zmalloc_used_memory_tl - mem_before;
 
     const uint32_t ext_bid = GetExtensionPoint(bucket_id);

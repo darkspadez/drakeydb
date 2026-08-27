@@ -29,9 +29,9 @@ class JournalStreamer : public journal::JournalConsumerInterface {
     // peer's ReplicaInfo (not this task's scope -- see multi_master.{h,cc}'s PeerRegistry for
     // where a peer's identity is established). When peer_mode is set, the base ShouldWrite()
     // drops entries that are not this node's own writes (origin_idx != PeerRegistry::kSelfIdx),
-    // expiry-flagged DELs, and Op::ORIGIN dictionary entries -- see journal::PassesPeerEchoFilter
-    // (journal/types.h), the single shared definition of that rule (T7b) -- streamer.cc's
-    // ShouldWrite is one of its two callers.
+    // expiry-flagged DELs, derived DELs (P4-0's kEntryFlagDerived), and Op::ORIGIN dictionary
+    // entries -- see journal::PassesPeerEchoFilter (journal/types.h), the single shared
+    // definition of that rule (T7b) -- streamer.cc's ShouldWrite is one of its two callers.
     bool peer_mode = false;
 
     // drakeydb: Phase 3 T6b fix-round-2 -- throttle (seconds) shared by the write-path periodic
