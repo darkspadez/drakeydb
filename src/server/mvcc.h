@@ -76,6 +76,14 @@ struct MvccStamp {
     return packed == 0 && origin_hash == 0;
   }
 
+  // INVARIANT: a tombstone's mvcc MUST be freshly minted via MvccClock::Next -- it must never
+  // reuse the mvcc of the value it deletes. operator< masks bit 63 below precisely because a
+  // fresh mvcc is assumed to make (mvcc, origin_hash) unique per write; if a tombstone instead
+  // sets bit 63 on the value's existing packed, it becomes order-equivalent to that value (see
+  // MvccStampTest.EqualityDistinguishesTombstoneAtEqualMvcc), and merge code written as
+  // `if (local < incoming) adopt;` silently drops the delete. operator== below is deliberately
+  // NOT tombstone-masked (it compares raw packed), so equality still distinguishes a tombstone
+  // from the value at the same mvcc even though ordering does not.
   friend bool operator<(const MvccStamp& a, const MvccStamp& b) {
     // std::tie needs lvalues; Mvcc() returns by value, so make_tuple (which copies) is used
     // instead. Semantics are identical: lexicographic comparison on (Mvcc(), origin_hash).
@@ -87,6 +95,9 @@ struct MvccStamp {
 };
 
 static_assert(sizeof(MvccStamp) == 16, "side-table per-slot cost is computed from this");
+static_assert(alignof(MvccStamp) == 8,
+              "16-byte packing assumes 8-byte alignment; a consumer "
+              "(e.g. the side table) may depend on this");
 
 // Stable across processes, builds and architectures -- the hash is persisted in the RDB and
 // compared against values written by other nodes, so std::hash is unusable here.

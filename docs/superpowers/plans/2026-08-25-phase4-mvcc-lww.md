@@ -756,6 +756,7 @@ Create `src/server/mvcc_test.cc`:
 #include "server/mvcc.h"
 
 #include <gmock/gmock.h>
+#include <xxhash.h>
 
 #include "base/gtest.h"
 
@@ -838,6 +839,29 @@ TEST(MvccStampTest, TombstoneBitIsMaskedFromComparison) {
   EXPECT_EQ(tombstone.Mvcc(), value.Mvcc());
   EXPECT_FALSE(value < tombstone) << "the marker must not make a tombstone win";
   EXPECT_FALSE(tombstone < value) << "...nor lose";
+
+  // Pinning mvcc == 100 on both operands above only observes masking at an exact tie, where an
+  // inflated left operand happens to be harmless. Cross-mvcc probes catch an a-side-only masking
+  // bug that the tie case cannot: without the mask, a tombstone could become order-equivalent to
+  // (neither greater nor less than) a strictly newer or older stamp instead of losing/winning.
+  const MvccStamp newer{101, 5};
+  EXPECT_LT(tombstone, newer) << "a tombstone must lose to a strictly newer stamp";
+  EXPECT_FALSE(newer < tombstone);
+  const MvccStamp older{99, 5};
+  EXPECT_LT(older, tombstone) << "...and beat a strictly older one";
+}
+
+// operator< masks bit 63 so ordering ignores the tombstone marker (above), but operator== does
+// not -- it compares raw packed. A tombstone and the value it replaces at the same mvcc are
+// therefore order-equivalent yet still distinguishable by equality. See the invariant comment
+// above operator< in mvcc.h for why an incoming tombstone must never reuse the value's mvcc.
+TEST(MvccStampTest, EqualityDistinguishesTombstoneAtEqualMvcc) {
+  const MvccStamp value{100, 5};
+  const MvccStamp tombstone{100 | MvccClock::kTombstoneBit, 5};
+
+  EXPECT_FALSE(value == tombstone) << "operator== is not tombstone-masked, unlike operator<";
+  EXPECT_FALSE(value < tombstone);
+  EXPECT_FALSE(tombstone < value);
 }
 
 TEST(MvccStampTest, MsPartIgnoresTombstoneBit) {
@@ -848,10 +872,20 @@ TEST(MvccStampTest, MsPartIgnoresTombstoneBit) {
 TEST(NodeUuidHashTest, StableAndDistinct) {
   const string a = "6f1c4c3e-0000-4000-8000-000000000001";
   const string b = "6f1c4c3e-0000-4000-8000-000000000002";
-  EXPECT_EQ(NodeUuidHash(a), NodeUuidHash(a)) << "must be stable -- it is persisted and compared "
-                                                 "against values written by other nodes";
+  // Golden value, computed once from the shipped implementation -- not fabricated. A same-process
+  // self-comparison (NodeUuidHash(a) == NodeUuidHash(a)) would pass for any pure function,
+  // including std::hash, XXH3, or a different seed, so it cannot exercise cross-process/
+  // cross-build/cross-architecture stability, which is the property that is actually load-bearing
+  // (the hash is persisted in the RDB and compared against values written by other nodes).
+  EXPECT_EQ(NodeUuidHash(a), 0x02b4489225d16e46ULL)
+      << "the origin hash is persisted in the RDB and compared against values written by "
+         "other nodes -- changing the algorithm, the seed, or the byte order silently "
+         "diverges every existing snapshot";
   EXPECT_NE(NodeUuidHash(a), NodeUuidHash(b));
   EXPECT_NE(NodeUuidHash(a), 0u) << "0 is reserved for 'no origin'";
+  // Must not collide with LockTag::Fingerprint's hash space (tx_base.cc:100), which hashes keys
+  // under a different seed (0x1C69B3F74AC4AE35UL) for a different purpose.
+  EXPECT_NE(NodeUuidHash(a), XXH64(a.data(), a.size(), 0x1C69B3F74AC4AE35ULL));
 }
 
 }  // namespace dfly
@@ -961,8 +995,18 @@ struct MvccStamp {
     return packed == 0 && origin_hash == 0;
   }
 
+  // INVARIANT: a tombstone's mvcc MUST be freshly minted via MvccClock::Next -- it must never
+  // reuse the mvcc of the value it deletes. operator< masks bit 63 below precisely because a
+  // fresh mvcc is assumed to make (mvcc, origin_hash) unique per write; if a tombstone instead
+  // sets bit 63 on the value's existing packed, it becomes order-equivalent to that value (see
+  // MvccStampTest.EqualityDistinguishesTombstoneAtEqualMvcc), and merge code written as
+  // `if (local < incoming) adopt;` silently drops the delete. operator== below is deliberately
+  // NOT tombstone-masked (it compares raw packed), so equality still distinguishes a tombstone
+  // from the value at the same mvcc even though ordering does not.
   friend bool operator<(const MvccStamp& a, const MvccStamp& b) {
-    return std::tie(a.Mvcc(), a.origin_hash) < std::tie(b.Mvcc(), b.origin_hash);
+    // std::tie needs lvalues; Mvcc() returns by value, so make_tuple (which copies) is used
+    // instead. Semantics are identical: lexicographic comparison on (Mvcc(), origin_hash).
+    return std::make_tuple(a.Mvcc(), a.origin_hash) < std::make_tuple(b.Mvcc(), b.origin_hash);
   }
   friend bool operator==(const MvccStamp& a, const MvccStamp& b) {
     return a.packed == b.packed && a.origin_hash == b.origin_hash;
@@ -970,6 +1014,9 @@ struct MvccStamp {
 };
 
 static_assert(sizeof(MvccStamp) == 16, "side-table per-slot cost is computed from this");
+static_assert(alignof(MvccStamp) == 8,
+              "16-byte packing assumes 8-byte alignment; a consumer "
+              "(e.g. the side table) may depend on this");
 
 // Stable across processes, builds and architectures -- the hash is persisted in the RDB and
 // compared against values written by other nodes, so std::hash is unusable here.
@@ -977,6 +1024,10 @@ uint64_t NodeUuidHash(std::string_view uuid);
 
 }  // namespace dfly
 ```
+
+Note: `std::tie` cannot bind `Mvcc()`'s prvalue return (it deduces `uint64_t&`); use
+`std::make_tuple` as shown above -- it copies its arguments, so it accepts prvalues, and
+`tuple::operator<` is still elementwise lexicographic, so the predicate is unchanged.
 
 - [ ] **Step 4: Write `mvcc.cc`**
 
@@ -991,7 +1042,7 @@ uint64_t NodeUuidHash(std::string_view uuid);
 namespace dfly {
 
 namespace {
-// Distinct from LockTag::Fingerprint's seed (tx_base.cc:94) so the two hash spaces cannot be
+// Distinct from LockTag::Fingerprint's seed (tx_base.cc:100) so the two hash spaces cannot be
 // confused in a debugger or a log.
 constexpr uint64_t kOriginHashSeed = 0x9E3779B97F4A7C15ULL;
 }  // namespace
@@ -1009,15 +1060,22 @@ uint64_t NodeUuidHash(std::string_view uuid) {
 docker exec drakeydb-p2 sh -c 'cd /src/build-dbg && ninja -j4 mvcc_test && /src/build-dbg/mvcc_test'
 ```
 
-Expected: PASS, 10 cases.
+Expected: PASS, 11 cases.
 
-- [ ] **Step 6: Falsify the two load-bearing claims, per D9**
+- [ ] **Step 6: Falsify the three load-bearing claims, per D9**
 
 1. In `Next`, change `(cand > last_) ? cand : last_ + 1` to plain `cand`. Rebuild, run
    `MvccClockTest.NeverGoesBackwardsOnClockStep`. Record the observed failure, restore.
-2. In `operator<`, use `a.packed` instead of `a.Mvcc()`. Rebuild, run
-   `MvccStampTest.TombstoneBitIsMaskedFromComparison`. Record the observed failure
-   (`the marker must not make a tombstone win`), restore.
+2. Symmetric mutation -- in `operator<`, use `a.packed`/`b.packed` instead of `a.Mvcc()`/
+   `b.Mvcc()` on *both* operands. Rebuild, run `MvccStampTest.TombstoneBitIsMaskedFromComparison`.
+   Record the observed failure (`the marker must not make a tombstone win`), restore.
+3. a-side-only mutation -- in `operator<`, use `a.packed` on the left operand only, leaving
+   `b.Mvcc()` untouched on the right. This is the mutation that matters: pinning mvcc == 100 on
+   both operands in the tie assertions above only observes masking at an exact tie, where an
+   inflated left operand is harmless, so a one-sided mutation there survives undetected. It is
+   the cross-mvcc probes (`tombstone` vs `newer`/`older`) that catch it -- `tombstone < newer`
+   flips because `100 | kTombstoneBit` (unsigned) outweighs `101`. Rebuild, run
+   `MvccStampTest.TombstoneBitIsMaskedFromComparison` again. Record the observed failure, restore.
 
 - [ ] **Step 7: Format and commit**
 
