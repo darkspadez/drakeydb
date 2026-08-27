@@ -1098,7 +1098,7 @@ git add -A && git commit -m "feat: add MvccClock and MvccStamp value types (P4)"
 - Produces: `class MvccStamper` with `static MvccStamper* tlocal()`,
   `uint64_t HopStamp(uint64_t now_ms)`, `void Arm(DbIndex, std::string_view)`,
   `void Disarm(DbIndex, std::string_view)`,
-  `void Commit(uint64_t mvcc, uint32_t origin_idx, uint64_t now_ms, const CommitFn&)`,
+  `void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn&)`,
   `void EndOfWriteEpoch()`, `uint64_t OriginHash(uint32_t origin_idx)`,
   `void SetSelfUuid(std::string_view)`,
   `void RegisterOriginHash(uint32_t idx, uint64_t hash)`,
@@ -1108,7 +1108,7 @@ git add -A && git commit -m "feat: add MvccClock and MvccStamp value types (P4)"
 `Commit` takes a callback rather than touching `DbSlice`, so this whole task stays
 testable with no shard set and no database. Task 7 supplies the real callback.
 
-**Three design points that are load-bearing, not stylistic:**
+**Four design points that are load-bearing, not stylistic:**
 
 1. **The hop memo.** `HopStamp(now_ms)` returns the *same* value for every call within
    one shard-callback. This is what makes author and applier agree when the author
@@ -1119,21 +1119,38 @@ testable with no shard set and no database. Task 7 supplies the real callback.
 2. **The stale-epoch backstop.** If a code path forgets to call `EndOfWriteEpoch()`,
    reusing an ancient hop stamp would be silent corruption. Instead, re-mint once the
    memo is older than `kMaxEpochMs` and count it, so a missed epoch degrades visibly.
-3. **`now_ms` is a parameter, not read internally via `GetCurrentTimeMs()`.** `mvcc.cc`
-   compiles into `dfly_transaction`, which has no CMake link edge to `dragonfly_lib`
-   (only the reverse edge exists: `dragonfly_lib` -> `dfly_transaction`). Calling
-   `GetCurrentTimeMs()` (`engine_shard_set.h:155`, defined via `dragonfly_lib`'s
+3. **`now_ms` is a parameter of `HopStamp`, not read internally via `GetCurrentTimeMs()`.**
+   `mvcc.cc` compiles into `dfly_transaction`, which has no CMake link edge to
+   `dragonfly_lib` (only the reverse edge exists: `dragonfly_lib` -> `dfly_transaction`).
+   Calling `GetCurrentTimeMs()` (`engine_shard_set.h:155`, defined via `dragonfly_lib`'s
    `engine_shard.cc`) from inside `mvcc.cc` would link only by accident, in binaries
    whose closure happens to pull in `engine_shard.cc.o` for an unrelated reason (real
    `EngineShard` use elsewhere). `mvcc_test` has no fixtures and so no such reason —
    it is the first binary narrow enough to turn that accident into a hard link
    failure (confirmed: `undefined reference to dfly::TEST_current_time_ms`).
-   `HopStamp`/`Commit` take `now_ms` explicitly instead, matching `MvccClock::Next`/
-   `AheadMs`, which already do; Task 7's `journal.cc` (which legitimately reaches
-   `EngineShard` already) calls `HopStamp(GetCurrentTimeMs())`.
+   `HopStamp` takes `now_ms` explicitly instead, matching `MvccClock::Next`/`AheadMs`,
+   which already do; Task 7's `journal.cc` (which legitimately reaches `EngineShard`
+   already) calls `HopStamp(GetCurrentTimeMs())`.
+4. **`Commit` never mints — it only stores.** An earlier version of this task gave
+   `Commit` its own `now_ms` and a `mvcc != 0 ? mvcc : HopStamp(now_ms)` fallback.
+   Review round 1 proved that branch dead: `Commit`'s only production call site
+   (Task 7, `journal.cc`) is gated `MvccEnabled() && opcode == Op::COMMAND`, and the
+   mint block immediately above it carries the same gate plus `entry.mvcc == 0` — so
+   whenever `Commit` runs, either the caller supplied a non-zero `mvcc` or `HopStamp`
+   (which cannot return 0: `MvccClock::Next` with `last_ = 0` returns `last_ + 1 = 1`,
+   then is strictly increasing) just minted one. `Commit` therefore takes no `now_ms`,
+   has no clock of its own, `DCHECK(mvcc != 0)`s its input, and stores it verbatim.
+   This makes "a key's stamp advances iff that same stamp is propagated" (the class's
+   own contract comment, above) structural instead of conventional: `Commit` is no
+   longer *able* to invent a stamp that differs from the one on the wire.
 
 **Arming must not allocate.** libstdc++ SSO holds 15 chars, so a `std::string` per arm
-would allocate on every write to a 16-byte key. Use a reused arena plus `(offset, len)`.
+would allocate on every write to a 16-byte key. Use a reused arena plus `(offset, len)`
+for the key bytes, and `std::vector<Armed>` — not `absl::InlinedVector` — for the arm
+list itself: `InlinedVector::clear()` frees and reverts to inline storage, defeating the
+arena's own "cleared, never shrunk" discipline the moment any callback arms more than 4
+keys (allocating on arm 5, freeing on every `Commit`/`EndOfWriteEpoch`, forever).
+`std::vector::clear()` keeps capacity, which is the property actually needed.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1141,13 +1158,21 @@ Append to `src/server/mvcc_test.cc`:
 
 ```cpp
 namespace {
-// Collects what Commit would have written, so this task needs no DbSlice.
+// Collects what Commit would have written, so this task needs no DbSlice. A named struct, not a
+// std::pair/tuple of (key, stamp): DbSlice::PostUpdate arms per (DbIndex, key), and dropping db on
+// the floor here would make every test blind to a Disarm/Commit bug scoped to the wrong db (see
+// DisarmIsScopedToTheDbIndex, which regressed exactly this way once already).
 struct Recorder {
-  std::vector<std::pair<std::string, MvccStamp>> writes;
+  struct Write {
+    DbIndex db;
+    std::string key;
+    MvccStamp stamp;
+  };
+  std::vector<Write> writes;
 
   MvccStamper::CommitFn Fn() {
     return [this](DbIndex db, std::string_view key, const MvccStamp& st) {
-      writes.emplace_back(std::string(key), st);
+      writes.push_back(Write{db, std::string(key), st});
     };
   }
 };
@@ -1165,13 +1190,13 @@ TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
   Recorder rec;
   s->Arm(0, "k1");
   s->Arm(0, "k2");
-  s->Commit(4242, /* origin_idx= */ 0, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(4242, /* origin_idx= */ 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 2u);
-  EXPECT_EQ(rec.writes[0].first, "k1");
-  EXPECT_EQ(rec.writes[1].first, "k2");
-  EXPECT_EQ(rec.writes[0].second.Mvcc(), 4242u);
-  EXPECT_EQ(rec.writes[0].second.origin_hash, rec.writes[1].second.origin_hash);
+  EXPECT_EQ(rec.writes[0].key, "k1");
+  EXPECT_EQ(rec.writes[1].key, "k2");
+  EXPECT_EQ(rec.writes[0].stamp.Mvcc(), 4242u);
+  EXPECT_EQ(rec.writes[0].stamp.origin_hash, rec.writes[1].stamp.origin_hash);
   EXPECT_EQ(s->stats().unstamped_writes, 0u);
 }
 
@@ -1180,7 +1205,7 @@ TEST(MvccStamperTest, EndOfEpochDropsUncommittedArms) {
   Recorder rec;
   s->Arm(0, "orphan");
   s->EndOfWriteEpoch();
-  s->Commit(1, 0, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(1, 0, rec.Fn());
 
   EXPECT_TRUE(rec.writes.empty()) << "an arm with no journal entry must not be stamped";
   EXPECT_EQ(s->stats().unstamped_writes, 1u)
@@ -1194,22 +1219,29 @@ TEST(MvccStamperTest, DisarmRemovesOnlyTheNamedKey) {
   s->Arm(0, "keep");
   s->Arm(0, "drop");
   s->Disarm(0, "drop");
-  s->Commit(7, 0, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(7, 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
-  EXPECT_EQ(rec.writes[0].first, "keep");
+  EXPECT_EQ(rec.writes[0].key, "keep");
 }
 
+// Regression coverage: an earlier version of this test recorded only (key, stamp), so it could
+// not tell the surviving db=0 arm apart from a wrongly-surviving db=1 one -- both have key "k".
+// Disarm(1, "k") must remove the db=1 arm specifically; if Disarm ignored db_index it would erase
+// the first key match instead (db=0, armed first), leaving db=1's arm to reach Commit -- and the
+// old assertions (size == 1, key == "k") could not tell the two cases apart.
 TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
   s->Arm(0, "k");
   s->Arm(1, "k");
   s->Disarm(1, "k");
-  s->Commit(7, 0, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(7, 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
-  EXPECT_EQ(rec.writes[0].first, "k");
+  EXPECT_EQ(rec.writes[0].key, "k");
+  EXPECT_EQ(rec.writes[0].db, 0) << "the surviving arm must be db=0; db=1 was the one "
+                                     "Disarm(1, \"k\") was supposed to remove";
 }
 
 // The bit-identity mechanism: several entries minted inside one callback share a stamp.
@@ -1242,12 +1274,12 @@ TEST(MvccStamperTest, PeerMvccIsNeverReminted) {
   Recorder rec;
   s->RegisterOriginHash(3, 0xABCDEF);
   s->Arm(0, "k");
-  s->Commit(/* mvcc= */ 999, /* origin_idx= */ 3, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(/* mvcc= */ 999, /* origin_idx= */ 3, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
-  EXPECT_EQ(rec.writes[0].second.Mvcc(), 999u) << "an applied write keeps the author's stamp "
+  EXPECT_EQ(rec.writes[0].stamp.Mvcc(), 999u) << "an applied write keeps the author's stamp "
                                                   "verbatim, or stamps inflate on every hop";
-  EXPECT_EQ(rec.writes[0].second.origin_hash, 0xABCDEFu) << "and the author's origin, not ours";
+  EXPECT_EQ(rec.writes[0].stamp.origin_hash, 0xABCDEFu) << "and the author's origin, not ours";
 }
 
 TEST(MvccStamperTest, SelfOriginIsIndexZero) {
@@ -1264,11 +1296,11 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
     keys.push_back(absl::StrCat("key-with-a-long-enough-name-to-force-growth-", i));
     s->Arm(0, keys.back());
   }
-  s->Commit(5, 0, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(5, 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 256u);
   for (int i = 0; i < 256; ++i)
-    EXPECT_EQ(rec.writes[i].first, keys[i]) << "arm " << i << " was corrupted by later growth";
+    EXPECT_EQ(rec.writes[i].key, keys[i]) << "arm " << i << " was corrupted by later growth";
 }
 ```
 
@@ -1283,9 +1315,8 @@ Expected: **compile error**, `MvccStamper` not declared.
 - [ ] **Step 3: Implement `MvccStamper` in `mvcc.h`**
 
 ```cpp
-// (add near the top of mvcc.h)
-#include <absl/container/inlined_vector.h>
-
+// (add near the top of mvcc.h -- no absl/container/inlined_vector.h: armed_ below is a
+// std::vector, not an absl::InlinedVector. See "Arming must not allocate" above.)
 #include <functional>
 #include <string>
 #include <vector>
@@ -1334,9 +1365,13 @@ class MvccStamper {
   void Arm(DbIndex db_index, std::string_view key);
   void Disarm(DbIndex db_index, std::string_view key);
 
-  // mvcc == 0 means "mint locally" via HopStamp(now_ms); a non-zero value is an applied write's
-  // author stamp and is stored verbatim, and now_ms then goes unused. Clears the arm list.
-  void Commit(uint64_t mvcc, uint32_t origin_idx, uint64_t now_ms, const CommitFn& fn);
+  // The caller always supplies a non-zero stamp: the author's freshly minted HopStamp(now_ms), or
+  // an applied write's verbatim author stamp -- both under the same MvccEnabled() && COMMAND gate,
+  // so Commit itself never mints (DCHECK'd in the .cc). Clears the arm list.
+  //
+  // fn must not call Arm(): Commit is mid-iteration over armed_/arena_, both of which Arm() can
+  // reallocate, invalidating the iterator and the string_view key fn was just handed.
+  void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn);
 
   void EndOfWriteEpoch();
 
@@ -1363,17 +1398,24 @@ class MvccStamper {
   MvccClock clock_;
   uint64_t hop_stamp_ = 0;
   std::string arena_;  // cleared, never shrunk, so steady-state arming does not allocate
-  absl::InlinedVector<Armed, 4> armed_;
+  // std::vector, not absl::InlinedVector: InlinedVector::clear() frees (DeallocateIfAllocated())
+  // and reverts to inline storage, so any callback arming more than 4 keys would allocate on the
+  // 5th arm and free on every single Commit/EndOfWriteEpoch, forever. std::vector::clear() keeps
+  // capacity, matching arena_'s "cleared, never shrunk" discipline. Do not "optimise" this back --
+  // InlinedVector is only cheaper for callbacks that arm <=4 keys, and worse for every other one.
+  std::vector<Armed> armed_;
   std::vector<uint64_t> origin_hash_cache_;  // dense by origin_idx; index 0 == self
   Stats stats_;
+  bool in_commit_ = false;  // reentrancy guard for Arm(); see Commit()'s comment above
 };
 ```
 
 - [ ] **Step 4: Implement it in `mvcc.cc`**
 
 ```cpp
-// (add to mvcc.cc -- no new include: HopStamp takes now_ms as a parameter precisely so this
-// file never needs "server/engine_shard_set.h". See design point 3 above.)
+// (add to mvcc.cc -- needs "base/logging.h" for DCHECK; no "server/engine_shard_set.h":
+// HopStamp takes now_ms as a parameter precisely so this file never needs it. Design point 3.)
+#include "base/logging.h"  // DCHECK
 
 MvccStamper* MvccStamper::tlocal() {
   static thread_local MvccStamper stamper;
@@ -1404,6 +1446,8 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
 }
 
 void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
+  DCHECK(!in_commit_) << "a CommitFn armed a key -- Commit() is mid-iteration over armed_/arena_, "
+                          "both of which this call can reallocate, corrupting that iteration";
   const uint32_t off = static_cast<uint32_t>(arena_.size());
   arena_.append(key);
   armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size())});
@@ -1418,13 +1462,20 @@ void MvccStamper::Disarm(DbIndex db_index, std::string_view key) {
   }
 }
 
-void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, uint64_t now_ms, const CommitFn& fn) {
+void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn) {
   if (armed_.empty())
     return;
 
-  const MvccStamp stamp{mvcc != 0 ? mvcc : HopStamp(now_ms), OriginHash(origin_idx)};
+  // The only production call site mints (HopStamp, which cannot return 0) or forwards an applied
+  // write's non-zero author stamp before calling Commit, under the same MvccEnabled() && COMMAND
+  // gate. Commit has no clock of its own, so it cannot invent a stamp -- it can only store what it
+  // is given, and this DCHECK is the last check that "given" was ever actually true.
+  DCHECK(mvcc != 0);
+  const MvccStamp stamp{mvcc, OriginHash(origin_idx)};
+  in_commit_ = true;
   for (const Armed& a : armed_)
     fn(a.db_index, ArmedKey(a), stamp);
+  in_commit_ = false;
 
   armed_.clear();
   arena_.clear();  // keeps capacity
@@ -1444,6 +1495,7 @@ void MvccStamper::TEST_Reset() {
   arena_.clear();
   origin_hash_cache_.clear();
   stats_ = Stats{};
+  in_commit_ = false;
 }
 
 }  // namespace dfly
@@ -1943,14 +1995,29 @@ At the end of `DbSlice::PostUpdate` (`db_slice.cc:1426`):
 
 - [ ] **Step 4: Mint and commit in `RecordEntry`**
 
-In `src/server/journal/journal.cc:90-100`, `RecordEntry` (`AddLogRecord` is line `:99`). **Order matters and the two halves
-split around `AddLogRecord`:** mint **before** it, so the wire carries the same value the
-side table will store; commit **after** it, so a key is only stamped once its entry is
-durable. Getting this backwards puts mvcc 0 on the wire and makes every applier mint its
-own stamp.
+In `src/server/journal/journal.cc:90-100`, `RecordEntry`. Its body is, in order:
+`entry.origin_idx = origin_idx;` (`:96`), `entry.mvcc = mvcc;` (`:97`),
+`entry.entry_flags = entry_flags;` (`:98`), `journal_slice.AddLogRecord(entry);` (`:99`).
+
+**The mint block's placement is exact, not "somewhere before `AddLogRecord`."** It must go
+**after `entry.entry_flags = entry_flags;` (`:98`) and before `AddLogRecord(entry)` (`:99`)** --
+specifically *after* `entry.mvcc = mvcc;` (`:97`), not merely before `AddLogRecord`. `:97`
+assigns the **parameter** `mvcc`, which is 0 on the local-author path (the caller has no stamp
+yet); inserting the mint block anywhere above `:97` -- including directly above `AddLogRecord`
+but above `:96`-`:98` -- mints into `entry.mvcc` and then has `:97` overwrite it straight back to
+0. The `entry.mvcc == 0` guard on the mint block does not catch this, because the incoming
+parameter is also 0 on exactly the path that needs minting. Getting the mint half's placement
+wrong this way reproduces silently: it puts mvcc 0 on the wire and makes every applier mint its
+own stamp, and P4-4's LWW guard (P4-4, not yet implemented) would do nothing at all because every
+stamp is 0 -- the same failure shape Task 7's own landmine section already warns about for
+`EndOfWriteEpoch`'s placement.
+
+Commit half: **after** `AddLogRecord`, so a key is only stamped once its entry is durable.
 
 ```cpp
-  // drakeydb: Phase 4 -- mint BEFORE AddLogRecord so the wire carries this exact value.
+  // drakeydb: Phase 4 -- mint AFTER entry.mvcc = mvcc (:97, an assignment from the possibly-zero
+  // caller-supplied parameter, which would otherwise clobber the mint straight back to 0) and
+  // BEFORE AddLogRecord (:99), so the wire carries this exact value.
   // HopStamp takes now_ms explicitly (Task 4, design point 3): mvcc.cc itself never calls
   // GetCurrentTimeMs(), so the caller -- here, already deep in EngineShard territory -- does.
   if (MvccEnabled() && opcode == Op::COMMAND && entry.mvcc == 0)
@@ -1965,11 +2032,11 @@ then, immediately **after** `AddLogRecord(entry)`:
   // 0 is unreachable for a real stamp (ms << 20, ms ~ 1.77e12).
   // drakeydb: Phase 4 -- commit AFTER the entry is durable. A non-zero mvcc arriving from a
   // peer is that author's stamp and is stored verbatim, or stamps inflate on every hop. entry.mvcc
-  // is always non-zero by this point (freshly minted above, or supplied non-zero by the caller),
-  // so Commit's HopStamp(now_ms) fallback never actually runs here -- now_ms is passed because
-  // the signature requires it, not because this call site needs it.
+  // is always non-zero by this point (freshly minted above, or supplied non-zero by the caller) --
+  // Commit DCHECKs this (Task 4, fix round 1); it has no clock of its own and cannot mint a
+  // fallback stamp, so there is no now_ms to pass here.
   if (MvccEnabled() && opcode == Op::COMMAND) {
-    MvccStamper::tlocal()->Commit(entry.mvcc, entry.origin_idx, GetCurrentTimeMs(),
+    MvccStamper::tlocal()->Commit(entry.mvcc, entry.origin_idx,
                                   [](DbIndex db, std::string_view key, const MvccStamp& st) {
                                     EngineShard::tlocal()->db_slice().SetMvcc(db, PrimeKey{key},
                                                                              st);

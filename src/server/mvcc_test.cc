@@ -140,13 +140,21 @@ TEST(NodeUuidHashTest, StableAndDistinct) {
 }
 
 namespace {
-// Collects what Commit would have written, so this task needs no DbSlice.
+// Collects what Commit would have written, so this task needs no DbSlice. A named struct, not a
+// std::pair/tuple of (key, stamp): DbSlice::PostUpdate arms per (DbIndex, key), and dropping db on
+// the floor here would make every test blind to a Disarm/Commit bug scoped to the wrong db (see
+// DisarmIsScopedToTheDbIndex, which regressed exactly this way once already).
 struct Recorder {
-  std::vector<std::pair<std::string, MvccStamp>> writes;
+  struct Write {
+    DbIndex db;
+    std::string key;
+    MvccStamp stamp;
+  };
+  std::vector<Write> writes;
 
   MvccStamper::CommitFn Fn() {
     return [this](DbIndex db, std::string_view key, const MvccStamp& st) {
-      writes.emplace_back(std::string(key), st);
+      writes.push_back(Write{db, std::string(key), st});
     };
   }
 };
@@ -164,13 +172,13 @@ TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
   Recorder rec;
   s->Arm(0, "k1");
   s->Arm(0, "k2");
-  s->Commit(4242, /* origin_idx= */ 0, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(4242, /* origin_idx= */ 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 2u);
-  EXPECT_EQ(rec.writes[0].first, "k1");
-  EXPECT_EQ(rec.writes[1].first, "k2");
-  EXPECT_EQ(rec.writes[0].second.Mvcc(), 4242u);
-  EXPECT_EQ(rec.writes[0].second.origin_hash, rec.writes[1].second.origin_hash);
+  EXPECT_EQ(rec.writes[0].key, "k1");
+  EXPECT_EQ(rec.writes[1].key, "k2");
+  EXPECT_EQ(rec.writes[0].stamp.Mvcc(), 4242u);
+  EXPECT_EQ(rec.writes[0].stamp.origin_hash, rec.writes[1].stamp.origin_hash);
   EXPECT_EQ(s->stats().unstamped_writes, 0u);
 }
 
@@ -179,7 +187,7 @@ TEST(MvccStamperTest, EndOfEpochDropsUncommittedArms) {
   Recorder rec;
   s->Arm(0, "orphan");
   s->EndOfWriteEpoch();
-  s->Commit(1, 0, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(1, 0, rec.Fn());
 
   EXPECT_TRUE(rec.writes.empty()) << "an arm with no journal entry must not be stamped";
   EXPECT_EQ(s->stats().unstamped_writes, 1u)
@@ -193,22 +201,29 @@ TEST(MvccStamperTest, DisarmRemovesOnlyTheNamedKey) {
   s->Arm(0, "keep");
   s->Arm(0, "drop");
   s->Disarm(0, "drop");
-  s->Commit(7, 0, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(7, 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
-  EXPECT_EQ(rec.writes[0].first, "keep");
+  EXPECT_EQ(rec.writes[0].key, "keep");
 }
 
+// Regression coverage: an earlier version of this test recorded only (key, stamp), so it could
+// not tell the surviving db=0 arm apart from a wrongly-surviving db=1 one -- both have key "k".
+// Disarm(1, "k") must remove the db=1 arm specifically; if Disarm ignored db_index it would erase
+// the first key match instead (db=0, armed first), leaving db=1's arm to reach Commit -- and the
+// old assertions (size == 1, key == "k") could not tell the two cases apart.
 TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
   s->Arm(0, "k");
   s->Arm(1, "k");
   s->Disarm(1, "k");
-  s->Commit(7, 0, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(7, 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
-  EXPECT_EQ(rec.writes[0].first, "k");
+  EXPECT_EQ(rec.writes[0].key, "k");
+  EXPECT_EQ(rec.writes[0].db, 0) << "the surviving arm must be db=0; db=1 was the one "
+                                    "Disarm(1, \"k\") was supposed to remove";
 }
 
 // The bit-identity mechanism: several entries minted inside one callback share a stamp.
@@ -241,12 +256,12 @@ TEST(MvccStamperTest, PeerMvccIsNeverReminted) {
   Recorder rec;
   s->RegisterOriginHash(3, 0xABCDEF);
   s->Arm(0, "k");
-  s->Commit(/* mvcc= */ 999, /* origin_idx= */ 3, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(/* mvcc= */ 999, /* origin_idx= */ 3, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
-  EXPECT_EQ(rec.writes[0].second.Mvcc(), 999u) << "an applied write keeps the author's stamp "
-                                                  "verbatim, or stamps inflate on every hop";
-  EXPECT_EQ(rec.writes[0].second.origin_hash, 0xABCDEFu) << "and the author's origin, not ours";
+  EXPECT_EQ(rec.writes[0].stamp.Mvcc(), 999u) << "an applied write keeps the author's stamp "
+                                                 "verbatim, or stamps inflate on every hop";
+  EXPECT_EQ(rec.writes[0].stamp.origin_hash, 0xABCDEFu) << "and the author's origin, not ours";
 }
 
 TEST(MvccStamperTest, SelfOriginIsIndexZero) {
@@ -263,11 +278,11 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
     keys.push_back(absl::StrCat("key-with-a-long-enough-name-to-force-growth-", i));
     s->Arm(0, keys.back());
   }
-  s->Commit(5, 0, /* now_ms= */ 1'000, rec.Fn());
+  s->Commit(5, 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 256u);
   for (int i = 0; i < 256; ++i)
-    EXPECT_EQ(rec.writes[i].first, keys[i]) << "arm " << i << " was corrupted by later growth";
+    EXPECT_EQ(rec.writes[i].key, keys[i]) << "arm " << i << " was corrupted by later growth";
 }
 
 }  // namespace dfly

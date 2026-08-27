@@ -5,6 +5,8 @@
 
 #include <xxhash.h>
 
+#include "base/logging.h"  // DCHECK
+
 namespace dfly {
 
 namespace {
@@ -46,6 +48,8 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
 }
 
 void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
+  DCHECK(!in_commit_) << "a CommitFn armed a key -- Commit() is mid-iteration over armed_/arena_, "
+                         "both of which this call can reallocate, corrupting that iteration";
   const uint32_t off = static_cast<uint32_t>(arena_.size());
   arena_.append(key);
   armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size())});
@@ -60,13 +64,20 @@ void MvccStamper::Disarm(DbIndex db_index, std::string_view key) {
   }
 }
 
-void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, uint64_t now_ms, const CommitFn& fn) {
+void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn) {
   if (armed_.empty())
     return;
 
-  const MvccStamp stamp{mvcc != 0 ? mvcc : HopStamp(now_ms), OriginHash(origin_idx)};
+  // The only production call site mints (HopStamp, which cannot return 0) or forwards an applied
+  // write's non-zero author stamp before calling Commit, under the same MvccEnabled() && COMMAND
+  // gate. Commit has no clock of its own, so it cannot invent a stamp -- it can only store what it
+  // is given, and this DCHECK is the last check that "given" was ever actually true.
+  DCHECK(mvcc != 0);
+  const MvccStamp stamp{mvcc, OriginHash(origin_idx)};
+  in_commit_ = true;
   for (const Armed& a : armed_)
     fn(a.db_index, ArmedKey(a), stamp);
+  in_commit_ = false;
 
   armed_.clear();
   arena_.clear();  // keeps capacity
@@ -86,6 +97,7 @@ void MvccStamper::TEST_Reset() {
   arena_.clear();
   origin_hash_cache_.clear();
   stats_ = Stats{};
+  in_commit_ = false;
 }
 
 }  // namespace dfly

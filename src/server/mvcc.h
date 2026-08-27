@@ -3,8 +3,6 @@
 //
 #pragma once
 
-#include <absl/container/inlined_vector.h>
-
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -150,9 +148,13 @@ class MvccStamper {
   void Arm(DbIndex db_index, std::string_view key);
   void Disarm(DbIndex db_index, std::string_view key);
 
-  // mvcc == 0 means "mint locally" via HopStamp(now_ms); a non-zero value is an applied write's
-  // author stamp and is stored verbatim, and now_ms then goes unused. Clears the arm list.
-  void Commit(uint64_t mvcc, uint32_t origin_idx, uint64_t now_ms, const CommitFn& fn);
+  // The caller always supplies a non-zero stamp: the author's freshly minted HopStamp(now_ms), or
+  // an applied write's verbatim author stamp -- both under the same MvccEnabled() && COMMAND gate,
+  // so Commit itself never mints (DCHECK'd in the .cc). Clears the arm list.
+  //
+  // fn must not call Arm(): Commit is mid-iteration over armed_/arena_, both of which Arm() can
+  // reallocate, invalidating the iterator and the string_view key fn was just handed.
+  void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn);
 
   void EndOfWriteEpoch();
 
@@ -179,9 +181,15 @@ class MvccStamper {
   MvccClock clock_;
   uint64_t hop_stamp_ = 0;
   std::string arena_;  // cleared, never shrunk, so steady-state arming does not allocate
-  absl::InlinedVector<Armed, 4> armed_;
+  // std::vector, not absl::InlinedVector: InlinedVector::clear() frees (DeallocateIfAllocated())
+  // and reverts to inline storage, so any callback arming more than 4 keys would allocate on the
+  // 5th arm and free on every single Commit/EndOfWriteEpoch, forever. std::vector::clear() keeps
+  // capacity, matching arena_'s "cleared, never shrunk" discipline. Do not "optimise" this back --
+  // InlinedVector is only cheaper for callbacks that arm <=4 keys, and worse for every other one.
+  std::vector<Armed> armed_;
   std::vector<uint64_t> origin_hash_cache_;  // dense by origin_idx; index 0 == self
   Stats stats_;
+  bool in_commit_ = false;  // reentrancy guard for Arm(); see Commit()'s comment above
 };
 
 }  // namespace dfly
