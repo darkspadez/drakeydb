@@ -78,6 +78,11 @@ struct DbContext {
   // one of the most widely-included headers in the tree.
   uint32_t repl_origin_idx = 0;
 
+  // drakeydb: Phase 4 -- the applied entry's MVCC stamp, mirroring repl_origin_idx above. Lets
+  // delete paths that stamp directly (rather than through arm/commit) reproduce the author's
+  // stamp byte for byte. 0 means "mint locally".
+  uint64_t repl_mvcc = 0;
+
   // Convenience method.
   DbSlice& GetDbSlice(ShardId shard_id) const;
 };
