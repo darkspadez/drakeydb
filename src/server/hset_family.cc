@@ -720,7 +720,7 @@ OpResult<vector<long>> OpHExpire(const OpArgs& op_args, string_view key, uint32_
   if (pv->Encoding() == kEncodingStrMap2) {
     auto* sm = static_cast<StringMap*>(pv->RObjPtr());
     if (sm->UpperBoundSize() == 0) {
-      db_slice.DelMutable(op_args.db_cntx, std::move(*op_res));
+      db_slice.DelMutable(op_args.db_cntx, std::move(*op_res), DbSlice::DeleteReason::kExpired);
       key_deleted = true;
     }
   }
@@ -1100,7 +1100,7 @@ OpResult<vector<OptStr>> OpHGetEx(const OpArgs& op_args, string_view key, const 
   if (pv->Encoding() == kEncodingStrMap2) {
     auto* sm = static_cast<StringMap*>(pv->RObjPtr());
     if (sm->UpperBoundSize() == 0) {
-      db_slice.DelMutable(op_args.db_cntx, std::move(*op_res));
+      db_slice.DelMutable(op_args.db_cntx, std::move(*op_res), DbSlice::DeleteReason::kExpired);
       key_deleted = true;
     }
   }

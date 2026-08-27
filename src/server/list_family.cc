@@ -570,6 +570,14 @@ OpResult<uint32_t> OpPush(const OpArgs& op_args, std::string_view key, ListDir d
   lw.Launder(&res.it->second);
   len = lw.Size();
 
+  // drakeydb: Phase 4, P4-1 Task 8 fix round 2 (F3) -- arm before journaling, same reasoning as
+  // hset_family.cc's OpHExpire (:728-731): res.post_updater would otherwise not run until this
+  // function returns, after RecordJournal below. Only reached with journal_rewrite=true from the
+  // LMOVE/BLMOVE/RPOPLPUSH/BRPOPLPUSH cross-key push helper (this file); LPUSH/RPUSH's own call
+  // (journal_rewrite=false) never takes the block below and relies on ordinary auto-journal
+  // instead, so this Run() is harmless there too -- it just arms a little earlier.
+  res.post_updater.Run();
+
   if (journal_rewrite && op_args.shard->journal()) {
     string command = dir == ListDir::LEFT ? "LPUSH" : "RPUSH";
     vector<string_view> mapped(vals.size() + 1);

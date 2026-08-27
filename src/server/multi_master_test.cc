@@ -1144,6 +1144,23 @@ TEST_F(MvccStoreTest, RenameMovesTheStampByRecreatingIt) {
                                            "own journal entry";
 }
 
+// drakeydb: review fix round 2 -- the reviewer's bonus finding: GenericFamily::Copy always
+// constructs its Renamer with do_copy=true, and FinalizeRename routes to DeserializeDest for
+// every COPY (the `!do_copy_ && shard_id == src_sid_` branch that sends RENAME's source through
+// DelSrc instead is never taken when do_copy_ is true) -- so COPY was affected by the same F1 bug
+// regardless of shard placement, not just cross-shard RENAME. "a"/"c" is deliberately a
+// *same-shard* pair here (both hash to 1 under this fixture): unlike RENAME, COPY has no
+// single-shard fast path to fall back to, so this demonstrates the bug (and the fix) even in the
+// case that would have been safe for RENAME.
+TEST_F(MvccStoreTest, CopyStampsTheDestinationRegardlessOfShardPlacement) {
+  Run({"set", "a", "v"});
+  ASSERT_TRUE(StampOf("a").has_value());
+  Run({"copy", "a", "c"});
+  ASSERT_TRUE(StampOf("a").has_value()) << "COPY must not disturb the source's stamp";
+  ASSERT_TRUE(StampOf("c").has_value()) << "the destination is armed and committed by COPY's "
+                                           "own journal entry (via the same DeserializeDest)";
+}
+
 TEST_F(MvccStoreTest, ExpiryErasesTheStamp) {
   Run({"set", "k", "v", "px", "10"});
   ASSERT_TRUE(StampOf("k").has_value());
@@ -1158,6 +1175,60 @@ TEST_F(MvccStoreTest, MultiKeyDeleteErasesEveryStamp) {
   EXPECT_FALSE(StampOf("k1").has_value());
   EXPECT_FALSE(StampOf("k2").has_value());
   EXPECT_TRUE(StampOf("k3").has_value());
+}
+
+// drakeydb: review fix round 2 (F3) -- five NO_AUTOJOURNAL commands that build their own explicit
+// journal entry while a live AutoUpdater had not yet run, so their commit hit an empty arm list
+// and a *propagated* destination key was left permanently unstamped. Each test below stamps the
+// key its command writes; falsified per-site by reverting that one Run() and confirming failure
+// (see task-8-report.md's "Fix round 2" section for the verbatim output of each).
+
+TEST_F(MvccStoreTest, PfmergeStampsTheDestination) {
+  Run({"pfadd", "src", "a", "b", "c"});
+  Run({"pfmerge", "dest", "src"});
+  ASSERT_TRUE(StampOf("dest").has_value()) << "PFMERGE's own journal entry must stamp dest";
+}
+
+// journal_as_minid (and so the buggy explicit RecordJournal path) is only taken for MAXLEN/approx
+// trims -- see JournalAsMinId, stream_family.cc. A MINID trim without "~" auto-journals instead
+// and would not exercise this.
+//
+// Compares before/after rather than just has_value(): "s" already carries a stamp from the two
+// XADDs below before XTRIM ever runs, so a bare has_value() check after XTRIM would pass whether
+// or not XTRIM's own commit did anything -- it would just be re-observing the stale XADD stamp.
+// The real assertion is that XTRIM mints its own, strictly newer stamp (Task 7's monotonicity
+// invariant, also covered generally by StampsAreStrictlyIncreasingAcrossWrites).
+TEST_F(MvccStoreTest, XtrimStampsTheStream) {
+  Run({"xadd", "s", "*", "f", "v"});
+  Run({"xadd", "s", "*", "f", "v"});
+  auto before = StampOf("s");
+  ASSERT_TRUE(before.has_value());
+  Run({"xtrim", "s", "maxlen", "1"});
+  auto after = StampOf("s");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_TRUE(*before < *after) << "XTRIM's own journal entry must mint a fresh, strictly newer "
+                                   "stamp, not leave the stale one from the XADDs above";
+}
+
+TEST_F(MvccStoreTest, XaddStampsTheStream) {
+  Run({"xadd", "s", "*", "f", "v"});
+  ASSERT_TRUE(StampOf("s").has_value()) << "XADD's own journal entry must stamp the stream key";
+}
+
+// Cross-shard src/dest: OpMoveSingleShard (MoveGeneric's GetUniqueShardCnt() == 1 branch) already
+// runs both post_updater.Run() calls before its own explicit RecordJournal and was never broken
+// -- only the cross-shard MoveTwoShards -> OpPush(..., journal_rewrite=true) path was. "a"/"b"
+// are on different shards under this fixture, same pair already established for RENAME.
+TEST_F(MvccStoreTest, LmoveStampsTheDestinationCrossShard) {
+  Run({"rpush", "a", "v"});
+  Run({"lmove", "a", "b", "left", "right"});
+  ASSERT_TRUE(StampOf("b").has_value()) << "LMOVE's own journal entry must stamp the destination";
+}
+
+TEST_F(MvccStoreTest, SunionstoreStampsTheDestination) {
+  Run({"sadd", "s1", "x", "y"});
+  Run({"sunionstore", "dest", "s1"});
+  ASSERT_TRUE(StampOf("dest").has_value()) << "SUNIONSTORE's own journal entry must stamp dest";
 }
 
 // The "off means byte-identical to upstream" guard.

@@ -1232,6 +1232,13 @@ OpResult<streamID> OpAdd(const OpArgs& op_args, string_view key, const AddOpts& 
   // zmalloc_used_memory_tl, corrupting the diff computed by UpdateStreamSize.
   mem_tracker.UpdateStreamSize(it->second);
 
+  // drakeydb: Phase 4, P4-1 Task 8 fix round 2 (F3) -- arm before journaling, same reasoning as
+  // the UpdateStreamSize call just above and hset_family.cc's OpHExpire (:728-731): add_res's
+  // post_updater would otherwise not run until this function returns, after RecordJournal below.
+  // XADD is NO_AUTOJOURNAL (this file), so RecordJournal here is the only journal entry this
+  // write gets, and a propagated-but-unstamped key is exactly what Task 7's invariant forbids.
+  add_res.post_updater.Run();
+
   if (op_args.shard->journal()) {
     std::string result_id_as_string = StreamsIdToString(result_id);
     const bool stream_is_empty = stream_inst->length == 0;
@@ -2616,6 +2623,12 @@ OpResult<int64_t> OpTrim(const OpArgs& op_args, std::string_view key, const Trim
   RecordStreamAccess(op_args, StreamAccessKind::kSequential);
 
   mem_tracker.UpdateStreamSize(pv);
+
+  // drakeydb: Phase 4, P4-1 Task 8 fix round 2 (F3) -- arm before journaling, same reasoning as
+  // hset_family.cc's OpHExpire (:728-731): res_it->post_updater's implicit Run() would otherwise
+  // wait until this function's closing brace, after RecordJournal below already ran. XTRIM is
+  // NO_AUTOJOURNAL (this file), so RecordJournal here is the only journal entry this write gets.
+  res_it->post_updater.Run();
 
   if (op_args.shard->journal() && journal_as_minid) {
     const bool stream_is_empty = s->length == 0;
