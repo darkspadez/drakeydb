@@ -721,6 +721,41 @@ TEST_F(MvccStoreTest, RoundTripsAStamp) {
   EXPECT_EQ(*got, written);
 }
 
+// drakeydb: P4-1 Task 5, fix round 1 -- EraseMvcc and mvcc_enabled() had no caller anywhere in
+// the tree (production or test), so a mutation to either -- e.g. EraseMvcc silently becoming a
+// no-op, or mvcc_enabled_ getting stuck false -- would go undetected. This closes both.
+TEST_F(MvccStoreTest, EraseRemovesTheStampAndDecrementsCount) {
+  Run({"set", "k", "v"});
+  auto& shard_set_ref = *shard_set;
+  const ShardId sid = Shard("k", shard_set_ref.size());
+  const MvccStamp written{777, 111};
+
+  shard_set_ref.Await(sid, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    ASSERT_TRUE(db_slice.mvcc_enabled());
+    PrimeKey pk{"k"};
+    db_slice.SetMvcc(0, pk, written);
+  });
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_entries, 1u);
+
+  std::optional<MvccStamp> got;
+  shard_set_ref.Await(
+      sid, [&] { got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "k"); });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, written);
+
+  shard_set_ref.Await(sid, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    PrimeKey pk{"k"};
+    db_slice.EraseMvcc(0, pk);
+  });
+
+  shard_set_ref.Await(
+      sid, [&] { got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "k"); });
+  EXPECT_FALSE(got.has_value()) << "EraseMvcc must remove the stamp";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u) << "EraseMvcc must decrement mvcc_entries";
+}
+
 TEST_F(MvccStoreTest, AbsentKeyReturnsNullopt) {
   std::optional<MvccStamp> got;
   shard_set->Await(Shard("nope", shard_set->size()), [&] {
@@ -741,6 +776,57 @@ TEST_F(MvccStoreTest, FlushAllDropsTheSideTable) {
   ASSERT_EQ(GetMetrics().db_stats[0].mvcc_entries, 1u);
   Run({"flushall"});
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u);
+  // Fix round 1: the counter alone doesn't pin the table itself -- FlushDbIndexes replaces the
+  // whole DbTable, which resets DbTableStats (and so mvcc_entries) regardless of whether the side
+  // table was actually dropped. Check the table directly too.
+  std::optional<MvccStamp> got;
+  shard_set->Await(Shard("k", shard_set->size()), [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "k");
+  });
+  EXPECT_FALSE(got.has_value()) << "the side table itself, not just its counter, must be dropped";
+}
+
+// drakeydb: P4-1 Task 5, fix round 1 -- DbSlice::mvcc_table_memory() (unlike table_memory_, which
+// takes a live delta on every write, e.g. AddOrFind's `table_memory_ += table_increase;` at
+// db_slice.cc:937) is computed on demand from DbTable::mvcc_table_memory() rather than
+// accumulated, precisely so it cannot silently stop tracking real growth or underflow on flush.
+// This is the test that would have caught the original accumulator design being wrong: it
+// requires the value to actually move.
+TEST_F(MvccStoreTest, TableMemoryGrowsWithWritesAndDropsOnFlush) {
+  Run({"set", "k", "v"});
+  auto& shard_set_ref = *shard_set;
+  const ShardId sid = Shard("k", shard_set_ref.size());
+
+  size_t before = 0;
+  shard_set_ref.Await(sid, [&] {
+    before = namespaces->GetDefaultNamespace().GetCurrentDbSlice().mvcc_table_memory();
+  });
+
+  // Enough distinct keys to force the side table's DashTable past its initial single-segment
+  // capacity (kMaxSize = (56 + 4) * 14 = 840 slots) and actually grow, not just accept a write
+  // that fits in already-allocated space.
+  shard_set_ref.Await(sid, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < 2000; ++i) {
+      PrimeKey pk{absl::StrCat("mvcc-mem-", i)};
+      db_slice.SetMvcc(0, pk, MvccStamp{uint64_t(i) + 1, 1});
+    }
+  });
+
+  size_t after = 0;
+  shard_set_ref.Await(sid, [&] {
+    after = namespaces->GetDefaultNamespace().GetCurrentDbSlice().mvcc_table_memory();
+  });
+  EXPECT_GT(after, before) << "mvcc_table_memory() must grow as the side table fills";
+
+  Run({"flushall"});
+
+  size_t post_flush = 0;
+  shard_set_ref.Await(sid, [&] {
+    post_flush = namespaces->GetDefaultNamespace().GetCurrentDbSlice().mvcc_table_memory();
+  });
+  EXPECT_EQ(post_flush, before)
+      << "flush must drop the grown side table back to a freshly-allocated table's baseline";
 }
 
 // The "off means byte-identical to upstream" guard.

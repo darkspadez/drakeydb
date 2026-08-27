@@ -72,12 +72,7 @@ TEST(MvccStampTest, SizeAndAlignment) {
 TEST(MvccTableGeometry, BucketMatchesTheSizingArgument) {
   // 26 (BucketBase<14>) + 14*18 (PrimeKey) + 2 pad + 14*16 (MvccStamp) = 504.
   // If this changes, the ~41 B/key figure and the benchmark's [34,48] band are both stale.
-  //
-  // drakeydb: P4-1 Task 5 fix-minimal -- Segment_t::Bucket (core/dash_internal.h) is private, so
-  // the brief's literal `sizeof(Segment_t::Bucket)` does not compile from outside the class.
-  // Segment_t::kBucketByteSize is a minimal accessor added for exactly this check: it exposes
-  // only the byte size, not Bucket's type or interface.
-  EXPECT_EQ(DbTable::MvccTable::Segment_t::kBucketByteSize, 504u);
+  EXPECT_EQ(DbTable::MvccTable::Segment_t::kBucketSz, 504u);
 }
 
 TEST(MvccStampTest, LexicographicOrderOnMvccThenOrigin) {

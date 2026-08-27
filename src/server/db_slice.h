@@ -356,9 +356,16 @@ class DbSlice {
   void SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
-  size_t mvcc_table_memory() const {
-    return mvcc_table_memory_;
-  }
+
+  // drakeydb: P4-1 Task 5, fix round 1 -- computed on demand (sums DbTable::mvcc_table_memory()
+  // over db_arr_) rather than maintained as a running accumulator. table_memory_'s accumulator
+  // pattern only stays correct because every mutation site (e.g. AddOrFind's
+  // `table_memory_ += table_increase;`, db_slice.cc:937) takes a live growth delta; SetMvcc has
+  // no equivalent, so an accumulator here would report the sum of the tables' *initial empty*
+  // sizes forever and, worse, underflow (size_t) the first time FlushDbIndexes subtracts a since
+  // filled table's live size against a total that was never credited for the growth. Read rarely
+  // (INFO/benchmark), never on a write path, so the O(databases) scan costs nothing that matters.
+  size_t mvcc_table_memory() const;
 
   // Creates a database with index `db_ind`. If such database exists does nothing.
   void ActivateDb(DbIndex db_ind);
@@ -730,11 +737,8 @@ class DbSlice {
   bool journal_omit_redundant_writes_ = true;
 
   // drakeydb: P4-1 Task 5. mvcc_enabled_ caches IsActiveReplica() once at construction -- Tasks
-  // 7-8's hot paths read this member, never the flag. mvcc_table_memory_ mirrors table_memory_
-  // but tracks DbTable::mvcc only (see the table_memory() comment on why the two must stay
-  // separate).
+  // 7-8's hot paths read this member, never the flag.
   bool mvcc_enabled_ = false;
-  size_t mvcc_table_memory_ = 0;
 
   struct Hash {
     size_t operator()(const facade::ConnectionRef& c) const {

@@ -569,6 +569,15 @@ auto DbSlice::GetStats() const -> Stats {
   return s;
 }
 
+size_t DbSlice::mvcc_table_memory() const {
+  size_t total = 0;
+  for (const auto& db : db_arr_) {
+    if (db)
+      total += db->mvcc_table_memory();
+  }
+  return total;
+}
+
 SlotStats DbSlice::GetSlotStats(SlotId sid) const {
   CHECK(db_arr_[0]);
   // slots_stats is null outside real cluster mode.
@@ -1139,7 +1148,6 @@ util::fb2::Fiber DbSlice::FlushDbIndexes(const std::vector<DbIndex>& indexes) {
     }
 
     table_memory_ -= db_arr_[index]->table_memory();
-    mvcc_table_memory_ -= db_arr_[index]->mvcc_table_memory();
     entries_count_ -= db_arr_[index]->prime.size();
 
     InvalidateDbWatches(index);
@@ -2135,7 +2143,6 @@ void DbSlice::CreateDb(DbIndex db_ind) {
   if (!db) {
     db.reset(new DbTable{owner_->memory_resource(), db_ind});
     table_memory_ += db->table_memory();
-    mvcc_table_memory_ += db->mvcc_table_memory();
   }
 }
 
