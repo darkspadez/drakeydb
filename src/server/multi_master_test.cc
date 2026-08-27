@@ -1112,31 +1112,35 @@ TEST_F(MvccStoreTest, DeleteErasesTheStamp) {
 // disarm, Commit writes a stamp for a key that is already gone.
 TEST_F(MvccStoreTest, DeleteInSameCallbackDoesNotResurrectAStamp) {
   Run({"set", "k", "v"});
+  // drakeydb: review fix round 1 (minor) -- guard the precondition. Without this, a total
+  // stamping failure (e.g. Arm/Commit wired wrong) would leave "k" unstamped from the SET
+  // already, and the EXPECT_FALSE below would pass for the wrong reason.
+  ASSERT_TRUE(StampOf("k").has_value());
   Run({"del", "k"});
   EXPECT_FALSE(StampOf("k").has_value())
       << "the DEL's own journal entry must not re-stamp the key it just removed";
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u);
 }
 
-// drakeydb: falsification note -- the brief's original body used "a"/"b". Verified empirically
-// (temporary LOG(WARNING) of Shard(key, shard_set->size()), see this task's report) that under
-// this fixture's shard count (2), Shard("a")=1 and Shard("b")=0: different shards, so RENAME
-// takes generic_family.cc's cross-shard Renamer path (RenameGeneric's GetUniqueShardCnt() != 1
-// branch), not the single-shard OpRen fast path the brief's comment describes. That path
-// resurfaces a pre-existing, out-of-scope bug: Renamer::DeserializeDest calls RecordJournal (and
-// so the MVCC commit) BEFORE the AutoUpdater returned by RdbRestoreValue::Add's AddOrUpdate has
-// run -- that only happens when the local OpResult<ItAndUpdater> goes out of scope at the
-// function's end, which is AFTER RecordJournal already fired. The destination key is armed too
-// late for its own commit to see, so it is left permanently unstamped. This is a write-path
-// ordering bug in RENAME/RESTORE's cross-shard code (generic_family.cc), not in this task's
-// delete-path Disarm/EraseMvcc -- out of scope here; flagged in the report instead of fixed.
-// "a" and "c" share a shard (both hash to 1), which exercises the single-shard OpRen path the
-// test is meant to cover and sidesteps the unrelated bug.
+// drakeydb: review fix round 1 (F1) -- "a"/"b" restored (the brief's original pair). Verified
+// empirically (temporary LOG(WARNING) of Shard(key, shard_set->size()); the reviewer separately
+// confirmed via XXH64(...) % 2) that under this fixture's shard count (2), Shard("a")=1 and
+// Shard("b")=0: different shards, so this exercises generic_family.cc's cross-shard Renamer
+// path (RenameGeneric's GetUniqueShardCnt() != 1 branch), not the single-shard OpRen fast path.
+// That path used to resurface a real bug: Renamer::DeserializeDest journaled the RESTORE before
+// add_res's AutoUpdater ran, so the destination was armed too late for its own commit to see it
+// and was left permanently unstamped -- fixed in this same round by an explicit
+// add_res->post_updater.Run() before RecordJournal (see generic_family.cc). An earlier version
+// of this test substituted a same-shard key ("a"/"c") specifically to avoid tripping over that
+// bug, which made the suite green without the bug being fixed -- exactly the "test routes around
+// a known failure" pattern this fork's review process exists to catch. Restored to "a"/"b" so
+// this test proves the fix instead of avoiding what it was meant to cover.
 TEST_F(MvccStoreTest, RenameMovesTheStampByRecreatingIt) {
   Run({"set", "a", "v"});
-  Run({"rename", "a", "c"});
+  ASSERT_TRUE(StampOf("a").has_value());
+  Run({"rename", "a", "b"});
   EXPECT_FALSE(StampOf("a").has_value());
-  ASSERT_TRUE(StampOf("c").has_value()) << "the destination is armed and committed by RENAME's "
+  ASSERT_TRUE(StampOf("b").has_value()) << "the destination is armed and committed by RENAME's "
                                            "own journal entry";
 }
 

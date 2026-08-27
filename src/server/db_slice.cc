@@ -1009,9 +1009,9 @@ void DbSlice::Del(Context cntx, Iterator it, DbTable* db_table, bool async, Dele
   PerformDeletionAtomic(it, table, async, reason);
 }
 
-void DbSlice::DelMutable(Context cntx, ItAndUpdater it_updater) {
+void DbSlice::DelMutable(Context cntx, ItAndUpdater it_updater, DeleteReason reason) {
   it_updater.post_updater.Run();
-  Del(cntx, it_updater.it);
+  Del(cntx, it_updater.it, nullptr, false, reason);
 }
 
 void DbSlice::FlushSlotsFb(const cluster::SlotSet& slot_ids, uint64_t next_version,

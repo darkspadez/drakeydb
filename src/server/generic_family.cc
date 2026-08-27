@@ -567,6 +567,21 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
     bc->Awaken(t->GetDbIndex(), dest_key_);
   }
 
+  // drakeydb: Phase 4, P4-1 Task 8 fix round 1 (F1) -- arm dest_key_ before it is journaled.
+  // add_res->post_updater is an AutoUpdater; left to its own destructor, it would not run until
+  // add_res goes out of scope at this function's closing brace, which is AFTER RecordJournal
+  // below. journal::RecordEntry's commit runs synchronously inside RecordJournal, against
+  // whatever is armed at that instant -- so without this explicit Run(), the commit sees an
+  // empty (or unrelated) arm list, and dest_key_ is never stamped, permanently, even though its
+  // RESTORE was propagated. That is the exact "propagated but not stamped" violation Task 7's
+  // central invariant forbids in the other direction. OpRen (this file, single-shard RENAME
+  // fast path) already runs its own destination's post_updater.Run() before deleting the source
+  // and returning -- mirroring that here, not inventing a new pattern. Safe: nothing below this
+  // point reads or mutates add_res->it, so running the updater now costs nothing and changes no
+  // other behavior (memory accounting and member_expire_count bookkeeping simply happen here
+  // instead of at the implicit destructor call a few lines later).
+  add_res->post_updater.Run();
+
   if (shard->journal()) {
     auto expire_str = absl::StrCat(serialized_value_->expire_ts);
 

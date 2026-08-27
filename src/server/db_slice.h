@@ -393,7 +393,12 @@ class DbSlice {
   // Deletes a key after FindMutable(). Runs post_updater before deletion
   // to update memory accounting while the key is still valid.
   // Takes ownership of it_updater (pass by value with move semantics).
-  void DelMutable(Context cntx, ItAndUpdater it_updater);
+  // drakeydb: Phase 4, P4-1 Task 8 fix round 1 (F2) -- reason defaults to kExplicit and forwards
+  // to Del, same as every other DbSlice delete entry point. Without this, all 23 DelMutable call
+  // sites were permanently kExplicit regardless of the real reason, defeating the enum's purpose
+  // of letting P4-5 branch on it without revisiting every call site a second time.
+  void DelMutable(Context cntx, ItAndUpdater it_updater,
+                  DeleteReason reason = DeleteReason::kExplicit);
 
   constexpr static DbIndex kDbAll = 0xFFFF;
 

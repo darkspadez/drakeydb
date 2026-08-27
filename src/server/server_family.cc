@@ -2448,7 +2448,7 @@ void ServerFamily::Shrink(facade::CmdArgParser parser, CommandContext* cmd_cntx)
       // Shrink expires entries during bucket compaction.  If all entries expired,
       // delete the now-empty key to prevent zombie keys that crash SAVE.
       if (ds->Empty()) {
-        db_slice.DelMutable(t->GetDbContext(), std::move(it_res));
+        db_slice.DelMutable(t->GetDbContext(), std::move(it_res), DbSlice::DeleteReason::kExpired);
         // The replayed SHRINK re-applies relative member TTLs against the replica clock
         // and cannot reproduce this deletion; journal it explicitly.
         if (shard->journal()) {
