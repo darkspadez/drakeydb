@@ -230,6 +230,21 @@ makes the stamp's ms field agree with `JournalItem::time_ms` by construction.
 Bonus: it honours `TEST_current_time_ms`, so every clock unit test is deterministic
 with no fake-clock injection point.
 
+**The clock is read by the caller, not inside `mvcc.cc`.** `MvccClock::Next`,
+`MvccClock::AheadMs`, `MvccStamper::HopStamp` and `MvccStamper::Commit` all take
+`now_ms` as a parameter; `mvcc.cc` does not include `engine_shard_set.h`. This is a
+link-layering requirement, not a style choice: `mvcc.cc` compiles into
+`dfly_transaction`, while `GetCurrentTimeMs()`'s `TEST_current_time_ms` is defined in
+`engine_shard.cc` in `dragonfly_lib`, and only the `dragonfly_lib -> dfly_transaction`
+edge is declared. Reaching up would require declaring a circular dependency between two
+upstream CMake targets — the largest available widening of the upstream merge surface,
+against this phase's global constraints. It also matches the fork's existing discipline
+(`engine_shard.cc` resolves `IsActiveReplica()` and passes a bool down through
+`DeleteExpiredOptions` rather than letting `db_slice` read the flag), and it makes the
+unit tests strictly more deterministic than mutating a process-global override.
+`JournalSlice::CallOnChange` already computes `GetCurrentTimeMs()` per journal entry, so
+the Phase 4 hook has the value in hand at the one site that needs it.
+
 ```cpp
 uint64_t MvccClock::Next(uint64_t now_ms) {
   const uint64_t cand = now_ms << 20;          // KeyDB layout: ms << 20 | counter
