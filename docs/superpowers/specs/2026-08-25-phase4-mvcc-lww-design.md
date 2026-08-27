@@ -227,8 +227,9 @@ wall clock. The cost is a non-issue because **the clock is read once per
 shard-callback, not once per write** (below), and `JournalSlice::CallOnChange`
 already calls `GetCurrentTimeMs()` per journal entry — using the same source also
 makes the stamp's ms field agree with `JournalItem::time_ms` by construction.
-Bonus: it honours `TEST_current_time_ms`, so every clock unit test is deterministic
-with no fake-clock injection point.
+It honours `TEST_current_time_ms`, which keeps the *integration*-level clock
+deterministic; the `mvcc_test` units do not rely on that, because they pass `now_ms`
+explicitly (see below).
 
 **The clock is read by the caller, not inside `mvcc.cc`.** `MvccClock::Next`,
 `MvccClock::AheadMs`, `MvccStamper::HopStamp` and `MvccStamper::Commit` all take
@@ -270,7 +271,7 @@ per-*key*: a 100-key `MSET` or a 50-command squashed `EXEC` consumes one value, 
 100 or 50. **Do not widen the counter** — KeyDB wire parity for P7 `mvcc-tstamp`
 ingest depends on `ms << 20 | counter`.
 
-**One stamp per shard-callback.** `MvccStamper::HopStamp()` memoises the value for
+**One stamp per shard-callback.** `MvccStamper::HopStamp(now_ms)` memoises the value for
 the current callback, with a self-healing backstop: if the memo is older than
 `kMaxEpochMs` (50 ms) it re-mints and increments `mvcc_stale_epoch`, so a missed
 epoch end degrades and is *visible* rather than silently reusing a stale stamp.
@@ -471,7 +472,7 @@ beside `repl_origin_idx` (`tx_base.h:76`) and copy it in
 
 #### Why author and applier stamps are bit-identical
 
-- **Author**: `entry.mvcc = HopStamp()`, `origin_idx = kSelfIdx` -> stores `{S, H_A}`.
+- **Author**: `entry.mvcc = HopStamp(GetCurrentTimeMs())`, `origin_idx = kSelfIdx` -> stores `{S, H_A}`.
 - **Applier**: the parsed entry's mvcc reaches `repl_mvcc`, so `RecordEntry` sees a
   non-zero value and does **not** re-mint; the authenticated link's
   `peer_origin_hash_` supplies A's uuid hash -> stores `{S, H_A}`. Identical.
