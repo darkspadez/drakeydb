@@ -1252,7 +1252,7 @@ TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
   ASSERT_EQ(rec.writes.size(), 1u);
   EXPECT_EQ(rec.writes[0].key, "k");
   EXPECT_EQ(rec.writes[0].db, 0) << "the surviving arm must be db=0; db=1 was the one "
-                                     "Disarm(1, \"k\") was supposed to remove";
+                                    "Disarm(1, \"k\") was supposed to remove";
 }
 
 // The bit-identity mechanism: several entries minted inside one callback share a stamp.
@@ -1289,7 +1289,7 @@ TEST(MvccStamperTest, PeerMvccIsNeverReminted) {
 
   ASSERT_EQ(rec.writes.size(), 1u);
   EXPECT_EQ(rec.writes[0].stamp.Mvcc(), 999u) << "an applied write keeps the author's stamp "
-                                                  "verbatim, or stamps inflate on every hop";
+                                                 "verbatim, or stamps inflate on every hop";
   EXPECT_EQ(rec.writes[0].stamp.origin_hash, 0xABCDEFu) << "and the author's origin, not ours";
 }
 
@@ -1522,8 +1522,8 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
 
 void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn armed a key -- Commit() is mid-iteration over "
-                                  "armed_/arena_, both of which this call can reallocate, "
-                                  "corrupting that iteration";
+                                 "armed_/arena_, both of which this call can reallocate, "
+                                 "corrupting that iteration";
   const uint32_t off = static_cast<uint32_t>(arena_.size());
   arena_.append(key);
   armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size())});
@@ -1531,7 +1531,7 @@ void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
 
 void MvccStamper::Disarm(DbIndex db_index, std::string_view key) {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn disarmed a key -- Commit() is mid-iteration over "
-                                  "armed_, which erase() would corrupt";
+                                 "armed_, which erase() would corrupt";
   for (auto it = armed_.begin(); it != armed_.end(); ++it) {
     if (it->db_index == db_index && ArmedKey(*it) == key) {
       armed_.erase(it);
@@ -1547,8 +1547,8 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
   // Both DCHECKs below are scoped to a non-empty commit (above): Commit(0, ...), or a re-entrant
   // Commit() call, against an empty arm list is a harmless no-op that never reaches here.
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn called Commit() re-entrantly -- the inner call's "
-                                  "armed_.clear()/arena_.clear() would corrupt the outer call's "
-                                  "still-in-progress iteration over the very same containers";
+                                 "armed_.clear()/arena_.clear() would corrupt the outer call's "
+                                 "still-in-progress iteration over the very same containers";
   // The only production call site mints (HopStamp, which cannot return 0) or forwards an applied
   // write's non-zero author stamp, under the same MvccEnabled() && COMMAND gate; Commit has no
   // clock of its own, so it cannot invent a stamp -- it can only store what it is given.
