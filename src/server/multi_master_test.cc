@@ -1451,6 +1451,101 @@ TEST_F(MvccStoreTest, AppliedWriteAppliesCorrectlyOnEveryShard) {
   }
 }
 
+namespace {
+// drakeydb: Phase 4, P4-1 Task 10 -- sums TEST_VerifyMvccTable(0) (db_slice.cc) across every
+// shard. Each shard's callback writes to its own index of `per_shard`, never a shared accumulator
+// -- shard_set->RunBriefInParallel dispatches onto each shard's own proactor thread, so a naive
+// `mismatches += ...` shared across threads would be a data race (this fixture does not pin
+// num_shards=1, unlike OriginJournalFamilyTest elsewhere in this file, so relying on it would be
+// exactly the single-proactor-only trap: it would happen to pass here but be silently wrong).
+// Routes through Namespace::GetDbSlice (the ReaperJournalFamilyTest precedent above in this
+// file), not a nonexistent EngineShard::db_slice() -- and deliberately through
+// GetDefaultNamespace() specifically, which is what makes TEST_VerifyMvccTable's own default-
+// namespace gate (db_slice.cc) actually engage here instead of short-circuiting to 0.
+size_t SumMvccMismatchesAcrossShards() {
+  std::vector<size_t> per_shard(shard_set->size(), 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    per_shard[shard->shard_id()] = db_slice.TEST_VerifyMvccTable(0);
+  });
+  size_t total = 0;
+  for (size_t m : per_shard)
+    total += m;
+  return total;
+}
+}  // namespace
+
+// drakeydb: Phase 4, P4-1 Task 10 -- the dense-invariant regression test: after a mixed
+// write/delete/rename workload, every live prime key must have exactly one mvcc stamp and every
+// stamp must have exactly one live prime key. TEST_VerifyMvccTable (db_slice.cc) does the real
+// work; this drives SET (arm+commit), DEL (PerformDeletionAtomic's EraseMvcc), and RENAME
+// (arms/commits the destination) against it in one interleaved pass.
+//
+// Falsifying: see task-10-report.md for the verbatim run -- commenting out the EraseMvcc call in
+// PerformDeletionAtomic (db_slice.cc) makes this fail with a non-zero mismatch count and
+// "mvcc: stamp with no live key" LOG(ERROR) lines, one per deleted key.
+TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
+  for (int i = 0; i < 200; ++i) {
+    Run({"set", absl::StrCat("k", i), "v"});
+    if (i % 7 == 0) {
+      // Rename the key just written -- renaming k(i-1) would hit one the i%3 branch deleted,
+      // and RENAME on a missing key errors.
+      Run({"rename", absl::StrCat("k", i), absl::StrCat("r", i)});
+    } else if (i % 3 == 0) {
+      Run({"del", absl::StrCat("k", i)});
+    }
+  }
+
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u)
+      << "every live key needs exactly one stamp, and vice versa";
+}
+
+// drakeydb: Phase 4, P4-1 Task 10 -- MEMORY DEFRAGSEGMENTS (memory_cmd.cc:346's
+// MemoryCmd::DefragmentSegments) is the ONLY caller of DbSlice::DefragTableSegments. DEBUG
+// COMPACT-TABLE is a different mechanism entirely (buddy-segment merging via
+// EngineShard::CompactTable) and would exercise none of the mirror loop this test targets -- using
+// it here would pass vacuously, never reaching DefragTableSegments at all.
+//
+// Falsifying: see task-10-report.md for the verbatim run. Commenting out the EraseMvcc call in
+// PerformDeletionAtomic reproduces the same "stamp with no live key" failure here as in
+// TableMatchesPrimeAfterMixedWorkload above, since this test's setup also deletes half its keys.
+TEST_F(MvccStoreTest, DefragRelocationPreservesStamps) {
+  for (int i = 0; i < 500; ++i)
+    Run({"set", absl::StrCat("k", i), std::string(200, 'x')});
+  for (int i = 0; i < 500; i += 2)
+    Run({"del", absl::StrCat("k", i)});
+
+  const auto before = *StampOf("k1");
+  Run({"memory", "defragsegments"});  // the ONLY caller of DefragTableSegments (memory_cmd.cc:346).
+                                      // NOT "debug compact-table", a different mechanism entirely.
+  EXPECT_EQ(*StampOf("k1"), before) << "defrag must not lose or corrupt stamps";
+
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: Phase 4, P4-1 Task 10 -- rdb_load.cc's CreateObjectOnShard inserts every loaded key
+// via DbSlice::AddOrUpdate, which never calls PostUpdate (AddOrUpdateInternal, db_slice.cc), so
+// without an explicit {0,0} stamp beside the SetMCFlag mirror there, a loaded key would be dense
+// in prime but absent from mvcc -- tripping OnCbFinishBlocking's DCHECK (db_slice.cc) on the very
+// next write after a DEBUG RELOAD or a replica full sync.
+//
+// Needs --dbfilename set, or DEBUG RELOAD silently no-ops (BaseFamilyTest::SetUpTestSuite sets it
+// to "" globally) -- that exact vacuous-test trap was caught on P4-0. Unique per pid, matching
+// ReaperJournalFamilyTest's two RDB round-trip tests above (this file), the working precedent this
+// follows: SetTestFlag alone is sufficient here (no ResetService/InitWithDbFilename needed)
+// because DoSave reads the flag live.
+TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
+  BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("mvcc_reload_test_", getpid()));
+
+  for (int i = 0; i < 100; ++i)
+    Run({"set", absl::StrCat("k", i), "v"});
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 100u)
+      << "a reload that leaves keys unstamped trips the dense invariant on the next write";
+  Run({"set", "after", "v"});  // must not DCHECK -- a debug build aborts the whole test binary,
+                               // not just this one test, if the invariant is violated here.
+}
+
 // The "off means byte-identical to upstream" guard.
 TEST_F(BaseFamilyTest, NonActiveModeAllocatesNoMvccTable) {
   Run({"set", "k", "v"});
@@ -2367,6 +2462,16 @@ TEST_F(ReaperJournalFamilyTest, ReaperDeleteBypassesChangeCallbacks) {
 // EXPECT_EQ(Run({"exists", "s2"}), 0) fail -- "s2" is never walked, never reaped, and stays a set
 // with one dead member forever. Verbatim output recorded in task-2b-report.md.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperCoversSetWithNotYetDueWholeKeyTtl) {
+  // drakeydb: Phase 4, P4-1 Task 10 -- needed once the dense mvcc invariant (db_slice.cc's
+  // OnCbFinishBlocking) exists: without a running journal, SADD/FIELDEXPIRE/EXPIRE below still
+  // arm (PostUpdate, gated only on mvcc_enabled_ -- this fixture is active_replica) but never
+  // commit (LogAutoJournalOnShard short-circuits with no shard->journal()), so EndOfWriteEpoch
+  // discards the arm and "s2" would end up live in prime with no mvcc stamp. This particular test
+  // stayed accidentally invariant-safe either way -- the reaper below deletes "s2" outright, and
+  // PerformDeletionAtomic's EraseMvcc is a harmless no-op against a key that was never stamped --
+  // but is fixed here too, matching the Hash test below (and every other stamp-observing test in
+  // this file), so neither depends on that coincidence.
+  shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
   ASSERT_EQ(Run({"sadd", "s2", "m1"}).GetInt(), 1);
   Run({"fieldexpire", "s2", "1", "m1"});
   ASSERT_EQ(Run({"expire", "s2", "100"}).GetInt(), 1);  // whole-key TTL, far from due
@@ -2390,6 +2495,16 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperCoversSetWithNotYetDueWholeKey
 // one not) so the container survives with the not-yet-due whole-key TTL and the surviving field
 // both intact -- not just the "whole container disappears" case the set test above covers.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperCoversHashWithNotYetDueWholeKeyTtl) {
+  // drakeydb: Phase 4, P4-1 Task 10 -- required, not cosmetic, here: unlike the Set test above,
+  // "h2" SURVIVES the reap (only its "gone" field is reaped; "keep" remains, hlen == 1), so
+  // without a running journal HSET's arm is discarded unstamped (see the Set test's comment for
+  // the full mechanism) and h2 stays permanently live-in-prime/absent-from-mvcc -- caught by the
+  // dense mvcc invariant (db_slice.cc's OnCbFinishBlocking) the moment any later command in this
+  // process (not even necessarily in this test) runs OnCbFinishBlocking again, e.g. the HLEN
+  // assertion below. Observed verbatim (this exact test, before this fix): `Check failed:
+  // dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (0 vs. 1)`, aborting the
+  // whole binary -- see task-10-report.md.
+  shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
   ASSERT_EQ(Run({"hset", "h2", "gone", "v1", "keep", "v2"}).GetInt(), 2);
   Run({"fieldexpire", "h2", "1", "gone"});
   ASSERT_EQ(Run({"expire", "h2", "100"}).GetInt(), 1);  // whole-key TTL, far from due
@@ -2773,6 +2888,14 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
 // silently if the default is ever retuned again. Pin it explicitly here, comfortably above
 // kFields, so this test asserts what it says it asserts regardless of the flag's current default.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
+  // drakeydb: Phase 4, P4-1 Task 10 -- same requirement as MemberExpiryReaperCoversHashWithNotYet
+  // DueWholeKeyTtl above (see that test's comment for the full mechanism): "bighash" survives the
+  // reap (partial), so its creating HSET needs a real committed stamp or the dense mvcc invariant
+  // aborts on the next OnCbFinishBlocking. Observed verbatim (this exact test, before this fix):
+  // `Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (0 vs. 1)`,
+  // aborting the whole binary from CmdHLen's OnCbFinishBlocking call below -- see
+  // task-10-report.md.
+  shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
   constexpr int kFields = 2000;
   const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
   absl::SetFlag(&FLAGS_reaper_member_walk_budget, 100000);
@@ -2822,6 +2945,11 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
 // A partial hash reap is a real document mutation even though it bypasses command callbacks.
 // Search postings must be removed before expired fields are freed and rebuilt from survivors.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperRefreshesHashSearchIndex) {
+  // drakeydb: Phase 4, P4-1 Task 10 -- same requirement as MemberExpiryReaperCoversHashWithNotYet
+  // DueWholeKeyTtl above (see that test's comment for the full mechanism): "reaper-doc:1"
+  // survives the reap ("keep" remains), so its creating HSET needs a real committed stamp or the
+  // dense mvcc invariant aborts on a later OnCbFinishBlocking (e.g. the HGET below).
+  shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
   EXPECT_EQ(Run({"FT.CREATE", "reaper-index", "ON", "HASH", "PREFIX", "1", "reaper-doc:", "SCHEMA",
                  "tag", "TAG"}),
             "OK");
@@ -2858,6 +2986,11 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperRefreshesHashSearchIndex) {
 // hand -- see task-2b-report.md) makes the EXEC below come back kExecFail instead of
 // kExecSuccess, purely from the reaper's own heartbeat-driven walk.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotSpuriouslyAbortWatch) {
+  // drakeydb: Phase 4, P4-1 Task 10 -- same requirement as MemberExpiryReaperCoversHashWithNotYet
+  // DueWholeKeyTtl above (see that test's comment for the full mechanism): "ws" survives the reap
+  // ("keep" remains), so its creating SADD needs a real committed stamp or the dense mvcc
+  // invariant aborts on a later OnCbFinishBlocking (e.g. the SCARD below).
+  shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
   const auto kExecSuccess = ArgType(RespExpr::ARRAY);
 
   ASSERT_EQ(Run({"sadd", "ws", "keep", "gone"}).GetInt(), 2);
@@ -2900,6 +3033,12 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotSpuriouslyAbortWatch) {
 // MemberExpiryReaperUnclearedFlagPreservesTtlAcrossRdbRoundTrip, that catches an incorrect
 // clear; see that test's own falsification.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperClearedFlagSurvivesRdbRoundTrip) {
+  // drakeydb: Phase 4, P4-1 Task 10 -- same requirement as MemberExpiryReaperCoversHashWithNotYet
+  // DueWholeKeyTtl above (see that test's comment for the full mechanism): "rdbhash" survives the
+  // reap ("keep" remains), so its creating HSET needs a real committed stamp or the dense mvcc
+  // invariant aborts on the HLEN/HGET reads below -- well before DEBUG RELOAD is ever reached
+  // (whose own AddOrUpdate path is already covered separately, by Step 3b's {0,0} stamp).
+  shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
   // debug reload needs a dbfilename (BaseFamilyTest's default fixtures leave it unset; only
   // RdbTest's own SetUp calls InitWithDbFilename() to arrange this) -- read live by DoSave, so
   // setting it here (no full service reset needed) is sufficient. Unique per test to avoid
@@ -2940,6 +3079,11 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperClearedFlagSurvivesRdbRoundTri
 // "later"'s TTL would be silently lost on reload -- the exact silent-data-corruption failure
 // mode the coordinator's review named, not a wrong metric.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperUnclearedFlagPreservesTtlAcrossRdbRoundTrip) {
+  // drakeydb: Phase 4, P4-1 Task 10 -- same requirement as MemberExpiryReaperCoversHashWithNotYet
+  // DueWholeKeyTtl above (see that test's comment for the full mechanism): "rdbhash2" survives
+  // the reap ("later" remains), so its creating HSET needs a real committed stamp or the dense
+  // mvcc invariant aborts on the HLEN/FIELDTTL reads below, well before DEBUG RELOAD.
+  shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
   // See the sibling test above for why this is needed.
   BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("reaper_rdb_test_uncleared_", getpid()));
   ASSERT_EQ(Run({"hset", "rdbhash2", "soon", "v1", "later", "v2"}).GetInt(), 2);

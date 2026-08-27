@@ -175,6 +175,20 @@ class MvccStamper {
     return clock_;
   }
 
+  // drakeydb: Phase 4, P4-1 Task 10 -- read-only probe for the narrow window where this epoch's
+  // arms exist but have not been committed (Commit()) or discarded (EndOfWriteEpoch()) yet.
+  // DbSlice::OnCbFinishBlocking (db_slice.cc) is the sole caller: it runs between a shard
+  // callback's own PostUpdate arms and LogAutoJournalOnShard's later Commit call --
+  // transaction.cc's RunCallback says so explicitly ("not inside OnCbFinishBlocking, which runs
+  // before the journal entry exists") -- so a same-callback dense-table check must skip while
+  // this is true, or it DCHECKs on every single write (observed: task-10-report.md). Never masks
+  // a real leak from an earlier, already-finished callback: EndOfWriteEpoch() unconditionally
+  // clears armed_ before RunCallback returns, so a non-empty armed_ can only belong to the
+  // callback that is, right now, still finishing.
+  bool HasArmedKeys() const {
+    return !armed_.empty();
+  }
+
   void TEST_Reset();
 
  private:

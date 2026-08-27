@@ -1345,6 +1345,28 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
   shard_set->pool()->AwaitBrief(
       [uuid = node_identity_.uuid](unsigned, auto*) { MvccStamper::tlocal()->SetSelfUuid(uuid); });
 
+  // drakeydb: Phase 4, P4-1 Task 10 -- an active-replica node's journal must be running from boot,
+  // not only once a peer/replica first attaches (DFLY FLOW admission, dflycmd.cc:340, or a
+  // partial-sync resume, replica.cc:1955). Without this, MvccStamper::Arm() (PostUpdate,
+  // db_slice.cc) still fires on every write -- gated only on mvcc_enabled_, which is cached from
+  // IsActiveReplica() alone -- but with no running journal, LogAutoJournalOnShard
+  // (transaction.cc) never reaches journal::RecordEntry, so the arm is never committed and
+  // EndOfWriteEpoch() silently discards it: any client write between boot and the first peer
+  // connection would be permanently unstamped, tripping the dense mvcc invariant
+  // (DbSlice::OnCbFinishBlocking) the moment any later command touches that key again -- observed
+  // via the pytest gate (not a unit test): test_active_replica_refuses_redis_master_without_uuid
+  // (multimaster_test.py) issues `SET local-only local` in exactly this window, before its
+  // (correctly refused) REPLICAOF attempt. See task-10-report.md for the verbatim crash. Safe to
+  // call unconditionally on every boot: JournalSlice::Init() (journal_slice.cc) is an explicit
+  // no-op on a second call, and its ring buffer is a fixed 8192-entry capacity, not proportional
+  // to anything unbounded -- there is no meaningful cost to a mesh node that never gets a peer.
+  // RunBriefInParallel (shard-scoped), not pool()->AwaitBrief like SetSelfUuid above:
+  // journal::StartInThread() dereferences EngineShard::tlocal(), which is null on a non-shard
+  // proactor thread, unlike MvccStamper::tlocal() (a plain thread_local with no such requirement).
+  if (IsActiveReplica()) {
+    shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
+  }
+
   // --replicaof: a non-active node replicates instead of loading a snapshot; an active node loads
   // its own snapshot first (drakeydb) and then attaches every target.
   if (ReplicaOfFlag flag = GetFlag(FLAGS_replicaof); flag.has_value()) {

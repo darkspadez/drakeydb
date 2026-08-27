@@ -374,6 +374,13 @@ class DbSlice {
   // (INFO/benchmark), never on a write path, so the O(databases) scan costs nothing that matters.
   size_t mvcc_table_memory() const;
 
+  // drakeydb: Phase 4, P4-1 Task 10 -- from-scratch dense-invariant proof: every live prime key
+  // has exactly one mvcc stamp, and every mvcc stamp has exactly one live prime key. O(table
+  // size); this is the test-only counterpart to the O(1) DCHECK in OnCbFinishBlocking
+  // (db_slice.cc), which this test coverage exists to justify trusting. Returns the mismatch
+  // count (0 == clean). Scoped to the default namespace -- see the comment on the definition.
+  size_t TEST_VerifyMvccTable(DbIndex db_ind) const;
+
   // Creates a database with index `db_ind`. If such database exists does nothing.
   void ActivateDb(DbIndex db_ind);
 

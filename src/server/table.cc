@@ -137,6 +137,7 @@ void DbTable::Clear() {
   stats = DbTableStats{};
   expire_cursor = PrimeTable::Cursor::end();
   segment_defrag_cursor = PrimeTable::Cursor::end();
+  mvcc_defrag_cursor = MvccTable::Cursor::end();
 }
 
 PrimeIterator DbTable::Launder(PrimeIterator it, string_view key) {

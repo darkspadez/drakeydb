@@ -580,6 +580,54 @@ size_t DbSlice::mvcc_table_memory() const {
   return total;
 }
 
+// drakeydb: Phase 4, P4-1 Task 10.
+//
+// Scoped to the default namespace for the same reason PostUpdate's F1 gate is (see that comment,
+// below in this file): DbTable::mvcc is allocated per-shard from the global IsActiveReplica()
+// flag (DbTable::DbTable, table.cc), not per-namespace, so a non-default namespace's mvcc table
+// exists but is never armed or stamped -- an ACL-namespaced client's write (reachable via
+// acl_family.cc's NAMESPACE: directive) would otherwise show up here as a permanent, spurious
+// "live key with no stamp" mismatch for every key it ever writes. That is a property of where
+// this namespace's writes are (never) armed, not a leak -- do not "fix" it by removing the scope.
+// See OnCbFinishBlocking for the O(1) production-path DCHECK this from-scratch check justifies.
+size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
+  if (ns_ != &namespaces->GetDefaultNamespace())
+    return 0;
+
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return 0;
+
+  size_t mismatches = 0;
+  string scratch;
+
+  // dash.h:355 -- Traverse is element-granular but bounded per call (it stops at the first
+  // non-empty logical bucket it finds); the returned cursor must be fed back in until it is
+  // exhausted (falsy) to guarantee full coverage. There is no CVisit / single-call whole-table
+  // form.
+  PrimeTable::Cursor prime_cursor;
+  do {
+    prime_cursor = db.prime.Traverse(prime_cursor, [&](auto it) {
+      if (db.mvcc->Find(it->first.GetSlice(&scratch)).is_done()) {
+        LOG(ERROR) << "mvcc: live key with no stamp: " << it->first.ToString();
+        ++mismatches;
+      }
+    });
+  } while (prime_cursor);
+
+  detail::DashCursor mvcc_cursor;
+  do {
+    mvcc_cursor = db.mvcc->Traverse(mvcc_cursor, [&](auto it) {
+      if (db.prime.Find(it->first.GetSlice(&scratch)).is_done()) {
+        LOG(ERROR) << "mvcc: stamp with no live key: " << it->first.ToString();
+        ++mismatches;
+      }
+    });
+  } while (mvcc_cursor);
+
+  return mismatches;
+}
+
 SlotStats DbSlice::GetSlotStats(SlotId sid) const {
   CHECK(db_arr_[0]);
   // slots_stats is null outside real cluster mode.
@@ -2494,6 +2542,28 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
       pt.TryRelocateSegment(segment->first);
   } while (cursor && !page_usage->QuotaDepleted());
   db_table->segment_defrag_cursor = cursor;
+
+  // drakeydb: Phase 4, P4-1 Task 10 -- mirrors the prime-table loop above for DbTable::mvcc.
+  // Nothing else relocates the side table's segments, so without this mirror it accumulates
+  // mimalloc fragmentation for the process's lifetime (the per-object defrag in engine_shard.cc
+  // does not help -- it relocates a PrimeValue's heap, and the side table holds its own key
+  // copy). Absent on a non-active node. Shares page_usage's quota with the prime loop above
+  // (deliberately -- one call, one total defrag budget, regardless of which table it spends it
+  // on), so this loop may do nothing if the prime loop above already exhausted it.
+  if (!db_table->mvcc)
+    return;
+
+  auto& mt = *db_table->mvcc;
+  detail::DashCursor mvcc_cursor = db_table->mvcc_defrag_cursor;
+  do {
+    // Same non-yield requirement as the prime loop above -- see that comment.
+    FiberAtomicGuard g;
+    const auto [next, segment] = mt.VisitSegment(mvcc_cursor);
+    mvcc_cursor = next;
+    if (segment && page_usage->IsPageForObjectUnderUtilized(segment->second))
+      mt.TryRelocateSegment(segment->first);
+  } while (mvcc_cursor && !page_usage->QuotaDepleted());
+  db_table->mvcc_defrag_cursor = mvcc_cursor;
 }
 
 // drakeydb: Phase 4, P4-1 Task 8 -- `reason` is threaded through Del/PerformDeletionAtomic and
@@ -2638,6 +2708,41 @@ void DbSlice::OnCbFinishBlocking() {
       }
     }
   }
+
+#ifndef NDEBUG
+  // drakeydb: Phase 4, P4-1 Task 10 -- cheap O(1) dense invariant: the mvcc side table must hold
+  // exactly one entry per live prime key (TEST_VerifyMvccTable, above in this file, is the O(size)
+  // from-scratch proof this is derived from -- falsify by commenting out EraseMvcc in
+  // PerformDeletionAtomic, below in this file; see task-10-report.md for the observed failure).
+  // mvcc_tombstones stays 0 until P4-5 gives kExplicit/kExpired deletes a tombstone instead of an
+  // erase.
+  //
+  // Gated on !HasArmedKeys(): this function runs between the shard callback's own PostUpdate
+  // arms and LogAutoJournalOnShard's later Commit call that actually writes the stamp
+  // (transaction.cc's RunCallback documents this ordering explicitly -- "not inside
+  // OnCbFinishBlocking, which runs before the journal entry exists"). Without this guard the
+  // DCHECK below fires on every single write, arm ahead of commit, every time -- observed
+  // verbatim on the very first non-trivial test run (task-10-report.md); this is not a defensive
+  // guard against a hypothetical, it is the fix for that crash. See MvccStamper::HasArmedKeys
+  // (mvcc.h) for why this never masks a real leak from an earlier, already-settled callback.
+  //
+  // Scoped to the default namespace for the same reason PostUpdate's F1 gate is (see that
+  // comment, above in this file): DbTable::mvcc is allocated per-shard from the global
+  // IsActiveReplica() flag (DbTable::DbTable, table.cc), not per-namespace, so a non-default
+  // namespace has a populated prime table but a permanently empty, never-armed mvcc table --
+  // reachable by any ACL-namespaced client via acl_family.cc's NAMESPACE: directive. Without this
+  // scope, that client's very first write would trip the DCHECK below. This is a property of
+  // where writes get armed, not a leak -- do not "fix" it by removing the scope; see
+  // TEST_VerifyMvccTable for the identical guard, with the longer version of this comment.
+  if (mvcc_enabled_ && ns_ == &namespaces->GetDefaultNamespace() &&
+      !MvccStamper::tlocal()->HasArmedKeys()) {
+    for (const auto& dbp : db_arr_) {
+      if (!dbp || !dbp->mvcc)
+        continue;
+      DCHECK_EQ(dbp->mvcc->size() - dbp->stats.mvcc_tombstones, dbp->prime.size());
+    }
+  }
+#endif
 
   // Sends only if !pending_send_map_.empty()
   SendQueuedInvalidationMessages();

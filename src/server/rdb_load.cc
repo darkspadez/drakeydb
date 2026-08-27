@@ -3274,6 +3274,15 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     db_slice->SetMCFlag(db_cntx.db_index, updater.it->first, item->mc_flags);
   }
 
+  // drakeydb: Phase 4, P4-1 Task 10 -- an unversioned snapshot carries no stamp, and D-7 specifies
+  // {0,0} as its fallback: it never fabricates authority the snapshot does not contain, and any
+  // stamped resident value beats it on merge. P4-2 overwrites this with the persisted stamp when
+  // the RDB_OPCODE_DF_MVCC record is present. Unconditional (unlike the mc_flags mirror above):
+  // every loaded key needs an entry for the mvcc table to stay dense, not just ones with a flag.
+  // SetMvcc no-ops when db.mvcc is absent (non-active node), so this costs one predictable branch
+  // there.
+  db_slice->SetMvcc(db_cntx.db_index, updater.it->first, MvccStamp{});
+
   if (!override_existing_keys_ && !updater.is_new) {
     LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind << " of type "
                  << updater.it->second.ObjType();

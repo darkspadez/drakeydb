@@ -163,6 +163,11 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
   std::unique_ptr<SlotStats[]> slots_stats;
   PrimeTable::Cursor expire_cursor;
   PrimeTable::Cursor segment_defrag_cursor;
+  // drakeydb: Phase 4, P4-1 Task 10 -- mirrors segment_defrag_cursor above, but for DbTable::mvcc.
+  // DefragTableSegments's prime-table loop relocates prime segments only; nothing else relocates
+  // the side table's, so without a second cursor here it accumulates mimalloc fragmentation for
+  // the process's lifetime. See DbSlice::DefragTableSegments (db_slice.cc).
+  MvccTable::Cursor mvcc_defrag_cursor;
 
   struct SampleTopKeys {
     TopKeys* top_keys = nullptr;
