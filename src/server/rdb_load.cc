@@ -3003,6 +3003,10 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
     }
 
     DVLOG(2) << "Executing item: " << entry.ToString();
+    // drakeydb: Phase 4 -- per-entry, mirroring SetApplyOrigin's one-time-per-loader call above:
+    // the author's stamp so this apply path also stores it verbatim (see
+    // JournalExecutor::SetApplyMvcc's doc comment).
+    journal_executor_->SetApplyMvcc(entry.mvcc);
     journal_executor_->Execute(entry.dbid, entry.cmd);
   }
 

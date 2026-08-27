@@ -267,6 +267,16 @@ class Replica : ProtocolClient {
   // pulling that header into this one just for a constant.
   uint32_t peer_origin_idx_ = 0;
 
+  // drakeydb: Phase 4 -- the AUTHOR's hash, threaded to each DflyShardReplica (InitiateDflySync)
+  // the same way peer_origin_idx_ above is, and registered there with MvccStamper so an applied
+  // write's origin_idx resolves back to this hash. It cannot come from the wire:
+  // journal::PassesPeerEchoFilter (journal/types.cc) forwards only self-origin entries, so every
+  // COMMAND arriving on a peer link carries origin_idx == 0 (the sender's own kSelfIdx), not an
+  // index PeerRegistry could resolve to the true author. Under no-forward v1 the sender IS the
+  // author on the streaming path, so the link's own uuid is the correct source. Stays at its
+  // default for a non-peer Replica, matching peer_origin_idx_'s own convention.
+  uint64_t peer_origin_hash_ = 0;
+
   // drakeydb: P4-0 -- signed skew (peer - local, ms) computed in Greet() from
   // master_context_.master_clock_ms right after the handshake sets it; see ComputeClockSkewMs
   // (multi_master.h). Atomic: read from the INFO fiber via GetSummary(), written from the
@@ -304,9 +314,17 @@ class DflyShardReplica : public ProtocolClient {
   // (see peer_mode_ below) rather than forwarded once and forgotten: it is consulted repeatedly,
   // later, by StableSyncDflyReadFb, both to select TransactionReader's adopt-vs-compare behavior
   // for Op::LSN and to gate AdoptAuthoritativeLsn().
+  // `origin_hash`: drakeydb: Phase 4 -- the AUTHOR's hash for `origin_idx` (Replica's own
+  // peer_origin_hash_; see its doc comment for why this can't come from the wire). Registered
+  // with MvccStamper at construction, beside executor_->SetApplyOrigin(origin_idx) above, so an
+  // applied write's origin_idx resolves back to this hash instead of the unregistered default of
+  // 0. Trailing with a default (unlike origin_idx/peer_mode) so pre-existing direct-construction
+  // callers (peer_replication_test.cc's friended fixtures, which predate this parameter and don't
+  // exercise MvccStamper) do not need updating.
   DflyShardReplica(ServerContext server_context, MasterContext master_context, uint32_t flow_id,
                    Service* service, std::shared_ptr<MultiShardExecution> multi_shard_exe,
-                   class RdbLoadContext* load_context, uint32_t origin_idx, bool peer_mode);
+                   class RdbLoadContext* load_context, uint32_t origin_idx, bool peer_mode,
+                   uint64_t origin_hash = 0);
   ~DflyShardReplica();
 
   void Cancel();

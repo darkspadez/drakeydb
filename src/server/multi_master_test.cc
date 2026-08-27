@@ -714,6 +714,34 @@ class MvccStoreTest : public BaseFamilyTest {
     });
     return out;
   }
+
+  // drakeydb: Phase 4 Task 9 -- drives a JournalExecutor exactly the way a peer link's applier
+  // does (SetApplyOrigin + SetApplyMvcc before Execute), tagging the command as authored by
+  // `origin_idx` with author stamp `mvcc`. There is no shared harness for this: the same
+  // SetApplyOrigin+Execute shape is inlined per-test at OriginJournalFamilyTest's
+  // ApplyOriginTagsJournalEntries (this file) -- copied here rather than reused, since that
+  // fixture pins num_shards=1 and never sets FLAGS_active_replica, unlike this one. Constructed
+  // and driven on shard 0's own proactor thread via LaunchFiber, not shard_set->Await: Execute()
+  // calls into Service::DispatchCommand, which needs ServerState::tlocal() to resolve on the
+  // calling thread, and shard_set->Await would run this directly on shard 0's own
+  // TxQueue-processing fiber, self-deadlocking the moment a dispatched command needs that same
+  // queue to schedule a hop.
+  facade::DispatchResult ApplyReplicatedCommand(std::vector<std::string> args, uint32_t origin_idx,
+                                                uint64_t mvcc) {
+    facade::DispatchResult dispatch_result = facade::DispatchResult::ERROR;
+    pp_->at(0)
+        ->LaunchFiber([&] {
+          JournalExecutor executor(service_.get());
+          executor.SetApplyOrigin(origin_idx);
+          executor.SetApplyMvcc(mvcc);
+
+          journal::ParsedEntry::CmdData cmd_data;
+          cmd_data.Assign(args.begin(), args.end(), args.size());
+          dispatch_result = executor.Execute(0, cmd_data);
+        })
+        .Join();
+    return dispatch_result;
+  }
 };
 
 TEST_F(MvccStoreTest, SideTableIsAllocatedInActiveMode) {
@@ -1251,6 +1279,29 @@ TEST_F(MvccStoreTest, ZunionstoreStampsTheDestinationAcrossTwoJournalEntries) {
   ASSERT_TRUE(after.has_value());
   EXPECT_TRUE(*before < *after) << "ZUNIONSTORE's own journal entry must mint a fresh, strictly "
                                    "newer stamp for dest via its two-entry DEL+ZADD path";
+}
+
+// drakeydb: Phase 4 Task 9 -- the phase's acceptance criterion: an applied write carries the
+// author's stamp verbatim, not a freshly-minted local one, and records the AUTHOR's origin hash,
+// not the applier's own. Falsifying (see task-9-report.md for the verbatim run): removing the
+// executor_->SetApplyMvcc(tx_data.mvcc) call in DflyShardReplica::ExecuteTx (replica.cc) leaves
+// JournalExecutor's ConnectionContext::repl_mvcc at its 0 default, so RecordEntry's
+// `entry.mvcc == 0` test (journal.cc) is true and it mints a fresh HopStamp instead of storing
+// kAuthorMvcc, failing the first EXPECT_EQ below.
+TEST_F(MvccStoreTest, AppliedWriteKeepsAuthorStampVerbatim) {
+  constexpr uint64_t kAuthorMvcc = 0x1234'5678'9ABCULL;
+  constexpr uint32_t kPeerIdx = 3;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-0000-4000-8000-00000000000b");
+
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
+  ApplyReplicatedCommand({"set", "k", "v"}, kPeerIdx, kAuthorMvcc);
+
+  auto st = StampOf("k");
+  ASSERT_TRUE(st.has_value());
+  EXPECT_EQ(st->Mvcc(), kAuthorMvcc) << "the applier must not re-mint -- stamps would otherwise "
+                                        "inflate on every replication hop";
+  EXPECT_EQ(st->origin_hash, peer_hash) << "and must record the AUTHOR, not itself";
 }
 
 // The "off means byte-identical to upstream" guard.

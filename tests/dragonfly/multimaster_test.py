@@ -2164,3 +2164,30 @@ async def test_member_expiry_reaper_covers_namespaces_and_zero_budget(
         "FT.SEARCH", "reaper-namespace-index", "@tag:{red}", "NOCONTENT"
     )
     assert default_search[0] == 1
+
+
+# drakeydb: Phase 4 Task 9. DEBUG MVCC lands in Task 11 -- this test is written now (per that
+# task's plan) and stays skipped until Task 11 removes the skip as its last step.
+@pytest.mark.skip(reason="needs DEBUG MVCC from task 11")
+async def test_replicated_key_stamp_matches_origin(df_factory):
+    """The phase's headline criterion. Falsified by removing SetApplyMvcc in replica.cc:
+    B then mints its own stamp and the mvcc values differ."""
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+    attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+
+    await c_a.execute_command("set", "k", "v")
+    await assert_eventually(lambda: _exists(c_b, "k"))
+
+    stamp_a = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
+    stamp_b = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
+    assert stamp_a["mvcc"] == stamp_b["mvcc"], f"{stamp_a} != {stamp_b}"
+    assert stamp_a["origin"] == stamp_b["origin"], "both must name A as the author"
+
+
+def _parse_mvcc(reply) -> dict:
+    text = reply.decode() if isinstance(reply, bytes) else reply
+    return dict(part.split(":", 1) for part in text.split())

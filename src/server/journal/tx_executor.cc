@@ -76,6 +76,9 @@ void TransactionData::AddEntry(journal::ParsedEntry&& entry) {
       command = std::move(entry.cmd);
       dbid = entry.dbid;
       txid = entry.txid;
+      // drakeydb: Phase 4 -- carry the author's stamp inbound; see TransactionData::mvcc.
+      mvcc = entry.mvcc;
+      entry_flags = entry.entry_flags;
       return;
     default:
       DCHECK(false) << "Unsupported opcode";

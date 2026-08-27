@@ -37,6 +37,7 @@ extern "C" {
 #include "server/journal/serializer.h"
 #include "server/main_service.h"
 #include "server/multi_master.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/node_identity.h"
 #include "server/peer_replication.h"
@@ -499,6 +500,10 @@ error_code Replica::Greet() {
     }
     if (peer_mode_->registry)
       peer_origin_idx_ = peer_mode_->registry->AddOrGet(master_context_.master_node_uuid);
+    // drakeydb: Phase 4 -- the AUTHOR's hash. It cannot come from the wire: PassesPeerEchoFilter
+    // forwards only self-origin entries, so every COMMAND arriving here carries origin_idx == 0.
+    // Under no-forward v1 the sender is the author, so the link's uuid is the correct source.
+    peer_origin_hash_ = NodeUuidHash(master_context_.master_node_uuid);
   } else if (IsPeerMode()) {
     // drakeydb: D2b -- peer mode now requires a uuid. Without one there is no origin to stamp,
     // and stamping kSelfIdx would make this active node forward the source's writes back out to
@@ -793,7 +798,7 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
     }
     shard_flows_[i].reset(new DflyShardReplica(server(), master_context_, i, &service_,
                                                multi_shard_exe_, load_context.get(),
-                                               peer_origin_idx_, IsPeerMode()));
+                                               peer_origin_idx_, IsPeerMode(), peer_origin_hash_));
     if (partial_sync_lsn > 0) {
       shard_flows_[i]->SetRecordsExecuted(partial_sync_lsn);
     }
@@ -1535,7 +1540,7 @@ DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext m
                                    uint32_t flow_id, Service* service,
                                    std::shared_ptr<MultiShardExecution> multi_shard_exe,
                                    RdbLoadContext* load_context, uint32_t origin_idx,
-                                   bool peer_mode)
+                                   bool peer_mode, uint64_t origin_hash)
     : ProtocolClient(server_context),
       service_(*service),
       master_context_(master_context),
@@ -1547,6 +1552,11 @@ DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext m
   // here at flow setup, not per entry. Also read back by StableSyncDflyReadFb's PING re-record
   // below, via executor_->connection_context()->repl_origin_idx.
   executor_->SetApplyOrigin(origin_idx);
+  // drakeydb: Phase 4 -- registers this flow's origin_idx -> author hash mapping so an applied
+  // write's Commit (journal.cc's RecordEntry, via MvccStamper::OriginHash) resolves the real
+  // author instead of the unregistered default of 0. See Replica::peer_origin_hash_'s doc
+  // comment for why this must come from the link's own uuid rather than the wire.
+  MvccStamper::tlocal()->RegisterOriginHash(origin_idx, origin_hash);
   rdb_loader_ = std::make_unique<RdbLoader>(&service_, load_context);
   rdb_loader_->SetLoadUnownedSlots(true);
   rdb_loader_->SetShardCount(master_context.num_flows);
@@ -1574,6 +1584,10 @@ bool DflyShardReplica::ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx
     // (logger disabled) is cheap. Log before Execute so a crash during execute
     // still leaves the record on disk for post-mortem replay.
     facade::Connection::LogReplicaCommand(tx_data.command, tx_data.dbid);
+    // drakeydb: Phase 4 -- per-entry, unlike SetApplyOrigin above: the author's stamp must be set
+    // fresh before every Execute() so RecordEntry stores it verbatim instead of minting a local
+    // one (see JournalExecutor::SetApplyMvcc's doc comment).
+    executor_->SetApplyMvcc(tx_data.mvcc);
     return executor_->Execute(tx_data.dbid, tx_data.command) == facade::DispatchResult::OK;
   }
 
@@ -1605,6 +1619,8 @@ bool DflyShardReplica::ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx
     // Global command — log exactly once (only the inserter flow runs Execute,
     // so this guard naturally dedups across per-shard flows).
     facade::Connection::LogReplicaCommand(tx_data.command, tx_data.dbid);
+    // drakeydb: Phase 4 -- see the non-global path above for why this is per-entry.
+    executor_->SetApplyMvcc(tx_data.mvcc);
     execution_res = executor_->Execute(tx_data.dbid, tx_data.command) == facade::DispatchResult::OK;
   }
   // Wait until exection is done, to make sure we done execute next commands while the global is
