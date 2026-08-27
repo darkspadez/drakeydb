@@ -152,8 +152,11 @@ class MvccStamper {
   // an applied write's verbatim author stamp -- both under the same MvccEnabled() && COMMAND gate,
   // so Commit itself never mints (DCHECK'd in the .cc). Clears the arm list.
   //
-  // fn must not call Arm(): Commit is mid-iteration over armed_/arena_, both of which Arm() can
-  // reallocate, invalidating the iterator and the string_view key fn was just handed.
+  // fn must not call Arm(), Disarm(), or Commit(): this call is mid-iteration over armed_/arena_,
+  // and any of the three would corrupt that iteration -- Arm()/a nested Commit() by reallocating
+  // arena_ (invalidating the string_view key fn was just handed) and/or armed_ (invalidating the
+  // iterator), Disarm() by erasing from armed_ out from under it. All three are DCHECK'd in the
+  // .cc via commit_depth_.
   void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn);
 
   void EndOfWriteEpoch();
@@ -189,7 +192,13 @@ class MvccStamper {
   std::vector<Armed> armed_;
   std::vector<uint64_t> origin_hash_cache_;  // dense by origin_idx; index 0 == self
   Stats stats_;
-  bool in_commit_ = false;  // reentrancy guard for Arm(); see Commit()'s comment above
+  // >0 while Commit() is mid-iteration over armed_/arena_. Guards Arm(), Disarm(), and a
+  // re-entrant Commit() call from a CommitFn -- see Commit()'s comment above for why each would
+  // corrupt that iteration. A counter, not a bool: a bool reentrancy flag reset by an inner
+  // Commit() call on return would stop guarding Arm()/Disarm() calls still made by the outer,
+  // still-running one. RAII'd (absl::Cleanup, in the .cc) around the loop, not a bare decrement
+  // after it, so a throwing fn still leaves this at 0 rather than stuck positive forever.
+  int commit_depth_ = 0;
 };
 
 }  // namespace dfly

@@ -285,4 +285,56 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
     EXPECT_EQ(rec.writes[i].key, keys[i]) << "arm " << i << " was corrupted by later growth";
 }
 
+// ---------------------------------------------------------------------------
+// commit_depth_ reentrancy guard: fix round 2, findings 1(a) (exception safety) and 1(b)
+// (nesting-awareness). DCHECKs active in debug builds only.
+// ---------------------------------------------------------------------------
+
+// Hole 1(a): commit_depth_ must unwind via RAII even if fn throws -- e.g. SetMvcc's side-table
+// insert hitting bad_alloc, once Task 7 wires it -- or one transient failure leaves every
+// subsequent Arm()/Disarm()/Commit() DCHECK-aborting forever.
+TEST(MvccStamperTest, CommitDepthRecoversAfterCommitFnThrows) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+  EXPECT_THROW(
+      s->Commit(1, 0, [](DbIndex, std::string_view, const MvccStamp&) { throw std::bad_alloc{}; }),
+      std::bad_alloc);
+
+  // If commit_depth_ had leaked at 1 above, this would DCHECK-abort the whole test binary in a
+  // debug build -- there is no way to observe a leaked guard other than the process not dying.
+  s->Arm(0, "k2");
+}
+
+#ifndef NDEBUG
+// Hole 1(b): a CommitFn that called Commit() again used to clear armed_/arena_ out from under the
+// outer call's still-in-progress iteration (UB), and reset the old bool-typed guard to false on
+// return, so a later Arm()/Disarm() in the still-running outer loop went uncaught too.
+// commit_depth_ closes this: Commit() now DCHECK_EQ(commit_depth_, 0)s at its own entry, so the
+// inner call dies before it ever touches armed_ or arena_.
+//
+// EXPECT_DEBUG_DEATH runs `statement` in-process, without forking or checking for death, when
+// NDEBUG is defined (DCHECK is a no-op there) -- and the corruption this guards against is
+// genuine UB, so this whole test is compiled only in a debug build, where the forked child dies
+// at the DCHECK before doing any damage.
+TEST(MvccStamperDeathTest, ReentrantCommitDies) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+  EXPECT_DEBUG_DEATH(s->Commit(1, 0,
+                               [s](DbIndex, std::string_view, const MvccStamp&) {
+                                 s->Commit(2, 0,
+                                           [](DbIndex, std::string_view, const MvccStamp&) {});
+                               }),
+                     "re-entrantly");
+}
+
+// The hazard Commit()'s own doc comment names first: "fn must not call Arm()".
+TEST(MvccStamperDeathTest, ArmFromCommitFnDies) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+  EXPECT_DEBUG_DEATH(
+      s->Commit(1, 0, [s](DbIndex, std::string_view, const MvccStamp&) { s->Arm(0, "reentrant"); }),
+      "mid-iteration");
+}
+#endif  // NDEBUG
+
 }  // namespace dfly

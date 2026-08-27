@@ -1108,7 +1108,7 @@ git add -A && git commit -m "feat: add MvccClock and MvccStamp value types (P4)"
 `Commit` takes a callback rather than touching `DbSlice`, so this whole task stays
 testable with no shard set and no database. Task 7 supplies the real callback.
 
-**Four design points that are load-bearing, not stylistic:**
+**Five design points that are load-bearing, not stylistic:**
 
 1. **The hop memo.** `HopStamp(now_ms)` returns the *same* value for every call within
    one shard-callback. This is what makes author and applier agree when the author
@@ -1143,6 +1143,17 @@ testable with no shard set and no database. Task 7 supplies the real callback.
    This makes "a key's stamp advances iff that same stamp is propagated" (the class's
    own contract comment, above) structural instead of conventional: `Commit` is no
    longer *able* to invent a stamp that differs from the one on the wire.
+5. **`commit_depth_` is a counter, RAII'd, not a bare bool.** Fix round 2 found two holes in an
+   earlier bool-typed `in_commit_` reentrancy guard: (a) a bare `in_commit_ = false` after the
+   loop is not exception-safe -- a throwing `fn` (a realistic `bad_alloc` from a side-table
+   insert) would leave it stuck `true`, DCHECK-aborting every subsequent `Arm()` forever;
+   (b) a bool reset by an *inner* `Commit()` call on return stops guarding `Arm()`/`Disarm()`
+   calls the *outer*, still-running call still makes -- and the inner call's own
+   `armed_.clear()`/`arena_.clear()` already corrupts the outer's iteration regardless.
+   `commit_depth_` (an `int`) fixes both: `Commit()` itself now `DCHECK_EQ(commit_depth_, 0)`s
+   at entry (catching a re-entrant `Commit()` immediately, before it can touch either
+   container), `Arm()`/`Disarm()` DCHECK the same, and `absl::Cleanup` unwinds the increment
+   even if `fn` throws.
 
 **Arming must not allocate.** libstdc++ SSO holds 15 chars, so a `std::string` per arm
 would allocate on every write to a 16-byte key. Use a reused arena plus `(offset, len)`
@@ -1302,6 +1313,58 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
   for (int i = 0; i < 256; ++i)
     EXPECT_EQ(rec.writes[i].key, keys[i]) << "arm " << i << " was corrupted by later growth";
 }
+
+// ---------------------------------------------------------------------------
+// commit_depth_ reentrancy guard: fix round 2, findings 1(a) (exception safety) and 1(b)
+// (nesting-awareness). DCHECKs active in debug builds only.
+// ---------------------------------------------------------------------------
+
+// Hole 1(a): commit_depth_ must unwind via RAII even if fn throws -- e.g. SetMvcc's side-table
+// insert hitting bad_alloc, once Task 7 wires it -- or one transient failure leaves every
+// subsequent Arm()/Disarm()/Commit() DCHECK-aborting forever.
+TEST(MvccStamperTest, CommitDepthRecoversAfterCommitFnThrows) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+  EXPECT_THROW(
+      s->Commit(1, 0, [](DbIndex, std::string_view, const MvccStamp&) { throw std::bad_alloc{}; }),
+      std::bad_alloc);
+
+  // If commit_depth_ had leaked at 1 above, this would DCHECK-abort the whole test binary in a
+  // debug build -- there is no way to observe a leaked guard other than the process not dying.
+  s->Arm(0, "k2");
+}
+
+#ifndef NDEBUG
+// Hole 1(b): a CommitFn that called Commit() again used to clear armed_/arena_ out from under the
+// outer call's still-in-progress iteration (UB), and reset the old bool-typed guard to false on
+// return, so a later Arm()/Disarm() in the still-running outer loop went uncaught too.
+// commit_depth_ closes this: Commit() now DCHECK_EQ(commit_depth_, 0)s at its own entry, so the
+// inner call dies before it ever touches armed_ or arena_.
+//
+// EXPECT_DEBUG_DEATH runs `statement` in-process, without forking or checking for death, when
+// NDEBUG is defined (DCHECK is a no-op there) -- and the corruption this guards against is
+// genuine UB, so this whole test is compiled only in a debug build, where the forked child dies
+// at the DCHECK before doing any damage.
+TEST(MvccStamperDeathTest, ReentrantCommitDies) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+  EXPECT_DEBUG_DEATH(s->Commit(1, 0,
+                               [s](DbIndex, std::string_view, const MvccStamp&) {
+                                 s->Commit(2, 0,
+                                           [](DbIndex, std::string_view, const MvccStamp&) {});
+                               }),
+                     "re-entrantly");
+}
+
+// The hazard Commit()'s own doc comment names first: "fn must not call Arm()".
+TEST(MvccStamperDeathTest, ArmFromCommitFnDies) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+  EXPECT_DEBUG_DEATH(
+      s->Commit(1, 0, [s](DbIndex, std::string_view, const MvccStamp&) { s->Arm(0, "reentrant"); }),
+      "mid-iteration");
+}
+#endif  // NDEBUG
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -1369,8 +1432,11 @@ class MvccStamper {
   // an applied write's verbatim author stamp -- both under the same MvccEnabled() && COMMAND gate,
   // so Commit itself never mints (DCHECK'd in the .cc). Clears the arm list.
   //
-  // fn must not call Arm(): Commit is mid-iteration over armed_/arena_, both of which Arm() can
-  // reallocate, invalidating the iterator and the string_view key fn was just handed.
+  // fn must not call Arm(), Disarm(), or Commit(): this call is mid-iteration over armed_/arena_,
+  // and any of the three would corrupt that iteration -- Arm()/a nested Commit() by reallocating
+  // arena_ (invalidating the string_view key fn was just handed) and/or armed_ (invalidating the
+  // iterator), Disarm() by erasing from armed_ out from under it. All three are DCHECK'd in the
+  // .cc via commit_depth_.
   void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn);
 
   void EndOfWriteEpoch();
@@ -1406,15 +1472,24 @@ class MvccStamper {
   std::vector<Armed> armed_;
   std::vector<uint64_t> origin_hash_cache_;  // dense by origin_idx; index 0 == self
   Stats stats_;
-  bool in_commit_ = false;  // reentrancy guard for Arm(); see Commit()'s comment above
+  // >0 while Commit() is mid-iteration over armed_/arena_. Guards Arm(), Disarm(), and a
+  // re-entrant Commit() call from a CommitFn -- see Commit()'s comment above for why each would
+  // corrupt that iteration. A counter, not a bool: a bool reentrancy flag reset by an inner
+  // Commit() call on return would stop guarding Arm()/Disarm() calls still made by the outer,
+  // still-running one. RAII'd (absl::Cleanup, in the .cc) around the loop, not a bare decrement
+  // after it, so a throwing fn still leaves this at 0 rather than stuck positive forever.
+  int commit_depth_ = 0;
 };
 ```
 
 - [ ] **Step 4: Implement it in `mvcc.cc`**
 
 ```cpp
-// (add to mvcc.cc -- needs "base/logging.h" for DCHECK; no "server/engine_shard_set.h":
-// HopStamp takes now_ms as a parameter precisely so this file never needs it. Design point 3.)
+// (add to mvcc.cc -- needs <absl/cleanup/cleanup.h> for the RAII depth guard and "base/logging.h"
+// for DCHECK; no "server/engine_shard_set.h": HopStamp takes now_ms as a parameter precisely so
+// this file never needs it. Design point 3.)
+#include <absl/cleanup/cleanup.h>
+
 #include "base/logging.h"  // DCHECK
 
 MvccStamper* MvccStamper::tlocal() {
@@ -1446,14 +1521,17 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
 }
 
 void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
-  DCHECK(!in_commit_) << "a CommitFn armed a key -- Commit() is mid-iteration over armed_/arena_, "
-                          "both of which this call can reallocate, corrupting that iteration";
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn armed a key -- Commit() is mid-iteration over "
+                                  "armed_/arena_, both of which this call can reallocate, "
+                                  "corrupting that iteration";
   const uint32_t off = static_cast<uint32_t>(arena_.size());
   arena_.append(key);
   armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size())});
 }
 
 void MvccStamper::Disarm(DbIndex db_index, std::string_view key) {
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn disarmed a key -- Commit() is mid-iteration over "
+                                  "armed_, which erase() would corrupt";
   for (auto it = armed_.begin(); it != armed_.end(); ++it) {
     if (it->db_index == db_index && ArmedKey(*it) == key) {
       armed_.erase(it);
@@ -1466,16 +1544,24 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
   if (armed_.empty())
     return;
 
+  // Both DCHECKs below are scoped to a non-empty commit (above): Commit(0, ...), or a re-entrant
+  // Commit() call, against an empty arm list is a harmless no-op that never reaches here.
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn called Commit() re-entrantly -- the inner call's "
+                                  "armed_.clear()/arena_.clear() would corrupt the outer call's "
+                                  "still-in-progress iteration over the very same containers";
   // The only production call site mints (HopStamp, which cannot return 0) or forwards an applied
-  // write's non-zero author stamp before calling Commit, under the same MvccEnabled() && COMMAND
-  // gate. Commit has no clock of its own, so it cannot invent a stamp -- it can only store what it
-  // is given, and this DCHECK is the last check that "given" was ever actually true.
+  // write's non-zero author stamp, under the same MvccEnabled() && COMMAND gate; Commit has no
+  // clock of its own, so it cannot invent a stamp -- it can only store what it is given.
   DCHECK(mvcc != 0);
+
   const MvccStamp stamp{mvcc, OriginHash(origin_idx)};
-  in_commit_ = true;
+  ++commit_depth_;
+  // RAII, not a bare decrement after the loop: a throwing fn must still unwind commit_depth_, or
+  // one transient failure (e.g. a side-table insert hitting bad_alloc) leaves every subsequent
+  // Arm()/Disarm()/Commit() DCHECK-aborting forever.
+  absl::Cleanup restore_depth = [this] { --commit_depth_; };
   for (const Armed& a : armed_)
     fn(a.db_index, ArmedKey(a), stamp);
-  in_commit_ = false;
 
   armed_.clear();
   arena_.clear();  // keeps capacity
@@ -1495,7 +1581,7 @@ void MvccStamper::TEST_Reset() {
   arena_.clear();
   origin_hash_cache_.clear();
   stats_ = Stats{};
-  in_commit_ = false;
+  commit_depth_ = 0;
 }
 
 }  // namespace dfly
@@ -1507,8 +1593,10 @@ void MvccStamper::TEST_Reset() {
 docker exec drakeydb-p2 sh -c 'cd /src/build-dbg && ninja -j4 mvcc_test && /src/build-dbg/mvcc_test'
 ```
 
-Expected: PASS, all 20 cases (includes `HopStampReMintsPastStaleEpochBackstop`, added to
-cover the design point 3 backstop -- previously untested).
+Expected: PASS, all 23 cases: includes `HopStampReMintsPastStaleEpochBackstop` (covering design
+point 2's backstop) and three `commit_depth_` tests covering design point 5 --
+`CommitDepthRecoversAfterCommitFnThrows` plus two `MvccStamperDeathTest` cases (debug-build only,
+guarded by `#ifndef NDEBUG`).
 
 - [ ] **Step 6: Falsify the hop memo, per D9**
 
