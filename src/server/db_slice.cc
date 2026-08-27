@@ -298,7 +298,8 @@ unsigned PrimeEvictionPolicy::Evict(const PrimeTable::HotBuckets& eb, PrimeTable
     if (auto journal = db_slice_->shard_owner()->journal(); journal) {
       RecordExpiryBlocking(cntx_.db_index, key);
     }
-    db_slice_->Del(cntx_, DbSlice::Iterator(last_slot_it, StringOrView::FromView(key)));
+    db_slice_->Del(cntx_, DbSlice::Iterator(last_slot_it, StringOrView::FromView(key)), nullptr,
+                   false, DbSlice::DeleteReason::kEvicted);
 
     ++evicted_;
   }
@@ -984,7 +985,7 @@ void DbSlice::ActivateDb(DbIndex db_ind) {
   CreateDb(db_ind);
 }
 
-void DbSlice::Del(Context cntx, Iterator it, DbTable* db_table, bool async) {
+void DbSlice::Del(Context cntx, Iterator it, DbTable* db_table, bool async, DeleteReason reason) {
   CHECK(IsValid(it));
 
   DbTable* table = db_table ? db_table : db_arr_[cntx.db_index].get();
@@ -1005,7 +1006,7 @@ void DbSlice::Del(Context cntx, Iterator it, DbTable* db_table, bool async) {
     doc_del_cb_(key, cntx, it->second);
   }
 
-  PerformDeletionAtomic(it, table, async);
+  PerformDeletionAtomic(it, table, async, reason);
 }
 
 void DbSlice::DelMutable(Context cntx, ItAndUpdater it_updater) {
@@ -1040,7 +1041,7 @@ void DbSlice::FlushSlotsFb(const cluster::SlotSet& slot_ids, uint64_t next_versi
       SlotId sid = KeySlot(key);
       if (slot_ids.Contains(sid) && it.GetVersion() < next_version) {
         // We use copy of table smart pointer and pass it as table because FLUSHALL can drop table.
-        Del(db_cntx, Iterator::FromPrime(it), table.get());
+        Del(db_cntx, Iterator::FromPrime(it), table.get(), false, DeleteReason::kSlotFlush);
         ++del_count;
       }
       ++it;
@@ -1120,7 +1121,7 @@ void DbSlice::FlushSlots(const cluster::SlotRanges& slot_ranges) {
           DbContext cntx;
           cntx.time_now_ms = GetCurrentTimeMs();
           cntx.db_index = db_index;
-          Del(cntx, Iterator::FromPrime(it), table.get());
+          Del(cntx, Iterator::FromPrime(it), table.get(), false, DeleteReason::kSlotFlush);
         }
         ++it;
       }
@@ -1320,11 +1321,21 @@ optional<MvccStamp> DbSlice::GetMvcc(DbIndex db_ind, string_view key) const {
 }
 
 void DbSlice::EraseMvcc(DbIndex db_ind, const PrimeKey& key) {
+  string scratch;
+  EraseMvcc(db_ind, key.GetSlice(&scratch));
+}
+
+// drakeydb: Phase 4, P4-1 Task 8 -- same F4 split as SetMvcc's string_view overload above: this
+// skips the PrimeKey overload's GetSlice() scratch-copy, which CompactObj::GetSlice
+// (compact_object.cc) can allocate for encoded/small-tag keys. PerformDeletionAtomic (db_slice.cc)
+// is the motivating caller -- it already holds a free string_view, del_it.key(), one line above
+// its EraseMvcc call (in the Disarm() call), so there was never a reason to pay for a PrimeKey
+// round-trip there. Find() takes a string_view directly, exactly like GetMvcc above already does.
+void DbSlice::EraseMvcc(DbIndex db_ind, string_view key) {
   auto& db = *db_arr_[db_ind];
   if (!db.mvcc)
     return;
-  string scratch;
-  if (auto it = db.mvcc->Find(key.GetSlice(&scratch)); it != db.mvcc->end()) {
+  if (auto it = db.mvcc->Find(key); it != db.mvcc->end()) {
     db.mvcc->Erase(it);
     --db.stats.mvcc_entries;
   }
@@ -1424,7 +1435,7 @@ OpResult<int64_t> DbSlice::UpdateExpire(const Context& cntx, Iterator prime_it,
   // If we update and the new value is already expired, delete the key
   // Already-expired new value: delete; the caller emits the expired event after journaling.
   if (rel_msec <= 0) {
-    Del(cntx, prime_it);
+    Del(cntx, prime_it, nullptr, false, DeleteReason::kExpired);
     ++events_.expired_keys;
     db_arr_[cntx.db_index]->stats.events.expired_keys++;
     return -1;
@@ -1650,7 +1661,8 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
   }
 
   // Route through Del so that expiry runs the same per-type hooks as an explicit DEL.
-  const_cast<DbSlice*>(this)->Del(cntx, Iterator(it, StringOrView::FromView(key)), db.get());
+  const_cast<DbSlice*>(this)->Del(cntx, Iterator(it, StringOrView::FromView(key)), db.get(), false,
+                                  DeleteReason::kExpired);
 
   ++events_.expired_keys;
   db->stats.events.expired_keys++;
@@ -2093,7 +2105,7 @@ void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterat
   // family helpers: their OnChange callback can preempt inside the heartbeat's atomic section.
   if (owner_->journal() && journal_deletion)
     RecordDerivedDelete(cntx, key);
-  Del(cntx, it, db_arr_[cntx.db_index].get());
+  Del(cntx, it, db_arr_[cntx.db_index].get(), false, DeleteReason::kExpired);
 }
 
 int32_t DbSlice::GetNextSegmentForEviction(int32_t segment_id, DbIndex db_ind) const {
@@ -2175,7 +2187,8 @@ pair<uint64_t, size_t> DbSlice::FreeMemWithEvictionStepAtomic(DbIndex db_ind, co
         evicted_bytes += evict_it->first.MallocUsed() + evict_it->second.MallocUsed();
         ++evicted_items;
 
-        Del(cntx, Iterator(evict_it, StringOrView::FromView(key)));
+        Del(cntx, Iterator(evict_it, StringOrView::FromView(key)), nullptr, false,
+            DeleteReason::kEvicted);
 
         // returns when whichever condition is met first
         if ((evicted_items == max_eviction_per_hb) || (evicted_bytes >= increase_goal_bytes))
@@ -2483,7 +2496,20 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
   db_table->segment_defrag_cursor = cursor;
 }
 
-void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async) {
+// drakeydb: Phase 4, P4-1 Task 8 -- `reason` is threaded through Del/PerformDeletionAtomic and
+// every non-default call site already passes its real reason (see the DeleteReason comment,
+// db_slice.h), but P4-1 does not yet branch on it below: every reason erases the stamp, full
+// stop -- tombstones are P4-5's job. Landing the parameter now, unused, means P4-5 adds its
+// kExplicit/kExpired-vs-kEvicted/kSlotFlush branch without having to touch these same call sites
+// a second time. [[maybe_unused]] is not load-bearing for the build here -- confirmed by
+// compiling this translation unit both with and without it (task-8-report.md): the project
+// disables -Wunused-parameter project-wide (helio/cmake/internal.cmake's unconditional
+// `-Wno-unused-parameter`, positioned after `-Wextra` on the actual compile_commands.json command
+// line for this file, so it wins), and this build has no active -Werror regardless. Kept anyway
+// for the same self-documenting reason rdb_save.cc's CollectSearchIndices uses it -- flags an
+// intentionally-unused parameter to a reader -- not to satisfy the compiler.
+void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async,
+                                    [[maybe_unused]] DeleteReason reason) {
   FiberAtomicGuard guard;
   size_t table_before = table->table_memory();
 
@@ -2492,6 +2518,22 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
       LOG(DFATAL) << "Internal error, inconsistent state, mcflag should be present but not found "
                   << del_it->first.ToString();
     }
+  }
+
+  // drakeydb: Phase 4. Disarm first: OpDelV2 arms the key via post_updater.Run() before calling
+  // Del and journals afterwards, so without this the DEL's own Commit would re-stamp a key that
+  // no longer exists. The mvcc table is dense, so unlike mcflag there is no HasFlag()-style bit
+  // to skip the probe. That probe is not always useful: mvcc_enabled_ is DbSlice-wide (set once
+  // from IsActiveReplica(), db_slice.cc), not per-namespace, so this runs for every namespace's
+  // delete -- but PostUpdate's F1 gate (this file) only ever arms a default-namespace key. A
+  // non-default-namespace key therefore never has an entry here, and both calls below are a
+  // guaranteed miss for it. There is no cheaper test available at this point: mvcc_enabled_
+  // carries no namespace, and the armed-key state lives only in the namespace-blind, thread-local
+  // MvccStamper, not on the key itself. del_it.key() is the iterator's already-laundered
+  // string_view (StringOrView) -- free, unlike the PrimeKey overloads' GetSlice() scratch-copy.
+  if (mvcc_enabled_) {
+    MvccStamper::tlocal()->Disarm(table->index, del_it.key());
+    EraseMvcc(table->index, del_it.key());
   }
 
   DbTableStats& stats = table->stats;

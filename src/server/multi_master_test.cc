@@ -775,6 +775,35 @@ TEST_F(MvccStoreTest, EraseRemovesTheStampAndDecrementsCount) {
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u) << "EraseMvcc must decrement mvcc_entries";
 }
 
+// drakeydb: P4-1 Task 8 -- direct coverage for EraseMvcc's string_view overload. The test above
+// only ever exercises the PrimeKey overload; PerformDeletionAtomic's delete path (this task) now
+// calls the string_view one exclusively, to avoid a GetSlice() scratch-copy on every delete (see
+// db_slice.cc). A regression confined to that overload -- e.g. it silently no-ops, or looks up
+// the wrong bucket -- would still leave the PrimeKey-overload test above green.
+TEST_F(MvccStoreTest, EraseMvccStringViewOverloadRemovesTheStampAndDecrementsCount) {
+  Run({"set", "k", "v"});
+  auto& shard_set_ref = *shard_set;
+  const ShardId sid = Shard("k", shard_set_ref.size());
+  const MvccStamp written{777, 111};
+
+  shard_set_ref.Await(sid, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  written);
+  });
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_entries, 1u);
+
+  shard_set_ref.Await(sid, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(0, std::string_view{"k"});
+  });
+
+  std::optional<MvccStamp> got;
+  shard_set_ref.Await(
+      sid, [&] { got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "k"); });
+  EXPECT_FALSE(got.has_value()) << "EraseMvcc(string_view) must remove the stamp";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u)
+      << "EraseMvcc(string_view) must decrement mvcc_entries";
+}
+
 TEST_F(MvccStoreTest, AbsentKeyReturnsNullopt) {
   std::optional<MvccStamp> got;
   shard_set->Await(Shard("nope", shard_set->size()), [&] {
@@ -1067,6 +1096,64 @@ TEST_F(MvccStoreTest, NonDefaultNamespaceWriteLeavesNoStampAnywhere) {
       << "the ns1 write must not perturb the DEFAULT namespace's same-named key -- "
          "journal::RecordEntry's commit callback always targets GetDefaultNamespace(), so an "
          "unguarded arm would stamp this unrelated, never-written key instead";
+}
+
+// drakeydb: P4-1 Task 8 -- PerformDeletionAtomic must disarm and erase on every delete path, or a
+// pending arm can re-stamp a key that no longer exists (see the DoesNotResurrectAStamp case
+// below) and the mvcc side table leaks an entry for a dead key.
+TEST_F(MvccStoreTest, DeleteErasesTheStamp) {
+  Run({"set", "k", "v"});
+  ASSERT_TRUE(StampOf("k").has_value());
+  Run({"del", "k"});
+  EXPECT_FALSE(StampOf("k").has_value()) << "a deleted key must not leave a stamp behind";
+}
+
+// OpDelV2 arms the key (post_updater.Run()) before deleting and journals after. Without the
+// disarm, Commit writes a stamp for a key that is already gone.
+TEST_F(MvccStoreTest, DeleteInSameCallbackDoesNotResurrectAStamp) {
+  Run({"set", "k", "v"});
+  Run({"del", "k"});
+  EXPECT_FALSE(StampOf("k").has_value())
+      << "the DEL's own journal entry must not re-stamp the key it just removed";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u);
+}
+
+// drakeydb: falsification note -- the brief's original body used "a"/"b". Verified empirically
+// (temporary LOG(WARNING) of Shard(key, shard_set->size()), see this task's report) that under
+// this fixture's shard count (2), Shard("a")=1 and Shard("b")=0: different shards, so RENAME
+// takes generic_family.cc's cross-shard Renamer path (RenameGeneric's GetUniqueShardCnt() != 1
+// branch), not the single-shard OpRen fast path the brief's comment describes. That path
+// resurfaces a pre-existing, out-of-scope bug: Renamer::DeserializeDest calls RecordJournal (and
+// so the MVCC commit) BEFORE the AutoUpdater returned by RdbRestoreValue::Add's AddOrUpdate has
+// run -- that only happens when the local OpResult<ItAndUpdater> goes out of scope at the
+// function's end, which is AFTER RecordJournal already fired. The destination key is armed too
+// late for its own commit to see, so it is left permanently unstamped. This is a write-path
+// ordering bug in RENAME/RESTORE's cross-shard code (generic_family.cc), not in this task's
+// delete-path Disarm/EraseMvcc -- out of scope here; flagged in the report instead of fixed.
+// "a" and "c" share a shard (both hash to 1), which exercises the single-shard OpRen path the
+// test is meant to cover and sidesteps the unrelated bug.
+TEST_F(MvccStoreTest, RenameMovesTheStampByRecreatingIt) {
+  Run({"set", "a", "v"});
+  Run({"rename", "a", "c"});
+  EXPECT_FALSE(StampOf("a").has_value());
+  ASSERT_TRUE(StampOf("c").has_value()) << "the destination is armed and committed by RENAME's "
+                                           "own journal entry";
+}
+
+TEST_F(MvccStoreTest, ExpiryErasesTheStamp) {
+  Run({"set", "k", "v", "px", "10"});
+  ASSERT_TRUE(StampOf("k").has_value());
+  AdvanceTime(50);
+  Run({"get", "k"});  // triggers lazy expiry
+  EXPECT_FALSE(StampOf("k").has_value());
+}
+
+TEST_F(MvccStoreTest, MultiKeyDeleteErasesEveryStamp) {
+  Run({"mset", "k1", "v1", "k2", "v2", "k3", "v3"});
+  Run({"del", "k1", "k2"});
+  EXPECT_FALSE(StampOf("k1").has_value());
+  EXPECT_FALSE(StampOf("k2").has_value());
+  EXPECT_TRUE(StampOf("k3").has_value());
 }
 
 // The "off means byte-identical to upstream" guard.

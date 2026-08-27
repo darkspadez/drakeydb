@@ -359,6 +359,10 @@ class DbSlice {
   void SetMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
+  // drakeydb: Phase 4, P4-1 Task 8 -- same F4 split as SetMvcc above, for the same reason:
+  // PerformDeletionAtomic already holds a free string_view (the iterator's del_it.key()) one line
+  // above its EraseMvcc call, in the Disarm() call. See db_slice.cc.
+  void EraseMvcc(DbIndex db_ind, std::string_view key);
 
   // drakeydb: P4-1 Task 5, fix round 1 -- computed on demand (sums DbTable::mvcc_table_memory()
   // over db_arr_) rather than maintained as a running accumulator. table_memory_'s accumulator
@@ -373,11 +377,18 @@ class DbSlice {
   // Creates a database with index `db_ind`. If such database exists does nothing.
   void ActivateDb(DbIndex db_ind);
 
+  // drakeydb: Phase 4 -- why a key is being removed. In P4-1 every reason erases the stamp; P4-5
+  // gives kExplicit and kExpired a tombstone while kEvicted and kSlotFlush keep erasing.
+  // Eviction deliberately gets no tombstone: it is a local capacity decision, so resurrection from
+  // a peer is desirable -- the peer's copy is authoritative.
+  enum class DeleteReason : uint8_t { kExplicit, kExpired, kEvicted, kSlotFlush };
+
   // Deletes the iterator. The iterator must be valid.
   // Context argument is used only for document removal and it just needs
   // timestamp field. Last argument, db_table, is optional and is used only in FlushSlotsCb.
   // If async is set, AsyncDeleter will enqueue deletion of the object
-  void Del(Context cntx, Iterator it, DbTable* db_table = nullptr, bool async = false);
+  void Del(Context cntx, Iterator it, DbTable* db_table = nullptr, bool async = false,
+           DeleteReason reason = DeleteReason::kExplicit);
 
   // Deletes a key after FindMutable(). Runs post_updater before deletion
   // to update memory accounting while the key is still valid.
@@ -636,7 +647,8 @@ class DbSlice {
   void RemoveOffloadedEntriesFromTieredStorage(absl::Span<const DbIndex> indices,
                                                const DbTableArray& db_arr) const;
 
-  void PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async = false);
+  void PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async = false,
+                             DeleteReason reason = DeleteReason::kExplicit);
   // Reaper deletion intentionally bypasses FindMutable/OnChange. Its caller must already have
   // established that no snapshot consumer can race the container mutation.
   void DeleteReapedContainer(const Context& cntx, std::string_view key, Iterator it,
