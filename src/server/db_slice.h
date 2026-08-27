@@ -354,6 +354,9 @@ class DbSlice {
     return mvcc_enabled_;
   }
   void SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stamp);
+  // drakeydb: Phase 4, review fix round 1 (F4) -- avoids the PrimeKey round-trip for callers that
+  // already have a string_view (e.g. journal::RecordEntry's commit callback). See db_slice.cc.
+  void SetMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
 

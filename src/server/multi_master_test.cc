@@ -866,12 +866,21 @@ TEST_F(MvccStoreTest, NoAutoJournalCommandStampsKey) {
   ASSERT_TRUE(StampOf("k").has_value());
 }
 
+// drakeydb: review fix round 1 (minor) -- hardened against a regression that drops stamping
+// entirely: StampOf's optional is checked before every dereference now, so such a regression
+// fails cleanly here instead of reading an uninitialized MvccStamp (undefined behavior, and the
+// exact shape of the bug this task's own initial run of this fixture hit before the journal was
+// started -- see this task's report).
 TEST_F(MvccStoreTest, StampsAreStrictlyIncreasingAcrossWrites) {
   Run({"set", "k", "v1"});
-  const uint64_t first = StampOf("k")->Mvcc();
+  auto first_stamp = StampOf("k");
+  ASSERT_TRUE(first_stamp.has_value());
+  const uint64_t first = first_stamp->Mvcc();
   for (int i = 0; i < 50; ++i) {
     Run({"set", "k", absl::StrCat("v", i)});
-    const uint64_t cur = StampOf("k")->Mvcc();
+    auto cur_stamp = StampOf("k");
+    ASSERT_TRUE(cur_stamp.has_value()) << "iteration " << i;
+    const uint64_t cur = cur_stamp->Mvcc();
     EXPECT_GT(cur, first) << "iteration " << i;
   }
 }
@@ -892,18 +901,26 @@ TEST_F(MvccStoreTest, MultiKeySameShardCommandSharesOneStamp) {
 // The over-stamp cases. Each must leave the stamp untouched and bump the counter.
 TEST_F(MvccStoreTest, ReadOnlyGetExDoesNotStampKey) {
   Run({"set", "k", "v"});
-  const MvccStamp before = *StampOf("k");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const MvccStamp before = *before_stamp;
   Run({"getex", "k"});  // no expiry option -> mutates nothing, journals nothing
-  EXPECT_EQ(*StampOf("k"), before)
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, before)
       << "a read that runs an AutoUpdater must not advance the stamp -- if it does, this node "
          "silently rejects peer writes that should have won";
 }
 
 TEST_F(MvccStoreTest, SkippedExpireDoesNotStampKey) {
   Run({"set", "k", "v"});
-  const MvccStamp before = *StampOf("k");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const MvccStamp before = *before_stamp;
   EXPECT_EQ(0, CheckedInt({"expire", "k", "100", "XX"}));  // no TTL set -> predicate fails
-  EXPECT_EQ(*StampOf("k"), before);
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, before);
 }
 
 // drakeydb: P4-1 Task 7, Step 6 -- IsOmittableWrite's redundant-write optimisation arms but never
@@ -980,6 +997,63 @@ TEST_F(MvccStoreTest, PureWriteWorkloadLeavesNoUnstampedWrites) {
   shard_set->pool()->AwaitBrief(
       [&](unsigned, auto*) { unstamped += MvccStamper::tlocal()->stats().unstamped_writes; });
   EXPECT_EQ(unstamped.load(), 0u) << "a pure write workload must never discard an arm";
+}
+
+// drakeydb: review fix round 1 (F1) -- a write through a non-default namespace must leave no
+// stamp anywhere: not in its own namespace's side table (never propagated to any peer, so under
+// "a key's stamp advances iff that same stamp is propagated" it must never advance), and not as a
+// phantom stamp on a same-named key in the DEFAULT namespace's side table either --
+// journal::RecordEntry's commit callback always targets GetDefaultNamespace() (armed_ carries no
+// namespace, see DbSlice::PostUpdate's comment), so an unguarded arm from a non-default-namespace
+// write would stamp that unrelated, never-written default-namespace key instead.
+//
+// In production, ns1 is reached via ServerFamily::DoAuth (server_family.cc:2109-2120), which sets
+// `cntx->ns = &namespaces->GetOrInsert(cred.ns)` for an ACL user carrying a NAMESPACE: directive
+// (acl_family.cc's MaybeParseNamespace). That chain is exercised here via RunViaNamespace, not a
+// real ACL SETUSER+AUTH round trip: BaseFamilyTest::Run(id, slice) (test_utils.cc) unconditionally
+// resets the dispatching connection's `context->ns` back to the default namespace before every
+// single command, discovered the hard way while first writing this test with AUTH -- an ACL
+// NAMESPACE:-scoped SET still landed (and got legitimately stamped) in the default namespace,
+// which momentarily looked exactly like an F1 regression until DIAG prints traced it to Run()'s
+// own reset, confirmed by checking the stored ACL credential directly
+// (ServerState::tlocal()->user_registry->GetCredentials("nsuser").ns == "NS1", i.e. the ACL layer
+// itself was never the problem). RunViaNamespace (test_utils.h/.cc) is Run(id, slice)'s dispatch
+// verbatim with the namespace as a parameter instead of hardcoded, added specifically to route
+// around that reset -- it still goes through the real Transaction/PostUpdate/LogAutoJournalOnShard
+// path via DispatchCommand, only the mechanism for reaching a non-default `cntx->ns` differs from
+// production's ACL path (the ACL layer's own correctness -- MaybeParseNamespace, DoAuth -- is
+// pre-existing, unchanged by this task, and independently confirmed working above).
+//
+// Falsification: temporarily changing PostUpdate's `ns_ == &namespaces->GetDefaultNamespace()`
+// gate to unconditionally arm (the pre-fix-round-1 behavior) makes both assertions below fail --
+// see this task's report for the verbatim run.
+TEST_F(MvccStoreTest, NonDefaultNamespaceWriteLeavesNoStampAnywhere) {
+  // A key of the same name, already stamped in the default namespace, to prove the ns1 write
+  // below does not perturb it.
+  ASSERT_EQ(Run({"set", "shared", "v0"}), "OK");
+  auto original = StampOf("shared");
+  ASSERT_TRUE(original.has_value());
+
+  Namespace& ns1 = namespaces->GetOrInsert("ns1");
+  ASSERT_EQ(RunViaNamespace(&ns1, {"set", "shared", "v1"}), "OK");
+
+  const ShardId sid = Shard("shared", shard_set->size());
+  std::optional<MvccStamp> ns1_stamp;
+  shard_set->Await(sid, [&] { ns1_stamp = ns1.GetDbSlice(sid).GetMvcc(0, "shared"); });
+  EXPECT_FALSE(ns1_stamp.has_value())
+      << "a non-default-namespace write must never be stamped -- it is never propagated to any "
+         "peer, so under the phase invariant it must never advance a stamp either";
+
+  ASSERT_EQ(RunViaNamespace(&ns1, {"get", "shared"}), "v1")
+      << "sanity: the write must have actually landed in ns1's own table, or an unstamped ns1 "
+         "key proves nothing";
+
+  auto after = StampOf("shared");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(*after, *original)
+      << "the ns1 write must not perturb the DEFAULT namespace's same-named key -- "
+         "journal::RecordEntry's commit callback always targets GetDefaultNamespace(), so an "
+         "unguarded arm would stamp this unrelated, never-written key instead";
 }
 
 // The "off means byte-identical to upstream" guard.

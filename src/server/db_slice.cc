@@ -1286,11 +1286,23 @@ uint32_t DbSlice::GetMCFlag(DbIndex db_ind, const PrimeKey& key) const {
 }
 
 void DbSlice::SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stamp) {
+  string scratch;
+  SetMvcc(db_ind, key.GetSlice(&scratch), stamp);
+}
+
+// drakeydb: Phase 4, review fix round 1 (F4) -- journal::RecordEntry's commit callback already
+// holds a plain string_view (the key bytes it armed in DbSlice::PostUpdate); routing it through
+// the PrimeKey overload above cost three allocations per key per write for nothing: PrimeKey{key}
+// (allocates for keys > kMaxInlineLen, table.h), then key.GetSlice(&scratch) to get a string_view
+// straight back out, then db.mvcc->Insert(string_view, ...) re-encoding it a third time inside
+// Dash. This overload skips the PrimeKey round-trip entirely -- Insert already takes a
+// string_view, so there was never a reason to construct one at this call site. The PrimeKey
+// overload above is kept for callers that already have one on hand (e.g. tests).
+void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
   auto& db = *db_arr_[db_ind];
   if (!db.mvcc)
     return;
-  string scratch;
-  auto [it, inserted] = db.mvcc->Insert(key.GetSlice(&scratch), stamp);
+  auto [it, inserted] = db.mvcc->Insert(key, stamp);
   it->second = stamp;
   if (inserted)
     ++db.stats.mvcc_entries;
@@ -1576,7 +1588,24 @@ void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key) {
   // drakeydb: Phase 4 -- arm this key. journal::RecordEntry commits the entry's stamp to every
   // armed key; the end of the shard callback discards whatever is still armed. That is what
   // enforces "a key's stamp advances iff that same stamp is propagated". See server/mvcc.h.
-  if (mvcc_enabled_)
+  //
+  // drakeydb: Phase 4, review fix round 1 (F1) -- gated to the default namespace only. The
+  // journal has no namespace identity on the wire (a non-default-namespace write, reachable via
+  // an ACL user's NAMESPACE: directive, is never journaled/propagated to any peer -- see
+  // ServerFamily::DoAuth's `cntx->ns = &namespaces->GetOrInsert(cred.ns)`), and
+  // MvccStamper::Armed carries only {db_index, offset, len}, no namespace, so journal::
+  // RecordEntry's commit callback has no way to route a non-default-namespace arm to its actual
+  // DbSlice -- it always writes into the DEFAULT namespace's side table (GetCurrentDbSlice()
+  // resolves via EngineShard::tlocal() only, not via any per-namespace identity carried by the
+  // arm). Arming a non-default-namespace write here would therefore make BOTH invariant
+  // directions fail at once: the key actually written (non-default) stays permanently unstamped,
+  // and an unrelated, never-written key of the same name in the DEFAULT namespace gets a phantom
+  // stamp with no corresponding journal entry -- exactly the dangerous "stamp but do not
+  // propagate" direction, and a side-table entry EraseMvcc will never clean up. Gating here
+  // (rather than in the commit callback, which cannot recover the namespace after the fact) is
+  // the only point that still knows which namespace this write belongs to, and is cheaper.
+  DCHECK(ns_ != nullptr);
+  if (mvcc_enabled_ && ns_ == &namespaces->GetDefaultNamespace())
     MvccStamper::tlocal()->Arm(db_ind, key);
 }
 
@@ -1657,17 +1686,22 @@ void DbSlice::ExpireAllIfNeeded() {
     }
   }
 
+  // drakeydb: Phase 4 -- non-transactional sweep path; ends its own epoch since it never goes
+  // through Transaction::RunCallback. See server/mvcc.h.
+  //
+  // drakeydb: Phase 4, review fix round 1 (minor) -- moved ahead of the SendMessages loop below,
+  // which can preempt (channel_store->SendMessages), matching FlushSlotsFb's placement ahead of
+  // its own yield point. Wrong-side-of-a-preemption-point was benign today (nothing armed here
+  // still survives to be seen), but it is the wrong invariant to leave standing.
+  if (mvcc_enabled_)
+    MvccStamper::tlocal()->EndOfWriteEpoch();
+
   for (DbIndex i = 0; i < per_db_events.size(); ++i) {
     if (per_db_events[i].empty())
       continue;
     channel_store->SendMessages(absl::StrCat("__keyevent@", i, "__:expired"), per_db_events[i],
                                 false);
   }
-
-  // drakeydb: Phase 4 -- non-transactional sweep path; ends its own epoch since it never goes
-  // through Transaction::RunCallback. See server/mvcc.h.
-  if (mvcc_enabled_)
-    MvccStamper::tlocal()->EndOfWriteEpoch();
 }
 
 void DbSlice::RegisterOnChange(ChangeConsumerInterface* consumer) {
