@@ -56,7 +56,10 @@ struct ExpireTablePolicy {
     cs.Reset();
   }
 
-  static void DestroyValue(uint32_t val) {
+  // drakeydb: P4-1 Task 5 -- templated so this policy can back both mcflag (uint32_t) and
+  // DbTable::mvcc (MvccStamp). Both are trivially-destructible PODs with no owned resources, so
+  // this stays a no-op for either; a fix-minimal change over the pre-P4 uint32_t-only signature.
+  template <typename T> static void DestroyValue(T&) {
   }
 
   static bool Equal(const PrimeKey& s1, std::string_view s2) {

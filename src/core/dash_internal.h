@@ -396,6 +396,11 @@ class Segment {
 
   static constexpr size_t kFpMask = (1 << kFingerBits) - 1;
 
+  // drakeydb: P4-1 Task 5 -- Bucket itself stays private; this exposes only its byte size so a
+  // consumer's sizing assumption (mvcc_test.cc: MvccTableGeometry) can be verified without
+  // widening Bucket's own access or its interface.
+  static constexpr size_t kBucketByteSize = sizeof(Bucket);
+
   using Value_t = ValueType;
   using Key_t = KeyType;
   using Hash_t = uint64_t;

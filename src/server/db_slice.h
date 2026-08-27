@@ -51,6 +51,11 @@ struct DbStats : public DbTableStats {
   // Memory used by dictionaries.
   size_t table_mem_usage = 0;
 
+  // drakeydb: P4-1 Task 5 -- bytes held by DbTable::mvcc (0 outside active mode). Computed in
+  // DbSlice::GetStats from DbTable::mvcc_table_memory(), mirroring table_mem_usage above --
+  // not maintained as a running counter.
+  size_t mvcc_table_bytes = 0;
+
   // We override additional DbStats fields explicitly in DbSlice::GetStats().
   using DbTableStats::operator=;
 
@@ -344,6 +349,16 @@ class DbSlice {
   bool SetMCFlag(DbIndex db_ind, const PrimeKey& key, uint32_t flag);
 
   uint32_t GetMCFlag(DbIndex db_ind, const PrimeKey& key) const;
+
+  bool mvcc_enabled() const {
+    return mvcc_enabled_;
+  }
+  void SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stamp);
+  std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
+  void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
+  size_t mvcc_table_memory() const {
+    return mvcc_table_memory_;
+  }
 
   // Creates a database with index `db_ind`. If such database exists does nothing.
   void ActivateDb(DbIndex db_ind);
@@ -713,6 +728,13 @@ class DbSlice {
   bool expired_keys_events_recording_ = true;
 
   bool journal_omit_redundant_writes_ = true;
+
+  // drakeydb: P4-1 Task 5. mvcc_enabled_ caches IsActiveReplica() once at construction -- Tasks
+  // 7-8's hot paths read this member, never the flag. mvcc_table_memory_ mirrors table_memory_
+  // but tracks DbTable::mvcc only (see the table_memory() comment on why the two must stay
+  // separate).
+  bool mvcc_enabled_ = false;
+  size_t mvcc_table_memory_ = 0;
 
   struct Hash {
     size_t operator()(const facade::ConnectionRef& c) const {

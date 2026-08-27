@@ -8,6 +8,7 @@
 #include "base/logging.h"
 #include "core/top_keys.h"
 #include "server/cluster_support.h"
+#include "server/multi_master.h"
 #include "server/server_state.h"
 
 using namespace std;
@@ -45,11 +46,13 @@ void DbTableStats::AddTypeMemoryUsage(unsigned type, int64_t delta) {
 
 DbTableStats& DbTableStats::operator+=(const DbTableStats& o) {
   constexpr size_t kDbSz = sizeof(DbTableStats) - sizeof(memory_usage_by_type);
-  static_assert(kDbSz == 80);  // drakeydb: P4-0 Task 2b -- +8 for member_expire_count.
+  static_assert(kDbSz == 96);  // drakeydb: P4-1 Task 5 -- +16 for mvcc_entries/mvcc_tombstones.
 
   ADD(inline_keys);
   ADD(expire_count);
   ADD(member_expire_count);
+  ADD(mvcc_entries);
+  ADD(mvcc_tombstones);
   ADD(obj_memory_usage);
   ADD(tiered_entries);
   ADD(tiered_used_bytes);
@@ -112,6 +115,8 @@ DbTable::DbTable(PMR_NS::memory_resource* mr, DbIndex db_index)
     : prime(kInitSegmentLog, detail::PrimeTablePolicy{}, mr),
       mcflag(0, detail::ExpireTablePolicy{}, mr),
       index(db_index) {
+  if (IsActiveReplica())
+    mvcc = std::make_unique<MvccTable>(0, detail::ExpireTablePolicy{}, mr);
   if (IsClusterEnabled()) {
     slots_stats.reset(new SlotStats[kMaxSlotNum + 1]);
   }
@@ -127,6 +132,8 @@ DbTable::~DbTable() {
 void DbTable::Clear() {
   prime.Clear();
   mcflag.Clear();
+  if (mvcc)
+    mvcc->Clear();
   stats = DbTableStats{};
   expire_cursor = PrimeTable::Cursor::end();
   segment_defrag_cursor = PrimeTable::Cursor::end();

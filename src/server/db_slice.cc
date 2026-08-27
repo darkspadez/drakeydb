@@ -469,13 +469,14 @@ void AccountSlotTieredBytes(string_view key, int64_t delta, DbTable* db) {
 
 DbStats& DbStats::operator+=(const DbStats& o) {
   constexpr size_t kDbSz = sizeof(DbStats) - sizeof(DbTableStats);
-  static_assert(kDbSz == 24);
+  static_assert(kDbSz == 32);  // drakeydb: P4-1 Task 5 -- +8 for mvcc_table_bytes.
 
   DbTableStats::operator+=(o);
 
   ADD(key_count);
   ADD(prime_capacity);
   ADD(table_mem_usage);
+  ADD(mvcc_table_bytes);
 
   return *this;
 }
@@ -521,6 +522,9 @@ DbSlice::DbSlice(uint32_t index, bool cache_mode, EngineShard* owner, Namespace*
       cache_mode_(cache_mode),
       owner_(owner),
       ns_(ns),
+      // mvcc_enabled_ is declared (db_slice.h) before client_tracking_map_; keep this order to
+      // match, or -Wreorder fails the -Werror build.
+      mvcc_enabled_(IsActiveReplica()),
       client_tracking_map_(owner->memory_resource()) {
   CHECK(ns_ != nullptr);
   db_arr_.emplace_back();
@@ -555,6 +559,7 @@ auto DbSlice::GetStats() const -> Stats {
     stats.key_count = db_wrap.prime.size();
     stats.prime_capacity = db_wrap.prime.capacity();
     stats.table_mem_usage = db_wrap.table_memory();
+    stats.mvcc_table_bytes = db_wrap.mvcc_table_memory();
   }
   auto co_stats = CompactObj::GetStatsThreadLocal();
   s.small_string_bytes = co_stats.small_string_bytes;
@@ -1134,6 +1139,7 @@ util::fb2::Fiber DbSlice::FlushDbIndexes(const std::vector<DbIndex>& indexes) {
     }
 
     table_memory_ -= db_arr_[index]->table_memory();
+    mvcc_table_memory_ -= db_arr_[index]->mvcc_table_memory();
     entries_count_ -= db_arr_[index]->prime.size();
 
     InvalidateDbWatches(index);
@@ -1261,6 +1267,38 @@ uint32_t DbSlice::GetMCFlag(DbIndex db_ind, const PrimeKey& key) const {
     return 0;
   }
   return it->second;
+}
+
+void DbSlice::SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stamp) {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return;
+  string scratch;
+  auto [it, inserted] = db.mvcc->Insert(key.GetSlice(&scratch), stamp);
+  it->second = stamp;
+  if (inserted)
+    ++db.stats.mvcc_entries;
+}
+
+optional<MvccStamp> DbSlice::GetMvcc(DbIndex db_ind, string_view key) const {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return nullopt;
+  auto it = db.mvcc->Find(key);
+  if (it.is_done())
+    return nullopt;
+  return it->second;
+}
+
+void DbSlice::EraseMvcc(DbIndex db_ind, const PrimeKey& key) {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return;
+  string scratch;
+  if (auto it = db.mvcc->Find(key.GetSlice(&scratch)); it != db.mvcc->end()) {
+    db.mvcc->Erase(it);
+    --db.stats.mvcc_entries;
+  }
 }
 
 OpResult<DbSlice::ItAndUpdater> DbSlice::AddNew(const Context& cntx, string_view key,
@@ -2097,6 +2135,7 @@ void DbSlice::CreateDb(DbIndex db_ind) {
   if (!db) {
     db.reset(new DbTable{owner_->memory_resource(), db_ind});
     table_memory_ += db->table_memory();
+    mvcc_table_memory_ += db->mvcc_table_memory();
   }
 }
 

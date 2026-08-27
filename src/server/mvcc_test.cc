@@ -8,6 +8,7 @@
 #include <xxhash.h>
 
 #include "base/gtest.h"
+#include "server/table.h"
 
 namespace dfly {
 
@@ -66,6 +67,17 @@ TEST(MvccStampTest, SizeAndAlignment) {
   static_assert(sizeof(MvccStamp) == 16, "the side table's per-slot cost depends on this");
   static_assert(alignof(MvccStamp) == 8);
   EXPECT_EQ(sizeof(MvccStamp), 16u);
+}
+
+TEST(MvccTableGeometry, BucketMatchesTheSizingArgument) {
+  // 26 (BucketBase<14>) + 14*18 (PrimeKey) + 2 pad + 14*16 (MvccStamp) = 504.
+  // If this changes, the ~41 B/key figure and the benchmark's [34,48] band are both stale.
+  //
+  // drakeydb: P4-1 Task 5 fix-minimal -- Segment_t::Bucket (core/dash_internal.h) is private, so
+  // the brief's literal `sizeof(Segment_t::Bucket)` does not compile from outside the class.
+  // Segment_t::kBucketByteSize is a minimal accessor added for exactly this check: it exposes
+  // only the byte size, not Bucket's type or interface.
+  EXPECT_EQ(DbTable::MvccTable::Segment_t::kBucketByteSize, 504u);
 }
 
 TEST(MvccStampTest, LexicographicOrderOnMvccThenOrigin) {

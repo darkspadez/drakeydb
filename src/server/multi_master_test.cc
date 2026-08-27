@@ -682,6 +682,74 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   EXPECT_EQ(std::string::npos, info.find("connected_masters:"));
 }
 
+// drakeydb: P4-1 Task 5 -- the side table on DbTable. Storage only; nothing writes to it outside
+// these tests until Task 7. --active_replica is boot-only (DbTable reads it at construction), so
+// the flag must be set before BaseFamilyTest::SetUp() runs, not in the constructor/TearDown body.
+class MvccStoreTest : public BaseFamilyTest {
+ protected:
+  void SetUp() override {
+    absl::SetFlag(&FLAGS_active_replica, true);
+    BaseFamilyTest::SetUp();
+  }
+  void TearDown() override {
+    BaseFamilyTest::TearDown();
+    absl::SetFlag(&FLAGS_active_replica, false);
+  }
+};
+
+TEST_F(MvccStoreTest, SideTableIsAllocatedInActiveMode) {
+  Run({"set", "k", "v"});
+  EXPECT_GT(GetMetrics().db_stats[0].mvcc_table_bytes, 0u)
+      << "active mode must allocate the side table";
+}
+
+TEST_F(MvccStoreTest, RoundTripsAStamp) {
+  Run({"set", "k", "v"});
+  auto& shard_set_ref = *shard_set;
+  const MvccStamp written{12345, 999};
+  shard_set_ref.Await(Shard("k", shard_set_ref.size()), [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    PrimeKey pk{"k"};
+    db_slice.SetMvcc(0, pk, written);
+  });
+
+  std::optional<MvccStamp> got;
+  shard_set_ref.Await(Shard("k", shard_set_ref.size()), [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "k");
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, written);
+}
+
+TEST_F(MvccStoreTest, AbsentKeyReturnsNullopt) {
+  std::optional<MvccStamp> got;
+  shard_set->Await(Shard("nope", shard_set->size()), [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "nope");
+  });
+  EXPECT_FALSE(got.has_value());
+}
+
+TEST_F(MvccStoreTest, FlushAllDropsTheSideTable) {
+  Run({"set", "k", "v"});
+  shard_set->Await(Shard("k", shard_set->size()), [&] {
+    PrimeKey pk{"k"};
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, pk, MvccStamp{1, 1});
+  });
+  // Falsification note (P4-1 Task 5): the brief's original body asserted only the post-flush
+  // count, which stays 0 whether or not SetMvcc ever wrote anything -- vacuous against a no-op
+  // SetMvcc. This pre-flush check closes that gap.
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_entries, 1u);
+  Run({"flushall"});
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u);
+}
+
+// The "off means byte-identical to upstream" guard.
+TEST_F(BaseFamilyTest, NonActiveModeAllocatesNoMvccTable) {
+  Run({"set", "k", "v"});
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_table_bytes, 0u)
+      << "a non-active node must pay nothing for MVCC";
+}
+
 namespace {
 // drakeydb: Phase 3 T3 -- captures the origin_idx of every COMMAND journal entry seen on the
 // shard this consumer is registered on, via JournalSlice::AddLogRecord -> CallOnChange (see
