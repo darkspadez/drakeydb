@@ -887,23 +887,41 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
       // returns, using a synchronization boundary already exercised by every existing caller of
       // InitiateDflySync.
       //
-      // Ordering: still happens-before every apply on this thread. StartSyncFlow, called only
+      // Ordering: still happens-before every apply on THIS thread -- StartSyncFlow, called only
       // after this line within the very same per-thread callback, is what actually starts this
-      // flow applying entries -- so the registration is visible before the first command on this
-      // thread can possibly be dispatched.
+      // flow applying entries, so the registration is visible before the first command on this
+      // thread can possibly be dispatched. That is narrower than what the whole broadcast
+      // actually relies on, so it's worth being precise (fix round 2, F3): Commit runs on
+      // whichever thread owns the KEY being applied (transaction.cc -> journal.cc), which is not
+      // necessarily the thread running this callback for THIS flow, and AwaitFiberOnAll
+      // dispatches to every thread concurrently -- so in principle thread U's flow could reach
+      // Commit before thread T's callback (this one) has run at all, and nothing here orders
+      // them against each other directly. It is unreachable in practice, not by construction:
+      // StartSyncFlow itself (every thread's, including thread T's own) does a TCP connect,
+      // AUTH, and a DFLY FLOW round trip with the master before it ever launches the fiber that
+      // can apply an entry, while this registration is thread T's very first non-yielding
+      // statement in this callback -- so every thread's registration completes before any
+      // thread's StartSyncFlow has gotten far enough to matter, let alone applied anything.
       //
       // Idempotent: RegisterOriginHash (mvcc.cc) writes one dense-vector slot
       // (origin_hash_cache_[origin_idx] = hash, resizing on demand); repeated calls with the
       // same value (every reconnect re-enters InitiateDflySync with the same peer_origin_idx_/
       // peer_origin_hash_) are a no-op past the first.
       //
-      // Gated on IsPeerMode(): a non-peer (plain REPLICAOF) Replica always has peer_origin_idx_
-      // == kSelfIdx (0) and peer_origin_hash_ == 0 (Greet()'s peer-only branches never run for
-      // one). An unconditional RegisterOriginHash(0, 0) would reliably overwrite kSelfIdx's real
-      // hash (registered once at boot by SetSelfUuid) on every shard thread, breaking origin
-      // attribution for this node's OWN locally-authored writes on any active node that also
-      // carries a plain replica link. A non-peer Replica has no origin mapping to contribute.
-      if (IsPeerMode()) {
+      // Gated on peer_origin_idx_ != kSelfIdx, NOT IsPeerMode() (fix round 2, F2): a non-peer
+      // (plain REPLICAOF) Replica always has peer_origin_idx_ == kSelfIdx (0) and
+      // peer_origin_hash_ == 0 (Greet()'s peer-only branches never run for one), so
+      // IsPeerMode() and this condition agree in every configuration production ever builds
+      // (ReplicaPeerMode::registry is always real there). But ReplicaPeerMode::registry ==
+      // nullptr is a documented, reachable mode too ("tests" -- replica.h) in which Greet()'s
+      // `if (peer_mode_->registry) peer_origin_idx_ = ...AddOrGet(...)` (this file) never runs,
+      // leaving peer_origin_idx_ at kSelfIdx even though IsPeerMode() is still true and
+      // peer_origin_hash_ is still set unconditionally a few lines above it. Guarding on
+      // IsPeerMode() there would reintroduce exactly the RegisterOriginHash(0, <peer hash>)
+      // clobber of kSelfIdx's real hash this comment warns about, in that mode specifically.
+      // Checking the value peer_origin_idx_ actually holds, rather than the boolean that usually
+      // -- but not always -- agrees with it, makes the guard hold by invariant.
+      if (peer_origin_idx_ != PeerRegistry::kSelfIdx) {
         MvccStamper::tlocal()->RegisterOriginHash(peer_origin_idx_, peer_origin_hash_);
       }
       for (auto id : thread_flow_map_[index]) {
