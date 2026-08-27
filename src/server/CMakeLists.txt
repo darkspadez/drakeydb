@@ -43,6 +43,7 @@ add_library(dfly_transaction db_slice.cc blocking_controller.cc
             cluster_support.cc common.cc command_registry.cc
             execution_state.cc stats.cc synchronization.cc
             ${DF_JOURNAL_SRCS}
+            mvcc.cc
             server_state.cc table.cc  transaction.cc tx_base.cc
             serializer_commons.cc
             acl/acl_log.cc slowlog.cc channel_store.cc)
@@ -178,13 +179,14 @@ helio_cxx_test(acl/acl_family_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(engine_shard_set_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(serializer_base_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(detail/egress_throttle_test dfly_test_lib LABELS DFLY)
+helio_cxx_test(mvcc_test dfly_test_lib LABELS DFLY)
 
 add_dependencies(check_dfly dragonfly_test json_family_test list_family_test
                  generic_family_test memcache_parser_test rdb_test journal_test
                  redis_parser_test stream_family_test string_family_test
                  bitops_family_test set_family_test zset_family_test geo_family_test
                  hll_family_test cluster_config_test cluster_family_test acl_family_test
-                 json_family_memory_test multi_master_test peer_replication_test)
+                 json_family_memory_test multi_master_test peer_replication_test mvcc_test)
 
 if (WITH_SEARCH)
   helio_cxx_test(search/search_family_test dfly_test_lib LABELS DFLY)
