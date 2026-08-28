@@ -591,6 +591,12 @@ size_t DbSlice::mvcc_table_memory() const {
 // this namespace's writes are (never) armed, not a leak -- do not "fix" it by removing the scope.
 // See OnCbFinishBlocking for the O(1) production-path DCHECK this from-scratch check justifies.
 size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
+  // drakeydb: fix round 1 (Minor) -- guard against an out-of-range/never-activated db_ind, the
+  // same check every other public entry point taking a bare DbIndex relies on (e.g.
+  // DefragTableSegments, above in this file). Callers so far only ever pass 0 (always valid,
+  // the default db), so this was unreachable in practice, but TEST_VerifyMvccTable is public API.
+  if (!IsDbValid(db_ind))
+    return 0;
   if (ns_ != &namespaces->GetDefaultNamespace())
     return 0;
 

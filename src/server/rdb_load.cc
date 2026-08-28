@@ -3279,9 +3279,17 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   // stamped resident value beats it on merge. P4-2 overwrites this with the persisted stamp when
   // the RDB_OPCODE_DF_MVCC record is present. Unconditional (unlike the mc_flags mirror above):
   // every loaded key needs an entry for the mvcc table to stay dense, not just ones with a flag.
-  // SetMvcc no-ops when db.mvcc is absent (non-active node), so this costs one predictable branch
-  // there.
-  db_slice->SetMvcc(db_cntx.db_index, updater.it->first, MvccStamp{});
+  //
+  // drakeydb: fix round 1 (F5) -- the string_view overload, with item->key (already a stable
+  // std::string on this const Item*, no copy), not the PrimeKey overload used above for
+  // SetMCFlag. The PrimeKey overload's own GetSlice(&scratch) call (db_slice.cc) allocates for
+  // any key over CompactObj::kInlineLen -- unconditionally, on every node including non-active
+  // ones, since that allocation happens in the outer overload, before the inner overload's
+  // `if (!db.mvcc) return;` guard ever runs. The prior claim here ("costs one predictable
+  // branch") was true of the guard but not of the call as originally written, which paid the
+  // PrimeKey round-trip's allocation regardless of mvcc_enabled(). See task-10-report.md fix
+  // round 1.
+  db_slice->SetMvcc(db_cntx.db_index, item->key, MvccStamp{});
 
   if (!override_existing_keys_ && !updater.is_new) {
     LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind << " of type "
@@ -3313,6 +3321,24 @@ void RdbLoader::LoadItemsBuffer(const ItemsBuf& ib) {
     DbSlice& db_slice = db_cntx.GetDbSlice(es->shard_id());
     DCHECK(!db_slice.IsCacheMode());
     CreateObjectOnShard(db_cntx, item, &db_slice);
+    // drakeydb: fix round 1 (F2) -- CreateObjectOnShard's AddOrUpdate arms the loaded key
+    // (DbSlice::AutoUpdater::~AutoUpdater -> Run() -> PostUpdate -> Arm; or Run() earlier still,
+    // explicitly, right before a tiered-storage stash a few lines up in CreateObjectOnShard) --
+    // this file never journals a load, so nothing ever calls MvccStamper::Commit() for it, and
+    // without this call the arm would sit in armed_ until some LATER, unrelated journaled write
+    // on this same shard thread runs Commit(), which stamps every still-armed key -- not just its
+    // own -- with that write's mvcc and origin. That clobbers this task's {0,0} fallback with
+    // local authority no peer ever saw, exactly the "stamp without propagation" direction D-7
+    // forbids, and it would do so silently: TEST_VerifyMvccTable/OnCbFinishBlocking only check
+    // density (one stamp per key), not correctness of the stamp's value. Per item, not batched
+    // once after the loop: CreateObjectOnShard can itself yield (the tiered-storage throttle wait
+    // right after the explicit Run() above), so an item's arm must be retired before the next
+    // item's AddOrUpdate can add to armed_ behind it. Gated on mvcc_enabled() like every other
+    // EndOfWriteEpoch call site (transaction.cc) to skip the thread_local guard check when this
+    // node is not active. See task-10-report.md fix round 1 (F2) for how this was verified before
+    // being fixed, and its regression test.
+    if (db_slice.mvcc_enabled())
+      MvccStamper::tlocal()->EndOfWriteEpoch();
     if (stop_early_) {
       // force all items in ib to move into item_queue_ so they can be cleaned up later.
       break;
@@ -3478,7 +3504,15 @@ io::Result<bool> RdbLoader::ReadAndDispatchObject(int object_type, std::string& 
 
   if (run_inlined) {
     const DbContext db_cntx{&namespaces->GetDefaultNamespace(), db_index, GetCurrentTimeMs()};
-    CreateObjectOnShard(db_cntx, item, &db_cntx.GetDbSlice(sid));
+    DbSlice& db_slice = db_cntx.GetDbSlice(sid);
+    CreateObjectOnShard(db_cntx, item, &db_slice);
+    // drakeydb: fix round 1 (F2) -- same requirement as LoadItemsBuffer's loop above; see that
+    // comment for the full mechanism. run_inlined means this call is already on the target
+    // shard's own thread (the condition computing it, above in this function, is exactly
+    // EngineShard::tlocal()->shard_id() == sid), so MvccStamper::tlocal() here is the same
+    // instance CreateObjectOnShard just armed into.
+    if (db_slice.mvcc_enabled())
+      MvccStamper::tlocal()->EndOfWriteEpoch();
   } else {
     auto& out_buf = shard_buf_[sid];
     out_buf.emplace_back(item);

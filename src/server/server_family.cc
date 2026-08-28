@@ -1358,8 +1358,26 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
   // (multimaster_test.py) issues `SET local-only local` in exactly this window, before its
   // (correctly refused) REPLICAOF attempt. See task-10-report.md for the verbatim crash. Safe to
   // call unconditionally on every boot: JournalSlice::Init() (journal_slice.cc) is an explicit
-  // no-op on a second call, and its ring buffer is a fixed 8192-entry capacity, not proportional
-  // to anything unbounded -- there is no meaningful cost to a mesh node that never gets a peer.
+  // no-op on a second call.
+  //
+  // drakeydb: fix round 1 (F3) -- corrected. The ring buffer does NOT stay at its initial
+  // 8192-entry capacity: JournalSlice::CleanEntries (journal_slice.cc) grows it once full, up to
+  // min(--shard_repl_backlog_time_ms worth of writes (default 5000ms), GetPerShardBacklogMaxBytes()
+  // -- --shard_repl_backlog_max_bytes if set, else 0.5% of maxmemory, divided by shard count).
+  // So a peerless active node carries an ongoing backlog up to that bound that nothing will ever
+  // read, plus a full JournalWriter::Write serialization per write from here on -- a real,
+  // per-write cost, not a one-time allocation. Still judged acceptable: it is the same cost any
+  // active-replica node already pays once a peer attaches, just paid a bit earlier (from boot
+  // instead of from first attach), and bounded the same way production already bounds it for
+  // every other case.
+  //
+  // Residual noted, not closed, by this change: the partial-sync buffer is now non-empty from
+  // boot instead of from first peer attach, so DflyCmd::IsLSNInPartialSyncBuffer (dflycmd.cc)
+  // could in principle match a pre-peer local LSN on a later reconnect. Low risk in practice --
+  // that path additionally requires failover_match/cascaded_match and the off-by-default
+  // --experimental_cascaded_partial_sync -- but written down here since it is a direct consequence
+  // of this fix, not something it was designed to address.
+  //
   // RunBriefInParallel (shard-scoped), not pool()->AwaitBrief like SetSelfUuid above:
   // journal::StartInThread() dereferences EngineShard::tlocal(), which is null on a non-shard
   // proactor thread, unlike MvccStamper::tlocal() (a plain thread_local with no such requirement).
