@@ -693,16 +693,17 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
 class MvccStoreTest : public BaseFamilyTest {
  protected:
   void SetUp() override {
+    // drakeydb: P4-1 Task 7's original comment here explained why this fixture used to need its
+    // own explicit journal::StartInThread() call (LogAutoJournalOnShard/RecordJournal gate on
+    // shard->journal(), off by default in tests): FLAGS_active_replica is set to true on the line
+    // below, BEFORE BaseFamilyTest::SetUp() (which calls ResetService() -> ServerFamily::Init()),
+    // so fix round 1's boot-time journal start (server_family.cc, gated on IsActiveReplica())
+    // already covers every write in this fixture -- removed in fix round 2 (R2), which also
+    // removed the identical redundancy from seven ReaperJournalFamilyTest tests in fix round 1
+    // (F4): a fixture-level explicit start left here would mask a regression of the production
+    // fix from all of this fixture's tests, the same masking F4 closed for the reaper tests.
     absl::SetFlag(&FLAGS_active_replica, true);
     BaseFamilyTest::SetUp();
-    // drakeydb: P4-1 Task 7 -- LogAutoJournalOnShard and every command-specific RecordJournal
-    // call site (e.g. SetCmd::RecordJournal) gate on shard->journal() before ever reaching
-    // journal::RecordEntry, and the journal is off by default in tests (production only starts
-    // it via the DFLY FLOW replica handshake). Without this, RecordEntry -- and so Arm/Commit --
-    // never runs for a plain SET/LPUSH, and StampOf() returns nullopt for every write in this
-    // fixture. Broadcast to every shard (this fixture does not pin num_shards=1, unlike
-    // OriginJournalFamilyTest below).
-    shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
   }
   void TearDown() override {
     BaseFamilyTest::TearDown();
