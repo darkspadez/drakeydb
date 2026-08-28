@@ -587,6 +587,33 @@ auto-journals — still gets the suppressed default). Both carve-outs mirror `Op
 pre-existing plain-forwarded-DEL precedent for HEXPIRE/HPEXPIRE (`hset_family.cc`) rather than
 inventing a new exception shape.
 
+**P4-1 Task 12 delivered**: the MVCC side-table memory benchmark
+(`tests/dragonfly/multimaster_memory_test.py`), 1M keys x {8,16,24,32}-byte keys, an
+`--active_replica` instance vs. a plain baseline. `mvcc_table_bytes` tracks entry count
+only (46,497,792 B / 44.3 MiB identically in all four cases) and its own per-key cost
+stays inside the `[34, 48]` B/key geometry band predicted from
+`sizeof(DbTable::MvccTable::Segment_t::Bucket) == 504` (measured: 46.5 B/key, every
+case). The metric has a narrower version of the same blind spot `table_used_memory` has,
+though: it is `DashTable::mem_usage()`, documented as excluding "memory allocated by the
+hosted objects", so it cannot see the second, independent key copy `DbSlice::SetMvcc`
+heap-allocates for every key whose ASCII-packed form still exceeds
+`CompactObj::kInlineLen` (16 B). Measured (all four `used_memory`-delta assertions pass
+against a model of that second copy, not against `mvcc_table_bytes` alone — see
+`_expected_duplication_bytes` in the test and task-12-report.md):
+
+| key_len | mvcc_table_bytes (table-only) | used_memory delta (true cost) | gap over table-only |
+|---:|---:|---:|---:|
+| 8  | 44.3 MiB | 48.0 MiB | +8.3% |
+| 16 | 44.3 MiB | 48.0 MiB | +8.3% |
+| 24 | 44.3 MiB | 63.3 MiB | +42.7% |
+| 32 | 44.3 MiB | 78.5 MiB | +77.1% |
+
+For capacity planning on a long-key workload, `used_memory` is the figure to trust, not
+`mvcc_table_bytes` alone — documented at the `mvcc_table_bytes` INFO call site
+(`server_family.cc`) and in the test itself. Full data, the mimalloc-bin-table probe the
+duplication model is built from, and the falsification for every assertion:
+`.superpowers/sdd/2026-08-25-phase4-mvcc-lww/task-12-report.md`.
+
 ## Phase 5 — Streaming LWW guard
 Command classifier + pre-exec compare/drop in `JournalExecutor`; `multimaster_lww_dropped`
 metric; `--multi_master_stream_lww` off = KeyDB-parity arrival order.

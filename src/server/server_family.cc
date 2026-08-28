@@ -2870,6 +2870,20 @@ string ServerFamily::FormatInfoMetrics(
     // drakeydb: Phase 4, P4-1 Task 11 -- side table sized by DbTable::mvcc_table_memory(),
     // entries/tombstones maintained in DbSlice::SetMvcc/EraseMvcc (table.h/db_slice.cc). All
     // three stay 0 outside --active_replica, where the side table is never allocated.
+    //
+    // drakeydb: P4-1 Task 12 (memory benchmark) -- mvcc_table_bytes UNDER-REPORTS the side
+    // table's true cost for keys over CompactObj::kInlineLen (16 B). It is
+    // DashTable::mem_usage() (dash.h), documented there as excluding "memory allocated by
+    // the hosted objects": for every key whose encoded form still exceeds kInlineLen,
+    // DbSlice::SetMvcc heap-allocates a second, independent copy of the key (a PrimeKey
+    // living in this table's own bucket, separate from the prime table's copy), and that
+    // allocation is invisible here. Measured (tests/dragonfly/multimaster_memory_test.py):
+    // 24-byte keys cost ~43% more than this field reports, 32-byte keys ~77% more; 1M-key
+    // deltas of 63 MiB and 78 MiB respectively against a 44 MiB mvcc_table_bytes. This is
+    // the same blind spot table_used_memory/prime.mem_usage() already has, one level
+    // deeper. For capacity planning on a long-key workload, trust used_memory (which does
+    // include the second copy, being allocated from the shard's MiMemoryResource), not
+    // this field alone.
     append("mvcc_table_bytes", total.mvcc_table_bytes);
     append("mvcc_entries", total.mvcc_entries);
     append("mvcc_tombstones", total.mvcc_tombstones);
