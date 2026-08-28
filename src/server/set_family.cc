@@ -613,6 +613,16 @@ OpResult<uint32_t> OpAdd(const OpArgs& op_args, std::string_view key, const NewE
     res = StringSetWrapper{co, op_args.db_cntx}.Add(vals, UINT32_MAX, false);
   }
 
+  // drakeydb: Phase 4, P4-1 Task 8 fix round 2 (F3), corrected round 3 -- arm before journaling,
+  // same reasoning as hset_family.cc's OpHExpire (:728-731): add_res.post_updater would otherwise
+  // not run until this function returns, after RecordJournal below. Reached with
+  // journal_update=true, overwrite=true from SDIFFSTORE/SINTERSTORE/SUNIONSTORE (all
+  // NO_AUTOJOURNAL, this file's Register()) -- and also, overwrite=false, from SMOVE's
+  // destination write (Mover::OpMutate, this file, journal_rewrite_=true from CmdSMove). Either
+  // way RecordJournal below is the only journal entry that key gets, and a
+  // propagated-but-unstamped key is exactly what Task 7's invariant forbids.
+  add_res.post_updater.Run();
+
   // TODO: consider optimization to record real command if the replica is in stable_sync state
   // and there is no slot migration process going on.
   if (journal_update && op_args.shard->journal()) {
@@ -1042,7 +1052,7 @@ OpStatus OpPop(const OpArgs& op_args, string_view key, unsigned count, cmn::Back
   // Lazy per-member TTL expiry during RandMemberSet iteration may have emptied
   // the set (Size() includes expired members, but iteration skips them).
   if (is_empty) {
-    db_slice.DelMutable(db_cntx, std::move(*find_res));
+    db_slice.DelMutable(db_cntx, std::move(*find_res), DbSlice::DeleteReason::kExpired);
     if (op_args.shard->journal()) {
       RecordJournal(op_args, "DEL"sv, ArgSlice{key});
     }
@@ -1650,7 +1660,7 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
     return false;
 
   if (auto res = db_slice.FindMutable(db_cntx, key, OBJ_SET); res) {
-    db_slice.DelMutable(db_cntx, std::move(*res));
+    db_slice.DelMutable(db_cntx, std::move(*res), DbSlice::DeleteReason::kExpired);
     if (db_slice.shard_owner()->journal()) {
       // drakeydb: Phase 3 -- db_cntx carries the causing transaction's replication-apply origin
       // (see DbContext::repl_origin_idx), so this derived DEL inherits it rather than always

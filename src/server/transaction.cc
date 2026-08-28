@@ -4,6 +4,7 @@
 
 #include "server/transaction.h"
 
+#include <absl/cleanup/cleanup.h>
 #include <absl/strings/match.h>
 
 #include <memory>
@@ -18,6 +19,7 @@
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/journal.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/server_state.h"
 
@@ -687,6 +689,38 @@ bool Transaction::RunInShard(EngineShard* shard, bool allow_q_removal) {
 void Transaction::RunCallback(EngineShard* shard) {
   DCHECK_EQ(shard, EngineShard::tlocal());
   DCHECK(shard->running_tx() == nullptr);
+
+  // drakeydb: Phase 4, review fix round 1 (F2) -- declared first, so this runs on EVERY exit from
+  // this function, not just the path after LogAutoJournalOnShard below.
+  // db_slice.OnCbFinishBlocking() (below, OUTSIDE the try/catch that follows) itself allocates
+  // (CallChangeCallbacks -> snapshot serialization, SendQueuedInvalidationMessages), and
+  // LogAutoJournalOnShard/MaybeInvokeTrackingCb are outside it too; any throw from any of those, or
+  // a non-std::exception throw from cb, used to leave armed_/arena_ populated and hop_stamp_
+  // unreset -- the NEXT callback on this thread would then silently stamp THIS callback's leftover
+  // armed keys with the next entry's mvcc. MvccStamper::Commit's own absl::Cleanup only covers
+  // throws from inside Commit itself, not this function's later exits.
+  //
+  // Gated on mvcc_enabled, read once here rather than an unconditional
+  // MvccStamper::tlocal()->EndOfWriteEpoch() call: tlocal() is a function-local thread_local with
+  // a non-trivial destructor, so every call costs a non-inlinable guard-variable check plus four
+  // stores that a non-active node (mvcc_enabled always false, nothing ever armed) should not pay
+  // on every shard callback -- ctest and the pytest suites don't observe this, only a profiler
+  // would. db_slice.mvcc_enabled() is IsActiveReplica() cached at DbSlice construction (Task 5);
+  // every DbSlice caches the same boot-time value regardless of namespace, so it does not matter
+  // that this db_slice may be a non-default namespace's (see LogJournalOnShard/F1's comment).
+  //
+  // This epoch is thread-local, not fiber- or transaction-local (MvccStamper::tlocal(), mvcc.h).
+  // Its correctness rests entirely on the running_tx_ serialization invariant enforced elsewhere:
+  // EngineShard::PollExecution and ::Heartbeat both refuse to proceed while running_tx_ is set
+  // (engine_shard.cc) -- only one Transaction's callback can be mid-flight on a given shard thread
+  // at a time, so "the epoch" and "this callback" coincide for as long as that invariant holds.
+  auto& db_slice = GetDbSlice(shard->shard_id());
+  const bool mvcc_enabled = db_slice.mvcc_enabled();
+  absl::Cleanup epoch_end = [mvcc_enabled] {
+    if (mvcc_enabled)
+      MvccStamper::tlocal()->EndOfWriteEpoch();
+  };
+
   shard->set_running_tx(this);
 
   RunnableResult result;
@@ -713,7 +747,6 @@ void Transaction::RunCallback(EngineShard* shard) {
     LOG(FATAL) << "Unexpected exception " << e.what();
   }
 
-  auto& db_slice = GetDbSlice(shard->shard_id());
   db_slice.OnCbFinishBlocking();
 
   // Handle result flags to alter behaviour.
@@ -732,6 +765,11 @@ void Transaction::RunCallback(EngineShard* shard) {
   }
 
   shard->set_running_tx(nullptr);
+
+  // drakeydb: Phase 4 -- MUST be after LogAutoJournalOnShard, which is guaranteed here since
+  // epoch_end (declared at the top of this function) runs on scope exit, after every statement
+  // above including this one -- not inside OnCbFinishBlocking, which runs before the journal
+  // entry exists. See server/mvcc.h.
 }
 
 // TODO: For multi-transactions we should be able to deduce mode() at run-time based
@@ -1521,6 +1559,20 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
   auto* shard = EngineShard::tlocal();
   auto& db_slice = GetDbSlice(shard->shard_id());
 
+  // drakeydb: Phase 4, review fix round 1 (F2) -- declared first, same rationale as RunCallback's
+  // epoch_end above: db_slice.OnCbFinishBlocking() below is outside any try/catch here (this
+  // function has none for LogAutoJournalOnShard/MaybeInvokeTrackingCb either), and this function
+  // -- unlike RunCallback -- has no catch (std::exception&) at all, so a non-bad_alloc throw from
+  // cb() propagates immediately. Gated on mvcc_enabled for the same reason as RunCallback (avoids
+  // the non-inlinable MvccStamper::tlocal() call on a non-active node). This epoch is
+  // thread-local, not fiber- or transaction-local -- see RunCallback's comment for the
+  // running_tx_ serialization invariant this relies on.
+  const bool mvcc_enabled = db_slice.mvcc_enabled();
+  absl::Cleanup epoch_end = [mvcc_enabled] {
+    if (mvcc_enabled)
+      MvccStamper::tlocal()->EndOfWriteEpoch();
+  };
+
   // In NON_ATOMIC mode SquashedHopCb is invoked directly, without a wrapping RunCallback,
   // so this stub owns the running_tx_ slot. In atomic modes (LOCK_AHEAD / GLOBAL) the
   // parent transaction's RunCallback has already set running_tx_ to itself.
@@ -1545,6 +1597,11 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
 
   if (owns_running_tx)
     shard->set_running_tx(nullptr);
+
+  // drakeydb: Phase 4 -- epoch_end (declared at the top of this function) runs on scope exit,
+  // after LogAutoJournalOnShard above, unconditionally -- not gated on owns_running_tx like
+  // set_running_tx() just above: this stub's own callback may have armed keys and emitted its
+  // own journal entry regardless of which Transaction owns running_tx_. See server/mvcc.h.
 
   DCHECK_EQ(result.flags, 0);  // if it's sophisticated, we shouldn't squash it
   return result;
@@ -1666,6 +1723,14 @@ void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult resul
 }
 
 void Transaction::LogJournalOnShard(journal::Entry::Payload&& payload) const {
+  // The journal wire has no namespace identity and JournalExecutor applies every COMMAND to the
+  // default namespace. Serializing an ACL-namespaced write would therefore leak it into a
+  // different tenant on every replica. Non-default namespaces are local-only until the wire can
+  // carry and authenticate their identity.
+  DCHECK(namespace_ != nullptr);
+  if (namespace_ != &namespaces->GetDefaultNamespace())
+    return;
+
   // drakeydb: Phase 3 -- stamp this transaction's replication-apply origin (kSelfIdx/0 for an
   // ordinary client transaction) onto the recorded entry.
   journal::RecordEntry(txid_, journal::Op::COMMAND, db_index_,

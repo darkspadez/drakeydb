@@ -2323,9 +2323,7 @@ TEST_F(GenericFamilyTest, KeyspaceNotificationNoAtomicSectionOnExpiry) {
   // which are sent outside the atomic section (see issue #7052).
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     DbSlice::DeleteExpiredStats stats = db_slice.DeleteExpiredStep(db_cntx, 100);
     if (!stats.key_events.empty())
       channel_store->SendMessages("__keyevent@0__:expired", stats.key_events, false);

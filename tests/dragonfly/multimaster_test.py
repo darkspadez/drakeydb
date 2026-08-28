@@ -2059,18 +2059,25 @@ async def test_member_expiry_reaper_self_heals_peer_without_read(df_factory: Dfl
     await wait_for_peers(c_b, 1)
 
     assert await c_a.execute_command("sadd", "s", "m1") == 1
-    await c_a.execute_command("fieldexpire", "s", "1", "m1")
 
-    # Ordinary setup traffic (SADD/FIELDEXPIRE) replicates normally; wait for it to land on b
-    # before starting the measurement window below -- this convergence poll is setup, not the
-    # load-bearing assertion.
+    # Let the value replicate before arming its short TTL. Otherwise a loaded runner can let the
+    # TTL elapse and correctly reap the key before this setup poll ever observes it, producing a
+    # false replication failure (the adjacent derived-delete test uses the same ordering).
     @assert_eventually(timeout=30)
     async def setup_converged():
         assert await _exists(c_b, "s")
 
     await setup_converged()
 
-    await asyncio.sleep(1.2)  # let the 1s member TTL elapse on every node's own clock
+    await c_a.execute_command("fieldexpire", "s", "3", "m1")
+
+    @assert_eventually(timeout=30)
+    async def ttl_setup_converged():
+        assert await c_b.execute_command("fieldttl", "s", "m1") > 0
+
+    await ttl_setup_converged()
+
+    await asyncio.sleep(3.2)  # let the 3s member TTL elapse on every node's own clock
 
     # a's own read triggers a's lazy member expiry, deriving a DEL that is suppressed on the peer
     # link (proven unconditionally by the test above). Nothing about this call touches b.
@@ -2164,3 +2171,47 @@ async def test_member_expiry_reaper_covers_namespaces_and_zero_budget(
         "FT.SEARCH", "reaper-namespace-index", "@tag:{red}", "NOCONTENT"
     )
     assert default_search[0] == 1
+
+
+# drakeydb: Phase 4 Task 9 wrote this test and Task 11 (DEBUG MVCC) unskips it. This is the
+# phase's headline acceptance criterion: a key written on node A and replicated to node B must
+# carry bit-identical {mvcc, origin_hash} on both.
+#
+# Task 9's original body called `await assert_eventually(lambda: _exists(c_b, "k"))` to wait for
+# replication -- that does NOT work: assert_eventually's retry loop (tests/dragonfly/utility.py)
+# only retries on a caught AssertionError, _exists() returns a plain bool rather than raising, and
+# the return value is never asserted on either, so the wrapped call returned on its first attempt
+# regardless of the result. Fixed below using the decorator form already established elsewhere in
+# this file (e.g. test_member_expiry_reaper_covers_namespaces_and_zero_budget, same module).
+async def test_replicated_key_stamp_matches_origin(df_factory):
+    """The phase's headline criterion. Falsified by removing SetApplyMvcc in replica.cc:
+    B then mints its own stamp and the mvcc values differ."""
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+    # drakeydb: Task 9's original body called this bare (no await). attach() is `async def`
+    # (defined above; every other call site in this file correctly awaits it, e.g.
+    # test_peer_clock_skew_reported just above) -- an un-awaited coroutine never runs its body,
+    # so the REPLICAOF this issues would never actually be sent and wait_for_peers below would
+    # hang for its full timeout waiting for a peer link that was never requested.
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+
+    await c_a.execute_command("set", "k", "v")
+
+    @assert_eventually(timeout=30)
+    async def key_replicated():
+        assert await _exists(c_b, "k")
+
+    await key_replicated()
+
+    stamp_a = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
+    stamp_b = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
+    assert stamp_a["mvcc"] == stamp_b["mvcc"], f"{stamp_a} != {stamp_b}"
+    assert stamp_a["origin"] == stamp_b["origin"], "both must name A as the author"
+
+
+def _parse_mvcc(reply) -> dict:
+    text = reply.decode() if isinstance(reply, bytes) else reply
+    return dict(part.split(":", 1) for part in text.split())

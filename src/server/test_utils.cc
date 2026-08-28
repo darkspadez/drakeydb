@@ -490,6 +490,32 @@ RespExpr BaseFamilyTest::Run(std::string_view id, ArgSlice slice) {
   return conn_wrapper->ParseResponse(single_response_);
 }
 
+RespExpr BaseFamilyTest::RunViaNamespace(Namespace* ns, ArgSlice slice) {
+  if (!ProactorBase::IsProactorThread()) {
+    return pp_->at(0)->Await([&] { return this->RunViaNamespace(ns, slice); });
+  }
+
+  TestConnWrapper* conn_wrapper = AddFindConn(Protocol::REDIS, GetId());
+
+  CmdArgVec args = conn_wrapper->Args(slice);
+
+  ConnectionContext* context = conn_wrapper->cmd_cntx();
+  context->ns = ns;
+
+  DCHECK(context->transaction == nullptr);
+  CommandContext cmd_cntx;
+  cmd_cntx.Init(conn_wrapper->builder(), context);
+  cmd_cntx.Assign(args.begin(), args.end(), args.size());
+  service_->DispatchCommand(ParsedArgs{cmd_cntx}, &cmd_cntx, AsyncPreference::ONLY_SYNC);
+
+  DCHECK(context->transaction == nullptr);
+
+  unique_lock lk(mu_);
+  last_cmd_dbg_info_ = context->last_cmd_stats;
+
+  return conn_wrapper->ParseResponse(single_response_);
+}
+
 void BaseFamilyTest::RunMany(const std::vector<std::vector<std::string>>& cmds) {
   if (!ProactorBase::IsProactorThread()) {
     return pp_->at(0)->Await([&] { return this->RunMany(cmds); });

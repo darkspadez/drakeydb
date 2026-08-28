@@ -272,6 +272,49 @@ TEST(Journal, WriteReadExtendedFraming) {
   EXPECT_EQ(ExtractPayload(entry), ExtractPayload(res));
 }
 
+// drakeydb: Phase 4 Task 9, fix round 2 (F1) -- WriteReadExtendedFraming above only exercises
+// mvcc == 0, which is also ParsedEntry::mvcc's own default-constructed value -- so it would
+// survive undetected even if the wire read (serializer.cc) or TransactionData::AddEntry's copy
+// (tx_executor.cc) were both silently broken. That left the wire -> TransactionData hop
+// genuinely untested: journal_test.cc's other mvcc assertions are all EXPECT_EQ(res.mvcc, 0u),
+// and multi_master_test.cc's MvccStoreTest sets TransactionData::mvcc by hand rather than
+// deriving it from a parsed wire entry. This closes that gap directly: chains the same two
+// steps WriteReadExtendedFraming does (JournalWriter::Write -> JournalReader::ReadEntry) with a
+// third, TransactionData::AddEntry (tx_executor.cc), and asserts the FINAL TransactionData::mvcc
+// with a non-zero value -- not just the intermediate ParsedEntry::mvcc -- so a mutation at
+// either serializer.cc:305 (the wire read) or tx_executor.cc:80 (the TransactionData copy) fails
+// this test. See task-9-report.md for the verbatim falsification of the latter.
+TEST(Journal, NonZeroMvccSurvivesWireToTransactionData) {
+  StoredSlices slices{};
+  auto slice = [v = &slices](auto... ss) { return StoreSlice(v, ss...); };
+  using Payload = Entry::Payload;
+
+  constexpr uint64_t kNonZeroMvcc = 0x1234'5678'9ABCULL;
+  Entry entry{7, Op::COMMAND, 2, nullopt, Payload("SET", slice("key", "value"))};
+  entry.origin_idx = 3;
+  entry.mvcc = kNonZeroMvcc;
+  entry.entry_flags = kEntryFlagExpired;
+
+  base::IoBuf buf;
+  io::BufSink sink{&buf};
+  JournalWriter writer{&sink, /*extended_framing=*/true};
+  writer.Write(entry);
+
+  io::BufSource source{&buf};
+  JournalReader reader{&source, 0};
+  ParsedEntry res;
+  auto ec = reader.ReadEntry(&res);
+  ASSERT_FALSE(ec);
+  ASSERT_EQ(res.mvcc, kNonZeroMvcc) << "already lost on the wire round trip alone";
+
+  TransactionData tx_data;
+  tx_data.AddEntry(std::move(res));
+  EXPECT_EQ(tx_data.mvcc, kNonZeroMvcc)
+      << "TransactionData::AddEntry (tx_executor.cc) did not copy the wire's mvcc";
+  EXPECT_EQ(tx_data.entry_flags, kEntryFlagExpired)
+      << "TransactionData::AddEntry (tx_executor.cc) did not copy the wire's entry_flags";
+}
+
 // drakeydb: Phase 3 T2 -- the reader is version-agnostic: one JournalReader instance, with no
 // knowledge of either writer's framing choice, parses a v2 entry followed by a v1 entry, and the
 // legacy-framed entry does not inherit the previous v2 entry's origin metadata.

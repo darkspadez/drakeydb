@@ -44,7 +44,11 @@ struct EntryBase {
   // drakeydb: Phase 3 origin metadata. All defaulted so non-active nodes stay byte-identical to
   // upstream, and placed after `lsn` so the aggregate-init constructors below keep compiling.
   uint32_t origin_idx{0};  // PeerRegistry index of this entry's author; kSelfIdx (0) == self.
-  uint64_t mvcc{0};        // Reserved for future conflict resolution; not yet threaded further.
+  // Author's MVCC stamp for conflict resolution. Stale note from Phase 3 removed here in review
+  // wave 2 (F2): Phase 4 threads this fully -- serializer.cc writes/reads it under
+  // extended_framing_, and journal::RecordEntry (journal.cc) both stamps it locally via
+  // MvccStamper::Commit and puts it on the wire via AddLogRecord.
+  uint64_t mvcc{0};
   uint8_t entry_flags{0};  // Bitmask; bit0 == kEntryFlagExpired, bit1 == kEntryFlagDerived.
 };
 

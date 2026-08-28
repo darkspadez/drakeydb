@@ -11,6 +11,7 @@
 
 #include "core/intent_lock.h"
 #include "server/detail/table.h"
+#include "server/mvcc.h"
 #include "server/tx_base.h"
 
 extern "C" {
@@ -66,6 +67,12 @@ struct DbTableStats {
   // post-mutation chokepoint every PrimeValue write funnels through, including RDB/full-sync
   // loads) and DbSlice::PerformDeletionAtomic (key deleted while still carrying member TTLs).
   uint64_t member_expire_count = 0;
+
+  // drakeydb: P4-1 Task 5 -- number of entries in DbTable::mvcc (active mode only; stays 0
+  // otherwise). Maintained in DbSlice::SetMvcc/EraseMvcc.
+  size_t mvcc_entries = 0;
+  // stays 0 until P4-5; declared now so Task 10's invariant compiles.
+  size_t mvcc_tombstones = 0;
 
   // Object memory usage besides hash-table capacity.
   // Applies for any non-inline objects.
@@ -136,6 +143,16 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
   PrimeTable prime;
   DashTable<PrimeKey, uint32_t, detail::ExpireTablePolicy> mcflag;
 
+  // drakeydb: Phase 4. Per-key MVCC stamp, mirroring the mcflag side-table precedent above.
+  // unique_ptr because it is allocated only in active mode -- a non-active node pays 8 bytes per
+  // DbTable rather than an empty DashTable. Same policy as mcflag/expire: 14 slots, no versioning.
+  using MvccTable = DashTable<PrimeKey, MvccStamp, detail::ExpireTablePolicy>;
+  std::unique_ptr<MvccTable> mvcc;
+
+  size_t mvcc_table_memory() const {
+    return mvcc ? mvcc->mem_usage() : 0;
+  }
+
   // Contains transaction locks
   LockTable trans_locks;
 
@@ -146,6 +163,11 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
   std::unique_ptr<SlotStats[]> slots_stats;
   PrimeTable::Cursor expire_cursor;
   PrimeTable::Cursor segment_defrag_cursor;
+  // drakeydb: Phase 4, P4-1 Task 10 -- mirrors segment_defrag_cursor above, but for DbTable::mvcc.
+  // DefragTableSegments's prime-table loop relocates prime segments only; nothing else relocates
+  // the side table's, so without a second cursor here it accumulates mimalloc fragmentation for
+  // the process's lifetime. See DbSlice::DefragTableSegments (db_slice.cc).
+  MvccTable::Cursor mvcc_defrag_cursor;
 
   struct SampleTopKeys {
     TopKeys* top_keys = nullptr;

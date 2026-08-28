@@ -56,6 +56,15 @@ class JournalExecutor {
     conn_context_.repl_origin_idx = idx;
   }
 
+  // drakeydb: Phase 4 -- the applied entry's author stamp, so PrepareTransaction's
+  // SetReplOrigin(repl_origin_idx, repl_mvcc) (main_service.cc) forwards it verbatim onto the
+  // Transaction, and RecordEntry (journal.cc) stores it as-is instead of minting a fresh
+  // HopStamp. Per-ENTRY, unlike SetApplyOrigin which is per-link: call this before every
+  // Execute(), not once at flow setup.
+  void SetApplyMvcc(uint64_t mvcc) {
+    conn_context_.repl_mvcc = mvcc;
+  }
+
  private:
   facade::DispatchResult Execute(CommandContext* cmd_cntx);
 

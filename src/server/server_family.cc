@@ -68,6 +68,7 @@ extern "C" {
 #include "server/main_service.h"
 #include "server/memory_cmd.h"
 #include "server/multi_command_squasher.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/node_identity.h"
 #include "server/peer_replication.h"
@@ -1340,6 +1341,48 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
   LOG(INFO) << "Node uuid: " << node_identity_.uuid
             << (node_identity_.ephemeral ? " (ephemeral)" : "");
 
+  // drakeydb: Phase 4 -- every proactor thread needs the self origin hash before the first write.
+  shard_set->pool()->AwaitBrief(
+      [uuid = node_identity_.uuid](unsigned, auto*) { MvccStamper::tlocal()->SetSelfUuid(uuid); });
+
+  // drakeydb: Phase 4, P4-1 Task 10 -- an active-replica node's journal must be running from boot,
+  // not only once a peer/replica first attaches (DFLY FLOW admission, dflycmd.cc:340, or a
+  // partial-sync resume, replica.cc:1955). Without this, MvccStamper::Arm() (PostUpdate,
+  // db_slice.cc) still fires on every write -- gated only on mvcc_enabled_, which is cached from
+  // IsActiveReplica() alone -- but with no running journal, LogAutoJournalOnShard
+  // (transaction.cc) never reaches journal::RecordEntry, so the arm is never committed and
+  // EndOfWriteEpoch() silently discards it: any client write between boot and the first peer
+  // connection would be permanently unstamped, tripping the dense mvcc invariant
+  // (DbSlice::OnCbFinishBlocking) the moment any later command touches that key again -- observed
+  // via the pytest gate (not a unit test): test_active_replica_refuses_redis_master_without_uuid
+  // (multimaster_test.py) issues `SET local-only local` in exactly this window, before its
+  // (correctly refused) REPLICAOF attempt. See task-10-report.md for the verbatim crash. Safe to
+  // call unconditionally on every boot: JournalSlice::Init() (journal_slice.cc) is an explicit
+  // no-op on a second call.
+  //
+  // The ring buffer does NOT stay at its initial 8192-entry capacity: JournalSlice::CleanEntries
+  // grows it once full. Retained bytes are hard-bounded by --shard_repl_backlog_max_bytes (or
+  // 0.5% of maxmemory divided by shard count by default). The time setting is a retention target,
+  // not a hard age bound: cleanup removes at most 100 time-expired entries per subsequent write,
+  // so a burst can temporarily leave older entries behind. A peerless active node therefore pays
+  // an ongoing bounded backlog plus full JournalWriter serialization per write, not a one-time
+  // allocation. This is the same steady-state cost paid after a peer attaches, started at boot so
+  // pre-peer writes can be stamped consistently.
+  //
+  // Residual noted, not closed, by this change: the partial-sync buffer is now non-empty from
+  // boot instead of from first peer attach, so DflyCmd::IsLSNInPartialSyncBuffer (dflycmd.cc)
+  // could in principle match a pre-peer local LSN on a later reconnect. Low risk in practice --
+  // that path additionally requires failover_match/cascaded_match and the off-by-default
+  // --experimental_cascaded_partial_sync -- but written down here since it is a direct consequence
+  // of this fix, not something it was designed to address.
+  //
+  // RunBriefInParallel (shard-scoped), not pool()->AwaitBrief like SetSelfUuid above:
+  // journal::StartInThread() dereferences EngineShard::tlocal(), which is null on a non-shard
+  // proactor thread, unlike MvccStamper::tlocal() (a plain thread_local with no such requirement).
+  if (IsActiveReplica()) {
+    shard_set->RunBriefInParallel([](auto*) { journal::StartInThread(); });
+  }
+
   // --replicaof: a non-active node replicates instead of loading a snapshot; an active node loads
   // its own snapshot first (drakeydb) and then attaches every target.
   if (ReplicaOfFlag flag = GetFlag(FLAGS_replicaof); flag.has_value()) {
@@ -2443,7 +2486,7 @@ void ServerFamily::Shrink(facade::CmdArgParser parser, CommandContext* cmd_cntx)
       // Shrink expires entries during bucket compaction.  If all entries expired,
       // delete the now-empty key to prevent zombie keys that crash SAVE.
       if (ds->Empty()) {
-        db_slice.DelMutable(t->GetDbContext(), std::move(it_res));
+        db_slice.DelMutable(t->GetDbContext(), std::move(it_res), DbSlice::DeleteReason::kExpired);
         // The replayed SHRINK re-applies relative member TTLs against the replica clock
         // and cannot reproduce this deletion; journal it explicitly.
         if (shard->journal()) {
@@ -2822,6 +2865,34 @@ string ServerFamily::FormatInfoMetrics(
     append("prime_capacity", total.prime_capacity);
     append("num_entries", total.key_count);
     append("inline_keys", total.inline_keys);
+    // drakeydb: Phase 4, P4-1 Task 11 -- side table sized by DbTable::mvcc_table_memory(),
+    // entries/tombstones maintained in DbSlice::SetMvcc/EraseMvcc (table.h/db_slice.cc). All
+    // three stay 0 outside --active_replica, where the side table is never allocated.
+    //
+    // drakeydb: P4-1 Task 12 (memory benchmark) -- mvcc_table_bytes UNDER-REPORTS the side
+    // table's true cost for keys over CompactObj::kInlineLen (16 B). It is
+    // DashTable::mem_usage() (dash.h), documented there as excluding "memory allocated by
+    // the hosted objects": for every key whose encoded form still exceeds kInlineLen,
+    // DbSlice::SetMvcc heap-allocates a second, independent copy of the key (a PrimeKey
+    // living in this table's own bucket, separate from the prime table's copy), and that
+    // allocation is invisible here. Measured (tests/dragonfly/multimaster_memory_test.py):
+    // 24-byte keys cost ~43% more than this field reports, 32-byte keys ~77% more; 1M-key
+    // deltas of 63 MiB and 78 MiB respectively against a 44 MiB mvcc_table_bytes. This is
+    // the same blind spot table_used_memory/prime.mem_usage() already has, one level
+    // deeper. For capacity planning on a long-key workload, trust used_memory (which does
+    // include the second copy, being allocated from the shard's MiMemoryResource), not
+    // this field alone.
+    //
+    // drakeydb: Phase 4, review wave 2 (F5, MINOR) -- gated on IsActiveReplica(), matching how
+    // the "replication" section below already gates mvcc_unstamped_writes/mvcc_clock_ahead_ms/
+    // mvcc_stale_epoch. All three values are always 0 on a non-active node (the comment above
+    // already says so), but appending them unconditionally still made INFO memory diverge from
+    // upstream for that node -- the values were right, the extra keys' mere presence was the bug.
+    if (IsActiveReplica()) {
+      append("mvcc_table_bytes", total.mvcc_table_bytes);
+      append("mvcc_entries", total.mvcc_entries);
+      append("mvcc_tombstones", total.mvcc_tombstones);
+    }
     append("small_string_bytes", m.small_string_bytes);
     append("pipeline_cache_bytes", m.facade_stats.conn_stats.pipeline_cmd_cache_bytes);
     append("dispatch_queue_bytes", m.facade_stats.conn_stats.dispatch_queue_bytes);
@@ -3055,6 +3126,17 @@ string ServerFamily::FormatInfoMetrics(
       if (IsActiveReplica()) {  // drakeydb: peer links of an active node (fan-in)
         info.append(
             RenderPeerReplicationInfo(peers_->Summaries(), IsMultiMaster(), show_managed_info));
+
+        // drakeydb: Phase 4, P4-1 Task 11 -- the two operationally load-bearing signals: a
+        // nonzero mvcc_unstamped_writes means a read-mutation path is over-arming (PostUpdate
+        // arms a key that no journal entry ever commits for); a nonzero mvcc_clock_ahead_ms
+        // means NTP stepped this node's wall clock backwards, so its MvccClock -- which never
+        // steps back, mvcc.h -- now runs ahead and wins every LWW conflict until the wall clock
+        // catches up. mvcc_stale_epoch counts HopStamp's own backstop for a missed
+        // EndOfWriteEpoch (mvcc.cc) firing; healthy operation keeps it at 0.
+        append("mvcc_clock_ahead_ms", m.mvcc_clock_ahead_ms);
+        append("mvcc_unstamped_writes", m.mvcc_unstamped_writes);
+        append("mvcc_stale_epoch", m.mvcc_stale_epoch);
       }
     } else {
       append("role", GetFlag(FLAGS_info_replication_valkey_compatible) ? "slave" : "replica");

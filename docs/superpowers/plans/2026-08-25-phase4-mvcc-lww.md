@@ -103,7 +103,7 @@ docker exec drakeydb-p2 sh -c \
 | `src/server/journal/tx_executor.{h,cc}`, `journal/executor.h`, `replica.{h,cc}` | Inbound mvcc + `peer_origin_hash_` (P4-1). |
 | `src/server/debugcmd.cc` | `DEBUG MVCC` (P4-1). |
 | `src/server/multi_master.{h,cc}` | `PeerRegistry::GetUuidHash` (P4-1). |
-| `src/server/CMakeLists.txt` | `mvcc.cc` into `dragonfly_lib`; `mvcc_test` target. |
+| `src/server/CMakeLists.txt` | `mvcc.cc` into `dfly_transaction`; `mvcc_test` target. |
 | `tests/dragonfly/multimaster_test.py` | P4-0 and P4-1 end-to-end coverage. |
 | `tests/dragonfly/multimaster_memory_test.py` | New: the memory benchmark deliverable. |
 
@@ -756,6 +756,7 @@ Create `src/server/mvcc_test.cc`:
 #include "server/mvcc.h"
 
 #include <gmock/gmock.h>
+#include <xxhash.h>
 
 #include "base/gtest.h"
 
@@ -838,6 +839,29 @@ TEST(MvccStampTest, TombstoneBitIsMaskedFromComparison) {
   EXPECT_EQ(tombstone.Mvcc(), value.Mvcc());
   EXPECT_FALSE(value < tombstone) << "the marker must not make a tombstone win";
   EXPECT_FALSE(tombstone < value) << "...nor lose";
+
+  // Pinning mvcc == 100 on both operands above only observes masking at an exact tie, where an
+  // inflated left operand happens to be harmless. Cross-mvcc probes catch an a-side-only masking
+  // bug that the tie case cannot: without the mask, a tombstone could become order-equivalent to
+  // (neither greater nor less than) a strictly newer or older stamp instead of losing/winning.
+  const MvccStamp newer{101, 5};
+  EXPECT_LT(tombstone, newer) << "a tombstone must lose to a strictly newer stamp";
+  EXPECT_FALSE(newer < tombstone);
+  const MvccStamp older{99, 5};
+  EXPECT_LT(older, tombstone) << "...and beat a strictly older one";
+}
+
+// operator< masks bit 63 so ordering ignores the tombstone marker (above), but operator== does
+// not -- it compares raw packed. A tombstone and the value it replaces at the same mvcc are
+// therefore order-equivalent yet still distinguishable by equality. See the invariant comment
+// above operator< in mvcc.h for why an incoming tombstone must never reuse the value's mvcc.
+TEST(MvccStampTest, EqualityDistinguishesTombstoneAtEqualMvcc) {
+  const MvccStamp value{100, 5};
+  const MvccStamp tombstone{100 | MvccClock::kTombstoneBit, 5};
+
+  EXPECT_FALSE(value == tombstone) << "operator== is not tombstone-masked, unlike operator<";
+  EXPECT_FALSE(value < tombstone);
+  EXPECT_FALSE(tombstone < value);
 }
 
 TEST(MvccStampTest, MsPartIgnoresTombstoneBit) {
@@ -848,10 +872,20 @@ TEST(MvccStampTest, MsPartIgnoresTombstoneBit) {
 TEST(NodeUuidHashTest, StableAndDistinct) {
   const string a = "6f1c4c3e-0000-4000-8000-000000000001";
   const string b = "6f1c4c3e-0000-4000-8000-000000000002";
-  EXPECT_EQ(NodeUuidHash(a), NodeUuidHash(a)) << "must be stable -- it is persisted and compared "
-                                                 "against values written by other nodes";
+  // Golden value, computed once from the shipped implementation -- not fabricated. A same-process
+  // self-comparison (NodeUuidHash(a) == NodeUuidHash(a)) would pass for any pure function,
+  // including std::hash, XXH3, or a different seed, so it cannot exercise cross-process/
+  // cross-build/cross-architecture stability, which is the property that is actually load-bearing
+  // (the hash is persisted in the RDB and compared against values written by other nodes).
+  EXPECT_EQ(NodeUuidHash(a), 0x02b4489225d16e46ULL)
+      << "the origin hash is persisted in the RDB and compared against values written by "
+         "other nodes -- changing the algorithm, the seed, or the byte order silently "
+         "diverges every existing snapshot";
   EXPECT_NE(NodeUuidHash(a), NodeUuidHash(b));
   EXPECT_NE(NodeUuidHash(a), 0u) << "0 is reserved for 'no origin'";
+  // Must not collide with LockTag::Fingerprint's hash space (tx_base.cc:100), which hashes keys
+  // under a different seed (0x1C69B3F74AC4AE35UL) for a different purpose.
+  EXPECT_NE(NodeUuidHash(a), XXH64(a.data(), a.size(), 0x1C69B3F74AC4AE35ULL));
 }
 
 }  // namespace dfly
@@ -860,8 +894,13 @@ TEST(NodeUuidHashTest, StableAndDistinct) {
 - [ ] **Step 2: Run to verify it fails**
 
 Register the target first — in `src/server/CMakeLists.txt`, add `mvcc.cc` to the
-`dragonfly_lib` source list (alphabetically, beside `multi_master.cc`), and add
-beside the other test registrations:
+**`dfly_transaction`** source list (`CMakeLists.txt:42-48`, beside `tx_base.cc`).
+**Not `dragonfly_lib`** — every consumer (`db_slice.cc`, `table.cc`,
+`journal/journal.cc` via `DF_JOURNAL_SRCS`) lives in `dfly_transaction`, and
+`dragonfly_lib` links `dfly_transaction`, so that is the direction that resolves.
+xxhash reaches it transitively (`dfly_core` -> `base` -> `TRDP::xxhash`), already
+proven by `tx_base.cc:100`'s existing `XXH64` call. Then add beside the other test
+registrations:
 
 ```cmake
 helio_cxx_test(mvcc_test dfly_test_lib LABELS DFLY)
@@ -956,8 +995,18 @@ struct MvccStamp {
     return packed == 0 && origin_hash == 0;
   }
 
+  // INVARIANT: a tombstone's mvcc MUST be freshly minted via MvccClock::Next -- it must never
+  // reuse the mvcc of the value it deletes. operator< masks bit 63 below precisely because a
+  // fresh mvcc is assumed to make (mvcc, origin_hash) unique per write; if a tombstone instead
+  // sets bit 63 on the value's existing packed, it becomes order-equivalent to that value (see
+  // MvccStampTest.EqualityDistinguishesTombstoneAtEqualMvcc), and merge code written as
+  // `if (local < incoming) adopt;` silently drops the delete. operator== below is deliberately
+  // NOT tombstone-masked (it compares raw packed), so equality still distinguishes a tombstone
+  // from the value at the same mvcc even though ordering does not.
   friend bool operator<(const MvccStamp& a, const MvccStamp& b) {
-    return std::tie(a.Mvcc(), a.origin_hash) < std::tie(b.Mvcc(), b.origin_hash);
+    // std::tie needs lvalues; Mvcc() returns by value, so make_tuple (which copies) is used
+    // instead. Semantics are identical: lexicographic comparison on (Mvcc(), origin_hash).
+    return std::make_tuple(a.Mvcc(), a.origin_hash) < std::make_tuple(b.Mvcc(), b.origin_hash);
   }
   friend bool operator==(const MvccStamp& a, const MvccStamp& b) {
     return a.packed == b.packed && a.origin_hash == b.origin_hash;
@@ -965,6 +1014,9 @@ struct MvccStamp {
 };
 
 static_assert(sizeof(MvccStamp) == 16, "side-table per-slot cost is computed from this");
+static_assert(alignof(MvccStamp) == 8,
+              "16-byte packing assumes 8-byte alignment; a consumer "
+              "(e.g. the side table) may depend on this");
 
 // Stable across processes, builds and architectures -- the hash is persisted in the RDB and
 // compared against values written by other nodes, so std::hash is unusable here.
@@ -972,6 +1024,10 @@ uint64_t NodeUuidHash(std::string_view uuid);
 
 }  // namespace dfly
 ```
+
+Note: `std::tie` cannot bind `Mvcc()`'s prvalue return (it deduces `uint64_t&`); use
+`std::make_tuple` as shown above -- it copies its arguments, so it accepts prvalues, and
+`tuple::operator<` is still elementwise lexicographic, so the predicate is unchanged.
 
 - [ ] **Step 4: Write `mvcc.cc`**
 
@@ -986,7 +1042,7 @@ uint64_t NodeUuidHash(std::string_view uuid);
 namespace dfly {
 
 namespace {
-// Distinct from LockTag::Fingerprint's seed (tx_base.cc:94) so the two hash spaces cannot be
+// Distinct from LockTag::Fingerprint's seed (tx_base.cc:100) so the two hash spaces cannot be
 // confused in a debugger or a log.
 constexpr uint64_t kOriginHashSeed = 0x9E3779B97F4A7C15ULL;
 }  // namespace
@@ -1004,15 +1060,22 @@ uint64_t NodeUuidHash(std::string_view uuid) {
 docker exec drakeydb-p2 sh -c 'cd /src/build-dbg && ninja -j4 mvcc_test && /src/build-dbg/mvcc_test'
 ```
 
-Expected: PASS, 10 cases.
+Expected: PASS, 11 cases.
 
-- [ ] **Step 6: Falsify the two load-bearing claims, per D9**
+- [ ] **Step 6: Falsify the three load-bearing claims, per D9**
 
 1. In `Next`, change `(cand > last_) ? cand : last_ + 1` to plain `cand`. Rebuild, run
    `MvccClockTest.NeverGoesBackwardsOnClockStep`. Record the observed failure, restore.
-2. In `operator<`, use `a.packed` instead of `a.Mvcc()`. Rebuild, run
-   `MvccStampTest.TombstoneBitIsMaskedFromComparison`. Record the observed failure
-   (`the marker must not make a tombstone win`), restore.
+2. Symmetric mutation -- in `operator<`, use `a.packed`/`b.packed` instead of `a.Mvcc()`/
+   `b.Mvcc()` on *both* operands. Rebuild, run `MvccStampTest.TombstoneBitIsMaskedFromComparison`.
+   Record the observed failure (`the marker must not make a tombstone win`), restore.
+3. a-side-only mutation -- in `operator<`, use `a.packed` on the left operand only, leaving
+   `b.Mvcc()` untouched on the right. This is the mutation that matters: pinning mvcc == 100 on
+   both operands in the tie assertions above only observes masking at an exact tie, where an
+   inflated left operand is harmless, so a one-sided mutation there survives undetected. It is
+   the cross-mvcc probes (`tombstone` vs `newer`/`older`) that catch it -- `tombstone < newer`
+   flips because `100 | kTombstoneBit` (unsigned) outweighs `101`. Rebuild, run
+   `MvccStampTest.TombstoneBitIsMaskedFromComparison` again. Record the observed failure, restore.
 
 - [ ] **Step 7: Format and commit**
 
@@ -1033,7 +1096,7 @@ git add -A && git commit -m "feat: add MvccClock and MvccStamp value types (P4)"
 **Interfaces:**
 - Consumes: Task 3's `MvccClock`, `MvccStamp`, `NodeUuidHash`.
 - Produces: `class MvccStamper` with `static MvccStamper* tlocal()`,
-  `uint64_t HopStamp()`, `void Arm(DbIndex, std::string_view)`,
+  `uint64_t HopStamp(uint64_t now_ms)`, `void Arm(DbIndex, std::string_view)`,
   `void Disarm(DbIndex, std::string_view)`,
   `void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn&)`,
   `void EndOfWriteEpoch()`, `uint64_t OriginHash(uint32_t origin_idx)`,
@@ -1045,20 +1108,60 @@ git add -A && git commit -m "feat: add MvccClock and MvccStamp value types (P4)"
 `Commit` takes a callback rather than touching `DbSlice`, so this whole task stays
 testable with no shard set and no database. Task 7 supplies the real callback.
 
-**Two design points that are load-bearing, not stylistic:**
+**Five design points that are load-bearing, not stylistic:**
 
-1. **The hop memo.** `HopStamp()` returns the *same* value for every call within one
-   shard-callback. This is what makes author and applier agree when the author lumps
-   several journal entries into one callback: the applier receives those entries
+1. **The hop memo.** `HopStamp(now_ms)` returns the *same* value for every call within
+   one shard-callback. This is what makes author and applier agree when the author
+   lumps several journal entries into one callback: the applier receives those entries
    separately and stamps each key from its own entry, so the entries must carry an
    identical mvcc. It also means the 20-bit counter is consumed per *hop*, not per
    *key* — a 100-key `MSET` costs one counter value.
 2. **The stale-epoch backstop.** If a code path forgets to call `EndOfWriteEpoch()`,
    reusing an ancient hop stamp would be silent corruption. Instead, re-mint once the
    memo is older than `kMaxEpochMs` and count it, so a missed epoch degrades visibly.
+3. **`now_ms` is a parameter of `HopStamp`, not read internally via `GetCurrentTimeMs()`.**
+   `mvcc.cc` compiles into `dfly_transaction`, which has no CMake link edge to
+   `dragonfly_lib` (only the reverse edge exists: `dragonfly_lib` -> `dfly_transaction`).
+   Calling `GetCurrentTimeMs()` (`engine_shard_set.h:155`, defined via `dragonfly_lib`'s
+   `engine_shard.cc`) from inside `mvcc.cc` would link only by accident, in binaries
+   whose closure happens to pull in `engine_shard.cc.o` for an unrelated reason (real
+   `EngineShard` use elsewhere). `mvcc_test` has no fixtures and so no such reason —
+   it is the first binary narrow enough to turn that accident into a hard link
+   failure (confirmed: `undefined reference to dfly::TEST_current_time_ms`).
+   `HopStamp` takes `now_ms` explicitly instead, matching `MvccClock::Next`/`AheadMs`,
+   which already do; Task 7's `journal.cc` (which legitimately reaches `EngineShard`
+   already) calls `HopStamp(GetCurrentTimeMs())`.
+4. **`Commit` never mints — it only stores.** An earlier version of this task gave
+   `Commit` its own `now_ms` and a `mvcc != 0 ? mvcc : HopStamp(now_ms)` fallback.
+   Review round 1 proved that branch dead: `Commit`'s only production call site
+   (Task 7, `journal.cc`) is gated `MvccEnabled() && opcode == Op::COMMAND`, and the
+   mint block immediately above it carries the same gate plus `entry.mvcc == 0` — so
+   whenever `Commit` runs, either the caller supplied a non-zero `mvcc` or `HopStamp`
+   (which cannot return 0: `MvccClock::Next` with `last_ = 0` returns `last_ + 1 = 1`,
+   then is strictly increasing) just minted one. `Commit` therefore takes no `now_ms`,
+   has no clock of its own, `DCHECK(mvcc != 0)`s its input, and stores it verbatim.
+   This makes "a key's stamp advances iff that same stamp is propagated" (the class's
+   own contract comment, above) structural instead of conventional: `Commit` is no
+   longer *able* to invent a stamp that differs from the one on the wire.
+5. **`commit_depth_` is a counter, RAII'd, not a bare bool.** Fix round 2 found two holes in an
+   earlier bool-typed `in_commit_` reentrancy guard: (a) a bare `in_commit_ = false` after the
+   loop is not exception-safe -- a throwing `fn` (a realistic `bad_alloc` from a side-table
+   insert) would leave it stuck `true`, DCHECK-aborting every subsequent `Arm()` forever;
+   (b) a bool reset by an *inner* `Commit()` call on return stops guarding `Arm()`/`Disarm()`
+   calls the *outer*, still-running call still makes -- and the inner call's own
+   `armed_.clear()`/`arena_.clear()` already corrupts the outer's iteration regardless.
+   `commit_depth_` (an `int`) fixes both: `Commit()` itself now `DCHECK_EQ(commit_depth_, 0)`s
+   at entry (catching a re-entrant `Commit()` immediately, before it can touch either
+   container), `Arm()`/`Disarm()` DCHECK the same, and `absl::Cleanup` unwinds the increment
+   even if `fn` throws.
 
 **Arming must not allocate.** libstdc++ SSO holds 15 chars, so a `std::string` per arm
-would allocate on every write to a 16-byte key. Use a reused arena plus `(offset, len)`.
+would allocate on every write to a 16-byte key. Use a reused arena plus `(offset, len)`
+for the key bytes, and `std::vector<Armed>` — not `absl::InlinedVector` — for the arm
+list itself: `InlinedVector::clear()` frees and reverts to inline storage, defeating the
+arena's own "cleared, never shrunk" discipline the moment any callback arms more than 4
+keys (allocating on arm 5, freeing on every `Commit`/`EndOfWriteEpoch`, forever).
+`std::vector::clear()` keeps capacity, which is the property actually needed.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1066,13 +1169,21 @@ Append to `src/server/mvcc_test.cc`:
 
 ```cpp
 namespace {
-// Collects what Commit would have written, so this task needs no DbSlice.
+// Collects what Commit would have written, so this task needs no DbSlice. A named struct, not a
+// std::pair/tuple of (key, stamp): DbSlice::PostUpdate arms per (DbIndex, key), and dropping db on
+// the floor here would make every test blind to a Disarm/Commit bug scoped to the wrong db (see
+// DisarmIsScopedToTheDbIndex, which regressed exactly this way once already).
 struct Recorder {
-  std::vector<std::pair<std::string, MvccStamp>> writes;
+  struct Write {
+    DbIndex db;
+    std::string key;
+    MvccStamp stamp;
+  };
+  std::vector<Write> writes;
 
   MvccStamper::CommitFn Fn() {
     return [this](DbIndex db, std::string_view key, const MvccStamp& st) {
-      writes.emplace_back(std::string(key), st);
+      writes.push_back(Write{db, std::string(key), st});
     };
   }
 };
@@ -1093,10 +1204,10 @@ TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
   s->Commit(4242, /* origin_idx= */ 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 2u);
-  EXPECT_EQ(rec.writes[0].first, "k1");
-  EXPECT_EQ(rec.writes[1].first, "k2");
-  EXPECT_EQ(rec.writes[0].second.Mvcc(), 4242u);
-  EXPECT_EQ(rec.writes[0].second.origin_hash, rec.writes[1].second.origin_hash);
+  EXPECT_EQ(rec.writes[0].key, "k1");
+  EXPECT_EQ(rec.writes[1].key, "k2");
+  EXPECT_EQ(rec.writes[0].stamp.Mvcc(), 4242u);
+  EXPECT_EQ(rec.writes[0].stamp.origin_hash, rec.writes[1].stamp.origin_hash);
   EXPECT_EQ(s->stats().unstamped_writes, 0u);
 }
 
@@ -1122,9 +1233,14 @@ TEST(MvccStamperTest, DisarmRemovesOnlyTheNamedKey) {
   s->Commit(7, 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
-  EXPECT_EQ(rec.writes[0].first, "keep");
+  EXPECT_EQ(rec.writes[0].key, "keep");
 }
 
+// Regression coverage: an earlier version of this test recorded only (key, stamp), so it could
+// not tell the surviving db=0 arm apart from a wrongly-surviving db=1 one -- both have key "k".
+// Disarm(1, "k") must remove the db=1 arm specifically; if Disarm ignored db_index it would erase
+// the first key match instead (db=0, armed first), leaving db=1's arm to reach Commit -- and the
+// old assertions (size == 1, key == "k") could not tell the two cases apart.
 TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
@@ -1134,18 +1250,34 @@ TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
   s->Commit(7, 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
-  EXPECT_EQ(rec.writes[0].first, "k");
+  EXPECT_EQ(rec.writes[0].key, "k");
+  EXPECT_EQ(rec.writes[0].db, 0) << "the surviving arm must be db=0; db=1 was the one "
+                                    "Disarm(1, \"k\") was supposed to remove";
 }
 
 // The bit-identity mechanism: several entries minted inside one callback share a stamp.
 TEST(MvccStamperTest, HopStampIsStableWithinEpochAndAdvancesAfter) {
   MvccStamper* s = FreshStamper();
-  const uint64_t first = s->HopStamp();
+  // Same now_ms on every "stable" call, and well inside kMaxEpochMs of itself, so the backstop
+  // (see HopStampReMintsPastStaleEpochBackstop below) cannot fire and confound this assertion.
+  const uint64_t kNow = 10'000;
+  const uint64_t first = s->HopStamp(kNow);
   for (int i = 0; i < 5; ++i)
-    EXPECT_EQ(s->HopStamp(), first) << "iteration " << i;
+    EXPECT_EQ(s->HopStamp(kNow), first) << "iteration " << i;
 
   s->EndOfWriteEpoch();
-  EXPECT_GT(s->HopStamp(), first);
+  EXPECT_GT(s->HopStamp(kNow), first);
+}
+
+// The stale-epoch backstop: a missed EndOfWriteEpoch must not let a hop stamp be reused forever.
+TEST(MvccStamperTest, HopStampReMintsPastStaleEpochBackstop) {
+  MvccStamper* s = FreshStamper();
+  const uint64_t first = s->HopStamp(10'000);
+  const uint64_t later = s->HopStamp(10'000 + MvccStamper::kMaxEpochMs + 1);
+
+  EXPECT_GT(later, first) << "a memo older than kMaxEpochMs must be re-minted, not reused";
+  EXPECT_EQ(s->stats().stale_epoch, 1u)
+      << "a missed EndOfWriteEpoch must be visible in stats, not silently absorbed";
 }
 
 TEST(MvccStamperTest, PeerMvccIsNeverReminted) {
@@ -1156,9 +1288,9 @@ TEST(MvccStamperTest, PeerMvccIsNeverReminted) {
   s->Commit(/* mvcc= */ 999, /* origin_idx= */ 3, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
-  EXPECT_EQ(rec.writes[0].second.Mvcc(), 999u) << "an applied write keeps the author's stamp "
-                                                  "verbatim, or stamps inflate on every hop";
-  EXPECT_EQ(rec.writes[0].second.origin_hash, 0xABCDEFu) << "and the author's origin, not ours";
+  EXPECT_EQ(rec.writes[0].stamp.Mvcc(), 999u) << "an applied write keeps the author's stamp "
+                                                 "verbatim, or stamps inflate on every hop";
+  EXPECT_EQ(rec.writes[0].stamp.origin_hash, 0xABCDEFu) << "and the author's origin, not ours";
 }
 
 TEST(MvccStamperTest, SelfOriginIsIndexZero) {
@@ -1179,8 +1311,60 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
 
   ASSERT_EQ(rec.writes.size(), 256u);
   for (int i = 0; i < 256; ++i)
-    EXPECT_EQ(rec.writes[i].first, keys[i]) << "arm " << i << " was corrupted by later growth";
+    EXPECT_EQ(rec.writes[i].key, keys[i]) << "arm " << i << " was corrupted by later growth";
 }
+
+// ---------------------------------------------------------------------------
+// commit_depth_ reentrancy guard: fix round 2, findings 1(a) (exception safety) and 1(b)
+// (nesting-awareness). DCHECKs active in debug builds only.
+// ---------------------------------------------------------------------------
+
+// Hole 1(a): commit_depth_ must unwind via RAII even if fn throws -- e.g. SetMvcc's side-table
+// insert hitting bad_alloc, once Task 7 wires it -- or one transient failure leaves every
+// subsequent Arm()/Disarm()/Commit() DCHECK-aborting forever.
+TEST(MvccStamperTest, CommitDepthRecoversAfterCommitFnThrows) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+  EXPECT_THROW(
+      s->Commit(1, 0, [](DbIndex, std::string_view, const MvccStamp&) { throw std::bad_alloc{}; }),
+      std::bad_alloc);
+
+  // If commit_depth_ had leaked at 1 above, this would DCHECK-abort the whole test binary in a
+  // debug build -- there is no way to observe a leaked guard other than the process not dying.
+  s->Arm(0, "k2");
+}
+
+#ifndef NDEBUG
+// Hole 1(b): a CommitFn that called Commit() again used to clear armed_/arena_ out from under the
+// outer call's still-in-progress iteration (UB), and reset the old bool-typed guard to false on
+// return, so a later Arm()/Disarm() in the still-running outer loop went uncaught too.
+// commit_depth_ closes this: Commit() now DCHECK_EQ(commit_depth_, 0)s at its own entry, so the
+// inner call dies before it ever touches armed_ or arena_.
+//
+// EXPECT_DEBUG_DEATH runs `statement` in-process, without forking or checking for death, when
+// NDEBUG is defined (DCHECK is a no-op there) -- and the corruption this guards against is
+// genuine UB, so this whole test is compiled only in a debug build, where the forked child dies
+// at the DCHECK before doing any damage.
+TEST(MvccStamperDeathTest, ReentrantCommitDies) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+  EXPECT_DEBUG_DEATH(s->Commit(1, 0,
+                               [s](DbIndex, std::string_view, const MvccStamp&) {
+                                 s->Commit(2, 0,
+                                           [](DbIndex, std::string_view, const MvccStamp&) {});
+                               }),
+                     "re-entrantly");
+}
+
+// The hazard Commit()'s own doc comment names first: "fn must not call Arm()".
+TEST(MvccStamperDeathTest, ArmFromCommitFnDies) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+  EXPECT_DEBUG_DEATH(
+      s->Commit(1, 0, [s](DbIndex, std::string_view, const MvccStamp&) { s->Arm(0, "reentrant"); }),
+      "mid-iteration");
+}
+#endif  // NDEBUG
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -1194,9 +1378,8 @@ Expected: **compile error**, `MvccStamper` not declared.
 - [ ] **Step 3: Implement `MvccStamper` in `mvcc.h`**
 
 ```cpp
-// (add near the top of mvcc.h)
-#include <absl/container/inlined_vector.h>
-
+// (add near the top of mvcc.h -- no absl/container/inlined_vector.h: armed_ below is a
+// std::vector, not an absl::InlinedVector. See "Arming must not allocate" above.)
 #include <functional>
 #include <string>
 #include <vector>
@@ -1236,14 +1419,24 @@ class MvccStamper {
   void RegisterOriginHash(uint32_t origin_idx, uint64_t hash);
   uint64_t OriginHash(uint32_t origin_idx) const;
 
-  // Stable for the whole shard callback. See kMaxEpochMs.
-  uint64_t HopStamp();
+  // Stable for the whole shard callback: repeated calls with a non-decreasing now_ms return the
+  // same value until the memo is older than kMaxEpochMs, or EndOfWriteEpoch() resets it. Takes
+  // the time as a parameter -- like MvccClock::Next/AheadMs -- so dfly_transaction never reaches
+  // up into dragonfly_lib for GetCurrentTimeMs; callers (Task 7's journal.cc) pass it explicitly.
+  uint64_t HopStamp(uint64_t now_ms);
 
   void Arm(DbIndex db_index, std::string_view key);
   void Disarm(DbIndex db_index, std::string_view key);
 
-  // mvcc == 0 means "mint locally"; a non-zero value is an applied write's author stamp and is
-  // stored verbatim. Clears the arm list.
+  // The caller always supplies a non-zero stamp: the author's freshly minted HopStamp(now_ms), or
+  // an applied write's verbatim author stamp -- both under the same MvccEnabled() && COMMAND gate,
+  // so Commit itself never mints (DCHECK'd in the .cc). Clears the arm list.
+  //
+  // fn must not call Arm(), Disarm(), or Commit(): this call is mid-iteration over armed_/arena_,
+  // and any of the three would corrupt that iteration -- Arm()/a nested Commit() by reallocating
+  // arena_ (invalidating the string_view key fn was just handed) and/or armed_ (invalidating the
+  // iterator), Disarm() by erasing from armed_ out from under it. All three are DCHECK'd in the
+  // .cc via commit_depth_.
   void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn);
 
   void EndOfWriteEpoch();
@@ -1271,19 +1464,33 @@ class MvccStamper {
   MvccClock clock_;
   uint64_t hop_stamp_ = 0;
   std::string arena_;  // cleared, never shrunk, so steady-state arming does not allocate
-  absl::InlinedVector<Armed, 4> armed_;
+  // std::vector, not absl::InlinedVector: InlinedVector::clear() frees (DeallocateIfAllocated())
+  // and reverts to inline storage, so any callback arming more than 4 keys would allocate on the
+  // 5th arm and free on every single Commit/EndOfWriteEpoch, forever. std::vector::clear() keeps
+  // capacity, matching arena_'s "cleared, never shrunk" discipline. Do not "optimise" this back --
+  // InlinedVector is only cheaper for callbacks that arm <=4 keys, and worse for every other one.
+  std::vector<Armed> armed_;
   std::vector<uint64_t> origin_hash_cache_;  // dense by origin_idx; index 0 == self
   Stats stats_;
+  // >0 while Commit() is mid-iteration over armed_/arena_. Guards Arm(), Disarm(), and a
+  // re-entrant Commit() call from a CommitFn -- see Commit()'s comment above for why each would
+  // corrupt that iteration. A counter, not a bool: a bool reentrancy flag reset by an inner
+  // Commit() call on return would stop guarding Arm()/Disarm() calls still made by the outer,
+  // still-running one. RAII'd (absl::Cleanup, in the .cc) around the loop, not a bare decrement
+  // after it, so a throwing fn still leaves this at 0 rather than stuck positive forever.
+  int commit_depth_ = 0;
 };
 ```
 
 - [ ] **Step 4: Implement it in `mvcc.cc`**
 
 ```cpp
-// (add to mvcc.cc)
-#include "server/engine_shard_set.h"  // GetCurrentTimeMs
+// (add to mvcc.cc -- needs <absl/cleanup/cleanup.h> for the RAII depth guard and "base/logging.h"
+// for DCHECK; no "server/engine_shard_set.h": HopStamp takes now_ms as a parameter precisely so
+// this file never needs it. Design point 3.)
+#include <absl/cleanup/cleanup.h>
 
-namespace dfly {
+#include "base/logging.h"  // DCHECK
 
 MvccStamper* MvccStamper::tlocal() {
   static thread_local MvccStamper stamper;
@@ -1304,23 +1511,27 @@ uint64_t MvccStamper::OriginHash(uint32_t origin_idx) const {
   return origin_idx < origin_hash_cache_.size() ? origin_hash_cache_[origin_idx] : 0;
 }
 
-uint64_t MvccStamper::HopStamp() {
-  const uint64_t now = GetCurrentTimeMs();
-  if (hop_stamp_ == 0 || (hop_stamp_ >> MvccClock::kCounterBits) + kMaxEpochMs < now) {
+uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
+  if (hop_stamp_ == 0 || (hop_stamp_ >> MvccClock::kCounterBits) + kMaxEpochMs < now_ms) {
     if (hop_stamp_ != 0)
       ++stats_.stale_epoch;
-    hop_stamp_ = clock_.Next(now);
+    hop_stamp_ = clock_.Next(now_ms);
   }
   return hop_stamp_;
 }
 
 void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn armed a key -- Commit() is mid-iteration over "
+                                 "armed_/arena_, both of which this call can reallocate, "
+                                 "corrupting that iteration";
   const uint32_t off = static_cast<uint32_t>(arena_.size());
   arena_.append(key);
   armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size())});
 }
 
 void MvccStamper::Disarm(DbIndex db_index, std::string_view key) {
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn disarmed a key -- Commit() is mid-iteration over "
+                                 "armed_, which erase() would corrupt";
   for (auto it = armed_.begin(); it != armed_.end(); ++it) {
     if (it->db_index == db_index && ArmedKey(*it) == key) {
       armed_.erase(it);
@@ -1333,7 +1544,22 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
   if (armed_.empty())
     return;
 
-  const MvccStamp stamp{mvcc != 0 ? mvcc : HopStamp(), OriginHash(origin_idx)};
+  // Both DCHECKs below are scoped to a non-empty commit (above): Commit(0, ...), or a re-entrant
+  // Commit() call, against an empty arm list is a harmless no-op that never reaches here.
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn called Commit() re-entrantly -- the inner call's "
+                                 "armed_.clear()/arena_.clear() would corrupt the outer call's "
+                                 "still-in-progress iteration over the very same containers";
+  // The only production call site mints (HopStamp, which cannot return 0) or forwards an applied
+  // write's non-zero author stamp, under the same MvccEnabled() && COMMAND gate; Commit has no
+  // clock of its own, so it cannot invent a stamp -- it can only store what it is given.
+  DCHECK(mvcc != 0);
+
+  const MvccStamp stamp{mvcc, OriginHash(origin_idx)};
+  ++commit_depth_;
+  // RAII, not a bare decrement after the loop: a throwing fn must still unwind commit_depth_, or
+  // one transient failure (e.g. a side-table insert hitting bad_alloc) leaves every subsequent
+  // Arm()/Disarm()/Commit() DCHECK-aborting forever.
+  absl::Cleanup restore_depth = [this] { --commit_depth_; };
   for (const Armed& a : armed_)
     fn(a.db_index, ArmedKey(a), stamp);
 
@@ -1355,6 +1581,7 @@ void MvccStamper::TEST_Reset() {
   arena_.clear();
   origin_hash_cache_.clear();
   stats_ = Stats{};
+  commit_depth_ = 0;
 }
 
 }  // namespace dfly
@@ -1366,11 +1593,14 @@ void MvccStamper::TEST_Reset() {
 docker exec drakeydb-p2 sh -c 'cd /src/build-dbg && ninja -j4 mvcc_test && /src/build-dbg/mvcc_test'
 ```
 
-Expected: PASS, all 19 cases.
+Expected: PASS, all 23 cases: includes `HopStampReMintsPastStaleEpochBackstop` (covering design
+point 2's backstop) and three `commit_depth_` tests covering design point 5 --
+`CommitDepthRecoversAfterCommitFnThrows` plus two `MvccStamperDeathTest` cases (debug-build only,
+guarded by `#ifndef NDEBUG`).
 
 - [ ] **Step 6: Falsify the hop memo, per D9**
 
-In `HopStamp()`, drop the memo — return `clock_.Next(GetCurrentTimeMs())` every call.
+In `HopStamp(now_ms)`, drop the memo — return `clock_.Next(now_ms)` every call.
 Rebuild, run `MvccStamperTest.HopStampIsStableWithinEpochAndAdvancesAfter`. Record the
 observed failure, restore. This is the test that protects author/applier bit-identity
 for effect-rewriting commands.
@@ -1387,13 +1617,13 @@ git add -A && git commit -m "feat: add MvccStamper arm/commit with per-callback 
 ### Task 5: The side table on `DbTable`
 
 **Files:**
-- Modify: `src/server/table.h:126-176`, `src/server/table.cc:110-132`
+- Modify: `src/server/table.h:135-186`, `src/server/table.cc:111-133`
 - Modify: `src/server/db_slice.h`, `src/server/db_slice.cc`
 - Test: `src/server/multi_master_test.cc`
 
 **Interfaces:**
 - Consumes: `MvccStamp` (Task 3); `IsActiveReplica()` from `server/multi_master.h`;
-  the `mcflag` precedent at `table.h:128` and `db_slice.cc:1171-1197`.
+  the `mcflag` precedent at `table.h:137` and `db_slice.cc:1237-1264`.
 - Produces: `using MvccTable = DashTable<PrimeKey, MvccStamp, detail::ExpireTablePolicy>;`
   and `std::unique_ptr<MvccTable> DbTable::mvcc`;
   `size_t DbTable::mvcc_table_memory() const`;
@@ -1405,11 +1635,11 @@ git add -A && git commit -m "feat: add MvccStamper arm/commit with per-callback 
 Storage only. Nothing writes to it yet.
 
 **The memory metric trap — do not get this wrong.** `DbTable::table_memory()`
-(`table.h:174-176`) returns `prime.mem_usage()` **only**; mcflag has never been counted.
+(`table.h:183-185`) returns `prime.mem_usage()` **only**; mcflag has never been counted.
 So `table_used_memory` in INFO will **not** move when this table fills, and a benchmark
 comparing it reports a ~0 delta. Track a separate `mvcc_table_memory_` accumulator on
 `DbSlice`. **Do not fold `mvcc->mem_usage()` into `table_memory()`** — that breaks
-`DCHECK_EQ(table->table_memory(), table_before)` at `db_slice.cc:2087`, which asserts
+`DCHECK_EQ(table->table_memory(), table_before)` at `db_slice.cc:2435`, which asserts
 deletes do not shrink the prime table.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1490,7 +1720,7 @@ Expected: **compile error**, no member `mvcc_table_bytes` in `DbStats`.
 
 - [ ] **Step 3: Add the table to `DbTable`**
 
-In `src/server/table.h`, beside the `mcflag` declaration at `:128`:
+In `src/server/table.h`, beside the `mcflag` declaration at `:137`:
 
 ```cpp
 // drakeydb: Phase 4. Per-key MVCC stamp, mirroring the mcflag side-table precedent above.
@@ -1521,7 +1751,7 @@ and in `DbTable::Clear()`:
 ```
 
 > `DbTable::Clear()` has no caller today — mirror it for hygiene, but the real flush
-> path is `DbSlice::FlushDbIndexes` (`db_slice.cc:1055-1106`), which moves the whole
+> path is `DbSlice::FlushDbIndexes` (`db_slice.cc:1121-1174`), which moves the whole
 > `DbTable` out and `CreateDb`s a fresh one. That drops the side table for free.
 
 - [ ] **Step 4: Add the `DbSlice` accessors**
@@ -1549,7 +1779,7 @@ and as members, beside `journal_omit_redundant_writes_` (`db_slice.h:690` area):
 
 In `src/server/db_slice.cc`, initialise `mvcc_enabled_(IsActiveReplica())` in the
 constructor initialiser list (beside `journal_omit_redundant_writes_`, `db_slice.cc:477`),
-and implement, modelled on `SetMCFlag`/`GetMCFlag` at `:1171-1197`:
+and implement, modelled on `SetMCFlag`/`GetMCFlag` at **`:1237-1264`**:
 
 ```cpp
 void DbSlice::SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stamp) {
@@ -1582,27 +1812,30 @@ void DbSlice::EraseMvcc(DbIndex db_ind, const PrimeKey& key) {
 ```
 
 Maintain `mvcc_table_memory_` alongside the existing `table_memory_` updates in
-`CreateDb` (`db_slice.cc:1753` area) and `FlushDbIndexes` (`:1070` area).
+`CreateDb` (`db_slice.cc:2095-2101`) and `FlushDbIndexes` (`:1121-1174`, which already
+subtracts at `:1136` and re-adds via the nested `CreateDb`).
 
 - [ ] **Step 5: Surface the stats**
 
-Put the **counters** on `DbTableStats` (`table.h:54`), not on `DbStats`:
+Put the **counters** on `DbTableStats` (`table.h:54-99`), not on `DbStats`:
 
 ```cpp
   size_t mvcc_entries = 0;
   size_t mvcc_tombstones = 0;  // stays 0 until P4-5; declared now so Task 10's invariant compiles
 ```
 
-`DbStats : public DbTableStats` (`db_slice.h:43`), so the aggregate inherits both, and
+`DbStats : public DbTableStats` (`db_slice.h:44`), so the aggregate inherits both, and
 Task 10's `DCHECK` can read `db.stats.mvcc_tombstones` — `db.stats` is a `DbTableStats`
-(`table.h:136`), so declaring these on `DbStats` instead would not compile. Maintain
+(`table.h:145`), so declaring these on `DbStats` instead would not compile. Maintain
 `mvcc_entries` in `SetMvcc`/`EraseMvcc`.
 
 Add `size_t mvcc_table_bytes = 0;` to `DbStats` **only** — it is computed in
-`DbSlice::GetStats` (`db_slice.cc:493-514`) from `mvcc_table_memory()` rather than
+`DbSlice::GetStats` (`db_slice.cc:544-566`) from `mvcc_table_memory()` rather than
 maintained as a counter, mirroring how `table_memory` is already handled. Sum all three
-in `DbStats::operator+=` and merge them in `Metrics::Merge` (`metrics.cc:773` area)
-beside `lsn_buffer_bytes`.
+in `DbStats::operator+=` and merge them in `Metrics::Merge` (`metrics.cc:773`)
+beside `lsn_buffer_bytes`. **`Metrics::Merge` opens with a `sizeof(Metrics)`
+change-detector `static_assert` (`metrics.cc:724`, `:794`) — update its byte accounting
+or the build fails.**
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
@@ -1643,13 +1876,15 @@ git add -A && git commit -m "feat: add per-key MVCC side table on DbTable (P4)"
 ### Task 6: `DbContext::repl_mvcc`
 
 **Files:**
-- Modify: `src/server/tx_base.h:67-76`
-- Modify: `src/server/transaction.h:344-352` (`GetDbContext`)
+- Modify: `src/server/tx_base.h:60-83`
+- Modify: `src/server/transaction.h:346-354` (`GetDbContext`)
 
 **Interfaces:**
 - Consumes: `Transaction::repl_mvcc_` — already exists from P3
-  (`transaction.h:668-675`, passed into `journal::RecordEntry` by
-  `LogJournalOnShard` at `transaction.cc:1668`).
+  (`transaction.h:677`, passed into `journal::RecordEntry` by
+  `LogJournalOnShard` at `transaction.cc:1668-1674`).  `SetReplOrigin(origin_idx, mvcc)`
+  is already widened (`transaction.h:381-384`) and `ConnectionContext::repl_mvcc`
+  already exists (`conn_context.h:370`) — but nothing ever WRITES it. Task 9 does.
 - Produces: `uint64_t DbContext::repl_mvcc`.
 
 Two lines, no behaviour change, shipped as its own commit so a bisect can isolate it.
@@ -1661,7 +1896,7 @@ tombstones. It is an exact mirror of what P3 did for `repl_origin_idx`.
 
 - [ ] **Step 1: Add the field**
 
-In `src/server/tx_base.h`, immediately after `repl_origin_idx`:
+In `src/server/tx_base.h`, immediately after `repl_origin_idx` (`:79`):
 
 ```cpp
   // drakeydb: Phase 4 -- the applied entry's MVCC stamp, mirroring repl_origin_idx above. Lets
@@ -1700,9 +1935,9 @@ git add -A && git commit -m "feat: carry the apply-context MVCC stamp on DbConte
 **This is the risky task in the plan. Read the landmine section before writing code.**
 
 **Files:**
-- Modify: `src/server/db_slice.cc:1426` (`PostUpdate`)
-- Modify: `src/server/journal/journal.cc:90` (`RecordEntry`)
-- Modify: `src/server/transaction.cc:730`, `:1543` (epoch end)
+- Modify: `src/server/db_slice.cc:1492` (`PostUpdate`) — the plan's old `:1426` is stale
+- Modify: `src/server/journal/journal.cc:90-100` (`RecordEntry`; `AddLogRecord` at `:99`)
+- Modify: `src/server/transaction.cc:730`, `:1543` (epoch end) — verified current
 - Modify: `src/server/db_slice.cc` — four sweep paths
 - Modify: `src/server/server_family.cc` (seed the self uuid hash at boot)
 - Test: `src/server/multi_master_test.cc`
@@ -1710,7 +1945,7 @@ git add -A && git commit -m "feat: carry the apply-context MVCC stamp on DbConte
 **Interfaces:**
 - Consumes: `MvccStamper::tlocal()` (Task 4); `DbSlice::SetMvcc` (Task 5);
   `journal::RecordEntry(TxId, Op, DbIndex, optional<SlotId>, Entry::Payload, uint32_t origin_idx = 0, uint64_t mvcc = 0, uint8_t entry_flags = 0)`
-  (`journal/journal.h:50-52`).
+  (`journal/journal.h:52-54`).
 - Produces: after this task, any key written by a journaled command carries a stamp
   equal to that journal entry's `mvcc`.
 
@@ -1848,16 +2083,33 @@ At the end of `DbSlice::PostUpdate` (`db_slice.cc:1426`):
 
 - [ ] **Step 4: Mint and commit in `RecordEntry`**
 
-In `src/server/journal/journal.cc:90`, `RecordEntry`. **Order matters and the two halves
-split around `AddLogRecord`:** mint **before** it, so the wire carries the same value the
-side table will store; commit **after** it, so a key is only stamped once its entry is
-durable. Getting this backwards puts mvcc 0 on the wire and makes every applier mint its
-own stamp.
+In `src/server/journal/journal.cc:90-100`, `RecordEntry`. Its body is, in order:
+`entry.origin_idx = origin_idx;` (`:96`), `entry.mvcc = mvcc;` (`:97`),
+`entry.entry_flags = entry_flags;` (`:98`), `journal_slice.AddLogRecord(entry);` (`:99`).
+
+**The mint block's placement is exact, not "somewhere before `AddLogRecord`."** It must go
+**after `entry.entry_flags = entry_flags;` (`:98`) and before `AddLogRecord(entry)` (`:99`)** --
+specifically *after* `entry.mvcc = mvcc;` (`:97`), not merely before `AddLogRecord`. `:97`
+assigns the **parameter** `mvcc`, which is 0 on the local-author path (the caller has no stamp
+yet); inserting the mint block anywhere above `:97` -- including directly above `AddLogRecord`
+but above `:96`-`:98` -- mints into `entry.mvcc` and then has `:97` overwrite it straight back to
+0. The `entry.mvcc == 0` guard on the mint block does not catch this, because the incoming
+parameter is also 0 on exactly the path that needs minting. Getting the mint half's placement
+wrong this way reproduces silently: it puts mvcc 0 on the wire and makes every applier mint its
+own stamp, and P4-4's LWW guard (P4-4, not yet implemented) would do nothing at all because every
+stamp is 0 -- the same failure shape Task 7's own landmine section already warns about for
+`EndOfWriteEpoch`'s placement.
+
+Commit half: **after** `AddLogRecord`, so a key is only stamped once its entry is durable.
 
 ```cpp
-  // drakeydb: Phase 4 -- mint BEFORE AddLogRecord so the wire carries this exact value.
+  // drakeydb: Phase 4 -- mint AFTER entry.mvcc = mvcc (:97, an assignment from the possibly-zero
+  // caller-supplied parameter, which would otherwise clobber the mint straight back to 0) and
+  // BEFORE AddLogRecord (:99), so the wire carries this exact value.
+  // HopStamp takes now_ms explicitly (Task 4, design point 3): mvcc.cc itself never calls
+  // GetCurrentTimeMs(), so the caller -- here, already deep in EngineShard territory -- does.
   if (MvccEnabled() && opcode == Op::COMMAND && entry.mvcc == 0)
-    entry.mvcc = MvccStamper::tlocal()->HopStamp();
+    entry.mvcc = MvccStamper::tlocal()->HopStamp(GetCurrentTimeMs());
 ```
 
 then, immediately **after** `AddLogRecord(entry)`:
@@ -1867,7 +2119,10 @@ then, immediately **after** `AddLogRecord(entry)`:
   // applied write's author stamp and is kept verbatim, or stamps would inflate on every hop.
   // 0 is unreachable for a real stamp (ms << 20, ms ~ 1.77e12).
   // drakeydb: Phase 4 -- commit AFTER the entry is durable. A non-zero mvcc arriving from a
-  // peer is that author's stamp and is stored verbatim, or stamps inflate on every hop.
+  // peer is that author's stamp and is stored verbatim, or stamps inflate on every hop. entry.mvcc
+  // is always non-zero by this point (freshly minted above, or supplied non-zero by the caller) --
+  // Commit DCHECKs this (Task 4, fix round 1); it has no clock of its own and cannot mint a
+  // fallback stamp, so there is no now_ms to pass here.
   if (MvccEnabled() && opcode == Op::COMMAND) {
     MvccStamper::tlocal()->Commit(entry.mvcc, entry.origin_idx,
                                   [](DbIndex db, std::string_view key, const MvccStamp& st) {
@@ -1877,8 +2132,10 @@ then, immediately **after** `AddLogRecord(entry)`:
   }
 ```
 
-Gating on `Op::COMMAND` excludes `SELECT`/`PING`/`LSN`/`ORIGIN`. `MvccEnabled()` is a
-thin `IsActiveReplica()` wrapper local to this TU.
+Gating on `Op::COMMAND` excludes `SELECT`/`PING`/`LSN`/`ORIGIN`. `MvccEnabled()` must be a **cached** read, not a bare `IsActiveReplica()` —
+that is an uncached `absl::GetFlag` (`multi_master.cc:26-28`) and this runs once per
+journal entry. Mirror `JournalSlice`'s existing `extended_framing_`, which caches the
+same flag at `Init()`. P4-0 shipped a fix for this exact defect class (`a5345509`).
 
 - [ ] **Step 5: End the epoch in the right place**
 
@@ -1901,7 +2158,7 @@ Then the four non-transactional sweep paths in `db_slice.cc`, each at function e
 
 - [ ] **Step 6: Disable the journal-omission optimisation in active mode**
 
-`DbSlice::IsOmittableWrite` (`db_slice.cc:2152-2166`) suppresses a journal entry when
+`DbSlice::IsOmittableWrite` (**`db_slice.cc:2500-2513`**) suppresses a journal entry when
 there is exactly one eventually-consistent snapshot consumer that has not yet reached
 the bucket — the snapshot will carry the value instead. Under arm/commit that write
 **arms but never commits**, so the key ends up with *no stamp at all* and Task 10's
@@ -1936,13 +2193,14 @@ TEST_F(MvccStoreTest, WritesDuringSnapshotAreStillStamped) {
 
 - [ ] **Step 7: Seed the self uuid hash at boot**
 
-In `ServerFamily::Init()`, where the node identity is loaded (P1 code — search for
-`node_identity` / the loaded uuid), broadcast it to every shard thread:
+In `ServerFamily::Init()`, immediately after
+`peer_registry_.Init(node_identity_.uuid)` (`server_family.cc:1339`), broadcast it to
+every shard thread. The member is **`node_identity_.uuid`** — there is no `node_uuid_`:
 
 ```cpp
   // drakeydb: Phase 4 -- every proactor thread needs the self origin hash before the first write.
   shard_set->pool()->AwaitBrief(
-      [uuid = node_uuid_](unsigned, auto*) { MvccStamper::tlocal()->SetSelfUuid(uuid); });
+      [uuid = node_identity_.uuid](unsigned, auto*) { MvccStamper::tlocal()->SetSelfUuid(uuid); });
 ```
 
 - [ ] **Step 8: Run the tests to verify they pass**
@@ -2011,7 +2269,7 @@ git add -A && git commit -m "feat: stamp keys via arm/commit tied to journal emi
 ### Task 8: Delete coverage
 
 **Files:**
-- Modify: `src/server/db_slice.h:351,594`, `src/server/db_slice.cc:906,927,2025`
+- Modify: `src/server/db_slice.h:355,614`, `src/server/db_slice.cc:972,993,2367`
 - Test: `src/server/multi_master_test.cc`
 
 **Interfaces:**
@@ -2026,7 +2284,7 @@ In P4-1 **every reason erases** — tombstones are P4-5. The enum lands now beca
 Task 10's invariant and P4-5's tombstone table both key off it, and threading it later
 would touch the same five call sites twice.
 
-**Why `Disarm` is required.** `OpDelV2` (`generic_family.cc:1273`) runs
+**Why `Disarm` is required.** `OpDelV2` (`generic_family.cc:1291-1321`, `Del` at `:1305`) runs
 `post_updater.Run()` — which arms the key — *before* calling `Del`, and journals
 afterwards. Without a disarm, the subsequent `Commit` would write a stamp for a key
 that no longer exists, and Task 10's invariant would fire.
@@ -2076,8 +2334,9 @@ TEST_F(MvccStoreTest, MultiKeyDeleteErasesEveryStamp) {
 }
 ```
 
-Use whatever time-advance helper `BaseFamilyTest` already provides (`TEST_current_time_ms`
-via the existing `AdvanceTime`/`UpdateTime` helper — grep the fixture and match it).
+The time-advance helper is `AdvanceTime(int64_t ms)` (`test_utils.h:154-156`); there is
+no `UpdateTime`. `Shard(key, n)` is a **free function** (`engine_shard_set.h:148`), not a
+fixture member.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -2096,24 +2355,28 @@ enum class DeleteReason : uint8_t { kExplicit, kExpired, kEvicted, kSlotFlush };
 ```
 
 Add `DeleteReason reason = DeleteReason::kExplicit` as the trailing parameter of both
-`Del` (`db_slice.h:351`) and `PerformDeletionAtomic` (`:594`), and forward it at the
-single call site (`db_slice.cc:927`).
+`Del` (`db_slice.h:355`) and `PerformDeletionAtomic` (`:614`), and forward it at the
+single call site (`db_slice.cc:993`). `PerformDeletionAtomic` has exactly ONE caller —
+`Del` itself — but `Del` has 24 call sites; all keep the `kExplicit` default except the
+seven named below.
 
 Set a non-default reason at exactly these five sites, all inside `db_slice.cc`:
 
 | Line | Reason |
 |---|---|
-| `:249` `PrimeEvictionPolicy::Evict` | `kEvicted` |
-| `:1725` `FreeMemWithEvictionStepAtomic` | `kEvicted` |
-| `:1497` `ExpireIfNeeded` | `kExpired` |
-| `:962` `FlushSlotsFb` | `kSlotFlush` |
-| `:1035` `FlushSlots` on_change | `kSlotFlush` |
+| `:300` `PrimeEvictionPolicy::Evict` | `kEvicted` |
+| `:2065` `FreeMemWithEvictionStepAtomic` | `kEvicted` |
+| `:1563` `ExpireIfNeeded` | `kExpired` |
+| `:1028` `FlushSlotsFb` | `kSlotFlush` |
+| `:1101` `FlushSlots` on_change | `kSlotFlush` |
+| `:1991` `DeleteReapedContainer` (P4-0 reaper; postdates the plan) | `kExpired` |
+| `:1360` `UpdateExpire` already-expired branch (postdates the plan) | `kExpired` |
 
 Everything else keeps the `kExplicit` default.
 
 - [ ] **Step 4: Disarm and erase in `PerformDeletionAtomic`**
 
-Immediately after the existing mcflag block (`db_slice.cc:2029-2035`):
+Immediately after the existing mcflag block (**`db_slice.cc:2371-2376`**):
 
 ```cpp
   // drakeydb: Phase 4. Disarm first: OpDelV2 arms the key via post_updater.Run() before calling
@@ -2155,10 +2418,9 @@ git add -A && git commit -m "feat: erase MVCC stamps on every delete path (P4)"
 ### Task 9: Inbound plumbing — an applied write keeps the author's stamp
 
 **Files:**
-- Modify: `src/server/journal/tx_executor.h:48-54`, `src/server/journal/tx_executor.cc:74-79`
-- Modify: `src/server/journal/executor.h:55-57`
-- Modify: `src/server/replica.h`, `src/server/replica.cc:473,1517,1547,1580`
-- Modify: `src/server/multi_master.h`, `src/server/multi_master.cc`
+- Modify: `src/server/journal/tx_executor.h:42-54`, `src/server/journal/tx_executor.cc:58-83`
+- Modify: `src/server/journal/executor.h:55-57` (verified exact)
+- Modify: `src/server/replica.h`, `src/server/replica.cc:501,1549,1577,1608`
 - Test: `src/server/multi_master_test.cc`, `tests/dragonfly/multimaster_test.py`
 
 **Interfaces:**
@@ -2167,18 +2429,19 @@ git add -A && git commit -m "feat: erase MVCC stamps on every delete path (P4)"
   `MasterContext::master_node_uuid` (P1).
 - Produces: `uint64_t TransactionData::mvcc`;
   `void JournalExecutor::SetApplyMvcc(uint64_t)`;
-  `Replica::peer_origin_hash_`; `uint64_t PeerRegistry::GetUuidHash(uint32_t idx) const`.
+  `Replica::peer_origin_hash_`.
 
 **The counterintuitive part: the origin hash cannot come from the wire.**
-`journal::PassesPeerEchoFilter` (`journal/types.cc:51-66`) forwards only entries whose
-`origin_idx == kSelfIdx`, so **every COMMAND arriving on a peer link carries
+`journal::PassesPeerEchoFilter` (`journal/types.cc:51-69`) requires FOUR conditions, the
+first being `origin_idx == kSelfIdx` (the others reject `kEntryFlagExpired`,
+`kEntryFlagDerived` and `Op::ORIGIN`). Since only self-origin entries are ever forwarded, **every COMMAND arriving on a peer link carries
 `origin_idx == 0`**, meaning "the sender". Resolving that through `PeerRegistry` would
 label every foreign write as self. Under no-forward v1 the sender *is* the author on
 the streaming path, so the correct source is the **link's** peer uuid, which `Replica`
-already derives `peer_origin_idx_` from at `replica.cc:473`.
+already derives `peer_origin_idx_` from at `replica.cc:501`.
 
 **And `mvcc` is dropped inbound today.** `TransactionData::AddEntry`
-(`tx_executor.cc:74-79`) copies only `command`, `dbid` and `txid`;
+(`tx_executor.cc:58-83`) copies only `command`, `dbid` and `txid`;
 `TransactionData` has no `mvcc` field. `ConnectionContext::repl_mvcc` exists and is
 written by nobody. Without this task an applied write mints a *local* stamp and the
 phase's acceptance criterion fails.
@@ -2207,9 +2470,11 @@ TEST_F(MvccStoreTest, AppliedWriteKeepsAuthorStampVerbatim) {
 }
 ```
 
-Add `ApplyReplicatedCommand(args, origin_idx, mvcc)` to the fixture, modelled on how
-`OriginJournalFamilyTest` already drives `JournalExecutor` with `SetApplyOrigin` — read
-that helper and extend it with `SetApplyMvcc`.
+Add `ApplyReplicatedCommand(args, origin_idx, mvcc)` to `MvccStoreTest`. **There is no
+existing helper to reuse** — the `JournalExecutor` drive is inlined at
+`multi_master_test.cc:748-749`, `:829-830` and `:971-972`; copy that shape. Build it on
+`ActiveReplicaFamilyTest`, **not** `OriginJournalFamilyTest`, which never sets
+`FLAGS_active_replica` and would therefore have no side table at all.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -2244,19 +2509,20 @@ In `src/server/journal/executor.h`, beside `SetApplyOrigin`:
 ```
 
 In `src/server/replica.cc`, call `executor_->SetApplyMvcc(tx_data.mvcc)` immediately
-before **both** `Execute` calls in `ExecuteTx` (`:1547` and the global-command path at
-`:1580`), and in `RdbLoaderBase::HandleJournalBlob` (`rdb_load.cc:3006` area) before
-its `Execute`.
+before **both** `Execute` calls in `ExecuteTx` (`:1577` and the global-command path at
+`:1608`), and in `RdbLoaderBase::HandleJournalBlob` (function at `rdb_load.cc:2940`;
+its `Execute` is at `:3006`) before that `Execute`.
 
 - [ ] **Step 4: Resolve the origin hash from the link**
 
-Add `uint64_t GetUuidHash(uint32_t idx) const` to `PeerRegistry` backed by a parallel
-append-only `std::vector<uint64_t> idx_to_hash_`, filled in `Init` and `AddOrGet`
-(`multi_master.cc:104,110`). Indices are dense, monotonic and never reclaimed, so no
-extra synchronisation is needed beyond the existing registry mutex.
+**Do not add `PeerRegistry::GetUuidHash`.** The amended spec (D-6/D-9) states that
+*"PeerRegistry indices are not portable across nodes"* and that author identity comes
+from the authenticated link's `peer_origin_hash_`. The registry already carries
+`idx_to_uuid_` (`multi_master.h:108`) and `GetUuid` (`:100`) if a purely local mapping is
+ever wanted. `multi_master.{h,cc}` are **untouched** by this task.
 
 In `replica.h` add `uint64_t peer_origin_hash_ = 0;` beside `peer_origin_idx_`; set it
-at `replica.cc:473` where `peer_origin_idx_` is derived:
+at `replica.cc:501` where `peer_origin_idx_` is derived:
 
 ```cpp
   // drakeydb: Phase 4 -- the AUTHOR's hash. It cannot come from the wire: PassesPeerEchoFilter
@@ -2265,8 +2531,8 @@ at `replica.cc:473` where `peer_origin_idx_` is derived:
   peer_origin_hash_ = NodeUuidHash(master_context_.master_node_uuid);
 ```
 
-Register it on the shard threads when the flow starts (`replica.cc:1517` area, beside
-`SetApplyOrigin`):
+Register it on the shard threads when the flow starts (`replica.cc:1549`, beside
+`executor_->SetApplyOrigin(origin_idx)` in the `DflyShardReplica` ctor):
 
 ```cpp
   MvccStamper::tlocal()->RegisterOriginHash(peer_origin_idx_, peer_origin_hash_);
@@ -2327,9 +2593,9 @@ git add -A && git commit -m "feat: apply peer MVCC stamps verbatim on the replic
 ### Task 10: Defrag mirror and the leak invariant
 
 **Files:**
-- Modify: `src/server/db_slice.cc:2005-2023` (`DefragTableSegments`)
+- Modify: `src/server/db_slice.cc:2347-2364` (`DefragTableSegments`)
 - Modify: `src/server/table.h` (second cursor)
-- Modify: `src/server/db_slice.h`, `src/server/db_slice.cc:2097` (`OnCbFinishBlocking`)
+- Modify: `src/server/db_slice.h`, `src/server/db_slice.cc:2445` (`OnCbFinishBlocking`)
 - Test: `src/server/multi_master_test.cc`
 
 **Interfaces:**
@@ -2337,7 +2603,9 @@ git add -A && git commit -m "feat: apply peer MVCC stamps verbatim on the replic
 - Produces: `DbTable::mvcc_defrag_cursor`;
   `size_t DbSlice::TEST_VerifyMvccTable(DbIndex) const` returning a mismatch count.
 
-**Why the defrag mirror matters.** `DefragTableSegments` relocates `prime` segments
+**Why the defrag mirror matters.** `DefragTableSegments` (`db_slice.cc:2347`, cursor
+`DbTable::segment_defrag_cursor` at `table.h:148`, sole caller `memory_cmd.cc:346`)
+relocates `prime` segments
 only. Nothing else relocates the side table's, so without a mirror it accumulates
 mimalloc fragmentation for the process's lifetime. The per-object defrag at
 `engine_shard.cc:375` does **not** help — it relocates a `PrimeValue`'s heap, and the
@@ -2371,7 +2639,9 @@ TEST_F(MvccStoreTest, DefragRelocationPreservesStamps) {
     Run({"del", absl::StrCat("k", i)});
 
   const auto before = *StampOf("k1");
-  Run({"debug", "compact-table"});  // match the actual subcommand name in debugcmd.cc
+  Run({"memory", "defragsegments"});  // the ONLY caller of DefragTableSegments
+                                      // (memory_cmd.cc:346). NOT "debug compact-table",
+                                      // which is a different mechanism entirely.
   EXPECT_EQ(*StampOf("k1"), before) << "defrag must not lose or corrupt stamps";
 
   size_t mismatches = 0;
@@ -2398,13 +2668,13 @@ size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
 
   size_t mismatches = 0;
   string scratch;
-  db.prime.CVisit([&](const auto& it) {  // match the actual traversal API in dash.h
+  db.prime.Traverse(Cursor{}, [&](auto it) {  // dash.h:355 -- there is NO CVisit
     if (db.mvcc->Find(it->first.GetSlice(&scratch)).is_done()) {
       LOG(ERROR) << "mvcc: live key with no stamp: " << it->first.ToString();
       ++mismatches;
     }
   });
-  db.mvcc->CVisit([&](const auto& it) {
+  db.mvcc->Traverse(Cursor{}, [&](auto it) {
     if (db.prime.Find(it->first.GetSlice(&scratch)).is_done()) {
       LOG(ERROR) << "mvcc: stamp with no live key: " << it->first.ToString();
       ++mismatches;
@@ -2414,20 +2684,64 @@ size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
 }
 ```
 
-Match `dash.h`'s real traversal API — read it rather than assuming `CVisit`.
+`Traverse(Cursor, Cb)` (`dash.h:355`, impl `:1230`) is the real API: element-granular
+and coverage-guaranteed across resize. `CVisit` does **not** exist. Loop until the
+returned cursor is exhausted.
 
-Add the O(1) form to `OnCbFinishBlocking` (`db_slice.cc:2097`) behind `#ifndef NDEBUG`:
+Add the O(1) form to `OnCbFinishBlocking` (**`db_slice.cc:2445`**) behind `#ifndef NDEBUG`.
+**`OnCbFinishBlocking()` takes no parameters** — there is no `cntx` in scope, so iterate
+`db_arr_`:
 
 ```cpp
 #ifndef NDEBUG
   // drakeydb: Phase 4 -- cheap dense invariant. mvcc_tombstones is 0 until P4-5.
   if (mvcc_enabled_) {
-    auto& db = *db_arr_[cntx.db_index];
-    if (db.mvcc)
-      DCHECK_EQ(db.mvcc->size() - db.stats.mvcc_tombstones, db.prime.size());
+    for (const auto& dbp : db_arr_) {
+      if (!dbp || !dbp->mvcc)
+        continue;
+      DCHECK_EQ(dbp->mvcc->size() - dbp->stats.mvcc_tombstones, dbp->prime.size());
+    }
   }
 #endif
 ```
+
+- [ ] **Step 3b: Stamp RDB-loaded keys `{0,0}` — required for Step 3's invariant**
+
+`rdb_load.cc:3258` inserts loaded keys via `AddOrUpdate`, which does **not** call
+`PostUpdate` (`AddOrUpdateInternal`, `db_slice.cc:1377-1400`). Nothing arms, so nothing
+is stamped, and Step 3's `DCHECK` would abort **every debug build** after a
+`DEBUG RELOAD` or a replica full sync — i.e. the whole `multimaster_test.py` suite.
+
+Immediately beside the existing `SetMCFlag` mirror (`rdb_load.cc:3266-3270`), which is
+the exact precedent:
+
+```cpp
+  // drakeydb: Phase 4 -- an unversioned snapshot carries no stamp, and D-7 specifies
+  // {0,0} as its fallback: it never fabricates authority the snapshot does not contain,
+  // and any stamped resident value beats it on merge. P4-2 overwrites this with the
+  // persisted stamp when the RDB_OPCODE_DF_MVCC record is present.
+  db_slice->SetMvcc(db_cntx.db_index, updater.it->first, MvccStamp{});
+```
+
+Guard it the same way `SetMvcc` already guards itself (no-op when the table is absent),
+so a non-active load costs one predictable branch.
+
+Regression test:
+
+```cpp
+TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
+  for (int i = 0; i < 100; ++i)
+    Run({"set", absl::StrCat("k", i), "v"});
+  Run({"debug", "reload"});
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 100u)
+      << "a reload that leaves keys unstamped trips the dense invariant on the next write";
+  Run({"set", "after", "v"});  // must not DCHECK
+}
+```
+
+The fixture needs `--dbfilename` set or `DEBUG RELOAD` silently no-ops — that exact
+vacuous-test trap was caught on P4-0. Follow `MultiMasterFamilyTest`'s `--dir` handling
+(`multi_master_test.cc:501-517`).
 
 - [ ] **Step 4: Mirror the defrag**
 
@@ -2460,8 +2774,10 @@ git add -A && git commit -m "feat: mirror defrag and add the MVCC table leak inv
 
 **Files:**
 - Modify: `src/server/debugcmd.cc` (`DebugCmd::Run` dispatch + a new handler)
-- Modify: `src/server/server_family.cc:2821` (INFO memory), the active replication block
-- Modify: `src/server/metrics.h`, `src/server/metrics.cc:773`
+- Modify: `src/server/server_family.cc` INFO memory (`append` lambda at `:2712`); the
+  active replication block is `RenderPeerReplicationInfo` at `:3057`
+- Modify: `src/server/metrics.h:68-154`, `src/server/metrics.cc:773` (and the
+  `sizeof(Metrics)` static_assert at `:724`/`:794`)
 - Test: `src/server/multi_master_test.cc`, `tests/dragonfly/multimaster_test.py`
 
 **Interfaces:**
@@ -2472,10 +2788,10 @@ git add -A && git commit -m "feat: mirror defrag and add the MVCC table leak inv
   `mvcc_unstamped_writes`, `mvcc_stale_epoch`.
 
 **`DEBUG`, not `DFLY` — this corrects `docs/PLAN.md`.** `DFLY` is registered
-`CO::ADMIN | CO::GLOBAL_TRANS | CO::HIDDEN` (`server_family.cc:4308`), so a per-key
+`CO::ADMIN | CO::GLOBAL_TRANS | CO::HIDDEN` (`server_family.cc:4308`, verified), so a per-key
 stamp read would take a **global transaction across every shard** — serialising against
 all traffic and perturbing exactly what it measures. `DEBUG` is
-`CO::ADMIN | CO::LOADING` (`:4282`): same admin/ACL posture, one shard hop, and it works
+`CO::ADMIN | CO::LOADING` (`:4282`, verified): same admin/ACL posture, one shard hop, and it works
 during LOADING, which is when you most want to inspect stamps during a merge sync. It
 also has the per-key precedent (`DEBUG OBJECT`, `debugcmd.cc:1202-1261`) and keeps
 replication-critical `dflycmd.cc` untouched.
@@ -2514,8 +2830,9 @@ Expected: an unknown-subcommand error from `DEBUG`.
 
 - [ ] **Step 3: Implement `DEBUG MVCC`**
 
-Add a `MVCC` case to `DebugCmd::Run`'s dispatch (`debugcmd.cc:760-843`) and a handler
-modelled on `DebugCmd::Inspect` (`:1202-1261`) — resolve the shard with
+Add a `MVCC` case to `DebugCmd::Run`'s dispatch (`debugcmd.cc:652-845` — an upper-cased
+linear `if (subcmd == "X")` chain ending in `UnknownSubCmd`; also add a HELP entry) and a
+handler modelled on `DebugCmd::Inspect` (`:1202-1261`, verified exact) — resolve the shard with
 `Shard(key, shard_set->size())` and `ess.Await(sid, cb)`. Return a flat RESP simple
 string:
 
@@ -2532,7 +2849,7 @@ state:absent shard:<n>
 
 - [ ] **Step 4: Add the INFO fields**
 
-`INFO memory` (`server_family.cc:2821`): `mvcc_table_bytes`, `mvcc_entries`,
+`INFO memory` (the `append(a1, a2)` lambda defined at `server_family.cc:2712`): `mvcc_table_bytes`, `mvcc_entries`,
 `mvcc_tombstones`. Inside the active-mode replication block: `mvcc_clock_ahead_ms`,
 `mvcc_unstamped_writes`, `mvcc_stale_epoch`. Aggregate the stamper stats across shard
 threads in `Metrics::Merge`.
@@ -2615,7 +2932,10 @@ async def _mem(client) -> dict:
 @pytest.mark.slow
 @pytest.mark.parametrize("key_len", [8, 16, 24, 32])
 async def test_mvcc_table_memory_cost(df_factory: DflyInstanceFactory, key_len: int):
-    prefix = "k" * (key_len - 8)  # DEBUG POPULATE appends an 8-char numeric suffix
+    # DEBUG POPULATE builds StrCat(prefix, ":", index) with a PLAIN UNPADDED decimal
+    # (debugcmd.cc:1015, :1029) -- there is no fixed-width suffix. For KEY_COUNT=1e6 the
+    # index is 1-7 chars, ~6 on average, plus the ':' separator.
+    prefix = "k" * max(1, key_len - 7)
 
     off = df_factory.create(proactor_threads=4)
     on = df_factory.create(**active_args(multi=False, proactor_threads=4))
@@ -2648,6 +2968,13 @@ async def test_mvcc_table_memory_cost(df_factory: DflyInstanceFactory, key_len: 
           f"({100 * delta / m_off['used_memory']:.1f}% over baseline)")
 ```
 
+Register the marker first — `tests/pytest.ini:9-24` lists only `opt_only`,
+`exclude_epoll`, `debug_only`, `large`, `replication`. Add:
+
+```ini
+    slow: marks tests as slow (deselect with '-m "not slow"')
+```
+
 - [ ] **Step 2: Run it and record the table**
 
 ```bash
@@ -2676,7 +3003,7 @@ Before opening the PR, all of the following, with output pasted into the SDD led
 
 - [ ] `ninja -j4` completes warning-free (CI uses `-Werror`).
 - [ ] `ctest -V -L DFLY` — 87 pre-existing plus `mvcc_test` and the new `multi_master_test` cases.
-- [ ] `multimaster_test.py` at its P3 baseline of 41, plus everything added in P4-0 and P4-1.
+- [ ] `multimaster_test.py` at its current baseline of **44**, plus everything P4-1 adds.
 - [ ] `replication_test.py` 43 passed, `replication_specific_test.py` 61 passed,
       `replication_resilience_test.py` 41 passed + 1 pre-existing xfail.
 - [ ] Timing-adjacent new tests run 10-15x, pass rates recorded.

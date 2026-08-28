@@ -51,6 +51,11 @@ struct DbStats : public DbTableStats {
   // Memory used by dictionaries.
   size_t table_mem_usage = 0;
 
+  // drakeydb: P4-1 Task 5 -- bytes held by DbTable::mvcc (0 outside active mode). Computed in
+  // DbSlice::GetStats from DbTable::mvcc_table_memory(), mirroring table_mem_usage above --
+  // not maintained as a running counter.
+  size_t mvcc_table_bytes = 0;
+
   // We override additional DbStats fields explicitly in DbSlice::GetStats().
   using DbTableStats::operator=;
 
@@ -197,6 +202,10 @@ class DbSlice {
     void ResyncBaseline();
 
     void Run();
+    // Finalizes accounting, notifications, and indexes without joining the MVCC arm/commit
+    // protocol. RDB loading uses this after installing its explicit {0,0} fallback stamp: a load
+    // is carried by the snapshot itself and has no COMMAND journal entry to commit an arm.
+    void RunWithoutMvccArm();
     void Cancel();
 
    private:
@@ -218,6 +227,7 @@ class DbSlice {
     };
 
     AutoUpdater(DbIndex db_ind, std::string_view key, const Iterator& it, DbSlice* db_slice);
+    void RunInternal(bool arm_mvcc);
 
     friend class DbSlice;
 
@@ -345,19 +355,68 @@ class DbSlice {
 
   uint32_t GetMCFlag(DbIndex db_ind, const PrimeKey& key) const;
 
+  bool mvcc_enabled() const {
+    return mvcc_enabled_;
+  }
+  void SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stamp);
+  // Avoids the PrimeKey round-trip for callers that already have a string_view, notably the RDB
+  // loader's explicit {0,0} fallback and tests. See db_slice.cc.
+  void SetMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
+  // Ensures a zero-authority slot exists before the write enters the journal. Does not overwrite
+  // an existing stamp. This is the only allocation-capable half of journal-driven stamping.
+  void EnsureMvcc(DbIndex db_ind, std::string_view key);
+  // Updates a slot prepared by EnsureMvcc. This is called only after AddLogRecord and therefore
+  // must remain allocation-free; a missing slot is a fatal invariant violation.
+  void SetExistingMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
+  std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
+  void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
+  // drakeydb: Phase 4, P4-1 Task 8 -- same F4 split as SetMvcc above, for the same reason:
+  // PerformDeletionAtomic already holds a free string_view (the iterator's del_it.key()) one line
+  // above its EraseMvcc call, in the Disarm() call. See db_slice.cc.
+  void EraseMvcc(DbIndex db_ind, std::string_view key);
+
+  // drakeydb: P4-1 Task 5, fix round 1 -- computed on demand (sums DbTable::mvcc_table_memory()
+  // over db_arr_) rather than maintained as a running accumulator. table_memory_'s accumulator
+  // pattern only stays correct because every mutation site (e.g. AddOrFind's
+  // `table_memory_ += table_increase;`, db_slice.cc:946) takes a live growth delta; SetMvcc has
+  // no equivalent, so an accumulator here would report the sum of the tables' *initial empty*
+  // sizes forever and, worse, underflow (size_t) the first time FlushDbIndexes subtracts a since
+  // filled table's live size against a total that was never credited for the growth. Read rarely
+  // (INFO/benchmark), never on a write path, so the O(databases) scan costs nothing that matters.
+  size_t mvcc_table_memory() const;
+
+  // drakeydb: Phase 4, P4-1 Task 10 -- from-scratch dense-invariant proof: every live prime key
+  // has exactly one mvcc stamp, and every mvcc stamp has exactly one live prime key. O(table
+  // size); this is the test-only counterpart to the O(1) DCHECK in OnCbFinishBlocking
+  // (db_slice.cc), which this test coverage exists to justify trusting. Returns the mismatch
+  // count (0 == clean). Scoped to the default namespace -- see the comment on the definition.
+  size_t TEST_VerifyMvccTable(DbIndex db_ind) const;
+
   // Creates a database with index `db_ind`. If such database exists does nothing.
   void ActivateDb(DbIndex db_ind);
+
+  // drakeydb: Phase 4 -- why a key is being removed. In P4-1 every reason erases the stamp; P4-5
+  // gives kExplicit and kExpired a tombstone while kEvicted and kSlotFlush keep erasing.
+  // Eviction deliberately gets no tombstone: it is a local capacity decision, so resurrection from
+  // a peer is desirable -- the peer's copy is authoritative.
+  enum class DeleteReason : uint8_t { kExplicit, kExpired, kEvicted, kSlotFlush };
 
   // Deletes the iterator. The iterator must be valid.
   // Context argument is used only for document removal and it just needs
   // timestamp field. Last argument, db_table, is optional and is used only in FlushSlotsCb.
   // If async is set, AsyncDeleter will enqueue deletion of the object
-  void Del(Context cntx, Iterator it, DbTable* db_table = nullptr, bool async = false);
+  void Del(Context cntx, Iterator it, DbTable* db_table = nullptr, bool async = false,
+           DeleteReason reason = DeleteReason::kExplicit);
 
   // Deletes a key after FindMutable(). Runs post_updater before deletion
   // to update memory accounting while the key is still valid.
   // Takes ownership of it_updater (pass by value with move semantics).
-  void DelMutable(Context cntx, ItAndUpdater it_updater);
+  // drakeydb: Phase 4, P4-1 Task 8 fix round 1 (F2) -- reason defaults to kExplicit and forwards
+  // to Del, same as every other DbSlice delete entry point. Without this, all 23 DelMutable call
+  // sites were permanently kExplicit regardless of the real reason, defeating the enum's purpose
+  // of letting P4-5 branch on it without revisiting every call site a second time.
+  void DelMutable(Context cntx, ItAndUpdater it_updater,
+                  DeleteReason reason = DeleteReason::kExplicit);
 
   constexpr static DbIndex kDbAll = 0xFFFF;
 
@@ -591,7 +650,7 @@ class DbSlice {
   friend class ReaperJournalFamilyTest;
 
   void PreUpdateBlocking(DbIndex db_ind, const Iterator& it);
-  void PostUpdate(DbIndex db_ind, std::string_view key);
+  void PostUpdate(DbIndex db_ind, std::string_view key, bool arm_mvcc);
 
   OpResult<ItAndUpdater> AddOrUpdateInternal(const Context& cntx, std::string_view key,
                                              PrimeValue obj, uint64_t expire_at_ms,
@@ -611,7 +670,8 @@ class DbSlice {
   void RemoveOffloadedEntriesFromTieredStorage(absl::Span<const DbIndex> indices,
                                                const DbTableArray& db_arr) const;
 
-  void PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async = false);
+  void PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async = false,
+                             DeleteReason reason = DeleteReason::kExplicit);
   // Reaper deletion intentionally bypasses FindMutable/OnChange. Its caller must already have
   // established that no snapshot consumer can race the container mutation.
   void DeleteReapedContainer(const Context& cntx, std::string_view key, Iterator it,
@@ -713,6 +773,10 @@ class DbSlice {
   bool expired_keys_events_recording_ = true;
 
   bool journal_omit_redundant_writes_ = true;
+
+  // drakeydb: P4-1 Task 5. mvcc_enabled_ caches IsActiveReplica() once at construction -- Tasks
+  // 7-8's hot paths read this member, never the flag.
+  bool mvcc_enabled_ = false;
 
   struct Hash {
     size_t operator()(const facade::ConnectionRef& c) const {

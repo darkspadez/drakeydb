@@ -227,8 +227,26 @@ wall clock. The cost is a non-issue because **the clock is read once per
 shard-callback, not once per write** (below), and `JournalSlice::CallOnChange`
 already calls `GetCurrentTimeMs()` per journal entry — using the same source also
 makes the stamp's ms field agree with `JournalItem::time_ms` by construction.
-Bonus: it honours `TEST_current_time_ms`, so every clock unit test is deterministic
-with no fake-clock injection point.
+It honours `TEST_current_time_ms`, which keeps the *integration*-level clock
+deterministic; the `mvcc_test` units do not rely on that, because they pass `now_ms`
+explicitly (see below).
+
+**The clock is read by the caller, not inside `mvcc.cc`.** `MvccClock::Next`,
+`MvccClock::AheadMs` and `MvccStamper::HopStamp` take `now_ms` as a parameter
+(`MvccStamper::Commit` needs no clock at all — it stores the stamp it is given and
+`DCHECK`s that one was given, which is what makes "the stamp in the table is the stamp
+on the wire" structural rather than conventional); `mvcc.cc` does not include `engine_shard_set.h`. This is a
+link-layering requirement, not a style choice: `mvcc.cc` compiles into
+`dfly_transaction`, while `GetCurrentTimeMs()`'s `TEST_current_time_ms` is defined in
+`engine_shard.cc` in `dragonfly_lib`, and only the `dragonfly_lib -> dfly_transaction`
+edge is declared. Reaching up would require declaring a circular dependency between two
+upstream CMake targets — the largest available widening of the upstream merge surface,
+against this phase's global constraints. It also matches the fork's existing discipline
+(`engine_shard.cc` resolves `IsActiveReplica()` and passes a bool down through
+`DeleteExpiredOptions` rather than letting `db_slice` read the flag), and it makes the
+unit tests strictly more deterministic than mutating a process-global override.
+`JournalSlice::CallOnChange` already computes `GetCurrentTimeMs()` per journal entry, so
+the Phase 4 hook has the value in hand at the one site that needs it.
 
 ```cpp
 uint64_t MvccClock::Next(uint64_t now_ms) {
@@ -255,7 +273,7 @@ per-*key*: a 100-key `MSET` or a 50-command squashed `EXEC` consumes one value, 
 100 or 50. **Do not widen the counter** — KeyDB wire parity for P7 `mvcc-tstamp`
 ingest depends on `ms << 20 | counter`.
 
-**One stamp per shard-callback.** `MvccStamper::HopStamp()` memoises the value for
+**One stamp per shard-callback.** `MvccStamper::HopStamp(now_ms)` memoises the value for
 the current callback, with a self-healing backstop: if the memo is older than
 `kMaxEpochMs` (50 ms) it re-mints and increments `mvcc_stale_epoch`, so a missed
 epoch end degrades and is *visible* rather than silently reusing a stale stamp.
@@ -456,7 +474,7 @@ beside `repl_origin_idx` (`tx_base.h:76`) and copy it in
 
 #### Why author and applier stamps are bit-identical
 
-- **Author**: `entry.mvcc = HopStamp()`, `origin_idx = kSelfIdx` -> stores `{S, H_A}`.
+- **Author**: `entry.mvcc = HopStamp(GetCurrentTimeMs())`, `origin_idx = kSelfIdx` -> stores `{S, H_A}`.
 - **Applier**: the parsed entry's mvcc reaches `repl_mvcc`, so `RecordEntry` sees a
   non-zero value and does **not** re-mint; the authenticated link's
   `peer_origin_hash_` supplies A's uuid hash -> stores `{S, H_A}`. Identical.
@@ -924,7 +942,7 @@ the derived-DEL fix — so they never land together.
 | PR | Scope |
 |---|---|
 | **P4-0** | Proactive member-expiry reaper + D-11 derived-DEL fix + D-12 clock-skew warning/metric. Mergeable independently of P4-1...P4-5 only as this complete unit; D-11 must not land without its reaper prerequisite. |
-| **P4-1** | **T0 inbound plumbing** (`TransactionData.mvcc`, `SetApplyMvcc`, `peer_origin_hash_`, widened `SetReplOrigin`), D-2 stamp, D-3 clock, D-4 side table, D-5 stamping, D-6 wire, D-13 `DEBUG MVCC` + `mvcc_table_bytes`, memory benchmark. No behaviour change beyond memory. |
+| **P4-1** | **T0 inbound plumbing** (`TransactionData.mvcc`, `SetApplyMvcc`, `peer_origin_hash_`, widened `SetReplOrigin`), D-2 stamp, D-3 clock, D-4 side table, D-5 stamping, D-6 wire, D-13 `DEBUG MVCC` + `mvcc_table_bytes`, memory benchmark. Starts the active-node journal at boot so peerless writes are stamped and retains non-default ACL namespaces as local-only because the wire has no namespace identity; no conflict-resolution behavior changes yet. |
 | **P4-2** | D-7 RDB persistence (`RDB_OPCODE_DF_MVCC` save + load, KeyDB read branch). |
 | **P4-3** | D-8 merge-on-full-sync LWW. First real behaviour change. |
 | **P4-4** | D-9 streaming guard + per-key split, `--multi_master_stream_lww`, `multimaster_lww_dropped`. Highest risk; lands on a foundation already proven by P4-1..3. |

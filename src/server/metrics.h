@@ -108,6 +108,14 @@ struct Metrics {
   size_t lsn_buffer_size = 0;
   size_t lsn_buffer_bytes = 0;
 
+  // drakeydb: Phase 4, P4-1 Task 11 -- per-shard MvccStamper stats (mvcc.h), gathered on each
+  // shard's own thread in InitFromThread and folded here. mvcc_clock_ahead_ms takes the max
+  // across shards (like tx_queue_len below); the other two sum (like the fiber counters below).
+  // All three stay 0 outside --active_replica, where MvccStamper is never armed.
+  uint64_t mvcc_clock_ahead_ms = 0;
+  uint64_t mvcc_unstamped_writes = 0;
+  uint64_t mvcc_stale_epoch = 0;
+
   // Meaningful only on a master (zero on replicas / no replicas).
   ReplicationMemoryStats replication_stats;
 

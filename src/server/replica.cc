@@ -37,6 +37,7 @@ extern "C" {
 #include "server/journal/serializer.h"
 #include "server/main_service.h"
 #include "server/multi_master.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/node_identity.h"
 #include "server/peer_replication.h"
@@ -499,6 +500,52 @@ error_code Replica::Greet() {
     }
     if (peer_mode_->registry)
       peer_origin_idx_ = peer_mode_->registry->AddOrGet(master_context_.master_node_uuid);
+    // drakeydb: Phase 4 -- the AUTHOR's hash. It cannot come from the wire: PassesPeerEchoFilter
+    // forwards only self-origin entries, so every COMMAND arriving here carries origin_idx == 0.
+    // Under no-forward v1 the sender is the author, so the link's uuid is the correct source.
+    peer_origin_hash_ = NodeUuidHash(master_context_.master_node_uuid);
+
+    // drakeydb: Phase 4, review wave 2 (F3, IMPORTANT) -- register it here, not only from
+    // InitiateDflySync's shard_cb (below in this file), because that call site is unreachable for
+    // a Redis-protocol peer link: the state machine driving this Replica (MainReplicationFb)
+    // branches on HasDflyMaster() to choose InitiateDflySync (DFLY protocol) vs InitiatePSync
+    // (plain PSYNC) for full sync, and InitiatePSync never touches InitiateDflySync at all -- but
+    // the uuid handshake just above runs unconditionally, before that branch is even reached
+    // (KeyDB replies to REPLCONF UUID same as a DFLY peer would; see this function's own uuid
+    // exchange comment above). Without this, a genuine KeyDB peer -- explicitly supported here,
+    // this whole block admits it once it presents a uuid -- applied every write with the correct
+    // origin_idx (ConsumeRedisStream sets conn_context.repl_origin_idx = peer_origin_idx_) but an
+    // UNREGISTERED origin_hash: OriginHash(peer_origin_idx_) (mvcc.cc) returns 0 for any index
+    // origin_hash_cache_ was never resized to cover, indistinguishable from a genuinely-computed
+    // hash landing on 0. Two distinct KeyDB peers would then both stamp writes with origin_hash
+    // == 0 and become order-indistinguishable on an exact mvcc tie -- precisely the swap
+    // MvccStamp::origin_hash exists to prevent (mvcc.h). mvcc itself is a separate, NOT-closed
+    // gap: ConsumeRedisStream has no SetApplyMvcc call anywhere, and could not usefully add one --
+    // plain Redis/KeyDB replication carries no room for an extra per-command stamp on the wire,
+    // unlike DFLY's extended framing (serializer.cc), so an applied write via this path always
+    // mints a fresh local stamp regardless of this fix. Parsing KeyDB's own mvcc-tstamp off the
+    // wire is P7 onboarding's job (mvcc.h's MvccClock comment), not this one. This fix closes the
+    // origin_hash half only -- still a real improvement, since operator< (mvcc.h) compares Mvcc()
+    // first and origin_hash only breaks an exact tie, so a wrong-but-distinct-per-peer hash is far
+    // better than a hash shared by every unregistered peer.
+    //
+    // shard_set->pool()->AwaitBrief, the same primitive ServerFamily::Init's SetSelfUuid call
+    // uses (server_family.cc) for this exact reason: MvccStamper::tlocal() is a plain
+    // thread_local with no EngineShard::tlocal() requirement, so any proactor thread works, and
+    // AwaitBrief is the lighter-weight choice when the callback itself neither blocks nor needs
+    // shard identity (unlike journal::StartInThread's shard_set->RunBriefInParallel a few lines
+    // above SetSelfUuid in that same file, which does need it). InitiateDflySync's own
+    // registration below uses AwaitFiberOnAll instead, for reasons specific to that callback (see
+    // its own comment) that do not apply to this one. Guarded on the value, not IsPeerMode(), for
+    // the identical reason InitiateDflySync's own call is (see its comment): ReplicaPeerMode::
+    // registry == nullptr (documented reachable in tests) leaves peer_origin_idx_ at kSelfIdx even
+    // with IsPeerMode() true, and registering hash-for-self here would clobber SetSelfUuid's real
+    // entry.
+    if (peer_origin_idx_ != PeerRegistry::kSelfIdx) {
+      shard_set->pool()->AwaitBrief([this](unsigned, auto*) {
+        MvccStamper::tlocal()->RegisterOriginHash(peer_origin_idx_, peer_origin_hash_);
+      });
+    }
   } else if (IsPeerMode()) {
     // drakeydb: D2b -- peer mode now requires a uuid. Without one there is no origin to stamp,
     // and stamping kSelfIdx would make this active node forward the source's writes back out to
@@ -850,6 +897,75 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
     std::memset(is_full_sync.get(), 0, num_df_flows);
     DCHECK(!last_journal_LSNs_ || last_journal_LSNs_->size() == num_df_flows);
     auto shard_cb = [&](unsigned index, auto*) {
+      // drakeydb: Phase 4, fix round (F1v2) -- registers this Replica's origin_idx -> author hash
+      // mapping (see peer_origin_hash_'s doc comment) so an applied write's Commit
+      // (journal.cc's RecordEntry, via MvccStamper::OriginHash) resolves the real author instead
+      // of the unregistered default of 0.
+      //
+      // Placement: this callback already runs on EVERY proactor thread -- that's what
+      // AwaitFiberOnAll below does -- so this is a genuine per-thread broadcast, unconditional on
+      // whether thread_flow_map_[index] happens to be non-empty for this thread: any shard can
+      // receive a command for any key regardless of which flow (if any) this thread also owns,
+      // via the normal Transaction dispatch. MvccStamper::tlocal() is a `static thread_local`
+      // (mvcc.cc), so a bare, non-broadcast call anywhere else -- e.g. in DflyShardReplica's own
+      // constructor, right beside executor_->SetApplyOrigin(origin_idx) above it, which an
+      // earlier version of this fix used -- only reaches whichever ONE thread happens to run the
+      // constructor (InitiateDflySync's flow-construction loop, driven by MainReplicationFb),
+      // not reliably any of the shard threads that later call Commit()/OriginHash(). This
+      // callback is the first point in the flow's setup where "run once on every shard thread" is
+      // both true and already an established, safe synchronization boundary -- see below.
+      //
+      // Safety: this specific point was chosen deliberately, after an earlier version of this fix
+      // (a shard_set->pool()->AwaitBrief(...) call inside DflyShardReplica's constructor) crashed
+      // the server -- reproduced 5/10 runs of test_active_replica_single_peer_replaces
+      // (multimaster_test.py, which replaces one active peer with another) with SIGSEGV; see the
+      // constructor's own comment and task-9-report.md for the full account. That constructor
+      // had never yielded its calling fiber before (every member it initializes -- JournalExecutor,
+      // RdbLoader -- does pure, non-blocking work), and it runs inside InitiateDflySync's tight
+      // per-flow loop; introducing a yield point there let a concurrent peer-replacement teardown
+      // interleave with flow construction in ways the original code never had to handle. This
+      // callback introduces no NEW yield point: AwaitFiberOnAll already fiber-blocks the caller
+      // (MainReplicationFb) here regardless of this change, and this call runs before that wait
+      // returns, using a synchronization boundary already exercised by every existing caller of
+      // InitiateDflySync.
+      //
+      // Ordering: still happens-before every apply on THIS thread -- StartSyncFlow, called only
+      // after this line within the very same per-thread callback, is what actually starts this
+      // flow applying entries, so the registration is visible before the first command on this
+      // thread can possibly be dispatched. That is narrower than what the whole broadcast
+      // actually relies on, so it's worth being precise (fix round 2, F3): Commit runs on
+      // whichever thread owns the KEY being applied (transaction.cc -> journal.cc), which is not
+      // necessarily the thread running this callback for THIS flow, and AwaitFiberOnAll
+      // dispatches to every thread concurrently -- so in principle thread U's flow could reach
+      // Commit before thread T's callback (this one) has run at all, and nothing here orders
+      // them against each other directly. It is unreachable in practice, not by construction:
+      // StartSyncFlow itself (every thread's, including thread T's own) does a TCP connect,
+      // AUTH, and a DFLY FLOW round trip with the master before it ever launches the fiber that
+      // can apply an entry, while this registration is thread T's very first non-yielding
+      // statement in this callback -- so every thread's registration completes before any
+      // thread's StartSyncFlow has gotten far enough to matter, let alone applied anything.
+      //
+      // Idempotent: RegisterOriginHash (mvcc.cc) writes one dense-vector slot
+      // (origin_hash_cache_[origin_idx] = hash, resizing on demand); repeated calls with the
+      // same value (every reconnect re-enters InitiateDflySync with the same peer_origin_idx_/
+      // peer_origin_hash_) are a no-op past the first.
+      //
+      // Gated on peer_origin_idx_ != kSelfIdx, NOT IsPeerMode() (fix round 2, F2): a non-peer
+      // (plain REPLICAOF) Replica always has peer_origin_idx_ == kSelfIdx (0) and
+      // peer_origin_hash_ == 0 (Greet()'s peer-only branches never run for one), so
+      // IsPeerMode() and this condition agree in every configuration production ever builds
+      // (ReplicaPeerMode::registry is always real there). But ReplicaPeerMode::registry ==
+      // nullptr is a documented, reachable mode too ("tests" -- replica.h) in which Greet()'s
+      // `if (peer_mode_->registry) peer_origin_idx_ = ...AddOrGet(...)` (this file) never runs,
+      // leaving peer_origin_idx_ at kSelfIdx even though IsPeerMode() is still true and
+      // peer_origin_hash_ is still set unconditionally a few lines above it. Guarding on
+      // IsPeerMode() there would reintroduce exactly the RegisterOriginHash(0, <peer hash>)
+      // clobber of kSelfIdx's real hash this comment warns about, in that mode specifically.
+      // Checking the value peer_origin_idx_ actually holds, rather than the boolean that usually
+      // -- but not always -- agrees with it, makes the guard hold by invariant.
+      if (peer_origin_idx_ != PeerRegistry::kSelfIdx) {
+        MvccStamper::tlocal()->RegisterOriginHash(peer_origin_idx_, peer_origin_hash_);
+      }
       for (auto id : thread_flow_map_[index]) {
         auto ec = shard_flows_[id]->StartSyncFlow(sync_block, &exec_st_,
                                                   last_journal_LSNs_.has_value()
@@ -1547,6 +1663,23 @@ DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext m
   // here at flow setup, not per entry. Also read back by StableSyncDflyReadFb's PING re-record
   // below, via executor_->connection_context()->repl_origin_idx.
   executor_->SetApplyOrigin(origin_idx);
+  // drakeydb: Phase 4, fix round (F1v2) -- the origin_idx -> author hash registration this flow
+  // needs (see Replica::peer_origin_hash_'s doc comment) is deliberately NOT done here. An
+  // earlier version of this constructor called shard_set->pool()->AwaitBrief(...) at this exact
+  // point, and that crashed: this constructor previously never yielded the calling fiber (every
+  // member here -- JournalExecutor, RdbLoader below -- does pure, non-blocking initialization,
+  // "the constructor performs no I/O" per DflyShardReplicaOriginTest's own comment in
+  // peer_replication_test.cc). AwaitBrief fiber-blocks its caller (FiberBlockingCounter::Wait),
+  // which was the FIRST yield point ever introduced into this constructor -- and this
+  // constructor runs inside InitiateDflySync's tight per-flow loop, driven by MainReplicationFb.
+  // Introducing a yield there let previously-impossible interleaving happen: reproduced by hand
+  // with test_active_replica_single_peer_replaces (multimaster_test.py), which replaces an
+  // active peer (stops the old Replica while starting a new one) -- 5/10 isolated runs crashed
+  // the server with SIGSEGV once this constructor could yield mid-construction, vs. 0/10 on the
+  // pre-this-change code and 0/15 on the fix below. See task-9-report.md for the full before/
+  // after reproduction (isolated re-run counts and the crash log). The registration itself moved
+  // to InitiateDflySync's existing shard_cb (below in this file) -- see the comment there for why
+  // that point is safe where this one was not.
   rdb_loader_ = std::make_unique<RdbLoader>(&service_, load_context);
   rdb_loader_->SetLoadUnownedSlots(true);
   rdb_loader_->SetShardCount(master_context.num_flows);
@@ -1574,6 +1707,10 @@ bool DflyShardReplica::ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx
     // (logger disabled) is cheap. Log before Execute so a crash during execute
     // still leaves the record on disk for post-mortem replay.
     facade::Connection::LogReplicaCommand(tx_data.command, tx_data.dbid);
+    // drakeydb: Phase 4 -- per-entry, unlike SetApplyOrigin above: the author's stamp must be set
+    // fresh before every Execute() so RecordEntry stores it verbatim instead of minting a local
+    // one (see JournalExecutor::SetApplyMvcc's doc comment).
+    executor_->SetApplyMvcc(tx_data.mvcc);
     return executor_->Execute(tx_data.dbid, tx_data.command) == facade::DispatchResult::OK;
   }
 
@@ -1605,6 +1742,8 @@ bool DflyShardReplica::ExecuteTx(TransactionData&& tx_data, ExecutionState* cntx
     // Global command — log exactly once (only the inserter flow runs Execute,
     // so this guard naturally dedups across per-shard flows).
     facade::Connection::LogReplicaCommand(tx_data.command, tx_data.dbid);
+    // drakeydb: Phase 4 -- see the non-global path above for why this is per-entry.
+    executor_->SetApplyMvcc(tx_data.mvcc);
     execution_res = executor_->Execute(tx_data.dbid, tx_data.command) == facade::DispatchResult::OK;
   }
   // Wait until exection is done, to make sure we done execute next commands while the global is

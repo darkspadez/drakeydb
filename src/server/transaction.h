@@ -350,6 +350,7 @@ class Transaction {
     // repl_origin_idx_/SetReplOrigin below.
     DbContext ctx{namespace_, db_index_, time_now_ms_};
     ctx.repl_origin_idx = repl_origin_idx_;
+    ctx.repl_mvcc = repl_mvcc_;
     return ctx;
   }
 

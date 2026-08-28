@@ -37,11 +37,14 @@ extern "C" {
 #include "facade/dragonfly_connection.h"
 #include "server/blocking_controller.h"
 #include "server/container_utils.h"
+#include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/hset_family.h"
 #include "server/main_service.h"
 #include "server/multi_command_squasher.h"
+#include "server/multi_master.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/rdb_load.h"
 #include "server/server_state.h"
@@ -743,6 +746,15 @@ void DebugCmd::Run(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
         "    scan exited early due to an in-progress snapshot).",
         "UNIQ-STRS",
         "    Prints per-object unique string stats and estimated dedup savings across shards.",
+        "MVCC [<key> | VERIFY]",
+        "    Inspect the per-key MVCC/LWW stamp side table (--active_replica only). With <key>,",
+        "    hops to that key's shard and prints its stamp: 'state:value mvcc:<u64> ms:<u64>",
+        "    counter:<u32> origin:<hex16> shard:<n>', 'state:tombstone mvcc:<u64> ms:<u64>",
+        "    origin:<hex16> shard:<n>' (no counter: field), or 'state:absent shard:<n>'. With no",
+        "    key, prints per-shard aggregates (entries/tombstones/bytes/clock_last/clock_ahead_ms/",
+        "    unstamped_writes). VERIFY runs the from-scratch dense-invariant check on every shard",
+        "    and every db, returning 'mismatches:<n>'. Supported only in the default namespace;",
+        "    errors name --active_replica when the feature is off.",
         "HELP",
         "    Prints this help.",
     };
@@ -775,6 +787,10 @@ void DebugCmd::Run(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
   if (subcmd == "OBJECT" && parser.HasNext()) {
     string_view key = parser.Next();
     return Inspect(key, parser, cmd_cntx);
+  }
+
+  if (subcmd == "MVCC") {
+    return Mvcc(parser, cmd_cntx);
   }
 
   if (subcmd == "TX") {
@@ -1257,6 +1273,160 @@ void DebugCmd::Inspect(string_view key, facade::CmdArgParser parser, CommandCont
       StrAppend(&resp, " lock:", res.lock_status == ObjInfo::X ? "x" : "s");
     }
   }
+  rb->SendSimpleString(resp);
+}
+
+// drakeydb: Phase 4, P4-1 Task 11 -- DEBUG, not DFLY: DFLY is CO::ADMIN | CO::GLOBAL_TRANS |
+// CO::HIDDEN, so a per-key stamp read would take a global transaction across every shard,
+// serialising against all traffic and perturbing exactly what it measures. DEBUG is
+// CO::ADMIN | CO::LOADING -- same admin/ACL posture, one shard hop, and it works during LOADING,
+// which is when inspecting stamps during a merge sync matters most.
+//
+// Three forms, dispatched on what follows "MVCC":
+//   DEBUG MVCC <key>    -- shard-hops to <key>'s shard (Inspect()'s precedent, above) and prints
+//                           its stamp.
+//   DEBUG MVCC          -- per-shard aggregates (side-table entries/tombstones/bytes, this
+//                           shard's clock/unstamped-write counters).
+//   DEBUG MVCC VERIFY   -- runs the from-scratch dense-invariant check (DbSlice::
+//                           TEST_VerifyMvccTable) on every db of every shard.
+//
+// All three refuse up front when --active_replica is off: DbTable::mvcc is never allocated then
+// (table.h), so every key would otherwise read back state:absent -- indistinguishable from a
+// real absence and silently misleading about why.
+//
+// Non-default ACL namespaces are local-only because the journal wire has no namespace identity.
+// They therefore have no replicated MVCC state. Refuse all forms rather than reporting a live
+// key as state:absent, zero aggregates, or a vacuous successful VERIFY.
+void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
+
+  if (!IsActiveReplica()) {
+    return cmd_cntx->SendError(
+        "DEBUG MVCC requires --active_replica -- the mvcc side table is not maintained without "
+        "it");
+  }
+
+  if (cntx_->ns != &namespaces->GetDefaultNamespace()) {
+    return cmd_cntx->SendError("DEBUG MVCC is supported only in the default namespace");
+  }
+
+  if (parser.Check("VERIFY")) {
+    if (!parser.Finalize())
+      return cmd_cntx->SendError(parser.TakeError().MakeReply());
+
+    Namespace* ns = cntx_->ns;
+    vector<size_t> mismatches(shard_set->size(), 0);
+    // RunBlockingInParallel (Dispatch, spawns a fiber -- e.g. Watched() above, :1427), not
+    // RunBriefInParallel (DispatchBrief, callback must not preempt -- reserved elsewhere in this
+    // file for O(1)/O(db-count) gathers like Shards()'s per-shard memory stats).
+    // TEST_VerifyMvccTable drives two Traverse cursors to exhaustion over the whole prime table
+    // AND the whole mvcc table, for every db, with a LOG(ERROR) per mismatch -- O(table size),
+    // unbounded by this caller. Under DispatchBrief that stalls the entire proactor (every
+    // connection, journal I/O, replication ACK on that thread) uninterruptibly for the whole
+    // traversal on a large dataset; a fiber at least makes the call schedulable like any other
+    // blocking work on this thread.
+    shard_set->RunBlockingInParallel([&](EngineShard* shard) {
+      ShardId sid = shard->shard_id();
+      auto& db_slice = ns->GetDbSlice(sid);
+      size_t shard_mismatches = 0;
+      // unsigned i + static_cast<DbIndex>, not a DbIndex (uint16_t) loop var directly compared
+      // against db_array_size()'s size_t: TraverseAllEntries (above in this file) uses the same
+      // shape for the same reason -- uint16_t promotes to signed int, so comparing it straight
+      // against a size_t trips -Wsign-compare under -Werror.
+      for (unsigned i = 0; i < db_slice.db_array_size(); ++i)
+        shard_mismatches += db_slice.TEST_VerifyMvccTable(static_cast<DbIndex>(i));
+      mismatches[sid] = shard_mismatches;
+    });
+    size_t total = std::accumulate(mismatches.begin(), mismatches.end(), size_t(0));
+    return rb->SendSimpleString(StrCat("mismatches:", total));
+  }
+
+  if (!parser.HasNext()) {
+    if (!parser.Finalize())
+      return cmd_cntx->SendError(parser.TakeError().MakeReply());
+
+    struct ShardMvccInfo {
+      size_t entries = 0;
+      size_t tombstones = 0;
+      size_t bytes = 0;
+      uint64_t clock_last = 0;
+      uint64_t clock_ahead_ms = 0;
+      uint64_t unstamped_writes = 0;
+    };
+    vector<ShardMvccInfo> infos(shard_set->size());
+    // Captured once and handed to every shard's AheadMs() below, so all shards are judged
+    // against the same wall-clock instant rather than drifting apart across the fan-out.
+    const uint64_t now_ms = GetCurrentTimeMs();
+    Namespace* ns = cntx_->ns;
+
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      ShardId sid = shard->shard_id();
+      ShardMvccInfo& info = infos[sid];
+
+      auto& db_slice = ns->GetDbSlice(sid);
+      auto slice_stats = db_slice.GetStats();
+      DbStats total;
+      for (const auto& db_stats : slice_stats.db_stats)
+        total += db_stats;
+      info.entries = total.mvcc_entries;
+      info.tombstones = total.mvcc_tombstones;
+      // drakeydb: Task 11 fix round 1 (F3, Minor) -- DbSlice::mvcc_table_memory() (db_slice.h)
+      // already sums DbTable::mvcc_table_memory() over every db directly; re-deriving the same
+      // number via total.mvcc_table_bytes above would just repeat that summation a second time
+      // (GetStats() computes it per-db via the identical call, db_slice.cc's GetStats()) for no
+      // benefit -- entries/tombstones have no equivalent direct accessor, so those still come
+      // from the total above.
+      info.bytes = db_slice.mvcc_table_memory();
+
+      MvccStamper* stamper = MvccStamper::tlocal();
+      info.clock_last = stamper->clock().last();
+      info.clock_ahead_ms = stamper->clock().AheadMs(now_ms);
+      info.unstamped_writes = stamper->stats().unstamped_writes;
+    });
+
+    string resp;
+    for (size_t i = 0; i < infos.size(); ++i) {
+      const ShardMvccInfo& info = infos[i];
+      StrAppend(&resp, i == 0 ? "" : " ", "shard", i, "_entries:", info.entries, " shard", i,
+                "_tombstones:", info.tombstones, " shard", i, "_bytes:", info.bytes, " shard", i,
+                "_clock_last:", info.clock_last, " shard", i,
+                "_clock_ahead_ms:", info.clock_ahead_ms, " shard", i,
+                "_unstamped_writes:", info.unstamped_writes);
+    }
+    return rb->SendSimpleString(resp);
+  }
+
+  string_view key = parser.Next();
+  if (!parser.Finalize())
+    return cmd_cntx->SendError(parser.TakeError().MakeReply());
+
+  EngineShardSet& ess = *shard_set;
+  ShardId sid = Shard(key, ess.size());
+  DbIndex db_index = cntx_->db_index();
+  Namespace* ns = cntx_->ns;
+
+  // Same shard-hop shape as Inspect()/InspectOp() above: GetCurrentDbSlice() resolves correctly
+  // here because this lambda runs ON shard `sid`'s own thread (ess.Await below), exactly like
+  // MvccStoreTest::StampOf (multi_master_test.cc) relies on for the identical read.
+  auto cb = [&]() -> string {
+    std::optional<MvccStamp> stamp = ns->GetCurrentDbSlice().GetMvcc(db_index, key);
+    string out;
+    if (!stamp) {
+      StrAppend(&out, "state:absent shard:", sid);
+    } else if (stamp->IsTombstone()) {
+      // P4-5 sets this bit; nothing does yet, but the field format is already fixed by that
+      // future task's dependency on this one, so the branch is wired in now rather than left
+      // for P4-5 to discover DEBUG MVCC never accounted for it.
+      StrAppend(&out, "state:tombstone mvcc:", stamp->Mvcc(), " ms:", stamp->MsPart(),
+                " origin:", absl::Hex(stamp->origin_hash, absl::kZeroPad16), " shard:", sid);
+    } else {
+      StrAppend(&out, "state:value mvcc:", stamp->Mvcc(), " ms:", stamp->MsPart(),
+                " counter:", (stamp->Mvcc() & MvccClock::kCounterMask),
+                " origin:", absl::Hex(stamp->origin_hash, absl::kZeroPad16), " shard:", sid);
+    }
+    return out;
+  };
+  string resp = ess.Await(sid, std::move(cb));
   rb->SendSimpleString(resp);
 }
 

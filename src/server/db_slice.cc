@@ -32,6 +32,7 @@ extern "C" {
 #include "server/error.h"
 #include "server/journal/journal.h"
 #include "server/multi_master.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/server_state.h"
 #include "server/tiered_storage.h"
@@ -295,9 +296,10 @@ unsigned PrimeEvictionPolicy::Evict(const PrimeTable::HotBuckets& eb, PrimeTable
 
     // log the evicted keys to journal.
     if (auto journal = db_slice_->shard_owner()->journal(); journal) {
-      RecordExpiryBlocking(cntx_.db_index, key);
+      RecordExpiryBlocking(cntx_, key);
     }
-    db_slice_->Del(cntx_, DbSlice::Iterator(last_slot_it, StringOrView::FromView(key)));
+    db_slice_->Del(cntx_, DbSlice::Iterator(last_slot_it, StringOrView::FromView(key)), nullptr,
+                   false, DbSlice::DeleteReason::kEvicted);
 
     ++evicted_;
   }
@@ -469,13 +471,14 @@ void AccountSlotTieredBytes(string_view key, int64_t delta, DbTable* db) {
 
 DbStats& DbStats::operator+=(const DbStats& o) {
   constexpr size_t kDbSz = sizeof(DbStats) - sizeof(DbTableStats);
-  static_assert(kDbSz == 24);
+  static_assert(kDbSz == 32);  // drakeydb: P4-1 Task 5 -- +8 for mvcc_table_bytes.
 
   DbTableStats::operator+=(o);
 
   ADD(key_count);
   ADD(prime_capacity);
   ADD(table_mem_usage);
+  ADD(mvcc_table_bytes);
 
   return *this;
 }
@@ -521,6 +524,9 @@ DbSlice::DbSlice(uint32_t index, bool cache_mode, EngineShard* owner, Namespace*
       cache_mode_(cache_mode),
       owner_(owner),
       ns_(ns),
+      // mvcc_enabled_ is declared (db_slice.h) before client_tracking_map_; keep this order to
+      // match, or -Wreorder fails the -Werror build.
+      mvcc_enabled_(IsActiveReplica()),
       client_tracking_map_(owner->memory_resource()) {
   CHECK(ns_ != nullptr);
   db_arr_.emplace_back();
@@ -555,6 +561,7 @@ auto DbSlice::GetStats() const -> Stats {
     stats.key_count = db_wrap.prime.size();
     stats.prime_capacity = db_wrap.prime.capacity();
     stats.table_mem_usage = db_wrap.table_memory();
+    stats.mvcc_table_bytes = db_wrap.mvcc_table_memory();
   }
   auto co_stats = CompactObj::GetStatsThreadLocal();
   s.small_string_bytes = co_stats.small_string_bytes;
@@ -562,6 +569,69 @@ auto DbSlice::GetStats() const -> Stats {
   s.events.huff_encode_success = co_stats.huff_encode_success;
 
   return s;
+}
+
+size_t DbSlice::mvcc_table_memory() const {
+  size_t total = 0;
+  for (const auto& db : db_arr_) {
+    if (db)
+      total += db->mvcc_table_memory();
+  }
+  return total;
+}
+
+// drakeydb: Phase 4, P4-1 Task 10.
+//
+// Scoped to the default namespace for the same reason PostUpdate's F1 gate is (see that comment,
+// below in this file): DbTable::mvcc is allocated per-shard from the global IsActiveReplica()
+// flag (DbTable::DbTable, table.cc), not per-namespace, so a non-default namespace's mvcc table
+// exists but is never armed or stamped -- an ACL-namespaced client's write (reachable via
+// acl_family.cc's NAMESPACE: directive) would otherwise show up here as a permanent, spurious
+// "live key with no stamp" mismatch for every key it ever writes. That is a property of where
+// this namespace's writes are (never) armed, not a leak -- do not "fix" it by removing the scope.
+// See OnCbFinishBlocking for the O(1) production-path DCHECK this from-scratch check justifies.
+size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
+  // drakeydb: fix round 1 (Minor) -- guard against an out-of-range/never-activated db_ind, the
+  // same check every other public entry point taking a bare DbIndex relies on (e.g.
+  // DefragTableSegments, above in this file). Callers so far only ever pass 0 (always valid,
+  // the default db), so this was unreachable in practice, but TEST_VerifyMvccTable is public API.
+  if (!IsDbValid(db_ind))
+    return 0;
+  if (ns_ != &namespaces->GetDefaultNamespace())
+    return 0;
+
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return 0;
+
+  size_t mismatches = 0;
+  string scratch;
+
+  // dash.h:355 -- Traverse is element-granular but bounded per call (it stops at the first
+  // non-empty logical bucket it finds); the returned cursor must be fed back in until it is
+  // exhausted (falsy) to guarantee full coverage. There is no CVisit / single-call whole-table
+  // form.
+  PrimeTable::Cursor prime_cursor;
+  do {
+    prime_cursor = db.prime.Traverse(prime_cursor, [&](auto it) {
+      if (db.mvcc->Find(it->first.GetSlice(&scratch)).is_done()) {
+        LOG(ERROR) << "mvcc: live key with no stamp: " << it->first.ToString();
+        ++mismatches;
+      }
+    });
+  } while (prime_cursor);
+
+  detail::DashCursor mvcc_cursor;
+  do {
+    mvcc_cursor = db.mvcc->Traverse(mvcc_cursor, [&](auto it) {
+      if (db.prime.Find(it->first.GetSlice(&scratch)).is_done()) {
+        LOG(ERROR) << "mvcc: stamp with no live key: " << it->first.ToString();
+        ++mismatches;
+      }
+    });
+  } while (mvcc_cursor);
+
+  return mismatches;
 }
 
 SlotStats DbSlice::GetSlotStats(SlotId sid) const {
@@ -608,6 +678,14 @@ void DbSlice::AutoUpdater::ResyncBaseline() {
 }
 
 void DbSlice::AutoUpdater::Run() {
+  RunInternal(true);
+}
+
+void DbSlice::AutoUpdater::RunWithoutMvccArm() {
+  RunInternal(false);
+}
+
+void DbSlice::AutoUpdater::RunInternal(bool arm_mvcc) {
   if (fields_.db_slice == nullptr) {
     return;
   }
@@ -650,7 +728,7 @@ void DbSlice::AutoUpdater::Run() {
     --table->stats.member_expire_count;
   }
 
-  fields_.db_slice->PostUpdate(fields_.db_ind, fields_.key);
+  fields_.db_slice->PostUpdate(fields_.db_ind, fields_.key, arm_mvcc);
   Cancel();  // Reset to not run again
 }
 
@@ -969,7 +1047,7 @@ void DbSlice::ActivateDb(DbIndex db_ind) {
   CreateDb(db_ind);
 }
 
-void DbSlice::Del(Context cntx, Iterator it, DbTable* db_table, bool async) {
+void DbSlice::Del(Context cntx, Iterator it, DbTable* db_table, bool async, DeleteReason reason) {
   CHECK(IsValid(it));
 
   DbTable* table = db_table ? db_table : db_arr_[cntx.db_index].get();
@@ -990,12 +1068,12 @@ void DbSlice::Del(Context cntx, Iterator it, DbTable* db_table, bool async) {
     doc_del_cb_(key, cntx, it->second);
   }
 
-  PerformDeletionAtomic(it, table, async);
+  PerformDeletionAtomic(it, table, async, reason);
 }
 
-void DbSlice::DelMutable(Context cntx, ItAndUpdater it_updater) {
+void DbSlice::DelMutable(Context cntx, ItAndUpdater it_updater, DeleteReason reason) {
   it_updater.post_updater.Run();
-  Del(cntx, it_updater.it);
+  Del(cntx, it_updater.it, nullptr, false, reason);
 }
 
 void DbSlice::FlushSlotsFb(const cluster::SlotSet& slot_ids, uint64_t next_version,
@@ -1014,6 +1092,7 @@ void DbSlice::FlushSlotsFb(const cluster::SlotSet& slot_ids, uint64_t next_versi
   size_t memory_before = table->table_memory() + table->stats.obj_memory_usage;
 
   DbContext db_cntx;
+  db_cntx.ns = ns_;
   db_cntx.time_now_ms = GetCurrentTimeMs();
   db_cntx.db_index = table->index;
 
@@ -1025,7 +1104,7 @@ void DbSlice::FlushSlotsFb(const cluster::SlotSet& slot_ids, uint64_t next_versi
       SlotId sid = KeySlot(key);
       if (slot_ids.Contains(sid) && it.GetVersion() < next_version) {
         // We use copy of table smart pointer and pass it as table because FLUSHALL can drop table.
-        Del(db_cntx, Iterator::FromPrime(it), table.get());
+        Del(db_cntx, Iterator::FromPrime(it), table.get(), false, DeleteReason::kSlotFlush);
         ++del_count;
       }
       ++it;
@@ -1039,6 +1118,13 @@ void DbSlice::FlushSlotsFb(const cluster::SlotSet& slot_ids, uint64_t next_versi
   do {
     PrimeTable::Cursor next = pt->TraverseBuckets(cursor, iterate_bucket);
     cursor = next;
+
+    // drakeydb: Phase 4 -- per bucket-batch, before the yield point below: this fiber has no
+    // Transaction epoch of its own, so nothing must carry stray armed state across a preemption.
+    // See server/mvcc.h.
+    if (mvcc_enabled_)
+      MvccStamper::tlocal()->EndOfWriteEpoch();
+
     ThisFiber::Yield();
 
     // Del above only marks the watchers of a deleted stream as awakened; normally the deleting
@@ -1096,9 +1182,10 @@ void DbSlice::FlushSlots(const cluster::SlotRanges& slot_ranges) {
         SlotId sid = KeySlot(key);
         if (shared_slots->Contains(sid) && it.GetVersion() < next_version) {
           DbContext cntx;
+          cntx.ns = ns_;
           cntx.time_now_ms = GetCurrentTimeMs();
           cntx.db_index = db_index;
-          Del(cntx, Iterator::FromPrime(it), table.get());
+          Del(cntx, Iterator::FromPrime(it), table.get(), false, DeleteReason::kSlotFlush);
         }
         ++it;
       }
@@ -1263,6 +1350,78 @@ uint32_t DbSlice::GetMCFlag(DbIndex db_ind, const PrimeKey& key) const {
   return it->second;
 }
 
+void DbSlice::SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stamp) {
+  string scratch;
+  SetMvcc(db_ind, key.GetSlice(&scratch), stamp);
+}
+
+// Callers such as the RDB loader already hold a plain string_view. Routing it through the
+// PrimeKey overload above would allocate for some encoded keys, copy it back into a scratch
+// string, and then re-encode it inside Dash. This overload skips that round-trip; the PrimeKey
+// overload remains for callers that already have one on hand.
+void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return;
+  auto [it, inserted] = db.mvcc->Insert(key, stamp);
+  it->second = stamp;
+  if (inserted)
+    ++db.stats.mvcc_entries;
+}
+
+void DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return;
+
+  bool inserted = db.mvcc->Insert(key, MvccStamp{}).second;
+  if (inserted)
+    ++db.stats.mvcc_entries;
+}
+
+void DbSlice::SetExistingMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
+  auto& db = *db_arr_[db_ind];
+  CHECK(db.mvcc != nullptr);
+  auto it = db.mvcc->Find(key);
+  CHECK(!it.is_done()) << "MVCC slot must be prepared before journal commit: db=" << db_ind
+                       << " key=" << key;
+  it->second = stamp;
+}
+
+optional<MvccStamp> DbSlice::GetMvcc(DbIndex db_ind, string_view key) const {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return nullopt;
+  auto it = db.mvcc->Find(key);
+  if (it.is_done())
+    return nullopt;
+  return it->second;
+}
+
+void DbSlice::EraseMvcc(DbIndex db_ind, const PrimeKey& key) {
+  string scratch;
+  EraseMvcc(db_ind, key.GetSlice(&scratch));
+}
+
+// drakeydb: Phase 4, P4-1 Task 8 -- same F4 split as SetMvcc's string_view overload above: this
+// skips the PrimeKey overload's GetSlice() scratch-copy, which CompactObj::GetSlice
+// (compact_object.cc) can allocate for encoded/small-tag/int-tag keys (fix round 3, R7: INT_TAG
+// added here too, alongside rdb_load.cc's sibling comment on Step 3b's SetMvcc call -- reachable
+// for a 17-20 char numeric key over CompactObj::kInlineLen == 16, not just the encoded/SMALL_TAG
+// cases this comment used to name alone). PerformDeletionAtomic (db_slice.cc) is the motivating
+// caller -- it already holds a free string_view, del_it.key(), one line above its EraseMvcc call
+// (in the Disarm() call), so there was never a reason to pay for a PrimeKey round-trip there.
+// Find() takes a string_view directly, exactly like GetMvcc above already does.
+void DbSlice::EraseMvcc(DbIndex db_ind, string_view key) {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return;
+  if (auto it = db.mvcc->Find(key); it != db.mvcc->end()) {
+    db.mvcc->Erase(it);
+    --db.stats.mvcc_entries;
+  }
+}
+
 OpResult<DbSlice::ItAndUpdater> DbSlice::AddNew(const Context& cntx, string_view key,
                                                 PrimeValue obj, uint64_t expire_at_ms) {
   auto op_result = AddOrUpdateInternal(cntx, key, std::move(obj), expire_at_ms, false);
@@ -1357,7 +1516,7 @@ OpResult<int64_t> DbSlice::UpdateExpire(const Context& cntx, Iterator prime_it,
   // If we update and the new value is already expired, delete the key
   // Already-expired new value: delete; the caller emits the expired event after journaling.
   if (rel_msec <= 0) {
-    Del(cntx, prime_it);
+    Del(cntx, prime_it, nullptr, false, DeleteReason::kExpired);
     ++events_.expired_keys;
     db_arr_[cntx.db_index]->stats.events.expired_keys++;
     return -1;
@@ -1489,7 +1648,7 @@ void DbSlice::PreUpdateBlocking(DbIndex db_ind, const Iterator& it) {
   inner_it.SetVersion(NextVersion());
 }
 
-void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key) {
+void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key, bool arm_mvcc) {
   // A blocked reader may watch this key expecting a different type, e.g. XREADGROUP when the
   // stream is overwritten by BITOP/RENAME/SUNIONSTORE. Let the readiness check re-evaluate it.
   if (auto* bc = ns_->GetBlockingController(owner_->shard_id());
@@ -1518,6 +1677,23 @@ void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key) {
   if (!client_tracking_map_.empty()) {
     QueueInvalidationTrackingMessageAtomic(key);
   }
+
+  // drakeydb: Phase 4 -- arm this key. journal::RecordEntry commits the entry's stamp to every
+  // armed key; the end of the shard callback discards whatever is still armed. That is what
+  // enforces "a key's stamp advances iff that same stamp is propagated". See server/mvcc.h.
+  //
+  // Non-default ACL namespaces are local-only: the journal wire has no namespace identity, so
+  // Transaction::LogJournalOnShard and the DbContext delete helpers reject them before emission.
+  // They must not arm here either; no COMMAND entry could commit that arm, so epoch end would
+  // merely discard it and inflate mvcc_unstamped_writes.
+  DCHECK(ns_ != nullptr);
+  if (arm_mvcc && mvcc_enabled_ && ns_ == &namespaces->GetDefaultNamespace()) {
+    // Prepare the side-table slot before Arm makes this key eligible for RecordEntry's
+    // post-journal Commit. SetExistingMvcc can then update it without allocating after the entry
+    // has already been accepted and exposed to consumers.
+    EnsureMvcc(db_ind, key);
+    MvccStamper::tlocal()->Arm(db_ind, key);
+  }
 }
 
 DbSlice::Iterator DbSlice::ExpireIfNeeded(const Context& cntx, Iterator it) const {
@@ -1545,7 +1721,7 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
 
   // Replicate expiry
   if (auto journal = owner_->journal(); journal && journal_expiry) {
-    RecordExpiryBlocking(cntx.db_index, key);
+    RecordExpiryBlocking(cntx, key);
   }
 
   auto& db = db_arr_[cntx.db_index];
@@ -1560,7 +1736,8 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
   }
 
   // Route through Del so that expiry runs the same per-type hooks as an explicit DEL.
-  const_cast<DbSlice*>(this)->Del(cntx, Iterator(it, StringOrView::FromView(key)), db.get());
+  const_cast<DbSlice*>(this)->Del(cntx, Iterator(it, StringOrView::FromView(key)), db.get(), false,
+                                  DeleteReason::kExpired);
 
   ++events_.expired_keys;
   db->stats.events.expired_keys++;
@@ -1585,7 +1762,7 @@ void DbSlice::ExpireAllIfNeeded() {
 
       auto cb = [&](PrimeTable::iterator prime_it) {
         if (prime_it->first.HasExpire()) {
-          ExpireIfNeeded(Context{nullptr, db_index, GetCurrentTimeMs()}, prime_it,
+          ExpireIfNeeded(Context{ns_, db_index, GetCurrentTimeMs()}, prime_it,
                          &per_db_events[db_index]);
         }
       };
@@ -1596,6 +1773,16 @@ void DbSlice::ExpireAllIfNeeded() {
       } while (cursor);
     }
   }
+
+  // drakeydb: Phase 4 -- non-transactional sweep path; ends its own epoch since it never goes
+  // through Transaction::RunCallback. See server/mvcc.h.
+  //
+  // drakeydb: Phase 4, review fix round 1 (minor) -- moved ahead of the SendMessages loop below,
+  // which can preempt (channel_store->SendMessages), matching FlushSlotsFb's placement ahead of
+  // its own yield point. Wrong-side-of-a-preemption-point was benign today (nothing armed here
+  // still survives to be seen), but it is the wrong invariant to leave standing.
+  if (mvcc_enabled_)
+    MvccStamper::tlocal()->EndOfWriteEpoch();
 
   for (DbIndex i = 0; i < per_db_events.size(); ++i) {
     if (per_db_events[i].empty())
@@ -1979,6 +2166,11 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count, DeleteExpir
     }
   }
 
+  // drakeydb: Phase 4 -- non-transactional sweep path; ends its own epoch since it never goes
+  // through Transaction::RunCallback. See server/mvcc.h.
+  if (mvcc_enabled_)
+    MvccStamper::tlocal()->EndOfWriteEpoch();
+
   return result;
 }
 
@@ -1988,7 +2180,7 @@ void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterat
   // family helpers: their OnChange callback can preempt inside the heartbeat's atomic section.
   if (owner_->journal() && journal_deletion)
     RecordDerivedDelete(cntx, key);
-  Del(cntx, it, db_arr_[cntx.db_index].get());
+  Del(cntx, it, db_arr_[cntx.db_index].get(), false, DeleteReason::kExpired);
 }
 
 int32_t DbSlice::GetNextSegmentForEviction(int32_t segment_id, DbIndex db_ind) const {
@@ -2010,12 +2202,20 @@ pair<uint64_t, size_t> DbSlice::FreeMemWithEvictionStepAtomic(DbIndex db_ind, co
 
   if (owner_->tiered_storage()) {
     evicted_bytes = owner_->tiered_storage()->ReclaimMemory(increase_goal_bytes);
-    if (evicted_bytes >= increase_goal_bytes)
+    if (evicted_bytes >= increase_goal_bytes) {
+      // drakeydb: Phase 4 -- non-transactional sweep path; ends its own epoch at every exit since
+      // it never goes through Transaction::RunCallback. See server/mvcc.h.
+      if (mvcc_enabled_)
+        MvccStamper::tlocal()->EndOfWriteEpoch();
       return {0, evicted_bytes};
+    }
   }
 
-  if ((!IsCacheMode()) || !expire_allowed_)
+  if ((!IsCacheMode()) || !expire_allowed_) {
+    if (mvcc_enabled_)
+      MvccStamper::tlocal()->EndOfWriteEpoch();
     return {0, 0};
+  }
 
   auto max_eviction_per_hb = GetFlag(FLAGS_max_eviction_per_heartbeat);
   auto max_segment_to_consider = GetFlag(FLAGS_max_segment_to_consider);
@@ -2062,7 +2262,8 @@ pair<uint64_t, size_t> DbSlice::FreeMemWithEvictionStepAtomic(DbIndex db_ind, co
         evicted_bytes += evict_it->first.MallocUsed() + evict_it->second.MallocUsed();
         ++evicted_items;
 
-        Del(cntx, Iterator(evict_it, StringOrView::FromView(key)));
+        Del(cntx, Iterator(evict_it, StringOrView::FromView(key)), nullptr, false,
+            DeleteReason::kEvicted);
 
         // returns when whichever condition is met first
         if ((evicted_items == max_eviction_per_hb) || (evicted_bytes >= increase_goal_bytes))
@@ -2076,7 +2277,7 @@ finish:
   for (string_view key : keys_to_journal) {
     if (auto journal = owner_->journal(); journal)
       // Won't block because we disabled journal flushing. See first line of this function.
-      RecordExpiryBlocking(db_ind, key);
+      RecordExpiryBlocking(cntx, key);
 
     if (expired_keys_events_recording_ && key_events)
       key_events->emplace_back(key);
@@ -2089,6 +2290,12 @@ finish:
   events_.evicted_keys += evicted_items;
   db_arr_[db_ind]->stats.events.evicted_keys += evicted_items;
   DVLOG(2) << "Eviction time (us): " << (time_finish - time_start) / 1000;
+
+  // drakeydb: Phase 4 -- non-transactional sweep path; ends its own epoch since it never goes
+  // through Transaction::RunCallback. See server/mvcc.h.
+  if (mvcc_enabled_)
+    MvccStamper::tlocal()->EndOfWriteEpoch();
+
   return pair<uint64_t, size_t>{evicted_items, evicted_bytes};
 }
 
@@ -2362,9 +2569,44 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
       pt.TryRelocateSegment(segment->first);
   } while (cursor && !page_usage->QuotaDepleted());
   db_table->segment_defrag_cursor = cursor;
+
+  // drakeydb: Phase 4, P4-1 Task 10 -- mirrors the prime-table loop above for DbTable::mvcc.
+  // Nothing else relocates the side table's segments, so without this mirror it accumulates
+  // mimalloc fragmentation for the process's lifetime (the per-object defrag in engine_shard.cc
+  // does not help -- it relocates a PrimeValue's heap, and the side table holds its own key
+  // copy). Absent on a non-active node. Shares page_usage's quota with the prime loop above
+  // (deliberately -- one call, one total defrag budget, regardless of which table it spends it
+  // on), so this loop may do nothing if the prime loop above already exhausted it.
+  if (!db_table->mvcc)
+    return;
+
+  auto& mt = *db_table->mvcc;
+  detail::DashCursor mvcc_cursor = db_table->mvcc_defrag_cursor;
+  do {
+    // Same non-yield requirement as the prime loop above -- see that comment.
+    FiberAtomicGuard g;
+    const auto [next, segment] = mt.VisitSegment(mvcc_cursor);
+    mvcc_cursor = next;
+    if (segment && page_usage->IsPageForObjectUnderUtilized(segment->second))
+      mt.TryRelocateSegment(segment->first);
+  } while (mvcc_cursor && !page_usage->QuotaDepleted());
+  db_table->mvcc_defrag_cursor = mvcc_cursor;
 }
 
-void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async) {
+// drakeydb: Phase 4, P4-1 Task 8 -- `reason` is threaded through Del/PerformDeletionAtomic and
+// every non-default call site already passes its real reason (see the DeleteReason comment,
+// db_slice.h), but P4-1 does not yet branch on it below: every reason erases the stamp, full
+// stop -- tombstones are P4-5's job. Landing the parameter now, unused, means P4-5 adds its
+// kExplicit/kExpired-vs-kEvicted/kSlotFlush branch without having to touch these same call sites
+// a second time. [[maybe_unused]] is not load-bearing for the build here -- confirmed by
+// compiling this translation unit both with and without it (task-8-report.md): the project
+// disables -Wunused-parameter project-wide (helio/cmake/internal.cmake's unconditional
+// `-Wno-unused-parameter`, positioned after `-Wextra` on the actual compile_commands.json command
+// line for this file, so it wins), and this build has no active -Werror regardless. Kept anyway
+// for the same self-documenting reason rdb_save.cc's CollectSearchIndices uses it -- flags an
+// intentionally-unused parameter to a reader -- not to satisfy the compiler.
+void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async,
+                                    [[maybe_unused]] DeleteReason reason) {
   FiberAtomicGuard guard;
   size_t table_before = table->table_memory();
 
@@ -2373,6 +2615,22 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
       LOG(DFATAL) << "Internal error, inconsistent state, mcflag should be present but not found "
                   << del_it->first.ToString();
     }
+  }
+
+  // drakeydb: Phase 4. Disarm first: OpDelV2 arms the key via post_updater.Run() before calling
+  // Del and journals afterwards, so without this the DEL's own Commit would re-stamp a key that
+  // no longer exists. The mvcc table is dense, so unlike mcflag there is no HasFlag()-style bit
+  // to skip the probe. That probe is not always useful: mvcc_enabled_ is DbSlice-wide (set once
+  // from IsActiveReplica(), db_slice.cc), not per-namespace, so this runs for every namespace's
+  // delete -- but PostUpdate's F1 gate (this file) only ever arms a default-namespace key. A
+  // non-default-namespace key therefore never has an entry here, and both calls below are a
+  // guaranteed miss for it. There is no cheaper test available at this point: mvcc_enabled_
+  // carries no namespace, and the armed-key state lives only in the namespace-blind, thread-local
+  // MvccStamper, not on the key itself. del_it.key() is the iterator's already-laundered
+  // string_view (StringOrView) -- free, unlike the PrimeKey overloads' GetSlice() scratch-copy.
+  if (mvcc_enabled_) {
+    MvccStamper::tlocal()->Disarm(table->index, del_it.key());
+    EraseMvcc(table->index, del_it.key());
   }
 
   DbTableStats& stats = table->stats;
@@ -2478,6 +2736,35 @@ void DbSlice::OnCbFinishBlocking() {
     }
   }
 
+#ifndef NDEBUG
+  // drakeydb: Phase 4, P4-1 Task 10 -- cheap O(1) dense invariant: the mvcc side table must hold
+  // exactly one entry per live prime key (TEST_VerifyMvccTable, above in this file, is the O(size)
+  // from-scratch proof this is derived from -- falsify by commenting out EraseMvcc in
+  // PerformDeletionAtomic, below in this file; see task-10-report.md for the observed failure).
+  // mvcc_tombstones stays 0 until P4-5 gives kExplicit/kExpired deletes a tombstone instead of an
+  // erase.
+  //
+  // PostUpdate now prepares a zero-authority side-table slot before arming a key, so density is
+  // already established in the arm-before-journal window. The journal commit later changes only
+  // that slot's value and cannot affect this size invariant.
+  //
+  // Scoped to the default namespace for the same reason PostUpdate's F1 gate is (see that
+  // comment, above in this file): DbTable::mvcc is allocated per-shard from the global
+  // IsActiveReplica() flag (DbTable::DbTable, table.cc), not per-namespace, so a non-default
+  // namespace has a populated prime table but a permanently empty, never-armed mvcc table --
+  // reachable by any ACL-namespaced client via acl_family.cc's NAMESPACE: directive. Without this
+  // scope, that client's very first write would trip the DCHECK below. This is a property of
+  // where writes get armed, not a leak -- do not "fix" it by removing the scope; see
+  // TEST_VerifyMvccTable for the identical guard, with the longer version of this comment.
+  if (mvcc_enabled_ && ns_ == &namespaces->GetDefaultNamespace()) {
+    for (const auto& dbp : db_arr_) {
+      if (!dbp || !dbp->mvcc)
+        continue;
+      DCHECK_EQ(dbp->mvcc->size() - dbp->stats.mvcc_tombstones, dbp->prime.size());
+    }
+  }
+#endif
+
   // Sends only if !pending_send_map_.empty()
   SendQueuedInvalidationMessages();
 }
@@ -2499,6 +2786,11 @@ void DbSlice::CallChangeCallbacks(DbIndex id, const ChangeReq& cr) const {
 // 4. the snapshot did not reach the bucket yet
 bool DbSlice::IsOmittableWrite(const Context& cntx, const ChangeReq& req) {
   if (!journal_omit_redundant_writes_)
+    return false;
+
+  // drakeydb: Phase 4 -- an omitted write arms but never commits, leaving the key unstamped.
+  // The optimisation only fires during a single full sync anyway, so active mode forgoes it.
+  if (mvcc_enabled_)
     return false;
 
   bool omit_update = false;

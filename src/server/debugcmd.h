@@ -50,6 +50,7 @@ class DebugCmd {
 
   void Exec(CommandContext* cmd_cntx);
   void Inspect(std::string_view key, facade::CmdArgParser parser, CommandContext* cmd_cntx);
+  void Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx);
   void Watched(CommandContext* cmd_cntx);
   void TxAnalysis(CommandContext* cmd_cntx);
   void ObjHist(CommandContext* cmd_cntx);

@@ -19,6 +19,15 @@ namespace dfly {
 using namespace std;
 using Payload = journal::Entry::Payload;
 
+namespace {
+
+bool IsDefaultNamespace(const DbContext& db_cntx) {
+  DCHECK(db_cntx.ns != nullptr);
+  return db_cntx.ns == &namespaces->GetDefaultNamespace();
+}
+
+}  // namespace
+
 unsigned KeyIndex::operator*() const {
   if (bonus)
     return *bonus;
@@ -70,23 +79,72 @@ void RecordDelete(DbIndex dbid, string_view key) {
 }
 
 void RecordDelete(const DbContext& db_cntx, string_view key) {
-  // drakeydb: Phase 3 -- see the declaration in tx_base.h. origin_idx is the only non-default
-  // journal::RecordEntry arg passed here; entry_flags stays 0 (this is never an expiry DEL).
+  if (!IsDefaultNamespace(db_cntx))
+    return;
+
+  // drakeydb: Phase 3 -- see the declaration in tx_base.h. origin_idx is one of two non-default
+  // journal::RecordEntry args passed here; entry_flags stays 0 (this is never an expiry DEL).
+  //
+  // drakeydb: Phase 4, review wave 2 (F2, IMPORTANT) -- also forward db_cntx.repl_mvcc, added in
+  // Task 6 for exactly this purpose (see its comment, tx_base.h) but left unread until now. A
+  // self-originated derived DEL has repl_mvcc == 0, so journal::RecordEntry's "caller supplied no
+  // stamp" test (entry.mvcc == 0, journal.cc) is unaffected and this call keeps minting a fresh
+  // local HopStamp exactly as before. On an applier, though, repl_mvcc carries the author's own
+  // verbatim stamp (Transaction::GetDbContext(), threaded from JournalExecutor::SetApplyMvcc via
+  // SetReplOrigin) -- without forwarding it here, this DEL minted a LOCAL stamp instead, so two
+  // peers applying the same replicated command that derives this same DEL diverged onto two
+  // different stamps for the same key ({H_A, hash(A)} vs {H_B, hash(A)}) instead of converging on
+  // one.
   journal::RecordEntry(0, journal::Op::COMMAND, db_cntx.db_index, KeySlot(key),
-                       Payload("DEL", ArgSlice{key}), db_cntx.repl_origin_idx);
+                       Payload("DEL", ArgSlice{key}), db_cntx.repl_origin_idx, db_cntx.repl_mvcc);
 }
 
 void RecordDerivedDelete(const DbContext& db_cntx, string_view key) {
+  if (!IsDefaultNamespace(db_cntx))
+    return;
+
+  // drakeydb: Phase 4, review wave 2 (F2, IMPORTANT) -- db_cntx.repl_mvcc, not a hardcoded 0; see
+  // RecordDelete's comment above for the full argument (identical here, modulo kEntryFlagDerived).
   journal::RecordEntry(0, journal::Op::COMMAND, db_cntx.db_index, KeySlot(key),
-                       Payload("DEL", ArgSlice{key}), db_cntx.repl_origin_idx,
-                       /* mvcc= */ 0, journal::kEntryFlagDerived);
+                       Payload("DEL", ArgSlice{key}), db_cntx.repl_origin_idx, db_cntx.repl_mvcc,
+                       journal::kEntryFlagDerived);
 }
 
-void RecordExpiryBlocking(DbIndex dbid, string_view key) {
+void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
+  if (!IsDefaultNamespace(db_cntx))
+    return;
+
   // drakeydb: Phase 3 -- see the declaration in tx_base.h. origin_idx stays default (0 ==
   // kSelfIdx; an expiry is always a local decision); entry_flags carries kEntryFlagExpired.
-  journal::RecordEntry(0, journal::Op::COMMAND, dbid, KeySlot(key), Payload("DEL", ArgSlice{key}),
-                       /* origin_idx= */ 0, /* mvcc= */ 0, journal::kEntryFlagExpired);
+  //
+  // drakeydb: Phase 4, review wave 2 (F4, IMPORTANT) -- mvcc is now db_cntx.repl_mvcc, not a
+  // hardcoded 0, but origin_idx deliberately stays kSelfIdx -- these two, unlike RecordDelete/
+  // RecordDerivedDelete above, are NOT symmetric here, and that asymmetry is load-bearing, not an
+  // oversight:
+  //
+  // The bug: MvccStamper::Commit(mvcc, origin_idx, fn) (mvcc.cc) stamps EVERY currently-armed
+  // key with the SAME stamp, not just the key this call's own payload names. A whole-key lazy
+  // expiry firing mid-callback (ExpireIfNeeded, this file) while an applier is still processing
+  // an earlier key of the SAME replicated multi-key command (e.g. MSET arms key-by-key via
+  // AddOrFind -> FindInternal -> ExpireIfNeeded, string_family.cc) sweeps that earlier,
+  // already-armed sibling key into THIS entry's Commit() call, permanently consuming its arm
+  // before the MSET's own trailing RecordJournal ever gets a chance to stamp it correctly. Before
+  // this fix, that sibling key was left stamped with a freshly LOCAL HopStamp (the applier's own
+  // "now") instead of the replicated command's real author stamp.
+  //
+  // Threading db_cntx.repl_mvcc through closes the numeric-ordering half of this: the sibling key
+  // now gets the AUTHOR's real mvcc, which is what operator< compares first (MvccStamp::Mvcc()),
+  // so this is what actually protects LWW ordering for that key in the overwhelmingly common
+  // case.
+  //
+  // origin_idx is kept self-originated because this node's clock made the expiry decision and the
+  // resulting DEL must not be echoed to peers. The transient stamp_origin_idx is separate: when
+  // this expiry fires while an applier is still processing a replicated multi-key command,
+  // Commit() may sweep sibling arms into this entry. Those siblings must retain the command
+  // author's origin hash as well as its mvcc, or an exact-MVCC tie can diverge on LWW ordering.
+  journal::RecordEntry(0, journal::Op::COMMAND, db_cntx.db_index, KeySlot(key),
+                       Payload("DEL", ArgSlice{key}), /* origin_idx= */ 0, db_cntx.repl_mvcc,
+                       journal::kEntryFlagExpired, db_cntx.repl_origin_idx);
 }
 
 LockTag::LockTag(std::string_view key) {

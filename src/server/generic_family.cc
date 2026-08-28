@@ -567,6 +567,27 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
     bc->Awaken(t->GetDbIndex(), dest_key_);
   }
 
+  // drakeydb: Phase 4, P4-1 Task 8 fix round 1 (F1) -- arm dest_key_ before it is journaled.
+  // add_res->post_updater is an AutoUpdater; left to its own destructor, it would not run until
+  // add_res goes out of scope at this function's closing brace, which is AFTER RecordJournal
+  // below. journal::RecordEntry's commit runs synchronously inside RecordJournal, against
+  // whatever is armed at that instant -- so without this explicit Run(), the commit sees an
+  // empty (or unrelated) arm list, and dest_key_ is never stamped, permanently, even though its
+  // RESTORE was propagated. That is the exact "propagated but not stamped" violation Task 7's
+  // central invariant forbids in the other direction. hset_family.cc's OpHExpire (:731) already
+  // runs its own post_updater.Run() before an explicit RecordJournal for the same reason,
+  // documented there as "Journaling below may yield; disarm the updater so no dash iterator
+  // survives the yield" -- mirroring that established pattern here, not inventing a new one.
+  // Also affects COPY, not just cross-shard RENAME: GenericFamily::Copy always constructs its
+  // Renamer with do_copy=true, and FinalizeRename routes to DeserializeDest for the destination
+  // shard unconditionally in that case (the `!do_copy_ && shard_id == src_sid_` branch above is
+  // never taken), so every COPY -- same-shard or cross-shard -- goes through this function and
+  // was affected. Safe: nothing below this point reads or mutates add_res->it, so running the
+  // updater now costs nothing and changes no other behavior (memory accounting and
+  // member_expire_count bookkeeping simply happen here instead of at the implicit destructor
+  // call a few lines later).
+  add_res->post_updater.Run();
+
   if (shard->journal()) {
     auto expire_str = absl::StrCat(serialized_value_->expire_ts);
 

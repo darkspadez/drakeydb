@@ -267,6 +267,16 @@ class Replica : ProtocolClient {
   // pulling that header into this one just for a constant.
   uint32_t peer_origin_idx_ = 0;
 
+  // drakeydb: Phase 4 -- the AUTHOR's hash, threaded to each DflyShardReplica (InitiateDflySync)
+  // the same way peer_origin_idx_ above is, and registered there with MvccStamper so an applied
+  // write's origin_idx resolves back to this hash. It cannot come from the wire:
+  // journal::PassesPeerEchoFilter (journal/types.cc) forwards only self-origin entries, so every
+  // COMMAND arriving on a peer link carries origin_idx == 0 (the sender's own kSelfIdx), not an
+  // index PeerRegistry could resolve to the true author. Under no-forward v1 the sender IS the
+  // author on the streaming path, so the link's own uuid is the correct source. Stays at its
+  // default for a non-peer Replica, matching peer_origin_idx_'s own convention.
+  uint64_t peer_origin_hash_ = 0;
+
   // drakeydb: P4-0 -- signed skew (peer - local, ms) computed in Greet() from
   // master_context_.master_clock_ms right after the handshake sets it; see ComputeClockSkewMs
   // (multi_master.h). Atomic: read from the INFO fiber via GetSummary(), written from the
@@ -288,6 +298,14 @@ class DflyShardReplica : public ProtocolClient {
   // on journal_rec_executed_, the same way DflyShardReplicaOriginTest above drives origin_idx.
   friend class DflyShardReplicaPeerModeTest;
 
+  // drakeydb: Phase 4 Task 9, fix round (F1) -- lets MvccStoreTest (multi_master_test.cc)
+  // construct a flow directly (no socket) the same way DflyShardReplicaOriginTest above does, to
+  // exercise ExecuteTx's real, per-shard application of an author's mvcc/origin_hash on a
+  // multi-shard configuration. Needed even though ExecuteTx itself is public: ServerContext is
+  // inherited from ProtocolClient::ServerContext, which is protected there, so only a subclass or
+  // friend can name it to build the constructor's first argument.
+  friend class MvccStoreTest;
+
  public:
   // `origin_idx`: this flow's PeerRegistry origin index (Replica::Greet() obtains it from
   // PeerRegistry::AddOrGet()); PeerRegistry::kSelfIdx (0) for a non-peer flow. Threaded straight
@@ -304,6 +322,17 @@ class DflyShardReplica : public ProtocolClient {
   // (see peer_mode_ below) rather than forwarded once and forgotten: it is consulted repeatedly,
   // later, by StableSyncDflyReadFb, both to select TransactionReader's adopt-vs-compare behavior
   // for Op::LSN and to gate AdoptAuthoritativeLsn().
+  // drakeydb: Phase 4, fix round (F1v2) -- this constructor deliberately does NOT also take or
+  // register the flow's author hash (Replica::peer_origin_hash_). An earlier version threaded a
+  // trailing `origin_hash` parameter through here and registered it with MvccStamper at
+  // construction; that crashed (SIGSEGV, reproduced 5/10 runs of
+  // test_active_replica_single_peer_replaces, multimaster_test.py) because it was the first
+  // yield point ever introduced into this constructor -- every other member here does pure,
+  // non-blocking initialization -- and this constructor runs inside InitiateDflySync's tight
+  // per-flow loop, where a new yield point let a concurrent peer-replacement teardown interleave
+  // in ways the original code never had to handle. See task-9-report.md and the registration's
+  // new home, Replica::InitiateDflySync's shard_cb, for the full account and why that point is
+  // safe where this one was not.
   DflyShardReplica(ServerContext server_context, MasterContext master_context, uint32_t flow_id,
                    Service* service, std::shared_ptr<MultiShardExecution> multi_shard_exe,
                    class RdbLoadContext* load_context, uint32_t origin_idx, bool peer_mode);

@@ -51,6 +51,11 @@ struct TransactionData {
 
   journal::Op opcode;
   uint64_t lsn = 0;
+
+  // drakeydb: Phase 4 -- the author's stamp, so the applier stores it verbatim rather than
+  // minting a local one. Dropped before P4; see AddEntry.
+  uint64_t mvcc = 0;
+  uint8_t entry_flags = 0;
 };
 
 // Utility for reading TransactionData from a journal reader.

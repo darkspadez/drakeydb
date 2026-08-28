@@ -3003,6 +3003,10 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
     }
 
     DVLOG(2) << "Executing item: " << entry.ToString();
+    // drakeydb: Phase 4 -- per-entry, mirroring SetApplyOrigin's one-time-per-loader call above:
+    // the author's stamp so this apply path also stores it verbatim (see
+    // JournalExecutor::SetApplyMvcc's doc comment).
+    journal_executor_->SetApplyMvcc(entry.mvcc);
     journal_executor_->Execute(entry.dbid, entry.cmd);
   }
 
@@ -3270,10 +3274,37 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     db_slice->SetMCFlag(db_cntx.db_index, updater.it->first, item->mc_flags);
   }
 
+  // drakeydb: Phase 4, P4-1 Task 10 -- an unversioned snapshot carries no stamp, and D-7 specifies
+  // {0,0} as its fallback: it never fabricates authority the snapshot does not contain, and any
+  // stamped resident value beats it on merge. P4-2 overwrites this with the persisted stamp when
+  // the RDB_OPCODE_DF_MVCC record is present. Unconditional (unlike the mc_flags mirror above):
+  // every loaded key needs an entry for the mvcc table to stay dense, not just ones with a flag.
+  //
+  // drakeydb: fix round 1 (F5) -- the string_view overload, with item->key (already a stable
+  // std::string on this const Item*, no copy), not the PrimeKey overload used above for
+  // SetMCFlag. The PrimeKey overload's own GetSlice(&scratch) call (db_slice.cc) can allocate for
+  // a key over CompactObj::kInlineLen -- true for the encoding_, SMALL_TAG, and INT_TAG cases
+  // (CompactObj::GetSlice, compact_object.cc -- INT_TAG added in fix round 3, R7: reachable for a
+  // 17-20 char numeric key over kInlineLen == 16, missed in fix round 2's own correction of this
+  // comment), corrected in fix round 2 (R3) from this comment's original overstatement ("any
+  // key... unconditionally"): LARGE_STR_TAG and SDS_TTL_TAG return a view with no copy, so it is
+  // not every over-kInlineLen key, just some of them -- and on every node including non-active
+  // ones regardless of which case applies, since whatever allocation does happen is in the outer
+  // overload, before the inner overload's `if (!db.mvcc) return;` guard ever runs. The prior
+  // claim here ("costs one predictable branch") was true of the guard but not of the call as
+  // originally written, which paid for that outer round-trip -- allocating or not, depending on
+  // tag -- regardless of mvcc_enabled(). See task-10-report.md fix round 1.
+  db_slice->SetMvcc(db_cntx.db_index, item->key, MvccStamp{});
+
   if (!override_existing_keys_ && !updater.is_new) {
     LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind << " of type "
                  << updater.it->second.ObjType();
   }
+
+  // Loading is propagated by the snapshot, not a COMMAND journal entry. Finalize normal memory,
+  // expiry, watcher, and index bookkeeping without arming the thread-local journal epoch. The
+  // explicit {0,0} slot above is the load's complete P4-1 MVCC effect.
+  updater.post_updater.RunWithoutMvccArm();
 
   if (auto* ts = db_slice->shard_owner()->tiered_storage(); ts) {
     // Finalize the AutoUpdater before stashing. The stash callback may complete
@@ -3281,7 +3312,6 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     // changing MallocUsed(). If the AutoUpdater ran after that, it would compute a
     // bogus negative memory delta and crash in AccountObjectMemory.
     auto it = updater.it;
-    updater.post_updater.Run();
     StashPrimeValue(db_cntx.db_index, item->key, it->first, &it->second, ts, nullptr);
 
     // Block, if tiered storage is active, but can't keep up
@@ -3465,7 +3495,8 @@ io::Result<bool> RdbLoader::ReadAndDispatchObject(int object_type, std::string& 
 
   if (run_inlined) {
     const DbContext db_cntx{&namespaces->GetDefaultNamespace(), db_index, GetCurrentTimeMs()};
-    CreateObjectOnShard(db_cntx, item, &db_cntx.GetDbSlice(sid));
+    DbSlice& db_slice = db_cntx.GetDbSlice(sid);
+    CreateObjectOnShard(db_cntx, item, &db_slice);
   } else {
     auto& out_buf = shard_buf_[sid];
     out_buf.emplace_back(item);

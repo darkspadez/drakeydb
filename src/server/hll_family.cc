@@ -329,6 +329,15 @@ OpResult<int> PFMergeInternal(string_view key, Transaction* tx, SinkReplyBuilder
     }
     res.it->second.SetString(hll);
 
+    // drakeydb: Phase 4, P4-1 Task 8 fix round 2 (F3) -- arm before journaling. Without this,
+    // res.post_updater's implicit Run() (at scope exit, after RecordJournal below) arms this key
+    // too late for RecordJournal's synchronous MvccStamper::Commit to see it: PFMERGE is
+    // NO_AUTOJOURNAL (this file), so this is the only journal entry this write gets, and a
+    // propagated-but-unstamped key is exactly the invariant violation Task 7 forbids. Journaling
+    // below may also yield (hset_family.cc's OpHExpire documents the same hazard at :728-731) --
+    // running now, before that, also keeps res.it from surviving a yield with stale accounting.
+    res.post_updater.Run();
+
     if (op_args.shard->journal()) {
       RecordJournal(op_args, "SET", ArgSlice{key, hll});
     }

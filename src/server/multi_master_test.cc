@@ -4,12 +4,14 @@
 #include "server/multi_master.h"
 
 #include <absl/cleanup/cleanup.h>
+#include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <absl/strings/ascii.h>
 #include <absl/strings/str_cat.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -28,8 +30,11 @@
 #include "server/journal/executor.h"
 #include "server/journal/journal.h"
 #include "server/journal/serializer.h"
+#include "server/journal/tx_executor.h"
 #include "server/journal/types.h"
 #include "server/node_identity.h"
+#include "server/rdb_load.h"
+#include "server/replica.h"
 #include "server/server_family.h"
 #include "server/snapshot.h"
 #include "server/test_utils.h"
@@ -661,6 +666,14 @@ TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
   EXPECT_NE(std::string::npos, info.find("multi_master:1\r\n"));
   EXPECT_NE(std::string::npos, info.find("connected_masters:0\r\n"));
   EXPECT_EQ(std::string::npos, info.find("master_host:"));
+
+  // drakeydb: review wave 2 (F5, MINOR) -- the positive half of NonActiveInfoHasNoActiveFields
+  // below: these three must actually show up when active, or gating them behind IsActiveReplica()
+  // could vacuously hide them always instead of only outside --active_replica.
+  std::string mem_info{ToSV(Run({"info", "memory"}).GetBuf())};
+  EXPECT_NE(std::string::npos, mem_info.find("mvcc_table_bytes:"));
+  EXPECT_NE(std::string::npos, mem_info.find("mvcc_entries:"));
+  EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones:"));
 }
 
 TEST_F(ActiveReplicaFamilyTest, ReplicaOfGrammarAndNoPeersPaths) {
@@ -680,6 +693,1379 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
   EXPECT_EQ(std::string::npos, info.find("active_replica:"));
   EXPECT_EQ(std::string::npos, info.find("connected_masters:"));
+
+  // drakeydb: review wave 2 (F5, MINOR) -- server_family.cc used to append mvcc_table_bytes/
+  // mvcc_entries/mvcc_tombstones to INFO memory unconditionally; a non-active node emitted all
+  // three as 0, the only observable delta from upstream on this command (the journal wire itself
+  // was already byte-identical). Gated on IsActiveReplica(), matching mvcc_unstamped_writes/
+  // mvcc_clock_ahead_ms/mvcc_stale_epoch's existing gate in the "replication" section above.
+  //
+  // Falsifying: deleting the `if (IsActiveReplica())` guard around these three appends
+  // (server_family.cc) makes all three EXPECT_EQ below fail (found instead of npos).
+  std::string mem_info{ToSV(Run({"info", "memory"}).GetBuf())};
+  EXPECT_EQ(std::string::npos, mem_info.find("mvcc_table_bytes:"));
+  EXPECT_EQ(std::string::npos, mem_info.find("mvcc_entries:"));
+  EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones:"));
+}
+
+// drakeydb: P4-1 Task 5 -- the side table on DbTable. Storage only; nothing writes to it outside
+// these tests until Task 7. --active_replica is boot-only (DbTable reads it at construction), so
+// the flag must be set before BaseFamilyTest::SetUp() runs, not in the constructor/TearDown body.
+class MvccStoreTest : public BaseFamilyTest {
+ protected:
+  void SetUp() override {
+    // drakeydb: P4-1 Task 7's original comment here explained why this fixture used to need its
+    // own explicit journal::StartInThread() call (LogAutoJournalOnShard/RecordJournal gate on
+    // shard->journal(), off by default in tests): FLAGS_active_replica is set to true on the line
+    // below, BEFORE BaseFamilyTest::SetUp() (which calls ResetService() -> ServerFamily::Init()),
+    // so fix round 1's boot-time journal start (server_family.cc, gated on IsActiveReplica())
+    // already covers every write in this fixture -- removed in fix round 2 (R2), which also
+    // removed the identical redundancy from seven ReaperJournalFamilyTest tests in fix round 1
+    // (F4): a fixture-level explicit start left here would mask a regression of the production
+    // fix from all of this fixture's tests, the same masking F4 closed for the reaper tests.
+    absl::SetFlag(&FLAGS_active_replica, true);
+    BaseFamilyTest::SetUp();
+  }
+  void TearDown() override {
+    BaseFamilyTest::TearDown();
+    absl::SetFlag(&FLAGS_active_replica, false);
+  }
+
+  // drakeydb: P4-1 Task 7 -- shard-hops to read back the stamp arm/commit left (or didn't leave)
+  // on a key, the same way production code would via DbSlice::GetMvcc.
+  std::optional<MvccStamp> StampOf(std::string_view key) {
+    std::optional<MvccStamp> out;
+    shard_set->Await(Shard(key, shard_set->size()), [&] {
+      out = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, key);
+    });
+    return out;
+  }
+
+  // drakeydb: Phase 4 Task 9 -- drives a JournalExecutor exactly the way a peer link's applier
+  // does (SetApplyOrigin + SetApplyMvcc before Execute), tagging the command as authored by
+  // `origin_idx` with author stamp `mvcc`. There is no shared harness for this: the same
+  // SetApplyOrigin+Execute shape is inlined per-test at OriginJournalFamilyTest's
+  // ApplyOriginTagsJournalEntries (this file) -- copied here rather than reused, since that
+  // fixture pins num_shards=1 and never sets FLAGS_active_replica, unlike this one. Constructed
+  // and driven on shard 0's own proactor thread via LaunchFiber, not shard_set->Await: Execute()
+  // calls into Service::DispatchCommand, which needs ServerState::tlocal() to resolve on the
+  // calling thread, and shard_set->Await would run this directly on shard 0's own
+  // TxQueue-processing fiber, self-deadlocking the moment a dispatched command needs that same
+  // queue to schedule a hop.
+  facade::DispatchResult ApplyReplicatedCommand(std::vector<std::string> args, uint32_t origin_idx,
+                                                uint64_t mvcc) {
+    facade::DispatchResult dispatch_result = facade::DispatchResult::ERROR;
+    pp_->at(0)
+        ->LaunchFiber([&] {
+          JournalExecutor executor(service_.get());
+          executor.SetApplyOrigin(origin_idx);
+          executor.SetApplyMvcc(mvcc);
+
+          journal::ParsedEntry::CmdData cmd_data;
+          cmd_data.Assign(args.begin(), args.end(), args.size());
+          dispatch_result = executor.Execute(0, cmd_data);
+        })
+        .Join();
+    return dispatch_result;
+  }
+
+  // drakeydb: Phase 4 Task 9, fix round (F1v2) -- constructs a real DflyShardReplica directly, no
+  // socket, exactly mirroring Replica::InitiateDflySync's production construction call
+  // (replica.cc) -- then, for each shard, applies a SET to a key that hashes to that shard
+  // through the flow's real ExecuteTx, and returns the keys for the caller to check the
+  // resulting stamps (see below for why assertions live there, not here). Defined as a genuine
+  // member of this exact friended class (`friend class MvccStoreTest;`, replica.h), not inlined
+  // into a TEST_F body: gtest generates a TEST_F's body as a method of a *derived* class, and
+  // friendship is not inherited (same reasoning as DflyShardReplicaOriginTest in
+  // peer_replication_test.cc).
+  //
+  // The origin_idx -> origin_hash registration is done manually here via
+  // shard_set->pool()->AwaitBrief, the same shape AppliedWriteKeepsAuthorStampVerbatim above
+  // uses -- NOT via DflyShardReplica's constructor. An earlier version of this helper relied on
+  // the constructor to do that registration (mirroring what was, at the time, production
+  // behavior); that production behavior was reverted after it crashed the server (SIGSEGV,
+  // reproduced 5/10 runs of test_active_replica_single_peer_replaces) -- see
+  // DflyShardReplica's constructor and Replica::InitiateDflySync's shard_cb (both replica.cc) for
+  // the full account. The registration now happens in InitiateDflySync's shard_cb, which this
+  // test does not call (it constructs DflyShardReplica directly, bypassing Replica entirely, the
+  // same way DflyShardReplicaOriginTest does for origin_idx) -- so this helper reproduces the
+  // broadcast manually instead. That means this test no longer pins "does flow construction
+  // register the hash automatically" (nothing in this file's reach does, post-fix; that
+  // property now lives in InitiateDflySync, a private Replica method with no no-socket
+  // construction path); what it still genuinely proves is multi-shard correctness of the
+  // CONSUMING side -- ExecuteTx's real, per-shard application of an author's mvcc/origin_hash --
+  // which AppliedWriteKeepsAuthorStampVerbatim above does not cover, since that test only ever
+  // touches one key/shard.
+  //
+  // Construction AND every ExecuteTx call run inside one pp_->at(0)->LaunchFiber(...).Join(),
+  // matching ApplyReplicatedCommand above: Execute() calls into Service::DispatchCommand, which
+  // needs ServerState::tlocal() to resolve on the calling thread, and that's only ever
+  // initialized on the pool's own proactor threads -- confirmed the hard way, by first writing
+  // this without the wrapper and hitting a SIGSEGV in dfly::ServerState::gstate() (see
+  // task-9-report.md for the verbatim crash -- a different crash from the constructor one above,
+  // hit and fixed earlier in the same investigation).
+  //
+  // Assertions on the applied stamps are deliberately NOT inside the LaunchFiber lambda below:
+  // gtest's ASSERT_* macros expand to a bare `return`, which only unwinds the immediately
+  // enclosing function -- here, the lambda -- not ApplyOnePeerWriteToEveryShard itself, so an
+  // in-lambda ASSERT_* failure would silently skip the remaining shards in THIS loop while the
+  // caller carries on regardless, rather than actually stopping the test. Collecting keys here
+  // and asserting on the resulting stamps after .Join() (ordinary control flow, not a lambda)
+  // avoids that trap.
+  std::vector<std::string> ApplyOnePeerWriteToEveryShard(uint32_t origin_idx, uint64_t origin_hash,
+                                                         uint64_t author_mvcc) {
+    const unsigned num_shards = shard_set->size();
+    std::vector<std::string> keys(num_shards);
+    for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+      for (int i = 0;; ++i) {
+        CHECK_LT(i, 10000) << "could not find a key hashing to shard " << target_shard;
+        keys[target_shard] = absl::StrCat("k", i);
+        if (Shard(keys[target_shard], num_shards) == target_shard)
+          break;
+      }
+    }
+
+    shard_set->pool()->AwaitBrief([origin_idx, origin_hash](unsigned, auto*) {
+      MvccStamper::tlocal()->RegisterOriginHash(origin_idx, origin_hash);
+    });
+
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = num_shards;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    std::vector<bool> dispatch_ok(num_shards, false);
+    pp_->at(0)
+        ->LaunchFiber([&] {
+          DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                                &load_context, origin_idx, /*peer_mode=*/true);
+          for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+            TransactionData tx_data;
+            tx_data.dbid = 0;
+            tx_data.mvcc = author_mvcc;
+            std::vector<std::string> parts{"SET", keys[target_shard], "v"};
+            tx_data.command.Assign(parts.begin(), parts.end(), parts.size());
+
+            // A single-key SET is never IsGlobalCmd(), so this takes ExecuteTx's non-global
+            // path -- executor_->SetApplyMvcc(tx_data.mvcc); return executor_->Execute(...) --
+            // the same call this task wires in production (replica.cc, ExecuteTx's first
+            // branch). Fresh ExecutionState per call: IsRunning() must read true at entry, and
+            // nothing here ever cancels or errors it, so reusing one is equally valid; a fresh
+            // one just keeps each iteration visibly independent.
+            ExecutionState exec_st;
+            dispatch_ok[target_shard] = flow.ExecuteTx(std::move(tx_data), &exec_st);
+          }
+        })
+        .Join();
+
+    for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+      EXPECT_TRUE(dispatch_ok[target_shard]) << "ExecuteTx failed for key '" << keys[target_shard]
+                                             << "' (target shard " << target_shard << ")";
+    }
+    return keys;
+  }
+};
+
+TEST_F(MvccStoreTest, SideTableIsAllocatedInActiveMode) {
+  Run({"set", "k", "v"});
+  EXPECT_GT(GetMetrics().db_stats[0].mvcc_table_bytes, 0u)
+      << "active mode must allocate the side table";
+}
+
+TEST_F(MvccStoreTest, RoundTripsAStamp) {
+  Run({"set", "k", "v"});
+  auto& shard_set_ref = *shard_set;
+  const MvccStamp written{12345, 999};
+  shard_set_ref.Await(Shard("k", shard_set_ref.size()), [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    PrimeKey pk{"k"};
+    db_slice.SetMvcc(0, pk, written);
+  });
+
+  std::optional<MvccStamp> got;
+  shard_set_ref.Await(Shard("k", shard_set_ref.size()), [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "k");
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, written);
+}
+
+// drakeydb: P4-1 Task 5, fix round 1 -- EraseMvcc and mvcc_enabled() had no caller anywhere in
+// the tree (production or test), so a mutation to either -- e.g. EraseMvcc silently becoming a
+// no-op, or mvcc_enabled_ getting stuck false -- would go undetected. This closes both.
+TEST_F(MvccStoreTest, EraseRemovesTheStampAndDecrementsCount) {
+  Run({"set", "k", "v"});
+  auto& shard_set_ref = *shard_set;
+  const ShardId sid = Shard("k", shard_set_ref.size());
+  const MvccStamp written{777, 111};
+
+  shard_set_ref.Await(sid, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    ASSERT_TRUE(db_slice.mvcc_enabled());
+    PrimeKey pk{"k"};
+    db_slice.SetMvcc(0, pk, written);
+  });
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_entries, 1u);
+
+  std::optional<MvccStamp> got;
+  shard_set_ref.Await(
+      sid, [&] { got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "k"); });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, written);
+
+  shard_set_ref.Await(sid, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    PrimeKey pk{"k"};
+    db_slice.EraseMvcc(0, pk);
+  });
+
+  shard_set_ref.Await(
+      sid, [&] { got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "k"); });
+  EXPECT_FALSE(got.has_value()) << "EraseMvcc must remove the stamp";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u) << "EraseMvcc must decrement mvcc_entries";
+}
+
+// drakeydb: P4-1 Task 8 -- direct coverage for EraseMvcc's string_view overload. The test above
+// only ever exercises the PrimeKey overload; PerformDeletionAtomic's delete path (this task) now
+// calls the string_view one exclusively, to avoid a GetSlice() scratch-copy on every delete (see
+// db_slice.cc). A regression confined to that overload -- e.g. it silently no-ops, or looks up
+// the wrong bucket -- would still leave the PrimeKey-overload test above green.
+TEST_F(MvccStoreTest, EraseMvccStringViewOverloadRemovesTheStampAndDecrementsCount) {
+  Run({"set", "k", "v"});
+  auto& shard_set_ref = *shard_set;
+  const ShardId sid = Shard("k", shard_set_ref.size());
+  const MvccStamp written{777, 111};
+
+  shard_set_ref.Await(sid, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  written);
+  });
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_entries, 1u);
+
+  shard_set_ref.Await(sid, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(0, std::string_view{"k"});
+  });
+
+  std::optional<MvccStamp> got;
+  shard_set_ref.Await(
+      sid, [&] { got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "k"); });
+  EXPECT_FALSE(got.has_value()) << "EraseMvcc(string_view) must remove the stamp";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u)
+      << "EraseMvcc(string_view) must decrement mvcc_entries";
+}
+
+TEST_F(MvccStoreTest, AbsentKeyReturnsNullopt) {
+  std::optional<MvccStamp> got;
+  shard_set->Await(Shard("nope", shard_set->size()), [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "nope");
+  });
+  EXPECT_FALSE(got.has_value());
+}
+
+TEST_F(MvccStoreTest, FlushAllDropsTheSideTable) {
+  Run({"set", "k", "v"});
+  shard_set->Await(Shard("k", shard_set->size()), [&] {
+    PrimeKey pk{"k"};
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, pk, MvccStamp{1, 1});
+  });
+  // Falsification note (P4-1 Task 5): the brief's original body asserted only the post-flush
+  // count, which stays 0 whether or not SetMvcc ever wrote anything -- vacuous against a no-op
+  // SetMvcc. This pre-flush check closes that gap.
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_entries, 1u);
+  Run({"flushall"});
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u);
+  // Fix round 1: the counter alone doesn't pin the table itself -- FlushDbIndexes replaces the
+  // whole DbTable, which resets DbTableStats (and so mvcc_entries) regardless of whether the side
+  // table was actually dropped. Check the table directly too.
+  std::optional<MvccStamp> got;
+  shard_set->Await(Shard("k", shard_set->size()), [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, "k");
+  });
+  EXPECT_FALSE(got.has_value()) << "the side table itself, not just its counter, must be dropped";
+}
+
+// drakeydb: P4-1 Task 5, fix round 1 -- DbSlice::mvcc_table_memory() (unlike table_memory_, which
+// takes a live delta on every write, e.g. AddOrFind's `table_memory_ += table_increase;` at
+// db_slice.cc:946) is computed on demand from DbTable::mvcc_table_memory() rather than
+// accumulated, precisely so it cannot silently stop tracking real growth or underflow on flush.
+// This is the test that would have caught the original accumulator design being wrong: it
+// requires the value to actually move.
+TEST_F(MvccStoreTest, TableMemoryGrowsWithWritesAndDropsOnFlush) {
+  Run({"set", "k", "v"});
+  auto& shard_set_ref = *shard_set;
+  const ShardId sid = Shard("k", shard_set_ref.size());
+
+  size_t before = 0;
+  shard_set_ref.Await(sid, [&] {
+    before = namespaces->GetDefaultNamespace().GetCurrentDbSlice().mvcc_table_memory();
+  });
+
+  // Enough distinct keys to force the side table's DashTable past its initial single-segment
+  // capacity (kMaxSize = (56 + 4) * 14 = 840 slots) and actually grow, not just accept a write
+  // that fits in already-allocated space.
+  shard_set_ref.Await(sid, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < 2000; ++i) {
+      PrimeKey pk{absl::StrCat("mvcc-mem-", i)};
+      db_slice.SetMvcc(0, pk, MvccStamp{uint64_t(i) + 1, 1});
+    }
+  });
+
+  size_t after = 0;
+  shard_set_ref.Await(sid, [&] {
+    after = namespaces->GetDefaultNamespace().GetCurrentDbSlice().mvcc_table_memory();
+  });
+  EXPECT_GT(after, before) << "mvcc_table_memory() must grow as the side table fills";
+
+  Run({"flushall"});
+
+  size_t post_flush = 0;
+  shard_set_ref.Await(sid, [&] {
+    post_flush = namespaces->GetDefaultNamespace().GetCurrentDbSlice().mvcc_table_memory();
+  });
+  EXPECT_EQ(post_flush, before)
+      << "flush must drop the grown side table back to a freshly-allocated table's baseline";
+}
+
+// drakeydb: P4-1 Task 7 -- the landmine test. LPUSH is auto-journaled AND mutates in place, so it
+// never calls AddOrUpdate. It is the command that fails if EndOfWriteEpoch is placed at
+// transaction.cc's OnCbFinishBlocking call instead of after LogAutoJournalOnShard -- see the
+// landmine section of task-7-brief.md and this task's report for the falsification run.
+TEST_F(MvccStoreTest, AutoJournaledCommandStampsKey) {
+  Run({"lpush", "mylist", "a"});
+  auto st = StampOf("mylist");
+  ASSERT_TRUE(st.has_value()) << "auto-journaled write left no stamp -- check that "
+                                 "EndOfWriteEpoch runs AFTER LogAutoJournalOnShard";
+  EXPECT_GT(st->Mvcc(), 0u);
+  EXPECT_NE(st->origin_hash, 0u) << "self origin hash must be seeded at boot";
+}
+
+TEST_F(MvccStoreTest, NoAutoJournalCommandStampsKey) {
+  Run({"set", "k", "v"});  // SET is NO_AUTOJOURNAL and journals via SetCmd::RecordJournal
+  ASSERT_TRUE(StampOf("k").has_value());
+}
+
+// drakeydb: review fix round 1 (minor) -- hardened against a regression that drops stamping
+// entirely: StampOf's optional is checked before every dereference now, so such a regression
+// fails cleanly here instead of reading an uninitialized MvccStamp (undefined behavior, and the
+// exact shape of the bug this task's own initial run of this fixture hit before the journal was
+// started -- see this task's report).
+TEST_F(MvccStoreTest, StampsAreStrictlyIncreasingAcrossWrites) {
+  Run({"set", "k", "v1"});
+  auto first_stamp = StampOf("k");
+  ASSERT_TRUE(first_stamp.has_value());
+  const uint64_t first = first_stamp->Mvcc();
+  for (int i = 0; i < 50; ++i) {
+    Run({"set", "k", absl::StrCat("v", i)});
+    auto cur_stamp = StampOf("k");
+    ASSERT_TRUE(cur_stamp.has_value()) << "iteration " << i;
+    const uint64_t cur = cur_stamp->Mvcc();
+    EXPECT_GT(cur, first) << "iteration " << i;
+  }
+}
+
+TEST_F(MvccStoreTest, MultiKeySameShardCommandSharesOneStamp) {
+  // drakeydb: falsification note -- the brief's comment here claimed "the single-shard test
+  // fixture"; MvccStoreTest does not pin num_shards (BaseFamilyTest's default is num_threads_ - 1
+  // = 2 shards here). "k1"/"k2" simply hash to the same one of those shards, verified empirically
+  // (this test passes reliably run in isolation, and MvccStoreTest's TEST_F's are declared before
+  // any fixture in this file that changes FLAGS_num_shards, so no earlier test can perturb it).
+  Run({"mset", "k1", "v1", "k2", "v2"});
+  auto a = StampOf("k1");
+  auto b = StampOf("k2");
+  ASSERT_TRUE(a.has_value() && b.has_value());
+  EXPECT_EQ(a->Mvcc(), b->Mvcc()) << "one shard callback mints one stamp";
+}
+
+// The over-stamp cases. Each must leave the stamp untouched and bump the counter.
+TEST_F(MvccStoreTest, ReadOnlyGetExDoesNotStampKey) {
+  Run({"set", "k", "v"});
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const MvccStamp before = *before_stamp;
+  Run({"getex", "k"});  // no expiry option -> mutates nothing, journals nothing
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, before)
+      << "a read that runs an AutoUpdater must not advance the stamp -- if it does, this node "
+         "silently rejects peer writes that should have won";
+}
+
+TEST_F(MvccStoreTest, SkippedExpireDoesNotStampKey) {
+  Run({"set", "k", "v"});
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const MvccStamp before = *before_stamp;
+  EXPECT_EQ(0, CheckedInt({"expire", "k", "100", "XX"}));  // no TTL set -> predicate fails
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, before);
+}
+
+// drakeydb: P4-1 Task 7, Step 6 -- IsOmittableWrite's redundant-write optimisation arms but never
+// commits (no journal entry is emitted for the omitted write), so under active mode it must be
+// disabled outright or the key ends up permanently unstamped.
+//
+// Falsification note: the brief's original body (`debug populate` then a plain `set`) never
+// registers a change consumer, so IsOmittableWrite's `change_cb_.size() == 1` branch never
+// engages and omission never actually happens -- confirmed by temporarily disabling this task's
+// `if (mvcc_enabled_) return false;` gate in IsOmittableWrite (db_slice.cc) and re-running: the
+// test still passed. Strengthened to genuinely trigger the omission path IsOmittableWrite
+// targets, mirroring the existing RegisterOnChange-under-shard_lock pattern used by
+// ReaperJournalFamilyTest.ReaperDeleteBypassesChangeCallbacks above: a real eventually-consistent
+// change consumer plus a real journal consumer, registered before "during" (a fresh key, so its
+// bucket version predates the registration) is ever written.
+TEST_F(MvccStoreTest, WritesDuringSnapshotAreStillStamped) {
+  class NoopChangeConsumer final : public DbSlice::ChangeConsumerInterface {
+   public:
+    void OnChange(DbIndex, const ChangeReq&) override {
+    }
+  } change_consumer;
+  change_consumer.eventually_consistent_ = true;  // the flavor of snapshot IsOmittableWrite gates
+
+  class NoopJournalConsumer final : public journal::JournalConsumerInterface {
+   public:
+    void ConsumeJournalChange(const journal::JournalChangeItem&) override {
+    }
+    void ThrottleIfNeeded() override {
+    }
+  } journal_consumer;
+  uint32_t journal_consumer_id = 0;
+
+  const ShardId sid = Shard("during", shard_set->size());
+  shard_set->Await(sid, [&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    journal_consumer_id = journal::RegisterConsumer(&journal_consumer);
+
+    // RegisterOnChange DCHECKs the shard's intent lock is held (see #7153) and stamps
+    // snapshot_version_ = NextVersion() -- higher than any bucket untouched since this call,
+    // "during"'s included, since it has not been written yet.
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    db_slice.RegisterOnChange(&change_consumer);
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+  });
+
+  // A write to a key whose bucket predates the registration above, with exactly one
+  // eventually-consistent change consumer and one journal consumer registered: precisely the
+  // shape IsOmittableWrite requires before it will omit the journal write.
+  Run({"set", "during", "v"});
+
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    EXPECT_TRUE(db_slice.UnregisterOnChange(&change_consumer));
+    journal::UnregisterConsumer(journal_consumer_id);
+  });
+
+  ASSERT_TRUE(StampOf("during").has_value())
+      << "a journal-omitted write must still be stamped, or the key is permanently unstamped";
+}
+
+// drakeydb: P4-1 Task 7, Step 10 -- a pure write workload (no reads-that-mutate, no
+// not-satisfied-predicate skips) must never discard an armed key: every arm this workload creates
+// must reach a commit. mvcc_unstamped_writes only counts arms EndOfWriteEpoch finds still armed,
+// so this is read through a shard hop rather than via INFO (that wiring is Task 11's job).
+TEST_F(MvccStoreTest, PureWriteWorkloadLeavesNoUnstampedWrites) {
+  for (int i = 0; i < 200; ++i)
+    Run({"set", absl::StrCat("k", i), "v"});
+
+  // Summed across every shard, not just shard 0: 200 distinct keys spread across every shard
+  // this fixture runs (BaseFamilyTest's default is more than one), and a bug could plausibly
+  // manifest on only one of them.
+  std::atomic<uint64_t> unstamped{0};
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { unstamped += MvccStamper::tlocal()->stats().unstamped_writes; });
+  EXPECT_EQ(unstamped.load(), 0u) << "a pure write workload must never discard an arm";
+}
+
+// RDB loading runs in a separate fiber on the shard thread. It must finalize the loaded value's
+// normal bookkeeping without either arming that value or clearing a transaction arm that was
+// already pending on the same thread. This pins the mechanism directly: the pending write keeps
+// its arm and receives the later commit, while the loaded value retains its explicit {0,0}
+// snapshot fallback.
+TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) {
+  constexpr uint64_t kPendingMvcc = 0x1234'5678;
+  std::optional<MvccStamp> prepared_stamp;
+  std::optional<MvccStamp> pending_stamp;
+  std::optional<MvccStamp> loaded_stamp;
+
+  shard_set->Await(0, [&] {
+    Namespace& default_ns = namespaces->GetDefaultNamespace();
+    DbSlice& db_slice = default_ns.GetCurrentDbSlice();
+    DbContext db_cntx{&default_ns, 0, GetCurrentTimeMs()};
+
+    PrimeValue pending_value;
+    pending_value.SetString("pending-value");
+    auto pending = db_slice.AddOrUpdate(db_cntx, "pending-key", std::move(pending_value), 0);
+    ASSERT_TRUE(pending);
+    pending->post_updater.Run();
+
+    prepared_stamp = db_slice.GetMvcc(0, "pending-key");
+    ASSERT_TRUE(prepared_stamp.has_value());
+    EXPECT_TRUE(prepared_stamp->Empty())
+        << "PostUpdate must prepare a zero-authority slot before journal commit";
+
+    PrimeValue loaded_value;
+    loaded_value.SetString("loaded-value");
+    auto loaded = db_slice.AddOrUpdate(db_cntx, "loaded-key", std::move(loaded_value), 0);
+    ASSERT_TRUE(loaded);
+    db_slice.SetMvcc(0, std::string_view{"loaded-key"}, MvccStamp{});
+    loaded->post_updater.RunWithoutMvccArm();
+
+    MvccStamper::tlocal()->Commit(kPendingMvcc, 0,
+                                  [&](DbIndex db, std::string_view key, const MvccStamp& stamp) {
+                                    db_slice.SetExistingMvcc(db, key, stamp);
+                                  });
+    pending_stamp = db_slice.GetMvcc(0, "pending-key");
+    loaded_stamp = db_slice.GetMvcc(0, "loaded-key");
+  });
+
+  ASSERT_TRUE(pending_stamp.has_value());
+  EXPECT_EQ(pending_stamp->Mvcc(), kPendingMvcc)
+      << "loader finalization must not clear another transaction's pending arm";
+  ASSERT_TRUE(loaded_stamp.has_value());
+  EXPECT_TRUE(loaded_stamp->Empty())
+      << "a loaded key must not be swept into an unrelated COMMAND commit";
+}
+
+// drakeydb: review fix round 1 (F1) -- a write through a non-default namespace must leave no
+// stamp anywhere: not in its own namespace's side table (not propagated to any peer, so under
+// "a key's stamp advances iff that same stamp is propagated" it must never advance), and not on
+// a same-named key in the default namespace either. The journal assertions below are the primary
+// safety boundary because every journal COMMAND is applied to the peer's default namespace.
+//
+// In production, ns1 is reached via ServerFamily::DoAuth (server_family.cc:2109-2120), which sets
+// `cntx->ns = &namespaces->GetOrInsert(cred.ns)` for an ACL user carrying a NAMESPACE: directive
+// (acl_family.cc's MaybeParseNamespace). This test exercises the behavior AFTER namespace
+// selection via RunViaNamespace, not the ACL SETUSER/AUTH selection chain itself:
+// BaseFamilyTest::Run(id, slice) (test_utils.cc) unconditionally
+// resets the dispatching connection's `context->ns` back to the default namespace before every
+// single command, discovered the hard way while first writing this test with AUTH -- an ACL
+// NAMESPACE:-scoped SET still landed (and got legitimately stamped) in the default namespace,
+// which momentarily looked exactly like an F1 regression until DIAG prints traced it to Run()'s
+// own reset, confirmed by checking the stored ACL credential directly
+// (ServerState::tlocal()->user_registry->GetCredentials("nsuser").ns == "NS1", i.e. the ACL layer
+// itself was never the problem). RunViaNamespace (test_utils.h/.cc) mirrors Run(id, slice)'s
+// dispatch with the namespace as a parameter instead of hardcoded, added specifically to route
+// around that reset -- it is NOT verbatim (see its own declaration comment in test_utils.h for the
+// two omissions, both harmless for this test's plain SET/GET calls) -- it still goes through the
+// real Transaction/PostUpdate/LogAutoJournalOnShard path via DispatchCommand, only the mechanism
+// for reaching a non-default `cntx->ns` differs from production's ACL path (the ACL layer's own
+// correctness -- MaybeParseNamespace, DoAuth -- is pre-existing and unchanged by this task).
+//
+// The journal consumer is the non-vacuous boundary check: SET takes the explicit RecordJournal
+// path while LPUSH takes the automatic path, and either entry would be applied in a peer's default
+// namespace because the wire has no namespace identity. The side-table assertions independently
+// prove that the local-only write neither acquires authority in ns1 nor perturbs the default
+// namespace's same-named key.
+TEST_F(MvccStoreTest, NonDefaultNamespaceWriteLeavesNoStampAnywhere) {
+  // A key of the same name, already stamped in the default namespace, to prove the ns1 write
+  // below does not perturb it.
+  ASSERT_EQ(Run({"set", "shared", "v0"}), "OK");
+  auto original = StampOf("shared");
+  ASSERT_TRUE(original.has_value());
+
+  Namespace& ns1 = namespaces->GetOrInsert("ns1");
+  class CountingJournalConsumer final : public journal::JournalConsumerInterface {
+   public:
+    void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+      if (item.journal_item.opcode == journal::Op::COMMAND)
+        ++commands;
+    }
+    void ThrottleIfNeeded() override {
+    }
+
+    std::atomic<size_t> commands{0};
+  } consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  ASSERT_EQ(RunViaNamespace(&ns1, {"set", "shared", "v1"}), "OK");
+  ASSERT_EQ(RunViaNamespace(&ns1, {"lpush", "automatic", "v"}).GetInt(), 1);
+  EXPECT_THAT(RunViaNamespace(&ns1, {"debug", "mvcc", "shared"}), ErrArg("default namespace"));
+  const std::string_view helper_key = "namespace-helper-key";
+  shard_set->Await(Shard(helper_key, shard_set->size()), [&] {
+    DbContext ns_cntx{&ns1, 0, GetCurrentTimeMs()};
+    RecordDelete(ns_cntx, helper_key);
+    RecordDerivedDelete(ns_cntx, helper_key);
+    RecordExpiryBlocking(ns_cntx, helper_key);
+  });
+
+  std::move(unregister_consumer).Invoke();
+  EXPECT_EQ(consumer.commands.load(), 0u)
+      << "neither transaction writes nor direct delete helpers from a non-default namespace may "
+         "enter the namespace-blind journal";
+
+  const ShardId sid = Shard("shared", shard_set->size());
+  std::optional<MvccStamp> ns1_stamp;
+  shard_set->Await(sid, [&] { ns1_stamp = ns1.GetDbSlice(sid).GetMvcc(0, "shared"); });
+  EXPECT_FALSE(ns1_stamp.has_value())
+      << "a non-default-namespace write must never be stamped -- it is not propagated to any "
+         "peer, so under the phase invariant it must never advance a stamp either";
+
+  ASSERT_EQ(RunViaNamespace(&ns1, {"get", "shared"}), "v1")
+      << "sanity: the write must have actually landed in ns1's own table, or an unstamped ns1 "
+         "key proves nothing";
+
+  auto after = StampOf("shared");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(*after, *original)
+      << "the ns1 write must not perturb the DEFAULT namespace's same-named key -- "
+         "journal::RecordEntry's commit callback always targets GetDefaultNamespace(), so an "
+         "unguarded arm would stamp this unrelated, never-written key instead";
+}
+
+// drakeydb: P4-1 Task 8 -- PerformDeletionAtomic must disarm and erase on every delete path, or a
+// pending arm can re-stamp a key that no longer exists (see the DoesNotResurrectAStamp case
+// below) and the mvcc side table leaks an entry for a dead key.
+TEST_F(MvccStoreTest, DeleteErasesTheStamp) {
+  Run({"set", "k", "v"});
+  ASSERT_TRUE(StampOf("k").has_value());
+  Run({"del", "k"});
+  EXPECT_FALSE(StampOf("k").has_value()) << "a deleted key must not leave a stamp behind";
+}
+
+// OpDelV2 arms the key (post_updater.Run()) before deleting and journals after. Without the
+// disarm, Commit writes a stamp for a key that is already gone.
+TEST_F(MvccStoreTest, DeleteInSameCallbackDoesNotResurrectAStamp) {
+  Run({"set", "k", "v"});
+  // drakeydb: review fix round 1 (minor) -- guard the precondition. Without this, a total
+  // stamping failure (e.g. Arm/Commit wired wrong) would leave "k" unstamped from the SET
+  // already, and the EXPECT_FALSE below would pass for the wrong reason.
+  ASSERT_TRUE(StampOf("k").has_value());
+  Run({"del", "k"});
+  EXPECT_FALSE(StampOf("k").has_value())
+      << "the DEL's own journal entry must not re-stamp the key it just removed";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u);
+}
+
+// drakeydb: review fix round 1 (F1) -- "a"/"b" restored (the brief's original pair). Verified
+// empirically (temporary LOG(WARNING) of Shard(key, shard_set->size()); the reviewer separately
+// confirmed via XXH64(...) % 2) that under this fixture's shard count (2), Shard("a")=1 and
+// Shard("b")=0: different shards, so this exercises generic_family.cc's cross-shard Renamer
+// path (RenameGeneric's GetUniqueShardCnt() != 1 branch), not the single-shard OpRen fast path.
+// That path used to resurface a real bug: Renamer::DeserializeDest journaled the RESTORE before
+// add_res's AutoUpdater ran, so the destination was armed too late for its own commit to see it
+// and was left permanently unstamped -- fixed in this same round by an explicit
+// add_res->post_updater.Run() before RecordJournal (see generic_family.cc). An earlier version
+// of this test substituted a same-shard key ("a"/"c") specifically to avoid tripping over that
+// bug, which made the suite green without the bug being fixed -- exactly the "test routes around
+// a known failure" pattern this fork's review process exists to catch. Restored to "a"/"b" so
+// this test proves the fix instead of avoiding what it was meant to cover.
+TEST_F(MvccStoreTest, RenameMovesTheStampByRecreatingIt) {
+  Run({"set", "a", "v"});
+  ASSERT_TRUE(StampOf("a").has_value());
+  Run({"rename", "a", "b"});
+  EXPECT_FALSE(StampOf("a").has_value());
+  ASSERT_TRUE(StampOf("b").has_value()) << "the destination is armed and committed by RENAME's "
+                                           "own journal entry";
+}
+
+// drakeydb: review fix round 2 -- the reviewer's bonus finding: GenericFamily::Copy always
+// constructs its Renamer with do_copy=true, and FinalizeRename routes to DeserializeDest for
+// every COPY (the `!do_copy_ && shard_id == src_sid_` branch that sends RENAME's source through
+// DelSrc instead is never taken when do_copy_ is true) -- so COPY was affected by the same F1 bug
+// regardless of shard placement, not just cross-shard RENAME. "a"/"c" is deliberately a
+// *same-shard* pair here (both hash to 1 under this fixture): unlike RENAME, COPY has no
+// single-shard fast path to fall back to, so this demonstrates the bug (and the fix) even in the
+// case that would have been safe for RENAME.
+TEST_F(MvccStoreTest, CopyStampsTheDestinationRegardlessOfShardPlacement) {
+  Run({"set", "a", "v"});
+  ASSERT_TRUE(StampOf("a").has_value());
+  Run({"copy", "a", "c"});
+  ASSERT_TRUE(StampOf("a").has_value()) << "COPY must not disturb the source's stamp";
+  ASSERT_TRUE(StampOf("c").has_value()) << "the destination is armed and committed by COPY's "
+                                           "own journal entry (via the same DeserializeDest)";
+}
+
+TEST_F(MvccStoreTest, ExpiryErasesTheStamp) {
+  Run({"set", "k", "v", "px", "10"});
+  ASSERT_TRUE(StampOf("k").has_value());
+  AdvanceTime(50);
+  Run({"get", "k"});  // triggers lazy expiry
+  EXPECT_FALSE(StampOf("k").has_value());
+}
+
+TEST_F(MvccStoreTest, MultiKeyDeleteErasesEveryStamp) {
+  Run({"mset", "k1", "v1", "k2", "v2", "k3", "v3"});
+  Run({"del", "k1", "k2"});
+  EXPECT_FALSE(StampOf("k1").has_value());
+  EXPECT_FALSE(StampOf("k2").has_value());
+  EXPECT_TRUE(StampOf("k3").has_value());
+}
+
+// drakeydb: review fix round 2 (F3) -- five NO_AUTOJOURNAL commands that build their own explicit
+// journal entry while a live AutoUpdater had not yet run, so their commit hit an empty arm list
+// and a *propagated* destination key was left permanently unstamped. Each test below stamps the
+// key its command writes; falsified per-site by reverting that one Run() and confirming failure
+// (see task-8-report.md's "Fix round 2" section for the verbatim output of each).
+
+TEST_F(MvccStoreTest, PfmergeStampsTheDestination) {
+  Run({"pfadd", "src", "a", "b", "c"});
+  Run({"pfmerge", "dest", "src"});
+  ASSERT_TRUE(StampOf("dest").has_value()) << "PFMERGE's own journal entry must stamp dest";
+}
+
+// journal_as_minid (and so the buggy explicit RecordJournal path) is only taken for MAXLEN/approx
+// trims -- see JournalAsMinId, stream_family.cc. A MINID trim without "~" auto-journals instead
+// and would not exercise this.
+//
+// Compares before/after rather than just has_value(): "s" already carries a stamp from the two
+// XADDs below before XTRIM ever runs, so a bare has_value() check after XTRIM would pass whether
+// or not XTRIM's own commit did anything -- it would just be re-observing the stale XADD stamp.
+// The real assertion is that XTRIM mints its own, strictly newer stamp (Task 7's monotonicity
+// invariant, also covered generally by StampsAreStrictlyIncreasingAcrossWrites).
+TEST_F(MvccStoreTest, XtrimStampsTheStream) {
+  Run({"xadd", "s", "*", "f", "v"});
+  Run({"xadd", "s", "*", "f", "v"});
+  auto before = StampOf("s");
+  ASSERT_TRUE(before.has_value());
+  Run({"xtrim", "s", "maxlen", "1"});
+  auto after = StampOf("s");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_TRUE(*before < *after) << "XTRIM's own journal entry must mint a fresh, strictly newer "
+                                   "stamp, not leave the stale one from the XADDs above";
+}
+
+TEST_F(MvccStoreTest, XaddStampsTheStream) {
+  Run({"xadd", "s", "*", "f", "v"});
+  ASSERT_TRUE(StampOf("s").has_value()) << "XADD's own journal entry must stamp the stream key";
+}
+
+// Cross-shard src/dest: OpMoveSingleShard (MoveGeneric's GetUniqueShardCnt() == 1 branch) already
+// runs both post_updater.Run() calls before its own explicit RecordJournal and was never broken
+// -- only the cross-shard MoveTwoShards -> OpPush(..., journal_rewrite=true) path was. "a"/"b"
+// are on different shards under this fixture, same pair already established for RENAME.
+TEST_F(MvccStoreTest, LmoveStampsTheDestinationCrossShard) {
+  Run({"rpush", "a", "v"});
+  Run({"lmove", "a", "b", "left", "right"});
+  ASSERT_TRUE(StampOf("b").has_value()) << "LMOVE's own journal entry must stamp the destination";
+}
+
+TEST_F(MvccStoreTest, SunionstoreStampsTheDestination) {
+  Run({"sadd", "s1", "x", "y"});
+  Run({"sunionstore", "dest", "s1"});
+  ASSERT_TRUE(StampOf("dest").has_value()) << "SUNIONSTORE's own journal entry must stamp dest";
+}
+
+// drakeydb: review fix round 3 (F5) -- ZSetFamily::OpAdd is the sixth instance of the same class:
+// PrepareZEntry returns a live ItAndUpdater with no post_updater reference anywhere before the
+// explicit RecordJournal calls (DEL, then ZADD) that NO_AUTOJOURNAL ZDIFFSTORE/ZINTERSTORE/
+// ZUNIONSTORE/ZRANGESTORE and GEORADIUS...STORE rely on. "dest" is pre-set to a plain string (a
+// different type entirely) specifically to force the two-entry DEL-then-ZADD path (zparams.override
+// is unconditionally true for these *STORE commands, so the DEL fires regardless of whether dest
+// previously existed -- but giving it a real prior value makes the test's own setup meaningful,
+// not just incidental). Compares before/after like XtrimStampsTheStream above, for the same
+// reason: a bare has_value() after the command would be satisfied by a stale stamp surviving
+// untouched, not necessarily by ZUNIONSTORE's own commit succeeding.
+TEST_F(MvccStoreTest, ZunionstoreStampsTheDestinationAcrossTwoJournalEntries) {
+  Run({"zadd", "z1", "1", "a"});
+  Run({"set", "dest", "stale"});
+  auto before = StampOf("dest");
+  ASSERT_TRUE(before.has_value());
+  Run({"zunionstore", "dest", "1", "z1"});
+  auto after = StampOf("dest");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_TRUE(*before < *after) << "ZUNIONSTORE's own journal entry must mint a fresh, strictly "
+                                   "newer stamp for dest via its two-entry DEL+ZADD path";
+}
+
+// drakeydb: Phase 4 Task 9 -- the phase's acceptance criterion: an applied write carries the
+// author's stamp verbatim, not a freshly-minted local one, and records the AUTHOR's origin hash,
+// not the applier's own. Falsifying (see task-9-report.md for the verbatim run): removing the
+// executor_->SetApplyMvcc(tx_data.mvcc) call in DflyShardReplica::ExecuteTx (replica.cc) leaves
+// JournalExecutor's ConnectionContext::repl_mvcc at its 0 default, so RecordEntry's
+// `entry.mvcc == 0` test (journal.cc) is true and it mints a fresh HopStamp instead of storing
+// kAuthorMvcc, failing the first EXPECT_EQ below.
+TEST_F(MvccStoreTest, AppliedWriteKeepsAuthorStampVerbatim) {
+  constexpr uint64_t kAuthorMvcc = 0x1234'5678'9ABCULL;
+  constexpr uint32_t kPeerIdx = 3;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-0000-4000-8000-00000000000b");
+
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
+  ApplyReplicatedCommand({"set", "k", "v"}, kPeerIdx, kAuthorMvcc);
+
+  auto st = StampOf("k");
+  ASSERT_TRUE(st.has_value());
+  EXPECT_EQ(st->Mvcc(), kAuthorMvcc) << "the applier must not re-mint -- stamps would otherwise "
+                                        "inflate on every replication hop";
+  EXPECT_EQ(st->origin_hash, peer_hash) << "and must record the AUTHOR, not itself";
+}
+
+// drakeydb: review wave 2 (F4, IMPORTANT) -- MvccStamper::Commit stamps EVERY currently-armed key
+// with the entry it is given, not just the key its own payload names (mvcc.h). MSET arms
+// key-by-key (OpMSet, string_family.cc: one Set() call per pair, one post_updater.Run() each) and
+// only journals once at the very end -- so if a LATER key in the same MSET already has an expired
+// whole-key TTL, AddOrFind -> FindInternal -> ExpireIfNeeded (db_slice.cc) fires
+// RecordExpiryBlocking (tx_base.cc) for it MID-CALLBACK, and that call's own Commit() sweeps up
+// every key armed so far -- including k1 here, armed by its own Set() one iteration earlier --
+// before MSET's own trailing RecordJournal ever gets a chance to stamp it. Before this fix, k1
+// came out stamped with a freshly-minted LOCAL HopStamp (RecordExpiryBlocking's hardcoded mvcc=0)
+// instead of the replicated MSET's real author stamp.
+//
+// Falsifying: reverting RecordExpiryBlocking's `db_cntx.repl_mvcc` argument (tx_base.cc) back to
+// a hardcoded 0 makes k1's EXPECT_EQ below fail -- st->Mvcc() comes back larger than kAuthorMvcc
+// (a real HopStamp minted from the live wall clock, not this literal).
+TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
+  constexpr uint32_t kPeerIdx = 6;
+  constexpr uint64_t kAuthorMvcc = 0x7777'0000'2222ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-0000-4000-8000-0000000000cc");
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
+
+  // Two distinct keys that hash to the same shard, so OpMSet processes both within one shard
+  // callback (one MvccStamper::armed_ list) -- the ordering this test depends on does not exist
+  // across shards.
+  const unsigned num_shards = shard_set->size();
+  std::string k1, k2;
+  for (int i = 0; k2.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find two keys hashing to the same shard";
+    std::string cand = absl::StrCat("mk", i);
+    if (Shard(cand, num_shards) == 0) {
+      (k1.empty() ? k1 : k2) = cand;
+    }
+  }
+
+  // k2 already exists with a whole-key TTL that has elapsed by the time MSET below re-probes it,
+  // but nothing has read it since, so it is still physically present -- ExpireIfNeeded discovers
+  // this lazily, mid-MSET, exactly like the recipe FieldExpireCausedDeleteIsNotFlaggedDerived
+  // (above in this file) uses for the analogous member-TTL case. AdvanceTime (mocked clock, no
+  // real sleep) keeps this deterministic.
+  Run({"set", k2, "old", "px", "10"});
+  AdvanceTime(50);
+
+  ApplyReplicatedCommand({"mset", k1, "v1", k2, "v2"}, kPeerIdx, kAuthorMvcc);
+
+  auto st1 = StampOf(k1);
+  ASSERT_TRUE(st1.has_value());
+  EXPECT_EQ(st1->Mvcc(), kAuthorMvcc)
+      << "k1 was armed by its own Set() before k2's lazy expiry swept it into that entry's "
+         "Commit() call -- it must still end up stamped with the MSET's real author mvcc";
+  EXPECT_EQ(st1->origin_hash, peer_hash)
+      << "k1 was swept into the expiry commit and must retain the MSET author's origin hash";
+
+  auto st2 = StampOf(k2);
+  ASSERT_TRUE(st2.has_value());
+  EXPECT_EQ(st2->Mvcc(), kAuthorMvcc) << "k2 itself is stamped by MSET's own trailing commit, "
+                                         "unaffected by this bug -- guards against a vacuous pass";
+  EXPECT_EQ(st2->origin_hash, peer_hash);
+}
+
+// drakeydb: Phase 4 Task 9, fix round (F1v2) -- proves ExecuteTx applies an author's mvcc AND
+// origin_hash correctly regardless of which shard a replicated write's key lands on, which
+// AppliedWriteKeepsAuthorStampVerbatim above cannot: that test touches exactly one key/shard, so
+// it cannot distinguish "correct on every shard" from "correct on whichever shard this key
+// happened to hash to." This test constructs a real DflyShardReplica -- exactly as
+// Replica::InitiateDflySync does -- and applies through one key per shard (not just one key
+// total), asserting the resulting stamp on each.
+//
+// This does NOT pin the origin-hash registration broadcast itself (InitiateDflySync's shard_cb,
+// replica.cc) the way an earlier version of this test did: that version relied on
+// DflyShardReplica's own constructor performing the registration, matching what was, at the
+// time, production behavior. That behavior was reverted -- see the constructor's own comment and
+// task-9-report.md -- after it crashed the server (SIGSEGV, reproduced 5/10 runs of
+// test_active_replica_single_peer_replaces in multimaster_test.py) by introducing the
+// constructor's first-ever fiber yield point inside InitiateDflySync's tight per-flow
+// construction loop. The registration now lives in InitiateDflySync's shard_cb instead, a
+// private Replica method with no no-socket construction path this file can reach the way
+// DflyShardReplicaOriginTest reaches DflyShardReplica's public constructor -- so
+// ApplyOnePeerWriteToEveryShard registers the origin hash manually (shard_set->pool()->AwaitBrief,
+// the same shape AppliedWriteKeepsAuthorStampVerbatim already uses) rather than relying on
+// construction to do it. See ApplyOnePeerWriteToEveryShard's own comment for the full account,
+// including why construction and every apply run on thread 0 specifically (ServerState::tlocal()
+// must resolve on the calling thread).
+//
+// Falsifying (see task-9-report.md for the verbatim run): no-op'ing the body of
+// JournalExecutor::SetApplyMvcc (executor.h) -- the same mutation that falsifies
+// AppliedWriteKeepsAuthorStampVerbatim -- makes every shard's Mvcc() EXPECT below fail with a
+// freshly-minted HopStamp instead of kAuthorMvcc, since ExecuteTx's non-global path calls that
+// same method before every Execute().
+TEST_F(MvccStoreTest, AppliedWriteAppliesCorrectlyOnEveryShard) {
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "this test's entire point is proving correctness on shards OTHER "
+                               "than whichever one a single key would happen to hash to -- with "
+                               "only one shard there is nothing to distinguish it from";
+
+  constexpr uint32_t kPeerIdx = 5;
+  constexpr uint64_t kAuthorMvcc = 0x9999'0000'1111ULL;
+  const uint64_t peer_hash = NodeUuidHash("a1b2c3d4-0000-4000-8000-0000000000aa");
+
+  std::vector<std::string> keys = ApplyOnePeerWriteToEveryShard(kPeerIdx, peer_hash, kAuthorMvcc);
+  for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+    auto st = StampOf(keys[target_shard]);
+    ASSERT_TRUE(st.has_value()) << "key '" << keys[target_shard] << "' on shard " << target_shard;
+    EXPECT_EQ(st->Mvcc(), kAuthorMvcc) << "shard " << target_shard;
+    EXPECT_EQ(st->origin_hash, peer_hash) << "shard " << target_shard;
+  }
+}
+
+namespace {
+// drakeydb: review wave 2 (F2, IMPORTANT) -- unlike OriginFlagCapturingConsumer above (which
+// reads origin_idx/entry_flags straight off item.journal_item, mirrored there by
+// JournalSlice::AddLogRecord), JournalItem carries no mvcc field at all -- only the wire bytes
+// do. So this consumer, like OriginOpcodeCapturingConsumer further down this file, reparses
+// item.journal_item.data with a real JournalReader to reach ParsedEntry::mvcc.
+struct MvccCapturedEntry {
+  std::string cmd;
+  uint32_t origin_idx;
+  uint64_t mvcc;
+};
+
+class MvccCapturingConsumer : public journal::JournalConsumerInterface {
+ public:
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    io::BytesSource source{item.journal_item.data};
+    JournalReader reader{&source, 0};
+    journal::ParsedEntry parsed;
+    CHECK(!reader.ReadEntry(&parsed));
+    util::fb2::LockGuard lk(mu_);
+    entries.push_back({std::string(item.cmd), parsed.origin_idx, parsed.mvcc});
+  }
+  void ThrottleIfNeeded() override {
+  }
+
+  util::fb2::Mutex mu_;
+  std::vector<MvccCapturedEntry> entries;  // guarded by mu_
+};
+}  // namespace
+
+// drakeydb: review wave 2 (F2, IMPORTANT) -- tx_base.cc's RecordDelete/RecordDerivedDelete used
+// to pass a hardcoded mvcc=0 to journal::RecordEntry regardless of DbContext::repl_mvcc, so
+// journal::RecordEntry's "caller supplied no stamp" test (entry.mvcc == 0, journal.cc) was always
+// true for a derived DEL and it always minted a fresh LOCAL HopStamp -- even when the DEL was
+// itself derived from applying a peer's replicated command. Two peers independently applying the
+// same replicated HDEL (each emptying their own copy of the hash) would then diverge onto two
+// different, locally-minted stamps for the same logical delete instead of converging on the
+// author's one stamp, exactly like AppliedWriteKeepsAuthorStampVerbatim above proves for ordinary
+// (non-derived) applied writes.
+//
+// The emptied key itself can't be used to observe this (StampOf would read nullopt either way --
+// the key is gone), so this test instead reads the derived DEL's own journal entry (mvcc travels
+// on the wire under extended framing -- see JournalItem's comment above) exactly the way a
+// downstream plain replica or a peer's Commit()-driven side-table stamp would.
+//
+// Falsifying: reverting either `db_cntx.repl_mvcc` argument in tx_base.cc back to a hardcoded 0
+// makes del->mvcc below come back as a freshly-minted local stamp instead of kAuthorMvcc -- always
+// larger, since HopStamp mints from the real current wall clock and kAuthorMvcc here is not a
+// live timestamp.
+TEST_F(MvccStoreTest, DerivedDeleteFromAppliedWriteKeepsAuthorStamp) {
+  constexpr uint32_t kPeerIdx = 4;
+  constexpr uint64_t kAuthorMvcc = 0x4242'0000'1111ULL;
+
+  const size_t num_shards = shard_set->size();
+  MvccCapturingConsumer consumer;
+  std::vector<uint32_t> consumer_ids(num_shards, 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+
+  Run({"hset", "h", "f", "v"});  // local write; its own entry is irrelevant to this test
+
+  ApplyReplicatedCommand({"hdel", "h", "f"}, kPeerIdx, kAuthorMvcc);
+
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  const MvccCapturedEntry* del = nullptr;
+  for (auto it = consumer.entries.rbegin(); it != consumer.entries.rend(); ++it) {
+    if (it->cmd == "DEL") {
+      del = &*it;
+      break;
+    }
+  }
+  ASSERT_NE(nullptr, del) << "HDEL emptying the hash must derive a DEL";
+  EXPECT_EQ(del->mvcc, kAuthorMvcc) << "a derived DEL caused by an applied write must reproduce "
+                                       "the author's stamp, not mint a fresh local one";
+  EXPECT_EQ(del->origin_idx, kPeerIdx);
+}
+
+namespace {
+// drakeydb: Phase 4, P4-1 Task 10 -- sums TEST_VerifyMvccTable(0) (db_slice.cc) across every
+// shard. Each shard's callback writes to its own index of `per_shard`, never a shared accumulator
+// -- shard_set->RunBriefInParallel dispatches onto each shard's own proactor thread, so a naive
+// `mismatches += ...` shared across threads would be a data race (this fixture does not pin
+// num_shards=1, unlike OriginJournalFamilyTest elsewhere in this file, so relying on it would be
+// exactly the single-proactor-only trap: it would happen to pass here but be silently wrong).
+// Routes through Namespace::GetDbSlice (the ReaperJournalFamilyTest precedent above in this
+// file), not a nonexistent EngineShard::db_slice() -- and deliberately through
+// GetDefaultNamespace() specifically, which is what makes TEST_VerifyMvccTable's own default-
+// namespace gate (db_slice.cc) actually engage here instead of short-circuiting to 0.
+size_t SumMvccMismatchesAcrossShards() {
+  std::vector<size_t> per_shard(shard_set->size(), 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    per_shard[shard->shard_id()] = db_slice.TEST_VerifyMvccTable(0);
+  });
+  size_t total = 0;
+  for (size_t m : per_shard)
+    total += m;
+  return total;
+}
+}  // namespace
+
+// drakeydb: Phase 4, P4-1 Task 10 -- the dense-invariant regression test: after a mixed
+// write/delete/rename workload, every live prime key must have exactly one mvcc stamp and every
+// stamp must have exactly one live prime key. TEST_VerifyMvccTable (db_slice.cc) does the real
+// work; this drives SET (arm+commit), DEL (PerformDeletionAtomic's EraseMvcc), and RENAME
+// (arms/commits the destination) against it in one interleaved pass.
+//
+// Falsifying: see task-10-report.md for the verbatim run -- commenting out the EraseMvcc call in
+// PerformDeletionAtomic (db_slice.cc) makes this fail with a non-zero mismatch count and
+// "mvcc: stamp with no live key" LOG(ERROR) lines, one per deleted key.
+TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
+  for (int i = 0; i < 200; ++i) {
+    Run({"set", absl::StrCat("k", i), "v"});
+    if (i % 7 == 0) {
+      // Rename the key just written -- renaming k(i-1) would hit one the i%3 branch deleted,
+      // and RENAME on a missing key errors.
+      Run({"rename", absl::StrCat("k", i), absl::StrCat("r", i)});
+    } else if (i % 3 == 0) {
+      Run({"del", absl::StrCat("k", i)});
+    }
+  }
+
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u)
+      << "every live key needs exactly one stamp, and vice versa";
+}
+
+// drakeydb: review wave 2 (F1, CRITICAL) -- HDEL emptying a hash arms the key TWICE: ExecuteW's
+// own it_res->post_updater.Run() (hset_family.cc) arms it once, then -- because the hash is now
+// empty -- DeleteHw takes a SECOND, independent FindMutable/AutoUpdater on the same still-present
+// key and arms it again via its own post_updater.Run(), before finally deleting it.
+// MvccStamper::Disarm (mvcc.cc) used to erase only the first matching arm and `return`, leaving
+// one arm behind for a key PerformDeletionAtomic had just erased from `prime`; the derived DEL's
+// own journal::RecordEntry->Commit then reinserted a side-table stamp for that now-nonexistent
+// key. This is the literal repro from the phase's review brief: under --active_replica,
+// `HSET h f v` then `HDEL h f` aborted the whole process with
+// `Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (1 vs. 0)`
+// at db_slice.cc's OnCbFinishBlocking -- reproduced verbatim before this fix; see
+// final-fix-report.md.
+//
+// Falsifying: restoring Disarm's early `return` after the first erase (mvcc.cc) reproduces that
+// exact DCHECK abort inside this test's own HDEL call -- see final-fix-report.md for the verbatim
+// output.
+TEST_F(MvccStoreTest, HdelEmptyingHashDoesNotResurrectAStamp) {
+  Run({"hset", "h", "f", "v"});
+  ASSERT_TRUE(StampOf("h").has_value());
+  Run({"hdel", "h", "f"});
+  EXPECT_FALSE(StampOf("h").has_value())
+      << "the HDEL's own journal entry must not re-stamp the key it just emptied";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: review wave 2 (F1, CRITICAL) -- the same double-arm shape as
+// HdelEmptyingHashDoesNotResurrectAStamp above, via a different pair of call sites:
+// OpFieldExpire's own auto_updater.Run() (generic_family.cc) arms the key once, then --
+// discovering the named field already lazily expired while trying to re-arm it, and the hash now
+// empty -- HSetFamily::DeleteIfEmpty takes a second, independent FindMutable/AutoUpdater and arms
+// it again before deleting. Recipe (a hash with one member whose TTL has already elapsed,
+// re-probed via FIELDEXPIRE) is the hash counterpart of
+// OriginJournalFamilyTest.FieldExpireCausedDeleteIsNotFlaggedDerived (this file), which pins this
+// same recipe's journal-flag behavior on a SET; AdvanceTime (a mocked clock, no real sleep) is
+// what keeps this deterministic instead of racing the ~100ms member-expiry reaper heartbeat.
+//
+// Falsifying: restoring Disarm's early `return` (mvcc.cc) reproduces the same
+// mvcc->size()/prime->size() DCHECK abort as the HDEL test above -- see final-fix-report.md.
+TEST_F(MvccStoreTest, FieldExpireEmptyingHashDoesNotResurrectAStamp) {
+  ASSERT_EQ(Run({"hset", "feh", "f", "v"}).GetInt(), 1);
+  Run({"fieldexpire", "feh", "1", "f"});
+  AdvanceTime(1100);
+  Run({"fieldexpire", "feh", "1", "f"});
+
+  // Guard against a vacuous pass: the hash must have actually been cleaned up.
+  ASSERT_EQ(Run({"exists", "feh"}).GetInt(), 0);
+  EXPECT_FALSE(StampOf("feh").has_value())
+      << "the derived DEL's own journal entry must not re-stamp the key it just emptied";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: review wave 2 (F1, CRITICAL) -- the SET counterpart of
+// FieldExpireEmptyingHashDoesNotResurrectAStamp above: OpFieldExpire's is_set branch calls
+// SetFamily::DeleteSetIfEmpty (set_family.cc) instead of HSetFamily::DeleteIfEmpty, but takes the
+// identical second-FindMutable/second-arm shape. Same recipe as
+// OriginJournalFamilyTest.FieldExpireCausedDeleteIsNotFlaggedDerived (this file), which pins this
+// scenario's journal-flag behavior; this test pins the mvcc side-table invariant instead.
+//
+// Falsifying: restoring Disarm's early `return` (mvcc.cc) reproduces the same
+// mvcc->size()/prime->size() DCHECK abort as the two tests above -- see final-fix-report.md.
+TEST_F(MvccStoreTest, FieldExpireEmptyingSetDoesNotResurrectAStamp) {
+  ASSERT_EQ(Run({"sadd", "fes", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "fes", "1", "m"});
+  AdvanceTime(1100);
+  Run({"fieldexpire", "fes", "1", "m"});
+
+  // Guard against a vacuous pass: the set must have actually been cleaned up.
+  ASSERT_EQ(Run({"exists", "fes"}).GetInt(), 0);
+  EXPECT_FALSE(StampOf("fes").has_value())
+      << "the derived DEL's own journal entry must not re-stamp the key it just emptied";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: Phase 4, P4-1 Task 10 -- MEMORY DEFRAGSEGMENTS (memory_cmd.cc:346's
+// MemoryCmd::DefragmentSegments) is the ONLY caller of DbSlice::DefragTableSegments. DEBUG
+// COMPACT-TABLE is a different mechanism entirely (buddy-segment merging via
+// EngineShard::CompactTable) and would exercise none of the mirror loop this test targets -- using
+// it here would pass vacuously, never reaching DefragTableSegments at all.
+//
+// Falsifying: see task-10-report.md for the verbatim run. Commenting out the EraseMvcc call in
+// PerformDeletionAtomic reproduces the same "stamp with no live key" failure here as in
+// TableMatchesPrimeAfterMixedWorkload above, since this test's setup also deletes half its keys.
+TEST_F(MvccStoreTest, DefragRelocationPreservesStamps) {
+  for (int i = 0; i < 500; ++i)
+    Run({"set", absl::StrCat("k", i), std::string(200, 'x')});
+  for (int i = 0; i < 500; i += 2)
+    Run({"del", absl::StrCat("k", i)});
+
+  auto before_stamp = StampOf("k1");
+  ASSERT_TRUE(before_stamp.has_value());
+  const MvccStamp before = *before_stamp;
+  Run({"memory", "defragsegments"});  // the ONLY caller of DefragTableSegments (memory_cmd.cc:346).
+                                      // NOT "debug compact-table", a different mechanism entirely.
+  auto after_stamp = StampOf("k1");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, before) << "defrag must not lose or corrupt stamps";
+
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: fix round 1 (F1, CRITICAL) -- DefragRelocationPreservesStamps above cannot, by
+// construction, distinguish a present mirror loop from a deleted one: TryRelocateSegment is a
+// content-preserving move local to whichever DashTable instance it is called on, invisible to
+// StampOf/TEST_VerifyMvccTable, both of which resolve by hash lookup, never by segment position
+// (recorded, with that test's own falsification proving it, in task-10-report.md). This test
+// follows the template DefragDflyEngineTest.SegmentsRelocated (dragonfly_test.cc) already uses to
+// prove the identical property for `prime`: force every segment to be reported "under-utilized"
+// (PageUsage::SetForceReallocate(true) -- an unconditional-true override of the virtual
+// IsPageForObjectUnderUtilized that DefragTableSegments' real caller, memory_cmd.cc, consults),
+// collect every segment's address before and after one DefragTableSegments call, and assert every
+// address changed. Applied to db->mvcc here, not db->prime.
+//
+// Falsifying: see task-10-report.md fix round 1. Replacing the mvcc mirror loop in
+// DefragTableSegments (db_slice.cc) with `return;` immediately after the prime loop -- the exact
+// mutation DefragRelocationPreservesStamps's own comment already tried and documented as
+// undetectable by that test -- makes this test fail: every mvcc segment address is unchanged
+// before/after.
+TEST_F(MvccStoreTest, DefragActuallyRelocatesMvccSegments) {
+  constexpr size_t kKeys = 5000;
+  Run({"DEBUG", "POPULATE", std::to_string(kKeys), "key", "32"});
+
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    DbTable* db = slice.GetDBTable(0);
+    ASSERT_TRUE(db->mvcc) << "active-replica mode must allocate the mvcc side table";
+    auto& mvcc = *db->mvcc;
+
+    auto collect_addresses = [&] {
+      absl::flat_hash_map<size_t, uintptr_t> seg_ptrs;
+      detail::DashCursor cursor;
+      do {
+        auto [next, segment] = mvcc.VisitSegment(cursor);
+        cursor = next;
+        if (!segment) {
+          ADD_FAILURE() << "Valid cursor did not resolve to a segment";
+          return seg_ptrs;
+        }
+        seg_ptrs.emplace(segment->first, reinterpret_cast<uintptr_t>(segment->second));
+      } while (cursor);
+      return seg_ptrs;
+    };
+
+    const auto before = collect_addresses();
+    const size_t size_before = mvcc.size();
+    ASSERT_GT(before.size(), 1u) << "need more than one segment for this test to mean anything";
+
+    PageUsage page_usage{CollectPageStats::NO, 0, CycleQuota::Unlimited()};
+    page_usage.SetForceReallocate(true);
+
+    slice.DefragTableSegments(0, &page_usage);
+
+    const auto after = collect_addresses();
+
+    EXPECT_EQ(after.size(), before.size());
+    EXPECT_EQ(mvcc.size(), size_before);
+
+    for (const auto& [sid, old_address] : before) {
+      ASSERT_TRUE(after.contains(sid));
+      EXPECT_NE(after.at(sid), old_address) << "mvcc segment " << sid << " was not relocated";
+    }
+  });
+
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u) << "forced defrag must not corrupt the mvcc table";
+}
+
+// drakeydb: Phase 4, P4-1 Task 10 -- rdb_load.cc's CreateObjectOnShard inserts every loaded key
+// via DbSlice::AddOrUpdate. Its ItAndUpdater's AutoUpdater DOES eventually call PostUpdate (on
+// destruction, or explicitly beside a tiered-storage stash -- db_slice.cc), so a loaded key does
+// get armed; fix round 1 (F2) covers the separate bug that arm exposed (nothing in the load path
+// ever committed or discarded it, so a later, unrelated write's Commit() could clobber this
+// test's {0,0} stamp with local authority no peer ever saw -- see
+// ReloadDoesNotLeaveArmsForALaterWriteToClobber, below). This test only proves the simpler,
+// first-order property Step 3b was for: the reload path leaves every key stamped at all, dense
+// with prime, immediately after the reload -- without an explicit {0,0} stamp beside the
+// SetMCFlag mirror, a loaded key would be dense in prime but absent from mvcc, tripping
+// OnCbFinishBlocking's DCHECK (db_slice.cc) on the next command that reaches it.
+//
+// Needs --dbfilename set, or DEBUG RELOAD silently no-ops (BaseFamilyTest::SetUpTestSuite sets it
+// to "" globally) -- that exact vacuous-test trap was caught on P4-0. Unique per pid, matching
+// ReaperJournalFamilyTest's two RDB round-trip tests above (this file), the working precedent this
+// follows: SetTestFlag alone is sufficient here (no ResetService/InitWithDbFilename needed)
+// because DoSave reads the flag live. absl::FlagSaver (fix round 1, Minor) restores it on scope
+// exit, matching MultiMasterFamilyTest's saver_ -- without it, dbfilename leaked globally into
+// every later test in this binary that also reads or sets it.
+//
+// drakeydb: Task 11 fix round 1 (F2) -- --dir also pointed at a private GetTestTempPath, matching
+// MultiMasterFamilyTest's constructor (:509, this file): dbfilename alone has no directory
+// component (ValidateFilename, save_stages_controller.cc, rejects one outright), so without this
+// the save/reload below wrote its .dfs files into whatever the process's cwd happened to be --
+// the repo root, when this binary is run directly rather than via ctest. Same flag_saver restores
+// it on scope exit.
+TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
+  absl::FlagSaver flag_saver;
+  absl::SetFlag(&FLAGS_dir, base::GetTestTempPath("mvcc_reload_test"));
+  BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("mvcc_reload_test_", getpid()));
+
+  for (int i = 0; i < 100; ++i)
+    Run({"set", absl::StrCat("k", i), "v"});
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 100u)
+      << "a reload that leaves keys unstamped trips the dense invariant on the next write";
+  // EXISTS, not DBSIZE: verified empirically, not assumed (see task-10-report.md) -- DBSIZE
+  // (ServerFamily::DbSize, server_family.cc) dispatches via a bare shard_set->RunBriefInParallel
+  // call and never goes through Transaction::RunCallback/OnCbFinishBlocking at all. A write would
+  // also prepare its own zero-authority slot before reaching the invariant, adding unnecessary
+  // mutation to this probe. GenericFamily::Exists
+  // (generic_family.cc) drives a real Transaction, the same shape as the HLEN calls that already
+  // caught this bug's Section 5 instances (task-10-report.md) -- confirmed here by disabling
+  // Step 3b's stamp and observing EXISTS reach and trip the DCHECK where DBSIZE had not.
+  Run({"exists", "k0"});  // must not DCHECK -- a debug build aborts the whole test binary, not
+                          // just this one test, if the invariant is violated here.
+}
+
+// drakeydb: fix round 1 (F2, IMPORTANT) -- regression test for the coordinator's finding, verified
+// before being fixed (see task-10-report.md): rdb_load.cc's CreateObjectOnShard arms every loaded
+// key (AddOrUpdate's AutoUpdater, see the comment above) but this file never journals a load, so
+// nothing ever calls MvccStamper::Commit() for those arms. Without an EndOfWriteEpoch() call
+// somewhere in the load path, those arms sat in armed_ until the next unrelated journaled write on
+// the same shard thread, whose own Commit() then stamped every still-armed key -- not just its
+// own -- with that write's mvcc/origin, clobbering this task's {0,0} fallback with local authority
+// no peer ever saw: exactly the "stamp without propagation" direction D-7 forbids, and it would do
+// so silently (TEST_VerifyMvccTable/OnCbFinishBlocking only check density, never the stamp's
+// value).
+//
+// One trigger write per shard, not one write total: armed_ is per-shard-thread (MvccStamper is
+// thread-local), so a bug here only clobbers reload keys sharing a shard with the trigger write --
+// a single trigger key would leave every other shard's reloaded keys looking correct regardless of
+// whether the fix is present, the same "passes only because the fixture happens to hash everything
+// onto one shard" trap this phase has hit before.
+TEST_F(MvccStoreTest, ReloadDoesNotLeaveArmsForALaterWriteToClobber) {
+  absl::FlagSaver flag_saver;
+  // drakeydb: Task 11 fix round 1 (F2) -- see ReloadedKeysAreStampedSoTheInvariantHolds's comment
+  // above for why --dir is set here too, not just --dbfilename.
+  absl::SetFlag(&FLAGS_dir, base::GetTestTempPath("mvcc_reload_arm_leak_test"));
+  BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("mvcc_reload_arm_leak_test_", getpid()));
+
+  const unsigned num_shards = shard_set->size();
+  std::vector<std::string> reload_keys(num_shards);
+  for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+    for (int i = 0;; ++i) {
+      CHECK_LT(i, 10000) << "could not find a key hashing to shard " << target_shard;
+      reload_keys[target_shard] = absl::StrCat("r", i);
+      if (Shard(reload_keys[target_shard], num_shards) == target_shard)
+        break;
+    }
+    Run({"set", reload_keys[target_shard], "v"});
+  }
+
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+
+  // Guard against a vacuous pass: every reloaded key must actually be {0,0}-stamped before the
+  // trigger writes below run, or this test would "pass" against a reload path that lost the
+  // stamp entirely, not just one that leaks arms.
+  for (const auto& key : reload_keys) {
+    auto st = StampOf(key);
+    ASSERT_TRUE(st.has_value()) << key;
+    ASSERT_TRUE(st->Empty()) << key << ": Step 3b's {0,0} stamp did not survive the reload itself";
+  }
+
+  // One real, journaled write per shard -- the only thing that ever calls MvccStamper::Commit().
+  for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+    std::string trigger;
+    for (int i = 0;; ++i) {
+      CHECK_LT(i, 10000) << "could not find a trigger key hashing to shard " << target_shard;
+      trigger = absl::StrCat("trigger", i);
+      if (Shard(trigger, num_shards) == target_shard)
+        break;
+    }
+    Run({"set", trigger, "v"});
+    auto trigger_stamp = StampOf(trigger);
+    ASSERT_TRUE(trigger_stamp.has_value()) << trigger;
+    EXPECT_FALSE(trigger_stamp->Empty())
+        << trigger << ": the triggering write itself must still get a real stamp";
+  }
+
+  for (const auto& key : reload_keys) {
+    auto st = StampOf(key);
+    ASSERT_TRUE(st.has_value()) << key;
+    EXPECT_TRUE(st->Empty())
+        << key
+        << ": a reloaded key's {0,0} stamp was clobbered by a later, unrelated write -- "
+           "its arm leaked past the load and got picked up by that write's Commit()";
+  }
+}
+
+// drakeydb: Phase 4, P4-1 Task 11 -- DEBUG MVCC, modelled on DebugCmd::Inspect's shard-hop.
+TEST_F(MvccStoreTest, DebugMvccReportsValueState) {
+  Run({"set", "k", "v"});
+  auto resp = Run({"debug", "mvcc", "k"});
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("state:value"));
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("mvcc:"));
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("origin:"));
+}
+
+TEST_F(MvccStoreTest, DebugMvccReportsAbsent) {
+  EXPECT_THAT(Run({"debug", "mvcc", "nope"}).GetString(), testing::HasSubstr("state:absent"));
+}
+
+TEST_F(MvccStoreTest, DebugMvccVerifyReportsZeroMismatches) {
+  for (int i = 0; i < 50; ++i)
+    Run({"set", absl::StrCat("k", i), "v"});
+  EXPECT_THAT(Run({"debug", "mvcc", "verify"}).GetString(), testing::HasSubstr("mismatches:0"));
+}
+
+// Not part of D9's acceptance test, but the third produced interface (alongside <key> and
+// VERIFY above) -- covered here so a crash or empty-reply regression in the aggregate path
+// doesn't first surface in production INFO/ops usage.
+TEST_F(MvccStoreTest, DebugMvccWithNoKeyReportsPerShardAggregates) {
+  Run({"set", "k", "v"});
+  auto resp = Run({"debug", "mvcc"});
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_entries:"));
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_clock_ahead_ms:"));
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_unstamped_writes:"));
+}
+
+// The "off means byte-identical to upstream" guard.
+TEST_F(BaseFamilyTest, NonActiveModeAllocatesNoMvccTable) {
+  Run({"set", "k", "v"});
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_table_bytes, 0u)
+      << "a non-active node must pay nothing for MVCC";
+}
+
+// drakeydb: Phase 4, P4-1 Task 11 -- DEBUG, not DFLY (see debugcmd.cc's DebugCmd::Mvcc comment):
+// must refuse by naming the flag rather than reporting a bare state:absent for every key, which
+// would be indistinguishable from a real absence.
+TEST_F(BaseFamilyTest, DebugMvccIsRefusedWhenInactive) {
+  auto resp = Run({"debug", "mvcc", "k"});
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("active_replica"))
+      << "must explain itself rather than reporting a bare absent";
 }
 
 namespace {
@@ -1470,9 +2856,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteCarriesDerivedFlag) {
   // applied to whole-key expiry).
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100);
   });
 
@@ -1598,9 +2982,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperCoversSetWithNotYetDueWholeKey
 
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 
@@ -1621,9 +3003,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperCoversHashWithNotYetDueWholeKe
 
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 
@@ -1789,9 +3169,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
     {
       journal::DisableFlushGuard guard(shard->journal());
       absl::SetFlag(&FLAGS_active_replica, true);
-      DbContext db_cntx;
-      db_cntx.db_index = 0;
-      db_cntx.time_now_ms = TEST_current_time_ms;
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
       db_slice.DeleteExpiredStep(db_cntx, 100);
       absl::SetFlag(&FLAGS_active_replica, false);
     }
@@ -1818,9 +3196,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
   absl::SetFlag(&FLAGS_active_replica, true);
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100);
   });
   absl::SetFlag(&FLAGS_active_replica, false);
@@ -1906,9 +3282,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
       // This call must still skip "bighash" entirely, since a snapshot consumer is registered
       // for its whole duration.
       absl::SetFlag(&FLAGS_active_replica, true);
-      DbContext db_cntx;
-      db_cntx.db_index = 0;
-      db_cntx.time_now_ms = TEST_current_time_ms;
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
       db_slice.DeleteExpiredStep(db_cntx, 100);
       absl::SetFlag(&FLAGS_active_replica, false);
     }
@@ -1944,9 +3318,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
   absl::SetFlag(&FLAGS_active_replica, true);
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
   absl::SetFlag(&FLAGS_active_replica, false);
@@ -1998,10 +3370,35 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
 // kFields, so this test asserts what it says it asserts regardless of the flag's current default.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
   constexpr int kFields = 2000;
-  const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
-  absl::SetFlag(&FLAGS_reaper_member_walk_budget, 100000);
-  absl::Cleanup restore_walk_budget = [saved_walk_budget] {
-    absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+
+  // drakeydb: fix round 3 (R6) -- pauses the background heartbeat's own member-expiry reaper for
+  // this whole test, restored via Cleanup, mirroring
+  // MemberExpiryReaperDoesNotBlockOnConcurrentBgsave's established pattern above in this file.
+  // EngineShard::Heartbeat computes
+  // `member_reap_active = IsActiveReplica()` and folds it into ttl_key_count -- forced to 0 when
+  // false -- so with no whole-key-TTL'd key anywhere in this (single-shard, per
+  // ReaperJournalFamilyTest's ctor) test, `if (ttl_key_count > 0)` is false and the heartbeat
+  // never calls DeleteExpiredStep at all while this is off. DeleteExpiredStep (db_slice.cc) reads
+  // `reap_member_expiry = IsActiveReplica()` itself, live, at the top of every call and gates the
+  // member-walk block on it directly (`if (reap_member_expiry && walk_budget != 0 && ...)`,
+  // db_slice.cc) -- not cached the way mvcc_enabled_ is -- so re-enabling it only around the
+  // manual call below (inside its own dispatched callback -- see that callback's own comment for
+  // why it is not bracketed here instead) is what lets that call, and only that call, actually
+  // reap.
+  //
+  // A first attempt at this fix only scoped the elevated FLAGS_reaper_member_walk_budget below to
+  // this measurement window (still worth keeping, see its own comment) without touching
+  // active_replica, on the theory that the heartbeat could only fully steal the measurement while
+  // the budget was elevated. Verified insufficient by repeated runs, not assumed: 3 of 30 runs
+  // still failed, now with a PARTIAL steal --
+  // `reported_deleted_bytes: Which is: 218528` against `before - after: Which is: 260464` --
+  // because RunBriefInParallel's own dispatch below is itself a yield point, and the heartbeat
+  // could still interleave inside the narrowed window (task-10-report.md fix round 3). Suppressing
+  // the heartbeat's walk at its source removes the race instead of narrowing it.
+  const bool saved_active_replica = absl::GetFlag(FLAGS_active_replica);
+  absl::SetFlag(&FLAGS_active_replica, false);
+  absl::Cleanup restore_active_replica = [saved_active_replica] {
+    absl::SetFlag(&FLAGS_active_replica, saved_active_replica);
   };
 
   vector<string> hset_args{"hset", "bighash"};
@@ -2021,15 +3418,36 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
 
   size_t before = GetMetrics().db_stats[0].obj_memory_usage;
 
+  // Elevated so the manual call below completes the whole reap in its own single pass instead of
+  // being bounded by the ambient default (300, db_slice.cc's ABSL_FLAG) -- unrelated to the
+  // active_replica toggle above, which is what actually prevents the heartbeat from racing it.
+  const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+  absl::SetFlag(&FLAGS_reaper_member_walk_budget, 100000);
+  absl::Cleanup restore_walk_budget = [saved_walk_budget] {
+    absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+  };
+
   size_t reported_deleted_bytes = 0;
   shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    // drakeydb: fix round 3 (R6) -- the flag toggle lives INSIDE this dispatched callback, not
+    // around the RunBriefInParallel call (a first attempt at that placement, verified
+    // insufficient by repeated runs: still 1 of 30 failures, task-10-report.md fix round 3).
+    // RunBriefInParallel's own dispatch to this shard's fiber queue is itself a yield/scheduling
+    // point from the calling (main test) fiber's perspective -- toggling the flag before that
+    // dispatch leaves a window, between the toggle and this callback actually starting to run on
+    // the shard's own thread, where the background heartbeat (also on this thread) could already
+    // be scheduled and win the race with active_replica now true. Toggling here, immediately
+    // before and after the one call that needs it, with no yield point anywhere in between (this
+    // callback's only statement that could yield is the DeleteExpiredStep call itself, and its
+    // container walk was already established to be non-preempting -- see the P4-0 Task 2b
+    // comments a few dozen lines up in db_slice.cc), removes that specific window.
+    absl::SetFlag(&FLAGS_active_replica, true);
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     // count=100000 bounds the outer prime-table traversal, not the reaper's own per-container
     // walk -- see this test's comment above for why that distinction matters here.
     reported_deleted_bytes = db_slice.DeleteExpiredStep(db_cntx, 100000).deleted_bytes;
+    absl::SetFlag(&FLAGS_active_replica, false);
   });
 
   size_t after = GetMetrics().db_stats[0].obj_memory_usage;
@@ -2092,9 +3510,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotSpuriouslyAbortWatch) {
 
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 
@@ -2137,9 +3553,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperClearedFlagSurvivesRdbRoundTri
   // to finish in one pass -- so this call reports (and acts on) a complete, clean pass.
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 
@@ -2173,9 +3587,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperUnclearedFlagPreservesTtlAcros
 
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 

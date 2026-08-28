@@ -95,6 +95,21 @@ class BaseFamilyTest : public ::testing::Test {
 
   RespExpr Run(std::string_view command);
 
+  // drakeydb: Phase 4, review fix round 1 -- Run(std::string_view, ArgSlice) always resets the
+  // dispatching connection's namespace to the default one before every command (test_utils.cc),
+  // which makes it impossible to exercise a non-default-namespace write end to end (e.g. via
+  // AUTH against an ACL user with a NAMESPACE: directive) through the ordinary Run() helpers --
+  // confirmed the hard way while writing
+  // MvccStoreTest.NonDefaultNamespaceWriteLeavesNoStampAnywhere (multi_master_test.cc), which needs
+  // exactly that. Mirrors Run(id, slice)'s dispatch with the namespace as a parameter instead of
+  // hardcoded to GetDefaultNamespace() -- NOT verbatim, and deliberately narrower: it omits
+  // Run(id, slice)'s post-dispatch EVAL/EVALSHA/EVAL_RO/EVALSHA_RO/EXEC ->
+  // shard_set->AwaitRunningOnShardQueue() drain for async UnlockMulti (test_utils.cc), and its
+  // first DCHECK(context->transaction == nullptr) drops Run(id, slice)'s `<< id`. Both are
+  // harmless for this task's plain SET/GET callers; add the drain here before reusing this for a
+  // multi/scripting test.
+  RespExpr RunViaNamespace(Namespace* ns, ArgSlice list);
+
   void RunMany(const std::vector<std::vector<std::string>>& cmds);
 
   using MCResponse = std::vector<std::string>;
