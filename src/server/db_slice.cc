@@ -1381,10 +1381,13 @@ void DbSlice::EraseMvcc(DbIndex db_ind, const PrimeKey& key) {
 
 // drakeydb: Phase 4, P4-1 Task 8 -- same F4 split as SetMvcc's string_view overload above: this
 // skips the PrimeKey overload's GetSlice() scratch-copy, which CompactObj::GetSlice
-// (compact_object.cc) can allocate for encoded/small-tag keys. PerformDeletionAtomic (db_slice.cc)
-// is the motivating caller -- it already holds a free string_view, del_it.key(), one line above
-// its EraseMvcc call (in the Disarm() call), so there was never a reason to pay for a PrimeKey
-// round-trip there. Find() takes a string_view directly, exactly like GetMvcc above already does.
+// (compact_object.cc) can allocate for encoded/small-tag/int-tag keys (fix round 3, R7: INT_TAG
+// added here too, alongside rdb_load.cc's sibling comment on Step 3b's SetMvcc call -- reachable
+// for a 17-20 char numeric key over CompactObj::kInlineLen == 16, not just the encoded/SMALL_TAG
+// cases this comment used to name alone). PerformDeletionAtomic (db_slice.cc) is the motivating
+// caller -- it already holds a free string_view, del_it.key(), one line above its EraseMvcc call
+// (in the Disarm() call), so there was never a reason to pay for a PrimeKey round-trip there.
+// Find() takes a string_view directly, exactly like GetMvcc above already does.
 void DbSlice::EraseMvcc(DbIndex db_ind, string_view key) {
   auto& db = *db_arr_[db_ind];
   if (!db.mvcc)

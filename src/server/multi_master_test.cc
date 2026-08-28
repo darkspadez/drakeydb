@@ -3027,10 +3027,35 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
 // kFields, so this test asserts what it says it asserts regardless of the flag's current default.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
   constexpr int kFields = 2000;
-  const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
-  absl::SetFlag(&FLAGS_reaper_member_walk_budget, 100000);
-  absl::Cleanup restore_walk_budget = [saved_walk_budget] {
-    absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+
+  // drakeydb: fix round 3 (R6) -- pauses the background heartbeat's own member-expiry reaper for
+  // this whole test, restored via Cleanup, mirroring
+  // MemberExpiryReaperDoesNotBlockOnConcurrentBgsave's established pattern above in this file.
+  // EngineShard::Heartbeat computes
+  // `member_reap_active = IsActiveReplica()` and folds it into ttl_key_count -- forced to 0 when
+  // false -- so with no whole-key-TTL'd key anywhere in this (single-shard, per
+  // ReaperJournalFamilyTest's ctor) test, `if (ttl_key_count > 0)` is false and the heartbeat
+  // never calls DeleteExpiredStep at all while this is off. DeleteExpiredStep (db_slice.cc) reads
+  // `reap_member_expiry = IsActiveReplica()` itself, live, at the top of every call and gates the
+  // member-walk block on it directly (`if (reap_member_expiry && walk_budget != 0 && ...)`,
+  // db_slice.cc) -- not cached the way mvcc_enabled_ is -- so re-enabling it only around the
+  // manual call below (inside its own dispatched callback -- see that callback's own comment for
+  // why it is not bracketed here instead) is what lets that call, and only that call, actually
+  // reap.
+  //
+  // A first attempt at this fix only scoped the elevated FLAGS_reaper_member_walk_budget below to
+  // this measurement window (still worth keeping, see its own comment) without touching
+  // active_replica, on the theory that the heartbeat could only fully steal the measurement while
+  // the budget was elevated. Verified insufficient by repeated runs, not assumed: 3 of 30 runs
+  // still failed, now with a PARTIAL steal --
+  // `reported_deleted_bytes: Which is: 218528` against `before - after: Which is: 260464` --
+  // because RunBriefInParallel's own dispatch below is itself a yield point, and the heartbeat
+  // could still interleave inside the narrowed window (task-10-report.md fix round 3). Suppressing
+  // the heartbeat's walk at its source removes the race instead of narrowing it.
+  const bool saved_active_replica = absl::GetFlag(FLAGS_active_replica);
+  absl::SetFlag(&FLAGS_active_replica, false);
+  absl::Cleanup restore_active_replica = [saved_active_replica] {
+    absl::SetFlag(&FLAGS_active_replica, saved_active_replica);
   };
 
   vector<string> hset_args{"hset", "bighash"};
@@ -3050,8 +3075,30 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
 
   size_t before = GetMetrics().db_stats[0].obj_memory_usage;
 
+  // Elevated so the manual call below completes the whole reap in its own single pass instead of
+  // being bounded by the ambient default (300, db_slice.cc's ABSL_FLAG) -- unrelated to the
+  // active_replica toggle above, which is what actually prevents the heartbeat from racing it.
+  const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
+  absl::SetFlag(&FLAGS_reaper_member_walk_budget, 100000);
+  absl::Cleanup restore_walk_budget = [saved_walk_budget] {
+    absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
+  };
+
   size_t reported_deleted_bytes = 0;
   shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    // drakeydb: fix round 3 (R6) -- the flag toggle lives INSIDE this dispatched callback, not
+    // around the RunBriefInParallel call (a first attempt at that placement, verified
+    // insufficient by repeated runs: still 1 of 30 failures, task-10-report.md fix round 3).
+    // RunBriefInParallel's own dispatch to this shard's fiber queue is itself a yield/scheduling
+    // point from the calling (main test) fiber's perspective -- toggling the flag before that
+    // dispatch leaves a window, between the toggle and this callback actually starting to run on
+    // the shard's own thread, where the background heartbeat (also on this thread) could already
+    // be scheduled and win the race with active_replica now true. Toggling here, immediately
+    // before and after the one call that needs it, with no yield point anywhere in between (this
+    // callback's only statement that could yield is the DeleteExpiredStep call itself, and its
+    // container walk was already established to be non-preempting -- see the P4-0 Task 2b
+    // comments a few dozen lines up in db_slice.cc), removes that specific window.
+    absl::SetFlag(&FLAGS_active_replica, true);
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
     DbContext db_cntx;
     db_cntx.db_index = 0;
@@ -3059,6 +3106,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
     // count=100000 bounds the outer prime-table traversal, not the reaper's own per-container
     // walk -- see this test's comment above for why that distinction matters here.
     reported_deleted_bytes = db_slice.DeleteExpiredStep(db_cntx, 100000).deleted_bytes;
+    absl::SetFlag(&FLAGS_active_replica, false);
   });
 
   size_t after = GetMetrics().db_stats[0].obj_memory_usage;

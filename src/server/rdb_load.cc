@@ -3283,15 +3283,17 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   // drakeydb: fix round 1 (F5) -- the string_view overload, with item->key (already a stable
   // std::string on this const Item*, no copy), not the PrimeKey overload used above for
   // SetMCFlag. The PrimeKey overload's own GetSlice(&scratch) call (db_slice.cc) can allocate for
-  // a key over CompactObj::kInlineLen -- true for the encoding_ and SMALL_TAG cases
-  // (CompactObj::GetSlice, compact_object.cc), corrected in fix round 2 (R3) from this comment's
-  // original overstatement ("any key... unconditionally"): LARGE_STR_TAG and SDS_TTL_TAG return a
-  // view with no copy, so it is not every over-kInlineLen key, just some of them -- and on every
-  // node including non-active ones regardless of which case applies, since whatever allocation
-  // does happen is in the outer overload, before the inner overload's `if (!db.mvcc) return;`
-  // guard ever runs. The prior claim here ("costs one predictable branch") was true of the guard
-  // but not of the call as originally written, which paid for that outer round-trip -- allocating
-  // or not, depending on tag -- regardless of mvcc_enabled(). See task-10-report.md fix round 1.
+  // a key over CompactObj::kInlineLen -- true for the encoding_, SMALL_TAG, and INT_TAG cases
+  // (CompactObj::GetSlice, compact_object.cc -- INT_TAG added in fix round 3, R7: reachable for a
+  // 17-20 char numeric key over kInlineLen == 16, missed in fix round 2's own correction of this
+  // comment), corrected in fix round 2 (R3) from this comment's original overstatement ("any
+  // key... unconditionally"): LARGE_STR_TAG and SDS_TTL_TAG return a view with no copy, so it is
+  // not every over-kInlineLen key, just some of them -- and on every node including non-active
+  // ones regardless of which case applies, since whatever allocation does happen is in the outer
+  // overload, before the inner overload's `if (!db.mvcc) return;` guard ever runs. The prior
+  // claim here ("costs one predictable branch") was true of the guard but not of the call as
+  // originally written, which paid for that outer round-trip -- allocating or not, depending on
+  // tag -- regardless of mvcc_enabled(). See task-10-report.md fix round 1.
   db_slice->SetMvcc(db_cntx.db_index, item->key, MvccStamp{});
 
   if (!override_existing_keys_ && !updater.is_new) {
@@ -3355,16 +3357,27 @@ void RdbLoader::LoadItemsBuffer(const ItemsBuf& ib) {
     // forbids, and it would do so silently: TEST_VerifyMvccTable/OnCbFinishBlocking only check
     // density (one stamp per key), not correctness of the stamp's value.
     //
-    // Per item, not batched once after the loop -- but NOT because it closes the tiered-storage
-    // yield window (fix round 2, R1, corrects this: it does not, and CreateObjectOnShard's own
-    // explicit EndOfWriteEpoch call, right after that arm, is what actually closes it). This
-    // call's job is bounding accumulation across items in this loop: without it, items
-    // 1..N-1's arms would still be outstanding by the time some LATER item N in this same batch
-    // reaches that same tiered-storage branch and yields, putting them at risk of being picked up
-    // by a concurrent commit alongside item N's own arm (which, by then, is already closed at its
-    // source). Gated on mvcc_enabled() like every other EndOfWriteEpoch call site (transaction.cc)
-    // to skip the thread_local guard check when this node is not active. See task-10-report.md
-    // fix round 1 (F2) for how this was verified before being fixed, and its regression test.
+    // Per item, not batched once after the loop. NOT because it closes the tiered-storage yield
+    // window: fix round 2 (R1) already closes that at its source, inside CreateObjectOnShard,
+    // immediately after that item's own arm -- by the time any item reaches that yield, armed_ is
+    // already empty, items 1..N-1 included, since R1's call there clears the whole vector, not
+    // just the current item's entry. Fix round 3 (R5) corrects an earlier version of this comment
+    // that gave that reason; it does not hold, foreclosed by R1 itself.
+    //
+    // The real reason: DbSlice::AddOrFindInternal (db_slice.cc) calls CallChangeCallbacks
+    // (db_slice.cc:917) whenever change_cb_ is non-empty (e.g. a concurrent snapshot/consumer is
+    // registered) -- a genuine preemption point, annotated "// blocking point." at its sibling
+    // call in PreUpdateBlocking (db_slice.cc:1619) -- and it runs inside AddOrUpdate, before THIS
+    // item's own PostUpdate/Arm ever fires (Arm happens later: either the AutoUpdater's
+    // destructor at the end of CreateObjectOnShard, or the explicit Run() in the tiered-storage
+    // branch above -- both strictly after AddOrUpdate, hence after AddOrFindInternal, returns).
+    // So if this per-item call were removed and batched instead, items 1..N-1's arms -- correctly
+    // armed by their own earlier iterations, not yet cleared -- would still be outstanding when
+    // item N's own AddOrUpdate call hits that preemption point, exposing them to a concurrent
+    // journaled write's Commit() before item N has armed anything of its own. Gated on
+    // mvcc_enabled() like every other EndOfWriteEpoch call site (transaction.cc) to skip the
+    // thread_local guard check when this node is not active. See task-10-report.md fix round 1
+    // (F2) for how this was verified before being fixed, and its regression test.
     //
     // drakeydb: fix round 2 (R4) -- known limitation, documented here and in task-10-report.md,
     // not fixed this round (gating the loader on running_tx_, or scoping epoch-end per-fiber, is
