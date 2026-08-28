@@ -202,6 +202,10 @@ class DbSlice {
     void ResyncBaseline();
 
     void Run();
+    // Finalizes accounting, notifications, and indexes without joining the MVCC arm/commit
+    // protocol. RDB loading uses this after installing its explicit {0,0} fallback stamp: a load
+    // is carried by the snapshot itself and has no COMMAND journal entry to commit an arm.
+    void RunWithoutMvccArm();
     void Cancel();
 
    private:
@@ -223,6 +227,7 @@ class DbSlice {
     };
 
     AutoUpdater(DbIndex db_ind, std::string_view key, const Iterator& it, DbSlice* db_slice);
+    void RunInternal(bool arm_mvcc);
 
     friend class DbSlice;
 
@@ -354,9 +359,15 @@ class DbSlice {
     return mvcc_enabled_;
   }
   void SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stamp);
-  // drakeydb: Phase 4, review fix round 1 (F4) -- avoids the PrimeKey round-trip for callers that
-  // already have a string_view (e.g. journal::RecordEntry's commit callback). See db_slice.cc.
+  // Avoids the PrimeKey round-trip for callers that already have a string_view, notably the RDB
+  // loader's explicit {0,0} fallback and tests. See db_slice.cc.
   void SetMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
+  // Ensures a zero-authority slot exists before the write enters the journal. Does not overwrite
+  // an existing stamp. This is the only allocation-capable half of journal-driven stamping.
+  void EnsureMvcc(DbIndex db_ind, std::string_view key);
+  // Updates a slot prepared by EnsureMvcc. This is called only after AddLogRecord and therefore
+  // must remain allocation-free; a missing slot is a fatal invariant violation.
+  void SetExistingMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
   // drakeydb: Phase 4, P4-1 Task 8 -- same F4 split as SetMvcc above, for the same reason:
@@ -639,7 +650,7 @@ class DbSlice {
   friend class ReaperJournalFamilyTest;
 
   void PreUpdateBlocking(DbIndex db_ind, const Iterator& it);
-  void PostUpdate(DbIndex db_ind, std::string_view key);
+  void PostUpdate(DbIndex db_ind, std::string_view key, bool arm_mvcc);
 
   OpResult<ItAndUpdater> AddOrUpdateInternal(const Context& cntx, std::string_view key,
                                              PrimeValue obj, uint64_t expire_at_ms,

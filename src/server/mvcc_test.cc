@@ -285,6 +285,17 @@ TEST(MvccStamperTest, HopStampReMintsPastStaleEpochBackstop) {
       << "a missed EndOfWriteEpoch must be visible in stats, not silently absorbed";
 }
 
+TEST(MvccStamperTest, HopStampReMintsWhenWallClockStepsBackward) {
+  MvccStamper* s = FreshStamper();
+  const uint64_t first = s->HopStamp(10'000);
+  const uint64_t after_rollback = s->HopStamp(9'000);
+
+  EXPECT_GT(after_rollback, first)
+      << "a clock rollback must end the memoized epoch while MvccClock preserves monotonicity";
+  EXPECT_EQ(s->stats().stale_epoch, 1u)
+      << "the rollback-triggered remint must be visible through the stale-epoch canary";
+}
+
 TEST(MvccStamperTest, PeerMvccIsNeverReminted) {
   MvccStamper* s = FreshStamper();
   Recorder rec;

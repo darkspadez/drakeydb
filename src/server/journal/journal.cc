@@ -4,8 +4,6 @@
 
 #include "server/journal/journal.h"
 
-#include <new>
-
 #include "base/logging.h"
 #include "server/common.h"
 #include "server/db_slice.h"
@@ -123,52 +121,26 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
   journal_slice.AddLogRecord(entry);
 
   // drakeydb: Phase 4 -- commit AFTER the entry is durable, so a key is only stamped once its
-  // entry has actually joined the journal on its way to peers. entry.mvcc is always non-zero by
-  // this point (freshly minted just above, or supplied non-zero by the caller -- an applied
-  // write's verbatim author stamp, kept as-is or stamps would inflate on every hop) -- Commit()
-  // DCHECKs this and has no clock of its own, so there is no now_ms to pass here. Gating on
-  // Op::COMMAND excludes SELECT/PING/LSN/ORIGIN.
+  // entry has actually joined the journal on its way to peers. DbSlice::PostUpdate prepared a
+  // zero-authority side-table slot before arming each key, so the callback below performs only a
+  // lookup and assignment: no allocation-capable operation remains after AddLogRecord. entry.mvcc
+  // is always non-zero by this point (freshly minted just above, or supplied non-zero by the
+  // caller -- an applied write's verbatim author stamp, kept as-is or stamps would inflate on
+  // every hop). Commit DCHECKs this and has no clock of its own, so there is no now_ms to pass
+  // here. Gating on Op::COMMAND excludes SELECT/PING/LSN/ORIGIN.
   //
-  // drakeydb: Phase 4, review fix round 1 (F1) -- the commit target is always
-  // GetDefaultNamespace(): the journal has no namespace identity on the wire, and armed_ (mvcc.h)
-  // carries no namespace either, so this callback has no way to route a non-default-namespace
-  // key to its actual DbSlice even if one were armed. That is exactly why DbSlice::PostUpdate
-  // gates arming to the default namespace only (see its comment) -- by the time Commit() runs
-  // here, every armed key is guaranteed to belong to the default namespace, so this lookup is
-  // correct by construction, not by the (previously wrong) claim that "the journal only ever
-  // carries the default namespace" -- ACL-namespaced writes ARE real commands that reach this
-  // function; they are simply never armed in the first place. Looked up once, not once per armed
-  // key inside the CommitFn, since a single journal entry can arm many keys (e.g. MSET).
+  // The commit target is always the default namespace because the wire carries no namespace
+  // identity. Transaction::LogJournalOnShard and the DbContext-based delete helpers reject
+  // non-default namespaces before they reach RecordEntry; DbSlice::PostUpdate applies the same
+  // boundary before arming. Looked up once, not once per armed key, since a single journal entry
+  // can arm many keys (for example MSET).
   if (MvccEnabled() && opcode == Op::COMMAND) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
-    // drakeydb: Phase 4, review fix round 1 (F3) -- contained locally, not for the odds (SetMvcc's
-    // side-table Insert can only fail via genuine OS allocation failure: DefaultEvictionPolicy's
-    // CanGrow always returns true, so maxmemory pressure can't reach it) but for the consequence
-    // of letting it escape uncaught: this call runs from LogAutoJournalOnShard, in
-    // Transaction::RunCallback's tail, OUTSIDE the try/catch that wraps only the command callback
-    // -- an uncaught throw here would skip shard->set_running_tx(nullptr) and permanently wedge
-    // the shard (PollExecution and Heartbeat both refuse to proceed while running_tx_ is set;
-    // engine_shard.cc). MvccStamper::Commit's own absl::Cleanup has already restored commit_depth_
-    // to 0 and cleared armed_/arena_ by the time this catch runs (Task 7's throw-safety decision),
-    // so the stamper itself is left consistent -- the affected keys simply stay unstamped, the
-    // safe direction for the phase's central invariant.
-    try {
-      MvccStamper::tlocal()->Commit(
-          entry.mvcc, entry.origin_idx,
-          [&db_slice](DbIndex db, std::string_view key, const MvccStamp& st) {
-            // drakeydb: Phase 4, review fix round 1 (F4) -- string_view overload, not
-            // SetMvcc(db, PrimeKey{key}, st): key is already a string_view (it was armed as one
-            // in PostUpdate and stored verbatim in MvccStamper's arena), so routing it through a
-            // freshly-constructed PrimeKey here cost three allocations per key per write for
-            // nothing (PrimeKey{key}'s own allocation for keys > its inline capacity, then
-            // PrimeKey::GetSlice back out to a string_view, then Dash re-encoding that string_view
-            // a third time) on the hottest shared path in the server. See db_slice.cc's SetMvcc
-            // overload comment.
-            db_slice.SetMvcc(db, key, st);
-          });
-    } catch (const std::bad_alloc&) {
-      LOG_EVERY_T(ERROR, 1) << "mvcc commit OOM -- key(s) left unstamped";
-    }
+    MvccStamper::tlocal()->Commit(
+        entry.mvcc, entry.origin_idx,
+        [&db_slice](DbIndex db, std::string_view key, const MvccStamp& st) {
+          db_slice.SetExistingMvcc(db, key, st);
+        });
   }
 }
 

@@ -1723,6 +1723,14 @@ void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult resul
 }
 
 void Transaction::LogJournalOnShard(journal::Entry::Payload&& payload) const {
+  // The journal wire has no namespace identity and JournalExecutor applies every COMMAND to the
+  // default namespace. Serializing an ACL-namespaced write would therefore leak it into a
+  // different tenant on every replica. Non-default namespaces are local-only until the wire can
+  // carry and authenticate their identity.
+  DCHECK(namespace_ != nullptr);
+  if (namespace_ != &namespaces->GetDefaultNamespace())
+    return;
+
   // drakeydb: Phase 3 -- stamp this transaction's replication-apply origin (kSelfIdx/0 for an
   // ordinary client transaction) onto the recorded entry.
   journal::RecordEntry(txid_, journal::Op::COMMAND, db_index_,

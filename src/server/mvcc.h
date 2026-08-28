@@ -139,10 +139,12 @@ class MvccStamper {
   void RegisterOriginHash(uint32_t origin_idx, uint64_t hash);
   uint64_t OriginHash(uint32_t origin_idx) const;
 
-  // Stable for the whole shard callback: repeated calls with a non-decreasing now_ms return the
-  // same value until the memo is older than kMaxEpochMs, or EndOfWriteEpoch() resets it. Takes
-  // the time as a parameter -- like MvccClock::Next/AheadMs -- so dfly_transaction never reaches
-  // up into dragonfly_lib for GetCurrentTimeMs; callers (Task 7's journal.cc) pass it explicitly.
+  // Stable for the whole shard callback: repeated calls return the same value until the memo is
+  // older than kMaxEpochMs, the wall clock moves backward, or EndOfWriteEpoch() resets it. Memo
+  // age is tracked separately from the logical stamp: MvccClock may deliberately ratchet its
+  // stamp ahead of wall time. Takes time as a parameter -- like MvccClock::Next/AheadMs -- so
+  // dfly_transaction never reaches up into dragonfly_lib for GetCurrentTimeMs; callers (Task 7's
+  // journal.cc) pass it explicitly.
   uint64_t HopStamp(uint64_t now_ms);
 
   // May be called more than once for the same (db_index, key) within one callback -- a command
@@ -181,20 +183,6 @@ class MvccStamper {
     return clock_;
   }
 
-  // drakeydb: Phase 4, P4-1 Task 10 -- read-only probe for the narrow window where this epoch's
-  // arms exist but have not been committed (Commit()) or discarded (EndOfWriteEpoch()) yet.
-  // DbSlice::OnCbFinishBlocking (db_slice.cc) is the sole caller: it runs between a shard
-  // callback's own PostUpdate arms and LogAutoJournalOnShard's later Commit call --
-  // transaction.cc's RunCallback says so explicitly ("not inside OnCbFinishBlocking, which runs
-  // before the journal entry exists") -- so a same-callback dense-table check must skip while
-  // this is true, or it DCHECKs on every single write (observed: task-10-report.md). Never masks
-  // a real leak from an earlier, already-finished callback: EndOfWriteEpoch() unconditionally
-  // clears armed_ before RunCallback returns, so a non-empty armed_ can only belong to the
-  // callback that is, right now, still finishing.
-  bool HasArmedKeys() const {
-    return !armed_.empty();
-  }
-
   void TEST_Reset();
 
  private:
@@ -210,7 +198,8 @@ class MvccStamper {
 
   MvccClock clock_;
   uint64_t hop_stamp_ = 0;
-  std::string arena_;  // cleared, never shrunk, so steady-state arming does not allocate
+  uint64_t hop_started_ms_ = 0;  // wall-time observation used only to age hop_stamp_
+  std::string arena_;            // cleared, never shrunk, so steady-state arming does not allocate
   // std::vector, not absl::InlinedVector: InlinedVector::clear() frees (DeallocateIfAllocated())
   // and reverts to inline storage, so any callback arming more than 4 keys would allocate on the
   // 5th arm and free on every single Commit/EndOfWriteEpoch, forever. std::vector::clear() keeps

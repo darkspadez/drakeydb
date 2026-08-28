@@ -753,7 +753,8 @@ void DebugCmd::Run(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
         "    origin:<hex16> shard:<n>' (no counter: field), or 'state:absent shard:<n>'. With no",
         "    key, prints per-shard aggregates (entries/tombstones/bytes/clock_last/clock_ahead_ms/",
         "    unstamped_writes). VERIFY runs the from-scratch dense-invariant check on every shard",
-        "    and every db, returning 'mismatches:<n>'. Errors naming --active_replica when off.",
+        "    and every db, returning 'mismatches:<n>'. Supported only in the default namespace;",
+        "    errors name --active_replica when the feature is off.",
         "HELP",
         "    Prints this help.",
     };
@@ -1293,18 +1294,9 @@ void DebugCmd::Inspect(string_view key, facade::CmdArgParser parser, CommandCont
 // (table.h), so every key would otherwise read back state:absent -- indistinguishable from a
 // real absence and silently misleading about why.
 //
-// drakeydb: Task 11 fix round 1 (F3, Minor) -- that same "state:absent looks like a real absence"
-// failure mode is NOT fully closed by the gate above: it resurfaces, --active_replica notwith-
-// standing, for a caller in a non-default ACL namespace. Arming (DbSlice::PostUpdate) is gated to
-// the default namespace only (see the F1 gate's own comment on that call site, db_slice.cc), so a
-// non-default namespace has a populated prime table and a permanently empty mvcc table -- <key>
-// reports state:absent for a live key, the no-key aggregate reads all zeros, and VERIFY returns a
-// vacuous mismatches:0 (TEST_VerifyMvccTable short-circuits there too, same file). This command
-// resolves cntx_->ns, the caller's own namespace, for all three forms -- deliberately not special-
-// cased here, since faithfully reflecting "this namespace never gets stamps" is correct given the
-// current design; flagging in the comment rather than fixing since a real fix (arm every
-// namespace, or refuse non-default namespaces here) is a design decision outside this task's
-// scope.
+// Non-default ACL namespaces are local-only because the journal wire has no namespace identity.
+// They therefore have no replicated MVCC state. Refuse all forms rather than reporting a live
+// key as state:absent, zero aggregates, or a vacuous successful VERIFY.
 void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
 
@@ -1312,6 +1304,10 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
     return cmd_cntx->SendError(
         "DEBUG MVCC requires --active_replica -- the mvcc side table is not maintained without "
         "it");
+  }
+
+  if (cntx_->ns != &namespaces->GetDefaultNamespace()) {
+    return cmd_cntx->SendError("DEBUG MVCC is supported only in the default namespace");
   }
 
   if (parser.Check("VERIFY")) {

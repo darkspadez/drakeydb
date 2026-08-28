@@ -19,6 +19,15 @@ namespace dfly {
 using namespace std;
 using Payload = journal::Entry::Payload;
 
+namespace {
+
+bool IsDefaultNamespace(const DbContext& db_cntx) {
+  DCHECK(db_cntx.ns != nullptr);
+  return db_cntx.ns == &namespaces->GetDefaultNamespace();
+}
+
+}  // namespace
+
 unsigned KeyIndex::operator*() const {
   if (bonus)
     return *bonus;
@@ -70,6 +79,9 @@ void RecordDelete(DbIndex dbid, string_view key) {
 }
 
 void RecordDelete(const DbContext& db_cntx, string_view key) {
+  if (!IsDefaultNamespace(db_cntx))
+    return;
+
   // drakeydb: Phase 3 -- see the declaration in tx_base.h. origin_idx is one of two non-default
   // journal::RecordEntry args passed here; entry_flags stays 0 (this is never an expiry DEL).
   //
@@ -88,6 +100,9 @@ void RecordDelete(const DbContext& db_cntx, string_view key) {
 }
 
 void RecordDerivedDelete(const DbContext& db_cntx, string_view key) {
+  if (!IsDefaultNamespace(db_cntx))
+    return;
+
   // drakeydb: Phase 4, review wave 2 (F2, IMPORTANT) -- db_cntx.repl_mvcc, not a hardcoded 0; see
   // RecordDelete's comment above for the full argument (identical here, modulo kEntryFlagDerived).
   journal::RecordEntry(0, journal::Op::COMMAND, db_cntx.db_index, KeySlot(key),
@@ -96,6 +111,9 @@ void RecordDerivedDelete(const DbContext& db_cntx, string_view key) {
 }
 
 void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
+  if (!IsDefaultNamespace(db_cntx))
+    return;
+
   // drakeydb: Phase 3 -- see the declaration in tx_base.h. origin_idx stays default (0 ==
   // kSelfIdx; an expiry is always a local decision); entry_flags carries kEntryFlagExpired.
   //

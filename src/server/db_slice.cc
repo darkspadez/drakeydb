@@ -678,6 +678,14 @@ void DbSlice::AutoUpdater::ResyncBaseline() {
 }
 
 void DbSlice::AutoUpdater::Run() {
+  RunInternal(true);
+}
+
+void DbSlice::AutoUpdater::RunWithoutMvccArm() {
+  RunInternal(false);
+}
+
+void DbSlice::AutoUpdater::RunInternal(bool arm_mvcc) {
   if (fields_.db_slice == nullptr) {
     return;
   }
@@ -720,7 +728,7 @@ void DbSlice::AutoUpdater::Run() {
     --table->stats.member_expire_count;
   }
 
-  fields_.db_slice->PostUpdate(fields_.db_ind, fields_.key);
+  fields_.db_slice->PostUpdate(fields_.db_ind, fields_.key, arm_mvcc);
   Cancel();  // Reset to not run again
 }
 
@@ -1084,6 +1092,7 @@ void DbSlice::FlushSlotsFb(const cluster::SlotSet& slot_ids, uint64_t next_versi
   size_t memory_before = table->table_memory() + table->stats.obj_memory_usage;
 
   DbContext db_cntx;
+  db_cntx.ns = ns_;
   db_cntx.time_now_ms = GetCurrentTimeMs();
   db_cntx.db_index = table->index;
 
@@ -1173,6 +1182,7 @@ void DbSlice::FlushSlots(const cluster::SlotRanges& slot_ranges) {
         SlotId sid = KeySlot(key);
         if (shared_slots->Contains(sid) && it.GetVersion() < next_version) {
           DbContext cntx;
+          cntx.ns = ns_;
           cntx.time_now_ms = GetCurrentTimeMs();
           cntx.db_index = db_index;
           Del(cntx, Iterator::FromPrime(it), table.get(), false, DeleteReason::kSlotFlush);
@@ -1345,15 +1355,10 @@ void DbSlice::SetMvcc(DbIndex db_ind, const PrimeKey& key, const MvccStamp& stam
   SetMvcc(db_ind, key.GetSlice(&scratch), stamp);
 }
 
-// drakeydb: Phase 4, review fix round 1 (F4) -- journal::RecordEntry's commit callback already
-// holds a plain string_view (the key bytes it armed in DbSlice::PostUpdate); routing it through
-// the PrimeKey overload above cost three allocations per key per write for nothing: PrimeKey{key}
-// (allocates for keys > CompactObj::kInlineLen == 16, core/compact_object.h:154), then
-// key.GetSlice(&scratch) to get a string_view straight back out, then
-// db.mvcc->Insert(string_view, ...) re-encoding it a third time inside
-// Dash. This overload skips the PrimeKey round-trip entirely -- Insert already takes a
-// string_view, so there was never a reason to construct one at this call site. The PrimeKey
-// overload above is kept for callers that already have one on hand (e.g. tests).
+// Callers such as the RDB loader already hold a plain string_view. Routing it through the
+// PrimeKey overload above would allocate for some encoded keys, copy it back into a scratch
+// string, and then re-encode it inside Dash. This overload skips that round-trip; the PrimeKey
+// overload remains for callers that already have one on hand.
 void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
   auto& db = *db_arr_[db_ind];
   if (!db.mvcc)
@@ -1362,6 +1367,25 @@ void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
   it->second = stamp;
   if (inserted)
     ++db.stats.mvcc_entries;
+}
+
+void DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return;
+
+  bool inserted = db.mvcc->Insert(key, MvccStamp{}).second;
+  if (inserted)
+    ++db.stats.mvcc_entries;
+}
+
+void DbSlice::SetExistingMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
+  auto& db = *db_arr_[db_ind];
+  CHECK(db.mvcc != nullptr);
+  auto it = db.mvcc->Find(key);
+  CHECK(!it.is_done()) << "MVCC slot must be prepared before journal commit: db=" << db_ind
+                       << " key=" << key;
+  it->second = stamp;
 }
 
 optional<MvccStamp> DbSlice::GetMvcc(DbIndex db_ind, string_view key) const {
@@ -1624,7 +1648,7 @@ void DbSlice::PreUpdateBlocking(DbIndex db_ind, const Iterator& it) {
   inner_it.SetVersion(NextVersion());
 }
 
-void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key) {
+void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key, bool arm_mvcc) {
   // A blocked reader may watch this key expecting a different type, e.g. XREADGROUP when the
   // stream is overwritten by BITOP/RENAME/SUNIONSTORE. Let the readiness check re-evaluate it.
   if (auto* bc = ns_->GetBlockingController(owner_->shard_id());
@@ -1658,24 +1682,18 @@ void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key) {
   // armed key; the end of the shard callback discards whatever is still armed. That is what
   // enforces "a key's stamp advances iff that same stamp is propagated". See server/mvcc.h.
   //
-  // drakeydb: Phase 4, review fix round 1 (F1) -- gated to the default namespace only. The
-  // journal has no namespace identity on the wire (a non-default-namespace write, reachable via
-  // an ACL user's NAMESPACE: directive, is never journaled/propagated to any peer -- see
-  // ServerFamily::DoAuth's `cntx->ns = &namespaces->GetOrInsert(cred.ns)`), and
-  // MvccStamper::Armed carries only {db_index, offset, len}, no namespace, so journal::
-  // RecordEntry's commit callback has no way to route a non-default-namespace arm to its actual
-  // DbSlice -- it always writes into the DEFAULT namespace's side table (GetCurrentDbSlice()
-  // resolves via EngineShard::tlocal() only, not via any per-namespace identity carried by the
-  // arm). Arming a non-default-namespace write here would therefore make BOTH invariant
-  // directions fail at once: the key actually written (non-default) stays permanently unstamped,
-  // and an unrelated, never-written key of the same name in the DEFAULT namespace gets a phantom
-  // stamp with no corresponding journal entry -- exactly the dangerous "stamp but do not
-  // propagate" direction, and a side-table entry EraseMvcc will never clean up. Gating here
-  // (rather than in the commit callback, which cannot recover the namespace after the fact) is
-  // the only point that still knows which namespace this write belongs to, and is cheaper.
+  // Non-default ACL namespaces are local-only: the journal wire has no namespace identity, so
+  // Transaction::LogJournalOnShard and the DbContext delete helpers reject them before emission.
+  // They must not arm here either; no COMMAND entry could commit that arm, so epoch end would
+  // merely discard it and inflate mvcc_unstamped_writes.
   DCHECK(ns_ != nullptr);
-  if (mvcc_enabled_ && ns_ == &namespaces->GetDefaultNamespace())
+  if (arm_mvcc && mvcc_enabled_ && ns_ == &namespaces->GetDefaultNamespace()) {
+    // Prepare the side-table slot before Arm makes this key eligible for RecordEntry's
+    // post-journal Commit. SetExistingMvcc can then update it without allocating after the entry
+    // has already been accepted and exposed to consumers.
+    EnsureMvcc(db_ind, key);
     MvccStamper::tlocal()->Arm(db_ind, key);
+  }
 }
 
 DbSlice::Iterator DbSlice::ExpireIfNeeded(const Context& cntx, Iterator it) const {
@@ -1744,7 +1762,7 @@ void DbSlice::ExpireAllIfNeeded() {
 
       auto cb = [&](PrimeTable::iterator prime_it) {
         if (prime_it->first.HasExpire()) {
-          ExpireIfNeeded(Context{nullptr, db_index, GetCurrentTimeMs()}, prime_it,
+          ExpireIfNeeded(Context{ns_, db_index, GetCurrentTimeMs()}, prime_it,
                          &per_db_events[db_index]);
         }
       };
@@ -2726,14 +2744,9 @@ void DbSlice::OnCbFinishBlocking() {
   // mvcc_tombstones stays 0 until P4-5 gives kExplicit/kExpired deletes a tombstone instead of an
   // erase.
   //
-  // Gated on !HasArmedKeys(): this function runs between the shard callback's own PostUpdate
-  // arms and LogAutoJournalOnShard's later Commit call that actually writes the stamp
-  // (transaction.cc's RunCallback documents this ordering explicitly -- "not inside
-  // OnCbFinishBlocking, which runs before the journal entry exists"). Without this guard the
-  // DCHECK below fires on every single write, arm ahead of commit, every time -- observed
-  // verbatim on the very first non-trivial test run (task-10-report.md); this is not a defensive
-  // guard against a hypothetical, it is the fix for that crash. See MvccStamper::HasArmedKeys
-  // (mvcc.h) for why this never masks a real leak from an earlier, already-settled callback.
+  // PostUpdate now prepares a zero-authority side-table slot before arming a key, so density is
+  // already established in the arm-before-journal window. The journal commit later changes only
+  // that slot's value and cannot affect this size invariant.
   //
   // Scoped to the default namespace for the same reason PostUpdate's F1 gate is (see that
   // comment, above in this file): DbTable::mvcc is allocated per-shard from the global
@@ -2743,8 +2756,7 @@ void DbSlice::OnCbFinishBlocking() {
   // scope, that client's very first write would trip the DCHECK below. This is a property of
   // where writes get armed, not a leak -- do not "fix" it by removing the scope; see
   // TEST_VerifyMvccTable for the identical guard, with the longer version of this comment.
-  if (mvcc_enabled_ && ns_ == &namespaces->GetDefaultNamespace() &&
-      !MvccStamper::tlocal()->HasArmedKeys()) {
+  if (mvcc_enabled_ && ns_ == &namespaces->GetDefaultNamespace()) {
     for (const auto& dbp : db_arr_) {
       if (!dbp || !dbp->mvcc)
         continue;

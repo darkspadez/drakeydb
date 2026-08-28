@@ -3301,33 +3301,17 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
                  << updater.it->second.ObjType();
   }
 
+  // Loading is propagated by the snapshot, not a COMMAND journal entry. Finalize normal memory,
+  // expiry, watcher, and index bookkeeping without arming the thread-local journal epoch. The
+  // explicit {0,0} slot above is the load's complete P4-1 MVCC effect.
+  updater.post_updater.RunWithoutMvccArm();
+
   if (auto* ts = db_slice->shard_owner()->tiered_storage(); ts) {
     // Finalize the AutoUpdater before stashing. The stash callback may complete
     // (e.g. during the SleepFor yield below) and transform the PrimeValue to external,
     // changing MallocUsed(). If the AutoUpdater ran after that, it would compute a
     // bogus negative memory delta and crash in AccountObjectMemory.
     auto it = updater.it;
-    updater.post_updater.Run();
-    // drakeydb: fix round 2 (R1) -- Run() just above armed this key (PostUpdate -> Arm), and
-    // StashPrimeValue/the throttle wait below can yield this fiber -- CreateObjectOnShard does
-    // not return to its caller (whose own EndOfWriteEpoch call, LoadItemsBuffer/
-    // ReadAndDispatchObject below, is too late for this) until after that yield. A concurrent
-    // journaled write's Commit(), running on this shard thread during that window, would still
-    // pick up and clobber this arm with its own mvcc/origin -- the original F2 bug
-    // (task-10-report.md fix round 1), narrowed to this one branch rather than closed by it.
-    // Closing it here, immediately after the arm and before anything that can yield, is what
-    // actually prevents it. The caller's per-item placement is for a different reason -- bounding
-    // armed_ accumulation across items in one load batch -- not this race; do not read that
-    // comment as already covering this window, which it does not (see task-10-report.md fix
-    // round 2, R1, for why this could not be falsified with a deterministic test and is pinned by
-    // reasoning instead).
-    //
-    // This call, and the other two in this file, are also subject to the separate, narrower,
-    // documented-not-fixed limitation at LoadItemsBuffer's own EndOfWriteEpoch call below (R4):
-    // none of them are serialized against running_tx_, so any of them can in principle discard a
-    // concurrent Transaction's still-pending arm instead of (or in addition to) this loader's own.
-    if (db_slice->mvcc_enabled())
-      MvccStamper::tlocal()->EndOfWriteEpoch();
     StashPrimeValue(db_cntx.db_index, item->key, it->first, &it->second, ts, nullptr);
 
     // Block, if tiered storage is active, but can't keep up
@@ -3346,97 +3330,6 @@ void RdbLoader::LoadItemsBuffer(const ItemsBuf& ib) {
     DbSlice& db_slice = db_cntx.GetDbSlice(es->shard_id());
     DCHECK(!db_slice.IsCacheMode());
     CreateObjectOnShard(db_cntx, item, &db_slice);
-    // drakeydb: fix round 1 (F2) -- CreateObjectOnShard's AddOrUpdate arms the loaded key
-    // (DbSlice::AutoUpdater::~AutoUpdater -> Run() -> PostUpdate -> Arm; or Run() earlier still,
-    // explicitly, right before a tiered-storage stash a few lines up in CreateObjectOnShard) --
-    // this file never journals a load, so nothing ever calls MvccStamper::Commit() for it, and
-    // without this call the arm would sit in armed_ until some LATER, unrelated journaled write
-    // on this same shard thread runs Commit(), which stamps every still-armed key -- not just its
-    // own -- with that write's mvcc and origin. That clobbers this task's {0,0} fallback with
-    // local authority no peer ever saw, exactly the "stamp without propagation" direction D-7
-    // forbids, and it would do so silently: TEST_VerifyMvccTable/OnCbFinishBlocking only check
-    // density (one stamp per key), not correctness of the stamp's value.
-    //
-    // Per item, not batched once after the loop. NOT because it closes the tiered-storage yield
-    // window: fix round 2 (R1) already closes that at its source, inside CreateObjectOnShard,
-    // immediately after that item's own arm -- by the time any item reaches that yield, armed_ is
-    // already empty, items 1..N-1 included, since R1's call there clears the whole vector, not
-    // just the current item's entry. Fix round 3 (R5) corrects an earlier version of this comment
-    // that gave that reason; it does not hold, foreclosed by R1 itself.
-    //
-    // The real reason: DbSlice::AddOrFindInternal (db_slice.cc) calls CallChangeCallbacks
-    // (db_slice.cc:917) whenever change_cb_ is non-empty (e.g. a concurrent snapshot/consumer is
-    // registered) -- a genuine preemption point, annotated "// blocking point." at its sibling
-    // call in PreUpdateBlocking (db_slice.cc:1619) -- and it runs inside AddOrUpdate, before THIS
-    // item's own PostUpdate/Arm ever fires (Arm happens later: either the AutoUpdater's
-    // destructor at the end of CreateObjectOnShard, or the explicit Run() in the tiered-storage
-    // branch above -- both strictly after AddOrUpdate, hence after AddOrFindInternal, returns).
-    // So if this per-item call were removed and batched instead, items 1..N-1's arms -- correctly
-    // armed by their own earlier iterations, not yet cleared -- would still be outstanding when
-    // item N's own AddOrUpdate call hits that preemption point, exposing them to a concurrent
-    // journaled write's Commit() before item N has armed anything of its own. Gated on
-    // mvcc_enabled() like every other EndOfWriteEpoch call site (transaction.cc) to skip the
-    // thread_local guard check when this node is not active. See task-10-report.md fix round 1
-    // (F2) for how this was verified before being fixed, and its regression test.
-    //
-    // drakeydb: fix round 2 (R4) -- known limitation, documented here and in task-10-report.md,
-    // not fixed this round (gating the loader on running_tx_, or scoping epoch-end per-fiber, is
-    // a design change for its own task). This call, like CreateObjectOnShard's (R1, above),
-    // clears whatever is in armed_ on this shard thread right now -- correct when this fiber is
-    // the only thing that has armed anything, but LoadItemsBuffer runs as its own fiber via the
-    // shard's FiberQueue (FlushShardAsync -> shard_set->Add -> EngineShardSet::Add ->
-    // GetFiberQueue()->Add, engine_shard_set.h), not serialized against running_tx_ the way the
-    // heartbeat's own EndOfWriteEpoch call sites (db_slice.cc) are. A concurrent
-    // Transaction::RunCallback on this same shard thread has a real preemption window between its
-    // own PostUpdate/Arm and its own Commit(): OnCbFinishBlocking ends in
-    // SendQueuedInvalidationMessages(), which does a preempting shard_set->pool()->AwaitBrief()
-    // call whenever client-tracking traffic is pending (db_slice.cc), and
-    // LogAutoJournalOnShard/Commit() only runs after OnCbFinishBlocking returns. If this call
-    // happens to run during that window, it would discard that OTHER transaction's still-pending
-    // arm along with whatever this item legitimately armed -- and since that other write goes on
-    // to be journaled and propagated regardless (Commit() already committed to running before the
-    // preemption), the result is the dangerous "propagated but not stamped" direction of this same
-    // invariant, not the "stamped but not propagated" direction F2/R1 close.
-    //
-    // drakeydb: review wave 2 (F6) -- this direction is dangerous ONLY because of a second fix
-    // this one composes with, and the composition made things worse, not better; worth spelling
-    // out since neither fix's own comment says so. Server_family.cc's boot-time journal start
-    // (`if (IsActiveReplica()) shard_set->RunBriefInParallel([](auto*) { journal::StartInThread();
-    // });`, ServerFamily::Init, landed the same task as this R4 gap) runs BEFORE LoadFromSnapshot()
-    // -- i.e. before this loader ever gets a chance to race anything -- specifically so a client
-    // write landing on a peerless active node before its first peer attaches still journals (see
-    // that call's own comment for the bug it closes). Before that boot fix existed, this loader
-    // ran during the SAME peerless boot window with no journal running at all: op_args.shard->
-    // journal() was null, so nothing on this shard could reach RecordEntry/Commit() regardless of
-    // what this loader's EndOfWriteEpoch discarded -- a race between "no stamp" and "no journal
-    // entry" is not a race, both invariant directions failed together the same safe way (0
-    // propagated, 0 stamped).
-    //
-    // CORRECTION (final re-review): the composition is real but its reach was overstated here, and
-    // the overstatement was the controller's, not this fix's. The peerless boot window is NOT
-    // freshly reachable: during LOADING a write is refused unless the connection is_replicating or
-    // the command carries CO::LOADING (main_service.cc's allowed_by_state), and a peerless node by
-    // definition has no is_replicating connection. The genuinely reachable case is the one this R4
-    // note already named on its own -- full-syncing from one peer while applying stable-sync from
-    // another -- and there the journal is running because of the second peer's link, boot fix or
-    // not. Keep the composition note: a future fix to either side should still check the other.
-    // Drop the claim that the boot fix widened the window. Fixing either half in isolation
-    // would not have revealed this: the boot-journal fix's own tests do not run the loader
-    // concurrently, and this R4 gap's own narrow reproduction (see below) does not depend on boot
-    // timing at all. Neither task's own review caught the interaction; recorded here so a future
-    // fix to either side checks the other before assuming it is independent.
-    //
-    // Narrow: needs a write with active client-tracking traffic (or an equivalently preempting
-    // cache-mode bump-up) to land its preemption inside a loader fiber's item-processing window,
-    // during LOADING
-    // specifically -- client writes are refused then, but is_replicating connections (i.e.
-    // exactly the concurrent-mesh-sync scenario this describes: a node full-syncing from one peer
-    // while applying stable-sync writes from another) are exempt. Not a new regression -- before
-    // this fix round's EndOfWriteEpoch calls existed at all, every loaded key's arm was
-    // guaranteed, not just narrowly at risk, to eventually be picked up by whatever journal entry
-    // came along next (F2).
-    if (db_slice.mvcc_enabled())
-      MvccStamper::tlocal()->EndOfWriteEpoch();
     if (stop_early_) {
       // force all items in ib to move into item_queue_ so they can be cleaned up later.
       break;
@@ -3604,15 +3497,6 @@ io::Result<bool> RdbLoader::ReadAndDispatchObject(int object_type, std::string& 
     const DbContext db_cntx{&namespaces->GetDefaultNamespace(), db_index, GetCurrentTimeMs()};
     DbSlice& db_slice = db_cntx.GetDbSlice(sid);
     CreateObjectOnShard(db_cntx, item, &db_slice);
-    // drakeydb: fix round 1 (F2) -- same requirement as LoadItemsBuffer's loop above; see that
-    // comment for the full mechanism. run_inlined means this call is already on the target
-    // shard's own thread (the condition computing it, above in this function, is exactly
-    // EngineShard::tlocal()->shard_id() == sid), so MvccStamper::tlocal() here is the same
-    // instance CreateObjectOnShard just armed into. Also subject to LoadItemsBuffer's
-    // R4 limitation (below): thread identity alone does not establish serialization against
-    // running_tx_, so this call can in principle discard a concurrent Transaction's arm too.
-    if (db_slice.mvcc_enabled())
-      MvccStamper::tlocal()->EndOfWriteEpoch();
   } else {
     auto& out_buf = shard_buf_[sid];
     out_buf.emplace_back(item);

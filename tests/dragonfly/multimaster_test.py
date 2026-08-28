@@ -2059,18 +2059,25 @@ async def test_member_expiry_reaper_self_heals_peer_without_read(df_factory: Dfl
     await wait_for_peers(c_b, 1)
 
     assert await c_a.execute_command("sadd", "s", "m1") == 1
-    await c_a.execute_command("fieldexpire", "s", "1", "m1")
 
-    # Ordinary setup traffic (SADD/FIELDEXPIRE) replicates normally; wait for it to land on b
-    # before starting the measurement window below -- this convergence poll is setup, not the
-    # load-bearing assertion.
+    # Let the value replicate before arming its short TTL. Otherwise a loaded runner can let the
+    # TTL elapse and correctly reap the key before this setup poll ever observes it, producing a
+    # false replication failure (the adjacent derived-delete test uses the same ordering).
     @assert_eventually(timeout=30)
     async def setup_converged():
         assert await _exists(c_b, "s")
 
     await setup_converged()
 
-    await asyncio.sleep(1.2)  # let the 1s member TTL elapse on every node's own clock
+    await c_a.execute_command("fieldexpire", "s", "3", "m1")
+
+    @assert_eventually(timeout=30)
+    async def ttl_setup_converged():
+        assert await c_b.execute_command("fieldttl", "s", "m1") > 0
+
+    await ttl_setup_converged()
+
+    await asyncio.sleep(3.2)  # let the 3s member TTL elapse on every node's own clock
 
     # a's own read triggers a's lazy member expiry, deriving a DEL that is suppressed on the peer
     # link (proven unconditionally by the test above). Nothing about this call touches b.

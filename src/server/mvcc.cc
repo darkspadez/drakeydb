@@ -40,10 +40,14 @@ uint64_t MvccStamper::OriginHash(uint32_t origin_idx) const {
 }
 
 uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
-  if (hop_stamp_ == 0 || (hop_stamp_ >> MvccClock::kCounterBits) + kMaxEpochMs < now_ms) {
+  const bool clock_stepped_back = hop_stamp_ != 0 && now_ms < hop_started_ms_;
+  const bool expired =
+      hop_stamp_ != 0 && !clock_stepped_back && now_ms - hop_started_ms_ > kMaxEpochMs;
+  if (hop_stamp_ == 0 || clock_stepped_back || expired) {
     if (hop_stamp_ != 0)
       ++stats_.stale_epoch;
     hop_stamp_ = clock_.Next(now_ms);
+    hop_started_ms_ = now_ms;
   }
   return hop_stamp_;
 }
@@ -110,24 +114,11 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
 
   const MvccStamp stamp{mvcc, OriginHash(origin_idx)};
   ++commit_depth_;
-  // RAII, not bare statements after the loop: a throwing fn (SetMvcc's side-table insert can
-  // hit bad_alloc) must still unwind commit_depth_ AND clear armed_/arena_, or two things break.
-  // First, commit_depth_ stuck positive DCHECK-aborts every subsequent Arm()/Disarm()/Commit()
-  // forever. Second -- the parked decision this closes -- a surviving armed_ would be picked up
-  // by whatever runs next: EndOfWriteEpoch() would silently over-count mvcc_unstamped_writes for
-  // keys this call actually attempted, or -- worse -- a LATER Commit() call within the same
-  // epoch (a second RecordEntry from the same callback, e.g. a Lua script issuing more than one
-  // write) would stamp these leftover keys with THAT entry's mvcc, misattributing them to a
-  // journal entry that never mentioned them. Unconditional clearing means a throw during Commit
-  // instead degrades to: keys fn() reached before the throw are stamped (SetMvcc succeeded);
-  // keys it never reached keep their pre-call stamp -- silently, NOT counted in
-  // stats_.unstamped_writes, since that counter is only touched by EndOfWriteEpoch(), which by
-  // then sees an already-empty armed_ (a known, narrow observability gap: a throw here is already
-  // an exceptional bad_alloc, and the exception itself propagates out of Commit() uncaught by
-  // anything between here and Transaction::RunCallback's tail -- see this task's report). Silent
-  // pre-call-stamp survival is still the SAFE direction for the phase's central invariant (stamp
-  // does not advance without the entry that would justify it), rather than silently corrupting a
-  // future, unrelated commit.
+  // RAII, not bare statements after the loop: Commit is a generic primitive and its callback may
+  // throw (the unit suite exercises that contract), even though journal::RecordEntry now supplies
+  // an allocation-free SetExistingMvcc callback. A throw must unwind commit_depth_ and clear the
+  // arm storage; otherwise later epoch end would over-count attempted keys, or a later Commit
+  // could misattribute surviving arms to an unrelated entry.
   absl::Cleanup restore_depth = [this] {
     --commit_depth_;
     armed_.clear();
@@ -149,11 +140,13 @@ void MvccStamper::EndOfWriteEpoch() {
   armed_.clear();
   arena_.clear();
   hop_stamp_ = 0;
+  hop_started_ms_ = 0;
 }
 
 void MvccStamper::TEST_Reset() {
   clock_ = MvccClock{};
   hop_stamp_ = 0;
+  hop_started_ms_ = 0;
   armed_.clear();
   arena_.clear();
   origin_hash_cache_.clear();

@@ -1178,18 +1178,67 @@ TEST_F(MvccStoreTest, PureWriteWorkloadLeavesNoUnstampedWrites) {
   EXPECT_EQ(unstamped.load(), 0u) << "a pure write workload must never discard an arm";
 }
 
+// RDB loading runs in a separate fiber on the shard thread. It must finalize the loaded value's
+// normal bookkeeping without either arming that value or clearing a transaction arm that was
+// already pending on the same thread. This pins the mechanism directly: the pending write keeps
+// its arm and receives the later commit, while the loaded value retains its explicit {0,0}
+// snapshot fallback.
+TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) {
+  constexpr uint64_t kPendingMvcc = 0x1234'5678;
+  std::optional<MvccStamp> prepared_stamp;
+  std::optional<MvccStamp> pending_stamp;
+  std::optional<MvccStamp> loaded_stamp;
+
+  shard_set->Await(0, [&] {
+    Namespace& default_ns = namespaces->GetDefaultNamespace();
+    DbSlice& db_slice = default_ns.GetCurrentDbSlice();
+    DbContext db_cntx{&default_ns, 0, GetCurrentTimeMs()};
+
+    PrimeValue pending_value;
+    pending_value.SetString("pending-value");
+    auto pending = db_slice.AddOrUpdate(db_cntx, "pending-key", std::move(pending_value), 0);
+    ASSERT_TRUE(pending);
+    pending->post_updater.Run();
+
+    prepared_stamp = db_slice.GetMvcc(0, "pending-key");
+    ASSERT_TRUE(prepared_stamp.has_value());
+    EXPECT_TRUE(prepared_stamp->Empty())
+        << "PostUpdate must prepare a zero-authority slot before journal commit";
+
+    PrimeValue loaded_value;
+    loaded_value.SetString("loaded-value");
+    auto loaded = db_slice.AddOrUpdate(db_cntx, "loaded-key", std::move(loaded_value), 0);
+    ASSERT_TRUE(loaded);
+    db_slice.SetMvcc(0, std::string_view{"loaded-key"}, MvccStamp{});
+    loaded->post_updater.RunWithoutMvccArm();
+
+    MvccStamper::tlocal()->Commit(kPendingMvcc, 0,
+                                  [&](DbIndex db, std::string_view key, const MvccStamp& stamp) {
+                                    db_slice.SetExistingMvcc(db, key, stamp);
+                                  });
+    pending_stamp = db_slice.GetMvcc(0, "pending-key");
+    loaded_stamp = db_slice.GetMvcc(0, "loaded-key");
+  });
+
+  ASSERT_TRUE(pending_stamp.has_value());
+  EXPECT_EQ(pending_stamp->Mvcc(), kPendingMvcc)
+      << "loader finalization must not clear another transaction's pending arm";
+  ASSERT_TRUE(loaded_stamp.has_value());
+  EXPECT_TRUE(loaded_stamp->Empty())
+      << "a loaded key must not be swept into an unrelated COMMAND commit";
+}
+
 // drakeydb: review fix round 1 (F1) -- a write through a non-default namespace must leave no
-// stamp anywhere: not in its own namespace's side table (never propagated to any peer, so under
-// "a key's stamp advances iff that same stamp is propagated" it must never advance), and not as a
-// phantom stamp on a same-named key in the DEFAULT namespace's side table either --
-// journal::RecordEntry's commit callback always targets GetDefaultNamespace() (armed_ carries no
-// namespace, see DbSlice::PostUpdate's comment), so an unguarded arm from a non-default-namespace
-// write would stamp that unrelated, never-written default-namespace key instead.
+// stamp anywhere: not in its own namespace's side table (not propagated to any peer, so under
+// "a key's stamp advances iff that same stamp is propagated" it must never advance), and not on
+// a same-named key in the default namespace either. The journal assertions below are the primary
+// safety boundary because every journal COMMAND is applied to the peer's default namespace.
 //
 // In production, ns1 is reached via ServerFamily::DoAuth (server_family.cc:2109-2120), which sets
 // `cntx->ns = &namespaces->GetOrInsert(cred.ns)` for an ACL user carrying a NAMESPACE: directive
-// (acl_family.cc's MaybeParseNamespace). That chain is exercised here via RunViaNamespace, not a
-// real ACL SETUSER+AUTH round trip: BaseFamilyTest::Run(id, slice) (test_utils.cc) unconditionally
+// (acl_family.cc's MaybeParseNamespace). This test exercises the behavior AFTER namespace
+// selection via RunViaNamespace, not the ACL SETUSER/AUTH selection chain itself:
+// BaseFamilyTest::Run(id, slice) (test_utils.cc) unconditionally
 // resets the dispatching connection's `context->ns` back to the default namespace before every
 // single command, discovered the hard way while first writing this test with AUTH -- an ACL
 // NAMESPACE:-scoped SET still landed (and got legitimately stamped) in the default namespace,
@@ -1202,23 +1251,13 @@ TEST_F(MvccStoreTest, PureWriteWorkloadLeavesNoUnstampedWrites) {
 // two omissions, both harmless for this test's plain SET/GET calls) -- it still goes through the
 // real Transaction/PostUpdate/LogAutoJournalOnShard path via DispatchCommand, only the mechanism
 // for reaching a non-default `cntx->ns` differs from production's ACL path (the ACL layer's own
-// correctness -- MaybeParseNamespace, DoAuth -- is pre-existing, unchanged by this task, and
-// independently confirmed working above).
+// correctness -- MaybeParseNamespace, DoAuth -- is pre-existing and unchanged by this task).
 //
-// Falsification: temporarily changing PostUpdate's `ns_ == &namespaces->GetDefaultNamespace()`
-// gate to unconditionally arm (the pre-fix-round-1 behavior) makes the LAST assertion below
-// (`EXPECT_EQ(*after, *original)`) fail -- that is what exercises the shipped gate, since
-// journal.cc's commit callback is only ever reachable with the default namespace's DbSlice
-// (`namespaces->GetDefaultNamespace().GetCurrentDbSlice()`, unconditional), so an unguarded arm
-// stamps the phantom key there, which this assertion catches. The earlier
-// `EXPECT_FALSE(ns1_stamp.has_value())` assertion does NOT fail under that same mutation and does
-// not exercise the shipped gate at all: SetMvcc is never called against ns1's own DbSlice by any
-// code path in this binary, gate present or not, so ns1_stamp is always empty regardless of what
-// PostUpdate does. It is not vacuous -- ns1's DbTable really does allocate an mvcc table
-// (table.cc's constructor gates on the global IsActiveReplica(), not on namespace) -- and it does
-// guard a plausible alternative fix this task did not take (routing the commit back to whichever
-// namespace originally armed the key, instead of always targeting the default namespace). See
-// this task's report for the verbatim falsification run.
+// The journal consumer is the non-vacuous boundary check: SET takes the explicit RecordJournal
+// path while LPUSH takes the automatic path, and either entry would be applied in a peer's default
+// namespace because the wire has no namespace identity. The side-table assertions independently
+// prove that the local-only write neither acquires authority in ns1 nor perturbs the default
+// namespace's same-named key.
 TEST_F(MvccStoreTest, NonDefaultNamespaceWriteLeavesNoStampAnywhere) {
   // A key of the same name, already stamped in the default namespace, to prove the ns1 write
   // below does not perturb it.
@@ -1227,13 +1266,47 @@ TEST_F(MvccStoreTest, NonDefaultNamespaceWriteLeavesNoStampAnywhere) {
   ASSERT_TRUE(original.has_value());
 
   Namespace& ns1 = namespaces->GetOrInsert("ns1");
+  class CountingJournalConsumer final : public journal::JournalConsumerInterface {
+   public:
+    void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+      if (item.journal_item.opcode == journal::Op::COMMAND)
+        ++commands;
+    }
+    void ThrottleIfNeeded() override {
+    }
+
+    std::atomic<size_t> commands{0};
+  } consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
   ASSERT_EQ(RunViaNamespace(&ns1, {"set", "shared", "v1"}), "OK");
+  ASSERT_EQ(RunViaNamespace(&ns1, {"lpush", "automatic", "v"}).GetInt(), 1);
+  EXPECT_THAT(RunViaNamespace(&ns1, {"debug", "mvcc", "shared"}), ErrArg("default namespace"));
+  const std::string_view helper_key = "namespace-helper-key";
+  shard_set->Await(Shard(helper_key, shard_set->size()), [&] {
+    DbContext ns_cntx{&ns1, 0, GetCurrentTimeMs()};
+    RecordDelete(ns_cntx, helper_key);
+    RecordDerivedDelete(ns_cntx, helper_key);
+    RecordExpiryBlocking(ns_cntx, helper_key);
+  });
+
+  std::move(unregister_consumer).Invoke();
+  EXPECT_EQ(consumer.commands.load(), 0u)
+      << "neither transaction writes nor direct delete helpers from a non-default namespace may "
+         "enter the namespace-blind journal";
 
   const ShardId sid = Shard("shared", shard_set->size());
   std::optional<MvccStamp> ns1_stamp;
   shard_set->Await(sid, [&] { ns1_stamp = ns1.GetDbSlice(sid).GetMvcc(0, "shared"); });
   EXPECT_FALSE(ns1_stamp.has_value())
-      << "a non-default-namespace write must never be stamped -- it is never propagated to any "
+      << "a non-default-namespace write must never be stamped -- it is not propagated to any "
          "peer, so under the phase invariant it must never advance a stamp either";
 
   ASSERT_EQ(RunViaNamespace(&ns1, {"get", "shared"}), "v1")
@@ -1749,10 +1822,14 @@ TEST_F(MvccStoreTest, DefragRelocationPreservesStamps) {
   for (int i = 0; i < 500; i += 2)
     Run({"del", absl::StrCat("k", i)});
 
-  const auto before = *StampOf("k1");
+  auto before_stamp = StampOf("k1");
+  ASSERT_TRUE(before_stamp.has_value());
+  const MvccStamp before = *before_stamp;
   Run({"memory", "defragsegments"});  // the ONLY caller of DefragTableSegments (memory_cmd.cc:346).
                                       // NOT "debug compact-table", a different mechanism entirely.
-  EXPECT_EQ(*StampOf("k1"), before) << "defrag must not lose or corrupt stamps";
+  auto after_stamp = StampOf("k1");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, before) << "defrag must not lose or corrupt stamps";
 
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
@@ -1858,16 +1935,11 @@ TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
   ASSERT_EQ(Run({"debug", "reload"}), "OK");
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 100u)
       << "a reload that leaves keys unstamped trips the dense invariant on the next write";
-  // drakeydb: fix round 1 (F6) -- a WRITE here would arm itself, so HasArmedKeys() (db_slice.cc)
-  // would be true at its own OnCbFinishBlocking call and the invariant check would be skipped by
-  // construction (see OnCbFinishBlocking's comment) -- the original `Run({"set", "after", "v"})`
-  // here could never have tripped the DCHECK regardless of whether the reload path were broken.
-  //
   // EXISTS, not DBSIZE: verified empirically, not assumed (see task-10-report.md) -- DBSIZE
   // (ServerFamily::DbSize, server_family.cc) dispatches via a bare shard_set->RunBriefInParallel
-  // call and never goes through Transaction::RunCallback/OnCbFinishBlocking at all, so it would
-  // have been every bit as vacuous as the SET it replaced, just for a different reason (never
-  // reaching the check, instead of reaching it and having it skipped). GenericFamily::Exists
+  // call and never goes through Transaction::RunCallback/OnCbFinishBlocking at all. A write would
+  // also prepare its own zero-authority slot before reaching the invariant, adding unnecessary
+  // mutation to this probe. GenericFamily::Exists
   // (generic_family.cc) drives a real Transaction, the same shape as the HLEN calls that already
   // caught this bug's Section 5 instances (task-10-report.md) -- confirmed here by disabling
   // Step 3b's stamp and observing EXISTS reach and trip the DCHECK where DBSIZE had not.
@@ -2781,9 +2853,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteCarriesDerivedFlag) {
   // applied to whole-key expiry).
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100);
   });
 
@@ -2909,9 +2979,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperCoversSetWithNotYetDueWholeKey
 
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 
@@ -2932,9 +3000,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperCoversHashWithNotYetDueWholeKe
 
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 
@@ -3100,9 +3166,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
     {
       journal::DisableFlushGuard guard(shard->journal());
       absl::SetFlag(&FLAGS_active_replica, true);
-      DbContext db_cntx;
-      db_cntx.db_index = 0;
-      db_cntx.time_now_ms = TEST_current_time_ms;
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
       db_slice.DeleteExpiredStep(db_cntx, 100);
       absl::SetFlag(&FLAGS_active_replica, false);
     }
@@ -3129,9 +3193,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
   absl::SetFlag(&FLAGS_active_replica, true);
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100);
   });
   absl::SetFlag(&FLAGS_active_replica, false);
@@ -3217,9 +3279,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
       // This call must still skip "bighash" entirely, since a snapshot consumer is registered
       // for its whole duration.
       absl::SetFlag(&FLAGS_active_replica, true);
-      DbContext db_cntx;
-      db_cntx.db_index = 0;
-      db_cntx.time_now_ms = TEST_current_time_ms;
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
       db_slice.DeleteExpiredStep(db_cntx, 100);
       absl::SetFlag(&FLAGS_active_replica, false);
     }
@@ -3255,9 +3315,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
   absl::SetFlag(&FLAGS_active_replica, true);
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
   absl::SetFlag(&FLAGS_active_replica, false);
@@ -3382,9 +3440,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
     // comments a few dozen lines up in db_slice.cc), removes that specific window.
     absl::SetFlag(&FLAGS_active_replica, true);
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     // count=100000 bounds the outer prime-table traversal, not the reaper's own per-container
     // walk -- see this test's comment above for why that distinction matters here.
     reported_deleted_bytes = db_slice.DeleteExpiredStep(db_cntx, 100000).deleted_bytes;
@@ -3451,9 +3507,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotSpuriouslyAbortWatch) {
 
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 
@@ -3496,9 +3550,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperClearedFlagSurvivesRdbRoundTri
   // to finish in one pass -- so this call reports (and acts on) a complete, clean pass.
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 
@@ -3532,9 +3584,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperUnclearedFlagPreservesTtlAcros
 
   shard_set->RunBriefInParallel([](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx;
-    db_cntx.db_index = 0;
-    db_cntx.time_now_ms = TEST_current_time_ms;
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
 

@@ -942,7 +942,7 @@ the derived-DEL fix — so they never land together.
 | PR | Scope |
 |---|---|
 | **P4-0** | Proactive member-expiry reaper + D-11 derived-DEL fix + D-12 clock-skew warning/metric. Mergeable independently of P4-1...P4-5 only as this complete unit; D-11 must not land without its reaper prerequisite. |
-| **P4-1** | **T0 inbound plumbing** (`TransactionData.mvcc`, `SetApplyMvcc`, `peer_origin_hash_`, widened `SetReplOrigin`), D-2 stamp, D-3 clock, D-4 side table, D-5 stamping, D-6 wire, D-13 `DEBUG MVCC` + `mvcc_table_bytes`, memory benchmark. No behaviour change beyond memory. |
+| **P4-1** | **T0 inbound plumbing** (`TransactionData.mvcc`, `SetApplyMvcc`, `peer_origin_hash_`, widened `SetReplOrigin`), D-2 stamp, D-3 clock, D-4 side table, D-5 stamping, D-6 wire, D-13 `DEBUG MVCC` + `mvcc_table_bytes`, memory benchmark. Starts the active-node journal at boot so peerless writes are stamped and retains non-default ACL namespaces as local-only because the wire has no namespace identity; no conflict-resolution behavior changes yet. |
 | **P4-2** | D-7 RDB persistence (`RDB_OPCODE_DF_MVCC` save + load, KeyDB read branch). |
 | **P4-3** | D-8 merge-on-full-sync LWW. First real behaviour change. |
 | **P4-4** | D-9 streaming guard + per-key split, `--multi_master_stream_lww`, `multimaster_lww_dropped`. Highest risk; lands on a foundation already proven by P4-1..3. |

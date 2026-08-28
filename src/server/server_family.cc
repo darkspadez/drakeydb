@@ -1360,16 +1360,14 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
   // call unconditionally on every boot: JournalSlice::Init() (journal_slice.cc) is an explicit
   // no-op on a second call.
   //
-  // drakeydb: fix round 1 (F3) -- corrected. The ring buffer does NOT stay at its initial
-  // 8192-entry capacity: JournalSlice::CleanEntries (journal_slice.cc) grows it once full, up to
-  // min(--shard_repl_backlog_time_ms worth of writes (default 5000ms), GetPerShardBacklogMaxBytes()
-  // -- --shard_repl_backlog_max_bytes if set, else 0.5% of maxmemory, divided by shard count).
-  // So a peerless active node carries an ongoing backlog up to that bound that nothing will ever
-  // read, plus a full JournalWriter::Write serialization per write from here on -- a real,
-  // per-write cost, not a one-time allocation. Still judged acceptable: it is the same cost any
-  // active-replica node already pays once a peer attaches, just paid a bit earlier (from boot
-  // instead of from first attach), and bounded the same way production already bounds it for
-  // every other case.
+  // The ring buffer does NOT stay at its initial 8192-entry capacity: JournalSlice::CleanEntries
+  // grows it once full. Retained bytes are hard-bounded by --shard_repl_backlog_max_bytes (or
+  // 0.5% of maxmemory divided by shard count by default). The time setting is a retention target,
+  // not a hard age bound: cleanup removes at most 100 time-expired entries per subsequent write,
+  // so a burst can temporarily leave older entries behind. A peerless active node therefore pays
+  // an ongoing bounded backlog plus full JournalWriter serialization per write, not a one-time
+  // allocation. This is the same steady-state cost paid after a peer attaches, started at boot so
+  // pre-peer writes can be stamped consistently.
   //
   // Residual noted, not closed, by this change: the partial-sync buffer is now non-empty from
   // boot instead of from first peer attach, so DflyCmd::IsLSNInPartialSyncBuffer (dflycmd.cc)
