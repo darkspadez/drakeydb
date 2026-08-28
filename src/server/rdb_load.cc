@@ -3410,10 +3410,17 @@ void RdbLoader::LoadItemsBuffer(const ItemsBuf& ib) {
     // journal() was null, so nothing on this shard could reach RecordEntry/Commit() regardless of
     // what this loader's EndOfWriteEpoch discarded -- a race between "no stamp" and "no journal
     // entry" is not a race, both invariant directions failed together the same safe way (0
-    // propagated, 0 stamped). After the boot fix, the journal runs from boot, so a client write
-    // that used to fail safe in this exact window now genuinely CAN have its arm discarded by this
-    // loader while its journal entry still goes out -- the dangerous direction above, freshly
-    // reachable in a window that used to be inert by construction. Fixing either half in isolation
+    // propagated, 0 stamped).
+    //
+    // CORRECTION (final re-review): the composition is real but its reach was overstated here, and
+    // the overstatement was the controller's, not this fix's. The peerless boot window is NOT
+    // freshly reachable: during LOADING a write is refused unless the connection is_replicating or
+    // the command carries CO::LOADING (main_service.cc's allowed_by_state), and a peerless node by
+    // definition has no is_replicating connection. The genuinely reachable case is the one this R4
+    // note already named on its own -- full-syncing from one peer while applying stable-sync from
+    // another -- and there the journal is running because of the second peer's link, boot fix or
+    // not. Keep the composition note: a future fix to either side should still check the other.
+    // Drop the claim that the boot fix widened the window. Fixing either half in isolation
     // would not have revealed this: the boot-journal fix's own tests do not run the loader
     // concurrently, and this R4 gap's own narrow reproduction (see below) does not depend on boot
     // timing at all. Neither task's own review caught the interaction; recorded here so a future
