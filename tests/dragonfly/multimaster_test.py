@@ -2166,24 +2166,16 @@ async def test_member_expiry_reaper_covers_namespaces_and_zero_budget(
     assert default_search[0] == 1
 
 
-# drakeydb: Phase 4 Task 9. DEBUG MVCC lands in Task 11 -- this test is written now (per that
-# task's plan) and stays skipped until Task 11 removes the skip as its last step.
+# drakeydb: Phase 4 Task 9 wrote this test and Task 11 (DEBUG MVCC) unskips it. This is the
+# phase's headline acceptance criterion: a key written on node A and replicated to node B must
+# carry bit-identical {mvcc, origin_hash} on both.
 #
-# KNOWN DEFECT for Task 11 to fix before trusting a green run here -- do not just remove the skip
-# and assume this body is correct because it typechecks: `await assert_eventually(lambda:
-# _exists(c_b, "k"))` below does NOT actually wait for anything. assert_eventually's retry loop
-# (tests/dragonfly/utility.py) only retries on a caught AssertionError; _exists() returns a plain
-# bool rather than raising, so the wrapped call returns on its FIRST attempt regardless of the
-# result, and that return value is never asserted on either -- so this line is a no-op wait AND a
-# no-op check. If replication hasn't propagated "k" to B yet, the very next lines (debug mvcc on
-# B) will race it, most likely reading a stale/absent value rather than failing loudly. Rewrite
-# using the pattern already established elsewhere in this file for a real wait-until-condition
-# (test_member_expiry_reaper_covers_namespaces_and_zero_budget, same module):
-#   @assert_eventually(timeout=30)
-#   async def key_replicated():
-#       assert await _exists(c_b, "k")
-#   await key_replicated()
-@pytest.mark.skip(reason="needs DEBUG MVCC from task 11")
+# Task 9's original body called `await assert_eventually(lambda: _exists(c_b, "k"))` to wait for
+# replication -- that does NOT work: assert_eventually's retry loop (tests/dragonfly/utility.py)
+# only retries on a caught AssertionError, _exists() returns a plain bool rather than raising, and
+# the return value is never asserted on either, so the wrapped call returned on its first attempt
+# regardless of the result. Fixed below using the decorator form already established elsewhere in
+# this file (e.g. test_member_expiry_reaper_covers_namespaces_and_zero_budget, same module).
 async def test_replicated_key_stamp_matches_origin(df_factory):
     """The phase's headline criterion. Falsified by removing SetApplyMvcc in replica.cc:
     B then mints its own stamp and the mvcc values differ."""
@@ -2191,13 +2183,21 @@ async def test_replicated_key_stamp_matches_origin(df_factory):
     b = df_factory.create(**active_args())
     df_factory.start_all([a, b])
     c_a, c_b = a.client(), b.client()
-    attach(c_b, a)
+    # drakeydb: Task 9's original body called this bare (no await). attach() is `async def`
+    # (defined above; every other call site in this file correctly awaits it, e.g.
+    # test_peer_clock_skew_reported just above) -- an un-awaited coroutine never runs its body,
+    # so the REPLICAOF this issues would never actually be sent and wait_for_peers below would
+    # hang for its full timeout waiting for a peer link that was never requested.
+    await attach(c_b, a)
     await wait_for_peers(c_b, 1)
 
     await c_a.execute_command("set", "k", "v")
-    # See the KNOWN DEFECT note above the @pytest.mark.skip decorator -- this line does not
-    # actually wait for replication before the assertions below.
-    await assert_eventually(lambda: _exists(c_b, "k"))
+
+    @assert_eventually(timeout=30)
+    async def key_replicated():
+        assert await _exists(c_b, "k")
+
+    await key_replicated()
 
     stamp_a = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
     stamp_b = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))

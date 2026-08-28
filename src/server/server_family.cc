@@ -2867,6 +2867,12 @@ string ServerFamily::FormatInfoMetrics(
     append("prime_capacity", total.prime_capacity);
     append("num_entries", total.key_count);
     append("inline_keys", total.inline_keys);
+    // drakeydb: Phase 4, P4-1 Task 11 -- side table sized by DbTable::mvcc_table_memory(),
+    // entries/tombstones maintained in DbSlice::SetMvcc/EraseMvcc (table.h/db_slice.cc). All
+    // three stay 0 outside --active_replica, where the side table is never allocated.
+    append("mvcc_table_bytes", total.mvcc_table_bytes);
+    append("mvcc_entries", total.mvcc_entries);
+    append("mvcc_tombstones", total.mvcc_tombstones);
     append("small_string_bytes", m.small_string_bytes);
     append("pipeline_cache_bytes", m.facade_stats.conn_stats.pipeline_cmd_cache_bytes);
     append("dispatch_queue_bytes", m.facade_stats.conn_stats.dispatch_queue_bytes);
@@ -3100,6 +3106,17 @@ string ServerFamily::FormatInfoMetrics(
       if (IsActiveReplica()) {  // drakeydb: peer links of an active node (fan-in)
         info.append(
             RenderPeerReplicationInfo(peers_->Summaries(), IsMultiMaster(), show_managed_info));
+
+        // drakeydb: Phase 4, P4-1 Task 11 -- the two operationally load-bearing signals: a
+        // nonzero mvcc_unstamped_writes means a read-mutation path is over-arming (PostUpdate
+        // arms a key that no journal entry ever commits for); a nonzero mvcc_clock_ahead_ms
+        // means NTP stepped this node's wall clock backwards, so its MvccClock -- which never
+        // steps back, mvcc.h -- now runs ahead and wins every LWW conflict until the wall clock
+        // catches up. mvcc_stale_epoch counts HopStamp's own backstop for a missed
+        // EndOfWriteEpoch (mvcc.cc) firing; healthy operation keeps it at 0.
+        append("mvcc_clock_ahead_ms", m.mvcc_clock_ahead_ms);
+        append("mvcc_unstamped_writes", m.mvcc_unstamped_writes);
+        append("mvcc_stale_epoch", m.mvcc_stale_epoch);
       }
     } else {
       append("role", GetFlag(FLAGS_info_replication_valkey_compatible) ? "slave" : "replica");

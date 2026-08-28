@@ -18,6 +18,7 @@
 #include "server/command_registry.h"
 #include "server/dflycmd.h"
 #include "server/journal/journal.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/search/doc_index.h"
 #include "server/server_family.h"
@@ -732,7 +733,9 @@ void Metrics::Merge(const Metrics& src) {
                              sizeof(std::optional<Metrics::ReplicaInfo>) + sizeof(LoadingStats) +
                              sizeof(absl::flat_hash_map<std::string, hdr_histogram*>) +
                              sizeof(InternedStringStats) + sizeof(acl::UserRegistry::AclStats) +
-                             176,  // scalar fields (19 fields) + 4-byte alignment padding
+                             200,  // scalar fields (22 fields: +3 for P4-1 Task 11's
+                                   // mvcc_clock_ahead_ms/mvcc_unstamped_writes/mvcc_stale_epoch)
+                                   // + 4-byte alignment padding
       "Metrics size changed - update Merge() and InitFromThread()");
 
   // Per-db stats / events / small_string_bytes are merged element-wise.
@@ -771,10 +774,17 @@ void Metrics::Merge(const Metrics& src) {
   refused_conn_max_clients_reached_count += src.refused_conn_max_clients_reached_count;
   lsn_buffer_size += src.lsn_buffer_size;
   lsn_buffer_bytes += src.lsn_buffer_bytes;
+  mvcc_unstamped_writes += src.mvcc_unstamped_writes;
+  mvcc_stale_epoch += src.mvcc_stale_epoch;
 
   // Non-sum reductions.
   tx_queue_len = std::max(tx_queue_len, src.tx_queue_len);
   oldest_pending_send_ts = std::min(oldest_pending_send_ts, src.oldest_pending_send_ts);
+  // drakeydb: Phase 4, P4-1 Task 11 -- max, not sum: this is "how far ahead is the worst-drifted
+  // shard's clock", the property that governs whether THIS node wins every LWW conflict (mvcc.h,
+  // MvccClock::AheadMs). Summing across shards would inflate a single drifted shard's reading by
+  // shard_set->size() and no longer mean anything.
+  mvcc_clock_ahead_ms = std::max(mvcc_clock_ahead_ms, src.mvcc_clock_ahead_ms);
 
   // Map merges.
   for (const auto& [k, v] : src.connections_lib_name_ver_map)
@@ -802,7 +812,9 @@ void Metrics::InitFromThread(Namespace* ns, const CommandRegistry* registry,
                              sizeof(std::optional<Metrics::ReplicaInfo>) + sizeof(LoadingStats) +
                              sizeof(absl::flat_hash_map<std::string, hdr_histogram*>) +
                              sizeof(InternedStringStats) + sizeof(acl::UserRegistry::AclStats) +
-                             176,  // scalar fields (19 fields) + 4-byte alignment padding
+                             200,  // scalar fields (22 fields: +3 for P4-1 Task 11's
+                                   // mvcc_clock_ahead_ms/mvcc_unstamped_writes/mvcc_stale_epoch)
+                                   // + 4-byte alignment padding
       "Metrics size changed - update Merge() and InitFromThread()");
   EngineShard* shard = EngineShard::tlocal();
   ServerState* ss = ServerState::tlocal();
@@ -842,6 +854,16 @@ void Metrics::InitFromThread(Namespace* ns, const CommandRegistry* registry,
     traverse_ttl_per_sec = shard->GetMovingSum6(EngineShard::TTL_TRAVERSE);
     delete_ttl_per_sec = shard->GetMovingSum6(EngineShard::TTL_DELETE);
     tx_queue_len = shard->txq()->size();
+
+    // drakeydb: Phase 4, P4-1 Task 11 -- this shard's own thread-local MvccStamper (mvcc.h).
+    // Safe to read outside --active_replica too: an inactive node's stamper is simply never
+    // armed, so all three read back 0 rather than needing a guard here.
+    {
+      MvccStamper* stamper = MvccStamper::tlocal();
+      mvcc_clock_ahead_ms = stamper->clock().AheadMs(GetCurrentTimeMs());
+      mvcc_unstamped_writes = stamper->stats().unstamped_writes;
+      mvcc_stale_epoch = stamper->stats().stale_epoch;
+    }
 
     if (shard->journal()) {
       lsn_buffer_size = journal::LsnBufferSize();

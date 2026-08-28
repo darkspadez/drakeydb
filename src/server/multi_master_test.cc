@@ -1704,11 +1704,50 @@ TEST_F(MvccStoreTest, ReloadDoesNotLeaveArmsForALaterWriteToClobber) {
   }
 }
 
+// drakeydb: Phase 4, P4-1 Task 11 -- DEBUG MVCC, modelled on DebugCmd::Inspect's shard-hop.
+TEST_F(MvccStoreTest, DebugMvccReportsValueState) {
+  Run({"set", "k", "v"});
+  auto resp = Run({"debug", "mvcc", "k"});
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("state:value"));
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("mvcc:"));
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("origin:"));
+}
+
+TEST_F(MvccStoreTest, DebugMvccReportsAbsent) {
+  EXPECT_THAT(Run({"debug", "mvcc", "nope"}).GetString(), testing::HasSubstr("state:absent"));
+}
+
+TEST_F(MvccStoreTest, DebugMvccVerifyReportsZeroMismatches) {
+  for (int i = 0; i < 50; ++i)
+    Run({"set", absl::StrCat("k", i), "v"});
+  EXPECT_THAT(Run({"debug", "mvcc", "verify"}).GetString(), testing::HasSubstr("mismatches:0"));
+}
+
+// Not part of D9's acceptance test, but the third produced interface (alongside <key> and
+// VERIFY above) -- covered here so a crash or empty-reply regression in the aggregate path
+// doesn't first surface in production INFO/ops usage.
+TEST_F(MvccStoreTest, DebugMvccWithNoKeyReportsPerShardAggregates) {
+  Run({"set", "k", "v"});
+  auto resp = Run({"debug", "mvcc"});
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_entries:"));
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_clock_ahead_ms:"));
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_unstamped_writes:"));
+}
+
 // The "off means byte-identical to upstream" guard.
 TEST_F(BaseFamilyTest, NonActiveModeAllocatesNoMvccTable) {
   Run({"set", "k", "v"});
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_table_bytes, 0u)
       << "a non-active node must pay nothing for MVCC";
+}
+
+// drakeydb: Phase 4, P4-1 Task 11 -- DEBUG, not DFLY (see debugcmd.cc's DebugCmd::Mvcc comment):
+// must refuse by naming the flag rather than reporting a bare state:absent for every key, which
+// would be indistinguishable from a real absence.
+TEST_F(BaseFamilyTest, DebugMvccIsRefusedWhenInactive) {
+  auto resp = Run({"debug", "mvcc", "k"});
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("active_replica"))
+      << "must explain itself rather than reporting a bare absent";
 }
 
 namespace {
