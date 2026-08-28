@@ -2884,9 +2884,17 @@ string ServerFamily::FormatInfoMetrics(
     // deeper. For capacity planning on a long-key workload, trust used_memory (which does
     // include the second copy, being allocated from the shard's MiMemoryResource), not
     // this field alone.
-    append("mvcc_table_bytes", total.mvcc_table_bytes);
-    append("mvcc_entries", total.mvcc_entries);
-    append("mvcc_tombstones", total.mvcc_tombstones);
+    //
+    // drakeydb: Phase 4, review wave 2 (F5, MINOR) -- gated on IsActiveReplica(), matching how
+    // the "replication" section below already gates mvcc_unstamped_writes/mvcc_clock_ahead_ms/
+    // mvcc_stale_epoch. All three values are always 0 on a non-active node (the comment above
+    // already says so), but appending them unconditionally still made INFO memory diverge from
+    // upstream for that node -- the values were right, the extra keys' mere presence was the bug.
+    if (IsActiveReplica()) {
+      append("mvcc_table_bytes", total.mvcc_table_bytes);
+      append("mvcc_entries", total.mvcc_entries);
+      append("mvcc_tombstones", total.mvcc_tombstones);
+    }
     append("small_string_bytes", m.small_string_bytes);
     append("pipeline_cache_bytes", m.facade_stats.conn_stats.pipeline_cmd_cache_bytes);
     append("dispatch_queue_bytes", m.facade_stats.conn_stats.dispatch_queue_bytes);

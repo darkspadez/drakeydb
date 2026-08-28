@@ -3396,9 +3396,32 @@ void RdbLoader::LoadItemsBuffer(const ItemsBuf& ib) {
     // arm along with whatever this item legitimately armed -- and since that other write goes on
     // to be journaled and propagated regardless (Commit() already committed to running before the
     // preemption), the result is the dangerous "propagated but not stamped" direction of this same
-    // invariant, not the "stamped but not propagated" direction F2/R1 close. Narrow: needs a write
-    // with active client-tracking traffic (or an equivalently preempting cache-mode bump-up) to
-    // land its preemption inside a loader fiber's item-processing window, during LOADING
+    // invariant, not the "stamped but not propagated" direction F2/R1 close.
+    //
+    // drakeydb: review wave 2 (F6) -- this direction is dangerous ONLY because of a second fix
+    // this one composes with, and the composition made things worse, not better; worth spelling
+    // out since neither fix's own comment says so. Server_family.cc's boot-time journal start
+    // (`if (IsActiveReplica()) shard_set->RunBriefInParallel([](auto*) { journal::StartInThread();
+    // });`, ServerFamily::Init, landed the same task as this R4 gap) runs BEFORE LoadFromSnapshot()
+    // -- i.e. before this loader ever gets a chance to race anything -- specifically so a client
+    // write landing on a peerless active node before its first peer attaches still journals (see
+    // that call's own comment for the bug it closes). Before that boot fix existed, this loader
+    // ran during the SAME peerless boot window with no journal running at all: op_args.shard->
+    // journal() was null, so nothing on this shard could reach RecordEntry/Commit() regardless of
+    // what this loader's EndOfWriteEpoch discarded -- a race between "no stamp" and "no journal
+    // entry" is not a race, both invariant directions failed together the same safe way (0
+    // propagated, 0 stamped). After the boot fix, the journal runs from boot, so a client write
+    // that used to fail safe in this exact window now genuinely CAN have its arm discarded by this
+    // loader while its journal entry still goes out -- the dangerous direction above, freshly
+    // reachable in a window that used to be inert by construction. Fixing either half in isolation
+    // would not have revealed this: the boot-journal fix's own tests do not run the loader
+    // concurrently, and this R4 gap's own narrow reproduction (see below) does not depend on boot
+    // timing at all. Neither task's own review caught the interaction; recorded here so a future
+    // fix to either side checks the other before assuming it is independent.
+    //
+    // Narrow: needs a write with active client-tracking traffic (or an equivalently preempting
+    // cache-mode bump-up) to land its preemption inside a loader fiber's item-processing window,
+    // during LOADING
     // specifically -- client writes are refused then, but is_replicating connections (i.e.
     // exactly the concurrent-mesh-sync scenario this describes: a node full-syncing from one peer
     // while applying stable-sync writes from another) are exempt. Not a new regression -- before

@@ -296,7 +296,7 @@ unsigned PrimeEvictionPolicy::Evict(const PrimeTable::HotBuckets& eb, PrimeTable
 
     // log the evicted keys to journal.
     if (auto journal = db_slice_->shard_owner()->journal(); journal) {
-      RecordExpiryBlocking(cntx_.db_index, key);
+      RecordExpiryBlocking(cntx_, key);
     }
     db_slice_->Del(cntx_, DbSlice::Iterator(last_slot_it, StringOrView::FromView(key)), nullptr,
                    false, DbSlice::DeleteReason::kEvicted);
@@ -1703,7 +1703,7 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
 
   // Replicate expiry
   if (auto journal = owner_->journal(); journal && journal_expiry) {
-    RecordExpiryBlocking(cntx.db_index, key);
+    RecordExpiryBlocking(cntx, key);
   }
 
   auto& db = db_arr_[cntx.db_index];
@@ -2259,7 +2259,7 @@ finish:
   for (string_view key : keys_to_journal) {
     if (auto journal = owner_->journal(); journal)
       // Won't block because we disabled journal flushing. See first line of this function.
-      RecordExpiryBlocking(db_ind, key);
+      RecordExpiryBlocking(cntx, key);
 
     if (expired_keys_events_recording_ && key_events)
       key_events->emplace_back(key);

@@ -666,6 +666,14 @@ TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
   EXPECT_NE(std::string::npos, info.find("multi_master:1\r\n"));
   EXPECT_NE(std::string::npos, info.find("connected_masters:0\r\n"));
   EXPECT_EQ(std::string::npos, info.find("master_host:"));
+
+  // drakeydb: review wave 2 (F5, MINOR) -- the positive half of NonActiveInfoHasNoActiveFields
+  // below: these three must actually show up when active, or gating them behind IsActiveReplica()
+  // could vacuously hide them always instead of only outside --active_replica.
+  std::string mem_info{ToSV(Run({"info", "memory"}).GetBuf())};
+  EXPECT_NE(std::string::npos, mem_info.find("mvcc_table_bytes:"));
+  EXPECT_NE(std::string::npos, mem_info.find("mvcc_entries:"));
+  EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones:"));
 }
 
 TEST_F(ActiveReplicaFamilyTest, ReplicaOfGrammarAndNoPeersPaths) {
@@ -685,6 +693,19 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
   EXPECT_EQ(std::string::npos, info.find("active_replica:"));
   EXPECT_EQ(std::string::npos, info.find("connected_masters:"));
+
+  // drakeydb: review wave 2 (F5, MINOR) -- server_family.cc used to append mvcc_table_bytes/
+  // mvcc_entries/mvcc_tombstones to INFO memory unconditionally; a non-active node emitted all
+  // three as 0, the only observable delta from upstream on this command (the journal wire itself
+  // was already byte-identical). Gated on IsActiveReplica(), matching mvcc_unstamped_writes/
+  // mvcc_clock_ahead_ms/mvcc_stale_epoch's existing gate in the "replication" section above.
+  //
+  // Falsifying: deleting the `if (IsActiveReplica())` guard around these three appends
+  // (server_family.cc) makes all three EXPECT_EQ below fail (found instead of npos).
+  std::string mem_info{ToSV(Run({"info", "memory"}).GetBuf())};
+  EXPECT_EQ(std::string::npos, mem_info.find("mvcc_table_bytes:"));
+  EXPECT_EQ(std::string::npos, mem_info.find("mvcc_entries:"));
+  EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones:"));
 }
 
 // drakeydb: P4-1 Task 5 -- the side table on DbTable. Storage only; nothing writes to it outside
@@ -1405,6 +1426,62 @@ TEST_F(MvccStoreTest, AppliedWriteKeepsAuthorStampVerbatim) {
   EXPECT_EQ(st->origin_hash, peer_hash) << "and must record the AUTHOR, not itself";
 }
 
+// drakeydb: review wave 2 (F4, IMPORTANT) -- MvccStamper::Commit stamps EVERY currently-armed key
+// with the entry it is given, not just the key its own payload names (mvcc.h). MSET arms
+// key-by-key (OpMSet, string_family.cc: one Set() call per pair, one post_updater.Run() each) and
+// only journals once at the very end -- so if a LATER key in the same MSET already has an expired
+// whole-key TTL, AddOrFind -> FindInternal -> ExpireIfNeeded (db_slice.cc) fires
+// RecordExpiryBlocking (tx_base.cc) for it MID-CALLBACK, and that call's own Commit() sweeps up
+// every key armed so far -- including k1 here, armed by its own Set() one iteration earlier --
+// before MSET's own trailing RecordJournal ever gets a chance to stamp it. Before this fix, k1
+// came out stamped with a freshly-minted LOCAL HopStamp (RecordExpiryBlocking's hardcoded mvcc=0)
+// instead of the replicated MSET's real author stamp.
+//
+// Falsifying: reverting RecordExpiryBlocking's `db_cntx.repl_mvcc` argument (tx_base.cc) back to
+// a hardcoded 0 makes k1's EXPECT_EQ below fail -- st->Mvcc() comes back larger than kAuthorMvcc
+// (a real HopStamp minted from the live wall clock, not this literal).
+TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
+  constexpr uint32_t kPeerIdx = 6;
+  constexpr uint64_t kAuthorMvcc = 0x7777'0000'2222ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-0000-4000-8000-0000000000cc");
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
+
+  // Two distinct keys that hash to the same shard, so OpMSet processes both within one shard
+  // callback (one MvccStamper::armed_ list) -- the ordering this test depends on does not exist
+  // across shards.
+  const unsigned num_shards = shard_set->size();
+  std::string k1, k2;
+  for (int i = 0; k2.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find two keys hashing to the same shard";
+    std::string cand = absl::StrCat("mk", i);
+    if (Shard(cand, num_shards) == 0) {
+      (k1.empty() ? k1 : k2) = cand;
+    }
+  }
+
+  // k2 already exists with a whole-key TTL that has elapsed by the time MSET below re-probes it,
+  // but nothing has read it since, so it is still physically present -- ExpireIfNeeded discovers
+  // this lazily, mid-MSET, exactly like the recipe FieldExpireCausedDeleteIsNotFlaggedDerived
+  // (above in this file) uses for the analogous member-TTL case. AdvanceTime (mocked clock, no
+  // real sleep) keeps this deterministic.
+  Run({"set", k2, "old", "px", "10"});
+  AdvanceTime(50);
+
+  ApplyReplicatedCommand({"mset", k1, "v1", k2, "v2"}, kPeerIdx, kAuthorMvcc);
+
+  auto st1 = StampOf(k1);
+  ASSERT_TRUE(st1.has_value());
+  EXPECT_EQ(st1->Mvcc(), kAuthorMvcc)
+      << "k1 was armed by its own Set() before k2's lazy expiry swept it into that entry's "
+         "Commit() call -- it must still end up stamped with the MSET's real author mvcc";
+
+  auto st2 = StampOf(k2);
+  ASSERT_TRUE(st2.has_value());
+  EXPECT_EQ(st2->Mvcc(), kAuthorMvcc) << "k2 itself is stamped by MSET's own trailing commit, "
+                                         "unaffected by this bug -- guards against a vacuous pass";
+}
+
 // drakeydb: Phase 4 Task 9, fix round (F1v2) -- proves ExecuteTx applies an author's mvcc AND
 // origin_hash correctly regardless of which shard a replicated write's key lands on, which
 // AppliedWriteKeepsAuthorStampVerbatim above cannot: that test touches exactly one key/shard, so
@@ -1454,6 +1531,88 @@ TEST_F(MvccStoreTest, AppliedWriteAppliesCorrectlyOnEveryShard) {
 }
 
 namespace {
+// drakeydb: review wave 2 (F2, IMPORTANT) -- unlike OriginFlagCapturingConsumer above (which
+// reads origin_idx/entry_flags straight off item.journal_item, mirrored there by
+// JournalSlice::AddLogRecord), JournalItem carries no mvcc field at all -- only the wire bytes
+// do. So this consumer, like OriginOpcodeCapturingConsumer further down this file, reparses
+// item.journal_item.data with a real JournalReader to reach ParsedEntry::mvcc.
+struct MvccCapturedEntry {
+  std::string cmd;
+  uint32_t origin_idx;
+  uint64_t mvcc;
+};
+
+class MvccCapturingConsumer : public journal::JournalConsumerInterface {
+ public:
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    io::BytesSource source{item.journal_item.data};
+    JournalReader reader{&source, 0};
+    journal::ParsedEntry parsed;
+    CHECK(!reader.ReadEntry(&parsed));
+    util::fb2::LockGuard lk(mu_);
+    entries.push_back({std::string(item.cmd), parsed.origin_idx, parsed.mvcc});
+  }
+  void ThrottleIfNeeded() override {
+  }
+
+  util::fb2::Mutex mu_;
+  std::vector<MvccCapturedEntry> entries;  // guarded by mu_
+};
+}  // namespace
+
+// drakeydb: review wave 2 (F2, IMPORTANT) -- tx_base.cc's RecordDelete/RecordDerivedDelete used
+// to pass a hardcoded mvcc=0 to journal::RecordEntry regardless of DbContext::repl_mvcc, so
+// journal::RecordEntry's "caller supplied no stamp" test (entry.mvcc == 0, journal.cc) was always
+// true for a derived DEL and it always minted a fresh LOCAL HopStamp -- even when the DEL was
+// itself derived from applying a peer's replicated command. Two peers independently applying the
+// same replicated HDEL (each emptying their own copy of the hash) would then diverge onto two
+// different, locally-minted stamps for the same logical delete instead of converging on the
+// author's one stamp, exactly like AppliedWriteKeepsAuthorStampVerbatim above proves for ordinary
+// (non-derived) applied writes.
+//
+// The emptied key itself can't be used to observe this (StampOf would read nullopt either way --
+// the key is gone), so this test instead reads the derived DEL's own journal entry (mvcc travels
+// on the wire under extended framing -- see JournalItem's comment above) exactly the way a
+// downstream plain replica or a peer's Commit()-driven side-table stamp would.
+//
+// Falsifying: reverting either `db_cntx.repl_mvcc` argument in tx_base.cc back to a hardcoded 0
+// makes del->mvcc below come back as a freshly-minted local stamp instead of kAuthorMvcc -- always
+// larger, since HopStamp mints from the real current wall clock and kAuthorMvcc here is not a
+// live timestamp.
+TEST_F(MvccStoreTest, DerivedDeleteFromAppliedWriteKeepsAuthorStamp) {
+  constexpr uint32_t kPeerIdx = 4;
+  constexpr uint64_t kAuthorMvcc = 0x4242'0000'1111ULL;
+
+  const size_t num_shards = shard_set->size();
+  MvccCapturingConsumer consumer;
+  std::vector<uint32_t> consumer_ids(num_shards, 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+
+  Run({"hset", "h", "f", "v"});  // local write; its own entry is irrelevant to this test
+
+  ApplyReplicatedCommand({"hdel", "h", "f"}, kPeerIdx, kAuthorMvcc);
+
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  const MvccCapturedEntry* del = nullptr;
+  for (auto it = consumer.entries.rbegin(); it != consumer.entries.rend(); ++it) {
+    if (it->cmd == "DEL") {
+      del = &*it;
+      break;
+    }
+  }
+  ASSERT_NE(nullptr, del) << "HDEL emptying the hash must derive a DEL";
+  EXPECT_EQ(del->mvcc, kAuthorMvcc) << "a derived DEL caused by an applied write must reproduce "
+                                       "the author's stamp, not mint a fresh local one";
+  EXPECT_EQ(del->origin_idx, kPeerIdx);
+}
+
+namespace {
 // drakeydb: Phase 4, P4-1 Task 10 -- sums TEST_VerifyMvccTable(0) (db_slice.cc) across every
 // shard. Each shard's callback writes to its own index of `per_shard`, never a shared accumulator
 // -- shard_set->RunBriefInParallel dispatches onto each shard's own proactor thread, so a naive
@@ -1500,6 +1659,79 @@ TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
 
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u)
       << "every live key needs exactly one stamp, and vice versa";
+}
+
+// drakeydb: review wave 2 (F1, CRITICAL) -- HDEL emptying a hash arms the key TWICE: ExecuteW's
+// own it_res->post_updater.Run() (hset_family.cc) arms it once, then -- because the hash is now
+// empty -- DeleteHw takes a SECOND, independent FindMutable/AutoUpdater on the same still-present
+// key and arms it again via its own post_updater.Run(), before finally deleting it.
+// MvccStamper::Disarm (mvcc.cc) used to erase only the first matching arm and `return`, leaving
+// one arm behind for a key PerformDeletionAtomic had just erased from `prime`; the derived DEL's
+// own journal::RecordEntry->Commit then reinserted a side-table stamp for that now-nonexistent
+// key. This is the literal repro from the phase's review brief: under --active_replica,
+// `HSET h f v` then `HDEL h f` aborted the whole process with
+// `Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (1 vs. 0)`
+// at db_slice.cc's OnCbFinishBlocking -- reproduced verbatim before this fix; see
+// final-fix-report.md.
+//
+// Falsifying: restoring Disarm's early `return` after the first erase (mvcc.cc) reproduces that
+// exact DCHECK abort inside this test's own HDEL call -- see final-fix-report.md for the verbatim
+// output.
+TEST_F(MvccStoreTest, HdelEmptyingHashDoesNotResurrectAStamp) {
+  Run({"hset", "h", "f", "v"});
+  ASSERT_TRUE(StampOf("h").has_value());
+  Run({"hdel", "h", "f"});
+  EXPECT_FALSE(StampOf("h").has_value())
+      << "the HDEL's own journal entry must not re-stamp the key it just emptied";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: review wave 2 (F1, CRITICAL) -- the same double-arm shape as
+// HdelEmptyingHashDoesNotResurrectAStamp above, via a different pair of call sites:
+// OpFieldExpire's own auto_updater.Run() (generic_family.cc) arms the key once, then --
+// discovering the named field already lazily expired while trying to re-arm it, and the hash now
+// empty -- HSetFamily::DeleteIfEmpty takes a second, independent FindMutable/AutoUpdater and arms
+// it again before deleting. Recipe (a hash with one member whose TTL has already elapsed,
+// re-probed via FIELDEXPIRE) is the hash counterpart of
+// OriginJournalFamilyTest.FieldExpireCausedDeleteIsNotFlaggedDerived (this file), which pins this
+// same recipe's journal-flag behavior on a SET; AdvanceTime (a mocked clock, no real sleep) is
+// what keeps this deterministic instead of racing the ~100ms member-expiry reaper heartbeat.
+//
+// Falsifying: restoring Disarm's early `return` (mvcc.cc) reproduces the same
+// mvcc->size()/prime->size() DCHECK abort as the HDEL test above -- see final-fix-report.md.
+TEST_F(MvccStoreTest, FieldExpireEmptyingHashDoesNotResurrectAStamp) {
+  ASSERT_EQ(Run({"hset", "feh", "f", "v"}).GetInt(), 1);
+  Run({"fieldexpire", "feh", "1", "f"});
+  AdvanceTime(1100);
+  Run({"fieldexpire", "feh", "1", "f"});
+
+  // Guard against a vacuous pass: the hash must have actually been cleaned up.
+  ASSERT_EQ(Run({"exists", "feh"}).GetInt(), 0);
+  EXPECT_FALSE(StampOf("feh").has_value())
+      << "the derived DEL's own journal entry must not re-stamp the key it just emptied";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: review wave 2 (F1, CRITICAL) -- the SET counterpart of
+// FieldExpireEmptyingHashDoesNotResurrectAStamp above: OpFieldExpire's is_set branch calls
+// SetFamily::DeleteSetIfEmpty (set_family.cc) instead of HSetFamily::DeleteIfEmpty, but takes the
+// identical second-FindMutable/second-arm shape. Same recipe as
+// OriginJournalFamilyTest.FieldExpireCausedDeleteIsNotFlaggedDerived (this file), which pins this
+// scenario's journal-flag behavior; this test pins the mvcc side-table invariant instead.
+//
+// Falsifying: restoring Disarm's early `return` (mvcc.cc) reproduces the same
+// mvcc->size()/prime->size() DCHECK abort as the two tests above -- see final-fix-report.md.
+TEST_F(MvccStoreTest, FieldExpireEmptyingSetDoesNotResurrectAStamp) {
+  ASSERT_EQ(Run({"sadd", "fes", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "fes", "1", "m"});
+  AdvanceTime(1100);
+  Run({"fieldexpire", "fes", "1", "m"});
+
+  // Guard against a vacuous pass: the set must have actually been cleaned up.
+  ASSERT_EQ(Run({"exists", "fes"}).GetInt(), 0);
+  EXPECT_FALSE(StampOf("fes").has_value())
+      << "the derived DEL's own journal entry must not re-stamp the key it just emptied";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
 // drakeydb: Phase 4, P4-1 Task 10 -- MEMORY DEFRAGSEGMENTS (memory_cmd.cc:346's

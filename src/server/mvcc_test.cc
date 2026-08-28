@@ -233,6 +233,33 @@ TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
                                     "Disarm(1, \"k\") was supposed to remove";
 }
 
+// drakeydb: review wave 2 (F1, CRITICAL) -- the core-mechanism unit test behind
+// multi_master_test.cc's HdelEmptyingHashDoesNotResurrectAStamp and its two FieldExpire siblings,
+// isolated from any specific command: a key can be armed twice before it is deleted (e.g. HDEL
+// emptying a hash -- ExecuteW's own post_updater.Run() arms it once, then DeleteHw takes a
+// second, independent FindMutable/AutoUpdater on the same still-present key and arms it again
+// before calling Del). Disarm's only caller, PerformDeletionAtomic, calls it exactly once per
+// deleted key regardless of how many times that key was armed -- so a single-match Disarm left
+// one arm behind, which the deleting command's own Commit() then re-stamped, corrupting the mvcc
+// side table with an entry for a key PerformDeletionAtomic had just erased from `prime`
+// (reproduced verbatim: `HSET h f v` then `HDEL h f` under --active_replica aborts the process --
+// see final-fix-report.md).
+//
+// Falsifying: restoring the early `return` inside Disarm's erase loop (mvcc.cc) makes rec.writes
+// non-empty here (size 1, key "h") instead of empty.
+TEST(MvccStamperTest, DisarmRemovesAllArmsForTheSameKey) {
+  MvccStamper* s = FreshStamper();
+  Recorder rec;
+  s->Arm(0, "h");
+  s->Arm(0, "h");
+  s->Disarm(0, "h");
+  s->Commit(7, 0, rec.Fn());
+
+  EXPECT_TRUE(rec.writes.empty())
+      << "a key armed twice before being deleted must not resurface in Commit() after a single "
+         "Disarm() call -- the surviving arm would re-stamp a key that no longer exists";
+}
+
 // The bit-identity mechanism: several entries minted inside one callback share a stamp.
 TEST(MvccStamperTest, HopStampIsStableWithinEpochAndAdvancesAfter) {
   MvccStamper* s = FreshStamper();

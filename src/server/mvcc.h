@@ -145,7 +145,13 @@ class MvccStamper {
   // up into dragonfly_lib for GetCurrentTimeMs; callers (Task 7's journal.cc) pass it explicitly.
   uint64_t HopStamp(uint64_t now_ms);
 
+  // May be called more than once for the same (db_index, key) within one callback -- a command
+  // can take a second, independent FindMutable/AutoUpdater on a key it is about to delete (e.g.
+  // DeleteHw, DelMutable's other callers). Duplicates are harmless: Commit() below just calls its
+  // CommitFn once per arm with the same stamp.
   void Arm(DbIndex db_index, std::string_view key);
+  // Erases EVERY arm matching (db_index, key), not just the first -- see the .cc for why a
+  // single-match version corrupted the mvcc side table (review wave 2, F1, CRITICAL).
   void Disarm(DbIndex db_index, std::string_view key);
 
   // The caller always supplies a non-zero stamp: the author's freshly minted HopStamp(now_ms), or

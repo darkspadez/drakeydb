@@ -80,7 +80,10 @@ struct DbContext {
 
   // drakeydb: Phase 4 -- the applied entry's MVCC stamp, mirroring repl_origin_idx above. Lets
   // delete paths that stamp directly (rather than through arm/commit) reproduce the author's
-  // stamp byte for byte. 0 means "mint locally".
+  // stamp byte for byte. 0 means "mint locally". Consumed by RecordDelete(const DbContext&, ...)
+  // and RecordDerivedDelete below (review wave 2, F2 -- landed here in Task 6 but left unread
+  // until then, so every derived/expiry DEL an applier produced minted its own local stamp
+  // instead of reproducing the author's).
   uint64_t repl_mvcc = 0;
 
   // Convenience method.
@@ -251,6 +254,9 @@ void RecordDelete(DbIndex dbid, std::string_view key);
 // OpFetchContainerElements's SORT case) whose own carve-out comments (generic_family.cc) explain
 // why. Never sets kEntryFlagExpired -- that flag is reserved for RecordExpiryBlocking below,
 // which does not go through RecordDelete.
+//
+// drakeydb: Phase 4, review wave 2 (F2) -- also forwards db_cntx.repl_mvcc, so on an applier this
+// DEL reproduces the author's stamp instead of minting a new one local to this node.
 void RecordDelete(const DbContext& db_cntx, std::string_view key);
 
 // drakeydb: P4-0 -- records a DEL derived from a collection becoming empty. Identical to
@@ -269,6 +275,10 @@ void RecordDerivedDelete(const DbContext& db_cntx, std::string_view key);
 // expiry is always a local decision, never the replay of a peer's command. Defined out-of-line
 // (tx_base.cc) rather than inline here because it needs journal::kEntryFlagExpired and can no
 // longer just forward to RecordDelete(DbIndex, ...), which must stay flag-free.
-void RecordExpiryBlocking(DbIndex dbid, std::string_view key);
+//
+// drakeydb: Phase 4, review wave 2 (F4) -- takes a DbContext (not a bare DbIndex) so it can pass
+// db_cntx.repl_mvcc to journal::RecordEntry instead of always minting a fresh local stamp; see
+// the .cc for why origin_idx deliberately does NOT get the same treatment.
+void RecordExpiryBlocking(const DbContext& db_cntx, std::string_view key);
 
 }  // namespace dfly

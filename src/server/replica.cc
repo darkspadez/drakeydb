@@ -504,6 +504,48 @@ error_code Replica::Greet() {
     // forwards only self-origin entries, so every COMMAND arriving here carries origin_idx == 0.
     // Under no-forward v1 the sender is the author, so the link's uuid is the correct source.
     peer_origin_hash_ = NodeUuidHash(master_context_.master_node_uuid);
+
+    // drakeydb: Phase 4, review wave 2 (F3, IMPORTANT) -- register it here, not only from
+    // InitiateDflySync's shard_cb (below in this file), because that call site is unreachable for
+    // a Redis-protocol peer link: the state machine driving this Replica (MainReplicationFb)
+    // branches on HasDflyMaster() to choose InitiateDflySync (DFLY protocol) vs InitiatePSync
+    // (plain PSYNC) for full sync, and InitiatePSync never touches InitiateDflySync at all -- but
+    // the uuid handshake just above runs unconditionally, before that branch is even reached
+    // (KeyDB replies to REPLCONF UUID same as a DFLY peer would; see this function's own uuid
+    // exchange comment above). Without this, a genuine KeyDB peer -- explicitly supported here,
+    // this whole block admits it once it presents a uuid -- applied every write with the correct
+    // origin_idx (ConsumeRedisStream sets conn_context.repl_origin_idx = peer_origin_idx_) but an
+    // UNREGISTERED origin_hash: OriginHash(peer_origin_idx_) (mvcc.cc) returns 0 for any index
+    // origin_hash_cache_ was never resized to cover, indistinguishable from a genuinely-computed
+    // hash landing on 0. Two distinct KeyDB peers would then both stamp writes with origin_hash
+    // == 0 and become order-indistinguishable on an exact mvcc tie -- precisely the swap
+    // MvccStamp::origin_hash exists to prevent (mvcc.h). mvcc itself is a separate, NOT-closed
+    // gap: ConsumeRedisStream has no SetApplyMvcc call anywhere, and could not usefully add one --
+    // plain Redis/KeyDB replication carries no room for an extra per-command stamp on the wire,
+    // unlike DFLY's extended framing (serializer.cc), so an applied write via this path always
+    // mints a fresh local stamp regardless of this fix. Parsing KeyDB's own mvcc-tstamp off the
+    // wire is P7 onboarding's job (mvcc.h's MvccClock comment), not this one. This fix closes the
+    // origin_hash half only -- still a real improvement, since operator< (mvcc.h) compares Mvcc()
+    // first and origin_hash only breaks an exact tie, so a wrong-but-distinct-per-peer hash is far
+    // better than a hash shared by every unregistered peer.
+    //
+    // shard_set->pool()->AwaitBrief, the same primitive ServerFamily::Init's SetSelfUuid call
+    // uses (server_family.cc) for this exact reason: MvccStamper::tlocal() is a plain
+    // thread_local with no EngineShard::tlocal() requirement, so any proactor thread works, and
+    // AwaitBrief is the lighter-weight choice when the callback itself neither blocks nor needs
+    // shard identity (unlike journal::StartInThread's shard_set->RunBriefInParallel a few lines
+    // above SetSelfUuid in that same file, which does need it). InitiateDflySync's own
+    // registration below uses AwaitFiberOnAll instead, for reasons specific to that callback (see
+    // its own comment) that do not apply to this one. Guarded on the value, not IsPeerMode(), for
+    // the identical reason InitiateDflySync's own call is (see its comment): ReplicaPeerMode::
+    // registry == nullptr (documented reachable in tests) leaves peer_origin_idx_ at kSelfIdx even
+    // with IsPeerMode() true, and registering hash-for-self here would clobber SetSelfUuid's real
+    // entry.
+    if (peer_origin_idx_ != PeerRegistry::kSelfIdx) {
+      shard_set->pool()->AwaitBrief([this](unsigned, auto*) {
+        MvccStamper::tlocal()->RegisterOriginHash(peer_origin_idx_, peer_origin_hash_);
+      });
+    }
   } else if (IsPeerMode()) {
     // drakeydb: D2b -- peer mode now requires a uuid. Without one there is no origin to stamp,
     // and stamping kSelfIdx would make this active node forward the source's writes back out to

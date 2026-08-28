@@ -57,13 +57,39 @@ void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
   armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size())});
 }
 
+// drakeydb: Phase 4, review wave 2 (F1, CRITICAL) -- erases EVERY arm matching (db_index, key),
+// not just the first. A key can be armed more than once before it is deleted: e.g. HDEL emptying
+// a hash arms it via ExecuteW's own it_res->post_updater.Run() (hset_family.cc), then DeleteHw
+// takes a SECOND, independent FindMutable/AutoUpdater on the same still-present key and arms it
+// again via its own post_updater.Run() before calling Del -- OpFieldExpire's
+// auto_updater.Run()-then-Delete{Set}IfEmpty->DelMutable shape (generic_family.cc) is the same
+// pattern on both the HASH and SET branches. The original single-match version (erase the first
+// hit, `return`) left one arm behind for a key PerformDeletionAtomic had just erased from `prime`
+// and from the mvcc side table; the derived DEL's own journal::RecordEntry->Commit then
+// reinserted a side-table entry for that now-nonexistent key, corrupting
+// mvcc->size()/prime->size() parity (the DCHECK in DbSlice::OnCbFinishBlocking) --
+// reproduced verbatim on `HSET h f v` then `HDEL h f` under --active_replica, which aborts the
+// process; see multi_master_test.cc's HdelEmptyingHashDoesNotResurrectAStamp and its two
+// FieldExpire siblings for the regression coverage, and final-fix-report.md for the verbatim
+// crash this fixes.
+//
+// Disarm's only caller is PerformDeletionAtomic, invoked once the key is gone for good, so there
+// is no scenario where leaving a second arm behind for it is correct -- erasing every match (not
+// de-duplicating in Arm) is the fix. This changes nothing about Arm()'s bookkeeping for the
+// (harmless) case of a still-live key armed more than once in one callback -- Commit() already
+// tolerates that by calling SetMvcc with the same stamp value once per arm -- and only removes
+// arms for keys that no longer exist, so stats_.unstamped_writes (only ever incremented by
+// EndOfWriteEpoch(), never by Disarm()) is unaffected either way. Already an O(n) scan in the
+// worst case (no match), so continuing past the first match instead of returning early costs
+// nothing extra asymptotically.
 void MvccStamper::Disarm(DbIndex db_index, std::string_view key) {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn disarmed a key -- Commit() is mid-iteration over "
                                  "armed_, which erase() would corrupt";
-  for (auto it = armed_.begin(); it != armed_.end(); ++it) {
+  for (auto it = armed_.begin(); it != armed_.end();) {
     if (it->db_index == db_index && ArmedKey(*it) == key) {
-      armed_.erase(it);
-      return;
+      it = armed_.erase(it);
+    } else {
+      ++it;
     }
   }
 }
