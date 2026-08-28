@@ -137,34 +137,14 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
   // so this is what actually protects LWW ordering for that key in the overwhelmingly common
   // case.
   //
-  // origin_idx is NOT threaded the same way, because unlike mvcc it is not merely descriptive --
-  // journal::PassesPeerEchoFilter (journal/types.cc) branches on it FIRST, before even looking at
-  // entry_flags: `if (item.origin_idx != kSelfIdx) { LOG(ERROR) ...; return false; }`. That
-  // check exists to catch a node accidentally re-forwarding a peer's entry to a THIRD peer in a
-  // full-mesh topology where every node is expected to link directly to every other node.
-  // kEntryFlagExpired already independently makes PassesPeerEchoFilter return false a few lines
-  // later, so setting origin_idx to db_cntx.repl_origin_idx here would not change whether this
-  // DEL reaches a peer (it still wouldn't) -- it would only make it take the noisy,
-  // rate-limited-ERROR "foreign-origin entry refused" branch instead of the silent,
-  // expiry-specific one, on every node in the mesh, for an entry that was never anomalous. It
-  // would also misattribute the expiry decision itself: kSelfIdx here is not a placeholder, it is
-  // the true statement that THIS node's own clock decided to reap this key, independent of
-  // whatever command is being replayed at that moment -- exactly the KeyDB semantics this
-  // function's original comment above documents.
-  //
-  // Residual, accepted gap: a sibling key swept into this Commit() call ends up with
-  // {author's real mvcc, THIS node's own origin_hash} rather than {author's mvcc, author's
-  // origin_hash} -- correct on the primary (Mvcc()) ordering key, wrong only on origin_hash,
-  // which operator< only consults to break an EXACT mvcc tie (mvcc.h). That already-narrow window
-  // (this expiry race, on a non-first key of a multi-key applied command) would have to further
-  // coincide with a second peer independently writing the very same key at the very same
-  // millisecond-and-counter for the wrong origin_hash to change the outcome. Not closed by this
-  // fix; needs Commit() to accept a stamp that differs from the entry it is nested inside, which
-  // is a larger change than this pass makes -- flagged here for a future phase rather than risked
-  // now.
+  // origin_idx is kept self-originated because this node's clock made the expiry decision and the
+  // resulting DEL must not be echoed to peers. The transient stamp_origin_idx is separate: when
+  // this expiry fires while an applier is still processing a replicated multi-key command,
+  // Commit() may sweep sibling arms into this entry. Those siblings must retain the command
+  // author's origin hash as well as its mvcc, or an exact-MVCC tie can diverge on LWW ordering.
   journal::RecordEntry(0, journal::Op::COMMAND, db_cntx.db_index, KeySlot(key),
-                       Payload("DEL", ArgSlice{key}),
-                       /* origin_idx= */ 0, db_cntx.repl_mvcc, journal::kEntryFlagExpired);
+                       Payload("DEL", ArgSlice{key}), /* origin_idx= */ 0, db_cntx.repl_mvcc,
+                       journal::kEntryFlagExpired, db_cntx.repl_origin_idx);
 }
 
 LockTag::LockTag(std::string_view key) {

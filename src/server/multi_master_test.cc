@@ -1548,11 +1548,14 @@ TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   EXPECT_EQ(st1->Mvcc(), kAuthorMvcc)
       << "k1 was armed by its own Set() before k2's lazy expiry swept it into that entry's "
          "Commit() call -- it must still end up stamped with the MSET's real author mvcc";
+  EXPECT_EQ(st1->origin_hash, peer_hash)
+      << "k1 was swept into the expiry commit and must retain the MSET author's origin hash";
 
   auto st2 = StampOf(k2);
   ASSERT_TRUE(st2.has_value());
   EXPECT_EQ(st2->Mvcc(), kAuthorMvcc) << "k2 itself is stamped by MSET's own trailing commit, "
                                          "unaffected by this bug -- guards against a vacuous pass";
+  EXPECT_EQ(st2->origin_hash, peer_hash);
 }
 
 // drakeydb: Phase 4 Task 9, fix round (F1v2) -- proves ExecuteTx applies an author's mvcc AND

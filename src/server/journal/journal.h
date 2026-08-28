@@ -48,10 +48,12 @@ void UnregisterConsumer(uint32_t id);
 // RecordExpiryBlocking tags expiry/eviction-triggered DELs with kEntryFlagExpired, and (P4-0)
 // RecordDerivedDelete tags a DEL derived from a collection command emptying its key with
 // kEntryFlagDerived -- both so a later peer-echo filter (journal::PassesPeerEchoFilter) can
-// suppress them.
+// suppress them. RecordExpiryBlocking also supplies stamp_origin_idx separately: its wire entry
+// must remain self-originated so peers do not echo a local expiry, while any sibling arms swept
+// into its Commit() must retain the applied command's author origin hash.
 void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
                  Entry::Payload payload, uint32_t origin_idx = 0, uint64_t mvcc = 0,
-                 uint8_t entry_flags = 0);
+                 uint8_t entry_flags = 0, std::optional<uint32_t> stamp_origin_idx = std::nullopt);
 
 size_t LsnBufferSize();
 size_t LsnBufferBytes();

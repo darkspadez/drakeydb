@@ -100,7 +100,8 @@ LSN GetLsn() {
 }
 
 void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
-                 Entry::Payload payload, uint32_t origin_idx, uint64_t mvcc, uint8_t entry_flags) {
+                 Entry::Payload payload, uint32_t origin_idx, uint64_t mvcc, uint8_t entry_flags,
+                 std::optional<uint32_t> stamp_origin_idx) {
   Entry entry{txid, opcode, dbid, slot, std::move(payload)};
   // drakeydb: Phase 3 -- stamp origin/mvcc/entry_flags onto the entry; defaults to self/0/none
   // for callers that don't pass them. See journal.h for why this isn't folded into the Entry
@@ -137,7 +138,7 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
   if (MvccEnabled() && opcode == Op::COMMAND) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     MvccStamper::tlocal()->Commit(
-        entry.mvcc, entry.origin_idx,
+        entry.mvcc, stamp_origin_idx.value_or(entry.origin_idx),
         [&db_slice](DbIndex db, std::string_view key, const MvccStamp& st) {
           db_slice.SetExistingMvcc(db, key, st);
         });
