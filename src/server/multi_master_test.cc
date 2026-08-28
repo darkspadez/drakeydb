@@ -1609,8 +1609,16 @@ TEST_F(MvccStoreTest, DefragActuallyRelocatesMvccSegments) {
 // because DoSave reads the flag live. absl::FlagSaver (fix round 1, Minor) restores it on scope
 // exit, matching MultiMasterFamilyTest's saver_ -- without it, dbfilename leaked globally into
 // every later test in this binary that also reads or sets it.
+//
+// drakeydb: Task 11 fix round 1 (F2) -- --dir also pointed at a private GetTestTempPath, matching
+// MultiMasterFamilyTest's constructor (:509, this file): dbfilename alone has no directory
+// component (ValidateFilename, save_stages_controller.cc, rejects one outright), so without this
+// the save/reload below wrote its .dfs files into whatever the process's cwd happened to be --
+// the repo root, when this binary is run directly rather than via ctest. Same flag_saver restores
+// it on scope exit.
 TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
   absl::FlagSaver flag_saver;
+  absl::SetFlag(&FLAGS_dir, base::GetTestTempPath("mvcc_reload_test"));
   BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("mvcc_reload_test_", getpid()));
 
   for (int i = 0; i < 100; ++i)
@@ -1653,6 +1661,9 @@ TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
 // onto one shard" trap this phase has hit before.
 TEST_F(MvccStoreTest, ReloadDoesNotLeaveArmsForALaterWriteToClobber) {
   absl::FlagSaver flag_saver;
+  // drakeydb: Task 11 fix round 1 (F2) -- see ReloadedKeysAreStampedSoTheInvariantHolds's comment
+  // above for why --dir is set here too, not just --dbfilename.
+  absl::SetFlag(&FLAGS_dir, base::GetTestTempPath("mvcc_reload_arm_leak_test"));
   BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("mvcc_reload_arm_leak_test_", getpid()));
 
   const unsigned num_shards = shard_set->size();

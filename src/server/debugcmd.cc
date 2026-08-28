@@ -748,10 +748,11 @@ void DebugCmd::Run(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
         "    Prints per-object unique string stats and estimated dedup savings across shards.",
         "MVCC [<key> | VERIFY]",
         "    Inspect the per-key MVCC/LWW stamp side table (--active_replica only). With <key>,",
-        "    hops to that key's shard and prints its stamp: 'state:value mvcc:<u64> ms:<u64> ",
-        "    counter:<u32> origin:<hex16> shard:<n>' or 'state:absent shard:<n>'. With no key, ",
-        "    prints per-shard aggregates (entries/tombstones/bytes/clock_last/clock_ahead_ms/",
-        "    unstamped_writes). VERIFY runs the from-scratch dense-invariant check on every shard ",
+        "    hops to that key's shard and prints its stamp: 'state:value mvcc:<u64> ms:<u64>",
+        "    counter:<u32> origin:<hex16> shard:<n>', 'state:tombstone mvcc:<u64> ms:<u64>",
+        "    origin:<hex16> shard:<n>' (no counter: field), or 'state:absent shard:<n>'. With no",
+        "    key, prints per-shard aggregates (entries/tombstones/bytes/clock_last/clock_ahead_ms/",
+        "    unstamped_writes). VERIFY runs the from-scratch dense-invariant check on every shard",
         "    and every db, returning 'mismatches:<n>'. Errors naming --active_replica when off.",
         "HELP",
         "    Prints this help.",
@@ -1291,6 +1292,19 @@ void DebugCmd::Inspect(string_view key, facade::CmdArgParser parser, CommandCont
 // All three refuse up front when --active_replica is off: DbTable::mvcc is never allocated then
 // (table.h), so every key would otherwise read back state:absent -- indistinguishable from a
 // real absence and silently misleading about why.
+//
+// drakeydb: Task 11 fix round 1 (F3, Minor) -- that same "state:absent looks like a real absence"
+// failure mode is NOT fully closed by the gate above: it resurfaces, --active_replica notwith-
+// standing, for a caller in a non-default ACL namespace. Arming (DbSlice::PostUpdate) is gated to
+// the default namespace only (see the F1 gate's own comment on that call site, db_slice.cc), so a
+// non-default namespace has a populated prime table and a permanently empty mvcc table -- <key>
+// reports state:absent for a live key, the no-key aggregate reads all zeros, and VERIFY returns a
+// vacuous mismatches:0 (TEST_VerifyMvccTable short-circuits there too, same file). This command
+// resolves cntx_->ns, the caller's own namespace, for all three forms -- deliberately not special-
+// cased here, since faithfully reflecting "this namespace never gets stamps" is correct given the
+// current design; flagging in the comment rather than fixing since a real fix (arm every
+// namespace, or refuse non-default namespaces here) is a design decision outside this task's
+// scope.
 void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
 
@@ -1306,7 +1320,16 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
 
     Namespace* ns = cntx_->ns;
     vector<size_t> mismatches(shard_set->size(), 0);
-    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    // RunBlockingInParallel (Dispatch, spawns a fiber -- e.g. Watched() above, :1427), not
+    // RunBriefInParallel (DispatchBrief, callback must not preempt -- reserved elsewhere in this
+    // file for O(1)/O(db-count) gathers like Shards()'s per-shard memory stats).
+    // TEST_VerifyMvccTable drives two Traverse cursors to exhaustion over the whole prime table
+    // AND the whole mvcc table, for every db, with a LOG(ERROR) per mismatch -- O(table size),
+    // unbounded by this caller. Under DispatchBrief that stalls the entire proactor (every
+    // connection, journal I/O, replication ACK on that thread) uninterruptibly for the whole
+    // traversal on a large dataset; a fiber at least makes the call schedulable like any other
+    // blocking work on this thread.
+    shard_set->RunBlockingInParallel([&](EngineShard* shard) {
       ShardId sid = shard->shard_id();
       auto& db_slice = ns->GetDbSlice(sid);
       size_t shard_mismatches = 0;
@@ -1344,13 +1367,20 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       ShardId sid = shard->shard_id();
       ShardMvccInfo& info = infos[sid];
 
-      auto slice_stats = ns->GetDbSlice(sid).GetStats();
+      auto& db_slice = ns->GetDbSlice(sid);
+      auto slice_stats = db_slice.GetStats();
       DbStats total;
       for (const auto& db_stats : slice_stats.db_stats)
         total += db_stats;
       info.entries = total.mvcc_entries;
       info.tombstones = total.mvcc_tombstones;
-      info.bytes = total.mvcc_table_bytes;
+      // drakeydb: Task 11 fix round 1 (F3, Minor) -- DbSlice::mvcc_table_memory() (db_slice.h)
+      // already sums DbTable::mvcc_table_memory() over every db directly; re-deriving the same
+      // number via total.mvcc_table_bytes above would just repeat that summation a second time
+      // (GetStats() computes it per-db via the identical call, db_slice.cc's GetStats()) for no
+      // benefit -- entries/tombstones have no equivalent direct accessor, so those still come
+      // from the total above.
+      info.bytes = db_slice.mvcc_table_memory();
 
       MvccStamper* stamper = MvccStamper::tlocal();
       info.clock_last = stamper->clock().last();
