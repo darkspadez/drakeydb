@@ -1467,6 +1467,46 @@ TEST_F(MemBufControllerTest, RollbackOnSuspendedEntry) {
 
 namespace {
 
+// drakeydb: P4-2 Task 2, review round 1 (Important, finding 2) -- duplicated from
+// journal_test.cc's own file-local ScopedLogCapture (same reasoning as WrapInRdbForTest in
+// peer_replication_test.cc: the original is anonymous-namespace-scoped there, so a second TU
+// needing the same capability copies it rather than promoting it to a shared header for one
+// caller). Registers as a real glog/absl-log sink for the scope's lifetime and records every
+// message's text verbatim, so a test can assert on the exact log output a code path produces
+// (or, as here, does NOT produce) without guessing at log levels or destinations.
+#ifdef USE_ABSL_LOG
+class ScopedLogCapture : public absl::LogSink {
+ public:
+  ScopedLogCapture() {
+    absl::AddLogSink(this);
+  }
+  ~ScopedLogCapture() override {
+    absl::RemoveLogSink(this);
+  }
+  void Send(const absl::LogEntry& entry) override {
+    logs.emplace_back(entry.text_message());
+  }
+
+  std::vector<std::string> logs;
+};
+#else
+class ScopedLogCapture : public google::LogSink {
+ public:
+  ScopedLogCapture() {
+    google::AddLogSink(this);
+  }
+  ~ScopedLogCapture() override {
+    google::RemoveLogSink(this);
+  }
+  void send(google::LogSeverity severity, const char* full_filename, const char* base_filename,
+            int line, const struct tm* tm_time, const char* message, size_t message_len) override {
+    logs.emplace_back(message, message_len);
+  }
+
+  std::vector<std::string> logs;
+};
+#endif
+
 // Wraps string in rdb version, eof, checksum, etc so it can be fed to a loader
 std::string WrapInRdb(std::string_view body) {
   std::string out = absl::StrFormat("REDIS%04d", RDB_SER_VERSION);
@@ -2628,6 +2668,87 @@ TEST_F(RdbMvccTest, LoadFallsBackToZeroStampWhenOpcodeAbsent) {
       << "no RDB_OPCODE_DF_MVCC record for this key (e.g. a snapshot produced by a node with "
          "--active_replica off) must fall back to {0,0}, D-7's unversioned default -- the "
          "fallback must survive Task 2's new opcode-aware path";
+}
+
+// drakeydb: P4-2 Task 2, review round 1 (Important, finding 1) -- covers D-7's "parses, discards"
+// compatibility row, which neither test above exercises: both use the ACTIVE RdbMvccTest
+// fixture, and the pytest plain-replica gate
+// (test_plain_replica_of_active_node_gets_full_unfiltered_stream) attaches before any writes, so
+// its own full-sync stream never carries a live 0xDD record either. A loader bug that skips the
+// opcode's 16 bytes WITHOUT consuming them (e.g. an errantly added `if (IsActiveReplica())` guard
+// around the fetch, not just around the eventual SetMvcc apply) would desync the byte stream --
+// the type byte of the NEXT record would be misread as the low byte of the abandoned stamp -- and
+// every real non-active consumer of an active node's snapshot (a plain replica's full sync, or
+// this exact scenario relayed through a peer mesh) would silently corrupt or fail to load
+// everything after the first stamped key. Nothing in the suite before this test could have caught
+// that: it is the first test in the file to put a live RDB_OPCODE_DF_MVCC record in front of an
+// INACTIVE loader with more data after it.
+//
+// Plain RdbTest (inactive is upstream's default, matching NoMvccOpcodeOrAuxWhenInactive above) --
+// k2 immediately follows k1's record with no opcode of its own, so it can only parse correctly if
+// the loader consumed exactly 16 bytes for k1's record, no more, no less.
+TEST_F(RdbTest, LoadConsumesAndDiscardsMvccRecordWhenInactive) {
+  ASSERT_FALSE(IsActiveReplica());
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+  std::string body;
+  uint8_t block[17] = {0xDD};
+  absl::little_endian::Store64(block + 1, kStamp.packed);
+  absl::little_endian::Store64(block + 9, kStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k1");
+  AppendString(&body, "v1");
+  // No opcode before k2: if the record above were not fully (and only) consumed, the loader
+  // would desync right here.
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k2");
+  AppendString(&body, "v2");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  // "Parses": both keys loaded with their correct values -- proof the record's 16 bytes were
+  // fully consumed rather than skipped or partially consumed.
+  EXPECT_EQ(Run({"get", "k1"}), "v1");
+  EXPECT_EQ(Run({"get", "k2"}), "v2");
+
+  // "Discards": an inactive node never allocates the mvcc side table (DbTable::DbTable,
+  // table.cc), so GetMvcc must return nullopt for k1 -- not the stamp the record carried, and
+  // not {0,0} either.
+  std::optional<MvccStamp> got;
+  shard_set->Await(Shard("k1", shard_set->size()), [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k1"});
+  });
+  EXPECT_FALSE(got.has_value())
+      << "an inactive node must never install a stamp -- GetMvcc must return nullopt, proving "
+         "SetMvcc's own `if (!db.mvcc) return;` guard (db_slice.cc) discarded it";
+}
+
+// drakeydb: P4-2 Task 2, review round 1 (Important, finding 2) -- rdb_save.cc's SaveAux writes
+// the "drakeydb-mvcc" breadcrumb unconditionally on every active-mode save (SaveAuxFieldStrStr,
+// gated on IsActiveReplica()); before HandleAux recognized it, every single active-mode load --
+// including this fixture's own SAVE-then-LOAD via `debug reload` -- logged "Unrecognized RDB AUX
+// field: 'drakeydb-mvcc'" once per shard file, inverting the warning's purpose (it exists to flag
+// a FOREIGN binary's genuinely unknown aux fields, not drakeydb's own recognized one).
+//
+// Real glog/absl-log capture (ScopedLogCapture above), not a code-inspection stand-in: this repo
+// already has a working, in-tree precedent for exactly this (journal_test.cc's
+// PassesPeerEchoFilterTest.DropsForeignOriginExpiryDelAndOriginOpcodeOnly, which asserts a
+// rate-limited log line's exact count the same way), so there was no reason to fall back to a
+// weaker check here.
+TEST_F(RdbMvccTest, ActiveReloadDoesNotWarnOnRecognizedMvccAux) {
+  ASSERT_TRUE(IsActiveReplica());
+  ScopedLogCapture log_capture;
+
+  ASSERT_EQ(Run({"set", "k", "v"}), "OK");
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+
+  for (const auto& log : log_capture.logs) {
+    EXPECT_EQ(log.find("Unrecognized RDB AUX field: 'drakeydb-mvcc'"), std::string::npos)
+        << "the recognized drakeydb-mvcc breadcrumb must not trigger the foreign-aux warning: "
+        << log;
+  }
 }
 
 }  // namespace dfly

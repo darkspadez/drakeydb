@@ -3127,6 +3127,13 @@ error_code RdbLoader::HandleAux() {
     if (absl::SimpleAtoi(auxval, &mem)) {
       table_used_memory_ = mem;
     }
+  } else if (auxkey == "drakeydb-mvcc") {
+    // drakeydb: P4-2 Task 2, review round 1 (Important, finding 2) -- recognized breadcrumb,
+    // informational only (rdb_save.cc's SaveAux); every RDB_OPCODE_DF_MVCC record is self-
+    // describing regardless of this aux field's presence, so there is nothing to record here.
+    // Without this branch the "unrecognized" case below fires on every active-mode load's own
+    // breadcrumb, inverting the warning's purpose (it exists to flag a FOREIGN binary's unknown
+    // aux fields, not our own recognized one).
   } else {
     /* We ignore fields we don't understand, as by AUX field
      * contract. */
