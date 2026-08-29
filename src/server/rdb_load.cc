@@ -2617,7 +2617,7 @@ error_code RdbLoader::Load(io::Source* src) {
     }
 
     if (type == RDB_OPCODE_AUX) {
-      RETURN_ON_ERR(HandleAux());
+      RETURN_ON_ERR(HandleAux(&settings));
       continue; /* Read type again. */
     }
 
@@ -3039,7 +3039,7 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
   return std::error_code{};
 }
 
-error_code RdbLoader::HandleAux() {
+error_code RdbLoader::HandleAux(ObjSettings* settings) {
   /* AUX: generic string-string fields. Use to add state to RDB
    * which is backward compatible. Implementations of RDB loading
    * are required to skip AUX fields they don't understand.
@@ -3134,6 +3134,22 @@ error_code RdbLoader::HandleAux() {
     // Without this branch the "unrecognized" case below fires on every active-mode load's own
     // breadcrumb, inverting the warning's purpose (it exists to flag a FOREIGN binary's unknown
     // aux fields, not our own recognized one).
+  } else if (auxkey == "mvcc-tstamp") {
+    // drakeydb: P4-2 Task 3 -- KeyDB (fActiveReplica) writes this decimal-u64 aux before every
+    // key (KeyDB/src/rdb.cpp:1164-1168). Same packed layout as MvccClock (D-3/D-4), no tombstone
+    // bit. Author identity is not in the file; use the link's origin (load_origin_hash_, set via
+    // SetLoadOriginHash -- 0/"unknown" for a local file load). Like the drakeydb-mvcc branch
+    // above and the DF_MVCC opcode case in the main loop, this read is unconditional on the
+    // local node's own active-ness (D-7): settings->has_mvcc/mvcc are plain fields that exist
+    // regardless of whether an mvcc side table will ultimately consume them (CreateObjectOnShard
+    // -> SetMvcc no-ops on an inactive node's null table).
+    uint64_t v;
+    if (absl::SimpleAtoi(auxval, &v)) {
+      settings->mvcc = MvccStamp{v, load_origin_hash_};
+      settings->has_mvcc = true;
+    } else {
+      LOG(WARNING) << "Ignoring malformed mvcc-tstamp aux: '" << auxval << "'";
+    }
   } else {
     /* We ignore fields we don't understand, as by AUX field
      * contract. */

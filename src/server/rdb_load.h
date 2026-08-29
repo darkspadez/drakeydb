@@ -334,6 +334,17 @@ class RdbLoader : protected RdbLoaderBase {
     apply_origin_idx_ = idx;
   }
 
+  // drakeydb: P4-2 Task 3 -- the origin_hash HandleAux stamps onto a parsed KeyDB "mvcc-tstamp"
+  // aux (rdb_load.cc). That aux carries only a raw KeyDB counter, never an author identity
+  // (unlike our own RDB_OPCODE_DF_MVCC, which carries origin_hash on the wire already -- see
+  // Item::mvcc's doc comment below), so the loader has no way to learn it from the file itself.
+  // Leave unset (default 0, "unknown origin") for a local RDB file load; a live link that knows
+  // its peer's identity (e.g. Replica::peer_origin_hash_, set at Greet -- replica.cc) sets it
+  // before Load() runs, mirroring SetApplyOrigin/apply_origin_idx_ immediately above.
+  void SetLoadOriginHash(uint64_t origin_hash) {
+    load_origin_hash_ = origin_hash;
+  }
+
   std::error_code Load(::io::Source* src);
 
   void set_source_limit(size_t n) {
@@ -436,7 +447,7 @@ class RdbLoader : protected RdbLoaderBase {
   // Returns whether to discard the read key pair.
   bool ShouldDiscardKey(std::string_view key, const ObjSettings& settings) const;
 
-  std::error_code HandleAux();
+  std::error_code HandleAux(ObjSettings* settings);
 
   std::error_code VerifyChecksum();
 
@@ -491,6 +502,8 @@ class RdbLoader : protected RdbLoaderBase {
   uint32_t shard_id_ = UINT32_MAX;
   uint32_t shard_count_ = 0;
   size_t table_used_memory_ = 0;
+  // See SetLoadOriginHash's doc comment above.
+  uint64_t load_origin_hash_ = 0;
   ScriptMgr* script_mgr_;
   std::vector<ItemsBuf> shard_buf_;
 

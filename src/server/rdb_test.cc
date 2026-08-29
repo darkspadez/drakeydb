@@ -2751,4 +2751,59 @@ TEST_F(RdbMvccTest, ActiveReloadDoesNotWarnOnRecognizedMvccAux) {
   }
 }
 
+// drakeydb: P4-2 Task 3 -- proves RdbLoader::HandleAux recognizes KeyDB's "mvcc-tstamp" aux
+// (fActiveReplica's rdbSaveAuxFieldStrStr, KeyDB/src/rdb.cpp:1164-1168 -- KeyDB source, not
+// guessed) and installs it as a stamp with the SAME packed layout
+// LoadInstallsThePersistedStampVerbatim above already proved for our own RDB_OPCODE_DF_MVCC
+// opcode, but with origin_hash coming from SetLoadOriginHash (the link) instead of the file:
+// unlike our own opcode, KeyDB's aux is a bare decimal counter with no author identity of its own
+// (D-7). k2 has no preceding aux at all -- not even an unrelated one -- which is the one-shot
+// semantics the brief calls out: ObjSettings::Reset() (rdb_load.cc, called after every
+// LoadKeyValPair) means k1's aux can never leak onto k2, exactly like has_mc_flags's existing
+// one-shot contract for the DF_MASK opcode.
+TEST_F(RdbMvccTest, LoadsKeyDbMvccTstampAuxWithLinkOriginHash) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "81985529216486895");  // decimal(0x0123456789ABCDEF), KeyDB's %PRIu64
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k1");
+  AppendString(&body, "v1");
+  // No aux at all precedes k2 -- proves one-shot semantics, not merely that the branch parses.
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k2");
+  AppendString(&body, "v2");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetLoadOriginHash(kStamp.origin_hash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k1"}), "v1");
+  EXPECT_EQ(Run({"get", "k2"}), "v2");
+
+  std::optional<MvccStamp> got1, got2;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got1 = db_slice.GetMvcc(0, std::string_view{"k1"});
+    got2 = db_slice.GetMvcc(0, std::string_view{"k2"});
+  });
+  ASSERT_TRUE(got1.has_value());
+  EXPECT_EQ(*got1, kStamp)
+      << "k1's stamp must combine the aux's raw counter with the link's origin hash";
+
+  ASSERT_TRUE(got2.has_value()) << "an active loader must still leave a dense {0,0} slot";
+  EXPECT_TRUE(got2->Empty())
+      << "k2 has no preceding aux -- one-shot semantics must not leak k1's stamp onto it";
+}
+
 }  // namespace dfly
