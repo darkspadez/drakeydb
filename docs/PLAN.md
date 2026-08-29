@@ -620,9 +620,12 @@ duplication model is built from, and the falsification for every assertion:
 `RDB_OPCODE_DF_MVCC = 221` (`rdb_extensions.h`) is written per stamped key — 16 raw LE bytes,
 `{mvcc.packed, origin_hash}` — immediately before the key's type byte, exactly like the existing
 `RDB_OPCODE_DF_MASK` block; a zero stamp is never emitted. **The write side is active-only**
-(side-table lookup returns nothing otherwise); **the read side is unconditional** — any binary,
-active or not, parses and installs the 16 bytes (`rdb_load.cc`), which is what lets a plain
-sub-replica of an active node keep loading its snapshot stream cleanly (spec D-7). An additive
+(side-table lookup returns nothing otherwise); **the read side is unconditional** — every
+drakeydb binary parses the 16 bytes without erroring (`rdb_load.cc`). Only an active node
+installs them into the side table; a non-active node parses and discards (`SetMvcc` early-
+returns when `db.mvcc` is null, `db_slice.cc:1362-1365`) — spec D-7's "parses, discards" row —
+which is what lets a plain sub-replica of an active node keep loading its snapshot stream
+cleanly. An additive
 `drakeydb-mvcc` AUX field precedes the opcode in active-mode saves so a stock Dragonfly's loader
 at least logs "Unrecognized RDB AUX field: 'drakeydb-mvcc'" before it dies on the opcode — see
 the stock-Dragonfly-cliff note added to `docs/differences.md`. The loader also accepts KeyDB's
@@ -662,8 +665,10 @@ workload (`DEBUG POPULATE 5000` + 300 `SET`s) on a standalone `--active_replica`
 `mvcc_entries` matched `DBSIZE` exactly (5300) and `mvcc_table_bytes` was nonzero and plausible
 (363,264 B, ~68.5 B/key — above the 1M-key asymptotic 34-48 B/key band because a 5.3k-entry table
 amortizes dash bucket/segment overhead over far fewer keys). Every Tasks 1-5 falsification is
-recorded verbatim in `task-1..5-report.md` (same ledger directory); host pre-commit clean on the
-two doc files this task touched.
+recorded verbatim in `task-1..5-report.md` (same ledger directory), except Task 5's restart
+leg, which the ledger records as established by static argument (sole apply site + port
+change) rather than an observed failing run; host pre-commit clean on the two doc files this
+task touched.
 
 ## Phase 5 — Streaming LWW guard
 Command classifier + pre-exec compare/drop in `JournalExecutor`; `multimaster_lww_dropped`
