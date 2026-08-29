@@ -614,6 +614,57 @@ For capacity planning on a long-key workload, `used_memory` is the figure to tru
 duplication model is built from, and the falsification for every assertion:
 `.superpowers/sdd/2026-08-25-phase4-mvcc-lww/task-12-report.md`.
 
+**P4-2 delivered** (branch `feat/phase4-2-rdb-mvcc-persist`, Tasks 1-5, ledger
+`.superpowers/sdd/2026-08-29-phase4-2-rdb-mvcc-persistence/progress.md`): every key's
+`{mvcc, origin_hash}` stamp now survives RDB save/load instead of degrading to `{0,0}`.
+`RDB_OPCODE_DF_MVCC = 221` (`rdb_extensions.h`) is written per stamped key — 16 raw LE bytes,
+`{mvcc.packed, origin_hash}` — immediately before the key's type byte, exactly like the existing
+`RDB_OPCODE_DF_MASK` block; a zero stamp is never emitted. **The write side is active-only**
+(side-table lookup returns nothing otherwise); **the read side is unconditional** — any binary,
+active or not, parses and installs the 16 bytes (`rdb_load.cc`), which is what lets a plain
+sub-replica of an active node keep loading its snapshot stream cleanly (spec D-7). An additive
+`drakeydb-mvcc` AUX field precedes the opcode in active-mode saves so a stock Dragonfly's loader
+at least logs "Unrecognized RDB AUX field: 'drakeydb-mvcc'" before it dies on the opcode — see
+the stock-Dragonfly-cliff note added to `docs/differences.md`. The loader also accepts KeyDB's
+own per-key `mvcc-tstamp` decimal aux (`HandleAux`, one-shot per key), mapped to
+`{parsed_u64, load_origin_hash_}`; a controller ruling treats KeyDB's bit-63 `OBJ_MVCC_INVALID`
+sentinel (and any other bit-63 value) as UNSTAMPED `{0,0}` plus a warning rather than installing
+it verbatim, overriding the plan's literal snippet — a phantom tombstone would otherwise win
+every future LWW merge (spec D-7's never-fabricate-authority principle). `mvcc_table_bytes` now
+reports the side table's true cost: `DbTableStats::mvcc_key_dup_bytes` accounts the second,
+independent key copy `DbSlice::SetMvcc` heap-allocates for keys over `CompactObj::kInlineLen`,
+folded into `DbTable::mvcc_table_memory()` beside the existing `DashTable::mem_usage()` — closes
+the blind spot P4-1's benchmark measured (24/32-byte keys previously under-reported by 43%/77%).
+The `multimaster_test.py` acceptance test now runs multi-shard (`proactor_threads=4` → 3 shards,
+≥2 shards asserted exercised, `test_replicated_key_stamp_matches_origin`) instead of P4-1's
+single-shard-only coverage, plus a new `test_stamps_survive_full_sync_and_restart` proving stamps
+survive both a live peer full sync and a `SAVE`/restart round trip.
+
+**Not in scope for P4-2** (still open, tracked by the Design overview's `rdb_load.cc` row above
+and spec section D-8): the full-sync loader installs an incoming peer's stamp **verbatim, with no
+comparison against the receiving node's own stored stamp** — `RdbLoader::CreateObjectOnShard`
+calls `SetMvcc` unconditionally (`rdb_load.cc:3369`), so an active↔active merge still always
+takes the sender's data regardless of recency. P4-2 makes the stamps durable and transportable;
+it does not yet arbitrate conflicts with them. The merge-on-full-sync LWW hook and tombstone
+persistence (`RDB_OPCODE_DF_TOMBSTONES = 225`) remain future work (Phase 6 below).
+
+**P4-2 verified** (Task 6 exit gate, Ubuntu 24.04 arm64 container `drakeydb-p2`, OrbStack): full
+`ninja -j4 dragonfly` (no work to do — already warning-free from the task rounds) +
+`ctest -V -L DFLY` **88/88 passed, 0 failed** (274 s); `journal_test`'s P3 golden-buffer case
+(`Journal.WriteLegacyFramingIsByteIdentical`) passed standalone and inside the suite, confirming
+`--active_replica`-off journal bytes are still byte-identical (its RDB-side sibling,
+`RdbTest.NoMvccOpcodeOrAuxWhenInactive`, also passed); pytest `multimaster_test.py` **50 passed**,
+`multimaster_memory_test.py -m large` **4 passed**, `replication_test.py` **43 passed** (21 large
+deselected, 209 s), `replication_specific_test.py` **61 passed** (13 deselected, 234 s),
+`replication_resilience_test.py` **41 passed** (8 deselected, 1 pre-existing xfail, 351 s) — 0
+failures across all five files. `mvcc_unstamped_writes` measured **0** after a pure-write
+workload (`DEBUG POPULATE 5000` + 300 `SET`s) on a standalone `--active_replica` node;
+`mvcc_entries` matched `DBSIZE` exactly (5300) and `mvcc_table_bytes` was nonzero and plausible
+(363,264 B, ~68.5 B/key — above the 1M-key asymptotic 34-48 B/key band because a 5.3k-entry table
+amortizes dash bucket/segment overhead over far fewer keys). Every Tasks 1-5 falsification is
+recorded verbatim in `task-1..5-report.md` (same ledger directory); host pre-commit clean on the
+two doc files this task touched.
+
 ## Phase 5 — Streaming LWW guard
 Command classifier + pre-exec compare/drop in `JournalExecutor`; `multimaster_lww_dropped`
 metric; `--multi_master_stream_lww` off = KeyDB-parity arrival order.
