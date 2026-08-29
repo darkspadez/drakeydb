@@ -2503,6 +2503,12 @@ TEST_F(RdbMvccTest, EmitsOpcodeOnlyForTheStampedKey) {
   ASSERT_NE(bytes.find(key0_encoded), std::string::npos) << "k0 must have been serialized";
   ASSERT_NE(bytes.find(key1_encoded), std::string::npos) << "k1 must have been serialized";
 
+  // Positive coverage for SaveAux's breadcrumb: active mode must actually write it. (The gating
+  // test below only proves it is ABSENT when inactive; without this, deleting the
+  // SaveAuxFieldStrStr call entirely would leave the whole suite green.)
+  EXPECT_NE(bytes.find("drakeydb-mvcc"), std::string::npos)
+      << "active mode must emit the drakeydb-mvcc aux breadcrumb";
+
   uint8_t block[17] = {0xDD};
   absl::little_endian::Store64(block + 1, kStamp.packed);
   absl::little_endian::Store64(block + 9, kStamp.origin_hash);
