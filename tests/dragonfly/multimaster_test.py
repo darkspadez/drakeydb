@@ -2298,6 +2298,13 @@ async def test_stamps_survive_full_sync_and_restart(df_factory, tmp_path):
     a.stop()
     a.start()
     c_a2 = a.client()
+    # _wait_for_server (inside a.start()) only waits for the listen socket -- the RDB load runs
+    # in a background fiber, and DEBUG is served during LOADING, so an immediate DEBUG MVCC can
+    # race a not-yet-loaded key and see "state:absent" instead. wait_available_async (imported at
+    # the top of this file, used the same way after every other REPLICAOF/restart in it) blocks
+    # on PING until loading finishes; the INFO-based second phase is a no-op here since a fresh
+    # restart is role:master, not a replica.
+    await wait_available_async(c_a2)
     for key in keys:
         stamp_after = _parse_mvcc(await c_a2.execute_command("debug", "mvcc", key))
         assert (
