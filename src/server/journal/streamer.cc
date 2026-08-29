@@ -748,8 +748,13 @@ unsigned RestoreStreamer::SerializeBucketLocked(DbIndex db_index, PrimeTable::bu
 // stats_.throttle_on_db_update += throttle_count_ - throttle_start;
 // stats_.throttle_usec_on_db_update += total_throttle_wait_usec_ - throttle_usec_start;
 
+// drakeydb: P4-2 Task 1 -- mvcc is accepted and ignored here, exactly like mc_flags above:
+// cluster mode (what RestoreStreamer serves, migrating slots as RESTORE commands) is incompatible
+// with active mode (ValidateMultiMasterFlags, multi_master.cc), so this path never carries a
+// real stamp to begin with.
 void RestoreStreamer::SerializeEntryLocked(DbIndex db_index, const PrimeKey& pk,
-                                           const PrimeValue& pv, time_t expire, uint32_t mc_flags) {
+                                           const PrimeValue& pv, time_t expire, uint32_t mc_flags,
+                                           const MvccStamp& mvcc) {
   stats_.commands += cmd_serializer_->SerializeEntry(pk.ToString(), pk, pv, expire);
 }
 

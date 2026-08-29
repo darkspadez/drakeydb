@@ -1398,6 +1398,24 @@ optional<MvccStamp> DbSlice::GetMvcc(DbIndex db_ind, string_view key) const {
   return it->second;
 }
 
+// drakeydb: P4-2 Task 1, F5 -- deliberately does NOT delegate to the string_view overload above
+// the way SetMvcc(PrimeKey)/EraseMvcc(PrimeKey) do: those two pay for key.GetSlice(&scratch)
+// unconditionally, before the callee's own `if (!db.mvcc) return;` guard ever runs (see
+// rdb_load.cc's SetMvcc comment for the full account of that trap). SerializeEntry calls this
+// overload for every key serialized, on every node, so a non-active node must not pay a
+// round-trip -- allocating or not, depending on CompactObj's tag -- just to learn the table does
+// not exist. The null check happens first here; GetSlice only runs once it is known to matter.
+optional<MvccStamp> DbSlice::GetMvcc(DbIndex db_ind, const PrimeKey& key) const {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return nullopt;
+  string scratch;
+  auto it = db.mvcc->Find(key.GetSlice(&scratch));
+  if (it.is_done())
+    return nullopt;
+  return it->second;
+}
+
 void DbSlice::EraseMvcc(DbIndex db_ind, const PrimeKey& key) {
   string scratch;
   EraseMvcc(db_ind, key.GetSlice(&scratch));

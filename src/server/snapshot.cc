@@ -251,8 +251,8 @@ unsigned SliceSnapshot::SerializeBucketLocked(DbIndex db_index, PrimeTable::buck
 }
 
 void SliceSnapshot::SerializeEntryLocked(DbIndex db_index, const PrimeKey& pk, const PrimeValue& pv,
-                                         time_t expire, uint32_t mc_flags) {
-  io::Result<uint8_t> res = serializer_->SaveEntry(pk, pv, expire, mc_flags, db_index);
+                                         time_t expire, uint32_t mc_flags, const MvccStamp& mvcc) {
+  io::Result<uint8_t> res = serializer_->SaveEntry(pk, pv, expire, mc_flags, db_index, mvcc);
   LOG_IF(ERROR, !res.has_value()) << "Serialization error: " << res.error();
   if (res)
     ++type_freq_map_[*res];

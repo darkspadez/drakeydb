@@ -369,6 +369,12 @@ class DbSlice {
   // must remain allocation-free; a missing slot is a fatal invariant violation.
   void SetExistingMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
+  // drakeydb: P4-2 Task 1 -- for callers that only have a PrimeKey on hand (the RDB save path's
+  // SerializeEntry). Checks db.mvcc for null BEFORE calling key.GetSlice(&scratch): the same F5
+  // trap the loader's SetMvcc call documents (rdb_load.cc) -- GetSlice can allocate for an
+  // encoded/SMALL_TAG/INT_TAG key over CompactObj::kInlineLen, and that cost must not be paid on a
+  // non-active node just to look up a table that does not exist there.
+  std::optional<MvccStamp> GetMvcc(DbIndex db_ind, const PrimeKey& key) const;
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
   // drakeydb: Phase 4, P4-1 Task 8 -- same F4 split as SetMvcc above, for the same reason:
   // PerformDeletionAtomic already holds a free string_view (the iterator's del_it.key()) one line

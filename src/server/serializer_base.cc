@@ -61,14 +61,14 @@ void BucketDependencies::WaitEmpty() const {
 
 void DelayedEntryHandler::EnqueueOffloaded(BucketIdentity bucket, DbIndex db_index, PrimeKey pk,
                                            const PrimeValue& pv, time_t expire_time,
-                                           uint32_t mc_flags) {
+                                           uint32_t mc_flags, const MvccStamp& mvcc) {
   DCHECK(pv.IsExternal());
   DCHECK(!pv.IsCool());
 
   auto key = pk.ToString();
   auto future = ReadTieredValue(db_index, key, pv, EngineShard::tlocal()->tiered_storage());
   auto entry = std::make_unique<TieredDelayedEntry>(db_index, std::move(pk), std::move(future),
-                                                    expire_time, mc_flags);
+                                                    expire_time, mc_flags, mvcc);
 
   deps_.Increment(bucket);
   delayed_entries_.emplace(bucket, std::move(entry));
@@ -136,19 +136,22 @@ void SerializerBase::SerializeEntry(BucketIdentity bucket, DbIndex db_index, con
 
   time_t expire_time = pk.GetExpireTime();
   uint32_t mc_flags = pv.HasFlag() ? db_slice_->GetMCFlag(db_index, pk) : 0;
+  // drakeydb: P4-2 Task 1 -- MvccStamp{} (unstamped/absent) on a non-active node, since GetMvcc's
+  // PrimeKey overload short-circuits on a null side table before it costs anything.
+  MvccStamp mvcc = db_slice_->GetMvcc(db_index, pk).value_or(MvccStamp{});
 
   if (pv.IsExternal()) {
     // TODO: we loose the stickiness attribute by cloning like this PrimeKey.
-    EnqueueOffloaded(bucket, db_index, PrimeKey{pk.ToString()}, pv, expire_time, mc_flags);
+    EnqueueOffloaded(bucket, db_index, PrimeKey{pk.ToString()}, pv, expire_time, mc_flags, mvcc);
   } else {
     std::lock_guard lk{stream_mu_};
-    SerializeEntryLocked(db_index, pk, pv, expire_time, mc_flags);
+    SerializeEntryLocked(db_index, pk, pv, expire_time, mc_flags, mvcc);
   }
 }
 
 void SerializerBase::SerializeFetchedEntry(const TieredDelayedEntry& tde, const PrimeValue& pv) {
   std::lock_guard lk{stream_mu_};
-  SerializeEntryLocked(tde.dbid, tde.key, pv, tde.expire, tde.mc_flags);
+  SerializeEntryLocked(tde.dbid, tde.key, pv, tde.expire, tde.mc_flags, tde.mvcc);
 }
 
 // Ordering invariant:

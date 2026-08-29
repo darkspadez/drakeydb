@@ -99,7 +99,7 @@ class SliceSnapshot : public SerializerBase, public journal::JournalConsumerInte
 
   // Called under stream_mu_ to perform RDB serialization of a single entry.
   void SerializeEntryLocked(DbIndex db_index, const PrimeKey& pk, const PrimeValue& pv,
-                            time_t expire, uint32_t mc_flags) override;
+                            time_t expire, uint32_t mc_flags, const MvccStamp& mvcc) override;
 
   // Push serializer's internal buffer.
   // Push regardless of buffer size if force is true.

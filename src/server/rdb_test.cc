@@ -53,6 +53,7 @@ ABSL_DECLARE_FLAG(bool, rdb_sbf_chunked);
 ABSL_DECLARE_FLAG(bool, serialize_hnsw_index);
 ABSL_DECLARE_FLAG(bool, deserialize_hnsw_index);
 ABSL_DECLARE_FLAG(std::string, dbfilename);
+ABSL_DECLARE_FLAG(bool, active_replica);
 
 namespace {
 
@@ -1564,7 +1565,8 @@ struct InterleaveHarness {
     // consume_fun_ -> ... The last entry in queue (next == queued size) does not add anything, it
     // simply returns until the entry is completed. From that point on all entries simply flush
     // repeatedly until completed, moving down the stack.
-    EXPECT_TRUE(serializer->SaveEntry(PrimeKey{entry.key}, *entry.value, 0, 0, 0).has_value());
+    EXPECT_TRUE(
+        serializer->SaveEntry(PrimeKey{entry.key}, *entry.value, 0, 0, 0, MvccStamp{}).has_value());
 
     io::StringSink sink;
     JournalWriter writer(&sink);
@@ -1903,7 +1905,8 @@ TEST_F(RdbTest, TaggedInterleavedRoundTrip) {
     auto it = db.FindReadOnly(ctx, "A", OBJ_HASH);
     ASSERT_TRUE(it.ok());
 
-    ASSERT_TRUE(serializer.SaveEntry(PrimeKey{"A"}, it.value()->second, 0, 0, 0).has_value());
+    ASSERT_TRUE(
+        serializer.SaveEntry(PrimeKey{"A"}, it.value()->second, 0, 0, 0, MvccStamp{}).has_value());
 
     if (auto tail = serializer.Flush(RdbSerializer::FlushState::kFlushEndEntry); !tail.empty())
       harness.body += tail;
@@ -2434,6 +2437,123 @@ TEST_F(RdbTest, EofWithRemoteShardChunksPending) {
 
   // Key was never fully loaded before EOF, so it must not exist.
   EXPECT_EQ(Run({"EXISTS", key}), 0);
+}
+
+// drakeydb: P4-2 Task 1 -- pins num_shards=1 (RdbTest's default num_threads_ == 3 gives 2 shards)
+// so a single-shard capture is guaranteed to see every key in this fixture's tests, regardless of
+// hash placement. FlagSaver restores active_replica/num_shards for every later RdbTest case in
+// this binary (gtest runs the whole file in one process).
+class RdbMvccTest : public RdbTest {
+ protected:
+  RdbMvccTest() {
+    absl::SetFlag(&FLAGS_active_replica, true);
+    num_threads_ = 1;
+    absl::SetFlag(&FLAGS_num_shards, 1);
+  }
+
+  absl::FlagSaver saver_;
+};
+
+// drakeydb: P4-2 Task 1 -- proves RDB_OPCODE_DF_MVCC (221 / 0xDD) is emitted exactly once per
+// stamped key, immediately before that key's type byte, and never for a key whose side-table
+// stamp is zero (unstamped/absent). Drives a REAL single-shard-with-summary RdbSaver capture over
+// a REAL DbSlice -- the same SaveHeader/StartSnapshotInShard sequence
+// PeerFullSyncFiltersConcurrentJournalPlainReplicaUnaffected above uses for its full-sync capture,
+// minus journal streaming (this is a plain point-in-time snapshot, not a stable-sync stream) --
+// so the opcode's SaveEntry/SerializeEntry/GetMvcc plumbing is exercised end to end, not
+// hand-simulated. Byte-scanned rather than round-tripped through a loader: Task 2 (the read side)
+// is a separate, not-yet-landed task, and an unrecognized opcode 221 would fail a loader round
+// trip for the wrong reason.
+TEST_F(RdbMvccTest, EmitsOpcodeOnlyForTheStampedKey) {
+  ASSERT_TRUE(IsActiveReplica());
+  ASSERT_EQ(Run({"set", "k0", "v0"}), "OK");
+  ASSERT_EQ(Run({"set", "k1", "v1"}), "OK");
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    // Overwrites whatever the real write path minted (active mode stamps every write): k1 gets an
+    // exact, recognizable stamp, and k0 is forced back to zero -- "unstamped" -- which is also
+    // what an unversioned key looks like after a plain SET under a not-yet-active P4-1 node.
+    db_slice.SetMvcc(0, std::string_view{"k1"}, kStamp);
+    db_slice.SetMvcc(0, std::string_view{"k0"}, MvccStamp{});
+  });
+
+  io::StringSink sink;
+  std::string bytes = pp_->at(0)->Await([&]() -> std::string {
+    RdbSaver saver(&sink, SaveMode::SINGLE_SHARD_WITH_SUMMARY, /*align_writes=*/false, "",
+                   DflyVersion::CURRENT_VER);
+    ExecutionState cntx;
+    EngineShard* shard = EngineShard::tlocal();
+    CHECK(!saver.SaveHeader(RdbSaver::GetGlobalData(service_.get(), true)));
+
+    // DbSlice::RegisterOnChange (inside StartSnapshotInShard's SliceSnapshot::Start) DCHECKs the
+    // shard's intent lock is held; ordinary command dispatch holds it via transaction scheduling,
+    // but this test drives RdbSaver directly, off that path.
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    saver.StartSnapshotInShard(/*stream_journal=*/false, &cntx, shard);
+    CHECK(!saver.WaitSnapshotInShard(shard));
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+    return std::move(sink).str();
+  });
+
+  std::string key0_encoded, key1_encoded;
+  AppendString(&key0_encoded, "k0");
+  AppendString(&key1_encoded, "k1");
+  ASSERT_NE(bytes.find(key0_encoded), std::string::npos) << "k0 must have been serialized";
+  ASSERT_NE(bytes.find(key1_encoded), std::string::npos) << "k1 must have been serialized";
+
+  uint8_t block[17] = {0xDD};
+  absl::little_endian::Store64(block + 1, kStamp.packed);
+  absl::little_endian::Store64(block + 9, kStamp.origin_hash);
+  std::string_view mvcc_block(reinterpret_cast<const char*>(block), sizeof(block));
+
+  size_t pos = bytes.find(mvcc_block);
+  ASSERT_NE(pos, std::string::npos) << "expected a 0xDD opcode block carrying k1's exact stamp";
+
+  // The block must sit immediately before k1's type byte: exactly one byte (the RDB type), then
+  // k1's own key encoding.
+  size_t after_block = pos + mvcc_block.size();
+  ASSERT_LE(after_block + 1 + key1_encoded.size(), bytes.size());
+  EXPECT_EQ(bytes.substr(after_block + 1, key1_encoded.size()), key1_encoded)
+      << "0xDD opcode block must be positioned before k1's type byte";
+
+  // 0xDD's first (and only legitimate) occurrence in the whole buffer is k1's block above -- so no
+  // 0xDD opcode precedes k0 (its stamp is zero == unstamped == absent), and the block does not
+  // appear a second time anywhere else either.
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD)), pos)
+      << "0xDD must not appear anywhere before k1's opcode block (e.g., preceding k0)";
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD), pos + 1), std::string::npos)
+      << "0xDD must not appear a second time anywhere in the buffer";
+}
+
+// drakeydb: P4-2 Task 1 -- the write side is active-only (spec D-7, "the single most important
+// compatibility rule in the phase"): with --active_replica off, neither the RDB_OPCODE_DF_MVCC
+// byte nor its "drakeydb-mvcc" breadcrumb aux field may appear, even though both keys below get a
+// real (non-mvcc-table-backed) write. Uses plain RdbTest -- inactive is upstream's default, so no
+// extra fixture scaffolding is needed.
+TEST_F(RdbTest, NoMvccOpcodeOrAuxWhenInactive) {
+  ASSERT_FALSE(IsActiveReplica());
+  ASSERT_EQ(Run({"set", "k0", "v0"}), "OK");
+  ASSERT_EQ(Run({"set", "k1", "v1"}), "OK");
+
+  io::StringSink sink;
+  std::string bytes = pp_->at(0)->Await([&]() -> std::string {
+    RdbSaver saver(&sink, SaveMode::SINGLE_SHARD_WITH_SUMMARY, /*align_writes=*/false, "",
+                   DflyVersion::CURRENT_VER);
+    ExecutionState cntx;
+    EngineShard* shard = EngineShard::tlocal();
+    CHECK(!saver.SaveHeader(RdbSaver::GetGlobalData(service_.get(), true)));
+
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    saver.StartSnapshotInShard(/*stream_journal=*/false, &cntx, shard);
+    CHECK(!saver.WaitSnapshotInShard(shard));
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+    return std::move(sink).str();
+  });
+
+  EXPECT_EQ(bytes.find("drakeydb-mvcc"), std::string::npos);
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD)), std::string::npos);
 }
 
 }  // namespace dfly

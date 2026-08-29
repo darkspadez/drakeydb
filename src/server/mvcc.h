@@ -80,6 +80,12 @@ struct MvccStamp {
   bool Empty() const {
     return packed == 0 && origin_hash == 0;
   }
+  // Alias for Empty(), spelled the way P4-2's RDB save side (rdb_save.cc's SaveEntry) reasons
+  // about it: a zero stamp means unstamped/absent, which is exactly when the DF_MVCC opcode must
+  // be omitted -- never emit authority the side table does not actually contain.
+  bool IsZero() const {
+    return Empty();
+  }
 
   // INVARIANT: a tombstone's mvcc MUST be freshly minted via MvccClock::Next -- it must never
   // reuse the mvcc of the value it deletes. operator< masks bit 63 below precisely because a
