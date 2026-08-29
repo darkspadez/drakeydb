@@ -74,6 +74,21 @@ struct DbTableStats {
   // stays 0 until P4-5; declared now so Task 10's invariant compiles.
   size_t mvcc_tombstones = 0;
 
+  // drakeydb: P4-2 Task 4 -- heap bytes held by the mvcc side table's own duplicated copy of
+  // every key over CompactObj::kInlineLen (16 B). DashTable::mem_usage() (dash.h) only counts
+  // the table's bucket/segment structure, never the hosted keys' own allocations -- see
+  // DbTable::mvcc_table_memory() below, which adds this in. Maintained via the stored key's
+  // MallocUsed() at exactly the three mutation points that already maintain mvcc_entries
+  // (DbSlice::SetMvcc/EnsureMvcc/EraseMvcc, db_slice.cc): += on insert, -= on erase, untouched on
+  // SetMvcc's overwrite path (same key object, no reallocation). Scoped to mvcc only: prime's own
+  // key cost is already covered by AccountObjectMemory's OBJ_KEY tracking (PerformDeletionAtomic,
+  // db_slice.cc), which is a different accounting path (memory_usage_by_type, not a bytes field
+  // exposed on DbTableStats directly). mcflag (DashTable<PrimeKey, uint32_t, ...>) has the same
+  // per-key duplication blind spot mvcc had, but no metric field surfaces its table_memory()
+  // today, so there is nothing for a parallel accumulator there to feed -- out of this task's
+  // scope, not a claim that mcflag is exempt from the underlying cost.
+  size_t mvcc_key_dup_bytes = 0;
+
   // Object memory usage besides hash-table capacity.
   // Applies for any non-inline objects.
   size_t obj_memory_usage = 0;
@@ -149,8 +164,13 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
   using MvccTable = DashTable<PrimeKey, MvccStamp, detail::ExpireTablePolicy>;
   std::unique_ptr<MvccTable> mvcc;
 
+  // drakeydb: P4-2 Task 4 -- mvcc->mem_usage() alone (dash.h) only counts the side table's own
+  // bucket/segment structure; stats.mvcc_key_dup_bytes adds back the heap bytes SetMvcc/EnsureMvcc
+  // spend on a second, independent copy of every key over CompactObj::kInlineLen (see that field's
+  // comment, above). `stats` is declared later in this struct, but member functions defined
+  // in-body see the complete class regardless of declaration order.
   size_t mvcc_table_memory() const {
-    return mvcc ? mvcc->mem_usage() : 0;
+    return mvcc ? mvcc->mem_usage() + stats.mvcc_key_dup_bytes : 0;
   }
 
   // Contains transaction locks

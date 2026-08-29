@@ -1365,8 +1365,16 @@ void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
     return;
   auto [it, inserted] = db.mvcc->Insert(key, stamp);
   it->second = stamp;
-  if (inserted)
+  if (inserted) {
     ++db.stats.mvcc_entries;
+    // drakeydb: P4-2 Task 4 -- accounts the second, independent heap copy of `key` this Insert
+    // may have just made (CompactKey::operator=(string_view), invoked by Dash's bucket-level
+    // Insert) for keys over CompactObj::kInlineLen. Only on the genuine-insert branch: Dash's
+    // Segment::Insert returns the existing iterator untouched on a duplicate (see
+    // Segment::Insert, dash_internal.h), so the overwrite path below never reallocates the key
+    // and must not double-count it here.
+    db.stats.mvcc_key_dup_bytes += it->first.MallocUsed();
+  }
 }
 
 void DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
@@ -1374,9 +1382,12 @@ void DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
   if (!db.mvcc)
     return;
 
-  bool inserted = db.mvcc->Insert(key, MvccStamp{}).second;
-  if (inserted)
+  auto [it, inserted] = db.mvcc->Insert(key, MvccStamp{});
+  if (inserted) {
     ++db.stats.mvcc_entries;
+    // drakeydb: P4-2 Task 4 -- same accounting as SetMvcc's insert branch above.
+    db.stats.mvcc_key_dup_bytes += it->first.MallocUsed();
+  }
 }
 
 void DbSlice::SetExistingMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
@@ -1435,6 +1446,10 @@ void DbSlice::EraseMvcc(DbIndex db_ind, string_view key) {
   if (!db.mvcc)
     return;
   if (auto it = db.mvcc->Find(key); it != db.mvcc->end()) {
+    // drakeydb: P4-2 Task 4 -- must read MallocUsed() before Erase(): Erase runs
+    // ExpireTablePolicy::DestroyKey (cs.Reset()), which frees the key's heap remainder, if any,
+    // making it->first.MallocUsed() unreadable (and 0) afterwards.
+    db.stats.mvcc_key_dup_bytes -= it->first.MallocUsed();
     db.mvcc->Erase(it);
     --db.stats.mvcc_entries;
   }

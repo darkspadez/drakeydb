@@ -1027,6 +1027,75 @@ TEST_F(MvccStoreTest, TableMemoryGrowsWithWritesAndDropsOnFlush) {
       << "flush must drop the grown side table back to a freshly-allocated table's baseline";
 }
 
+// drakeydb: P4-2 Task 4 -- TDD RED for the mvcc_table_bytes key-duplication blind spot (P4-1
+// Task 12's memory benchmark finding; see server_family.cc's mvcc_table_bytes comment). DbTable::
+// mvcc heap-allocates its own copy of every key over CompactObj::kInlineLen (16 B, SetMvcc,
+// db_slice.cc), but mvcc_table_bytes used to equal DashTable::mem_usage() alone, which never sees
+// that second copy -- a table of 32-char keys and a table of 8-char keys reported identical
+// mvcc_table_bytes. This proves that gap is closed. Falsification (task-4-report.md): reverting
+// the mvcc_key_dup_bytes accounting in db_slice.cc's SetMvcc/EnsureMvcc/EraseMvcc collapses
+// delta_long to 0, same as delta_short, and the EXPECT_GT below fails.
+TEST_F(MvccStoreTest, TableBytesAccountsForDuplicatedKeyHeapBytes) {
+  Run({"set", "k", "v"});
+  auto& shard_set_ref = *shard_set;
+  const ShardId sid = Shard("k", shard_set_ref.size());
+
+  // Stays well under the initial segment's ~840-slot capacity (see
+  // TableMemoryGrowsWithWritesAndDropsOnFlush above) for both phases combined, so
+  // DashTable::mem_usage() itself never grows across either phase -- any mvcc_table_bytes delta
+  // below is then attributable solely to duplicated key heap bytes, not table structure.
+  constexpr int kN = 300;
+
+  // Builds an exact-length, unique-per-i, non-numeric (leading letter, so CompactObj::SetString's
+  // string2ll fast path never fires) key.
+  auto make_key = [](char prefix, size_t len, int i) {
+    std::string suffix = std::to_string(i);
+    std::string key(len, '0');
+    key[0] = prefix;
+    key.replace(key.size() - suffix.size(), suffix.size(), suffix);
+    return key;
+  };
+
+  auto bytes_now = [&] { return GetMetrics().db_stats[0].mvcc_table_bytes; };
+
+  size_t before_short = bytes_now();
+  shard_set_ref.Await(sid, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < kN; ++i) {
+      PrimeKey pk{make_key('s', 8, i)};
+      db_slice.SetMvcc(0, pk, MvccStamp{uint64_t(i) + 1, 1});
+    }
+  });
+  size_t delta_short = bytes_now() - before_short;
+
+  size_t before_long = bytes_now();
+  shard_set_ref.Await(sid, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < kN; ++i) {
+      PrimeKey pk{make_key('l', 32, i)};
+      db_slice.SetMvcc(0, pk, MvccStamp{uint64_t(i) + 1, 1});
+    }
+  });
+  size_t delta_long = bytes_now() - before_long;
+
+  // 8-char keys never leave CompactObj's 16-byte inline union (kInlineLen == 16): MallocUsed()
+  // == 0 for every one (CompactObj::HasAllocated() is false for any inline taglen_), so
+  // delta_short must be exactly 0 regardless of the fix.
+  EXPECT_EQ(delta_short, 0u) << "8-char keys are inline and must not contribute heap bytes";
+
+  // Every 32-char key is forced through CompactObj::EncodeString (str.size() > 20 skips the
+  // int/inline fast paths entirely in SetString, compact_object.cc) and lands on SMALL_TAG or
+  // LARGE_STR_TAG, both heap-allocated. EncodeString's own DCHECK_GT(encoded.size(), kInlineLen)
+  // guarantees encoded.size() >= 17, so SmallString's remainder (size - kPrefLen(10),
+  // small_string.h) is >= 7 heap bytes per key even in the best case, before
+  // mi_malloc_usable_size's allocator rounding (which can only round up). Floor at kN * 7
+  // accordingly: mathematically safe, not just empirically likely.
+  EXPECT_GT(delta_long, static_cast<size_t>(kN) * 7)
+      << "delta_short=" << delta_short << " delta_long=" << delta_long
+      << " -- mvcc_table_bytes must grow for the 32-char table's duplicated key heap bytes, "
+         "which DashTable::mem_usage() alone (the pre-fix formula) cannot see";
+}
+
 // drakeydb: P4-1 Task 7 -- the landmine test. LPUSH is auto-journaled AND mutates in place, so it
 // never calls AddOrUpdate. It is the command that fails if EndOfWriteEpoch is placed at
 // transaction.cc's OnCbFinishBlocking call instead of after LogAutoJournalOnShard -- see the

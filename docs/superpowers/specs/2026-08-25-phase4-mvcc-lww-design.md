@@ -888,7 +888,9 @@ the full-scan invariant (D-4).
 
 #### INFO fields
 
-`INFO memory`: `mvcc_table_bytes`, `mvcc_entries`, `mvcc_tombstones`.
+`INFO memory`: `mvcc_table_bytes` (side table structural bytes plus each duplicated
+key's heap remainder over `CompactObj::kInlineLen`, P4-2 Task 4), `mvcc_entries`,
+`mvcc_tombstones`.
 `INFO replication` (inside the existing active block): `mvcc_clock_ahead_ms`,
 `mvcc_unstamped_writes`, `mvcc_tombstones_dropped`, `mvcc_stale_epoch`,
 `clock_skew_ms`, `multimaster_lww_dropped`.
