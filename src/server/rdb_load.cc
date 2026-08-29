@@ -3145,8 +3145,25 @@ error_code RdbLoader::HandleAux(ObjSettings* settings) {
     // -> SetMvcc no-ops on an inactive node's null table).
     uint64_t v;
     if (absl::SimpleAtoi(auxval, &v)) {
-      settings->mvcc = MvccStamp{v, load_origin_hash_};
-      settings->has_mvcc = true;
+      // drakeydb: P4-2 Task 3, review round 1 (Important, finding 1) -- KeyDB stamps a key it has
+      // no valid mvcc for (e.g. one synced in from a plain-Redis master) with OBJ_MVCC_INVALID,
+      // 0xFFFFFFFFFFFFFFFF (KeyDB/src/server.h:958), not a real timestamp. Bit 63 of drakeydb's
+      // packed layout is the tombstone bit (mvcc.h); installed verbatim, this sentinel would
+      // silently mint a phantom tombstone carrying the maximum possible mvcc, winning every LWW
+      // merge forever. More generally, no genuine KeyDB timestamp can ever set bit 63: KeyDB's
+      // ms << 20 layout needs ms to reach ~2^43 to touch it, i.e. roughly the year 280000 AD -- so
+      // bit 63 set is proof the value is not a representable timestamp, not just proof it equals
+      // OBJ_MVCC_INVALID specifically. Controller ruling overrides the brief's verbatim-install
+      // snippet for this one case: treat it as unstamped (has_mvcc stays false, D-7's {0,0}
+      // unversioned fallback) rather than installing it.
+      if (v & MvccClock::kTombstoneBit) {
+        LOG(WARNING) << "Ignoring unrepresentable mvcc-tstamp aux (bit 63 set, e.g. KeyDB's "
+                        "OBJ_MVCC_INVALID sentinel): '"
+                     << auxval << "'";
+      } else {
+        settings->mvcc = MvccStamp{v, load_origin_hash_};
+        settings->has_mvcc = true;
+      }
     } else {
       LOG(WARNING) << "Ignoring malformed mvcc-tstamp aux: '" << auxval << "'";
     }

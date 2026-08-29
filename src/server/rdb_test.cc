@@ -2806,4 +2806,117 @@ TEST_F(RdbMvccTest, LoadsKeyDbMvccTstampAuxWithLinkOriginHash) {
       << "k2 has no preceding aux -- one-shot semantics must not leak k1's stamp onto it";
 }
 
+// drakeydb: P4-2 Task 3, review round 1 (Important, finding 1) -- KeyDB stamps a key it has no
+// valid mvcc for (e.g. one synced in from a plain-Redis master) with OBJ_MVCC_INVALID,
+// 0xFFFFFFFFFFFFFFFF (KeyDB/src/server.h:958), not a real timestamp. Installed verbatim, that
+// value sets drakeydb's tombstone bit (bit 63, mvcc.h) and yields the maximum possible mvcc -- a
+// phantom tombstone that would win every LWW merge forever. Controller ruling overrode the
+// brief's original verbatim-install snippet for this one case: any parsed value with bit 63 set
+// is unrepresentable as a genuine KeyDB timestamp (their ms << 20 layout does not reach bit 63
+// until roughly the year 280000 AD) and must be treated as unstamped. k_invalid proves the
+// sentinel is rejected (loads {0,0}, not a tombstone); k_valid -- a second key in the SAME
+// stream, given an ordinary high-but-representable stamp -- proves the bit-63 guard does not
+// overreach and reject legitimate stamps in general.
+TEST_F(RdbMvccTest, TreatsKeyDbObjMvccInvalidSentinelAsUnstamped) {
+  ASSERT_TRUE(IsActiveReplica());
+  ScopedLogCapture log_capture;
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "18446744073709551615");  // decimal(0xFFFFFFFFFFFFFFFF) == OBJ_MVCC_INVALID
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k_invalid");
+  AppendString(&body, "v1");
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "81985529216486895");  // decimal(0x0123456789ABCDEF), an ordinary stamp
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k_valid");
+  AppendString(&body, "v2");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetLoadOriginHash(kStamp.origin_hash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k_invalid"}), "v1");
+  EXPECT_EQ(Run({"get", "k_valid"}), "v2");
+
+  std::optional<MvccStamp> got_invalid, got_valid;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got_invalid = db_slice.GetMvcc(0, std::string_view{"k_invalid"});
+    got_valid = db_slice.GetMvcc(0, std::string_view{"k_valid"});
+  });
+  ASSERT_TRUE(got_invalid.has_value());
+  EXPECT_TRUE(got_invalid->Empty())
+      << "KeyDB's OBJ_MVCC_INVALID sentinel (all bits set) must never install as a stamp -- "
+         "verbatim it would set drakeydb's tombstone bit and become a phantom tombstone that "
+         "wins every LWW merge forever";
+
+  ASSERT_TRUE(got_valid.has_value());
+  EXPECT_EQ(*got_valid, kStamp) << "an ordinary valid stamp in the same stream must still install";
+
+  bool warned = false;
+  for (const auto& log : log_capture.logs) {
+    if (log.find("18446744073709551615") != std::string::npos) {
+      warned = true;
+    }
+  }
+  EXPECT_TRUE(warned) << "the OBJ_MVCC_INVALID sentinel must be warned about, naming the value";
+}
+
+// drakeydb: P4-2 Task 3, review round 1 (Important, finding 2) -- the brief's "malformed value
+// must warn and load the key unstamped, never fail the load" requirement had zero coverage.
+// Real log capture (ScopedLogCapture, used identically by
+// ActiveReloadDoesNotWarnOnRecognizedMvccAux above), not a code-inspection stand-in.
+TEST_F(RdbMvccTest, WarnsAndLoadsUnstampedOnMalformedMvccTstampAux) {
+  ASSERT_TRUE(IsActiveReplica());
+  ScopedLogCapture log_capture;
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "not-a-number");
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k1");
+  AppendString(&body, "v1");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message() << " -- a malformed mvcc-tstamp aux must never fail the load";
+
+  EXPECT_EQ(Run({"get", "k1"}), "v1");
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k1"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_TRUE(got->Empty())
+      << "a malformed mvcc-tstamp aux must load the key unstamped ({0,0}), not fail the load";
+
+  bool warned = false;
+  for (const auto& log : log_capture.logs) {
+    if (log.find("Ignoring malformed mvcc-tstamp aux") != std::string::npos &&
+        log.find("not-a-number") != std::string::npos) {
+      warned = true;
+    }
+  }
+  EXPECT_TRUE(warned) << "a malformed mvcc-tstamp aux must be warned about, naming the value";
+}
+
 }  // namespace dfly
