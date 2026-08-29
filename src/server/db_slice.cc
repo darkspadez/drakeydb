@@ -1448,7 +1448,12 @@ void DbSlice::EraseMvcc(DbIndex db_ind, string_view key) {
   if (auto it = db.mvcc->Find(key); it != db.mvcc->end()) {
     // drakeydb: P4-2 Task 4 -- must read MallocUsed() before Erase(): Erase runs
     // ExpireTablePolicy::DestroyKey (cs.Reset()), which frees the key's heap remainder, if any,
-    // making it->first.MallocUsed() unreadable (and 0) afterwards.
+    // making it->first.MallocUsed() unreadable (and 0) afterwards. Falsified by reordering these
+    // two lines (task-4-report.md, fix round 1): the debug build's assert(IsBusy(bid, slot))
+    // (dash_internal.h:494) aborts the process on the post-Erase it->first dereference -- a
+    // release (NDEBUG) build has no such guard and would instead silently read a reset, empty
+    // key (MallocUsed() == 0), permanently over-reporting mvcc_table_bytes by the un-subtracted
+    // duplicated-key bytes on every delete of a non-inline key.
     db.stats.mvcc_key_dup_bytes -= it->first.MallocUsed();
     db.mvcc->Erase(it);
     --db.stats.mvcc_entries;

@@ -1096,6 +1096,60 @@ TEST_F(MvccStoreTest, TableBytesAccountsForDuplicatedKeyHeapBytes) {
          "which DashTable::mem_usage() alone (the pre-fix formula) cannot see";
 }
 
+// drakeydb: P4-2 Task 4, review fix round 1 -- closes a gap flagged in review: no existing test
+// exercised EraseMvcc's `db.stats.mvcc_key_dup_bytes -= it->first.MallocUsed();` line (db_slice.cc)
+// with a non-zero value. Every DEL in the pre-existing C++ suite deletes inline (<= 16 char) keys,
+// whose MallocUsed() is always 0, so a regression that silently breaks the erase-side accounting --
+// e.g. moving that `-=` to *after* db.mvcc->Erase(it), the exact hazard the comment right above it
+// warns about, since Erase() destroys the key and MallocUsed() reads 0 afterwards -- would pass
+// every existing test while permanently over-reporting mvcc_table_bytes on every delete of a
+// duplicated-key entry. Drives real SET + DEL through the normal command path (not a direct
+// EraseMvcc call) so this exercises the actual production route: PerformDeletionAtomic -> Disarm ->
+// EraseMvcc(string_view) (db_slice.cc), the same site review flagged.
+// Falsification (task-4-report.md, fix round 1): moving the `-=` after Erase() makes the final
+// EXPECT_EQ below fail with mvcc_table_bytes stuck above baseline by the total un-subtracted
+// duplicated-key bytes.
+TEST_F(MvccStoreTest, EraseAccountsForDuplicatedKeyHeapBytesOnRealDelete) {
+  Run({"set", "k", "v"});
+  size_t baseline = GetMetrics().db_stats[0].mvcc_table_bytes;
+
+  // 32-char keys: str.size() > 20 skips CompactObj::SetString's int/inline fast paths entirely
+  // (compact_object.cc), so every one of these is unconditionally heap-allocated -- same
+  // reasoning as TableBytesAccountsForDuplicatedKeyHeapBytes above. kN stays well under the
+  // initial segment's ~840-slot capacity (TableMemoryGrowsWithWritesAndDropsOnFlush above) so
+  // DashTable::mem_usage() itself never grows across insert or delete -- isolating both deltas
+  // below to mvcc_key_dup_bytes alone.
+  constexpr int kN = 100;
+  std::vector<std::string> keys;
+  keys.reserve(kN);
+  for (int i = 0; i < kN; ++i) {
+    std::string suffix = std::to_string(i);
+    std::string key(32, '0');
+    key[0] = 'e';
+    key.replace(key.size() - suffix.size(), suffix.size(), suffix);
+    keys.push_back(std::move(key));
+  }
+
+  for (const auto& key : keys) {
+    Run({"set", key, "v"});
+  }
+  size_t after_insert = GetMetrics().db_stats[0].mvcc_table_bytes;
+  ASSERT_GT(after_insert, baseline + static_cast<size_t>(kN) * 7)
+      << "expected the 32-char keys to carry duplicated heap bytes before delete -- see "
+         "TableBytesAccountsForDuplicatedKeyHeapBytes above for the >= 7 B/key derivation";
+
+  for (const auto& key : keys) {
+    Run({"del", key});
+  }
+  size_t after_delete = GetMetrics().db_stats[0].mvcc_table_bytes;
+
+  EXPECT_EQ(after_delete, baseline)
+      << "after_insert=" << after_insert << " after_delete=" << after_delete
+      << " baseline=" << baseline
+      << " -- mvcc_table_bytes must drop back to the pre-insert baseline once every "
+         "duplicated-key entry is deleted through the real DEL path";
+}
+
 // drakeydb: P4-1 Task 7 -- the landmine test. LPUSH is auto-journaled AND mutates in place, so it
 // never calls AddOrUpdate. It is the command that fails if EndOfWriteEpoch is placed at
 // transaction.cc's OnCbFinishBlocking call instead of after LogAutoJournalOnShard -- see the
