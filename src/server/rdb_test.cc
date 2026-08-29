@@ -2562,4 +2562,72 @@ TEST_F(RdbTest, NoMvccOpcodeOrAuxWhenInactive) {
   EXPECT_EQ(bytes.find(static_cast<char>(0xDD)), std::string::npos);
 }
 
+// drakeydb: P4-2 Task 2 -- the read-side counterpart to EmitsOpcodeOnlyForTheStampedKey above:
+// hand-builds the exact 17-byte block that test proved the saver emits (0xDD, then the stamp's
+// packed/origin_hash as raw LE uint64s) immediately before a key's type byte, feeds it through a
+// REAL RdbLoader (WrapInRdb/LoadRdbData -- the same helpers InterleavedLoad and friends use
+// earlier in this file), and asserts the loaded stamp equals the original bytes exactly: never
+// re-minted, installed verbatim. This is the invariant P4-2 exists for -- "a key's stamp advances
+// iff that same stamp is propagated" -- checked here for the load-as-propagation-by-snapshot
+// direction specifically.
+TEST_F(RdbMvccTest, LoadInstallsThePersistedStampVerbatim) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+  std::string body;
+  uint8_t block[17] = {0xDD};
+  absl::little_endian::Store64(block + 1, kStamp.packed);
+  absl::little_endian::Store64(block + 9, kStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k1");
+  AppendString(&body, "v1");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k1"}), "v1");
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k1"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kStamp)
+      << "a loaded key's stamp must equal the persisted RDB_OPCODE_DF_MVCC bytes exactly, "
+         "never re-minted by the loader";
+}
+
+// drakeydb: P4-2 Task 2 -- the counterpart to NoMvccOpcodeOrAuxWhenInactive above: a body with no
+// RDB_OPCODE_DF_MVCC record before the key's type byte is byte-for-byte what that test proved an
+// inactive save produces (also what an unstamped/absent key looks like on an active save, e.g.
+// k0 in EmitsOpcodeOnlyForTheStampedKey -- the loader cannot tell, and D-7 says it must not try:
+// the read is unconditional on the record's presence, never on the local node's own
+// active-ness). Loaded here by an ACTIVE node specifically, so the mvcc table actually exists and
+// this proves the {0,0} fallback is an explicit, dense slot -- not merely "no crash" -- exactly
+// like the unconditional SetMvcc call for a has_mc_flags-less key already is for mc_flags.
+TEST_F(RdbMvccTest, LoadFallsBackToZeroStampWhenOpcodeAbsent) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  std::string body;
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k0");
+  AppendString(&body, "v0");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k0"}), "v0");
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k0"});
+  });
+  ASSERT_TRUE(got.has_value()) << "an active loader must still leave a dense {0,0} slot";
+  EXPECT_TRUE(got->Empty())
+      << "no RDB_OPCODE_DF_MVCC record for this key (e.g. a snapshot produced by a node with "
+         "--active_replica off) must fall back to {0,0}, D-7's unversioned default -- the "
+         "fallback must survive Task 2's new opcode-aware path";
+}
+
 }  // namespace dfly

@@ -400,6 +400,12 @@ class RdbLoader : protected RdbLoaderBase {
     bool is_sticky = false;
     bool has_mc_flags = false;
     uint32_t mc_flags = 0;
+    // drakeydb: P4-2 Task 2 -- carried the same way as has_mc_flags/mc_flags above: set from
+    // ObjSettings by LoadKeyValPair, consumed by CreateObjectOnShard's SetMvcc apply. has_mvcc
+    // false means the RDB_OPCODE_DF_MVCC record was absent for this key (unversioned snapshot or
+    // a zero/absent stamp at save time); mvcc is left default-constructed ({0,0}) in that case.
+    bool has_mvcc = false;
+    MvccStamp mvcc;
 
     LoadConfig load_config;
 

@@ -1181,10 +1181,20 @@ TEST_F(MvccStoreTest, PureWriteWorkloadLeavesNoUnstampedWrites) {
 // RDB loading runs in a separate fiber on the shard thread. It must finalize the loaded value's
 // normal bookkeeping without either arming that value or clearing a transaction arm that was
 // already pending on the same thread. This pins the mechanism directly: the pending write keeps
-// its arm and receives the later commit, while the loaded value retains its explicit {0,0}
-// snapshot fallback.
+// its arm and receives the later commit, while the loaded value retains its explicit persisted
+// stamp.
+//
+// drakeydb: P4-2 Task 2 -- extended from P4-1 Task 10's original version, which only exercised
+// the {0,0} snapshot fallback (the only outcome the loader could produce back then). The loaded
+// key here now carries a non-zero stamp, simulating CreateObjectOnShard's new
+// item->has_mvcc ? item->mvcc : MvccStamp{} apply (rdb_load.cc) for a key whose RDB stream
+// carried a RDB_OPCODE_DF_MVCC record. The property under test is unchanged -- loader
+// finalization must not touch another transaction's pending arm, and must not let that other
+// transaction's Commit() touch the loaded key -- only the concrete value the loaded key ends up
+// with changes, from {0,0} to the persisted stamp.
 TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) {
   constexpr uint64_t kPendingMvcc = 0x1234'5678;
+  const MvccStamp kPersistedStamp{0xAAAABBBBCCCC1111ULL, 0xDEADBEEFULL};
   std::optional<MvccStamp> prepared_stamp;
   std::optional<MvccStamp> pending_stamp;
   std::optional<MvccStamp> loaded_stamp;
@@ -1209,7 +1219,7 @@ TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) 
     loaded_value.SetString("loaded-value");
     auto loaded = db_slice.AddOrUpdate(db_cntx, "loaded-key", std::move(loaded_value), 0);
     ASSERT_TRUE(loaded);
-    db_slice.SetMvcc(0, std::string_view{"loaded-key"}, MvccStamp{});
+    db_slice.SetMvcc(0, std::string_view{"loaded-key"}, kPersistedStamp);
     loaded->post_updater.RunWithoutMvccArm();
 
     MvccStamper::tlocal()->Commit(kPendingMvcc, 0,
@@ -1224,8 +1234,9 @@ TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) 
   EXPECT_EQ(pending_stamp->Mvcc(), kPendingMvcc)
       << "loader finalization must not clear another transaction's pending arm";
   ASSERT_TRUE(loaded_stamp.has_value());
-  EXPECT_TRUE(loaded_stamp->Empty())
-      << "a loaded key must not be swept into an unrelated COMMAND commit";
+  EXPECT_EQ(*loaded_stamp, kPersistedStamp)
+      << "a loaded key must not be swept into an unrelated COMMAND commit, and must keep exactly "
+         "its persisted stamp -- not {0,0}, and not the concurrent transaction's stamp";
 }
 
 // drakeydb: review fix round 1 (F1) -- a write through a non-default namespace must leave no
@@ -1907,12 +1918,15 @@ TEST_F(MvccStoreTest, DefragActuallyRelocatesMvccSegments) {
 // destruction, or explicitly beside a tiered-storage stash -- db_slice.cc), so a loaded key does
 // get armed; fix round 1 (F2) covers the separate bug that arm exposed (nothing in the load path
 // ever committed or discarded it, so a later, unrelated write's Commit() could clobber this
-// test's {0,0} stamp with local authority no peer ever saw -- see
+// test's stamp -- {0,0} at the time this was written, now (P4-2 Task 2) whatever was actually
+// persisted -- with local authority no peer ever saw -- see
 // ReloadDoesNotLeaveArmsForALaterWriteToClobber, below). This test only proves the simpler,
 // first-order property Step 3b was for: the reload path leaves every key stamped at all, dense
-// with prime, immediately after the reload -- without an explicit {0,0} stamp beside the
-// SetMCFlag mirror, a loaded key would be dense in prime but absent from mvcc, tripping
-// OnCbFinishBlocking's DCHECK (db_slice.cc) on the next command that reaches it.
+// with prime, immediately after the reload -- without an explicit stamp (persisted, or {0,0} when
+// no record was present) beside the SetMCFlag mirror, a loaded key would be dense in prime but
+// absent from mvcc, tripping OnCbFinishBlocking's DCHECK (db_slice.cc) on the next command that
+// reaches it. ReloadDoesNotLeaveArmsForALaterWriteToClobber (below) is where the exact stamp
+// VALUE surviving the round trip is actually checked.
 //
 // Needs --dbfilename set, or DEBUG RELOAD silently no-ops (BaseFamilyTest::SetUpTestSuite sets it
 // to "" globally) -- that exact vacuous-test trap was caught on P4-0. Unique per pid, matching
@@ -1956,10 +1970,19 @@ TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
 // nothing ever calls MvccStamper::Commit() for those arms. Without an EndOfWriteEpoch() call
 // somewhere in the load path, those arms sat in armed_ until the next unrelated journaled write on
 // the same shard thread, whose own Commit() then stamped every still-armed key -- not just its
-// own -- with that write's mvcc/origin, clobbering this task's {0,0} fallback with local authority
-// no peer ever saw: exactly the "stamp without propagation" direction D-7 forbids, and it would do
-// so silently (TEST_VerifyMvccTable/OnCbFinishBlocking only check density, never the stamp's
-// value).
+// own -- with that write's mvcc/origin, clobbering whatever the load path had installed with local
+// authority no peer ever saw: exactly the "stamp without propagation" direction D-7 forbids, and it
+// would do so silently (TEST_VerifyMvccTable/OnCbFinishBlocking only check density, never the
+// stamp's value).
+//
+// drakeydb: P4-2 Task 2 -- reload_keys are written BEFORE the reload, under this fixture's real
+// (active, journaled) write path, so each one already carries a genuine, non-zero stamp by the
+// time SAVE captures it; Task 1's saver then emits RDB_OPCODE_DF_MVCC for it, and Task 2's loader
+// installs it verbatim. That stamp -- not {0,0} -- is what must survive both the reload itself
+// and the trigger writes below unclobbered; comparing against the captured pre_reload_stamps
+// (rather than Empty()) is a strictly stronger check than the original {0,0}-only version: it
+// catches both arm leakage (this test's original purpose) AND a loader that silently drops or
+// re-mints the persisted authority instead of installing it verbatim.
 //
 // One trigger write per shard, not one write total: armed_ is per-shard-thread (MvccStamper is
 // thread-local), so a bug here only clobbers reload keys sharing a shard with the trigger write --
@@ -1975,6 +1998,7 @@ TEST_F(MvccStoreTest, ReloadDoesNotLeaveArmsForALaterWriteToClobber) {
 
   const unsigned num_shards = shard_set->size();
   std::vector<std::string> reload_keys(num_shards);
+  std::vector<MvccStamp> pre_reload_stamps(num_shards);
   for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
     for (int i = 0;; ++i) {
       CHECK_LT(i, 10000) << "could not find a key hashing to shard " << target_shard;
@@ -1983,17 +2007,25 @@ TEST_F(MvccStoreTest, ReloadDoesNotLeaveArmsForALaterWriteToClobber) {
         break;
     }
     Run({"set", reload_keys[target_shard], "v"});
+    auto st = StampOf(reload_keys[target_shard]);
+    ASSERT_TRUE(st.has_value()) << reload_keys[target_shard];
+    ASSERT_FALSE(st->Empty())
+        << reload_keys[target_shard]
+        << ": guard against a vacuous pass -- the pre-reload write itself must get a real "
+           "stamp before this test can check it survives the round trip";
+    pre_reload_stamps[target_shard] = *st;
   }
 
   ASSERT_EQ(Run({"debug", "reload"}), "OK");
 
-  // Guard against a vacuous pass: every reloaded key must actually be {0,0}-stamped before the
-  // trigger writes below run, or this test would "pass" against a reload path that lost the
-  // stamp entirely, not just one that leaks arms.
-  for (const auto& key : reload_keys) {
-    auto st = StampOf(key);
-    ASSERT_TRUE(st.has_value()) << key;
-    ASSERT_TRUE(st->Empty()) << key << ": Step 3b's {0,0} stamp did not survive the reload itself";
+  // Guard against a vacuous pass: every reloaded key's persisted stamp must survive the reload
+  // itself, exactly, before the trigger writes below run, or this test would "pass" against a
+  // reload path that lost or altered the stamp entirely, not just one that leaks arms.
+  for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+    auto st = StampOf(reload_keys[target_shard]);
+    ASSERT_TRUE(st.has_value()) << reload_keys[target_shard];
+    ASSERT_EQ(*st, pre_reload_stamps[target_shard])
+        << reload_keys[target_shard] << ": the persisted stamp did not survive the reload itself";
   }
 
   // One real, journaled write per shard -- the only thing that ever calls MvccStamper::Commit().
@@ -2012,12 +2044,12 @@ TEST_F(MvccStoreTest, ReloadDoesNotLeaveArmsForALaterWriteToClobber) {
         << trigger << ": the triggering write itself must still get a real stamp";
   }
 
-  for (const auto& key : reload_keys) {
-    auto st = StampOf(key);
-    ASSERT_TRUE(st.has_value()) << key;
-    EXPECT_TRUE(st->Empty())
-        << key
-        << ": a reloaded key's {0,0} stamp was clobbered by a later, unrelated write -- "
+  for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+    auto st = StampOf(reload_keys[target_shard]);
+    ASSERT_TRUE(st.has_value()) << reload_keys[target_shard];
+    EXPECT_EQ(*st, pre_reload_stamps[target_shard])
+        << reload_keys[target_shard]
+        << ": a reloaded key's persisted stamp was clobbered by a later, unrelated write -- "
            "its arm leaked past the load and got picked up by that write's Commit()";
   }
 }
