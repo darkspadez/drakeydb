@@ -114,6 +114,20 @@ DbTable::SampleUniqueKeys::~SampleUniqueKeys() {
   delete[] dense_hll;
 }
 
+// drakeydb: P4-2, final review round 2 (Critical) -- see DbTable::FromPrime's declaration
+// (table.h) for why a serializer cannot resolve a bucket's owner from its own pointers alone.
+// Namespace-scope thread_local, mirroring snapshot.cc's tl_slice_snapshots: DbTable is a
+// per-thread object (it stores thread_index and its destructor DCHECKs it), so a thread-local
+// map is the exact right scope -- no lock, no cross-thread visibility question. Entries live and
+// die with the DbTable, including one already detached from its DbSlice by a flush and kept alive
+// only by a snapshot's captured intrusive_ptr.
+thread_local absl::flat_hash_map<const PrimeTable*, DbTable*> tl_prime_owners;
+
+DbTable* DbTable::FromPrime(const PrimeTable* pt) {
+  auto it = tl_prime_owners.find(pt);
+  return it == tl_prime_owners.end() ? nullptr : it->second;
+}
+
 DbTable::DbTable(PMR_NS::memory_resource* mr, DbIndex db_index)
     : prime(kInitSegmentLog, detail::PrimeTablePolicy{}, mr),
       mcflag(0, detail::ExpireTablePolicy{}, mr),
@@ -124,10 +138,15 @@ DbTable::DbTable(PMR_NS::memory_resource* mr, DbIndex db_index)
     slots_stats.reset(new SlotStats[kMaxSlotNum + 1]);
   }
   thread_index = ServerState::tlocal()->thread_index();
+  tl_prime_owners[&prime] = this;
 }
 
 DbTable::~DbTable() {
   DCHECK_EQ(thread_index, ServerState::tlocal()->thread_index());
+  // Guarded on identity rather than erased blindly: a (DCHECK-violating) destruction on the wrong
+  // thread must not evict a live sibling's entry from that thread's map.
+  if (auto it = tl_prime_owners.find(&prime); it != tl_prime_owners.end() && it->second == this)
+    tl_prime_owners.erase(it);
   delete sample_top_keys;
   delete sample_unique_keys;
 }

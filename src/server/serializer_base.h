@@ -200,17 +200,17 @@ class SerializerBase : public BucketDependencies,
                                     time_t expire, uint32_t mc_flags, const MvccStamp& mvcc) = 0;
 
   // Serialize entry while automatically handling delayed/cooled values, calls SerializeEntryLocked
-  // drakeydb: P4-2, final review (Critical) -- `on_update` must be the same flag SerializeBucket-
-  // Locked was invoked with: it selects which DbTable the entry's mvcc stamp is read from (the
-  // captured db_array_ for the traversal flow, the live DbSlice for the OnChange flow). Passing
-  // the wrong one re-opens the stamp-loss/stamp-fabrication window across a mid-save FLUSHALL.
-  // See MvccOf in serializer_base.cc.
+  // drakeydb: P4-2, final review (Critical) -- `owner` must be `&it.owner()` of the very bucket
+  // iterator `pk`/`pv` were read from: it is what the entry's mvcc stamp is resolved against.
+  // Neither "always live" nor "always captured" nor any flow flag is a correct substitute -- see
+  // MvccOf in serializer_base.cc for the three tables that can be in play at once. Getting it
+  // wrong re-opens the stamp-loss/stamp-fabrication window across a mid-save FLUSHALL.
   void SerializeEntry(BucketIdentity bucket, DbIndex db_index, const PrimeKey& pk,
-                      const PrimeValue& pv, bool on_update);
+                      const PrimeValue& pv, const PrimeTable* owner);
 
-  // Stamp for `pk` from the DbTable this flow's buckets actually belong to; MvccStamp{} when there
-  // is none (non-active node, unstamped key, or no captured table). See serializer_base.cc.
-  MvccStamp MvccOf(DbIndex db_index, const PrimeKey& pk, bool on_update) const;
+  // Stamp for `pk` from the DbTable that owns `owner`; MvccStamp{} when there is none (non-active
+  // node, unstamped key, or an unresolvable/null owner). See serializer_base.cc.
+  MvccStamp MvccOf(DbIndex db_index, const PrimeKey& pk, const PrimeTable* owner) const;
 
   // Calls SerializeEntry internally under stream_mu_
   void SerializeFetchedEntry(const TieredDelayedEntry& tde, const PrimeValue& pv) override;

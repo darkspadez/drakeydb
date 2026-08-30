@@ -3026,6 +3026,11 @@ class CapturedTableProbe : public SerializerBase {
     return db_array_.size();
   }
 
+  const PrimeTable* captured_prime(DbIndex db_index) const {
+    return db_index < db_array_.size() && db_array_[db_index] ? &db_array_[db_index]->prime
+                                                              : nullptr;
+  }
+
   absl::flat_hash_map<std::string, Emitted> emitted;
 
  private:
@@ -3034,7 +3039,7 @@ class CapturedTableProbe : public SerializerBase {
     unsigned n = 0;
     for (it.AdvanceIfNotOccupied(); !it.is_done(); ++it, ++n)
       SerializerBase::SerializeEntry(it.bucket_address(), db_index, it->first, it->second,
-                                     on_update);
+                                     &it.owner());
     return n;
   }
 
@@ -3115,16 +3120,21 @@ TEST_F(RdbMvccTest, SerializerReadsStampsFromTheCapturedTableNotTheLiveOne) {
     captured_dbs = probe->captured_db_count();
 
     PrimeKey pk{"k0"};
-    captured_branch = probe->MvccOf(0, pk, /*on_update=*/false);
-    live_branch = probe->MvccOf(0, pk, /*on_update=*/true);
-    // Beyond the captured array (DbSlice::ActivateDb can grow the live one after a snapshot
-    // starts): must be unstamped, never an out-of-bounds read.
-    out_of_range = probe->MvccOf(static_cast<DbIndex>(captured_dbs + 5), pk, /*on_update=*/false);
+    const PrimeTable* captured_pt = probe->captured_prime(0);
+    const PrimeTable* live_pt = &db_slice.GetDBTable(0)->prime;
+    ASSERT_NE(captured_pt, live_pt) << "the flush must have replaced the table";
 
-    // RestoreStreamer::Start skips RegisterChangeListener when its context was already cancelled
-    // (streamer.cc), leaving db_array_ empty: must be unstamped, never a null deref.
+    captured_branch = probe->MvccOf(0, pk, captured_pt);
+    live_branch = probe->MvccOf(0, pk, live_pt);
+    // db_index is only a fast-path hint now: with a db index beyond the captured array
+    // (DbSlice::ActivateDb can grow the live one after a snapshot starts) the owner still
+    // resolves, and it must never be an out-of-bounds read.
+    out_of_range = probe->MvccOf(static_cast<DbIndex>(captured_dbs + 5), pk, captured_pt);
+
+    // An owner this thread knows nothing about (and RestoreStreamer's cancelled-before-Start
+    // case, where db_array_ is empty -- streamer.cc): unstamped, never a null deref.
     CapturedTableProbe never_registered(&db_slice, &cntx);
-    unregistered = never_registered.MvccOf(0, pk, /*on_update=*/false);
+    unregistered = never_registered.MvccOf(0, pk, nullptr);
 
     probe->UnregisterChangeListener();
   });
@@ -3152,13 +3162,112 @@ TEST_F(RdbMvccTest, SerializerReadsStampsFromTheCapturedTableNotTheLiveOne) {
          "value and can never LWW-reconcile";
 
   EXPECT_EQ(captured_branch, pre[0])
-      << "on_update=false (traversal) must resolve against the captured table";
+      << "a bucket owned by the captured table must resolve against the captured table";
   EXPECT_EQ(live_branch, kPostFlush)
-      << "on_update=true (OnChange, pre-mutation) walks LIVE-table buckets, so it must resolve "
-         "against the live table -- collapsing both branches onto the captured array would "
-         "mis-stamp that flow instead";
-  EXPECT_TRUE(out_of_range.Empty()) << "a db index beyond the captured array must be unstamped";
-  EXPECT_TRUE(unregistered.Empty()) << "an empty captured array must be unstamped, not a deref";
+      << "a bucket owned by the live table must resolve against the live table -- pinning both "
+         "tables onto one fixed choice mis-stamps the other flow instead";
+  EXPECT_EQ(out_of_range, pre[0])
+      << "db_index is a fast-path hint only: an out-of-range index must still resolve by owner, "
+         "and must never be an out-of-bounds read";
+  EXPECT_TRUE(unregistered.Empty()) << "an unknown owner must be unstamped, not a deref";
+}
+
+// drakeydb: P4-2, final review round 2 (Critical) -- the third route, which no single-consumer
+// test can see. SerializerBase::ProcessBucket's TRAVERSAL flow calls
+// DbSlice::FlushChangeToEarlierCallbacks with an iterator into its OWN captured table, and that
+// dispatches cb->OnChange(db_ind, ChangeReq{...}) to every EARLIER-registered consumer.
+// ChangeReq is a PrimeTable::BucketSet carrying only `owner_` (dash.h), and DbSlice::Iterator's
+// LaunderIfNeeded re-finds through `it_.owner()` (db_slice.h), so those buckets stay in the LATER
+// consumer's captured table while the EARLIER consumer serializes them. An earlier consumer that
+// resolved stamps by "am I in the OnChange flow?" would read the LIVE table for buckets that live
+// in neither its own captured table nor the live one -- stripping stamps to {0,0} and, for a key
+// re-created after the flush, fabricating a pre-flush-value/post-flush-stamp pair.
+//
+// Reachable in production whenever two consumers are registered at once (a BGSAVE via
+// save_stages_controller.cc plus a replica full sync via dflycmd.cc, or two replicas full-syncing)
+// and a FLUSHALL lands mid-save. FlushChangeToEarlierCallbacks short-circuits on
+// `cb->snapshot_version_ == upper_bound`, which is why one consumer alone never triggers it.
+//
+// Deterministic here: A registers, B registers, FLUSHALL, then B traverses. No fibers race; the
+// dispatch to A happens synchronously inside B's ProcessBucket.
+TEST_F(RdbMvccTest, EarlierConsumerStampsForeignBucketsFromTheOwningTable) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  constexpr int kKeys = 8;
+  for (int i = 0; i < kKeys; ++i)
+    ASSERT_EQ(Run({"set", StrCat("k", i), StrCat("v", i)}), "OK");
+
+  std::vector<MvccStamp> pre(kKeys);
+  for (int i = 0; i < kKeys; ++i)
+    pre[i] = MvccStamp{0x2000ULL + i, 0xCCCC0000ULL + i};
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < kKeys; ++i)
+      db_slice.SetMvcc(0, std::string_view{StrCat("k", i)}, pre[i]);
+  });
+
+  ExecutionState cntx;
+  std::optional<CapturedTableProbe> earlier, later;
+
+  pp_->at(0)->Await([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    earlier.emplace(&db_slice, &cntx);
+    later.emplace(&db_slice, &cntx);
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    // Registration order is what makes `earlier` the target of FlushChangeToEarlierCallbacks:
+    // DbSlice::RegisterOnChange appends to change_cb_ and hands out an increasing
+    // snapshot_version_. Both capture the SAME table here -- the situation the reviewer hit.
+    earlier->RegisterChangeListener(/*replication=*/false);
+    later->RegisterChangeListener(/*replication=*/false);
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+  });
+
+  ASSERT_EQ(Run({"flushall"}), "OK");
+
+  const MvccStamp kPostFlush{0x7777ULL, 0xDDDD0000ULL};
+  ASSERT_EQ(Run({"set", "k0", "NEWVAL"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k0"},
+                                                                  kPostFlush);
+  });
+
+  pp_->at(0)->Await([&] {
+    // `later`'s traversal walks the captured table and, per bucket, hands that same bucket to
+    // `earlier` through FlushChangeToEarlierCallbacks before stamping its own version on it.
+    later->TraverseCaptured();
+    earlier->UnregisterChangeListener();
+    later->UnregisterChangeListener();
+  });
+
+  auto from_earlier = earlier->emitted;
+  auto from_later = later->emitted;
+  pp_->at(0)->Await([&] {
+    earlier.reset();
+    later.reset();
+  });
+
+  ASSERT_EQ(from_earlier.size(), size_t(kKeys))
+      << "guard against a vacuous pass: the earlier consumer must actually have been dispatched "
+         "the later consumer's captured buckets (FlushChangeToEarlierCallbacks)";
+  ASSERT_EQ(from_later.size(), size_t(kKeys));
+
+  for (int i = 0; i < kKeys; ++i) {
+    const std::string key = StrCat("k", i);
+    ASSERT_TRUE(from_earlier.contains(key)) << key << " was not serialized by the earlier consumer";
+    EXPECT_EQ(from_earlier[key].value, StrCat("v", i));
+    EXPECT_EQ(from_earlier[key].mvcc, pre[i])
+        << key
+        << ": the earlier consumer received a bucket owned by the LATER consumer's "
+           "captured table; its stamp must come from that same table. {0,0} here is the "
+           "stamp-loss half of the bug; anything else is fabrication.";
+    EXPECT_EQ(from_later[key].mvcc, pre[i]) << key
+                                            << ": the traversing consumer must be correct "
+                                               "too";
+  }
+  EXPECT_NE(from_earlier["k0"].mvcc, kPostFlush)
+      << "k0 was serialized with its PRE-flush value but its POST-flush stamp -- authority no "
+         "node ever issued for that value, bit-identical to a peer's genuine newer write";
 }
 
 // drakeydb: P4-2, final review (Critical) -- the same invariant through the REAL SliceSnapshot,

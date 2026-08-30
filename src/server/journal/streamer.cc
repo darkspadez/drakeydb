@@ -733,7 +733,7 @@ unsigned RestoreStreamer::SerializeBucketLocked(DbIndex db_index, PrimeTable::bu
     string_view key = it->first.GetSlice(&key_buffer);
     if (ShouldWrite(key)) {
       ++shard_stats.total_migrated_keys;
-      SerializerBase::SerializeEntry(it.bucket_address(), db_index, it->first, pv, on_update);
+      SerializerBase::SerializeEntry(it.bucket_address(), db_index, it->first, pv, &it.owner());
       ++written;
     } else {
       stats_.keys_skipped++;
