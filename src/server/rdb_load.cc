@@ -3156,7 +3156,15 @@ error_code RdbLoader::HandleAux(ObjSettings* settings) {
       // OBJ_MVCC_INVALID specifically. Controller ruling overrides the brief's verbatim-install
       // snippet for this one case: treat it as unstamped (has_mvcc stays false, D-7's {0,0}
       // unversioned fallback) rather than installing it.
-      if (v & MvccClock::kTombstoneBit) {
+      if (v == 0) {
+        // drakeydb: P4-2, final review (Minor) -- same principle as the bit-63 guard below, for
+        // the opposite end of the range. MvccStamp::Empty() requires BOTH fields zero (mvcc.h),
+        // so installing {packed=0, origin_hash=load_origin_hash_} here would mint a NON-empty
+        // stamp out of an aux that carries no authority at all, and re-emit it as a real
+        // RDB_OPCODE_DF_MVCC record on every later save. A parsed 0 means "no timestamp", which
+        // is exactly D-7's {0,0} unversioned fallback: leave has_mvcc false. Silent, unlike the
+        // sentinel below: 0 is an absent value, not evidence of a corrupt or unrepresentable one.
+      } else if (v & MvccClock::kTombstoneBit) {
         LOG(WARNING) << "Ignoring unrepresentable mvcc-tstamp aux (bit 63 set, e.g. KeyDB's "
                         "OBJ_MVCC_INVALID sentinel): '"
                      << auxval << "'";

@@ -2875,6 +2875,65 @@ TEST_F(RdbMvccTest, TreatsKeyDbObjMvccInvalidSentinelAsUnstamped) {
   EXPECT_TRUE(warned) << "the OBJ_MVCC_INVALID sentinel must be warned about, naming the value";
 }
 
+// drakeydb: P4-2, final review (Minor) -- a KeyDB "mvcc-tstamp" aux whose value is "0" parses
+// cleanly (SimpleAtoi ok, bit 63 clear), so before the fix it installed {packed=0,
+// origin_hash=load_origin_hash_} with has_mvcc=true. MvccStamp::Empty() requires BOTH fields zero
+// (mvcc.h), so that is a NON-empty stamp minted from an aux that carried no authority whatsoever
+// -- and, being non-empty, rdb_save.cc's `!mvcc.IsZero()` gate re-emits it as a real
+// RDB_OPCODE_DF_MVCC record on every subsequent save, laundering "unknown" into "authored by the
+// link we happened to load from". Same never-fabricate-authority principle as the bit-63 sentinel
+// guard above, at the other end of the range. k_zero must land unstamped; k_one -- the smallest
+// possible NON-zero value, in the same stream -- proves the guard tests for zero exactly and does
+// not overreach into small legitimate stamps.
+TEST_F(RdbMvccTest, TreatsZeroKeyDbMvccTstampAuxAsUnstamped) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  constexpr uint64_t kLinkOrigin = 0xFEDCBA9876543210ULL;
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "0");
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k_zero");
+  AppendString(&body, "v1");
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "1");
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k_one");
+  AppendString(&body, "v2");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetLoadOriginHash(kLinkOrigin);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k_zero"}), "v1");
+  EXPECT_EQ(Run({"get", "k_one"}), "v2");
+
+  std::optional<MvccStamp> got_zero, got_one;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got_zero = db_slice.GetMvcc(0, std::string_view{"k_zero"});
+    got_one = db_slice.GetMvcc(0, std::string_view{"k_one"});
+  });
+  ASSERT_TRUE(got_zero.has_value()) << "an active loader must still leave a dense slot";
+  EXPECT_TRUE(got_zero->Empty())
+      << "an mvcc-tstamp aux of \"0\" carries no authority, so it must load UNSTAMPED ({0,0}); "
+         "installing {0, link_origin_hash} mints a non-empty stamp the file never contained and "
+         "re-emits it on every later save";
+
+  ASSERT_TRUE(got_one.has_value());
+  EXPECT_EQ(*got_one, (MvccStamp{1, kLinkOrigin}))
+      << "the zero guard must not overreach: the smallest non-zero value must still install";
+}
+
 // drakeydb: P4-2 Task 3, review round 1 (Important, finding 2) -- the brief's "malformed value
 // must warn and load the key unstamped, never fail the load" requirement had zero coverage.
 // Real log capture (ScopedLogCapture, used identically by
