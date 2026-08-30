@@ -129,16 +129,58 @@ SerializerBase::SerializerBase(DbSlice* slice, ExecutionState* cntx)
 SerializerBase::~SerializerBase() {
 }
 
+// drakeydb: P4-2, final review (Critical) -- resolve `pk`'s stamp from the SAME DbTable `pv` was
+// read out of. The two flows read from different tables, and a FLUSHALL mid-serialization makes
+// them different objects:
+//
+//   on_update == false (traversal): the bucket iterator walks db_array_[db_index]->prime, the
+//     pointer array captured in RegisterChangeListener below precisely so the point-in-time
+//     content survives a flush. FLUSHALL swaps the DbSlice's live array for fresh DbTables whose
+//     mvcc side table is brand new and EMPTY (DbSlice::FlushDbIndexes -> CreateDb -> DbTable's
+//     ctor), while the old table -- values AND stamps -- lives on only through this captured
+//     intrusive_ptr. Asking the live DbSlice here therefore either lost the stamp (miss in the
+//     new empty table -> {0,0} -> rdb_save.cc's `!mvcc.IsZero()` gate omits the opcode) or, for
+//     a key re-created after the flush, FABRICATED one: the post-flush write's authority pasted
+//     onto the pre-flush value, a {value, stamp} pair no node ever authored and that ties
+//     bit-identically against a peer's genuine newer value, so LWW can never reconcile it.
+//
+//   on_update == true (OnChange, pre-mutation): the bucket iterator belongs to the LIVE table --
+//     that is the table about to be mutated -- so the live DbSlice is the correct source there,
+//     and it is also the only correct one after a flush, when the captured array holds a
+//     different (older) table entirely.
+//
+// db_array_ may legitimately be empty or shorter than the live array, so this is bounds- and
+// null-checked: RestoreStreamer::Start skips RegisterChangeListener when its context was already
+// cancelled (streamer.cc), and DbSlice::ActivateDb can grow db_arr_ past the captured size after
+// serialization started. Both yield MvccStamp{} (unstamped), never a deref.
+//
+// Cost is unchanged on a non-active node: DbTable::GetMvcc (table.cc) returns on the null side
+// table before pk.GetSlice(&scratch) can materialize/allocate anything (F5).
+MvccStamp SerializerBase::MvccOf(DbIndex db_index, const PrimeKey& pk, bool on_update) const {
+  const DbTable* table = nullptr;
+  if (on_update) {
+    table = db_slice_->GetDBTable(db_index);
+  } else if (db_index < db_array_.size()) {
+    table = db_array_[db_index].get();
+  }
+  if (table == nullptr)
+    return MvccStamp{};
+  return table->GetMvcc(pk).value_or(MvccStamp{});
+}
+
 void SerializerBase::SerializeEntry(BucketIdentity bucket, DbIndex db_index, const PrimeKey& pk,
-                                    const PrimeValue& pv) {
+                                    const PrimeValue& pv, bool on_update) {
   if (pv.IsExternal() && pv.IsCool())
-    return SerializeEntry(bucket, db_index, pk, pv.GetCool().record->value);
+    return SerializeEntry(bucket, db_index, pk, pv.GetCool().record->value, on_update);
 
   time_t expire_time = pk.GetExpireTime();
+  // drakeydb: P4-2, final review -- GetMCFlag has the same live-DbSlice shape this line used to
+  // have and therefore the same captured-vs-live mismatch for mcflags across a mid-save FLUSHALL.
+  // That is pre-existing upstream behavior, deliberately left untouched here and reported
+  // upstream separately; do not "fix" it in passing without upstream's sign-off.
   uint32_t mc_flags = pv.HasFlag() ? db_slice_->GetMCFlag(db_index, pk) : 0;
-  // drakeydb: P4-2 Task 1 -- MvccStamp{} (unstamped/absent) on a non-active node, since GetMvcc's
-  // PrimeKey overload short-circuits on a null side table before it costs anything.
-  MvccStamp mvcc = db_slice_->GetMvcc(db_index, pk).value_or(MvccStamp{});
+  // drakeydb: P4-2 Task 1 -- MvccStamp{} (unstamped/absent) on a non-active node.
+  MvccStamp mvcc = MvccOf(db_index, pk, on_update);
 
   if (pv.IsExternal()) {
     // TODO: we loose the stickiness attribute by cloning like this PrimeKey.

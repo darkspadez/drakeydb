@@ -243,7 +243,7 @@ unsigned SliceSnapshot::SerializeBucketLocked(DbIndex db_index, PrimeTable::buck
     ++serialized;
 
     // might preempt due to big value serialization.
-    SerializerBase::SerializeEntry(it.bucket_address(), db_index, it->first, it->second);
+    SerializerBase::SerializeEntry(it.bucket_address(), db_index, it->first, it->second, on_update);
   }
 
   serialize_bucket_running_ = false;

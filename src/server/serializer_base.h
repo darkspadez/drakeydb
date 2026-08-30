@@ -200,8 +200,17 @@ class SerializerBase : public BucketDependencies,
                                     time_t expire, uint32_t mc_flags, const MvccStamp& mvcc) = 0;
 
   // Serialize entry while automatically handling delayed/cooled values, calls SerializeEntryLocked
+  // drakeydb: P4-2, final review (Critical) -- `on_update` must be the same flag SerializeBucket-
+  // Locked was invoked with: it selects which DbTable the entry's mvcc stamp is read from (the
+  // captured db_array_ for the traversal flow, the live DbSlice for the OnChange flow). Passing
+  // the wrong one re-opens the stamp-loss/stamp-fabrication window across a mid-save FLUSHALL.
+  // See MvccOf in serializer_base.cc.
   void SerializeEntry(BucketIdentity bucket, DbIndex db_index, const PrimeKey& pk,
-                      const PrimeValue& pv);
+                      const PrimeValue& pv, bool on_update);
+
+  // Stamp for `pk` from the DbTable this flow's buckets actually belong to; MvccStamp{} when there
+  // is none (non-active node, unstamped key, or no captured table). See serializer_base.cc.
+  MvccStamp MvccOf(DbIndex db_index, const PrimeKey& pk, bool on_update) const;
 
   // Calls SerializeEntry internally under stream_mu_
   void SerializeFetchedEntry(const TieredDelayedEntry& tde, const PrimeValue& pv) override;

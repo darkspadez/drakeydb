@@ -8,6 +8,7 @@
 
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
+#include <optional>
 
 #include "core/intent_lock.h"
 #include "server/detail/table.h"
@@ -172,6 +173,18 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
   size_t mvcc_table_memory() const {
     return mvcc ? mvcc->mem_usage() + stats.mvcc_key_dup_bytes : 0;
   }
+
+  // drakeydb: P4-2, final review (Critical) -- the single stamp-lookup primitive, on the table
+  // that owns both the value and its stamp. It lives here, not on DbSlice, because the snapshot
+  // serializer must resolve a stamp against the SAME DbTable the value came from: SerializerBase
+  // captures db_slice_->databases() at Start (serializer_base.cc) so values survive a mid-save
+  // FLUSHALL, and a DbSlice-indexed lookup would silently read the post-flush replacement table
+  // instead. Returns nullopt for "no stamp" -- both "not an active node" (null side table) and
+  // "this key has none". The null check runs BEFORE key.GetSlice(&scratch): GetSlice can allocate
+  // for an encoded/SMALL_TAG/INT_TAG key over CompactObj::kInlineLen, and a non-active node must
+  // not pay it on every serialized key just to learn the table does not exist (F5; see
+  // DbSlice::GetMvcc in db_slice.h/.cc, which delegates here).
+  std::optional<MvccStamp> GetMvcc(const PrimeKey& key) const;
 
   // Contains transaction locks
   LockTable trans_locks;

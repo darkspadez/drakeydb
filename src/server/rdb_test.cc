@@ -32,6 +32,7 @@ extern "C" {
 #include "server/rdb_load.h"
 #include "server/rdb_save.h"
 #include "server/serializer_commons.h"
+#include "server/snapshot.h"
 #include "server/test_utils.h"
 #include "strings/human_readable.h"
 
@@ -2917,6 +2918,249 @@ TEST_F(RdbMvccTest, WarnsAndLoadsUnstampedOnMalformedMvccTstampAux) {
     }
   }
   EXPECT_TRUE(warned) << "a malformed mvcc-tstamp aux must be warned about, naming the value";
+}
+
+// drakeydb: P4-2, final review (Critical) -- regression coverage for the stamp-source bug the
+// adversarial pass proved live (adversarial-review.md): SerializerBase::SerializeEntry read each
+// key's stamp through the LIVE DbSlice while the value it serialized came from the pointer array
+// captured at snapshot start. A FLUSHALL mid-save makes those two different DbTable objects, so
+// the pair the RDB recorded was either stamp-less ({0,0}, 74.9% of sampled keys in the live
+// repro) or -- for a key re-created after the flush -- the pre-flush VALUE married to the
+// post-flush write's STAMP: authority no node ever issued for that value, and bit-identical to a
+// peer's genuine newer write, so LWW can never reconcile it.
+//
+// This probe drives the real SerializerBase pipeline (RegisterChangeListener -> ProcessBucket ->
+// SerializeBucketLocked -> SerializeEntry -> MvccOf) and stubs only the output sink, so the
+// {value, stamp} pair the serializer produced is directly observable.
+namespace {
+
+class CapturedTableProbe : public SerializerBase {
+ public:
+  struct Emitted {
+    std::string value;
+    MvccStamp mvcc;
+  };
+
+  CapturedTableProbe(DbSlice* slice, ExecutionState* cntx) : SerializerBase(slice, cntx) {
+  }
+
+  using SerializerBase::MvccOf;
+  using SerializerBase::RegisterChangeListener;
+  using SerializerBase::UnregisterChangeListener;
+
+  // Mirrors SliceSnapshot::IterateBucketsFb (snapshot.cc): the traversal flow walks the CAPTURED
+  // tables, never the live ones, and reports on_update=false.
+  void TraverseCaptured() {
+    for (DbIndex i = 0; i < db_array_.size(); ++i) {
+      if (!db_array_[i])
+        continue;
+      PrimeTable* pt = &db_array_[i]->prime;
+      PrimeTable::Cursor cursor;
+      do {
+        cursor = pt->TraverseBuckets(
+            cursor, [&](PrimeTable::bucket_iterator it) { ProcessBucket(i, it, false); });
+      } while (cursor);
+    }
+  }
+
+  size_t captured_db_count() const {
+    return db_array_.size();
+  }
+
+  absl::flat_hash_map<std::string, Emitted> emitted;
+
+ private:
+  unsigned SerializeBucketLocked(DbIndex db_index, PrimeTable::bucket_iterator it,
+                                 bool on_update) override {
+    unsigned n = 0;
+    for (it.AdvanceIfNotOccupied(); !it.is_done(); ++it, ++n)
+      SerializerBase::SerializeEntry(it.bucket_address(), db_index, it->first, it->second,
+                                     on_update);
+    return n;
+  }
+
+  void SerializeEntryLocked(DbIndex db_index, const PrimeKey& pk, const PrimeValue& pv,
+                            time_t expire, uint32_t mc_flags, const MvccStamp& mvcc) override {
+    std::string scratch;
+    emitted[std::string(pk.GetSlice(&scratch))] = Emitted{pv.ToString(), mvcc};
+  }
+};
+
+// Accumulates every chunk a SliceSnapshot pushes, so the raw RDB bytes can be scanned.
+class RecordingSnapshotConsumer : public SliceSnapshot::SnapshotDataConsumerInterface {
+ public:
+  void ConsumeData(std::string data, ExecutionState*) override {
+    bytes.append(data);
+  }
+  void Finalize() override {
+  }
+
+  std::string bytes;
+};
+
+}  // namespace
+
+TEST_F(RdbMvccTest, SerializerReadsStampsFromTheCapturedTableNotTheLiveOne) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  constexpr int kKeys = 8;
+  for (int i = 0; i < kKeys; ++i)
+    ASSERT_EQ(Run({"set", StrCat("k", i), StrCat("v", i)}), "OK");
+
+  // Exact, recognizable pre-flush stamps -- one per key -- so a lost stamp ({0,0}) and a
+  // fabricated one (the post-flush stamp below) are distinguishable from each other.
+  std::vector<MvccStamp> pre(kKeys);
+  for (int i = 0; i < kKeys; ++i)
+    pre[i] = MvccStamp{0x1000ULL + i, 0xAAAA0000ULL + i};
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < kKeys; ++i)
+      db_slice.SetMvcc(0, std::string_view{StrCat("k", i)}, pre[i]);
+  });
+
+  ExecutionState cntx;
+  std::optional<CapturedTableProbe> probe;
+
+  pp_->at(0)->Await([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    probe.emplace(&db_slice, &cntx);
+    // DbSlice::RegisterOnChange DCHECKs the shard's intent lock is held; command dispatch holds
+    // it in production, this test drives the serializer directly.
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    probe->RegisterChangeListener(/*replication=*/false);  // captures db_array_
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+  });
+
+  // The flush lands strictly between "capture" and "traverse": the live array is swapped for
+  // fresh DbTables whose mvcc side table is brand new and EMPTY, while the captured intrusive_ptrs
+  // keep the old tables (values AND stamps) alive.
+  ASSERT_EQ(Run({"flushall"}), "OK");
+
+  // k0 is re-created after the flush and given a stamp of its own -- the value the buggy code
+  // pasted onto k0's PRE-flush value.
+  const MvccStamp kPostFlush{0x9999ULL, 0xBBBB0000ULL};
+  ASSERT_EQ(Run({"set", "k0", "NEWVAL"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k0"},
+                                                                  kPostFlush);
+  });
+
+  size_t captured_dbs = 0;
+  MvccStamp captured_branch{}, live_branch{}, out_of_range{}, unregistered{};
+  pp_->at(0)->Await([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+
+    probe->TraverseCaptured();
+    captured_dbs = probe->captured_db_count();
+
+    PrimeKey pk{"k0"};
+    captured_branch = probe->MvccOf(0, pk, /*on_update=*/false);
+    live_branch = probe->MvccOf(0, pk, /*on_update=*/true);
+    // Beyond the captured array (DbSlice::ActivateDb can grow the live one after a snapshot
+    // starts): must be unstamped, never an out-of-bounds read.
+    out_of_range = probe->MvccOf(static_cast<DbIndex>(captured_dbs + 5), pk, /*on_update=*/false);
+
+    // RestoreStreamer::Start skips RegisterChangeListener when its context was already cancelled
+    // (streamer.cc), leaving db_array_ empty: must be unstamped, never a null deref.
+    CapturedTableProbe never_registered(&db_slice, &cntx);
+    unregistered = never_registered.MvccOf(0, pk, /*on_update=*/false);
+
+    probe->UnregisterChangeListener();
+  });
+
+  auto emitted = probe->emitted;
+  pp_->at(0)->Await([&] { probe.reset(); });
+
+  ASSERT_EQ(emitted.size(), size_t(kKeys))
+      << "the traversal must still see the captured point-in-time content after the flush";
+  for (int i = 0; i < kKeys; ++i) {
+    const std::string key = StrCat("k", i);
+    ASSERT_TRUE(emitted.contains(key)) << key << " was not serialized";
+    EXPECT_EQ(emitted[key].value, StrCat("v", i)) << key
+                                                  << ": value must come from the captured "
+                                                     "table (point-in-time semantics)";
+    EXPECT_EQ(emitted[key].mvcc, pre[i])
+        << key
+        << ": the stamp must come from the SAME table as the value. A zero stamp here is "
+           "the stamp-loss half of the bug (the live table's side table is empty after the "
+           "flush); anything else is fabrication.";
+  }
+  EXPECT_NE(emitted["k0"].mvcc, kPostFlush)
+      << "k0 was serialized with its PRE-flush value but its POST-flush stamp -- a {value, stamp} "
+         "pair no node ever authored, which ties bit-identically against a peer's genuine newer "
+         "value and can never LWW-reconcile";
+
+  EXPECT_EQ(captured_branch, pre[0])
+      << "on_update=false (traversal) must resolve against the captured table";
+  EXPECT_EQ(live_branch, kPostFlush)
+      << "on_update=true (OnChange, pre-mutation) walks LIVE-table buckets, so it must resolve "
+         "against the live table -- collapsing both branches onto the captured array would "
+         "mis-stamp that flow instead";
+  EXPECT_TRUE(out_of_range.Empty()) << "a db index beyond the captured array must be unstamped";
+  EXPECT_TRUE(unregistered.Empty()) << "an empty captured array must be unstamped, not a deref";
+}
+
+// drakeydb: P4-2, final review (Critical) -- the same invariant through the REAL SliceSnapshot,
+// so snapshot.cc's on_update plumbing (not just SerializerBase's own resolution) is pinned: a
+// mid-save FLUSHALL must not strip the DF_MVCC record off the point-in-time bytes.
+TEST_F(RdbMvccTest, SnapshotKeepsTheMvccOpcodeAcrossAMidSaveFlush) {
+  ASSERT_TRUE(IsActiveReplica());
+  ASSERT_EQ(Run({"set", "k1", "v1"}), "OK");
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k1"},
+                                                                  kStamp);
+  });
+
+  RecordingSnapshotConsumer consumer;
+  ExecutionState cntx;
+  uint64_t serialized_at_swap = 0;
+  size_t live_size_after_flush = 0;
+
+  pp_->at(0)->Await([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+
+    SliceSnapshot snapshot(CompressionMode::NONE, &db_slice, &consumer, &cntx,
+                           DflyVersion::CURRENT_VER);
+    // kDisallow keeps the output un-chunked and untagged so it can be byte-scanned below.
+    snapshot.Start(/*stream_journal=*/false, SliceSnapshot::SnapshotFlush::kDisallow);
+
+    // Start() captures db_array_ and queues the traversal fiber; fb2 fibers are cooperative, so
+    // nothing runs until this fiber yields. FlushDbIndexes swaps the tables synchronously and
+    // hands back the deallocation fiber, so at this point the swap is done and -- asserted below
+    // -- not one key has been serialized yet. Every key in the output therefore came out of the
+    // captured table AFTER the live one was replaced: the exact window the bug lived in.
+    fb2::Fiber flush_fb = db_slice.FlushDb(0);
+    serialized_at_swap = snapshot.GetStats().keys_serialized;
+    live_size_after_flush = db_slice.DbSize(0);
+    flush_fb.Join();
+
+    snapshot.WaitSnapshotting();
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+  });
+
+  ASSERT_EQ(serialized_at_swap, 0u)
+      << "guard against a vacuous pass: the snapshot must not have serialized anything before the "
+         "flush swapped the tables";
+  ASSERT_EQ(live_size_after_flush, 0u) << "guard against a vacuous pass: the flush must have run";
+
+  std::string key1_encoded;
+  AppendString(&key1_encoded, "k1");
+  ASSERT_NE(consumer.bytes.find(key1_encoded), std::string::npos)
+      << "the captured point-in-time content must still be serialized after the flush";
+
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kStamp.packed);
+  absl::little_endian::Store64(block + 9, kStamp.origin_hash);
+  std::string_view mvcc_block(reinterpret_cast<const char*>(block), sizeof(block));
+  EXPECT_NE(consumer.bytes.find(mvcc_block), std::string::npos)
+      << "k1's stamp was dropped (or altered) because it was looked up in the post-flush LIVE "
+         "table instead of the captured one the value came from";
 }
 
 }  // namespace dfly
