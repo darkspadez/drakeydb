@@ -72,3 +72,6 @@ on merge, git may resurrect them as add/delete conflicts — keep them deleted
 - New fork code goes in **new files** where possible (`multi_master.*`, `node_identity.*`).
 - `DflyVersion` in `version.h` belongs to upstream; the fork's replication capability constant
   (`kDrakeydbReplVersion = 65`) lives in `node_identity.h` and must stay far above upstream's.
+- Bugs found in upstream code while working here go in
+  [ISSUE-REGISTER.md](ISSUE-REGISTER.md) Part 1 until they are filed against
+  `dragonflydb/dragonfly`; fork work we deliberately defer goes in Part 2.
