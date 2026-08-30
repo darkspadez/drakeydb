@@ -55,7 +55,7 @@ taking either side blindly:
 | `src/server/dflycmd.cc` | peer version/UUID gating; `DFLY TAKEOVER` refusal in active mode |
 | `src/server/server_family.cc` | REPLICAOF delegation + INFO additions (kept to additive lines); `--replicaof` list parser + active-mode REPLICAOF/INFO/REPLCONF/REPLTAKEOVER hooks, peers_ member |
 | `src/server/transaction.cc`, `tx_base.cc` | journal origin context |
-| `src/server/version.h` | upstream protocol versions — **always take upstream**, fork uses 65 |
+| `src/server/version.h` | upstream protocol versions — **always take upstream**, fork uses 66 |
 | `src/server/dfly_main.cc` | banner/usage strings, `version_check` default; `ValidateReplicaOfFlags()` + `ValidateMultiMasterFlags()` calls |
 | `src/server/CMakeLists.txt` | `OUTPUT_NAME drakeydb` + symlink lines; `peer_replication.cc` + `peer_replication_test` |
 | `tests/dragonfly/instance.py` | per-instance `--node_uuid` default in `DflyInstanceFactory.create()` |
@@ -71,7 +71,7 @@ on merge, git may resurrect them as add/delete conflicts — keep them deleted
 - Never edit `helio/` here — it is upstream's submodule; bump the pointer only via upstream merges.
 - New fork code goes in **new files** where possible (`multi_master.*`, `node_identity.*`).
 - `DflyVersion` in `version.h` belongs to upstream; the fork's replication capability constant
-  (`kDrakeydbReplVersion = 65`) lives in `node_identity.h` and must stay far above upstream's.
+  (`kDrakeydbReplVersion = 66`) lives in `node_identity.h` and must stay far above upstream's.
 - Bugs found in upstream code while working here go in
   [ISSUE-REGISTER.md](ISSUE-REGISTER.md) Part 1 until they are filed against
   `dragonflydb/dragonfly`; fork work we deliberately defer goes in Part 2.

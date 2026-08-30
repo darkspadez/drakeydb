@@ -202,14 +202,12 @@ class SerializerBase : public BucketDependencies,
   // Serialize entry while automatically handling delayed/cooled values, calls SerializeEntryLocked
   // drakeydb: P4-2, final review (Critical) -- `owner` must be `&it.owner()` of the very bucket
   // iterator `pk`/`pv` were read from: it is what the entry's mvcc stamp is resolved against.
-  // Neither "always live" nor "always captured" nor any flow flag is a correct substitute -- see
-  // MvccOf in serializer_base.cc for the three tables that can be in play at once. Getting it
-  // wrong re-opens the stamp-loss/stamp-fabrication window across a mid-save FLUSHALL.
+  // MvccOf accepts only this consumer's captured owner; a live or foreign owner is newer than the
+  // point-in-time snapshot and must never lend its stamp to captured content.
   void SerializeEntry(BucketIdentity bucket, DbIndex db_index, const PrimeKey& pk,
                       const PrimeValue& pv, const PrimeTable* owner);
 
-  // Stamp for `pk` from the DbTable that owns `owner`; MvccStamp{} when there is none (non-active
-  // node, unstamped key, or an unresolvable/null owner). See serializer_base.cc.
+  // Stamp for `pk` when `owner` is this consumer's captured DbTable; MvccStamp{} otherwise.
   MvccStamp MvccOf(DbIndex db_index, const PrimeKey& pk, const PrimeTable* owner) const;
 
   // Calls SerializeEntry internally under stream_mu_

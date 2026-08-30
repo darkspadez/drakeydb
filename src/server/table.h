@@ -186,20 +186,6 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
   // DbSlice::GetMvcc in db_slice.h/.cc, which delegates here).
   std::optional<MvccStamp> GetMvcc(const PrimeKey& key) const;
 
-  // drakeydb: P4-2, final review round 2 (Critical) -- maps a prime table back to the DbTable
-  // that contains it, for THIS thread. A serializer is handed bare bucket iterators
-  // (PrimeTable::BucketSet stores only `owner_`, a PrimeTable*, dash.h) and must resolve the
-  // stamp against the table that actually owns the bucket -- which is not always its own captured
-  // table nor the DbSlice's current one: SerializerBase::ProcessBucket's traversal flow forwards
-  // its OWN captured-table buckets to every earlier-registered consumer via
-  // DbSlice::FlushChangeToEarlierCallbacks, so a consumer can receive buckets belonging to a
-  // third table it has no pointer to. A DbTable detached by a flush stays registered here for as
-  // long as some snapshot's captured intrusive_ptr keeps it alive, which is exactly the window
-  // that matters. Returns nullptr for an unknown (or null) prime table -- callers treat that as
-  // "unstamped", never as a licence to guess. Thread-local by construction: DbTable records its
-  // creating thread and DCHECKs destruction on that same thread.
-  static DbTable* FromPrime(const PrimeTable* pt);
-
   // Contains transaction locks
   LockTable trans_locks;
 

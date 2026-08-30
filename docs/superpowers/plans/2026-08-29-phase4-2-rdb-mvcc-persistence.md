@@ -16,7 +16,8 @@ is implicitly gated on active mode (side-table lookup returns nothing otherwise)
 unconditional** — a non-active binary parses and discards. The loader replaces P4-1's `{0,0}`
 fallback with the persisted stamp when present, still creating an entry for every key so the
 side table stays dense. KeyDB's per-key `mvcc-tstamp` aux (decimal string) maps to
-`{parsed_u64, load_origin_hash_}`.
+`{parsed_u64, load_origin_hash_}` only when a live link supplied a non-zero authenticated origin;
+a local file import has no author identity and stays unstamped.
 
 **Tech Stack:** C++20, Dragonfly RDB serializer/loader, DashTable, GoogleTest, pytest,
 CMake/Ninja in the `drakeydb-p2` container.
@@ -94,9 +95,11 @@ record any deviation in the ledger.
   `SaveEntry(const PrimeKey&, const PrimeValue&, uint64_t expire_ms, uint32_t mc_flags, DbIndex, const MvccStamp& mvcc)`;
   `SerializeEntryLocked(DbIndex, const PrimeKey&, const PrimeValue&, time_t, uint32_t mc_flags, const MvccStamp& mvcc)`;
   `TieredDelayedEntry::mvcc`;
-  `std::optional<MvccStamp> DbSlice::GetMvcc(DbIndex, const PrimeKey&)` — **checks `db.mvcc`
-  for null BEFORE calling `pk.GetSlice(&scratch)`**, so non-active nodes pay one branch, no
-  allocation (same F5 trap the loader comment at `rdb_load.cc:3282-3296` documents).
+  `std::optional<MvccStamp> DbTable::GetMvcc(const PrimeKey&)` — **checks `mvcc` for null BEFORE
+  calling `pk.GetSlice(&scratch)`**, so non-active nodes pay one branch, no allocation (same F5
+  trap the loader comment at `rdb_load.cc:3282-3296` documents). The serializer resolves the
+  owning `DbTable` from the bucket owner so a mid-save flush cannot mix a captured value with a
+  live-table stamp.
 
 - [ ] **Step 1: Write the failing byte-level test**
 
@@ -130,7 +133,7 @@ constexpr uint8_t RDB_OPCODE_DF_MVCC = 221; /* {mvcc, origin_hash}, 16 raw LE by
 `RdbObjectType`:
 
 ```cpp
-if (!mvcc.IsZero()) {  // add IsZero() to MvccStamp if absent; zero == unstamped == absent
+if (!mvcc.Empty()) {  // zero == unstamped == absent
   uint8_t buf[17] = {RDB_OPCODE_DF_MVCC};
   absl::little_endian::Store64(buf + 1, mvcc.packed);
   absl::little_endian::Store64(buf + 9, mvcc.origin_hash);
@@ -268,15 +271,26 @@ the F5 string_view-overload rationale.
   // tombstone bit. Author identity is not in the file; use the link's origin.
   uint64_t v;
   if (absl::SimpleAtoi(auxval, &v)) {
-    settings->mvcc = MvccStamp{v, load_origin_hash_};
-    settings->has_mvcc = true;
+    if (v == 0) {
+      // An absent timestamp stays unstamped.
+    } else if (v & MvccClock::kTombstoneBit) {
+      LOG(WARNING) << "Ignoring unrepresentable mvcc-tstamp aux (bit 63 set): '"
+                   << auxval << "'";
+    } else if (load_origin_hash_ == 0) {
+      // The file has no authenticated author identity; leave the key unstamped.
+    } else {
+      settings->mvcc = MvccStamp{v, load_origin_hash_};
+      settings->has_mvcc = true;
+    }
   } else {
     LOG(WARNING) << "Ignoring malformed mvcc-tstamp aux: '" << auxval << "'";
   }
 }
 ```
 
-A malformed value must warn and load the key unstamped — never fail the load.
+A malformed or unrepresentable value must warn and load the key unstamped — never fail the load.
+A valid local-file timestamp with no authenticated origin also stays unstamped; active mode warns
+once per loader so the authority loss is visible without producing one log line per key.
 
 - [ ] **Step 4: Run, falsify** — revert the branch, observe the unknown-aux warning path and the
   test failing on `{0,0}`, restore, record.

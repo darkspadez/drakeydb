@@ -3,7 +3,7 @@
 > **Continue here.** This is the approved, living plan and canonical copy for the drakeydb fork.
 > Update the status block below as phases land.
 
-## Current status (last updated 2026-08-25)
+## Current status (last updated 2026-08-30)
 
 | Phase | Status | Where |
 |---|---|---|
@@ -11,7 +11,7 @@
 | **P1 — Identity foundations** | ✅ **complete, verified** | branch `feat/phase1-identity`, commits `9e653ab3..9c491fac` |
 | **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3) **merged** as `cd8e0602` — see [Phase 2](#phase-2) |
 | **P3 — Origin-tagged journal + active pair/mesh** | ✅ **complete, verified** | PR [#4](https://github.com/darkspadez/drakeydb/pull/4), branch `feat/phase3-origin-journal`, 30 commits `6b0c995a..7bddd7fe` — see [Phase 3](#phase-3) |
-| **P4 — MVCC store + stamping + wire** | ⏭️ **next up** | see [Phase 4](#phase-4--mvcc-store--stamping--wire) |
+| **P4 — MVCC store + stamping + wire** | 🚧 **in progress; P4-0 through P4-2 delivered** | see [Phase 4](#phase-4--mvcc-store--stamping--wire) |
 | P5–P9 | not started | — |
 
 **P0 verification record** (Ubuntu 24.04 arm64 container, OrbStack): debug build produces
@@ -228,9 +228,9 @@ Governing choices:
    `{varint origin_idx, varint mvcc, varint flags}` (flags bit0 = expiry-DEL). Active masters
    refuse replication consumers that didn't negotiate the fork protocol, so stock readers never
    see v2.
-4. **Fork protocol version = 65** (`kDrakeydbReplVersion`), sent via existing
-   `REPLCONF CLIENT-VERSION` — far above upstream's VER6 so future upstream bumps never collide.
-   Non-active nodes interop with stock Dragonfly unchanged.
+4. **Fork protocol version = 66** (`kDrakeydbReplVersion`; bumped by P4-2 for RDB opcode 221),
+   sent via existing `REPLCONF DRAKEY-VERSION` — far above upstream's VER6 so future upstream
+   bumps never collide. Non-active nodes interop with stock Dragonfly unchanged.
 5. **Persistent node UUID** in `<dir>/drakeydb.uuid` (fixes KeyDB's per-boot regeneration),
    exchanged KeyDB-style: `REPLCONF UUID <36char>` → `+<peer uuid> <peer ms-clock>` (clock echo
    enables skew warnings). Works against DF and real KeyDB masters.
@@ -252,7 +252,7 @@ Governing choices:
 
 | Path | Contents |
 |---|---|
-| `src/server/node_identity.h/.cc` | UUID create/load/persist, `--node_uuid` override, `kDrakeydbReplVersion = 65` |
+| `src/server/node_identity.h/.cc` | UUID create/load/persist, `--node_uuid` override, `kDrakeydbReplVersion = 66` |
 | `src/server/multi_master.h/.cc` | `PeerRegistry` (uuid ↔ origin_idx, 0 = self, P1). **P2 (done):** `active_replica`/`multi_master` flags, `IsActiveReplica()`/`IsMultiMaster()`, `ValidateMultiMasterFlags()`, `ParsePeerReplicaOfArgs()`, `RenderPeerReplicationInfo()`. `MvccClock` (P4, not yet built) |
 | `src/server/peer_replication.h/.cc` (new, P2) | `SyncGate` (FIFO ticket queue, cancellable, deferred while the process is LOADING for another reason, notifies under its mutex), `PeerReplicationManager` (peer links keyed by stored endpoint; add/remove/no-one; replace-vs-append by `--multi_master`) |
 | `src/server/multi_master_test.cc` | C++ units (registry; **P2:** flag validation, arg parser, INFO renderer, `ActiveReplicaFamilyTest`) |

@@ -29,12 +29,15 @@ hard-fails with "Unrecognized rdb object type: 221". A `drakeydb-mvcc` AUX field
 in the same file at least gives a stock loader's log a clue ("Unrecognized RDB AUX field:
 'drakeydb-mvcc'") before it reaches the fatal byte.
 
-This is a **one-way door, and file-only**: a snapshot written by an active node can only be
-loaded by a drakeydb binary (the read side understands opcode 221 unconditionally, active or
-not) — never by a stock Dragonfly. It never surfaces over replication: an active node's peer
-admission (fork protocol version + UUID negotiation) refuses any consumer that hasn't negotiated
-the fork protocol before a single byte of the stream is sent, so a stock Dragonfly (or plain
-Redis) can never `REPLICAOF` an active drakeydb node and receive opcode 221 in the first place.
-The cliff only bites when a snapshot **file** produced by an active node is copied by hand onto a
-stock Dragonfly's `--dir` (or loaded there via `DEBUG RELOAD`). A non-active drakeydb node never
-emits opcode 221 — the write side is active-only — so its own snapshots stay stock-compatible.
+This is a **one-way door for incompatible consumers**: a snapshot written by an active node can
+only be loaded by a drakeydb binary (the read side understands opcode 221 unconditionally, active
+or not) — never by a stock Dragonfly. Negotiated drakeydb full sync deliberately carries the same
+snapshot stream, including opcode 221. Peer admission requires fork protocol version 66 (the first
+version that understands this opcode) before a single byte is sent, so an older drakeydb, stock
+Dragonfly, or plain Redis consumer can never receive it from an active node. The compatibility
+cliff therefore appears when an active snapshot **file** is copied by hand onto a stock
+Dragonfly's `--dir` (or loaded there via `DEBUG RELOAD`), while compatible drakeydb replication
+preserves the stamps. To cross back deliberately, load the file with a current drakeydb under
+`--active_replica=false` and save it again; the non-active write side omits opcode 221, producing a
+stock-compatible snapshot at the cost of discarding all stamps. A non-active drakeydb node's own
+snapshots are stock-compatible for the same reason.

@@ -51,6 +51,7 @@ extern "C" {
 #include "server/journal/executor.h"
 #include "server/journal/serializer.h"
 #include "server/main_service.h"
+#include "server/multi_master.h"
 #include "server/namespaces.h"
 #include "server/rdb_extensions.h"
 #include "server/script_mgr.h"
@@ -3137,8 +3138,10 @@ error_code RdbLoader::HandleAux(ObjSettings* settings) {
   } else if (auxkey == "mvcc-tstamp") {
     // drakeydb: P4-2 Task 3 -- KeyDB (fActiveReplica) writes this decimal-u64 aux before every
     // key (KeyDB/src/rdb.cpp:1164-1168). Same packed layout as MvccClock (D-3/D-4), no tombstone
-    // bit. Author identity is not in the file; use the link's origin (load_origin_hash_, set via
-    // SetLoadOriginHash -- 0/"unknown" for a local file load). Like the drakeydb-mvcc branch
+    // bit. Author identity is not in the file; use the link's authenticated origin
+    // (load_origin_hash_, set via SetLoadOriginHash). A local file load has no link identity and
+    // therefore must leave the key unstamped rather than inventing origin 0. Like the
+    // drakeydb-mvcc branch
     // above and the DF_MVCC opcode case in the main loop, this read is unconditional on the
     // local node's own active-ness (D-7): settings->has_mvcc/mvcc are plain fields that exist
     // regardless of whether an mvcc side table will ultimately consume them (CreateObjectOnShard
@@ -3168,6 +3171,15 @@ error_code RdbLoader::HandleAux(ObjSettings* settings) {
         LOG(WARNING) << "Ignoring unrepresentable mvcc-tstamp aux (bit 63 set, e.g. KeyDB's "
                         "OBJ_MVCC_INVALID sentinel): '"
                      << auxval << "'";
+      } else if (load_origin_hash_ == 0) {
+        // A KeyDB aux contains only its logical clock, not the author's identity. Installing
+        // {v,0} on an active local import would mint durable authority that no authenticated
+        // sender supplied and re-emit it in opcode 221. Non-active loaders discard stamps by
+        // design and remain silent; an active local import gets one warning per loader.
+        if (IsActiveReplica() && !warned_missing_mvcc_origin_) {
+          LOG(WARNING) << "Ignoring mvcc-tstamp aux without an authenticated sender origin";
+          warned_missing_mvcc_origin_ = true;
+        }
       } else {
         settings->mvcc = MvccStamp{v, load_origin_hash_};
         settings->has_mvcc = true;

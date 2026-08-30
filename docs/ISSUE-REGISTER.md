@@ -31,17 +31,17 @@ swaps the live array for fresh empty tables, so values come from the captured ta
 come from a table that no longer holds them: flags are lost, or — for keys re-created after the
 flush — a pre-flush value is written with a post-flush key's flags.
 
-Three routes reach it, including the non-obvious one: `ProcessBucket` →
-`DbSlice::FlushChangeToEarlierCallbacks` hands an *earlier* registered consumer buckets owned by
-the *traversing* consumer's captured table, so "is this an update?" does not identify the owning
-table. Triggering that route needs two concurrent consumers (a BGSAVE plus a replica full sync,
-or two replicas syncing).
+The reachable failure is the ordinary captured-table traversal after a mid-save flush: the value
+still comes from the retained table while `GetMCFlag` consults its replacement. A proposed third
+route through `FlushChangeToEarlierCallbacks` was disproved during P4-2 review. An occupied bucket
+created after the earlier snapshot has a newer insertion version and is not forwarded to it; a
+bucket old enough to be forwarded belongs to the table both consumers captured.
 
 **How established:** found and live-proven for the drakeydb MVCC stamp, which sat on the same
 line and had the identical shape (P4-2 adversarial review; 2,996/4,000 keys lost their stamp and
-763/1,000 got a fabricated value/attribute pair). We fixed our field by resolving against the
-bucket's owning table (`&it.owner()`); `mc_flags` was deliberately left alone as out of scope.
-The `mc_flags` case is argued from the shared mechanism, not separately reproduced.
+763/1,000 got a fabricated value/attribute pair). We fixed our field by accepting the bucket's
+stamp only from the serializer's captured table; `mc_flags` was deliberately left alone as out
+of scope. The `mc_flags` case is argued from the shared mechanism, not separately reproduced.
 
 **Status:** not filed. Lower severity than our case (memcached flags, not conflict-resolution
 authority), but the same class.
@@ -89,15 +89,6 @@ end-to-end — three separate agents independently said so.
 
 **Owner:** P7. **From:** P4-1.
 
-### D-2. Old-peer upgrade is lockstep and undocumented
-
-A drakeydb peer built before P4-2 still advertises `DRAKEY-VERSION 65`, so a P4-2 active master
-will full-sync to it and the old peer hard-fails on opcode 221 mid-stream. Nothing refuses the
-pairing in advance. Either bump the version floor or document that active meshes must be upgraded
-together.
-
-**Owner:** unassigned — should be settled before any deployment spanning versions. **From:** P4-2.
-
 ### D-3. `SORT ... STORE` does not replicate
 
 Reproduced with `--active_replica` **off**, so the non-replication itself is upstream behavior.
@@ -121,27 +112,6 @@ INFO memory, but not for INFO as a whole.
 
 **Owner:** unassigned; introduced in P1/P3. **From:** P4-1.
 
-### D-6. Ownership-registry hardening
-
-The thread-local prime→`DbTable` registry added in P4-2 (`table.cc`, maintained in `DbTable`'s
-constructor and destructor) has three loose ends: `tl_prime_owners` has external linkage where its
-own comment cites `snapshot.cc`'s anonymous-namespace precedent; `DbTable::FromPrime` returns a
-mutable `DbTable*` from a `const PrimeTable*`; and a constructor `DCHECK` would turn the
-release-mode orphan residual (a cross-thread destroy) into a CI-visible failure at no cost — a
-reviewer ran exactly that as a `CHECK` across a four-thread hammer and it never fired.
-
-**Owner:** any phase touching serialization. **From:** P4-2 final review.
-
-### D-7. Registry's ≥3-table path has no dedicated test
-
-`RdbMvccTest.EarlierConsumerStampsForeignBucketsFromTheOwningTable` passes even with
-`DbTable::FromPrime` stubbed to return `nullptr`, because both probes capture the same table and
-resolve via the pointer-compare fast path. The registry is exercised only by the direct `MvccOf`
-probes in the sibling test; the ≥3-table case it exists for is closed by construction, not by a
-test.
-
-**Owner:** any phase touching serialization. **From:** P4-2 final review.
-
 ### D-8. Both stamp forms for one key are untested
 
 If a single RDB stream carries both `RDB_OPCODE_DF_MVCC` and a KeyDB `mvcc-tstamp` aux for the
@@ -151,17 +121,11 @@ emits both today.
 
 **Owner:** P7 (KeyDB onboarding). **From:** P4-2 final review.
 
-### D-9. Documentation loose ends
+### D-9. Historical commit-message figure
 
-- `docs/differences.md` describes the stock-Dragonfly RDB cliff as a one-way door but omits the
-  escape hatch: reload under `--active_replica=false` and re-save produces a stock-compatible
-  file, losing the stamps. That escape hatch is the design spec's own stated motivation for
-  making the read path unconditional.
-- `docs/PLAN.md`'s top status table still reads "P4 … next up" and is dated 2026-08-25, three
-  merged phases ago. Progress is recorded only in the Phase 4 prose section.
-- Commit `0d59e9fc`'s message carries a wrong "63%" figure for the `mvcc_table_bytes`
-  under-report (the true figure is ~43.6% below true cost). The code, the benchmark docstring,
-  and `PLAN.md` were all corrected; the commit message cannot be without a rebase.
+Commit `0d59e9fc`'s message carries a wrong "63%" figure for the `mvcc_table_bytes` under-report
+(the true figure is ~43.6% below true cost). The code, benchmark docstring, and `PLAN.md` are
+correct; the historical message can only be changed by rebasing the PR.
 
 **Owner:** any phase. **From:** P4-2.
 

@@ -65,7 +65,7 @@ bool WriteStringToFileForTest(const std::string& path, std::string_view content)
 }  // namespace
 
 TEST(NodeIdentity, VersionConstant) {
-  EXPECT_EQ(65u, kDrakeydbReplVersion);
+  EXPECT_EQ(66u, kDrakeydbReplVersion);
 }
 
 TEST(NodeUuid, GenerateIsValidV4) {
@@ -571,6 +571,14 @@ TEST_F(ActiveReplicaFamilyTest, ReplconfRefusedWhileActive) {
   auto resp = Run({"replconf", "listening-port", "1"});
   EXPECT_EQ("OK", resp);
   resp = Run({"replconf", "capa", "dragonfly"});
+  EXPECT_THAT(resp, ErrArg("active-replica"));
+}
+
+// P4-2 adds RDB opcode 221. A pre-P4-2 consumer advertises version 65 and cannot parse that
+// opcode, so it must be rejected at admission rather than failing partway through full sync.
+TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesPreMvccSnapshotConsumer) {
+  EXPECT_EQ("OK", Run({"replconf", "drakey-version", "65"}));
+  auto resp = Run({"replconf", "capa", "dragonfly"});
   EXPECT_THAT(resp, ErrArg("active-replica"));
 }
 

@@ -549,13 +549,16 @@ never fabricates authority the snapshot does not contain and is rollback-safe.
 
 | Loader | Sees `RDB_OPCODE_DF_MVCC` | Sees KeyDB `mvcc-tstamp` aux |
 |---|---|---|
-| Active drakeydb | parses, seeds the side table | parses, origin = sender uuid hash |
+| Active drakeydb | parses, seeds the side table | parses with an authenticated sender uuid hash; a local file import stays unstamped |
 | Non-active drakeydb | parses, **discards** | parses, **discards**, silently (amended in P4-2: this cell said "warns per key, ignores"; the implementation warns only on a *malformed* or unrepresentable value, because a per-key warning on a loader that correctly ignores a well-formed value is log spam) |
 | Stock Dragonfly | **hard fail** — `Unrecognized rdb object type: 221` (`rdb_load.cc:2670-2678`) | warns per key, loads fine |
 
-The stock-Dragonfly cliff is a one-way door and must be documented. It is **not**
-reachable via replication — P3's `DRAKEY-VERSION >= 65` admission already refuses
-stock consumers — only by handing an RDB file to a stock binary.
+The stock-Dragonfly cliff is a one-way door for incompatible consumers and must be documented.
+Negotiated drakeydb full sync does carry opcode 221. P4-2 therefore bumps the admission floor to
+`DRAKEY-VERSION >= 66`: older drakeydb builds and stock consumers are refused before streaming.
+The cliff is reachable only by handing an active-node RDB file directly to an incompatible
+binary. A current drakeydb can deliberately strip the stamps by loading under
+`--active_replica=false` and saving again, yielding a stock-compatible file.
 
 **Tombstone persistence** is a separate opcode, `RDB_OPCODE_DF_TOMBSTONES = 225`,
 one batch per shard in the shard epilogue, format

@@ -318,7 +318,7 @@ io::Result<uint8_t> RdbSerializer::SaveEntry(const PrimeKey& pk, const PrimeValu
   // stamp: the invariant is that a key's stamp advances iff the resulting value state is
   // propagated carrying that stamp, and an unstamped key has no authority to propagate. This is
   // the write side only -- see rdb_extensions.h for the read side's unconditional contract.
-  if (!mvcc.IsZero()) {
+  if (!mvcc.Empty()) {
     uint8_t buf[17] = {RDB_OPCODE_DF_MVCC};
     absl::little_endian::Store64(buf + 1, mvcc.packed);
     absl::little_endian::Store64(buf + 9, mvcc.origin_hash);

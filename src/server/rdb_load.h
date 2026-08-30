@@ -338,9 +338,10 @@ class RdbLoader : protected RdbLoaderBase {
   // aux (rdb_load.cc). That aux carries only a raw KeyDB counter, never an author identity
   // (unlike our own RDB_OPCODE_DF_MVCC, which carries origin_hash on the wire already -- see
   // Item::mvcc's doc comment below), so the loader has no way to learn it from the file itself.
-  // Leave unset (default 0, "unknown origin") for a local RDB file load; a live link that knows
-  // its peer's identity (e.g. Replica::peer_origin_hash_, set at Greet -- replica.cc) sets it
-  // before Load() runs, mirroring SetApplyOrigin/apply_origin_idx_ immediately above.
+  // Leave unset (default 0) for a local RDB file load; a KeyDB aux without an authenticated origin
+  // is then ignored rather than turned into durable {mvcc,0} authority. A live link that knows its
+  // peer's identity (e.g. Replica::peer_origin_hash_, set at Greet -- replica.cc) sets it before
+  // Load() runs, mirroring SetApplyOrigin/apply_origin_idx_ immediately above.
   void SetLoadOriginHash(uint64_t origin_hash) {
     load_origin_hash_ = origin_hash;
   }
@@ -504,6 +505,7 @@ class RdbLoader : protected RdbLoaderBase {
   size_t table_used_memory_ = 0;
   // See SetLoadOriginHash's doc comment above.
   uint64_t load_origin_hash_ = 0;
+  bool warned_missing_mvcc_origin_ = false;
   ScriptMgr* script_mgr_;
   std::vector<ItemsBuf> shard_buf_;
 
