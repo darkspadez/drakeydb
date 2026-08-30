@@ -15,10 +15,11 @@ namespace dfly {
 // T7 -- strictly before REPLCONF capa dragonfly, like REPLCONF UUID, so an active master's
 // admission check can see it) -- never via REPLCONF CLIENT-VERSION, which stays at
 // DflyVersion::CURRENT_VER. Deliberately a plain unsigned, NOT a DflyVersion: the enum's value
-// range is 0..7, so DflyVersion(65) is UB, and sending 65 via CLIENT-VERSION would flip every
+// range is 0..7, so DflyVersion(66) is UB, and sending 66 via CLIENT-VERSION would flip every
 // master-side `>= VER6` gate (rdb_save.cc:1782, snapshot.cc:101) against peers that don't
-// support those features.
-inline constexpr unsigned kDrakeydbReplVersion = 65;
+// support those features. P4-2 bumps 65 to 66 because its snapshot stream adds opcode 221: an
+// older consumer advertising 65 cannot parse that opcode and must be refused before full sync.
+inline constexpr unsigned kDrakeydbReplVersion = 66;
 
 inline constexpr char kNodeUuidFileName[] = "drakeydb.uuid";
 

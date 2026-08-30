@@ -80,7 +80,6 @@ struct MvccStamp {
   bool Empty() const {
     return packed == 0 && origin_hash == 0;
   }
-
   // INVARIANT: a tombstone's mvcc MUST be freshly minted via MvccClock::Next -- it must never
   // reuse the mvcc of the value it deletes. operator< masks bit 63 below precisely because a
   // fresh mvcc is assumed to make (mvcc, origin_hash) unique per write; if a tombstone instead

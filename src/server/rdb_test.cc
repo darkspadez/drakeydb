@@ -32,6 +32,7 @@ extern "C" {
 #include "server/rdb_load.h"
 #include "server/rdb_save.h"
 #include "server/serializer_commons.h"
+#include "server/snapshot.h"
 #include "server/test_utils.h"
 #include "strings/human_readable.h"
 
@@ -53,6 +54,7 @@ ABSL_DECLARE_FLAG(bool, rdb_sbf_chunked);
 ABSL_DECLARE_FLAG(bool, serialize_hnsw_index);
 ABSL_DECLARE_FLAG(bool, deserialize_hnsw_index);
 ABSL_DECLARE_FLAG(std::string, dbfilename);
+ABSL_DECLARE_FLAG(bool, active_replica);
 
 namespace {
 
@@ -1466,6 +1468,46 @@ TEST_F(MemBufControllerTest, RollbackOnSuspendedEntry) {
 
 namespace {
 
+// drakeydb: P4-2 Task 2, review round 1 (Important, finding 2) -- duplicated from
+// journal_test.cc's own file-local ScopedLogCapture (same reasoning as WrapInRdbForTest in
+// peer_replication_test.cc: the original is anonymous-namespace-scoped there, so a second TU
+// needing the same capability copies it rather than promoting it to a shared header for one
+// caller). Registers as a real glog/absl-log sink for the scope's lifetime and records every
+// message's text verbatim, so a test can assert on the exact log output a code path produces
+// (or, as here, does NOT produce) without guessing at log levels or destinations.
+#ifdef USE_ABSL_LOG
+class ScopedLogCapture : public absl::LogSink {
+ public:
+  ScopedLogCapture() {
+    absl::AddLogSink(this);
+  }
+  ~ScopedLogCapture() override {
+    absl::RemoveLogSink(this);
+  }
+  void Send(const absl::LogEntry& entry) override {
+    logs.emplace_back(entry.text_message());
+  }
+
+  std::vector<std::string> logs;
+};
+#else
+class ScopedLogCapture : public google::LogSink {
+ public:
+  ScopedLogCapture() {
+    google::AddLogSink(this);
+  }
+  ~ScopedLogCapture() override {
+    google::RemoveLogSink(this);
+  }
+  void send(google::LogSeverity severity, const char* full_filename, const char* base_filename,
+            int line, const struct tm* tm_time, const char* message, size_t message_len) override {
+    logs.emplace_back(message, message_len);
+  }
+
+  std::vector<std::string> logs;
+};
+#endif
+
 // Wraps string in rdb version, eof, checksum, etc so it can be fed to a loader
 std::string WrapInRdb(std::string_view body) {
   std::string out = absl::StrFormat("REDIS%04d", RDB_SER_VERSION);
@@ -1564,7 +1606,8 @@ struct InterleaveHarness {
     // consume_fun_ -> ... The last entry in queue (next == queued size) does not add anything, it
     // simply returns until the entry is completed. From that point on all entries simply flush
     // repeatedly until completed, moving down the stack.
-    EXPECT_TRUE(serializer->SaveEntry(PrimeKey{entry.key}, *entry.value, 0, 0, 0).has_value());
+    EXPECT_TRUE(
+        serializer->SaveEntry(PrimeKey{entry.key}, *entry.value, 0, 0, 0, MvccStamp{}).has_value());
 
     io::StringSink sink;
     JournalWriter writer(&sink);
@@ -1903,7 +1946,8 @@ TEST_F(RdbTest, TaggedInterleavedRoundTrip) {
     auto it = db.FindReadOnly(ctx, "A", OBJ_HASH);
     ASSERT_TRUE(it.ok());
 
-    ASSERT_TRUE(serializer.SaveEntry(PrimeKey{"A"}, it.value()->second, 0, 0, 0).has_value());
+    ASSERT_TRUE(
+        serializer.SaveEntry(PrimeKey{"A"}, it.value()->second, 0, 0, 0, MvccStamp{}).has_value());
 
     if (auto tail = serializer.Flush(RdbSerializer::FlushState::kFlushEndEntry); !tail.empty())
       harness.body += tail;
@@ -2434,6 +2478,783 @@ TEST_F(RdbTest, EofWithRemoteShardChunksPending) {
 
   // Key was never fully loaded before EOF, so it must not exist.
   EXPECT_EQ(Run({"EXISTS", key}), 0);
+}
+
+// drakeydb: P4-2 Task 1 -- pins num_shards=1 (RdbTest's default num_threads_ == 3 gives 2 shards)
+// so a single-shard capture is guaranteed to see every key in this fixture's tests, regardless of
+// hash placement. FlagSaver restores active_replica/num_shards for every later RdbTest case in
+// this binary (gtest runs the whole file in one process).
+class RdbMvccTest : public RdbTest {
+ protected:
+  RdbMvccTest() {
+    absl::SetFlag(&FLAGS_active_replica, true);
+    num_threads_ = 1;
+    absl::SetFlag(&FLAGS_num_shards, 1);
+  }
+
+  absl::FlagSaver saver_;
+};
+
+// drakeydb: P4-2 Task 1 -- proves RDB_OPCODE_DF_MVCC (221 / 0xDD) is emitted exactly once per
+// stamped key, immediately before that key's type byte, and never for a key whose side-table
+// stamp is zero (unstamped/absent). Drives a REAL single-shard-with-summary RdbSaver capture over
+// a REAL DbSlice -- the same SaveHeader/StartSnapshotInShard sequence
+// PeerFullSyncFiltersConcurrentJournalPlainReplicaUnaffected above uses for its full-sync capture,
+// minus journal streaming (this is a plain point-in-time snapshot, not a stable-sync stream) --
+// so the opcode's SaveEntry/SerializeEntry/GetMvcc plumbing is exercised end to end, not
+// hand-simulated. Byte-scanned rather than round-tripped through a loader: Task 2 (the read side)
+// is a separate, not-yet-landed task, and an unrecognized opcode 221 would fail a loader round
+// trip for the wrong reason.
+TEST_F(RdbMvccTest, EmitsOpcodeOnlyForTheStampedKey) {
+  ASSERT_TRUE(IsActiveReplica());
+  ASSERT_EQ(Run({"set", "k0", "v0"}), "OK");
+  ASSERT_EQ(Run({"set", "k1", "v1"}), "OK");
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    // Overwrites whatever the real write path minted (active mode stamps every write): k1 gets an
+    // exact, recognizable stamp, and k0 is forced back to zero -- "unstamped" -- which is also
+    // what an unversioned key looks like after a plain SET under a not-yet-active P4-1 node.
+    db_slice.SetMvcc(0, std::string_view{"k1"}, kStamp);
+    db_slice.SetMvcc(0, std::string_view{"k0"}, MvccStamp{});
+  });
+
+  io::StringSink sink;
+  std::string bytes = pp_->at(0)->Await([&]() -> std::string {
+    RdbSaver saver(&sink, SaveMode::SINGLE_SHARD_WITH_SUMMARY, /*align_writes=*/false, "",
+                   DflyVersion::CURRENT_VER);
+    ExecutionState cntx;
+    EngineShard* shard = EngineShard::tlocal();
+    CHECK(!saver.SaveHeader(RdbSaver::GetGlobalData(service_.get(), true)));
+
+    // DbSlice::RegisterOnChange (inside StartSnapshotInShard's SliceSnapshot::Start) DCHECKs the
+    // shard's intent lock is held; ordinary command dispatch holds it via transaction scheduling,
+    // but this test drives RdbSaver directly, off that path.
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    saver.StartSnapshotInShard(/*stream_journal=*/false, &cntx, shard);
+    CHECK(!saver.WaitSnapshotInShard(shard));
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+    return std::move(sink).str();
+  });
+
+  std::string key0_encoded, key1_encoded;
+  AppendString(&key0_encoded, "k0");
+  AppendString(&key1_encoded, "k1");
+  ASSERT_NE(bytes.find(key0_encoded), std::string::npos) << "k0 must have been serialized";
+  ASSERT_NE(bytes.find(key1_encoded), std::string::npos) << "k1 must have been serialized";
+
+  // Positive coverage for SaveAux's breadcrumb: active mode must actually write it. (The gating
+  // test below only proves it is ABSENT when inactive; without this, deleting the
+  // SaveAuxFieldStrStr call entirely would leave the whole suite green.)
+  EXPECT_NE(bytes.find("drakeydb-mvcc"), std::string::npos)
+      << "active mode must emit the drakeydb-mvcc aux breadcrumb";
+
+  uint8_t block[17] = {0xDD};
+  absl::little_endian::Store64(block + 1, kStamp.packed);
+  absl::little_endian::Store64(block + 9, kStamp.origin_hash);
+  std::string_view mvcc_block(reinterpret_cast<const char*>(block), sizeof(block));
+
+  size_t pos = bytes.find(mvcc_block);
+  ASSERT_NE(pos, std::string::npos) << "expected a 0xDD opcode block carrying k1's exact stamp";
+
+  // The block must sit immediately before k1's type byte: exactly one byte (the RDB type), then
+  // k1's own key encoding.
+  size_t after_block = pos + mvcc_block.size();
+  ASSERT_LE(after_block + 1 + key1_encoded.size(), bytes.size());
+  EXPECT_EQ(bytes.substr(after_block + 1, key1_encoded.size()), key1_encoded)
+      << "0xDD opcode block must be positioned before k1's type byte";
+
+  // 0xDD's first (and only legitimate) occurrence in the whole buffer is k1's block above -- so no
+  // 0xDD opcode precedes k0 (its stamp is zero == unstamped == absent), and the block does not
+  // appear a second time anywhere else either.
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD)), pos)
+      << "0xDD must not appear anywhere before k1's opcode block (e.g., preceding k0)";
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD), pos + 1), std::string::npos)
+      << "0xDD must not appear a second time anywhere in the buffer";
+}
+
+// drakeydb: P4-2 Task 1 -- the write side is active-only (spec D-7, "the single most important
+// compatibility rule in the phase"): with --active_replica off, neither the RDB_OPCODE_DF_MVCC
+// byte nor its "drakeydb-mvcc" breadcrumb aux field may appear, even though both keys below get a
+// real (non-mvcc-table-backed) write. Uses plain RdbTest -- inactive is upstream's default, so no
+// extra fixture scaffolding is needed.
+TEST_F(RdbTest, NoMvccOpcodeOrAuxWhenInactive) {
+  ASSERT_FALSE(IsActiveReplica());
+  ASSERT_EQ(Run({"set", "k0", "v0"}), "OK");
+  ASSERT_EQ(Run({"set", "k1", "v1"}), "OK");
+
+  io::StringSink sink;
+  std::string bytes = pp_->at(0)->Await([&]() -> std::string {
+    RdbSaver saver(&sink, SaveMode::SINGLE_SHARD_WITH_SUMMARY, /*align_writes=*/false, "",
+                   DflyVersion::CURRENT_VER);
+    ExecutionState cntx;
+    EngineShard* shard = EngineShard::tlocal();
+    CHECK(!saver.SaveHeader(RdbSaver::GetGlobalData(service_.get(), true)));
+
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    saver.StartSnapshotInShard(/*stream_journal=*/false, &cntx, shard);
+    CHECK(!saver.WaitSnapshotInShard(shard));
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+    return std::move(sink).str();
+  });
+
+  EXPECT_EQ(bytes.find("drakeydb-mvcc"), std::string::npos);
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD)), std::string::npos);
+}
+
+// drakeydb: P4-2 Task 2 -- the read-side counterpart to EmitsOpcodeOnlyForTheStampedKey above:
+// hand-builds the exact 17-byte block that test proved the saver emits (0xDD, then the stamp's
+// packed/origin_hash as raw LE uint64s) immediately before a key's type byte, feeds it through a
+// REAL RdbLoader (WrapInRdb/LoadRdbData -- the same helpers InterleavedLoad and friends use
+// earlier in this file), and asserts the loaded stamp equals the original bytes exactly: never
+// re-minted, installed verbatim. This is the invariant P4-2 exists for -- "a key's stamp advances
+// iff that same stamp is propagated" -- checked here for the load-as-propagation-by-snapshot
+// direction specifically.
+TEST_F(RdbMvccTest, LoadInstallsThePersistedStampVerbatim) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+  std::string body;
+  uint8_t block[17] = {0xDD};
+  absl::little_endian::Store64(block + 1, kStamp.packed);
+  absl::little_endian::Store64(block + 9, kStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k1");
+  AppendString(&body, "v1");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k1"}), "v1");
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k1"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kStamp)
+      << "a loaded key's stamp must equal the persisted RDB_OPCODE_DF_MVCC bytes exactly, "
+         "never re-minted by the loader";
+}
+
+// drakeydb: P4-2 Task 2 -- the counterpart to NoMvccOpcodeOrAuxWhenInactive above: a body with no
+// RDB_OPCODE_DF_MVCC record before the key's type byte is byte-for-byte what that test proved an
+// inactive save produces (also what an unstamped/absent key looks like on an active save, e.g.
+// k0 in EmitsOpcodeOnlyForTheStampedKey -- the loader cannot tell, and D-7 says it must not try:
+// the read is unconditional on the record's presence, never on the local node's own
+// active-ness). Loaded here by an ACTIVE node specifically, so the mvcc table actually exists and
+// this proves the {0,0} fallback is an explicit, dense slot -- not merely "no crash" -- exactly
+// like the unconditional SetMvcc call for a has_mc_flags-less key already is for mc_flags.
+TEST_F(RdbMvccTest, LoadFallsBackToZeroStampWhenOpcodeAbsent) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  std::string body;
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k0");
+  AppendString(&body, "v0");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k0"}), "v0");
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k0"});
+  });
+  ASSERT_TRUE(got.has_value()) << "an active loader must still leave a dense {0,0} slot";
+  EXPECT_TRUE(got->Empty())
+      << "no RDB_OPCODE_DF_MVCC record for this key (e.g. a snapshot produced by a node with "
+         "--active_replica off) must fall back to {0,0}, D-7's unversioned default -- the "
+         "fallback must survive Task 2's new opcode-aware path";
+}
+
+// drakeydb: P4-2 Task 2, review round 1 (Important, finding 1) -- covers D-7's "parses, discards"
+// compatibility row, which neither test above exercises: both use the ACTIVE RdbMvccTest
+// fixture, and the pytest plain-replica gate
+// (test_plain_replica_of_active_node_gets_full_unfiltered_stream) attaches before any writes, so
+// its own full-sync stream never carries a live 0xDD record either. A loader bug that skips the
+// opcode's 16 bytes WITHOUT consuming them (e.g. an errantly added `if (IsActiveReplica())` guard
+// around the fetch, not just around the eventual SetMvcc apply) would desync the byte stream --
+// the type byte of the NEXT record would be misread as the low byte of the abandoned stamp -- and
+// every real non-active consumer of an active node's snapshot (a plain replica's full sync, or
+// this exact scenario relayed through a peer mesh) would silently corrupt or fail to load
+// everything after the first stamped key. Nothing in the suite before this test could have caught
+// that: it is the first test in the file to put a live RDB_OPCODE_DF_MVCC record in front of an
+// INACTIVE loader with more data after it.
+//
+// Plain RdbTest (inactive is upstream's default, matching NoMvccOpcodeOrAuxWhenInactive above) --
+// k2 immediately follows k1's record with no opcode of its own, so it can only parse correctly if
+// the loader consumed exactly 16 bytes for k1's record, no more, no less.
+TEST_F(RdbTest, LoadConsumesAndDiscardsMvccRecordWhenInactive) {
+  ASSERT_FALSE(IsActiveReplica());
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+  std::string body;
+  uint8_t block[17] = {0xDD};
+  absl::little_endian::Store64(block + 1, kStamp.packed);
+  absl::little_endian::Store64(block + 9, kStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k1");
+  AppendString(&body, "v1");
+  // No opcode before k2: if the record above were not fully (and only) consumed, the loader
+  // would desync right here.
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k2");
+  AppendString(&body, "v2");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  // "Parses": both keys loaded with their correct values -- proof the record's 16 bytes were
+  // fully consumed rather than skipped or partially consumed.
+  EXPECT_EQ(Run({"get", "k1"}), "v1");
+  EXPECT_EQ(Run({"get", "k2"}), "v2");
+
+  // "Discards": an inactive node never allocates the mvcc side table (DbTable::DbTable,
+  // table.cc), so GetMvcc must return nullopt for k1 -- not the stamp the record carried, and
+  // not {0,0} either.
+  std::optional<MvccStamp> got;
+  shard_set->Await(Shard("k1", shard_set->size()), [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k1"});
+  });
+  EXPECT_FALSE(got.has_value())
+      << "an inactive node must never install a stamp -- GetMvcc must return nullopt, proving "
+         "SetMvcc's own `if (!db.mvcc) return;` guard (db_slice.cc) discarded it";
+}
+
+// drakeydb: P4-2 Task 2, review round 1 (Important, finding 2) -- rdb_save.cc's SaveAux writes
+// the "drakeydb-mvcc" breadcrumb unconditionally on every active-mode save (SaveAuxFieldStrStr,
+// gated on IsActiveReplica()); before HandleAux recognized it, every single active-mode load --
+// including this fixture's own SAVE-then-LOAD via `debug reload` -- logged "Unrecognized RDB AUX
+// field: 'drakeydb-mvcc'" once per shard file, inverting the warning's purpose (it exists to flag
+// a FOREIGN binary's genuinely unknown aux fields, not drakeydb's own recognized one).
+//
+// Real glog/absl-log capture (ScopedLogCapture above), not a code-inspection stand-in: this repo
+// already has a working, in-tree precedent for exactly this (journal_test.cc's
+// PassesPeerEchoFilterTest.DropsForeignOriginExpiryDelAndOriginOpcodeOnly, which asserts a
+// rate-limited log line's exact count the same way), so there was no reason to fall back to a
+// weaker check here.
+TEST_F(RdbMvccTest, ActiveReloadDoesNotWarnOnRecognizedMvccAux) {
+  ASSERT_TRUE(IsActiveReplica());
+  ScopedLogCapture log_capture;
+
+  ASSERT_EQ(Run({"set", "k", "v"}), "OK");
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+
+  for (const auto& log : log_capture.logs) {
+    EXPECT_EQ(log.find("Unrecognized RDB AUX field: 'drakeydb-mvcc'"), std::string::npos)
+        << "the recognized drakeydb-mvcc breadcrumb must not trigger the foreign-aux warning: "
+        << log;
+  }
+}
+
+// drakeydb: P4-2 Task 3 -- proves RdbLoader::HandleAux recognizes KeyDB's "mvcc-tstamp" aux
+// (fActiveReplica's rdbSaveAuxFieldStrStr, KeyDB/src/rdb.cpp:1164-1168 -- KeyDB source, not
+// guessed) and installs it as a stamp with the SAME packed layout
+// LoadInstallsThePersistedStampVerbatim above already proved for our own RDB_OPCODE_DF_MVCC
+// opcode, but with origin_hash coming from SetLoadOriginHash (the link) instead of the file:
+// unlike our own opcode, KeyDB's aux is a bare decimal counter with no author identity of its own
+// (D-7). k2 has no preceding aux at all -- not even an unrelated one -- which is the one-shot
+// semantics the brief calls out: ObjSettings::Reset() (rdb_load.cc, called after every
+// LoadKeyValPair) means k1's aux can never leak onto k2, exactly like has_mc_flags's existing
+// one-shot contract for the DF_MASK opcode.
+TEST_F(RdbMvccTest, LoadsKeyDbMvccTstampAuxWithLinkOriginHash) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "81985529216486895");  // decimal(0x0123456789ABCDEF), KeyDB's %PRIu64
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k1");
+  AppendString(&body, "v1");
+  // No aux at all precedes k2 -- proves one-shot semantics, not merely that the branch parses.
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k2");
+  AppendString(&body, "v2");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetLoadOriginHash(kStamp.origin_hash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k1"}), "v1");
+  EXPECT_EQ(Run({"get", "k2"}), "v2");
+
+  std::optional<MvccStamp> got1, got2;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got1 = db_slice.GetMvcc(0, std::string_view{"k1"});
+    got2 = db_slice.GetMvcc(0, std::string_view{"k2"});
+  });
+  ASSERT_TRUE(got1.has_value());
+  EXPECT_EQ(*got1, kStamp)
+      << "k1's stamp must combine the aux's raw counter with the link's origin hash";
+
+  ASSERT_TRUE(got2.has_value()) << "an active loader must still leave a dense {0,0} slot";
+  EXPECT_TRUE(got2->Empty())
+      << "k2 has no preceding aux -- one-shot semantics must not leak k1's stamp onto it";
+}
+
+// A local KeyDB RDB file carries a logical timestamp but no authenticated author identity. The
+// loader must not turn that into durable {mvcc,0} authority, which would later be re-emitted as a
+// real DF_MVCC record. Live KeyDB replication sets a non-zero link origin and is covered above.
+TEST_F(RdbMvccTest, LocalKeyDbMvccTstampWithoutOriginLoadsUnstamped) {
+  ASSERT_TRUE(IsActiveReplica());
+  ScopedLogCapture log_capture;
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "81985529216486895");
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k1");
+  AppendString(&body, "v1");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);  // no SetLoadOriginHash: local file load
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k1"});
+  });
+  ASSERT_TRUE(got.has_value()) << "an active loader must still leave a dense slot";
+  EXPECT_TRUE(got->Empty())
+      << "a local KeyDB import has no authenticated author and must remain unstamped";
+
+  bool warned = false;
+  for (const auto& log : log_capture.logs) {
+    warned |= log.find("without an authenticated sender origin") != std::string::npos;
+  }
+  EXPECT_TRUE(warned)
+      << "an active local import must explain why its otherwise-valid timestamp was ignored";
+}
+
+// drakeydb: P4-2 Task 3, review round 1 (Important, finding 1) -- KeyDB stamps a key it has no
+// valid mvcc for (e.g. one synced in from a plain-Redis master) with OBJ_MVCC_INVALID,
+// 0xFFFFFFFFFFFFFFFF (KeyDB/src/server.h:958), not a real timestamp. Installed verbatim, that
+// value sets drakeydb's tombstone bit (bit 63, mvcc.h) and yields the maximum possible mvcc -- a
+// phantom tombstone that would win every LWW merge forever. Controller ruling overrode the
+// brief's original verbatim-install snippet for this one case: any parsed value with bit 63 set
+// is unrepresentable as a genuine KeyDB timestamp (their ms << 20 layout does not reach bit 63
+// until roughly the year 280000 AD) and must be treated as unstamped. k_invalid proves the
+// sentinel is rejected (loads {0,0}, not a tombstone); k_valid -- a second key in the SAME
+// stream, given an ordinary high-but-representable stamp -- proves the bit-63 guard does not
+// overreach and reject legitimate stamps in general.
+TEST_F(RdbMvccTest, TreatsKeyDbObjMvccInvalidSentinelAsUnstamped) {
+  ASSERT_TRUE(IsActiveReplica());
+  ScopedLogCapture log_capture;
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "18446744073709551615");  // decimal(0xFFFFFFFFFFFFFFFF) == OBJ_MVCC_INVALID
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k_invalid");
+  AppendString(&body, "v1");
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "81985529216486895");  // decimal(0x0123456789ABCDEF), an ordinary stamp
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k_valid");
+  AppendString(&body, "v2");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetLoadOriginHash(kStamp.origin_hash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k_invalid"}), "v1");
+  EXPECT_EQ(Run({"get", "k_valid"}), "v2");
+
+  std::optional<MvccStamp> got_invalid, got_valid;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got_invalid = db_slice.GetMvcc(0, std::string_view{"k_invalid"});
+    got_valid = db_slice.GetMvcc(0, std::string_view{"k_valid"});
+  });
+  ASSERT_TRUE(got_invalid.has_value());
+  EXPECT_TRUE(got_invalid->Empty())
+      << "KeyDB's OBJ_MVCC_INVALID sentinel (all bits set) must never install as a stamp -- "
+         "verbatim it would set drakeydb's tombstone bit and become a phantom tombstone that "
+         "wins every LWW merge forever";
+
+  ASSERT_TRUE(got_valid.has_value());
+  EXPECT_EQ(*got_valid, kStamp) << "an ordinary valid stamp in the same stream must still install";
+
+  bool warned = false;
+  for (const auto& log : log_capture.logs) {
+    if (log.find("18446744073709551615") != std::string::npos) {
+      warned = true;
+    }
+  }
+  EXPECT_TRUE(warned) << "the OBJ_MVCC_INVALID sentinel must be warned about, naming the value";
+}
+
+// drakeydb: P4-2, final review (Minor) -- a KeyDB "mvcc-tstamp" aux whose value is "0" parses
+// cleanly (SimpleAtoi ok, bit 63 clear), so before the fix it installed {packed=0,
+// origin_hash=load_origin_hash_} with has_mvcc=true. MvccStamp::Empty() requires BOTH fields zero
+// (mvcc.h), so that is a NON-empty stamp minted from an aux that carried no authority whatsoever
+// -- and, being non-empty, rdb_save.cc's `!mvcc.Empty()` gate re-emits it as a real
+// RDB_OPCODE_DF_MVCC record on every subsequent save, laundering "unknown" into "authored by the
+// link we happened to load from". Same never-fabricate-authority principle as the bit-63 sentinel
+// guard above, at the other end of the range. k_zero must land unstamped; k_one -- the smallest
+// possible NON-zero value, in the same stream -- proves the guard tests for zero exactly and does
+// not overreach into small legitimate stamps.
+TEST_F(RdbMvccTest, TreatsZeroKeyDbMvccTstampAuxAsUnstamped) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  constexpr uint64_t kLinkOrigin = 0xFEDCBA9876543210ULL;
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "0");
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k_zero");
+  AppendString(&body, "v1");
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "1");
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k_one");
+  AppendString(&body, "v2");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetLoadOriginHash(kLinkOrigin);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k_zero"}), "v1");
+  EXPECT_EQ(Run({"get", "k_one"}), "v2");
+
+  std::optional<MvccStamp> got_zero, got_one;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got_zero = db_slice.GetMvcc(0, std::string_view{"k_zero"});
+    got_one = db_slice.GetMvcc(0, std::string_view{"k_one"});
+  });
+  ASSERT_TRUE(got_zero.has_value()) << "an active loader must still leave a dense slot";
+  EXPECT_TRUE(got_zero->Empty())
+      << "an mvcc-tstamp aux of \"0\" carries no authority, so it must load UNSTAMPED ({0,0}); "
+         "installing {0, link_origin_hash} mints a non-empty stamp the file never contained and "
+         "re-emits it on every later save";
+
+  ASSERT_TRUE(got_one.has_value());
+  EXPECT_EQ(*got_one, (MvccStamp{1, kLinkOrigin}))
+      << "the zero guard must not overreach: the smallest non-zero value must still install";
+}
+
+// drakeydb: P4-2 Task 3, review round 1 (Important, finding 2) -- the brief's "malformed value
+// must warn and load the key unstamped, never fail the load" requirement had zero coverage.
+// Real log capture (ScopedLogCapture, used identically by
+// ActiveReloadDoesNotWarnOnRecognizedMvccAux above), not a code-inspection stand-in.
+TEST_F(RdbMvccTest, WarnsAndLoadsUnstampedOnMalformedMvccTstampAux) {
+  ASSERT_TRUE(IsActiveReplica());
+  ScopedLogCapture log_capture;
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "not-a-number");
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k1");
+  AppendString(&body, "v1");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message() << " -- a malformed mvcc-tstamp aux must never fail the load";
+
+  EXPECT_EQ(Run({"get", "k1"}), "v1");
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k1"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_TRUE(got->Empty())
+      << "a malformed mvcc-tstamp aux must load the key unstamped ({0,0}), not fail the load";
+
+  bool warned = false;
+  for (const auto& log : log_capture.logs) {
+    if (log.find("Ignoring malformed mvcc-tstamp aux") != std::string::npos &&
+        log.find("not-a-number") != std::string::npos) {
+      warned = true;
+    }
+  }
+  EXPECT_TRUE(warned) << "a malformed mvcc-tstamp aux must be warned about, naming the value";
+}
+
+// drakeydb: P4-2, final review (Critical) -- regression coverage for the stamp-source bug the
+// adversarial pass proved live (adversarial-review.md): SerializerBase::SerializeEntry read each
+// key's stamp through the LIVE DbSlice while the value it serialized came from the pointer array
+// captured at snapshot start. A FLUSHALL mid-save makes those two different DbTable objects, so
+// the pair the RDB recorded was either stamp-less ({0,0}, 74.9% of sampled keys in the live
+// repro) or -- for a key re-created after the flush -- the pre-flush VALUE married to the
+// post-flush write's STAMP: authority no node ever issued for that value, and bit-identical to a
+// peer's genuine newer write, so LWW can never reconcile it.
+//
+// This probe drives the real SerializerBase pipeline (RegisterChangeListener -> ProcessBucket ->
+// SerializeBucketLocked -> SerializeEntry -> MvccOf) and stubs only the output sink, so the
+// {value, stamp} pair the serializer produced is directly observable.
+namespace {
+
+class CapturedTableProbe : public SerializerBase {
+ public:
+  struct Emitted {
+    std::string value;
+    MvccStamp mvcc;
+  };
+
+  CapturedTableProbe(DbSlice* slice, ExecutionState* cntx) : SerializerBase(slice, cntx) {
+  }
+
+  using SerializerBase::MvccOf;
+  using SerializerBase::RegisterChangeListener;
+  using SerializerBase::UnregisterChangeListener;
+
+  // Mirrors SliceSnapshot::IterateBucketsFb (snapshot.cc): the traversal flow walks the CAPTURED
+  // tables, never the live ones, and reports on_update=false.
+  void TraverseCaptured() {
+    for (DbIndex i = 0; i < db_array_.size(); ++i) {
+      if (!db_array_[i])
+        continue;
+      PrimeTable* pt = &db_array_[i]->prime;
+      PrimeTable::Cursor cursor;
+      do {
+        cursor = pt->TraverseBuckets(
+            cursor, [&](PrimeTable::bucket_iterator it) { ProcessBucket(i, it, false); });
+      } while (cursor);
+    }
+  }
+
+  const PrimeTable* captured_prime(DbIndex db_index) const {
+    return db_index < db_array_.size() && db_array_[db_index] ? &db_array_[db_index]->prime
+                                                              : nullptr;
+  }
+
+  absl::flat_hash_map<std::string, Emitted> emitted;
+
+ private:
+  unsigned SerializeBucketLocked(DbIndex db_index, PrimeTable::bucket_iterator it,
+                                 bool on_update) override {
+    unsigned n = 0;
+    for (it.AdvanceIfNotOccupied(); !it.is_done(); ++it, ++n)
+      SerializerBase::SerializeEntry(it.bucket_address(), db_index, it->first, it->second,
+                                     &it.owner());
+    return n;
+  }
+
+  void SerializeEntryLocked(DbIndex db_index, const PrimeKey& pk, const PrimeValue& pv,
+                            time_t expire, uint32_t mc_flags, const MvccStamp& mvcc) override {
+    std::string scratch;
+    emitted[std::string(pk.GetSlice(&scratch))] = Emitted{pv.ToString(), mvcc};
+  }
+};
+
+// Accumulates every chunk a SliceSnapshot pushes, so the raw RDB bytes can be scanned.
+class RecordingSnapshotConsumer : public SliceSnapshot::SnapshotDataConsumerInterface {
+ public:
+  void ConsumeData(std::string data, ExecutionState*) override {
+    bytes.append(data);
+  }
+  void Finalize() override {
+  }
+
+  std::string bytes;
+};
+
+}  // namespace
+
+TEST_F(RdbMvccTest, SerializerReadsStampsFromTheCapturedTableNotTheLiveOne) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  constexpr int kKeys = 8;
+  for (int i = 0; i < kKeys; ++i)
+    ASSERT_EQ(Run({"set", StrCat("k", i), StrCat("v", i)}), "OK");
+
+  // Exact, recognizable pre-flush stamps -- one per key -- so a lost stamp ({0,0}) and a
+  // fabricated one (the post-flush stamp below) are distinguishable from each other.
+  std::vector<MvccStamp> pre(kKeys);
+  for (int i = 0; i < kKeys; ++i)
+    pre[i] = MvccStamp{0x1000ULL + i, 0xAAAA0000ULL + i};
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < kKeys; ++i)
+      db_slice.SetMvcc(0, std::string_view{StrCat("k", i)}, pre[i]);
+  });
+
+  ExecutionState cntx;
+  std::optional<CapturedTableProbe> probe;
+
+  pp_->at(0)->Await([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    probe.emplace(&db_slice, &cntx);
+    // DbSlice::RegisterOnChange DCHECKs the shard's intent lock is held; command dispatch holds
+    // it in production, this test drives the serializer directly.
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    probe->RegisterChangeListener(/*replication=*/false);  // captures db_array_
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+  });
+
+  // The flush lands strictly between "capture" and "traverse": the live array is swapped for
+  // fresh DbTables whose mvcc side table is brand new and EMPTY, while the captured intrusive_ptrs
+  // keep the old tables (values AND stamps) alive.
+  ASSERT_EQ(Run({"flushall"}), "OK");
+
+  // k0 is re-created after the flush and given a stamp of its own -- the value the buggy code
+  // pasted onto k0's PRE-flush value.
+  const MvccStamp kPostFlush{0x9999ULL, 0xBBBB0000ULL};
+  ASSERT_EQ(Run({"set", "k0", "NEWVAL"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k0"},
+                                                                  kPostFlush);
+  });
+
+  MvccStamp captured_branch{}, foreign_branch{}, unregistered{};
+  pp_->at(0)->Await([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+
+    probe->TraverseCaptured();
+    PrimeKey pk{"k0"};
+    const PrimeTable* captured_pt = probe->captured_prime(0);
+    const PrimeTable* live_pt = &db_slice.GetDBTable(0)->prime;
+    ASSERT_NE(captured_pt, live_pt) << "the flush must have replaced the table";
+
+    captured_branch = probe->MvccOf(0, pk, captured_pt);
+    foreign_branch = probe->MvccOf(0, pk, live_pt);
+    // An owner this thread knows nothing about (and RestoreStreamer's cancelled-before-Start
+    // case, where db_array_ is empty -- streamer.cc): unstamped, never a null deref.
+    CapturedTableProbe never_registered(&db_slice, &cntx);
+    unregistered = never_registered.MvccOf(0, pk, nullptr);
+
+    probe->UnregisterChangeListener();
+  });
+
+  auto emitted = probe->emitted;
+  pp_->at(0)->Await([&] { probe.reset(); });
+
+  ASSERT_EQ(emitted.size(), size_t(kKeys))
+      << "the traversal must still see the captured point-in-time content after the flush";
+  for (int i = 0; i < kKeys; ++i) {
+    const std::string key = StrCat("k", i);
+    ASSERT_TRUE(emitted.contains(key)) << key << " was not serialized";
+    EXPECT_EQ(emitted[key].value, StrCat("v", i)) << key
+                                                  << ": value must come from the captured "
+                                                     "table (point-in-time semantics)";
+    EXPECT_EQ(emitted[key].mvcc, pre[i])
+        << key
+        << ": the stamp must come from the SAME table as the value. A zero stamp here is "
+           "the stamp-loss half of the bug (the live table's side table is empty after the "
+           "flush); anything else is fabrication.";
+  }
+  EXPECT_NE(emitted["k0"].mvcc, kPostFlush)
+      << "k0 was serialized with its PRE-flush value but its POST-flush stamp -- a {value, stamp} "
+         "pair no node ever authored, which ties bit-identically against a peer's genuine newer "
+         "value and can never LWW-reconcile";
+
+  EXPECT_EQ(captured_branch, pre[0])
+      << "a bucket owned by the captured table must resolve against the captured table";
+  EXPECT_TRUE(foreign_branch.Empty())
+      << "a post-snapshot live owner must not lend its stamp to captured content";
+  EXPECT_TRUE(unregistered.Empty()) << "an unknown owner must be unstamped, not a deref";
+}
+
+// drakeydb: P4-2, final review (Critical) -- the same invariant through the REAL SliceSnapshot,
+// so snapshot.cc's on_update plumbing (not just SerializerBase's own resolution) is pinned: a
+// mid-save FLUSHALL must not strip the DF_MVCC record off the point-in-time bytes.
+TEST_F(RdbMvccTest, SnapshotKeepsTheMvccOpcodeAcrossAMidSaveFlush) {
+  ASSERT_TRUE(IsActiveReplica());
+  ASSERT_EQ(Run({"set", "k1", "v1"}), "OK");
+
+  const MvccStamp kStamp{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k1"},
+                                                                  kStamp);
+  });
+
+  RecordingSnapshotConsumer consumer;
+  ExecutionState cntx;
+  uint64_t serialized_at_swap = 0;
+  size_t live_size_after_flush = 0;
+
+  pp_->at(0)->Await([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+
+    SliceSnapshot snapshot(CompressionMode::NONE, &db_slice, &consumer, &cntx,
+                           DflyVersion::CURRENT_VER);
+    // kDisallow keeps the output un-chunked and untagged so it can be byte-scanned below.
+    snapshot.Start(/*stream_journal=*/false, SliceSnapshot::SnapshotFlush::kDisallow);
+
+    // Start() captures db_array_ and queues the traversal fiber; fb2 fibers are cooperative, so
+    // nothing runs until this fiber yields. FlushDbIndexes swaps the tables synchronously and
+    // hands back the deallocation fiber, so at this point the swap is done and -- asserted below
+    // -- not one key has been serialized yet. Every key in the output therefore came out of the
+    // captured table AFTER the live one was replaced: the exact window the bug lived in.
+    fb2::Fiber flush_fb = db_slice.FlushDb(0);
+    serialized_at_swap = snapshot.GetStats().keys_serialized;
+    live_size_after_flush = db_slice.DbSize(0);
+    flush_fb.Join();
+
+    snapshot.WaitSnapshotting();
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+  });
+
+  ASSERT_EQ(serialized_at_swap, 0u)
+      << "guard against a vacuous pass: the snapshot must not have serialized anything before the "
+         "flush swapped the tables";
+  ASSERT_EQ(live_size_after_flush, 0u) << "guard against a vacuous pass: the flush must have run";
+
+  std::string key1_encoded;
+  AppendString(&key1_encoded, "k1");
+  ASSERT_NE(consumer.bytes.find(key1_encoded), std::string::npos)
+      << "the captured point-in-time content must still be serialized after the flush";
+
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kStamp.packed);
+  absl::little_endian::Store64(block + 9, kStamp.origin_hash);
+  std::string_view mvcc_block(reinterpret_cast<const char*>(block), sizeof(block));
+  EXPECT_NE(consumer.bytes.find(mvcc_block), std::string::npos)
+      << "k1's stamp was dropped (or altered) because it was looked up in the post-flush LIVE "
+         "table instead of the captured one the value came from";
 }
 
 }  // namespace dfly

@@ -61,14 +61,14 @@ void BucketDependencies::WaitEmpty() const {
 
 void DelayedEntryHandler::EnqueueOffloaded(BucketIdentity bucket, DbIndex db_index, PrimeKey pk,
                                            const PrimeValue& pv, time_t expire_time,
-                                           uint32_t mc_flags) {
+                                           uint32_t mc_flags, const MvccStamp& mvcc) {
   DCHECK(pv.IsExternal());
   DCHECK(!pv.IsCool());
 
   auto key = pk.ToString();
   auto future = ReadTieredValue(db_index, key, pv, EngineShard::tlocal()->tiered_storage());
   auto entry = std::make_unique<TieredDelayedEntry>(db_index, std::move(pk), std::move(future),
-                                                    expire_time, mc_flags);
+                                                    expire_time, mc_flags, mvcc);
 
   deps_.Increment(bucket);
   delayed_entries_.emplace(bucket, std::move(entry));
@@ -129,26 +129,64 @@ SerializerBase::SerializerBase(DbSlice* slice, ExecutionState* cntx)
 SerializerBase::~SerializerBase() {
 }
 
+// drakeydb: P4-2, final review (Critical) -- resolve `pk`'s stamp from the same captured DbTable
+// that owns the value. RegisterChangeListener retains that table precisely so point-in-time
+// content survives FLUSHALL replacing the live table.
+//
+// Getting this wrong is not merely lossy. A stamp read from the wrong table is either absent
+// (-> {0,0} -> rdb_save.cc's `!mvcc.Empty()` gate omits the opcode, silently stripping
+// authority) or, for a key re-created after the flush, FABRICATED: the post-flush write's
+// authority pasted onto the pre-flush value -- a {value, stamp} pair no node ever authored, which
+// ties bit-identically against a peer's genuine newer value so LWW can never reconcile it.
+//
+// Only a bucket owned by this consumer's captured table can reach SerializeEntry. Before a flush,
+// OnChange sees that same table. After a flush (or database activation), any occupied bucket in the
+// replacement table was inserted after snapshot_version_ and ProcessBucket skips it. Likewise,
+// FlushChangeToEarlierCallbacks forwards a bucket only when its version is old enough for the
+// earlier snapshot; such a bucket belongs to the table both consumers captured. Therefore a
+// live/foreign-table fallback is both unnecessary and dangerous: it would make an impossible
+// state fabricate authority instead of failing closed. An unknown or null owner yields
+// MvccStamp{} -- unstamped, never a guess or dereference.
+//
+// Cost is unchanged on a non-active node: DbTable::GetMvcc (table.cc) returns on the null side
+// table before pk.GetSlice(&scratch) can materialize/allocate anything.
+MvccStamp SerializerBase::MvccOf(DbIndex db_index, const PrimeKey& pk,
+                                 const PrimeTable* owner) const {
+  const DbTable* table = nullptr;
+  if (db_index < db_array_.size() && db_array_[db_index] && &db_array_[db_index]->prime == owner) {
+    table = db_array_[db_index].get();
+  }
+  if (table == nullptr)
+    return MvccStamp{};
+  return table->GetMvcc(pk).value_or(MvccStamp{});
+}
+
 void SerializerBase::SerializeEntry(BucketIdentity bucket, DbIndex db_index, const PrimeKey& pk,
-                                    const PrimeValue& pv) {
+                                    const PrimeValue& pv, const PrimeTable* owner) {
   if (pv.IsExternal() && pv.IsCool())
-    return SerializeEntry(bucket, db_index, pk, pv.GetCool().record->value);
+    return SerializeEntry(bucket, db_index, pk, pv.GetCool().record->value, owner);
 
   time_t expire_time = pk.GetExpireTime();
+  // drakeydb: P4-2, final review -- GetMCFlag has the same live-DbSlice shape this line used to
+  // have and therefore the same captured-vs-live mismatch for mcflags across a mid-save FLUSHALL.
+  // That is pre-existing upstream behavior, deliberately left untouched here and reported
+  // upstream separately; do not "fix" it in passing without upstream's sign-off.
   uint32_t mc_flags = pv.HasFlag() ? db_slice_->GetMCFlag(db_index, pk) : 0;
+  // drakeydb: P4-2 Task 1 -- MvccStamp{} (unstamped/absent) on a non-active node.
+  MvccStamp mvcc = MvccOf(db_index, pk, owner);
 
   if (pv.IsExternal()) {
     // TODO: we loose the stickiness attribute by cloning like this PrimeKey.
-    EnqueueOffloaded(bucket, db_index, PrimeKey{pk.ToString()}, pv, expire_time, mc_flags);
+    EnqueueOffloaded(bucket, db_index, PrimeKey{pk.ToString()}, pv, expire_time, mc_flags, mvcc);
   } else {
     std::lock_guard lk{stream_mu_};
-    SerializeEntryLocked(db_index, pk, pv, expire_time, mc_flags);
+    SerializeEntryLocked(db_index, pk, pv, expire_time, mc_flags, mvcc);
   }
 }
 
 void SerializerBase::SerializeFetchedEntry(const TieredDelayedEntry& tde, const PrimeValue& pv) {
   std::lock_guard lk{stream_mu_};
-  SerializeEntryLocked(tde.dbid, tde.key, pv, tde.expire, tde.mc_flags);
+  SerializeEntryLocked(tde.dbid, tde.key, pv, tde.expire, tde.mc_flags, tde.mvcc);
 }
 
 // Ordering invariant:

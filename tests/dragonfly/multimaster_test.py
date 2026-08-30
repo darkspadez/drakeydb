@@ -2183,11 +2183,20 @@ async def test_member_expiry_reaper_covers_namespaces_and_zero_budget(
 # the return value is never asserted on either, so the wrapped call returned on its first attempt
 # regardless of the result. Fixed below using the decorator form already established elsewhere in
 # this file (e.g. test_member_expiry_reaper_covers_namespaces_and_zero_budget, same module).
+#
+# drakeydb: P4-2 Task 5 widened this from a single "k" key under active_args()'s default
+# proactor_threads=2 (-> num_shards=1, per instance.py's proactor_threads-1 default) to
+# proactor_threads=4 (-> num_shards=3) and 12 keys. Every e2e stamp test in this file had run with
+# proactor_threads in {1, 2} until now, so this never actually left shard 0 -- a shard-scoped bug
+# in the apply path could have slipped through undetected. The shard-spread assert below is
+# load-bearing, not decorative: it must fail loudly if this test ever regresses to single-shard
+# again (mirrors the C++ ASSERT_GT(num_shards, 1u) discipline in multi_master_test.cc). See
+# task-5-report.md for the falsification proving it does.
 async def test_replicated_key_stamp_matches_origin(df_factory):
     """The phase's headline criterion. Falsified by removing SetApplyMvcc in replica.cc:
     B then mints its own stamp and the mvcc values differ."""
-    a = df_factory.create(**active_args())
-    b = df_factory.create(**active_args())
+    a = df_factory.create(**active_args(proactor_threads=4))
+    b = df_factory.create(**active_args(proactor_threads=4))
     df_factory.start_all([a, b])
     c_a, c_b = a.client(), b.client()
     # drakeydb: Task 9's original body called this bare (no await). attach() is `async def`
@@ -2198,20 +2207,109 @@ async def test_replicated_key_stamp_matches_origin(df_factory):
     await attach(c_b, a)
     await wait_for_peers(c_b, 1)
 
-    await c_a.execute_command("set", "k", "v")
+    keys = [f"k{i}" for i in range(12)]
+    for key in keys:
+        await c_a.execute_command("set", key, f"v-{key}")
 
     @assert_eventually(timeout=30)
-    async def key_replicated():
-        assert await _exists(c_b, "k")
+    async def keys_replicated():
+        for key in keys:
+            assert await _exists(c_b, key)
 
-    await key_replicated()
+    await keys_replicated()
 
-    stamp_a = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
-    stamp_b = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
-    assert stamp_a["mvcc"] == stamp_b["mvcc"], f"{stamp_a} != {stamp_b}"
-    assert stamp_a["origin"] == stamp_b["origin"], "both must name A as the author"
+    shards_seen = set()
+    for key in keys:
+        stamp_a = _parse_mvcc(await c_a.execute_command("debug", "mvcc", key))
+        stamp_b = _parse_mvcc(await c_b.execute_command("debug", "mvcc", key))
+        assert stamp_a["mvcc"] == stamp_b["mvcc"], f"{key}: {stamp_a} != {stamp_b}"
+        assert stamp_a["origin"] == stamp_b["origin"], f"{key}: both must name A as the author"
+        shards_seen.add(stamp_a["shard"])
+
+    # num_shards is 3 here (proactor_threads=4 - 1). Guard at >= 2 rather than == 3 so the assert
+    # stays robust to a shard-count change without needing to re-derive the exact key/shard
+    # mapping, while still failing loudly the moment this test collapses back to a single shard.
+    assert len(shards_seen) >= 2, (
+        f"all {len(keys)} keys landed on {len(shards_seen)} shard(s) ({shards_seen}) -- this "
+        "test must exercise more than one shard or it silently regresses to the P4-1 gap"
+    )
 
 
 def _parse_mvcc(reply) -> dict:
     text = reply.decode() if isinstance(reply, bytes) else reply
     return dict(part.split(":", 1) for part in text.split())
+
+
+# drakeydb: P4-2 Task 5. test_replicated_key_stamp_matches_origin above writes AFTER attach, so it
+# only ever exercises the incremental journal-command stream (replica.cc's per-command
+# SetApplyMvcc). This test writes BEFORE B attaches, so B's initial sync is a genuine full sync of
+# non-empty data -- the RDB/DF snapshot wire path (rdb_save.cc's SaveEntry, RDB_OPCODE_DF_MVCC) on
+# the send side and RdbLoader::CreateObjectOnShard (rdb_load.cc) on the receive side -- which is
+# also the exact code path a SAVE-to-file and later reload uses. Both legs below therefore share
+# one apply line (CreateObjectOnShard's `db_slice->SetMvcc(..., item->has_mvcc ? item->mvcc :
+# MvccStamp{})`, rdb_load.cc), so one revert falsifies both -- see task-5-report.md for the
+# verbatim failure this produces (coordinated with Task 2's own falsification of the same line).
+async def test_stamps_survive_full_sync_and_restart(df_factory, tmp_path):
+    a_args = active_args(proactor_threads=4, dir=str(tmp_path / "a"), dbfilename="dump")
+    a = df_factory.create(**a_args)
+    a.start()
+    c_a = a.client()
+
+    keys = [f"k{i}" for i in range(12)]
+    for key in keys:
+        await c_a.execute_command("set", key, f"v-{key}")
+
+    # Captured once, before B ever attaches and before the SAVE/restart below -- A is never
+    # written to again, so this is simultaneously "what the full sync must reproduce on B" and
+    # "what the restarted A must reproduce from disk".
+    stamps_before = {
+        key: _parse_mvcc(await c_a.execute_command("debug", "mvcc", key)) for key in keys
+    }
+
+    b = df_factory.create(**active_args(proactor_threads=4))
+    b.start()
+    c_b = b.client()
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+
+    @assert_eventually(timeout=30)
+    async def keys_replicated():
+        for key in keys:
+            assert await _exists(c_b, key)
+
+    await keys_replicated()
+
+    shards_seen = set()
+    for key in keys:
+        stamp_b = _parse_mvcc(await c_b.execute_command("debug", "mvcc", key))
+        assert (
+            stamp_b["mvcc"] == stamps_before[key]["mvcc"]
+        ), f"{key}: full sync did not preserve the stamp: {stamp_b} != {stamps_before[key]}"
+        assert (
+            stamp_b["origin"] == stamps_before[key]["origin"]
+        ), f"{key}: full sync changed the origin: {stamp_b} != {stamps_before[key]}"
+        shards_seen.add(stamp_b["shard"])
+    assert len(shards_seen) >= 2, f"full-sync leg only touched shard(s) {shards_seen}"
+
+    # Persistence leg: SAVE, restart A in place (same dir/dbfilename -> same on-disk snapshot is
+    # auto-loaded), and every stamp must equal its pre-restart value -- loaded verbatim from the
+    # RDB_OPCODE_DF_MVCC bytes (Task 1+2), never re-minted by the loader.
+    assert await c_a.execute_command("SAVE")
+    a.stop()
+    a.start()
+    c_a2 = a.client()
+    # _wait_for_server (inside a.start()) only waits for the listen socket -- the RDB load runs
+    # in a background fiber, and DEBUG is served during LOADING, so an immediate DEBUG MVCC can
+    # race a not-yet-loaded key and see "state:absent" instead. wait_available_async (imported at
+    # the top of this file, used the same way after every other REPLICAOF/restart in it) blocks
+    # on PING until loading finishes; the INFO-based second phase is a no-op here since a fresh
+    # restart is role:master, not a replica.
+    await wait_available_async(c_a2)
+    for key in keys:
+        stamp_after = _parse_mvcc(await c_a2.execute_command("debug", "mvcc", key))
+        assert (
+            stamp_after["mvcc"] == stamps_before[key]["mvcc"]
+        ), f"{key}: restart did not preserve the stamp: {stamp_after} != {stamps_before[key]}"
+        assert (
+            stamp_after["origin"] == stamps_before[key]["origin"]
+        ), f"{key}: restart changed the origin: {stamp_after} != {stamps_before[key]}"

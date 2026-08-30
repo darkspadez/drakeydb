@@ -39,6 +39,7 @@ extern "C" {
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/main_service.h"
+#include "server/multi_master.h"  // drakeydb: P4-2 Task 1, for IsActiveReplica() (SaveAux breadcrumb)
 #include "server/namespaces.h"
 #include "server/rdb_extensions.h"
 #include "server/search/doc_index.h"
@@ -267,7 +268,8 @@ error_code RdbSerializer::SelectDb(uint32_t dbid) {
 
 // Called by snapshot
 io::Result<uint8_t> RdbSerializer::SaveEntry(const PrimeKey& pk, const PrimeValue& pv,
-                                             uint64_t expire_ms, uint32_t mc_flags, DbIndex dbid) {
+                                             uint64_t expire_ms, uint32_t mc_flags, DbIndex dbid,
+                                             const MvccStamp& mvcc) {
   if (!pv.TagAllowsEmptyValue() && pv.Size() == 0) {
     // A read that lazily expires a container's last field deletes the key while a
     // snapshot is active, so an empty value can reach here transiently; skipping is
@@ -308,6 +310,19 @@ io::Result<uint8_t> RdbSerializer::SaveEntry(const PrimeKey& pk, const PrimeValu
       buf_size += 4;
     }
     if (auto ec = WriteRaw(Bytes{buf, buf_size}); ec)
+      return make_unexpected(ec);
+  }
+
+  // drakeydb: P4-2 Task 1 -- {mvcc, origin_hash}, 16 raw LE bytes, immediately before the type
+  // byte, exactly like the DF_MASK block above. Never emitted for a zero (unstamped/absent)
+  // stamp: the invariant is that a key's stamp advances iff the resulting value state is
+  // propagated carrying that stamp, and an unstamped key has no authority to propagate. This is
+  // the write side only -- see rdb_extensions.h for the read side's unconditional contract.
+  if (!mvcc.Empty()) {
+    uint8_t buf[17] = {RDB_OPCODE_DF_MVCC};
+    absl::little_endian::Store64(buf + 1, mvcc.packed);
+    absl::little_endian::Store64(buf + 9, mvcc.origin_hash);
+    if (auto ec = WriteRaw(Bytes{buf, 17}); ec)
       return make_unexpected(ec);
   }
 
@@ -1771,6 +1786,14 @@ error_code RdbSaver::SaveAux(const GlobalData& glob_state) {
   VLOG(1) << "Used memory during save: " << used_mem;
   RETURN_ON_ERR(SaveAuxFieldStrInt("used-mem", used_mem));
   RETURN_ON_ERR(SaveAuxFieldStrInt("aof-preamble", 0));
+
+  // drakeydb: P4-2 Task 1 -- the single most important compatibility rule in the phase (spec
+  // D-7): the write side is active-only. This breadcrumb lets a stock (non-drakeydb) Dragonfly
+  // log a clear "Unrecognized RDB AUX field: 'drakeydb-mvcc'" and continue, instead of silently
+  // mis-parsing, before it hits the actually-fatal RDB_OPCODE_DF_MVCC byte a few records later.
+  if (IsActiveReplica()) {
+    RETURN_ON_ERR(impl_->SaveAuxFieldStrStr("drakeydb-mvcc", "1"));
+  }
 
   // Save lua scripts only in rdb or summary file
   DCHECK(save_mode_ != SaveMode::SINGLE_SHARD || glob_state.lua_scripts.empty());

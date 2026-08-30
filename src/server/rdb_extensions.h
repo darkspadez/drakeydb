@@ -50,6 +50,12 @@ constexpr uint8_t RDB_OPCODE_DF_MASK = 220; /* Mask for key properties */
 constexpr uint32_t DF_MASK_FLAG_STICKY = (1 << 0);
 constexpr uint32_t DF_MASK_FLAG_MC_FLAGS = (1 << 1);
 
+// drakeydb: P4-2 Task 1 -- {mvcc, origin_hash}, 16 raw LE bytes. Emitted per stamped key
+// (active-replica save side only), immediately before the key's type byte, exactly like
+// RDB_OPCODE_DF_MASK above. The read side is unconditional (any node can load it); the write side
+// is active-only (spec D-7). A zero stamp is never emitted -- it means unstamped/absent.
+constexpr uint8_t RDB_OPCODE_DF_MVCC = 221; /* {mvcc, origin_hash}, 16 raw LE bytes */
+
 // Opcode to store HNSW vector index node data for global indices.
 // Format: [index_name, enterpoint_node, elements_number,
 //          then for each node in ascending internal_id 0..elements_number-1:

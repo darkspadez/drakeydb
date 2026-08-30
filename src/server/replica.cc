@@ -767,6 +767,15 @@ error_code Replica::InitiatePSync() {
     RdbLoadContext load_context;
     RdbLoader loader(NULL, &load_context);
     loader.SetLoadUnownedSlots(true);
+    // drakeydb: P4-2 Task 3 -- this legacy Redis/KeyDB-protocol loader (see the peer-mode comment
+    // just below) is the only path a KeyDB active-replica master's RDB stream reaches: KeyDB
+    // speaks classic PSYNC, never the DFLY multi-shard protocol, so DflyShardReplica's own
+    // RdbLoader (InitiateDflySync, below in this file) can never see a "mvcc-tstamp" aux and does
+    // not need this call. Safe to set unconditionally, not just under IsPeerMode() below: like
+    // peer_origin_idx_, peer_origin_hash_ stays at its default (0, "unknown origin") for a
+    // non-peer Replica (Greet()'s peer-only branches never run for one -- replica.h), so this is
+    // a no-op there, matching mvcc-tstamp's own KeyDB-active-replica-only provenance.
+    loader.SetLoadOriginHash(peer_origin_hash_);
     if (IsPeerMode()) {
       loader.SetOverrideExistingKeys(true);  // drakeydb: merge
       // drakeydb: Phase 3 fix wave -- this legacy Redis/KeyDB-protocol loader is peer-aware

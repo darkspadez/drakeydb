@@ -89,12 +89,15 @@ struct TieredDelayedEntry {
   util::fb2::Future<io::Result<PrimeValue>> value;
   time_t expire;
   uint32_t mc_flags;
+  // drakeydb: P4-2 Task 1 -- the stamp fetched at enqueue time (SerializeEntry), carried through
+  // to SerializeFetchedEntry once the tiered read resolves, mirroring mc_flags above.
+  MvccStamp mvcc;
 };
 
 // Tracks serialization progress of offloaded (delayed) entries.
 struct DelayedEntryHandler {
   void EnqueueOffloaded(BucketIdentity bucket, DbIndex db_index, PrimeKey pk, const PrimeValue& pv,
-                        time_t expire_time, uint32_t mc_flags);
+                        time_t expire_time, uint32_t mc_flags, const MvccStamp& mvcc);
 
   // Must be called periodically to progress on delayed entries. Calls SerializeFetchedEntry.
   // If force is false, only serializes entries whose futures are already resolved.
@@ -192,13 +195,20 @@ class SerializerBase : public BucketDependencies,
   virtual unsigned SerializeBucketLocked(DbIndex db_index, PrimeTable::bucket_iterator it,
                                          bool on_update) = 0;
 
-  // Serialize single entry with expire/flags
+  // Serialize single entry with expire/flags/mvcc stamp (MvccStamp{} if unstamped/absent).
   virtual void SerializeEntryLocked(DbIndex db_index, const PrimeKey& pk, const PrimeValue& pv,
-                                    time_t expire, uint32_t mc_flags) = 0;
+                                    time_t expire, uint32_t mc_flags, const MvccStamp& mvcc) = 0;
 
   // Serialize entry while automatically handling delayed/cooled values, calls SerializeEntryLocked
+  // drakeydb: P4-2, final review (Critical) -- `owner` must be `&it.owner()` of the very bucket
+  // iterator `pk`/`pv` were read from: it is what the entry's mvcc stamp is resolved against.
+  // MvccOf accepts only this consumer's captured owner; a live or foreign owner is newer than the
+  // point-in-time snapshot and must never lend its stamp to captured content.
   void SerializeEntry(BucketIdentity bucket, DbIndex db_index, const PrimeKey& pk,
-                      const PrimeValue& pv);
+                      const PrimeValue& pv, const PrimeTable* owner);
+
+  // Stamp for `pk` when `owner` is this consumer's captured DbTable; MvccStamp{} otherwise.
+  MvccStamp MvccOf(DbIndex db_index, const PrimeKey& pk, const PrimeTable* owner) const;
 
   // Calls SerializeEntry internally under stream_mu_
   void SerializeFetchedEntry(const TieredDelayedEntry& tde, const PrimeValue& pv) override;

@@ -163,7 +163,7 @@ class RestoreStreamer : public JournalStreamer, public SerializerBase {
                                  bool on_update) override;
 
   void SerializeEntryLocked(DbIndex db_index, const PrimeKey& pk, const PrimeValue& pv,
-                            time_t expire, uint32_t mc_flags) override;
+                            time_t expire, uint32_t mc_flags, const MvccStamp& mvcc) override;
 
   bool ShouldWrite(const journal::JournalChangeItem& item) const override;
   bool ShouldWrite(std::string_view key) const;

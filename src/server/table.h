@@ -8,6 +8,7 @@
 
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
+#include <optional>
 
 #include "core/intent_lock.h"
 #include "server/detail/table.h"
@@ -73,6 +74,21 @@ struct DbTableStats {
   size_t mvcc_entries = 0;
   // stays 0 until P4-5; declared now so Task 10's invariant compiles.
   size_t mvcc_tombstones = 0;
+
+  // drakeydb: P4-2 Task 4 -- heap bytes held by the mvcc side table's own duplicated copy of
+  // every key over CompactObj::kInlineLen (16 B). DashTable::mem_usage() (dash.h) only counts
+  // the table's bucket/segment structure, never the hosted keys' own allocations -- see
+  // DbTable::mvcc_table_memory() below, which adds this in. Maintained via the stored key's
+  // MallocUsed() at exactly the three mutation points that already maintain mvcc_entries
+  // (DbSlice::SetMvcc/EnsureMvcc/EraseMvcc, db_slice.cc): += on insert, -= on erase, untouched on
+  // SetMvcc's overwrite path (same key object, no reallocation). Scoped to mvcc only: prime's own
+  // key cost is already covered by AccountObjectMemory's OBJ_KEY tracking (PerformDeletionAtomic,
+  // db_slice.cc), which is a different accounting path (memory_usage_by_type, not a bytes field
+  // exposed on DbTableStats directly). mcflag (DashTable<PrimeKey, uint32_t, ...>) has the same
+  // per-key duplication blind spot mvcc had, but no metric field surfaces its table_memory()
+  // today, so there is nothing for a parallel accumulator there to feed -- out of this task's
+  // scope, not a claim that mcflag is exempt from the underlying cost.
+  size_t mvcc_key_dup_bytes = 0;
 
   // Object memory usage besides hash-table capacity.
   // Applies for any non-inline objects.
@@ -149,9 +165,26 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
   using MvccTable = DashTable<PrimeKey, MvccStamp, detail::ExpireTablePolicy>;
   std::unique_ptr<MvccTable> mvcc;
 
+  // drakeydb: P4-2 Task 4 -- mvcc->mem_usage() alone (dash.h) only counts the side table's own
+  // bucket/segment structure; stats.mvcc_key_dup_bytes adds back the heap bytes SetMvcc/EnsureMvcc
+  // spend on a second, independent copy of every key over CompactObj::kInlineLen (see that field's
+  // comment, above). `stats` is declared later in this struct, but member functions defined
+  // in-body see the complete class regardless of declaration order.
   size_t mvcc_table_memory() const {
-    return mvcc ? mvcc->mem_usage() : 0;
+    return mvcc ? mvcc->mem_usage() + stats.mvcc_key_dup_bytes : 0;
   }
+
+  // drakeydb: P4-2, final review (Critical) -- the single stamp-lookup primitive, on the table
+  // that owns both the value and its stamp. It lives here, not on DbSlice, because the snapshot
+  // serializer must resolve a stamp against the SAME DbTable the value came from: SerializerBase
+  // captures db_slice_->databases() at Start (serializer_base.cc) so values survive a mid-save
+  // FLUSHALL, and a DbSlice-indexed lookup would silently read the post-flush replacement table
+  // instead. Returns nullopt for "no stamp" -- both "not an active node" (null side table) and
+  // "this key has none". The null check runs BEFORE key.GetSlice(&scratch): GetSlice can allocate
+  // for an encoded/SMALL_TAG/INT_TAG key over CompactObj::kInlineLen, and a non-active node must
+  // not pay it on every serialized key just to learn the table does not exist (F5; see
+  // DbSlice::GetMvcc in db_slice.h/.cc, which delegates here).
+  std::optional<MvccStamp> GetMvcc(const PrimeKey& key) const;
 
   // Contains transaction locks
   LockTable trans_locks;

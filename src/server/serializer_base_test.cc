@@ -115,7 +115,7 @@ struct TestDriver : public SerializerBase, journal::JournalConsumerInterface {
                                  bool on_update) override;
 
   void SerializeEntryLocked(DbIndex db_index, const PrimeKey& pk, const PrimeValue& pv,
-                            time_t expire, uint32_t mc_flags) override {
+                            time_t expire, uint32_t mc_flags, const MvccStamp& mvcc) override {
     RecordSerialized(pk.ToString());
   }
 
@@ -137,8 +137,8 @@ struct TestDriver : public SerializerBase, journal::JournalConsumerInterface {
     if (obj_type == OBJ_STRING && absl::Bernoulli(bg_, params_.delay_prob)) {
       DelayedEntryHandler::deps_.Increment(bucket);
       unsigned delay = absl::Uniform(bg_, params_.delay_lat_us.first, params_.delay_lat_us.second);
-      auto de = std::make_unique<TieredDelayedEntry>(0, CompactKey{key},
-                                                     delay_driver_.Enqeue(delay), 0, 0);
+      auto de = std::make_unique<TieredDelayedEntry>(
+          0, CompactKey{key}, delay_driver_.Enqeue(delay), 0, 0, MvccStamp{});
       DelayedEntryHandler::delayed_entries_.emplace(bucket, std::move(de));
       ++delayed_enqueued_;
     } else {

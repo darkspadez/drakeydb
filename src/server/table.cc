@@ -46,13 +46,16 @@ void DbTableStats::AddTypeMemoryUsage(unsigned type, int64_t delta) {
 
 DbTableStats& DbTableStats::operator+=(const DbTableStats& o) {
   constexpr size_t kDbSz = sizeof(DbTableStats) - sizeof(memory_usage_by_type);
-  static_assert(kDbSz == 96);  // drakeydb: P4-1 Task 5 -- +16 for mvcc_entries/mvcc_tombstones.
+  // drakeydb: P4-1 Task 5 -- +16 for mvcc_entries/mvcc_tombstones. P4-2 Task 4 -- +8 for
+  // mvcc_key_dup_bytes (96 -> 104).
+  static_assert(kDbSz == 104);
 
   ADD(inline_keys);
   ADD(expire_count);
   ADD(member_expire_count);
   ADD(mvcc_entries);
   ADD(mvcc_tombstones);
+  ADD(mvcc_key_dup_bytes);
   ADD(obj_memory_usage);
   ADD(tiered_entries);
   ADD(tiered_used_bytes);
@@ -138,6 +141,18 @@ void DbTable::Clear() {
   expire_cursor = PrimeTable::Cursor::end();
   segment_defrag_cursor = PrimeTable::Cursor::end();
   mvcc_defrag_cursor = MvccTable::Cursor::end();
+}
+
+// drakeydb: P4-2, final review (Critical) -- see the declaration in table.h for why this lives on
+// DbTable. The `if (!mvcc)` test must stay above the GetSlice call.
+optional<MvccStamp> DbTable::GetMvcc(const PrimeKey& key) const {
+  if (!mvcc)
+    return nullopt;
+  string scratch;
+  auto it = mvcc->Find(key.GetSlice(&scratch));
+  if (it.is_done())
+    return nullopt;
+  return it->second;
 }
 
 PrimeIterator DbTable::Launder(PrimeIterator it, string_view key) {

@@ -65,7 +65,7 @@ bool WriteStringToFileForTest(const std::string& path, std::string_view content)
 }  // namespace
 
 TEST(NodeIdentity, VersionConstant) {
-  EXPECT_EQ(65u, kDrakeydbReplVersion);
+  EXPECT_EQ(66u, kDrakeydbReplVersion);
 }
 
 TEST(NodeUuid, GenerateIsValidV4) {
@@ -574,6 +574,14 @@ TEST_F(ActiveReplicaFamilyTest, ReplconfRefusedWhileActive) {
   EXPECT_THAT(resp, ErrArg("active-replica"));
 }
 
+// P4-2 adds RDB opcode 221. A pre-P4-2 consumer advertises version 65 and cannot parse that
+// opcode, so it must be rejected at admission rather than failing partway through full sync.
+TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesPreMvccSnapshotConsumer) {
+  EXPECT_EQ("OK", Run({"replconf", "drakey-version", "65"}));
+  auto resp = Run({"replconf", "capa", "dragonfly"});
+  EXPECT_THAT(resp, ErrArg("active-replica"));
+}
+
 TEST_F(ActiveReplicaFamilyTest, ReplTakeoverRefusedWhileActive) {
   EXPECT_THAT(Run({"repltakeover", "1"}), ErrArg("active-replica"));
 }
@@ -1027,6 +1035,129 @@ TEST_F(MvccStoreTest, TableMemoryGrowsWithWritesAndDropsOnFlush) {
       << "flush must drop the grown side table back to a freshly-allocated table's baseline";
 }
 
+// drakeydb: P4-2 Task 4 -- TDD RED for the mvcc_table_bytes key-duplication blind spot (P4-1
+// Task 12's memory benchmark finding; see server_family.cc's mvcc_table_bytes comment). DbTable::
+// mvcc heap-allocates its own copy of every key over CompactObj::kInlineLen (16 B, SetMvcc,
+// db_slice.cc), but mvcc_table_bytes used to equal DashTable::mem_usage() alone, which never sees
+// that second copy -- a table of 32-char keys and a table of 8-char keys reported identical
+// mvcc_table_bytes. This proves that gap is closed. Falsification (task-4-report.md): reverting
+// the mvcc_key_dup_bytes accounting in db_slice.cc's SetMvcc/EnsureMvcc/EraseMvcc collapses
+// delta_long to 0, same as delta_short, and the EXPECT_GT below fails.
+TEST_F(MvccStoreTest, TableBytesAccountsForDuplicatedKeyHeapBytes) {
+  Run({"set", "k", "v"});
+  auto& shard_set_ref = *shard_set;
+  const ShardId sid = Shard("k", shard_set_ref.size());
+
+  // Stays well under the initial segment's ~840-slot capacity (see
+  // TableMemoryGrowsWithWritesAndDropsOnFlush above) for both phases combined, so
+  // DashTable::mem_usage() itself never grows across either phase -- any mvcc_table_bytes delta
+  // below is then attributable solely to duplicated key heap bytes, not table structure.
+  constexpr int kN = 300;
+
+  // Builds an exact-length, unique-per-i, non-numeric (leading letter, so CompactObj::SetString's
+  // string2ll fast path never fires) key.
+  auto make_key = [](char prefix, size_t len, int i) {
+    std::string suffix = std::to_string(i);
+    std::string key(len, '0');
+    key[0] = prefix;
+    key.replace(key.size() - suffix.size(), suffix.size(), suffix);
+    return key;
+  };
+
+  auto bytes_now = [&] { return GetMetrics().db_stats[0].mvcc_table_bytes; };
+
+  size_t before_short = bytes_now();
+  shard_set_ref.Await(sid, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < kN; ++i) {
+      PrimeKey pk{make_key('s', 8, i)};
+      db_slice.SetMvcc(0, pk, MvccStamp{uint64_t(i) + 1, 1});
+    }
+  });
+  size_t delta_short = bytes_now() - before_short;
+
+  size_t before_long = bytes_now();
+  shard_set_ref.Await(sid, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < kN; ++i) {
+      PrimeKey pk{make_key('l', 32, i)};
+      db_slice.SetMvcc(0, pk, MvccStamp{uint64_t(i) + 1, 1});
+    }
+  });
+  size_t delta_long = bytes_now() - before_long;
+
+  // 8-char keys never leave CompactObj's 16-byte inline union (kInlineLen == 16): MallocUsed()
+  // == 0 for every one (CompactObj::HasAllocated() is false for any inline taglen_), so
+  // delta_short must be exactly 0 regardless of the fix.
+  EXPECT_EQ(delta_short, 0u) << "8-char keys are inline and must not contribute heap bytes";
+
+  // Every 32-char key is forced through CompactObj::EncodeString (str.size() > 20 skips the
+  // int/inline fast paths entirely in SetString, compact_object.cc) and lands on SMALL_TAG or
+  // LARGE_STR_TAG, both heap-allocated. EncodeString's own DCHECK_GT(encoded.size(), kInlineLen)
+  // guarantees encoded.size() >= 17, so SmallString's remainder (size - kPrefLen(10),
+  // small_string.h) is >= 7 heap bytes per key even in the best case, before
+  // mi_malloc_usable_size's allocator rounding (which can only round up). Floor at kN * 7
+  // accordingly: mathematically safe, not just empirically likely.
+  EXPECT_GT(delta_long, static_cast<size_t>(kN) * 7)
+      << "delta_short=" << delta_short << " delta_long=" << delta_long
+      << " -- mvcc_table_bytes must grow for the 32-char table's duplicated key heap bytes, "
+         "which DashTable::mem_usage() alone (the pre-fix formula) cannot see";
+}
+
+// drakeydb: P4-2 Task 4, review fix round 1 -- closes a gap flagged in review: no existing test
+// exercised EraseMvcc's `db.stats.mvcc_key_dup_bytes -= it->first.MallocUsed();` line (db_slice.cc)
+// with a non-zero value. Every DEL in the pre-existing C++ suite deletes inline (<= 16 char) keys,
+// whose MallocUsed() is always 0, so a regression that silently breaks the erase-side accounting --
+// e.g. moving that `-=` to *after* db.mvcc->Erase(it), the exact hazard the comment right above it
+// warns about, since Erase() destroys the key and MallocUsed() reads 0 afterwards -- would pass
+// every existing test while permanently over-reporting mvcc_table_bytes on every delete of a
+// duplicated-key entry. Drives real SET + DEL through the normal command path (not a direct
+// EraseMvcc call) so this exercises the actual production route: PerformDeletionAtomic -> Disarm ->
+// EraseMvcc(string_view) (db_slice.cc), the same site review flagged.
+// Falsification (task-4-report.md, fix round 1): moving the `-=` after Erase() makes the final
+// EXPECT_EQ below fail with mvcc_table_bytes stuck above baseline by the total un-subtracted
+// duplicated-key bytes.
+TEST_F(MvccStoreTest, EraseAccountsForDuplicatedKeyHeapBytesOnRealDelete) {
+  Run({"set", "k", "v"});
+  size_t baseline = GetMetrics().db_stats[0].mvcc_table_bytes;
+
+  // 32-char keys: str.size() > 20 skips CompactObj::SetString's int/inline fast paths entirely
+  // (compact_object.cc), so every one of these is unconditionally heap-allocated -- same
+  // reasoning as TableBytesAccountsForDuplicatedKeyHeapBytes above. kN stays well under the
+  // initial segment's ~840-slot capacity (TableMemoryGrowsWithWritesAndDropsOnFlush above) so
+  // DashTable::mem_usage() itself never grows across insert or delete -- isolating both deltas
+  // below to mvcc_key_dup_bytes alone.
+  constexpr int kN = 100;
+  std::vector<std::string> keys;
+  keys.reserve(kN);
+  for (int i = 0; i < kN; ++i) {
+    std::string suffix = std::to_string(i);
+    std::string key(32, '0');
+    key[0] = 'e';
+    key.replace(key.size() - suffix.size(), suffix.size(), suffix);
+    keys.push_back(std::move(key));
+  }
+
+  for (const auto& key : keys) {
+    Run({"set", key, "v"});
+  }
+  size_t after_insert = GetMetrics().db_stats[0].mvcc_table_bytes;
+  ASSERT_GT(after_insert, baseline + static_cast<size_t>(kN) * 7)
+      << "expected the 32-char keys to carry duplicated heap bytes before delete -- see "
+         "TableBytesAccountsForDuplicatedKeyHeapBytes above for the >= 7 B/key derivation";
+
+  for (const auto& key : keys) {
+    Run({"del", key});
+  }
+  size_t after_delete = GetMetrics().db_stats[0].mvcc_table_bytes;
+
+  EXPECT_EQ(after_delete, baseline)
+      << "after_insert=" << after_insert << " after_delete=" << after_delete
+      << " baseline=" << baseline
+      << " -- mvcc_table_bytes must drop back to the pre-insert baseline once every "
+         "duplicated-key entry is deleted through the real DEL path";
+}
+
 // drakeydb: P4-1 Task 7 -- the landmine test. LPUSH is auto-journaled AND mutates in place, so it
 // never calls AddOrUpdate. It is the command that fails if EndOfWriteEpoch is placed at
 // transaction.cc's OnCbFinishBlocking call instead of after LogAutoJournalOnShard -- see the
@@ -1181,10 +1312,20 @@ TEST_F(MvccStoreTest, PureWriteWorkloadLeavesNoUnstampedWrites) {
 // RDB loading runs in a separate fiber on the shard thread. It must finalize the loaded value's
 // normal bookkeeping without either arming that value or clearing a transaction arm that was
 // already pending on the same thread. This pins the mechanism directly: the pending write keeps
-// its arm and receives the later commit, while the loaded value retains its explicit {0,0}
-// snapshot fallback.
+// its arm and receives the later commit, while the loaded value retains its explicit persisted
+// stamp.
+//
+// drakeydb: P4-2 Task 2 -- extended from P4-1 Task 10's original version, which only exercised
+// the {0,0} snapshot fallback (the only outcome the loader could produce back then). The loaded
+// key here now carries a non-zero stamp, simulating CreateObjectOnShard's new
+// item->has_mvcc ? item->mvcc : MvccStamp{} apply (rdb_load.cc) for a key whose RDB stream
+// carried a RDB_OPCODE_DF_MVCC record. The property under test is unchanged -- loader
+// finalization must not touch another transaction's pending arm, and must not let that other
+// transaction's Commit() touch the loaded key -- only the concrete value the loaded key ends up
+// with changes, from {0,0} to the persisted stamp.
 TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) {
   constexpr uint64_t kPendingMvcc = 0x1234'5678;
+  const MvccStamp kPersistedStamp{0xAAAABBBBCCCC1111ULL, 0xDEADBEEFULL};
   std::optional<MvccStamp> prepared_stamp;
   std::optional<MvccStamp> pending_stamp;
   std::optional<MvccStamp> loaded_stamp;
@@ -1209,7 +1350,7 @@ TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) 
     loaded_value.SetString("loaded-value");
     auto loaded = db_slice.AddOrUpdate(db_cntx, "loaded-key", std::move(loaded_value), 0);
     ASSERT_TRUE(loaded);
-    db_slice.SetMvcc(0, std::string_view{"loaded-key"}, MvccStamp{});
+    db_slice.SetMvcc(0, std::string_view{"loaded-key"}, kPersistedStamp);
     loaded->post_updater.RunWithoutMvccArm();
 
     MvccStamper::tlocal()->Commit(kPendingMvcc, 0,
@@ -1224,8 +1365,9 @@ TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) 
   EXPECT_EQ(pending_stamp->Mvcc(), kPendingMvcc)
       << "loader finalization must not clear another transaction's pending arm";
   ASSERT_TRUE(loaded_stamp.has_value());
-  EXPECT_TRUE(loaded_stamp->Empty())
-      << "a loaded key must not be swept into an unrelated COMMAND commit";
+  EXPECT_EQ(*loaded_stamp, kPersistedStamp)
+      << "a loaded key must not be swept into an unrelated COMMAND commit, and must keep exactly "
+         "its persisted stamp -- not {0,0}, and not the concurrent transaction's stamp";
 }
 
 // drakeydb: review fix round 1 (F1) -- a write through a non-default namespace must leave no
@@ -1907,12 +2049,15 @@ TEST_F(MvccStoreTest, DefragActuallyRelocatesMvccSegments) {
 // destruction, or explicitly beside a tiered-storage stash -- db_slice.cc), so a loaded key does
 // get armed; fix round 1 (F2) covers the separate bug that arm exposed (nothing in the load path
 // ever committed or discarded it, so a later, unrelated write's Commit() could clobber this
-// test's {0,0} stamp with local authority no peer ever saw -- see
+// test's stamp -- {0,0} at the time this was written, now (P4-2 Task 2) whatever was actually
+// persisted -- with local authority no peer ever saw -- see
 // ReloadDoesNotLeaveArmsForALaterWriteToClobber, below). This test only proves the simpler,
 // first-order property Step 3b was for: the reload path leaves every key stamped at all, dense
-// with prime, immediately after the reload -- without an explicit {0,0} stamp beside the
-// SetMCFlag mirror, a loaded key would be dense in prime but absent from mvcc, tripping
-// OnCbFinishBlocking's DCHECK (db_slice.cc) on the next command that reaches it.
+// with prime, immediately after the reload -- without an explicit stamp (persisted, or {0,0} when
+// no record was present) beside the SetMCFlag mirror, a loaded key would be dense in prime but
+// absent from mvcc, tripping OnCbFinishBlocking's DCHECK (db_slice.cc) on the next command that
+// reaches it. ReloadDoesNotLeaveArmsForALaterWriteToClobber (below) is where the exact stamp
+// VALUE surviving the round trip is actually checked.
 //
 // Needs --dbfilename set, or DEBUG RELOAD silently no-ops (BaseFamilyTest::SetUpTestSuite sets it
 // to "" globally) -- that exact vacuous-test trap was caught on P4-0. Unique per pid, matching
@@ -1956,10 +2101,19 @@ TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
 // nothing ever calls MvccStamper::Commit() for those arms. Without an EndOfWriteEpoch() call
 // somewhere in the load path, those arms sat in armed_ until the next unrelated journaled write on
 // the same shard thread, whose own Commit() then stamped every still-armed key -- not just its
-// own -- with that write's mvcc/origin, clobbering this task's {0,0} fallback with local authority
-// no peer ever saw: exactly the "stamp without propagation" direction D-7 forbids, and it would do
-// so silently (TEST_VerifyMvccTable/OnCbFinishBlocking only check density, never the stamp's
-// value).
+// own -- with that write's mvcc/origin, clobbering whatever the load path had installed with local
+// authority no peer ever saw: exactly the "stamp without propagation" direction D-7 forbids, and it
+// would do so silently (TEST_VerifyMvccTable/OnCbFinishBlocking only check density, never the
+// stamp's value).
+//
+// drakeydb: P4-2 Task 2 -- reload_keys are written BEFORE the reload, under this fixture's real
+// (active, journaled) write path, so each one already carries a genuine, non-zero stamp by the
+// time SAVE captures it; Task 1's saver then emits RDB_OPCODE_DF_MVCC for it, and Task 2's loader
+// installs it verbatim. That stamp -- not {0,0} -- is what must survive both the reload itself
+// and the trigger writes below unclobbered; comparing against the captured pre_reload_stamps
+// (rather than Empty()) is a strictly stronger check than the original {0,0}-only version: it
+// catches both arm leakage (this test's original purpose) AND a loader that silently drops or
+// re-mints the persisted authority instead of installing it verbatim.
 //
 // One trigger write per shard, not one write total: armed_ is per-shard-thread (MvccStamper is
 // thread-local), so a bug here only clobbers reload keys sharing a shard with the trigger write --
@@ -1975,6 +2129,7 @@ TEST_F(MvccStoreTest, ReloadDoesNotLeaveArmsForALaterWriteToClobber) {
 
   const unsigned num_shards = shard_set->size();
   std::vector<std::string> reload_keys(num_shards);
+  std::vector<MvccStamp> pre_reload_stamps(num_shards);
   for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
     for (int i = 0;; ++i) {
       CHECK_LT(i, 10000) << "could not find a key hashing to shard " << target_shard;
@@ -1983,17 +2138,25 @@ TEST_F(MvccStoreTest, ReloadDoesNotLeaveArmsForALaterWriteToClobber) {
         break;
     }
     Run({"set", reload_keys[target_shard], "v"});
+    auto st = StampOf(reload_keys[target_shard]);
+    ASSERT_TRUE(st.has_value()) << reload_keys[target_shard];
+    ASSERT_FALSE(st->Empty())
+        << reload_keys[target_shard]
+        << ": guard against a vacuous pass -- the pre-reload write itself must get a real "
+           "stamp before this test can check it survives the round trip";
+    pre_reload_stamps[target_shard] = *st;
   }
 
   ASSERT_EQ(Run({"debug", "reload"}), "OK");
 
-  // Guard against a vacuous pass: every reloaded key must actually be {0,0}-stamped before the
-  // trigger writes below run, or this test would "pass" against a reload path that lost the
-  // stamp entirely, not just one that leaks arms.
-  for (const auto& key : reload_keys) {
-    auto st = StampOf(key);
-    ASSERT_TRUE(st.has_value()) << key;
-    ASSERT_TRUE(st->Empty()) << key << ": Step 3b's {0,0} stamp did not survive the reload itself";
+  // Guard against a vacuous pass: every reloaded key's persisted stamp must survive the reload
+  // itself, exactly, before the trigger writes below run, or this test would "pass" against a
+  // reload path that lost or altered the stamp entirely, not just one that leaks arms.
+  for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+    auto st = StampOf(reload_keys[target_shard]);
+    ASSERT_TRUE(st.has_value()) << reload_keys[target_shard];
+    ASSERT_EQ(*st, pre_reload_stamps[target_shard])
+        << reload_keys[target_shard] << ": the persisted stamp did not survive the reload itself";
   }
 
   // One real, journaled write per shard -- the only thing that ever calls MvccStamper::Commit().
@@ -2012,12 +2175,12 @@ TEST_F(MvccStoreTest, ReloadDoesNotLeaveArmsForALaterWriteToClobber) {
         << trigger << ": the triggering write itself must still get a real stamp";
   }
 
-  for (const auto& key : reload_keys) {
-    auto st = StampOf(key);
-    ASSERT_TRUE(st.has_value()) << key;
-    EXPECT_TRUE(st->Empty())
-        << key
-        << ": a reloaded key's {0,0} stamp was clobbered by a later, unrelated write -- "
+  for (unsigned target_shard = 0; target_shard < num_shards; ++target_shard) {
+    auto st = StampOf(reload_keys[target_shard]);
+    ASSERT_TRUE(st.has_value()) << reload_keys[target_shard];
+    EXPECT_EQ(*st, pre_reload_stamps[target_shard])
+        << reload_keys[target_shard]
+        << ": a reloaded key's persisted stamp was clobbered by a later, unrelated write -- "
            "its arm leaked past the load and got picked up by that write's Commit()";
   }
 }

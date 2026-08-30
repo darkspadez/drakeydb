@@ -51,6 +51,7 @@ extern "C" {
 #include "server/journal/executor.h"
 #include "server/journal/serializer.h"
 #include "server/main_service.h"
+#include "server/multi_master.h"
 #include "server/namespaces.h"
 #include "server/rdb_extensions.h"
 #include "server/script_mgr.h"
@@ -2344,11 +2345,20 @@ struct RdbLoader::ObjSettings {
   bool is_sticky = false;
   bool has_mc_flags = false;
 
+  // drakeydb: P4-2 Task 2 -- set by the RDB_OPCODE_DF_MVCC case below when that record is present
+  // for the upcoming key; left at the default ({false, {0,0}}) otherwise, which is D-7's
+  // unversioned-snapshot fallback. Reset alongside the other per-key settings below so a record
+  // seen for one key can never leak onto the next.
+  bool has_mvcc = false;
+  MvccStamp mvcc;
+
   void Reset() {
     mc_flags = expiretime = 0;
     has_expired = false;
     is_sticky = false;
     has_mc_flags = false;
+    has_mvcc = false;
+    mvcc = MvccStamp{};
   }
 
   void SetExpire(int64_t val) {
@@ -2495,6 +2505,23 @@ error_code RdbLoader::Load(io::Source* src) {
       continue; /* Read next opcode. */
     }
 
+    if (type == RDB_OPCODE_DF_MVCC) {
+      // drakeydb: P4-2 Task 2 -- spec D-7's single most important compatibility rule: this read
+      // is UNCONDITIONAL. Every binary loading this stream -- active or not, drakeydb or a
+      // future fork -- must consume these 16 bytes before the type byte that follows, exactly
+      // like the DF_MASK block above. Task 1's saver only ever emits this opcode for a non-zero
+      // stamp on an active node, but the loader must not gate its own parsing on the local
+      // node's own active-ness: doing so would desync the byte stream (the type byte would be
+      // misread as the low byte of a stamp) the moment an active node's snapshot reaches a
+      // non-active one. Whether the parsed stamp is actually kept is DbSlice::SetMvcc's call
+      // (it no-ops when db.mvcc is null) -- that is the "parses, discards" row of the
+      // compatibility matrix, not a reason to skip reading here.
+      SET_OR_RETURN(FetchInt<uint64_t>(), settings.mvcc.packed);
+      SET_OR_RETURN(FetchInt<uint64_t>(), settings.mvcc.origin_hash);
+      settings.has_mvcc = true;
+      continue; /* Read next opcode. */
+    }
+
     if (type == RDB_OPCODE_FREQ) {
       /* FREQ: LFU frequency. */
       FetchInt<uint8_t>();  // IGNORE
@@ -2591,7 +2618,7 @@ error_code RdbLoader::Load(io::Source* src) {
     }
 
     if (type == RDB_OPCODE_AUX) {
-      RETURN_ON_ERR(HandleAux());
+      RETURN_ON_ERR(HandleAux(&settings));
       continue; /* Read type again. */
     }
 
@@ -3013,7 +3040,7 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
   return std::error_code{};
 }
 
-error_code RdbLoader::HandleAux() {
+error_code RdbLoader::HandleAux(ObjSettings* settings) {
   /* AUX: generic string-string fields. Use to add state to RDB
    * which is backward compatible. Implementations of RDB loading
    * are required to skip AUX fields they don't understand.
@@ -3100,6 +3127,65 @@ error_code RdbLoader::HandleAux() {
     size_t mem;
     if (absl::SimpleAtoi(auxval, &mem)) {
       table_used_memory_ = mem;
+    }
+  } else if (auxkey == "drakeydb-mvcc") {
+    // drakeydb: P4-2 Task 2, review round 1 (Important, finding 2) -- recognized breadcrumb,
+    // informational only (rdb_save.cc's SaveAux); every RDB_OPCODE_DF_MVCC record is self-
+    // describing regardless of this aux field's presence, so there is nothing to record here.
+    // Without this branch the "unrecognized" case below fires on every active-mode load's own
+    // breadcrumb, inverting the warning's purpose (it exists to flag a FOREIGN binary's unknown
+    // aux fields, not our own recognized one).
+  } else if (auxkey == "mvcc-tstamp") {
+    // drakeydb: P4-2 Task 3 -- KeyDB (fActiveReplica) writes this decimal-u64 aux before every
+    // key (KeyDB/src/rdb.cpp:1164-1168). Same packed layout as MvccClock (D-3/D-4), no tombstone
+    // bit. Author identity is not in the file; use the link's authenticated origin
+    // (load_origin_hash_, set via SetLoadOriginHash). A local file load has no link identity and
+    // therefore must leave the key unstamped rather than inventing origin 0. Like the
+    // drakeydb-mvcc branch
+    // above and the DF_MVCC opcode case in the main loop, this read is unconditional on the
+    // local node's own active-ness (D-7): settings->has_mvcc/mvcc are plain fields that exist
+    // regardless of whether an mvcc side table will ultimately consume them (CreateObjectOnShard
+    // -> SetMvcc no-ops on an inactive node's null table).
+    uint64_t v;
+    if (absl::SimpleAtoi(auxval, &v)) {
+      // drakeydb: P4-2 Task 3, review round 1 (Important, finding 1) -- KeyDB stamps a key it has
+      // no valid mvcc for (e.g. one synced in from a plain-Redis master) with OBJ_MVCC_INVALID,
+      // 0xFFFFFFFFFFFFFFFF (KeyDB/src/server.h:958), not a real timestamp. Bit 63 of drakeydb's
+      // packed layout is the tombstone bit (mvcc.h); installed verbatim, this sentinel would
+      // silently mint a phantom tombstone carrying the maximum possible mvcc, winning every LWW
+      // merge forever. More generally, no genuine KeyDB timestamp can ever set bit 63: KeyDB's
+      // ms << 20 layout needs ms to reach ~2^43 to touch it, i.e. roughly the year 280000 AD -- so
+      // bit 63 set is proof the value is not a representable timestamp, not just proof it equals
+      // OBJ_MVCC_INVALID specifically. Controller ruling overrides the brief's verbatim-install
+      // snippet for this one case: treat it as unstamped (has_mvcc stays false, D-7's {0,0}
+      // unversioned fallback) rather than installing it.
+      if (v == 0) {
+        // drakeydb: P4-2, final review (Minor) -- same principle as the bit-63 guard below, for
+        // the opposite end of the range. MvccStamp::Empty() requires BOTH fields zero (mvcc.h),
+        // so installing {packed=0, origin_hash=load_origin_hash_} here would mint a NON-empty
+        // stamp out of an aux that carries no authority at all, and re-emit it as a real
+        // RDB_OPCODE_DF_MVCC record on every later save. A parsed 0 means "no timestamp", which
+        // is exactly D-7's {0,0} unversioned fallback: leave has_mvcc false. Silent, unlike the
+        // sentinel below: 0 is an absent value, not evidence of a corrupt or unrepresentable one.
+      } else if (v & MvccClock::kTombstoneBit) {
+        LOG(WARNING) << "Ignoring unrepresentable mvcc-tstamp aux (bit 63 set, e.g. KeyDB's "
+                        "OBJ_MVCC_INVALID sentinel): '"
+                     << auxval << "'";
+      } else if (load_origin_hash_ == 0) {
+        // A KeyDB aux contains only its logical clock, not the author's identity. Installing
+        // {v,0} on an active local import would mint durable authority that no authenticated
+        // sender supplied and re-emit it in opcode 221. Non-active loaders discard stamps by
+        // design and remain silent; an active local import gets one warning per loader.
+        if (IsActiveReplica() && !warned_missing_mvcc_origin_) {
+          LOG(WARNING) << "Ignoring mvcc-tstamp aux without an authenticated sender origin";
+          warned_missing_mvcc_origin_ = true;
+        }
+      } else {
+        settings->mvcc = MvccStamp{v, load_origin_hash_};
+        settings->has_mvcc = true;
+      }
+    } else {
+      LOG(WARNING) << "Ignoring malformed mvcc-tstamp aux: '" << auxval << "'";
     }
   } else {
     /* We ignore fields we don't understand, as by AUX field
@@ -3274,11 +3360,17 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     db_slice->SetMCFlag(db_cntx.db_index, updater.it->first, item->mc_flags);
   }
 
-  // drakeydb: Phase 4, P4-1 Task 10 -- an unversioned snapshot carries no stamp, and D-7 specifies
-  // {0,0} as its fallback: it never fabricates authority the snapshot does not contain, and any
-  // stamped resident value beats it on merge. P4-2 overwrites this with the persisted stamp when
-  // the RDB_OPCODE_DF_MVCC record is present. Unconditional (unlike the mc_flags mirror above):
-  // every loaded key needs an entry for the mvcc table to stay dense, not just ones with a flag.
+  // drakeydb: Phase 4, P4-1 Task 10 / P4-2 Task 2 -- an unversioned snapshot, or a key whose
+  // stamp was zero (unstamped/absent) at save time, carries no RDB_OPCODE_DF_MVCC record
+  // (item->has_mvcc is false); D-7 specifies {0,0} as its fallback there: it never fabricates
+  // authority the snapshot does not contain, and any stamped resident value beats it on merge.
+  // When the record IS present (item->has_mvcc true), item->mvcc holds the exact 16 bytes Task
+  // 1's saver wrote for this key, installed here verbatim -- never re-minted. That is P4-2's
+  // whole promise: loading is propagation-by-snapshot, and "a key's stamp advances iff that same
+  // stamp is propagated" holds for it exactly because the loader never invents a stamp, only
+  // ever replays one the save side already committed to the stream. Unconditional either way
+  // (unlike the mc_flags mirror above): every loaded key needs an entry for the mvcc table to
+  // stay dense, not just ones with a flag or a record.
   //
   // drakeydb: fix round 1 (F5) -- the string_view overload, with item->key (already a stable
   // std::string on this const Item*, no copy), not the PrimeKey overload used above for
@@ -3294,7 +3386,7 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   // claim here ("costs one predictable branch") was true of the guard but not of the call as
   // originally written, which paid for that outer round-trip -- allocating or not, depending on
   // tag -- regardless of mvcc_enabled(). See task-10-report.md fix round 1.
-  db_slice->SetMvcc(db_cntx.db_index, item->key, MvccStamp{});
+  db_slice->SetMvcc(db_cntx.db_index, item->key, item->has_mvcc ? item->mvcc : MvccStamp{});
 
   if (!override_existing_keys_ && !updater.is_new) {
     LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind << " of type "
@@ -3303,7 +3395,8 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
 
   // Loading is propagated by the snapshot, not a COMMAND journal entry. Finalize normal memory,
   // expiry, watcher, and index bookkeeping without arming the thread-local journal epoch. The
-  // explicit {0,0} slot above is the load's complete P4-1 MVCC effect.
+  // explicit SetMvcc call above -- the persisted stamp verbatim, or D-7's {0,0} fallback -- is
+  // the load's complete P4-2 MVCC effect.
   updater.post_updater.RunWithoutMvccArm();
 
   if (auto* ts = db_slice->shard_owner()->tiered_storage(); ts) {
@@ -3488,6 +3581,8 @@ io::Result<bool> RdbLoader::ReadAndDispatchObject(int object_type, std::string& 
   item->is_sticky = obj_settings.is_sticky;
   item->has_mc_flags = obj_settings.has_mc_flags;
   item->mc_flags = obj_settings.mc_flags;
+  item->has_mvcc = obj_settings.has_mvcc;
+  item->mvcc = obj_settings.mvcc;
   item->expire_ms = obj_settings.expiretime;
   item->db_index = db_index;
 

@@ -317,9 +317,11 @@ class RdbSerializer {
   // Must be called in the thread to which `it` belongs.
   // Returns the serialized rdb_type or the error.
   // expire_ms = 0 means no expiry.
+  // mvcc is the key's side-table stamp (MvccStamp{} if unstamped/absent); a non-zero stamp emits
+  // an RDB_OPCODE_DF_MVCC record immediately before the type byte. See rdb_extensions.h.
   // This function might preempt if flush_fun_ is used.
   io::Result<uint8_t> SaveEntry(const PrimeKey& pk, const PrimeValue& pv, uint64_t expire_ms,
-                                uint32_t mc_flags, DbIndex dbid);
+                                uint32_t mc_flags, DbIndex dbid, const MvccStamp& mvcc);
 
   // This would work for either string or an object.
   // The arg pv is taken from it->second if accessing

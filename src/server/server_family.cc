@@ -2869,19 +2869,26 @@ string ServerFamily::FormatInfoMetrics(
     // entries/tombstones maintained in DbSlice::SetMvcc/EraseMvcc (table.h/db_slice.cc). All
     // three stay 0 outside --active_replica, where the side table is never allocated.
     //
-    // drakeydb: P4-1 Task 12 (memory benchmark) -- mvcc_table_bytes UNDER-REPORTS the side
-    // table's true cost for keys over CompactObj::kInlineLen (16 B). It is
-    // DashTable::mem_usage() (dash.h), documented there as excluding "memory allocated by
-    // the hosted objects": for every key whose encoded form still exceeds kInlineLen,
-    // DbSlice::SetMvcc heap-allocates a second, independent copy of the key (a PrimeKey
-    // living in this table's own bucket, separate from the prime table's copy), and that
-    // allocation is invisible here. Measured (tests/dragonfly/multimaster_memory_test.py):
-    // 24-byte keys cost ~43% more than this field reports, 32-byte keys ~77% more; 1M-key
-    // deltas of 63 MiB and 78 MiB respectively against a 44 MiB mvcc_table_bytes. This is
-    // the same blind spot table_used_memory/prime.mem_usage() already has, one level
-    // deeper. For capacity planning on a long-key workload, trust used_memory (which does
-    // include the second copy, being allocated from the shard's MiMemoryResource), not
-    // this field alone.
+    // drakeydb: P4-1 Task 12 (memory benchmark) -- mvcc_table_bytes USED TO UNDER-REPORT the
+    // side table's true cost for keys over CompactObj::kInlineLen (16 B): it was
+    // DashTable::mem_usage() (dash.h) alone, documented there as excluding "memory allocated
+    // by the hosted objects", so the second, independent key copy DbSlice::SetMvcc
+    // heap-allocates for every key whose encoded form still exceeds kInlineLen (a PrimeKey
+    // living in this table's own bucket, separate from the prime table's copy) was invisible
+    // here. Measured at the time (tests/dragonfly/multimaster_memory_test.py): 24-byte keys
+    // cost ~43% more than this field reported, 32-byte keys ~77% more; 1M-key deltas of 63 MiB
+    // and 78 MiB respectively against a 44 MiB mvcc_table_bytes. This was the same blind spot
+    // table_used_memory/prime.mem_usage() already has, one level deeper.
+    //
+    // Fixed in P4-2 Task 4 (task-4-report.md): DbTableStats::mvcc_key_dup_bytes now accounts
+    // that second copy's MallocUsed() at the same three mutation points that already maintain
+    // mvcc_entries (DbSlice::SetMvcc/EnsureMvcc/EraseMvcc, db_slice.cc), and
+    // DbTable::mvcc_table_memory() (table.h) folds it directly into this field -- confirmed by
+    // the same benchmark: the gap against the measured used_memory delta dropped to within the
+    // benchmark's 15% tolerance (4.9%-8.3% measured) across all four key lengths. Still trust
+    // used_memory over this field for capacity planning in general (it also carries the prime
+    // table's own value/overhead bytes this field never claimed to cover), but the specific
+    // key-duplication blind spot described above is closed.
     //
     // drakeydb: Phase 4, review wave 2 (F5, MINOR) -- gated on IsActiveReplica(), matching how
     // the "replication" section below already gates mvcc_unstamped_writes/mvcc_clock_ahead_ms/
