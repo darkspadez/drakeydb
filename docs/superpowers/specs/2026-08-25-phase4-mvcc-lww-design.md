@@ -550,7 +550,7 @@ never fabricates authority the snapshot does not contain and is rollback-safe.
 | Loader | Sees `RDB_OPCODE_DF_MVCC` | Sees KeyDB `mvcc-tstamp` aux |
 |---|---|---|
 | Active drakeydb | parses, seeds the side table | parses, origin = sender uuid hash |
-| Non-active drakeydb | parses, **discards** | warns per key, ignores |
+| Non-active drakeydb | parses, **discards** | parses, **discards**, silently (amended in P4-2: this cell said "warns per key, ignores"; the implementation warns only on a *malformed* or unrepresentable value, because a per-key warning on a loader that correctly ignores a well-formed value is log spam) |
 | Stock Dragonfly | **hard fail** — `Unrecognized rdb object type: 221` (`rdb_load.cc:2670-2678`) | warns per key, loads fine |
 
 The stock-Dragonfly cliff is a one-way door and must be documented. It is **not**

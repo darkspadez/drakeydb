@@ -29,8 +29,11 @@ was `DashTable::mem_usage()` alone, documented in dash.h as excluding "memory
 allocated by the hosted objects". For a key over `CompactObj::kInlineLen` (16 B),
 `SetMvcc` heap-allocates a second, independent copy of the key -- a real cost, inside
 `used_memory`, that the field could not see. Measured at the time (task-12-report.md):
-mvcc_table_bytes read an identical 46,497,792 across key lengths 8-32 -- a 63%
-under-report of the true side-table cost at 32-byte keys.
+mvcc_table_bytes read an identical 46,497,792 (~44 MiB) across key lengths 8-32, against
+1M-key `used_memory` deltas of 63 MiB at 24-byte keys and 78 MiB at 32-byte keys -- i.e.
+the field sat ~30.2% below the true side-table cost at 24-byte keys and ~43.6% below it
+at 32-byte keys (equivalently, true cost ran ~43% and ~77% *higher* than reported, which
+is how `server_family.cc`'s `mvcc_table_bytes` comment and `docs/PLAN.md` state it).
 
 Fixed in P4-2 Task 4 (task-4-report.md): `DbTableStats::mvcc_key_dup_bytes` now
 accounts that second copy's `MallocUsed()` at the same three mutation points that
