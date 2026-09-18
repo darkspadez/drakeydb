@@ -16,6 +16,7 @@
 #include "server/engine_shard_set.h"
 #include "server/execution_state.h"
 #include "server/journal/journal.h"
+#include "server/multi_master.h"
 #include "server/rdb_extensions.h"
 #include "server/rdb_save.h"
 #include "server/search/global_hnsw_index.h"
@@ -118,6 +119,10 @@ void SliceSnapshot::Start(bool stream_journal, SnapshotFlush allow_flush) {
       SearchSerializer::Serialize(serializer_.get(), db_slice_,
                                   std::bind(&SliceSnapshot::PushSerialized, this, false));
     }
+    // drakeydb: P4-3 Task 5 -- unlike serialize_index above (search-specific, version-gated),
+    // this runs unconditionally: RDB_OPCODE_DF_TOMBSTONES's own write-gate (IsActiveReplica() +
+    // non-empty table, checked inside) decides whether anything is actually emitted.
+    this->SerializeTombstones();
     this->IterateBucketsFb(stream_journal);
     UnregisterChangeListener();
     consumer_->Finalize();
@@ -147,6 +152,76 @@ void SliceSnapshot::FinalizeJournalStream(bool cancel) {
     VLOG(1) << "FinalizeJournalStream lsn: " << journal::GetLsn();
     std::ignore = serializer_->SendJournalOffset(journal::GetLsn());
     PushSerialized(true);
+  }
+}
+
+// drakeydb: P4-3 Task 5 -- see snapshot.h's doc comment for why this runs from the per-shard
+// PROLOGUE (called from Start() above, beside SearchSerializer::Serialize) instead of an
+// epilogue: RdbSaver has no per-shard epilogue hook. Ordering relative to IterateBucketsFb below,
+// and relative to any concurrent journal blob on this same shard, carries no meaning either way:
+// tombstone application is itself LWW-guarded (MergeAccepts, mvcc.h), so whichever of the three
+// lands last for a given key resolves the same way regardless of ordering (rdb_load.cc's
+// HandleTombstones says the same on the read side).
+//
+// Write side only -- gated on IsActiveReplica() and a non-empty tombstone table per db (D-7); the
+// read side (RdbLoader::HandleTombstones) is unconditional. An inactive node's DbTable::mvcc is
+// always null (table.cc), so the per-db `!db->mvcc` check below already makes this a no-op then
+// too, but the explicit IsActiveReplica() gate up front makes that first-class rather than
+// incidental, and avoids the table.size()-driven work below entirely on the far more common
+// (inactive) path.
+void SliceSnapshot::SerializeTombstones() {
+  if (!IsActiveReplica())
+    return;
+
+  // drakeydb: D-10 save-time GC -- a tombstone already past its GC deadline is dropped HERE
+  // rather than shipped: nothing on the load side ever re-evaluates a persisted tombstone's
+  // deadline against "now" (TombstoneGcStep, db_slice.cc, only walks the LIVE table on an idle
+  // tick; a loaded tombstone just sits there until that GC eventually reaps it), so an
+  // already-expired one would otherwise ride the RDB and its own TTL semantics indefinitely.
+  const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
+  const uint64_t now_ms = GetCurrentTimeMs();
+  std::string scratch;
+
+  for (DbIndex db_indx = 0; db_indx < db_array_.size(); ++db_indx) {
+    auto& db = db_array_[db_indx];
+    if (!db || !db->mvcc)
+      continue;
+
+    std::vector<std::pair<std::string, MvccStamp>> entries;
+    detail::DashCursor cursor;
+    do {
+      // Mirrors TombstoneGcStep's own guard (db_slice.cc) for the identical reason: a
+      // Mvcc() == 0 slot is never a real, committed tombstone -- only a synchronous
+      // placeholder PerformDeletionAtomic writes mid-epoch, before the delete's own journal
+      // commit overwrites it with a real, minted stamp. Never ship that placeholder: a loaded
+      // tombstone with Mvcc() == 0 would be immortal (RdbLoader::HandleTombstones rejects one
+      // anyway, but this is the cleaner place to never produce one in the first place).
+      FiberAtomicGuard g;
+      cursor = db->mvcc->Traverse(cursor, [&](auto it) {
+        if (!it->second.IsTombstone() || it->second.Mvcc() == 0)
+          return;
+        if (it->second.DeadlineMs(ttl_ms) <= now_ms)
+          return;
+        entries.emplace_back(std::string(it->first.GetSlice(&scratch)), it->second);
+      });
+    } while (cursor);
+
+    if (entries.empty())
+      continue;
+
+    if (auto ec = serializer_->WriteOpcode(RDB_OPCODE_DF_TOMBSTONES); ec)
+      continue;
+    if (auto ec = serializer_->SaveLen(db_indx); ec)
+      continue;
+    if (auto ec = serializer_->SaveLen(entries.size()); ec)
+      continue;
+    for (const auto& [key, stamp] : entries) {
+      if (auto ec = serializer_->SaveString(key); ec)
+        break;
+      if (auto ec = serializer_->SaveMvccStampBits(stamp); ec)
+        break;
+    }
+    PushSerialized(false);
   }
 }
 

@@ -510,6 +510,11 @@ class RdbLoader : protected RdbLoaderBase {
   // locals don't accumulate in Load()'s stack frame.
   std::error_code HandleVectorIndex();
   std::error_code HandleShardDocIndex();
+  // drakeydb: P4-3 Task 5 -- read side of RDB_OPCODE_DF_TOMBSTONES (rdb_extensions.h), mirroring
+  // HandleShardDocIndex's shape: always fully consumes the section's bytes (D-7's unconditional
+  // read), installing a tombstone per entry only when active and only on that key's owning
+  // shard's thread. See the .cc for the three reject cases carried over from Task 3's contract.
+  std::error_code HandleTombstones();
 
   // validates if the current chunk is fully read, resets the state. returns early if stop_early_ is
   // requested.
@@ -532,6 +537,12 @@ class RdbLoader : protected RdbLoaderBase {
   bool merge_lww_ = false;
   uint64_t merge_origin_hash_ = 0;
   bool warned_missing_mvcc_origin_ = false;
+  // drakeydb: P4-3 Task 5 -- HandleTombstones' two format-validation warnings (mvcc.h's carried
+  // Task 3 contract: Mvcc() == 0 would be immortal; bit 63 clear is not a tombstone at all), each
+  // rate-limited to once per loader instance -- both parsing-thread-only checks (before any
+  // per-shard dispatch), so a plain bool is race-free here, unlike a per-shard check would be.
+  bool warned_tombstone_zero_mvcc_ = false;
+  bool warned_tombstone_not_flagged_ = false;
   ScriptMgr* script_mgr_;
   std::vector<ItemsBuf> shard_buf_;
 

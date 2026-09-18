@@ -2669,6 +2669,11 @@ error_code RdbLoader::Load(io::Source* src) {
       continue;
     }
 
+    if (type == RDB_OPCODE_DF_TOMBSTONES) {
+      RETURN_ON_ERR(HandleTombstones());
+      continue;
+    }
+
     if (type == RDB_OPCODE_TAGGED_CHUNK) {
       ActiveTaggedChunk state;
       SET_OR_RETURN(FetchInt<uint32_t>(), state.stream_id);
@@ -3799,6 +3804,127 @@ error_code RdbLoader::HandleShardDocIndex() {
   // Always store mappings. When shard counts differ, PerformPostLoad will redistribute
   // keys to replica shards and remap global_ids accordingly.
   load_context_->AddPendingIndexMapping(shard_id, std::move(pim));
+  return kOk;
+}
+
+// drakeydb: P4-3 Task 5 -- read side of RDB_OPCODE_DF_TOMBSTONES (rdb_extensions.h). D-7's single
+// most important compatibility rule applies here exactly as it did to RDB_OPCODE_DF_MVCC (P4-2):
+// this read is UNCONDITIONAL. Every binary loading this stream -- active or not -- must consume
+// every byte of this section before the next opcode, or the stream desyncs the instant an active
+// node's snapshot reaches any other node. Whether a parsed entry is actually installed is a
+// separate, per-entry, active-only decision below.
+//
+// Format: [db_index][count][count x {key, packed, origin_hash}] -- db_index/count are
+// RDB-length-encoded, key is an RDB string, and {packed, origin_hash} are the same 16 raw LE
+// bytes RDB_OPCODE_DF_MVCC uses for a per-key stamp (FetchInt<uint64_t> pair below mirrors that
+// opcode's own read, above in this file).
+error_code RdbLoader::HandleTombstones() {
+  DbIndex db_index;
+  SET_OR_RETURN(LoadLen(nullptr), db_index);
+
+  uint64_t count;
+  SET_OR_RETURN(LoadLen(nullptr), count);
+
+  const bool active = IsActiveReplica();
+
+  for (uint64_t i = 0; i < count; ++i) {
+    string key;
+    SET_OR_RETURN(FetchGenericString(), key);
+    uint64_t packed;
+    SET_OR_RETURN(FetchInt<uint64_t>(), packed);
+    uint64_t origin_hash;
+    SET_OR_RETURN(FetchInt<uint64_t>(), origin_hash);
+
+    if (!active)
+      continue;  // parsed and discarded -- D-7's read-unconditional / install-active-only split.
+
+    // drakeydb: Task 5 -- reconstructs the tombstone from persisted bytes via AsTombstone(), the
+    // one legitimate place outside the live delete path allowed to set bit 63 (mvcc.h). A
+    // well-formed entry already has bit 63 set on the wire (SerializeTombstones, snapshot.cc,
+    // only ever collects slots that already satisfy IsTombstone()), so this is idempotent in the
+    // common case -- calling it here rather than trusting the wire bit directly keeps this the
+    // one call site responsible for what "is a tombstone" means, mirroring how the live delete
+    // path is itself the only other such call site (MvccStamper::Commit, mvcc.h).
+    const MvccStamp persisted{packed, origin_hash};
+    if (!persisted.IsTombstone()) {
+      // A live stamp (bit 63 clear) has no business in the tombstone section -- a malformed
+      // file; our own saver never produces this. Diagnostic, not fatal: skip this entry only.
+      if (!warned_tombstone_not_flagged_) {
+        LOG(WARNING) << "RDB_OPCODE_DF_TOMBSTONES entry for key '" << absl::CHexEscape(key)
+                     << "' in DB " << db_index
+                     << " has bit 63 clear (not a tombstone) -- skipping; malformed file";
+        warned_tombstone_not_flagged_ = true;
+      }
+      continue;
+    }
+
+    const MvccStamp stamp = persisted.AsTombstone();
+    if (stamp.Mvcc() == 0) {
+      // drakeydb: carried contract from Task 3 (db_slice.cc's TombstoneGcStep comment) --
+      // Mvcc() == 0 is the exact value of a transient, mid-epoch placeholder
+      // (PerformDeletionAtomic's synchronous write, before the delete's own journal commit
+      // overwrites it), never a real committed tombstone's value (MvccClock::Next never mints 0
+      // for any real now_ms). TombstoneGcStep's reap predicate requires Mvcc() != 0 specifically
+      // so it never reaps that placeholder -- so a LOADED tombstone with Mvcc() == 0 would be
+      // immortal: never reaped, and the strict minimum of every future merge comparison,
+      // blocking a resurrection forever instead of merely delaying it. Reject, never install.
+      if (!warned_tombstone_zero_mvcc_) {
+        LOG(WARNING) << "RDB_OPCODE_DF_TOMBSTONES entry for key '" << absl::CHexEscape(key)
+                     << "' in DB " << db_index
+                     << " has Mvcc() == 0 -- skipping; installing it would be immortal (never "
+                        "reaped, always wins future merge comparisons)";
+        warned_tombstone_zero_mvcc_ = true;
+      }
+      continue;
+    }
+
+    // drakeydb: install only on the key's owning shard's thread -- mirrors
+    // ReadAndDispatchObject's own run_inlined / shard_set->Add split (below in this file).
+    // Fire-and-forget is safe: FinishLoad's sentinel barrier (below in this file) guarantees
+    // every dispatch here has completed before Load() returns, and tombstone application needs
+    // no ordering against the key stream or a concurrent journal blob -- it is itself
+    // LWW-guarded (MergeAccepts, mvcc.h), so whichever of the three lands last for a given key
+    // resolves the same way regardless of ordering.
+    const ShardId sid = Shard(key, shard_set->size());
+    auto install = [db_index, key, stamp] {
+      DbSlice& db_slice = GetCurrentDbSlice();
+      // drakeydb: this section is emitted from the per-shard PROLOGUE (snapshot.cc), before this
+      // shard's own key stream would otherwise trigger RDB_OPCODE_SELECTDB's per-shard
+      // ActivateDb calls -- a db whose only remaining trace is tombstones (every live key
+      // already deleted) may carry no SELECTDB opcode at all in this shard's stream. ActivateDb
+      // is idempotent (db_slice.h), so calling it unconditionally here is always safe.
+      db_slice.ActivateDb(db_index);
+
+      // drakeydb: dense-invariant guard -- a loaded tombstone must never coexist with a live
+      // prime entry for the same key (mvcc->size() - mvcc_tombstones == prime.size(),
+      // db_slice.cc). Our own saver never produces this: SerializeTombstones only ever collects
+      // keys whose mvcc slot IsTombstone(), which the dense invariant already guarantees have no
+      // live prime counterpart. A foreign or hand-merged file could still name a key both ways;
+      // skip rather than corrupt the invariant here -- Task 6's LWW apply is what handles a
+      // genuine cross-peer conflict for a live key correctly, not this loader.
+      DbTable* table = db_slice.GetDBTable(db_index);
+      if (table != nullptr && !table->prime.Find(string_view{key}).is_done()) {
+        LOG(WARNING) << "RDB_OPCODE_DF_TOMBSTONES entry for key '" << absl::CHexEscape(key)
+                     << "' in DB " << db_index
+                     << " names a key that is live in this same file -- keeping the live value "
+                        "and skipping the tombstone";
+        return;
+      }
+
+      // No-ops if this DbSlice's own mvcc side table doesn't exist -- see the D-7 unconditional
+      // read comment above; that only happens if `active` above raced with a runtime flag flip,
+      // which is not a supported scenario, but SetTombstone's own guard (db_slice.cc) makes it
+      // harmless regardless.
+      db_slice.SetTombstone(db_index, key, stamp);
+    };
+
+    if (EngineShard::tlocal() != nullptr && EngineShard::tlocal()->shard_id() == sid) {
+      install();
+    } else {
+      shard_set->Add(sid, std::move(install));
+    }
+  }
+
   return kOk;
 }
 

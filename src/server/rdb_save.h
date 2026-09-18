@@ -323,6 +323,14 @@ class RdbSerializer {
   io::Result<uint8_t> SaveEntry(const PrimeKey& pk, const PrimeValue& pv, uint64_t expire_ms,
                                 uint32_t mc_flags, DbIndex dbid, const MvccStamp& mvcc);
 
+  // drakeydb: P4-3 Task 5 -- writes {packed, origin_hash} as 16 raw LE bytes: the same wire shape
+  // SaveEntry above uses for a per-key RDB_OPCODE_DF_MVCC record's trailing bytes. Factored out
+  // here so RDB_OPCODE_DF_TOMBSTONES's per-entry stamp (SliceSnapshot::SerializeTombstones,
+  // snapshot.cc) shares one encoding with the per-key stamp instead of re-deriving it
+  // independently. Does not write an opcode or a key -- callers do that themselves first (see
+  // rdb_extensions.h for RDB_OPCODE_DF_TOMBSTONES's payload layout).
+  std::error_code SaveMvccStampBits(const MvccStamp& stamp);
+
   // This would work for either string or an object.
   // The arg pv is taken from it->second if accessing
   // this by finding the key. This function is used

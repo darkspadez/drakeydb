@@ -351,6 +351,19 @@ io::Result<uint8_t> RdbSerializer::SaveEntry(const PrimeKey& pk, const PrimeValu
   return rdb_type;
 }
 
+// drakeydb: P4-3 Task 5 -- see the declaration (rdb_save.h) for why this is factored out rather
+// than inlined at each call site: it is the same 16-byte {packed, origin_hash} LE encoding
+// SaveEntry above writes inline for RDB_OPCODE_DF_MVCC, reused verbatim for
+// RDB_OPCODE_DF_TOMBSTONES's per-entry stamp so the two opcodes can never drift apart on wire
+// format. SaveEntry's own inline block is left untouched (not refactored to call this) to avoid
+// touching an already-reviewed, byte-exact-tested path for a two-line saving.
+error_code RdbSerializer::SaveMvccStampBits(const MvccStamp& stamp) {
+  uint8_t buf[16];
+  absl::little_endian::Store64(buf, stamp.packed);
+  absl::little_endian::Store64(buf + 8, stamp.origin_hash);
+  return WriteRaw(Bytes{buf, sizeof(buf)});
+}
+
 error_code RdbSerializer::SaveObject(const PrimeValue& pv) {
   unsigned obj_type = pv.ObjType();
   CHECK_NE(obj_type, OBJ_STRING);
@@ -1832,6 +1845,14 @@ error_code RdbSaver::SaveAux(const GlobalData& glob_state) {
   return error_code{};
 }
 
+// drakeydb: P4-3 Task 5 ledger note -- the plan's own D-7 draft called for tombstones to ride
+// "the shard epilogue", but this function is the only epilogue hook that exists, and it is
+// GLOBAL, not per-shard: it just sends EOF+checksum once for the whole save, with no per-shard
+// callback point analogous to SearchSerializer::Serialize's prologue slot (snapshot.cc). Rather
+// than add a new hook here, the tombstone section is emitted from that existing per-shard
+// PROLOGUE instead (SliceSnapshot::SerializeTombstones, snapshot.cc) -- sound precisely because
+// tombstone application is itself LWW-guarded (MergeAccepts, mvcc.h), so the section's position
+// relative to the key stream carries no meaning either way.
 error_code RdbSaver::SaveEpilog() {
   RETURN_ON_ERR(impl_->serializer()->SendEofAndChecksum());
 
