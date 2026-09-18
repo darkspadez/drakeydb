@@ -19,7 +19,10 @@ namespace dfly {
 // master-side `>= VER6` gate (rdb_save.cc:1782, snapshot.cc:101) against peers that don't
 // support those features. P4-2 bumps 65 to 66 because its snapshot stream adds opcode 221: an
 // older consumer advertising 65 cannot parse that opcode and must be refused before full sync.
-inline constexpr unsigned kDrakeydbReplVersion = 66;
+// P4-3 bumps 66 to 67 because its snapshot stream adds opcode 225 (RDB_OPCODE_DF_TOMBSTONES,
+// rdb_extensions.h): a P4-2-era consumer advertising 66 cannot parse that opcode either and must
+// likewise be refused before full sync, not admitted and then hard-failed mid-stream.
+inline constexpr unsigned kDrakeydbReplVersion = 67;
 
 inline constexpr char kNodeUuidFileName[] = "drakeydb.uuid";
 

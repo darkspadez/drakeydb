@@ -69,7 +69,11 @@ bool WriteStringToFileForTest(const std::string& path, std::string_view content)
 }  // namespace
 
 TEST(NodeIdentity, VersionConstant) {
-  EXPECT_EQ(66u, kDrakeydbReplVersion);
+  // drakeydb: P4-3 Task 5 review fix (M2) -- bumped 66 -> 67 alongside kDrakeydbReplVersion
+  // itself (node_identity.h): P4-3's snapshot stream adds opcode 225, so a P4-2-era peer
+  // advertising the old 66 must be refused before full sync, not admitted and hard-failed on an
+  // opcode it cannot parse.
+  EXPECT_EQ(67u, kDrakeydbReplVersion);
 }
 
 TEST(NodeUuid, GenerateIsValidV4) {

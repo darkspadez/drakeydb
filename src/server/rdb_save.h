@@ -325,11 +325,24 @@ class RdbSerializer {
 
   // drakeydb: P4-3 Task 5 -- writes {packed, origin_hash} as 16 raw LE bytes: the same wire shape
   // SaveEntry above uses for a per-key RDB_OPCODE_DF_MVCC record's trailing bytes. Factored out
-  // here so RDB_OPCODE_DF_TOMBSTONES's per-entry stamp (SliceSnapshot::SerializeTombstones,
-  // snapshot.cc) shares one encoding with the per-key stamp instead of re-deriving it
-  // independently. Does not write an opcode or a key -- callers do that themselves first (see
-  // rdb_extensions.h for RDB_OPCODE_DF_TOMBSTONES's payload layout).
+  // here so RDB_OPCODE_DF_TOMBSTONES's per-entry stamp shares one encoding with the per-key stamp
+  // instead of re-deriving it independently. Does not write an opcode or a key -- callers do that
+  // themselves first (see rdb_extensions.h for RDB_OPCODE_DF_TOMBSTONES's payload layout).
   std::error_code SaveMvccStampBits(const MvccStamp& stamp);
+
+  // drakeydb: P4-3 Task 5 review fix (I1) -- writes one COMPLETE RDB_OPCODE_DF_TOMBSTONES section
+  // (opcode, db_index, count, then count x {key, stamp}) as a single all-or-nothing unit, using
+  // the same StartEntry()/FinishEntry(bool) transaction SaveEntry above uses: if any step fails
+  // partway through, FinishEntry(false) rolls the ENTIRE section back out of the buffer,
+  // including the opcode byte already written -- so a caller can never leave a bare opcode with
+  // no payload, or a payload with fewer records than the `count` it already announced, sitting in
+  // the output stream. `entries.size()` is written verbatim as `count` -- callers that want to
+  // bound peak memory / a single section's size should chunk `entries` themselves and call this
+  // once per chunk (SliceSnapshot::SerializeTombstones, snapshot.cc, does exactly that); the
+  // loader (RdbLoader::HandleTombstones) treats any number of sections per db as ordinary
+  // repeats of the same opcode.
+  std::error_code SaveTombstoneSection(DbIndex db_index,
+                                       absl::Span<const std::pair<std::string, MvccStamp>> entries);
 
   // This would work for either string or an object.
   // The arg pv is taken from it->second if accessing

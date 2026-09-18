@@ -3819,8 +3819,18 @@ error_code RdbLoader::HandleShardDocIndex() {
 // bytes RDB_OPCODE_DF_MVCC uses for a per-key stamp (FetchInt<uint64_t> pair below mirrors that
 // opcode's own read, above in this file).
 error_code RdbLoader::HandleTombstones() {
-  DbIndex db_index;
-  SET_OR_RETURN(LoadLen(nullptr), db_index);
+  // drakeydb: P4-3 Task 5 review fix (I3) -- mirrors RDB_OPCODE_SELECTDB's own validation
+  // (above in this file) exactly: without this, a malformed db_index narrowed silently through
+  // SET_OR_RETURN's plain uint64->DbIndex assignment and drove ActivateDb on a db SELECTDB
+  // itself would have refused. A bad db_index rejects the whole load with the same error
+  // SELECTDB uses, rather than silently wrapping/truncating into some other, unintended db.
+  unsigned dbid = 0;
+  SET_OR_RETURN(LoadLen(nullptr), dbid);
+  if (dbid > GetFlag(FLAGS_dbnum)) {
+    LOG(WARNING) << "database id " << dbid << " exceeds dbnum limit. Try increasing the flag.";
+    return RdbError(errc::bad_db_index);
+  }
+  const DbIndex db_index = static_cast<DbIndex>(dbid);
 
   uint64_t count;
   SET_OR_RETURN(LoadLen(nullptr), count);
@@ -3886,37 +3896,63 @@ error_code RdbLoader::HandleTombstones() {
     // LWW-guarded (MergeAccepts, mvcc.h), so whichever of the three lands last for a given key
     // resolves the same way regardless of ordering.
     const ShardId sid = Shard(key, shard_set->size());
-    auto install = [db_index, key, stamp] {
-      DbSlice& db_slice = GetCurrentDbSlice();
-      // drakeydb: this section is emitted from the per-shard PROLOGUE (snapshot.cc), before this
-      // shard's own key stream would otherwise trigger RDB_OPCODE_SELECTDB's per-shard
-      // ActivateDb calls -- a db whose only remaining trace is tombstones (every live key
-      // already deleted) may carry no SELECTDB opcode at all in this shard's stream. ActivateDb
-      // is idempotent (db_slice.h), so calling it unconditionally here is always safe.
-      db_slice.ActivateDb(db_index);
+    auto install =
+        [db_index, key, stamp] {
+          DbSlice& db_slice = GetCurrentDbSlice();
+          // drakeydb: this section is emitted from the per-shard PROLOGUE (snapshot.cc), before
+          // this shard's own key stream would otherwise trigger RDB_OPCODE_SELECTDB's per-shard
+          // ActivateDb calls -- a db whose only remaining trace is tombstones (every live key
+          // already deleted) may carry no SELECTDB opcode at all in this shard's stream. ActivateDb
+          // is idempotent (db_slice.h), so calling it unconditionally here is always safe.
+          db_slice.ActivateDb(db_index);
 
-      // drakeydb: dense-invariant guard -- a loaded tombstone must never coexist with a live
-      // prime entry for the same key (mvcc->size() - mvcc_tombstones == prime.size(),
-      // db_slice.cc). Our own saver never produces this: SerializeTombstones only ever collects
-      // keys whose mvcc slot IsTombstone(), which the dense invariant already guarantees have no
-      // live prime counterpart. A foreign or hand-merged file could still name a key both ways;
-      // skip rather than corrupt the invariant here -- Task 6's LWW apply is what handles a
-      // genuine cross-peer conflict for a live key correctly, not this loader.
-      DbTable* table = db_slice.GetDBTable(db_index);
-      if (table != nullptr && !table->prime.Find(string_view{key}).is_done()) {
-        LOG(WARNING) << "RDB_OPCODE_DF_TOMBSTONES entry for key '" << absl::CHexEscape(key)
-                     << "' in DB " << db_index
-                     << " names a key that is live in this same file -- keeping the live value "
-                        "and skipping the tombstone";
-        return;
-      }
+          // drakeydb: P4-3 Task 5 review fix (I4) -- dense-invariant guard against a RESIDENT live
+          // key, not a same-file one: this section is a PROLOGUE, parsed and (if active) installed
+          // before this shard's own key stream even begins, so at this exact moment `table->prime`
+          // can only hold whatever this DbSlice already held BEFORE this file started loading (a
+          // non-flushing load onto an already-populated database, e.g. DEBUG LOAD / RESTORE, or a
+          // merge-mode full sync landing on existing data) -- it can never yet hold a later key
+          // from THIS SAME file, since those haven't been parsed yet. Installing a tombstone over a
+          // pre-existing resident value would incorrectly delete it and violate the dense invariant
+          // (mvcc->size() - mvcc_tombstones == prime.size(), db_slice.cc); skip instead -- Task 6's
+          // LWW apply is what handles a genuine cross-peer conflict for a live key correctly, not
+          // this loader.
+          //
+          // The SAME-file case (this file's own later key stream re-creating a key this same file
+          // tombstoned) is a different, legitimate scenario our own saver DOES produce: a key
+          // deleted before the snapshot's PROLOGUE ran, then re-SET while IterateBucketsFb (below
+          // in this file) was still walking buckets, is captured by SerializeTombstones as a
+          // tombstone AND later re-appears in the key stream as a live record. That is not a
+          // same-file collision THIS guard ever sees: the live record hasn't loaded yet when this
+          // callback runs, so this check passes, SetTombstone below installs the tombstone, and the
+          // later live record's own CreateObjectOnShard -> SetMvcc (above in this file) transitions
+          // the slot from tombstone to live via SetMvcc's own was_tombstone repair (db_slice.cc),
+          // decrementing mvcc_tombstones and restoring the dense invariant -- self-repairing,
+          // correct in this ordering by construction (our own emit order is always
+          // prologue-before-key-stream) without this loader needing to reason about it at all.
+          //
+          // review fix (M6) -- LOG_FIRST_N, not a per-instance bool: this check runs per-key on
+          // whichever shard owns that key (potentially several different shard threads within one
+          // load), so a plain bool member here would race the way the two parsing-thread-only
+          // warnings above (checked before any per-shard dispatch) do not. LOG_FIRST_N's internal
+          // counter is atomic (replica.cc:441's REPLCONF UUID warning is the in-tree precedent for
+          // exactly this).
+          DbTable* table = db_slice.GetDBTable(db_index);
+          if (table != nullptr && !table->prime.Find(string_view{key}).is_done()) {
+            LOG_FIRST_N(WARNING, 1)
+                << "RDB_OPCODE_DF_TOMBSTONES entry for key '" << absl::CHexEscape(key) << "' in DB "
+                << db_index
+                << " names a key that already holds a live, resident value on this node -- keeping "
+                   "the resident value and skipping the tombstone";
+            return;
+          }
 
-      // No-ops if this DbSlice's own mvcc side table doesn't exist -- see the D-7 unconditional
-      // read comment above; that only happens if `active` above raced with a runtime flag flip,
-      // which is not a supported scenario, but SetTombstone's own guard (db_slice.cc) makes it
-      // harmless regardless.
-      db_slice.SetTombstone(db_index, key, stamp);
-    };
+          // No-ops if this DbSlice's own mvcc side table doesn't exist -- see the D-7 unconditional
+          // read comment above; that only happens if `active` above raced with a runtime flag flip,
+          // which is not a supported scenario, but SetTombstone's own guard (db_slice.cc) makes it
+          // harmless regardless.
+          db_slice.SetTombstone(db_index, key, stamp);
+        };
 
     if (EngineShard::tlocal() != nullptr && EngineShard::tlocal()->shard_id() == sid) {
       install();

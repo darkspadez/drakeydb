@@ -2782,6 +2782,50 @@ TEST_F(RdbMvccTest, SaveTimeGcDropsExpiredTombstone) {
          "live dataset first, so a surviving slot here can only have come from the file";
 }
 
+// drakeydb: P4-3 Task 5 review fix (I2) -- SerializeTombstones (snapshot.cc) now chunks a db's
+// tombstones into bounded RDB_OPCODE_DF_TOMBSTONES sections (kChunkSize = 1000) instead of
+// materializing and emitting the whole db in one section, to bound peak memory and let the
+// shard fiber yield/throttle between chunks. This creates more tombstones than one chunk holds
+// (comfortably above kChunkSize, tolerant of that constant changing slightly) for a single db on
+// a single shard (RdbMvccTest pins one shard), forcing the save side to emit -- and the load
+// side to correctly accumulate -- more than one section for the same db. A bug that dropped or
+// overwrote entries past the first chunk would fail this round trip, not just "look chunky" in
+// the wire bytes.
+TEST_F(RdbMvccTest, SurvivesMultipleTombstoneSectionsForOneDb) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr int kNumKeys = 1500;
+
+  for (int i = 0; i < kNumKeys; ++i) {
+    std::string key = absl::StrCat("multi-", i);
+    ASSERT_EQ(Run({"set", key, "v"}), "OK");
+    ASSERT_THAT(Run({"del", key}), IntArg(1));
+  }
+
+  size_t tombstones_before = 0;
+  shard_set->Await(0, [&] {
+    tombstones_before =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetDBTable(0)->stats.mvcc_tombstones;
+  });
+  ASSERT_EQ(tombstones_before, static_cast<size_t>(kNumKeys));
+
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+
+  size_t tombstones_after = 0;
+  int missing = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    tombstones_after = db_slice.GetDBTable(0)->stats.mvcc_tombstones;
+    for (int i = 0; i < kNumKeys; ++i) {
+      auto got = db_slice.GetMvcc(0, std::string_view{absl::StrCat("multi-", i)});
+      if (!got.has_value() || !got->IsTombstone())
+        ++missing;
+    }
+  });
+  EXPECT_EQ(tombstones_after, tombstones_before);
+  EXPECT_EQ(missing, 0) << "every tombstone across multiple sections for the same db must "
+                           "survive the round trip";
+}
+
 // drakeydb: P4-3 Task 5 -- D-7's read-unconditional counterpart to
 // NoMvccOpcodeOrAuxWhenInactive/LoadConsumesAndDiscardsMvccRecordWhenInactive above, for the new
 // opcode: an inactive loader must still fully consume a well-formed RDB_OPCODE_DF_TOMBSTONES
@@ -2885,26 +2929,35 @@ TEST_F(RdbMvccTest, RejectsPersistedTombstoneMissingTombstoneBit) {
   EXPECT_TRUE(warned) << "expected a WARNING naming the rejected key and the reason";
 }
 
-// drakeydb: P4-3 Task 5 -- the tombstone section names a key that is ALSO live in the same file
-// (a foreign/hand-merged file; our own saver never produces this -- SerializeTombstones only
-// collects keys whose slot IsTombstone(), which the dense invariant already excludes for any key
-// with a live prime counterpart). "dup"'s live record is placed BEFORE the tombstone section in
-// this crafted body specifically so the loader observes the live key first, exactly the ordering
-// a foreign producer that appended a tombstone section after its own key stream would produce.
-// Safe choice (documented in rdb_load.cc): keep the live value, skip the tombstone.
-TEST_F(RdbMvccTest, RejectsPersistedTombstoneForKeyLiveInSameFile) {
+// drakeydb: P4-3 Task 5 review fix (I4) -- renamed and rewritten from
+// RejectsPersistedTombstoneForKeyLiveInSameFile: that name and framing were wrong. This section
+// is a PROLOGUE, parsed and (if active) installed before this shard's own key stream even
+// begins, so the guard being tested here can only ever see a key that was RESIDENT on this node
+// BEFORE the file started loading -- never a later key from the same file (see the corrected
+// comment on this reject case in rdb_load.cc for the full account, including why our own
+// saver's legitimate same-file dual-emission -- delete-then-recreate straddling the snapshot --
+// is a different, self-repairing case this guard never even observes). "dup" is made resident
+// via a real SET BEFORE LoadRdbData runs, independent of anything the loaded body itself
+// contains -- the body below carries only a well-formed tombstone section for "dup" (no live
+// record for it at all) plus a trailing key to prove the section's bytes are still fully
+// consumed. Safe choice (documented in rdb_load.cc): keep the resident value, skip the
+// tombstone.
+TEST_F(RdbMvccTest, RejectsPersistedTombstoneForResidentLiveKey) {
   ASSERT_TRUE(IsActiveReplica());
   ScopedLogCapture log_capture;
 
-  std::string body;
-  body.push_back(RDB_TYPE_STRING);
-  AppendString(&body, "dup");
-  AppendString(&body, "livevalue");
+  ASSERT_EQ(Run({"set", "dup", "livevalue"}), "OK");
+  std::optional<MvccStamp> before;
+  shard_set->Await(Shard("dup", shard_set->size()), [&] {
+    before =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"dup"});
+  });
+  ASSERT_TRUE(before.has_value());
+  ASSERT_FALSE(before->IsTombstone());
 
   const MvccStamp kWellFormed{MvccClock::kTombstoneBit | (12345ULL << MvccClock::kCounterBits),
                               0xAAAA};
-  body += BuildTombstoneSection(0, {{"dup", kWellFormed}});
-
+  std::string body = BuildTombstoneSection(0, {{"dup", kWellFormed}});
   body.push_back(RDB_TYPE_STRING);
   AppendString(&body, "after");
   AppendString(&body, "afterval");
@@ -2912,21 +2965,23 @@ TEST_F(RdbMvccTest, RejectsPersistedTombstoneForKeyLiveInSameFile) {
   auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
   ASSERT_FALSE(ec) << ec.message();
 
-  EXPECT_EQ(Run({"get", "dup"}), "livevalue") << "the live value must survive untouched";
+  EXPECT_EQ(Run({"get", "dup"}), "livevalue") << "the resident value must survive untouched";
   EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
 
-  std::optional<MvccStamp> got;
+  std::optional<MvccStamp> after;
   shard_set->Await(Shard("dup", shard_set->size()), [&] {
-    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"dup"});
+    after =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"dup"});
   });
-  ASSERT_TRUE(got.has_value()) << "an active loader still leaves a dense slot for the live key";
-  EXPECT_TRUE(got->Empty()) << "the tombstone must not have overwritten dup's {0,0} live stamp";
+  ASSERT_TRUE(after.has_value()) << "an active node keeps a dense slot for a resident live key";
+  EXPECT_EQ(*after, *before)
+      << "the resident key's own stamp must survive untouched -- the tombstone must never have "
+         "been installed over it";
 
   bool warned = std::any_of(log_capture.logs.begin(), log_capture.logs.end(), [](const auto& l) {
-    return l.find("live in this same file") != std::string::npos &&
-           l.find("dup") != std::string::npos;
+    return l.find("resident") != std::string::npos && l.find("dup") != std::string::npos;
   });
-  EXPECT_TRUE(warned) << "expected a WARNING naming the colliding key";
+  EXPECT_TRUE(warned) << "expected a WARNING naming the rejected key and the reason";
 }
 
 // drakeydb: P4-3 Task 5, D-7 -- the write-side counterpart to NoMvccOpcodeOrAuxWhenInactive
@@ -2953,6 +3008,96 @@ TEST_F(RdbTest, NoTombstoneOpcodeWhenInactive) {
   });
 
   EXPECT_EQ(bytes.find(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES)), std::string::npos);
+}
+
+// drakeydb: P4-3 Task 5 review fix (I5) -- every tombstone test above uses RdbMvccTest, whose
+// constructor pins num_threads_ = 1 and FLAGS_num_shards = 1: with exactly one proactor and one
+// shard, a loader fiber can only ever run ON that same shard's own thread, so
+// HandleTombstones's `if (EngineShard::tlocal() ... == sid) install(); else shard_set->Add(...)`
+// split (rdb_load.cc) always takes the inlined branch -- the shard_set->Add cross-shard dispatch
+// path had zero coverage. This fixture deliberately leaves BaseFamilyTest's own default
+// (num_threads_ = 3, FLAGS_num_shards derived to 2) untouched, and drives the round trip through
+// a REAL `debug reload` (ServerFamily::Load, server_family.cc): that path assigns each shard's
+// own RDB file to a loader fiber via `pool.GetNextProactor()` -- a plain round robin over ALL
+// proactors, not shard-aware -- so with 2 shards spread over 3 threads, at least one file's
+// loader fiber is virtually certain to run on a thread that is NOT the shard that data belongs
+// to, forcing the cross-shard dispatch this test exists to cover.
+class RdbMvccMultiShardTest : public RdbTest {
+ protected:
+  RdbMvccMultiShardTest() {
+    absl::SetFlag(&FLAGS_active_replica, true);
+  }
+
+  absl::FlagSaver saver_;
+};
+
+TEST_F(RdbMvccMultiShardTest, TombstonesRouteToOwningShardOnReload) {
+  ASSERT_TRUE(IsActiveReplica());
+  ASSERT_GT(shard_set->size(), 1u) << "this test requires more than one shard to be meaningful";
+
+  // Shard() is a deterministic hash -- search for two keys landing on two different shards
+  // rather than assuming particular literals stay stable across any future hash change.
+  std::string key_a, key_b;
+  ShardId shard_a = 0, shard_b = 0;
+  for (int i = 0; i < 10000 && key_b.empty(); ++i) {
+    std::string candidate = absl::StrCat("mk", i);
+    ShardId sid = Shard(candidate, shard_set->size());
+    if (key_a.empty()) {
+      key_a = candidate;
+      shard_a = sid;
+    } else if (sid != shard_a) {
+      key_b = candidate;
+      shard_b = sid;
+    }
+  }
+  ASSERT_FALSE(key_b.empty()) << "could not find two keys hashing to different shards";
+  ASSERT_NE(shard_a, shard_b);
+
+  ASSERT_EQ(Run({"set", key_a, "va"}), "OK");
+  ASSERT_EQ(Run({"set", key_b, "vb"}), "OK");
+  ASSERT_THAT(Run({"del", key_a, key_b}), IntArg(2));
+
+  std::optional<MvccStamp> stamp_a_before, stamp_b_before;
+  shard_set->Await(shard_a, [&] {
+    stamp_a_before =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{key_a});
+  });
+  shard_set->Await(shard_b, [&] {
+    stamp_b_before =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{key_b});
+  });
+  ASSERT_TRUE(stamp_a_before.has_value());
+  ASSERT_TRUE(stamp_a_before->IsTombstone());
+  ASSERT_TRUE(stamp_b_before.has_value());
+  ASSERT_TRUE(stamp_b_before->IsTombstone());
+
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+
+  EXPECT_THAT(Run({"exists", key_a}), IntArg(0));
+  EXPECT_THAT(Run({"exists", key_b}), IntArg(0));
+
+  std::optional<MvccStamp> stamp_a_after, stamp_b_after;
+  size_t tombstones_a = 0, tombstones_b = 0;
+  shard_set->Await(shard_a, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    stamp_a_after = db_slice.GetMvcc(0, std::string_view{key_a});
+    tombstones_a = db_slice.GetDBTable(0)->stats.mvcc_tombstones;
+  });
+  shard_set->Await(shard_b, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    stamp_b_after = db_slice.GetMvcc(0, std::string_view{key_b});
+    tombstones_b = db_slice.GetDBTable(0)->stats.mvcc_tombstones;
+  });
+
+  ASSERT_TRUE(stamp_a_after.has_value())
+      << "key_a's tombstone must have routed to its owning shard (" << shard_a << ")";
+  EXPECT_EQ(*stamp_a_after, *stamp_a_before);
+  EXPECT_GE(tombstones_a, 1u);
+
+  ASSERT_TRUE(stamp_b_after.has_value())
+      << "key_b's tombstone must have routed to its owning shard (" << shard_b << ")";
+  EXPECT_EQ(*stamp_b_after, *stamp_b_before);
+  EXPECT_GE(tombstones_b, 1u);
 }
 
 // drakeydb: P4-3 Task 4 -- merge-LWW on the full-sync load path. A peer-mode full sync must merge

@@ -364,6 +364,37 @@ error_code RdbSerializer::SaveMvccStampBits(const MvccStamp& stamp) {
   return WriteRaw(Bytes{buf, sizeof(buf)});
 }
 
+// drakeydb: P4-3 Task 5 review fix (I1) -- see the declaration (rdb_save.h) for the full
+// contract. Mirrors SaveEntry's own StartEntry()/FinishEntry(bool) transaction above exactly:
+// `save_succeeded` starts false, the Cleanup rolls back everything written since StartEntry() if
+// this returns before flipping it to true, and it is only flipped once every field below has
+// been written successfully. That makes a bare opcode with no payload, or a payload short of its
+// own announced `count`, structurally impossible to leave in the buffer -- a mid-section failure
+// removes the whole section, opcode included, rather than leaving a partial one for the next
+// opcode byte to desync against.
+error_code RdbSerializer::SaveTombstoneSection(
+    DbIndex db_index, absl::Span<const std::pair<std::string, MvccStamp>> entries) {
+  mem_buf_controller_.StartEntry();
+  bool save_succeeded = false;
+  absl::Cleanup cleanup = [&] { mem_buf_controller_.FinishEntry(save_succeeded); };
+
+  if (auto ec = WriteOpcode(RDB_OPCODE_DF_TOMBSTONES); ec)
+    return ec;
+  if (auto ec = SaveLen(db_index); ec)
+    return ec;
+  if (auto ec = SaveLen(entries.size()); ec)
+    return ec;
+  for (const auto& [key, stamp] : entries) {
+    if (auto ec = SaveString(key); ec)
+      return ec;
+    if (auto ec = SaveMvccStampBits(stamp); ec)
+      return ec;
+  }
+
+  save_succeeded = true;
+  return {};
+}
+
 error_code RdbSerializer::SaveObject(const PrimeValue& pv) {
   unsigned obj_type = pv.ObjType();
   CHECK_NE(obj_type, OBJ_STRING);
