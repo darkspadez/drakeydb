@@ -2984,6 +2984,271 @@ TEST_F(RdbMvccTest, RejectsPersistedTombstoneForResidentLiveKey) {
   EXPECT_TRUE(warned) << "expected a WARNING naming the rejected key and the reason";
 }
 
+// drakeydb: P4-3 Task 6 -- the delete half of the resurrection fix: applying a peer's WINNING
+// tombstone must delete a resident LIVE key, not merely decline to (re)write it (Task 5 stopped at
+// "skip and warn" for exactly this case -- see the I4 comment on that branch in rdb_load.cc, which
+// explicitly defers to this task). Peer B deleted "k" at t=0x2000 while this node was down holding
+// "k"@0x1000; B's snapshot carries a tombstone for "k" and no "k" key at all, so this tombstone
+// record is the ONLY way this node ever learns about the delete -- the resurrection hole Task 6
+// closes.
+TEST_F(RdbMvccTest, MergeLwwWinningTombstoneDeletesResidentLiveKey) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x1000, kSelfHash};
+  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"k", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil) << "a winning peer tombstone must delete our live key";
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value()) << "the tombstone must be installed with the peer's stamp";
+  EXPECT_EQ(*got, kIncomingTombstone)
+      << "no leftover {kTombstoneBit, 0} placeholder from the delete -- the peer's real stamp "
+         "must have overwritten it";
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after the delete";
+}
+
+// The guard: the same resident key, but the incoming tombstone is OLDER than the resident value's
+// own stamp. MergeAccepts must reject it -- the apply is itself LWW-guarded -- leaving both the
+// value and its stamp completely untouched, and no tombstone installed at all.
+TEST_F(RdbMvccTest, MergeLwwStaleTombstoneLeavesResidentLiveKeyIntact) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x1000, kSelfHash};
+  const MvccStamp kIncomingTombstone = MvccStamp{0x0500, kPeerHash}.AsTombstone();  // stale
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"k", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "resident_v")
+      << "a stale peer tombstone must never delete a newer resident value";
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kResidentStamp) << "the resident stamp must survive untouched";
+  EXPECT_FALSE(got->IsTombstone());
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold: the rejected tombstone touched nothing";
+}
+
+// The second guarded path: a resident TOMBSTONE, not a live key. SetTombstone alone overwrites
+// unconditionally, so without this guard a stale persisted tombstone would regress a newer
+// resident tombstone's own stamp -- and with it, its GC deadline (DeadlineMs is derived from
+// MsPart(), mvcc.h) -- silently reviving a shorter TTL than the one already committed to.
+TEST_F(RdbMvccTest, MergeLwwOlderIncomingTombstoneDoesNotRegressResidentTombstone) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentTombstone = MvccStamp{0x2000, kSelfHash}.AsTombstone();
+  const MvccStamp kIncomingTombstone = MvccStamp{0x1000, kPeerHash}.AsTombstone();  // older
+
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetTombstone(0, std::string_view{"k"},
+                                                                       kResidentTombstone);
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"k", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kResidentTombstone)
+      << "an older incoming tombstone must never regress a newer resident tombstone's stamp";
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold";
+}
+
+TEST_F(RdbMvccTest, MergeLwwNewerIncomingTombstoneUpdatesResidentTombstone) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentTombstone = MvccStamp{0x1000, kSelfHash}.AsTombstone();
+  const MvccStamp kIncomingTombstone = MvccStamp{0x3000, kPeerHash}.AsTombstone();  // newer
+
+  size_t tombstones_before = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetTombstone(0, std::string_view{"k"}, kResidentTombstone);
+    tombstones_before = db_slice.MutableStats(0)->mvcc_tombstones;
+  });
+  ASSERT_GT(tombstones_before, 0u);
+
+  std::string body = BuildTombstoneSection(0, {{"k", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t tombstones_after = 0, mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    tombstones_after = db_slice.MutableStats(0)->mvcc_tombstones;
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kIncomingTombstone) << "a newer incoming tombstone must update the resident one";
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(tombstones_after, tombstones_before)
+      << "overwriting one tombstone with another must not change the tombstone count";
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold";
+}
+
+// Non-merge control: Task 5's plain (skip-and-warn) behavior for a resident live key is untouched
+// by this task. Without SetMergeLww, the incoming tombstone's relative age is irrelevant -- Task
+// 5's branch never compares stamps at all, so even a "newer" tombstone must still be skipped.
+TEST_F(RdbMvccTest, WithoutMergeLwwNewerTombstoneStillSkipsResidentLiveKey) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x1000, kSelfHash};
+  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();  // "newer"
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"k", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "resident_v")
+      << "without merge-LWW, a resident live key must never be deleted by a tombstone record, "
+         "regardless of relative stamp age";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kResidentStamp);
+}
+
+// Non-merge control, second guarded path: without SetMergeLww, SetTombstone's own pre-existing
+// unconditional overwrite is exactly Task 5's behavior -- an OLDER incoming tombstone still
+// regresses a newer resident tombstone's stamp. This is the plain-replica/local-load compatibility
+// row the merge guard above must never touch (D-7).
+TEST_F(RdbMvccTest, WithoutMergeLwwOlderTombstoneStillRegressesResidentTombstone) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentTombstone = MvccStamp{0x2000, kSelfHash}.AsTombstone();
+  const MvccStamp kIncomingTombstone = MvccStamp{0x1000, kPeerHash}.AsTombstone();  // older
+
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetTombstone(0, std::string_view{"k"},
+                                                                       kResidentTombstone);
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"k", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kIncomingTombstone)
+      << "without merge-LWW, SetTombstone's pre-existing unconditional overwrite is unchanged";
+}
+
 // drakeydb: P4-3 Task 5, D-7 -- the write-side counterpart to NoMvccOpcodeOrAuxWhenInactive
 // above: an --active_replica off save must never emit RDB_OPCODE_DF_TOMBSTONES (byte 225 / 0xE1),
 // even though DEL below performs a real delete.
@@ -3098,6 +3363,84 @@ TEST_F(RdbMvccMultiShardTest, TombstonesRouteToOwningShardOnReload) {
       << "key_b's tombstone must have routed to its owning shard (" << shard_b << ")";
   EXPECT_EQ(*stamp_b_after, *stamp_b_before);
   EXPECT_GE(tombstones_b, 1u);
+}
+
+// drakeydb: P4-3 Task 6 -- the merge-LWW delete-or-guard path (rdb_load.cc's HandleTombstones
+// `install` lambda, `if (merge_lww)` branch) must also work when the loader fiber parsing this
+// file is NOT running on the target key's owning shard thread -- the same cross-shard dispatch
+// concern TombstonesRouteToOwningShardOnReload above exists to cover for the non-merge path (see
+// that fixture's own I5 review-fix comment). Deliberately picks a parsing proactor whose own
+// EngineShard (if it has one at all) differs from "k"'s owning shard, so `install`'s
+// `shard_set->Add(sid, ...)` cross-shard branch -- not the inlined same-thread branch -- is the one
+// that runs the actual GetMvcc/Del/SetTombstone sequence for this test.
+TEST_F(RdbMvccMultiShardTest, MergeLwwWinningTombstoneDeletesResidentLiveKeyOnNonParsingShard) {
+  ASSERT_TRUE(IsActiveReplica());
+  ASSERT_GT(shard_set->size(), 1u) << "this test requires more than one shard to be meaningful";
+
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x1000, kSelfHash};
+  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  const ShardId target_shard = Shard("k", shard_set->size());
+  shard_set->Await(target_shard, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  // Probe every proactor's own EngineShard (nullptr on a proactor with no shard, e.g. the third
+  // thread with the fixture's default num_threads_=3/num_shards=2 -- see the comment on
+  // RdbMvccMultiShardTest above) and pick one that does not own target_shard.
+  int parsing_proactor = -1;
+  for (size_t i = 0; i < pp_->size(); ++i) {
+    std::optional<ShardId> owner = pp_->at(i)->Await([]() -> std::optional<ShardId> {
+      EngineShard* es = EngineShard::tlocal();
+      if (es == nullptr)
+        return std::nullopt;
+      return es->shard_id();
+    });
+    if (!owner.has_value() || *owner != target_shard) {
+      parsing_proactor = static_cast<int>(i);
+      break;
+    }
+  }
+  ASSERT_GE(parsing_proactor, 0)
+      << "need a proactor whose own shard (if any) differs from target_shard for this test to be "
+         "meaningful";
+
+  std::string body = BuildTombstoneSection(0, {{"k", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(parsing_proactor)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil)
+      << "a winning peer tombstone must delete our live key even when parsed on another shard's "
+         "thread";
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(target_shard, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value()) << "the tombstone must have routed to its owning shard ("
+                               << target_shard << ")";
+  EXPECT_EQ(*got, kIncomingTombstone);
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold on the owning shard after the delete";
 }
 
 // drakeydb: P4-3 Task 4 -- merge-LWW on the full-sync load path. A peer-mode full sync must merge

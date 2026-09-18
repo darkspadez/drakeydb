@@ -170,7 +170,10 @@ void SliceSnapshot::FinalizeJournalStream(bool cancel) {
 // and relative to any concurrent journal blob on this same shard, carries no meaning either way:
 // tombstone application is itself LWW-guarded (MergeAccepts, mvcc.h), so whichever of the three
 // lands last for a given key resolves the same way regardless of ordering (rdb_load.cc's
-// HandleTombstones says the same on the read side).
+// HandleTombstones says the same on the read side). That guarantee was completed by P4-3 Task 6
+// (rdb_load.cc's HandleTombstones `install` lambda): before it, a tombstone landing against a
+// RESIDENT LIVE key or a resident TOMBSTONE was not yet compared via MergeAccepts on the apply
+// side, so this claim held only for the "no prior entry at all" case. It now holds unconditionally.
 //
 // Write side only -- gated on IsActiveReplica() and a non-empty tombstone table per db (D-7); the
 // read side (RdbLoader::HandleTombstones) is unconditional. An inactive node's DbTable::mvcc is
