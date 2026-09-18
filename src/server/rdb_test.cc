@@ -4767,25 +4767,30 @@ TEST_F(RdbMvccTest, SnapshotKeepsTheMvccOpcodeAcrossAMidSaveFlush) {
          "table instead of the captured one the value came from";
 }
 
-// drakeydb: P4-3 Task 12 -- the regression this task exists to fix (task-12-brief.md, controller
-// ruling 2026-09-18). Task 4 routed EVERY incoming key on a merge_lww_ peer link through the
-// ordinary MergeAccepts compare, including one with no RDB_OPCODE_DF_MVCC record at all -- exactly
-// what a real Redis/KeyDB master's RDB produces, since it cannot emit that opcode. Such a key's
-// `incoming` stamp is {0,0}, the strict minimum of operator< (mvcc.h), so it lost to EVERY resident
-// key -- test_active_replica_merges_redis_full_sync_via_synthetic_uuid (multimaster_test.py) failed
-// its "last wins" assertion because of exactly this. The ruling: {0,0} on an authenticated peer
-// link means NO AUTHORITY INFORMATION, not "older than everything" -- such a key must OVERRIDE the
-// resident value instead (CreateObjectOnShard's own comment, rdb_load.cc, carries the full ruling).
-//
-// The resident stamp's Mvcc() component is set to the largest representable value specifically so
-// this test cannot pass "by accident": if a future change silently re-routed unstamped keys back
-// through MergeAccepts, no real HopStamp could ever compare greater than this, and the test would
-// fail exactly like the pytest regression this task fixes (see task-12-report.md's falsification).
-TEST_F(RdbMvccTest, MergeLwwUnstampedIncomingOverridesResidentWithFreshPeerAttributedStamp) {
+// drakeydb: P4-3 Task 13 -- replaces Task 12's withdrawn unconditional-override rule
+// (task-12-report.md; controller reversal, task-13-report.md). `!item->has_mvcc` captured far
+// more than "a peer that cannot stamp": it also matched keys P4-2 deliberately downgraded so they
+// would LOSE (KeyDB's OBJ_MVCC_INVALID sentinel, a zero mvcc-tstamp, a malformed aux, or one
+// without an authenticated origin), which then won unconditionally instead -- and on the DFLY
+// multi-shard protocol, SaveEntry omits RDB_OPCODE_DF_MVCC outright for a {0,0} stamp, so an
+// unversioned drakeydb peer (or a whole non-active drakeydb master) would override this node's
+// ENTIRE resident dataset, a direct D-7 violation (see MergeLwwDflyUnstampedIncomingLosesTo
+// StampedResident below, pinning exactly that). The replacement: on a CLASSIC-PSYNC link only
+// (SetMergeLww's third argument), an unstamped key is stamped from the snapshot's own "ctime" aux
+// (HandleAux) -- clamped to this node's own `now`, so a peer can never claim a future time -- and
+// then runs through the ORDINARY MergeAccepts compare, never bypassed. This test: a resident key
+// written 5 real seconds AFTER the snapshot's ctime must still win against an unstamped incoming
+// key from that snapshot.
+TEST_F(RdbMvccTest, MergeLwwClassicUnstampedIncomingLosesToResidentWrittenAfterCtime) {
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
-  const MvccStamp kResidentStamp{MvccClock::kStampMask, kSelfHash};  // max representable Mvcc()
+  // Deliberately old and far below any real "now" in this process's lifetime, so `min(ctime, now)`
+  // in the implementation is a no-op here -- this test isolates the ctime-vs-resident compare
+  // itself, not the future-clamp (see MergeLwwClassicFutureCtimeClampedToNow below for that).
+  const int64_t kCtimeSec = 1'000'000;
+  const uint64_t kCtimeMs = static_cast<uint64_t>(kCtimeSec) * 1000;
+  const MvccStamp kResidentStamp{(kCtimeMs + 5000) << MvccClock::kCounterBits, kSelfHash};
 
   ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
   shard_set->Await(0, [&] {
@@ -4794,6 +4799,9 @@ TEST_F(RdbMvccTest, MergeLwwUnstampedIncomingOverridesResidentWithFreshPeerAttri
   });
 
   std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "ctime");
+  AppendString(&body, absl::StrCat(kCtimeSec));
   body.push_back(RDB_TYPE_STRING);  // no RDB_OPCODE_DF_MVCC block: unstamped, like a real Redis RDB
   AppendString(&body, "k");
   AppendString(&body, "incoming_v");
@@ -4803,41 +4811,32 @@ TEST_F(RdbMvccTest, MergeLwwUnstampedIncomingOverridesResidentWithFreshPeerAttri
   RdbLoadContext load_context;
   auto ec = pp_->at(0)->Await([&]() -> std::error_code {
     RdbLoader loader(service_.get(), &load_context);
-    loader.SetMergeLww(true, kPeerHash);
+    loader.SetMergeLww(true, kPeerHash, /*classic_protocol=*/true);
     return loader.Load(&src);
   });
   ASSERT_FALSE(ec) << ec.message();
 
-  EXPECT_EQ(Run({"get", "k"}), "incoming_v")
-      << "an unstamped peer key must override the resident value regardless of the resident stamp";
+  EXPECT_EQ(Run({"get", "k"}), "resident_v")
+      << "a resident value written AFTER the snapshot's ctime must survive an unstamped incoming "
+         "key from that snapshot";
 
   std::optional<MvccStamp> got;
   shard_set->Await(0, [&] {
     got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
   });
   ASSERT_TRUE(got.has_value());
-  EXPECT_FALSE(got->Empty())
-      << "the written stamp must not be {0,0} -- that would carry the least possible authority and "
-         "lose every future merge on this node forever, defeating the point of overriding at all";
-  EXPECT_NE(got->Mvcc(), 0u) << "must carry a freshly minted HopStamp, not a zero placeholder";
-  EXPECT_EQ(got->origin_hash, kPeerHash)
-      << "the write must be attributed to the peer link's origin (merge_origin_hash_), so it "
-         "behaves like a local write authored on behalf of that peer";
-  EXPECT_NE(*got, kResidentStamp) << "guard against a vacuous pass";
+  EXPECT_EQ(*got, kResidentStamp) << "the resident stamp must also survive untouched";
 }
 
-// The reverse of the case above: a STAMPED incoming key on the same merge_lww_ link is entirely
-// unaffected by Task 12 -- it still goes through the ordinary MergeAccepts compare and loses to a
-// newer resident value, exactly as
-// MergeLwwRejectsStaleIncomingLeavingResidentValueAndStampUntouched (Task 4) already proves. Pinned
-// again here, explicitly, as Task 12's own "no change for stamped keys" regression guard rather
-// than relying solely on that pre-existing test's continued passing.
-TEST_F(RdbMvccTest, MergeLwwStampedIncomingStillGoesThroughMergeAccepts) {
+// The mirror of the case above: a resident key written 5 seconds BEFORE the snapshot's ctime must
+// lose to the unstamped incoming key, which is stamped with ctime's (later) authority.
+TEST_F(RdbMvccTest, MergeLwwClassicUnstampedIncomingWinsAgainstResidentWrittenBeforeCtime) {
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
-  const MvccStamp kResidentStamp{0x2000, kSelfHash};
-  const MvccStamp kIncomingStamp{0x1000, kPeerHash};  // Mvcc() 0x1000 < 0x2000: strictly older
+  const int64_t kCtimeSec = 1'000'000;
+  const uint64_t kCtimeMs = static_cast<uint64_t>(kCtimeSec) * 1000;
+  const MvccStamp kResidentStamp{(kCtimeMs - 5000) << MvccClock::kCounterBits, kSelfHash};
 
   ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
   shard_set->Await(0, [&] {
@@ -4846,10 +4845,9 @@ TEST_F(RdbMvccTest, MergeLwwStampedIncomingStillGoesThroughMergeAccepts) {
   });
 
   std::string body;
-  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
-  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
-  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
-  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "ctime");
+  AppendString(&body, absl::StrCat(kCtimeSec));
   body.push_back(RDB_TYPE_STRING);
   AppendString(&body, "k");
   AppendString(&body, "incoming_v");
@@ -4859,14 +4857,67 @@ TEST_F(RdbMvccTest, MergeLwwStampedIncomingStillGoesThroughMergeAccepts) {
   RdbLoadContext load_context;
   auto ec = pp_->at(0)->Await([&]() -> std::error_code {
     RdbLoader loader(service_.get(), &load_context);
-    loader.SetMergeLww(true, kPeerHash);
+    loader.SetMergeLww(true, kPeerHash, /*classic_protocol=*/true);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "incoming_v")
+      << "an unstamped incoming key must win against a resident value written BEFORE the "
+         "snapshot's ctime";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  // +999: ctime is 1-second granularity: CreateObjectOnShard (rdb_load.cc) assumes the latest
+  // millisecond consistent with the truncated value -- see that function's own comment (post-
+  // review fix) for why the literal start-of-second value broke the same-real-second race this
+  // rule exists to resolve in the first place.
+  EXPECT_EQ(got->Mvcc(), (kCtimeMs + 999) << MvccClock::kCounterBits)
+      << "the installed stamp must carry ctime's own ms value (rounded to the latest ms within "
+         "its 1-second granularity), not a fresh HopStamp -- Task 12's withdrawn rule minted one, "
+         "Task 13 does not";
+  EXPECT_EQ(got->origin_hash, kPeerHash);
+}
+
+// drakeydb: P4-3 Task 13 -- C2 pinned: on the DFLY multi-shard protocol (classic_protocol left at
+// its default, false), an unstamped incoming key keeps D-7's {0,0} fallback and therefore still
+// loses to ANY stamped resident value, exactly as it did before Task 12 ever existed. This is the
+// scenario Task 12's withdrawn rule broke silently: SaveEntry (snapshot.cc) never emits
+// RDB_OPCODE_DF_MVCC for a {0,0} stamp, so an unversioned drakeydb peer (or a whole non-active
+// drakeydb master, all of whose keys are unstamped) must never be able to override this node's
+// resident dataset on this link type.
+TEST_F(RdbMvccTest, MergeLwwDflyUnstampedIncomingLosesToStampedResident) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x1000, kSelfHash};
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body;
+  body.push_back(RDB_TYPE_STRING);  // unstamped: no RDB_OPCODE_DF_MVCC block
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);  // classic_protocol defaults false: the DFLY link
     return loader.Load(&src);
   });
   ASSERT_FALSE(ec) << ec.message();
 
   EXPECT_EQ(Run({"get", "k"}), "resident_v")
-      << "a STAMPED incoming key must still lose to a newer resident value -- Task 12's override "
-         "rule applies only to an unstamped incoming key, never a stamped one";
+      << "C2: an unstamped key on the DFLY link must never override a stamped resident value";
 
   std::optional<MvccStamp> got;
   shard_set->Await(0, [&] {
@@ -4876,13 +4927,107 @@ TEST_F(RdbMvccTest, MergeLwwStampedIncomingStillGoesThroughMergeAccepts) {
   EXPECT_EQ(*got, kResidentStamp);
 }
 
-// drakeydb: P4-3 Task 12 -- merge_origin_hash_ == 0 should never happen on a real peer link
+// drakeydb: P4-3 Task 13 -- C1 pinned: a KeyDB OBJ_MVCC_INVALID sentinel (mvcc-tstamp aux value
+// 2^64-1, KeyDB/src/server.h:958) is deliberately treated as unstamped by HandleAux's own
+// mvcc-tstamp branch (rdb_load.cc, P4-2 Task 3) -- Task 12's withdrawn rule then let it win
+// unconditionally (+infinity authority) instead of the "no valid mvcc" it actually represents.
+// Under Task 13's ctime rule, it gets the SAME ctime authority as any other unstamped key on this
+// classic link -- so it still loses to a resident value written after ctime, exactly like
+// MergeLwwClassicUnstampedIncomingLosesToResidentWrittenAfterCtime above.
+TEST_F(RdbMvccTest, MergeLwwClassicKeyDbInvalidMvccGetsCtimeAuthorityNotInfinity) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const int64_t kCtimeSec = 1'000'000;
+  const uint64_t kCtimeMs = static_cast<uint64_t>(kCtimeSec) * 1000;
+  const MvccStamp kResidentStamp{(kCtimeMs + 5000) << MvccClock::kCounterBits, kSelfHash};
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "ctime");
+  AppendString(&body, absl::StrCat(kCtimeSec));
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "mvcc-tstamp");
+  AppendString(&body, "18446744073709551615");  // 2^64-1, KeyDB's OBJ_MVCC_INVALID
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash, /*classic_protocol=*/true);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "resident_v")
+      << "C1: OBJ_MVCC_INVALID must get ctime authority, not +infinity -- it must still lose to a "
+         "resident value written after ctime";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kResidentStamp);
+}
+
+// drakeydb: P4-3 Task 13 -- the future-ctime clamp: a snapshot claiming a ctime in the future must
+// never be believed literally (a peer's clock is not this node's authority) -- clamped to this
+// node's own `now` instead, per `min(ctime_ms, now_ms)` in CreateObjectOnShard (rdb_load.cc). Uses
+// an ABSENT key (no resident conflict) purely to observe the installed stamp's value directly.
+TEST_F(RdbMvccTest, MergeLwwClassicFutureCtimeClampedToNow) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const int64_t kFutureCtimeSec =
+      static_cast<int64_t>(time(nullptr)) + 1'000'000;  // ~11.5 days out
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "ctime");
+  AppendString(&body, absl::StrCat(kFutureCtimeSec));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash, /*classic_protocol=*/true);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+  const uint64_t after_load_ms = GetCurrentTimeMs();
+
+  EXPECT_EQ(Run({"get", "k"}), "incoming_v");
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_LE(got->MsPart(), after_load_ms)
+      << "a future ctime must be clamped to this node's own `now`, never believed literally";
+}
+
+// drakeydb: P4-3 Task 13 -- merge_origin_hash_ == 0 should never happen on a real peer link
 // (SetMergeLww's only caller, replica.cc, always passes peer_origin_hash_, which the ownership
 // comment there notes stays "unknown origin" (0) only for a non-peer Replica -- a path that never
-// sets merge_lww_ true at all), but the override write must not silently produce {mvcc, 0} in that
-// case either -- indistinguishable from a genuine self origin, misattributing the write. Falls
-// back to this node's own origin hash (PeerRegistry::kSelfIdx) instead.
-TEST_F(RdbMvccTest, MergeLwwUnstampedIncomingWithZeroOriginHashFallsBackToSelfOrigin) {
+// sets merge_lww_ true at all), but the ctime-derived stamp must not silently carry {mvcc, 0} in
+// that case either -- indistinguishable from a genuine self origin, misattributing the write.
+// Falls back to this node's own origin hash (PeerRegistry::kSelfIdx) instead.
+TEST_F(RdbMvccTest, MergeLwwClassicUnstampedIncomingWithZeroOriginHashFallsBackToSelfOrigin) {
   ASSERT_TRUE(IsActiveReplica());
   ASSERT_EQ(Run({"set", "control", "v"}), "OK");
   std::optional<MvccStamp> control_stamp;
@@ -4904,7 +5049,7 @@ TEST_F(RdbMvccTest, MergeLwwUnstampedIncomingWithZeroOriginHashFallsBackToSelfOr
   RdbLoadContext load_context;
   auto ec = pp_->at(0)->Await([&]() -> std::error_code {
     RdbLoader loader(service_.get(), &load_context);
-    loader.SetMergeLww(true, /*sender_origin_hash=*/0);
+    loader.SetMergeLww(true, /*sender_origin_hash=*/0, /*classic_protocol=*/true);
     return loader.Load(&src);
   });
   ASSERT_FALSE(ec) << ec.message();
@@ -5115,6 +5260,131 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneForAbsentKeyInstallsNoneAtCap) {
   EXPECT_EQ(dropped_after, dropped_before + 1)
       << "the cap-induced degradation must be counted here too, exactly like the delete path's";
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold when nothing was installed";
+}
+
+// drakeydb: P4-3 Task 13 review fix (I3, Important) -- MvccStamper::tlocal() is a per-SHARD-THREAD
+// singleton, not per-callback: the tombstone-install lambda (HandleTombstones, rdb_load.cc) is
+// dispatched via shard_set->Add, and an ordinary command can yield between its own arm
+// (PostUpdate::Arm() or PerformDeletionAtomic's ArmTombstone) and its eventual journal Commit()
+// (e.g. RecordJournal blocking on a slow replica or a full ring buffer). An earlier version of the
+// "no live key" fallthrough's fix (Task 12 carried item (b)) Disarmed UNCONDITIONALLY there, even
+// when found_mutable is false -- meaning this callback never itself called FindMutable and so
+// could not possibly have armed anything of its own for this key. That unconditional Disarm could
+// instead steal a DIFFERENT, concurrent fiber's still-pending, legitimate arm for the SAME key
+// name, silently orphaning ITS eventual Commit() (a real, minted stamp would then never overwrite
+// the {kTombstoneBit,0} placeholder that fiber's own delete left -- an immortal, unreapable
+// tombstone). Constructed directly here rather than via real fiber timing: arms a tombstone for
+// "ghost" and writes the matching placeholder PerformDeletionAtomic would have left for a
+// concurrent, not-yet-committed DEL, THEN loads a peer tombstone for that same (still logically
+// absent-live) key through the merge fallthrough. CommitOwnTombstone (mvcc.h) below finds and
+// consumes the concurrent arm, returning true, iff the loader's own Disarm call was correctly
+// scoped to found_mutable -- see task-13-report.md for the verbatim falsification (reverting the
+// scoping makes this return false).
+TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyDoesNotStealConcurrentArm) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    // Mirrors PerformDeletionAtomic's own synchronous placeholder write + arm (db_slice.cc) for a
+    // concurrent DEL of "ghost" that has not yet reached its own journal Commit().
+    db_slice.SetTombstone(0, std::string_view{"ghost"}, MvccStamp{MvccClock::kTombstoneBit, 0});
+    MvccStamper::tlocal()->ArmTombstone(0, std::string_view{"ghost"});
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  // Checked via shard_set->Await, BEFORE any command is dispatched: a real command would itself
+  // reach Transaction::RunCallback's own epoch end, which -- entirely correctly -- rolls back any
+  // arm still pending at that point (this test's synthetic "concurrent fiber" never goes on to
+  // commit its own arm, unlike a real one eventually would). This block must run first so it
+  // observes the state right after the loader's own install, not after that unrelated rollback.
+  std::optional<MvccStamp> got;
+  bool arm_survived = false;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    arm_survived = MvccStamper::tlocal()->CommitOwnTombstone(
+        0, std::string_view{"ghost"}, GetCurrentTimeMs(),
+        [](DbIndex, std::string_view, const MvccStamp&) {});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kIncomingTombstone)
+      << "the peer's real stamp must still have been installed over the placeholder";
+  EXPECT_TRUE(arm_survived)
+      << "the concurrent fiber's own pending tombstone arm for the SAME key must survive this "
+         "callback's install -- an unconditional Disarm here would silently steal it";
+
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+}
+
+// drakeydb: P4-3 Task 13 review fix (I4, Important) -- the per-shard tombstone cap
+// (--multi_master_max_tombstones) must gate only an install that would actually GROW the table:
+// SetTombstone's own Insert-or-overwrite (db_slice.cc) does NOT increment mvcc_tombstones when the
+// slot it is updating is ALREADY a tombstone. An earlier version of this fix applied the cap
+// unconditionally, so updating an already-tombstoned slot to a NEWER, MergeAccepts-approved stamp
+// was wrongly refused at the cap, spuriously counted as a drop, AND left the OLDER, weaker
+// tombstone stamp resident -- letting a THIRD peer's later write, correctly losing against the
+// newer stamp this callback was trying to install, wrongly win against the stale one instead (an
+// intermediate resurrection). max_tombstones=0 makes the cap trivially refuse any GROWING install,
+// without needing to pre-populate the table with real tombstones to reach it.
+TEST_F(RdbMvccTest, MergeLwwTombstoneUpdateForAbsentKeyIgnoresCapWhenNoGrowth) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_max_tombstones, 0);
+
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const MvccStamp kOldTombstone = MvccStamp{0x1000, kPeerHash}.AsTombstone();
+  const MvccStamp kNewTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  // Pre-install an OLDER tombstone directly (SetTombstone has no cap of its own -- the cap lives
+  // only at call sites) so "ghost" already occupies a tombstone slot before the merge fallthrough
+  // ever consults the cap for it: installing a NEWER stamp over it does not grow mvcc_tombstones.
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetTombstone(0, std::string_view{"ghost"},
+                                                                       kOldTombstone);
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kNewTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"ghost"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kNewTombstone)
+      << "updating an ALREADY-tombstoned slot does not grow mvcc_tombstones, so the per-shard cap "
+         "must not block it even at max_tombstones=0 -- a stale stamp here would let a later, "
+         "intermediate resurrection win";
 }
 
 }  // namespace dfly

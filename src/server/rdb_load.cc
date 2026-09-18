@@ -3086,6 +3086,17 @@ error_code RdbLoader::HandleAux(ObjSettings* settings) {
       if (age < 0)
         age = 0;
       VLOG(1) << "RDB age " << strings::HumanReadableElapsedTime(age);
+      // drakeydb: P4-3 Task 13 (reviewer-adopted ctime-authority rule, replacing Task 12's
+      // withdrawn unconditional override) -- store this snapshot's own commit time, in ms, so
+      // CreateObjectOnShard's classic-PSYNC unstamped-key path (merge_classic_protocol_) can stamp
+      // such a key with the ORIGINAL sender's wall clock instead of D-7's {0,0} fallback or Task
+      // 12's withdrawn "+infinity" override -- see that function's own comment for the full
+      // rationale. `ctime <= 0` is treated the same as absent (left at 0, the default):
+      // CreateObjectOnShard falls back to its own `now` in that case, logging once there rather
+      // than here, since this branch has no per-shard/per-key context to attribute the warning to.
+      if (ctime > 0) {
+        rdb_ctime_ms_ = static_cast<uint64_t>(ctime) * 1000;
+      }
     }
   } else if (auxkey == "used-mem") {
     int64_t usedmem;
@@ -3378,34 +3389,72 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   // ShouldDiscardKey (below, called from ReadAndDispatchObject) looks like a cheaper home for this
   // check and is wrong: it runs on the loader fiber, not the target shard, so it would read this
   // shard's mvcc side table cross-thread.
-  const MvccStamp incoming = item->has_mvcc ? item->mvcc : MvccStamp{};
+  MvccStamp incoming = item->has_mvcc ? item->mvcc : MvccStamp{};
 
-  // drakeydb: P4-3 Task 12 -- unstamped-on-a-peer-link override rule (controller ruling,
-  // 2026-09-18, task-12-brief.md). A real Redis/KeyDB master cannot emit RDB_OPCODE_DF_MVCC at
-  // all, so `incoming` above is {0,0} (item->has_mvcc == false) for every key it sends.
-  // MergeAccepts(stored, {0,0}) is false whenever `stored` holds any value, since {0,0} is the
-  // strict minimum of operator< (mvcc.h) -- so routing such a key through the ordinary merge
-  // compare below would let it lose to EVERY resident key, meaning a classic-PSYNC peer could
-  // never overwrite anything this node already holds (Task 4's regression: see
-  // test_active_replica_merges_redis_full_sync_via_synthetic_uuid in multimaster_test.py).
+  // drakeydb: P4-3 Task 13 -- ctime-authority rule for an unstamped key on a CLASSIC-PSYNC peer
+  // link, replacing Task 12's withdrawn unconditional-override rule (task-12-report.md;
+  // controller reversal, task-13-report.md). Task 12's `!item->has_mvcc` test captured far more
+  // than "a peer that cannot stamp": it also matched keys P4-2 deliberately downgraded so they
+  // would LOSE -- KeyDB's OBJ_MVCC_INVALID sentinel, a zero mvcc-tstamp, a malformed aux, or one
+  // without an authenticated origin (see HandleAux's own mvcc-tstamp branch, above in this file)
+  // -- which then won unconditionally instead. Worse, on the DFLY multi-shard protocol,
+  // SaveEntry (snapshot.cc) omits RDB_OPCODE_DF_MVCC outright for a {0,0} stamp, so an unversioned
+  // drakeydb peer, or a whole non-active drakeydb master, would override this node's ENTIRE
+  // resident dataset -- a direct D-7 violation. And "override" really meant "this peer's clock is
+  // +infinity for the whole sync": it would clobber a concurrent third-peer apply arriving during
+  // LOADING (permanent, un-journalled divergence) and resurrect every locally tombstoned key on
+  // that link.
   //
-  // The ruling: {0,0} on an authenticated peer link means NO AUTHORITY INFORMATION (the sender
-  // cannot stamp its writes at all), not "older than everything". D-7's own {0,0}-loses
-  // reasoning was about OUR OWN unversioned snapshots/files -- {0,0} there really does mean "no
-  // information" from this node's perspective, so a stamped resident value should win. A live
-  // peer's write is different: its authority is real, only its wire format cannot carry a stamp.
-  // So an unstamped incoming key on a merge_lww_ link takes OVERRIDE semantics instead: written
-  // unconditionally (both the fast-path check right below and the authoritative post-AddOrFind
-  // recheck further down are skipped for it, exactly like override_existing_keys_ for a
-  // non-merge loader), and the stamp actually written is decided just above the SetMvcc call at
-  // the bottom of this function -- see that comment for why it must not be {0,0} either.
-  //
-  // A STAMPED incoming key (item->has_mvcc true) is entirely unaffected: it still goes through
-  // the ordinary MergeAccepts compare below, exactly as Task 4 left it.
-  const bool unstamped_peer_override = merge_lww_ && !item->has_mvcc;
+  // The replacement: only on a classic-PSYNC link (merge_classic_protocol_, set exclusively by
+  // replica.cc's legacy Redis/KeyDB-protocol call site -- never the DFLY multi-shard one), an
+  // unstamped key is stamped with the SNAPSHOT'S OWN wall-clock reading (the "ctime" aux HandleAux
+  // parsed earlier in this same load, rdb_ctime_ms_, above in this file) instead of D-7's {0,0} --
+  // then runs through the EXACT SAME MergeAccepts compare as every other key, both the fast path
+  // right below and the authoritative recheck further down: no bypass, unlike Task 12. ctime is
+  // the ORIGINAL sender's own commit time, real and coarse but never a fabricated authority, and
+  // `min(ctime, now)` (never the reverse) means a peer can never claim to be newer than this
+  // node's own clock -- strictly safer than Task 12's +infinity, and safer than a bare `now` too
+  // (which would make every unstamped key from every sync look equally "freshest", clobbering
+  // relative ordering between keys written at different real times on the sender). Falls back to
+  // this node's own `now` (still clamped -- a no-op then) if ctime was absent or unusable
+  // (rdb_ctime_ms_ == 0), logged once per loader.
+  if (merge_lww_ && merge_classic_protocol_ && !item->has_mvcc) {
+    uint64_t ctime_ms = rdb_ctime_ms_;
+    if (ctime_ms == 0) {
+      if (!warned_missing_rdb_ctime_) {
+        LOG(WARNING) << "Classic-protocol peer snapshot has no usable 'ctime' aux -- falling back "
+                        "to this node's own clock as merge authority for its unstamped keys";
+        warned_missing_rdb_ctime_ = true;
+      }
+      ctime_ms = db_cntx.time_now_ms;
+    } else {
+      // drakeydb: P4-3 Task 13, post-review fix -- ctime is 1-SECOND granularity (the real Redis
+      // RDB format has no finer-grained save timestamp), while every local stamp (HopStamp) is
+      // millisecond-granularity. Using ctime's literal start-of-second value made a snapshot
+      // genuinely saved LATE in a given wall-clock second compare as OLDER than a local write
+      // made EARLIER in that SAME second, purely because truncation discarded the snapshot's own
+      // late-second fraction -- observed breaking
+      // test_active_replica_merges_redis_full_sync_via_synthetic_uuid (multimaster_test.py) in
+      // exactly this way: the test's two mset calls and the subsequent full sync routinely land
+      // within the same real second. +999 assumes the LATEST millisecond consistent with the
+      // truncated value -- the most defensible reading of "sometime during this second" -- so a
+      // peer's snapshot is only ever treated as OLDER than a local write in the same second when
+      // the local write's own millisecond-precise stamp is itself from a LATER second entirely.
+      // The symmetric risk (a peer's snapshot that was ACTUALLY saved early in its ctime second
+      // wrongly outranking a local write later in that same second) is the accepted trade-off of a
+      // 1-second-granularity peer clock -- same-second races are inherently unresolvable without
+      // finer sender-side precision, and biasing toward letting the peer's full sync actually take
+      // effect is the entire point of this rule (the original Task 4 regression this replaces).
+      ctime_ms += 999;
+    }
+    const uint64_t clamped_ms = std::min(ctime_ms, db_cntx.time_now_ms);
+    const uint64_t origin = merge_origin_hash_ != 0
+                                ? merge_origin_hash_
+                                : MvccStamper::tlocal()->OriginHash(PeerRegistry::kSelfIdx);
+    incoming = MvccStamp{clamped_ms << MvccClock::kCounterBits, origin};
+  }
 
-  if (merge_lww_ && !unstamped_peer_override &&
-      !MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming))
+  if (merge_lww_ && !MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming))
     return;  // fast path only; the authoritative check runs again below
 
   // drakeydb: P4-3 Task 4, Hazard 1 fix -- AddOrFind, not AddOrUpdate: AddOrFindInternal's own
@@ -3426,12 +3475,12 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
 
   DbSlice::ItAndUpdater& updater = *op_res;
 
-  if (merge_lww_ && !unstamped_peer_override) {
+  if (merge_lww_) {
     // The authoritative compare -- see the comment above AddOrFind for why only this one, run
-    // after AddOrFind's own last-possible yield, can be trusted. Skipped entirely for an
-    // unstamped incoming key on a peer link (unstamped_peer_override, set above): Task 12's
-    // override rule writes it unconditionally, so there is no comparison left to make here --
-    // exactly how a non-merge (merge_lww_ false) load already skips this whole block.
+    // after AddOrFind's own last-possible yield, can be trusted. `incoming` here is the SAME
+    // value the fast-path check above used -- including, per Task 13, a classic-PSYNC unstamped
+    // key's ctime-derived stamp -- so this recheck applies uniformly to every key merge_lww_
+    // covers, with no bypass for any of them.
     if (!MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming)) {
       if (updater.is_new) {
         // drakeydb: fix round 1 (M2) -- a FRESH insert can be rejected two ways, both landing here
@@ -3499,35 +3548,13 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   // tag -- regardless of mvcc_enabled(). See task-10-report.md fix round 1.
   //
   // `incoming` (computed above, before AddOrFind) is the same value this used to recompute inline
-  // (item->has_mvcc ? item->mvcc : MvccStamp{}) -- reused here rather than recomputed. NOT used
-  // verbatim when unstamped_peer_override is set -- see the stamp computed just below instead.
-  //
-  // drakeydb: P4-3 Task 12 -- the stamp an unstamped-on-a-peer-link override actually writes.
-  // Installing `incoming` (== MvccStamp{}, i.e. {0,0}) verbatim here, the same way a genuinely
-  // unversioned local snapshot falls back to it (D-7, see the long comment above), was
-  // considered and rejected: {0,0} is the strict minimum of operator< (mvcc.h), so a key written
-  // that way would carry the LEAST possible authority and lose every subsequent merge compare on
-  // this node forever -- including against another node's own future ordinary write of the
-  // SAME peer-sourced value, which is not the intended effect of "override" at all. Instead this
-  // mints a genuinely fresh HopStamp (this shard's own logical clock, same call every ordinary
-  // active write uses) and attributes it to merge_origin_hash_ -- this link's authenticated peer
-  // identity, set by SetMergeLww's caller (replica.cc) -- so the write behaves exactly like an
-  // ordinary local write made ON BEHALF OF that peer: it can win or lose future merges on its own
-  // logical-time merits from here on, instead of being pinned at the bottom forever.
-  // merge_origin_hash_ == 0 should not happen on a real peer link (SetMergeLww's caller always
-  // passes peer_origin_hash_, replica.cc), but a stale/unset value must not silently produce a
-  // {mvcc, 0} stamp -- 0 is also NodeUuidHash's never-actually-returned-but-not-reserved value,
-  // and worse, indistinguishable here from "this really is the self origin" -- so fall back to
-  // this node's own origin hash (PeerRegistry::kSelfIdx) in that case, making the write behave
-  // like an ordinary local write instead of one falsely attributed to an unidentified peer.
-  const MvccStamp stamp_to_write =
-      unstamped_peer_override
-          ? MvccStamp{MvccStamper::tlocal()->HopStamp(db_cntx.time_now_ms),
-                      merge_origin_hash_ != 0
-                          ? merge_origin_hash_
-                          : MvccStamper::tlocal()->OriginHash(PeerRegistry::kSelfIdx)}
-          : incoming;
-  db_slice->SetMvcc(db_cntx.db_index, item->key, stamp_to_write);
+  // (item->has_mvcc ? item->mvcc : MvccStamp{}) -- reused here rather than recomputed. Per Task 13
+  // (above), `incoming` may instead hold a classic-PSYNC unstamped key's ctime-derived stamp; it
+  // was ALREADY the value both the fast-path check and the authoritative recheck compared against,
+  // so installing it verbatim here (exactly as the pre-Task-13 code always did) is correct with no
+  // further special-casing -- unlike Task 12's withdrawn rule, which minted a SEPARATE stamp here
+  // that the compares above never actually saw.
+  db_slice->SetMvcc(db_cntx.db_index, item->key, incoming);
 
   if (!override_existing_keys_ && !updater.is_new) {
     LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind << " of type "
@@ -4218,14 +4245,35 @@ error_code RdbLoader::HandleTombstones() {
             // decision already taken above -- nothing has yielded since, so re-checking it a second
             // time would be redundant, not safer.
             //
-            // drakeydb: P4-3 Task 12 carried item (b) -- Disarm unconditionally before installing
-            // below, for the same reason as the authoritative-reject branch above: whether or not
-            // an expiry actually fired inside FindMutable, this call is a no-op if nothing is armed
-            // and load-bearing if something is. Must run BEFORE SetTombstone, not after:
-            // SetTombstone and the eventual Disarm target the same (db_index, key) slot, and doing
-            // this first guarantees nothing this callback itself just installed can ever be the
-            // thing a stray arm's later rollback erases.
-            MvccStamper::tlocal()->Disarm(db_index, key);
+            // drakeydb: P4-3 Task 12 carried item (b), Task 13 review fix (I3, Important) -- Disarm
+            // before installing below, for the same reason as the authoritative-reject branch
+            // above: FindMutable, when it ran, may have lazily expired this key and left a
+            // tombstone arm pending. Must run BEFORE SetTombstone, not after: SetTombstone and the
+            // eventual Disarm target the same (db_index, key) slot, and doing this first guarantees
+            // nothing this callback itself just installed can ever be the thing a stray arm's later
+            // rollback erases.
+            //
+            // SCOPED to found_mutable, NOT unconditional (Task 13 review fix I3 -- an earlier
+            // version of this fix called Disarm unconditionally here): MvccStamper::tlocal() is a
+            // per-SHARD-THREAD singleton, not per-callback -- this lambda is dispatched via
+            // shard_set->Add, and an ordinary command can yield between its own PostUpdate::Arm()
+            // (or PerformDeletionAtomic's ArmTombstone) and its eventual journal Commit() (e.g.
+            // RecordJournal blocking on a slow replica or a full ring buffer). When found_mutable
+            // is false, resident_live was false from the very start and NOTHING in this lambda has
+            // yielded or called FindMutable -- so this callback could not possibly have armed
+            // anything itself for this key. Disarming anyway in that case does not target OUR OWN
+            // arm (there is none): it can instead steal a DIFFERENT, concurrent fiber's still-
+            // pending, legitimate arm for the SAME key name (e.g. a client's own `DEL k`,
+            // mid-yield in that same window) -- that fiber's eventual Commit() then finds no arm
+            // left to stamp, and its own {kTombstoneBit, 0} placeholder is never overwritten with a
+            // real, minted stamp: an immortal, unreapable tombstone (TombstoneGcStep's reap
+            // predicate requires Mvcc() != 0, db_slice.cc), a silently-lost delete. found_mutable
+            // being true, by contrast, means FindMutable DID run for this exact key on this exact
+            // callback, so Disarming then can only ever target an arm this callback's own call
+            // could have created.
+            if (found_mutable) {
+              MvccStamper::tlocal()->Disarm(db_index, key);
+            }
 
             // drakeydb: P4-3 Task 6, review fix I2 (Important) -- "the resident-tombstone install
             // path obeys the same gate" as the delete path above: no live key was (or still is)
@@ -4249,13 +4297,31 @@ error_code RdbLoader::HandleTombstones() {
             // here either, on the branch of this fallthrough where FindMutable did yield) rather
             // than reusing `table` or re-deriving the cap decision from a delete that never
             // happened on this branch.
+            //
+            // drakeydb: Task 13 review fix (I4, Important) -- the cap must gate only an install
+            // that would actually GROW the table, exactly like PerformDeletionAtomic's own
+            // `table->stats.mvcc_tombstones < max` check does for a FRESH tombstone (db_slice.cc):
+            // SetTombstone's own Insert-or-overwrite (db_slice.cc) does NOT increment
+            // mvcc_tombstones when the slot it is updating is ALREADY a tombstone (`was_tombstone`
+            // guard) -- so refusing that case here at the cap is not just an unnecessary,
+            // spuriously-counted drop, it actively leaves the OLDER, already-resident tombstone
+            // stamp in place even though MergeAccepts (the authoritative recheck above, unchanged
+            // by this yield-free fallthrough) already decided `stamp` should win over it. A THIRD
+            // peer's later write, correctly losing against the newer `stamp` this callback was
+            // trying to install, could then wrongly win against the stale one left behind instead
+            // -- an intermediate resurrection. `would_grow` mirrors SetTombstone's own
+            // `was_tombstone` test (absent slot, or a slot that is not currently a tombstone).
             if (TombstonesEnabled()) {
               DbTable* cur_table = db_slice.GetDBTable(db_index);
-              if (cur_table != nullptr && cur_table->stats.mvcc_tombstones <
-                                              absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
-                db_slice.SetTombstone(db_index, key, stamp);
-              } else if (cur_table != nullptr) {
-                ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly
+              if (cur_table != nullptr) {
+                const std::optional<MvccStamp> existing = db_slice.GetMvcc(db_index, key);
+                const bool would_grow = !existing.has_value() || !existing->IsTombstone();
+                if (!would_grow || cur_table->stats.mvcc_tombstones <
+                                       absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
+                  db_slice.SetTombstone(db_index, key, stamp);
+                } else {
+                  ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly
+                }
               }
             }
             return;

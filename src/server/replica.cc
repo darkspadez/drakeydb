@@ -789,7 +789,14 @@ error_code Replica::InitiatePSync() {
       // must merge into this node's own dataset, not blindly replace a concurrently-newer resident
       // value. peer_origin_hash_ is this link's authenticated author identity, same as the
       // SetLoadOriginHash call just above.
-      loader.SetMergeLww(true, peer_origin_hash_);
+      //
+      // drakeydb: P4-3 Task 13 -- classic_protocol=true: this is the legacy Redis/KeyDB-protocol
+      // (classic PSYNC) full-sync path (see the P4-2 Task 3 comment on SetLoadOriginHash just
+      // above -- a KeyDB active-replica master, or a real Redis master, can only ever reach this
+      // loader, never DflyShardReplica's DFLY-protocol one). CreateObjectOnShard's own comment
+      // (rdb_load.cc) explains why this link type gets ctime-based authority for an unstamped key
+      // instead of D-7's {0,0} fallback.
+      loader.SetMergeLww(true, peer_origin_hash_, /*classic_protocol=*/true);
       // drakeydb: Phase 3 fix wave -- this legacy Redis/KeyDB-protocol loader is peer-aware
       // (merge above) but was missing the origin tag on its embedded journal-blob apply path.
       // Unreachable today (a redis-protocol master emits no RDB_OPCODE_JOURNAL_BLOB), but P7
@@ -1462,6 +1469,12 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
     // the same mapping InitiateDflySync's shard_cb registers for this thread before this flow's
     // sync fiber (this method) ever starts running (replica.cc, shard_cb comment).
     const uint32_t origin_idx = executor_->connection_context()->repl_origin_idx;
+    // drakeydb: P4-3 Task 13 -- classic_protocol left at its default (false): this is the DFLY
+    // multi-shard protocol's own loader, never reachable by a classic-PSYNC (Redis/KeyDB) master.
+    // An unstamped key here keeps D-7's {0,0} fallback and keeps losing every merge -- see
+    // CreateObjectOnShard's own comment (rdb_load.cc) for why that matters (C2): SaveEntry omits
+    // RDB_OPCODE_DF_MVCC outright for a {0,0} stamp, so an unversioned drakeydb peer, or a whole
+    // non-active drakeydb master, must never be able to override this node's resident dataset.
     rdb_loader_->SetMergeLww(true, MvccStamper::tlocal()->OriginHash(origin_idx));
   }
 

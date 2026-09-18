@@ -358,15 +358,27 @@ class RdbLoader : protected RdbLoaderBase {
   // or newly, guarded on peer mode -- grep SetMergeLww); every other loader -- a local RDB file
   // load, DEBUG LOAD/restore, and a plain Dragonfly replica's full sync -- leaves merge_lww_ at its
   // default false and keeps loading verbatim (last-loaded-wins), exactly as before this task.
-  // `sender_origin_hash`:
-  // captured for parity with SetLoadOriginHash/load_origin_hash_ immediately above, and reserved
-  // for a future record that (like KeyDB's mvcc-tstamp aux) carries no origin_hash of its own --
-  // Task 4's own compare never needs it: every RDB_OPCODE_DF_MVCC-carrying Item already carries
-  // its author's origin_hash inline (Item::mvcc.origin_hash), and an Item without one falls back
-  // to D-7's {0,0}, which MergeAccepts (mvcc.h) already handles without a substitute hash.
-  void SetMergeLww(bool enable, uint64_t sender_origin_hash) {
+  //
+  // `sender_origin_hash`: drakeydb: P4-3 Task 13 correction -- an earlier version of this comment
+  // called this parameter "reserved for a future record" and claimed "Task 4's own compare never
+  // needs it". Both were true only of Task 4's own logic and are WRONG now: CreateObjectOnShard's
+  // classic-PSYNC unstamped-key path (see `classic_protocol` below, and that function's own
+  // comment) stamps such a key with `sender_origin_hash` directly -- it is load-bearing, not
+  // reserved. Still doubles as parity with SetLoadOriginHash/load_origin_hash_ immediately above
+  // for every OTHER (stamped-item) case, where it remains unused: an Item carrying its own
+  // RDB_OPCODE_DF_MVCC record already has its author's origin_hash inline (Item::mvcc.origin_hash).
+  //
+  // `classic_protocol`: drakeydb: P4-3 Task 13 -- distinguishes replica.cc's two call sites, which
+  // Task 12's original (withdrawn) rule conflated. True only for the legacy Redis/KeyDB-protocol
+  // (classic PSYNC) full-sync path: the only one a KeyDB active-replica master's RDB stream, or a
+  // real Redis master's, can ever reach -- neither speaks the DFLY multi-shard protocol, so
+  // DflyShardReplica's own loader (the other call site) never needs this true. Defaults to false
+  // so every pre-existing (DFLY-link) call site compiles unchanged and keeps D-7's {0,0} fallback
+  // for an unstamped key, exactly as before this task.
+  void SetMergeLww(bool enable, uint64_t sender_origin_hash, bool classic_protocol = false) {
     merge_lww_ = enable;
     merge_origin_hash_ = sender_origin_hash;
+    merge_classic_protocol_ = classic_protocol;
   }
 
   std::error_code Load(::io::Source* src);
@@ -536,6 +548,22 @@ class RdbLoader : protected RdbLoaderBase {
   // See SetMergeLww's doc comment above.
   bool merge_lww_ = false;
   uint64_t merge_origin_hash_ = 0;
+  // drakeydb: P4-3 Task 13 (reviewer-adopted ctime-authority rule, replacing Task 12's withdrawn
+  // unconditional override) -- true only for replica.cc's classic-PSYNC call site (a real
+  // Redis/KeyDB master, which cannot emit RDB_OPCODE_DF_MVCC at all). See SetMergeLww's doc
+  // comment and CreateObjectOnShard's own comment (rdb_load.cc) for why this link type matters:
+  // an unstamped key on THIS kind of link is stamped from the snapshot's own `ctime` aux and
+  // still runs through the ordinary MergeAccepts compare, never bypassed; on the DFLY multi-shard
+  // protocol (this stays false) an unstamped key keeps D-7's {0,0} fallback and keeps losing,
+  // exactly as before Task 12.
+  bool merge_classic_protocol_ = false;
+  // drakeydb: P4-3 Task 13 -- this snapshot's own "ctime" aux (HandleAux, rdb_load.cc), converted
+  // to milliseconds; 0 if the aux was absent or malformed (real Redis/KeyDB RDBs always emit it,
+  // but a synthetic or truncated file might not). CreateObjectOnShard falls back to its own `now`
+  // in that case (logged once, warned_missing_rdb_ctime_ below) -- still clamped to `now`, so this
+  // degrades to "just now", never to something unsafe.
+  uint64_t rdb_ctime_ms_ = 0;
+  bool warned_missing_rdb_ctime_ = false;
   bool warned_missing_mvcc_origin_ = false;
   // drakeydb: P4-3 Task 5 -- HandleTombstones' two format-validation warnings (mvcc.h's carried
   // Task 3 contract: Mvcc() == 0 would be immortal; bit 63 clear is not a tombstone at all), each
