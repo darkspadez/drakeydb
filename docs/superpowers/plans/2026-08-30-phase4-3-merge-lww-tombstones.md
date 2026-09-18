@@ -586,3 +586,38 @@ The three other `kExpired` sites already delete before journaling and need no ch
 
 - [ ] **Step 6:** Run `ctest -L DFLY`, `multi_master_test`, `mvcc_test`. pre-commit; commit
   `fix: journal expiry after the delete so expired keys earn tombstones (P4)`.
+
+---
+
+### Task 12: Unstamped peer keys fall back to override semantics (added 2026-09-18 by controller ruling; run after Task 6)
+
+Task 4 enabled merge-LWW on the classic-PSYNC peer path (`replica.cc` `InitiatePSync`). A Redis or
+KeyDB master that cannot stamp sends every key as `{0,0}`, and `MergeAccepts(stored, {0,0})` is
+false for every stored key (ties go to the stored side), so such a peer can no longer overwrite any
+resident key. `test_active_replica_merges_redis_full_sync_via_synthetic_uuid` fails at its
+"last wins" assertion. This regresses the fork's onboarding story (D-1 defers the wire slot to P7).
+
+**Ruling:** `{0,0}` on a peer link means *no authority information*, not *older than everything*.
+D-7's "a stamped resident beats an unversioned snapshot" reasoning was about our own unversioned
+files, not a live peer that cannot stamp at all.
+
+**Files:** Modify `src/server/rdb_load.cc` (`CreateObjectOnShard` merge path); Test
+`src/server/rdb_test.cc`, `tests/dragonfly/multimaster_test.py`
+
+- [ ] **Step 1: Failing tests.** `RdbMvccTest`: resident `k` stamped `{0x1000, SELF}`; load with
+  `SetMergeLww(true, PEER)` a snapshot whose `k` carries NO stamp (`has_mvcc == false`) →
+  incoming wins (override semantics), value replaced, stamp becomes `{0,0}`... **no** — decide
+  and pin the resulting stamp explicitly: the written key must not carry `{0,0}` authority that
+  then loses every future merge; give it the load's `merge_origin_hash_` with a freshly minted
+  `HopStamp` so it behaves like a local write authored on behalf of that peer. Assert that. Then:
+  a STAMPED incoming key still goes through `MergeAccepts` (no change). Then the pytest that
+  currently fails must pass.
+- [ ] **Step 2: Run, observe failure.**
+- [ ] **Step 3: Implement** in the merge path: `if (merge_lww_ && !item->has_mvcc)` → take the
+  `override_existing_keys_` path (write unconditionally) and stamp as decided in Step 1. Keep the
+  fast path and the post-`AddOrFind` authoritative compare for stamped items exactly as Task 4 left
+  them. Document the rule at the site: unstamped-on-a-peer-link = no information = override.
+- [ ] **Step 4: Falsify** (route unstamped through `MergeAccepts` again → the pytest fails at
+  `:452` with `'local'`), restore, verbatim.
+- [ ] **Step 5:** `rdb_test`, `multi_master_test`, full `multimaster_test.py`. pre-commit; commit
+  `fix: let unstamped peer keys override resident keys on merge (P4)`; push.
