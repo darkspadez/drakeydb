@@ -3249,6 +3249,238 @@ TEST_F(RdbMvccTest, WithoutMergeLwwOlderTombstoneStillRegressesResidentTombstone
       << "without merge-LWW, SetTombstone's pre-existing unconditional overwrite is unchanged";
 }
 
+// drakeydb: P4-3 Task 6, review fix I1 (Important) -- the race itself, forced deterministically,
+// for the DELETE path this time (MergeLwwRaceConcurrentWriteDuringYieldBeatsStaleSnapshot below
+// already covers Task 4's key-write path). Before this fix, the merge-apply delete branch called
+// Del() directly on an already-found PrimeIterator with no yield at all, on the theory that the
+// idle-task eviction sweep does the same -- wrong precedent (review fix M1): that sweep runs
+// inside its own FiberAtomicGuard, which this one-shot loader path has none of. Without a yield
+// point, a SliceSnapshot fiber genuinely registered and suspended mid-SerializeEntry on this exact
+// bucket (Task 4's own Hazard 1 finding: a BGSAVE/full-sync snapshot CAN be registered while a
+// LOAD's is_replicating apply runs on this same shard thread) could have its PrimeValue freed out
+// from under it by this delete's prime.Erase. The fix routes the resident-live-key branch through
+// FindMutable first, exactly like AddOrFind's own found-bucket branch, so a registered
+// ChangeConsumerInterface gets the same chance to run first. This test reproduces the same
+// interleaving mechanism MergeLwwRaceConcurrentWriteDuringYieldBeatsStaleSnapshot below uses
+// (BlockFirstCallChangeConsumer, a plain ChangeConsumerInterface that blocks on its FIRST OnChange
+// call and passes every later one straight through) but drives it through the TOMBSTONE apply path
+// instead of the key-write path: the loader's own FindMutable call is OnChange's call #1 (blocks,
+// strictly before Del() runs), and a concurrent SET's own FindMutable->PreUpdateBlocking is call #2
+// (passes straight through). No sleeps, no timing assumptions -- WaitEntered()/Release() are a
+// util::fb2::Done pair, so the interleaving is exact every run.
+TEST_F(RdbMvccTest, MergeLwwRaceRegisteredSnapshotDuringDeleteYieldBeatsStaleTombstone) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x1000, kSelfHash};
+  // Beats kResidentStamp at the fast-path pre-check, BEFORE FindMutable's yield -- the whole
+  // point is that this tombstone must still lose once a fresher write lands during that yield.
+  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  // No trailing key after the tombstone section here (unlike this file's other tombstone tests):
+  // a fresh key loaded via the regular key stream would itself hit AddOrFindInternal's INSERT
+  // branch, which also calls CallChangeCallbacks whenever change_cb_ is non-empty (db_slice.cc) --
+  // exactly the same OnChange this test's own consumer reacts to. With a second, unrelated trigger
+  // in the stream, "call #1" could come from loading that key instead of from this test's actual
+  // target (the tombstone section's own resident-live-key delete), making the interleaving this
+  // test exists to force ambiguous. The tombstone section alone is enough to prove the point.
+  const std::string rdb = WrapInRdb(BuildTombstoneSection(0, {{"k", kIncomingTombstone}}));
+
+  class BlockFirstCallChangeConsumer final : public DbSlice::ChangeConsumerInterface {
+   public:
+    void OnChange(DbIndex, const ChangeReq&) override {
+      if (calls_++ == 0) {
+        entered_.Notify();
+        release_.Wait();
+      }
+    }
+    void WaitEntered() {
+      entered_.Wait();
+    }
+    void Release() {
+      release_.Notify();
+    }
+
+   private:
+    int calls_ = 0;
+    util::fb2::Done entered_;
+    util::fb2::Done release_;
+  } consumer;
+
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  std::error_code load_ec;
+
+  util::fb2::Fiber loader_fiber = pp_->at(0)->LaunchFiber([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    db_slice.RegisterOnChange(&consumer);
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    load_ec = loader.Load(&src);
+
+    db_slice.UnregisterOnChange(&consumer);
+  });
+
+  // Blocks THIS (the test's own) fiber until the loader fiber is genuinely parked inside
+  // OnChange's call #1 -- i.e. mid-FindMutable's PreUpdateBlocking, strictly before Del() has
+  // touched anything.
+  consumer.WaitEntered();
+
+  // The concurrent write: a plain SET on the very same key, from a completely independent path,
+  // mints and commits a real, fresh HopStamp -- standing in for "another peer's stable-sync apply
+  // landing on this shard thread during LOADING" per main_service.cc's is_replicating admission
+  // rule. Its own FindMutable->PreUpdateBlocking call is OnChange's call #2 above, which passes
+  // straight through, so this completes normally.
+  ASSERT_EQ(Run({"set", "k", "concurrent_v"}), "OK");
+
+  consumer.Release();
+  loader_fiber.Join();
+
+  ASSERT_FALSE(load_ec) << load_ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "concurrent_v")
+      << "the write that landed during FindMutable's own yield must win, even though the "
+         "loader's incoming tombstone passed the earlier, non-authoritative fast-path pre-check";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_FALSE(got->IsTombstone())
+      << "the stale incoming tombstone must not have been installed over the concurrent write's "
+         "own, freshly-minted (live) stamp";
+  EXPECT_NE(*got, kIncomingTombstone);
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold: the rejected delete touched nothing";
+}
+
+// drakeydb: P4-3 Task 6, review fix I2 (Important) -- with tombstones disabled node-wide
+// (--multi_master_tombstone_ttl=0, TombstonesEnabled() false, multi_master.cc), a winning peer
+// tombstone must still DELETE the resident live key (the peer's delete authority is real and must
+// not be silently ignored) but must install NO tombstone afterward: PerformDeletionAtomic
+// (db_slice.cc) itself refuses to arm one under this policy for a local delete, and blindly
+// installing one anyway here would create an entry TombstoneGcStep can never reap (it no-ops
+// entirely whenever !TombstonesEnabled()) -- immortal, the same failure class the Mvcc()==0
+// rejection (above in HandleTombstones) exists to prevent, just reached a different way.
+TEST_F(RdbMvccTest, MergeLwwWinningTombstoneDeletesLiveKeyButInstallsNoneWhenDisabled) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 0);
+  ASSERT_FALSE(TombstonesEnabled());
+
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x1000, kSelfHash};
+  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"k", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil)
+      << "the peer's delete authority must still apply even though tombstoning is disabled";
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  EXPECT_FALSE(got.has_value())
+      << "no tombstone may be installed while --multi_master_tombstone_ttl=0 -- one would be "
+         "immortal, since TombstoneGcStep never reaps anything under this policy";
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after a plain (non-tombstoning) erase";
+}
+
+// drakeydb: P4-3 Task 6, review fix I2 (Important) -- the second half: at the per-shard tombstone
+// cap (--multi_master_max_tombstones), PerformDeletionAtomic degrades a kExplicit delete to a
+// plain erase (counted in mvcc_tombstones_dropped) instead of arming a tombstone placeholder --
+// the merge-apply path must read and respect that exact decision instead of installing the peer's
+// tombstone anyway. max_tombstones=0 makes every delete hit the cap trivially (mvcc_tombstones(0)
+// < max(0) is never true), without needing to pre-populate the table with real tombstones first.
+TEST_F(RdbMvccTest, MergeLwwWinningTombstoneDeletesLiveKeyButInstallsNoneAtCap) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_max_tombstones, 0);
+
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x1000, kSelfHash};
+  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  size_t dropped_before = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetMvcc(0, std::string_view{"k"}, kResidentStamp);
+    dropped_before = db_slice.MutableStats(0)->mvcc_tombstones_dropped;
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"k", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil)
+      << "the peer's delete authority must still apply even at the tombstone cap";
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t dropped_after = 0, mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    dropped_after = db_slice.MutableStats(0)->mvcc_tombstones_dropped;
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  EXPECT_FALSE(got.has_value())
+      << "no tombstone may be installed once PerformDeletionAtomic itself degraded to a plain "
+         "erase at the cap";
+  EXPECT_EQ(dropped_after, dropped_before + 1)
+      << "the cap-induced degradation must still be counted, exactly as a local delete's would be";
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after a plain (capped-out) erase";
+}
+
 // drakeydb: P4-3 Task 5, D-7 -- the write-side counterpart to NoMvccOpcodeOrAuxWhenInactive
 // above: an --active_replica off save must never emit RDB_OPCODE_DF_TOMBSTONES (byte 225 / 0xE1),
 // even though DEL below performs a real delete.

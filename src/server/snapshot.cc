@@ -170,10 +170,16 @@ void SliceSnapshot::FinalizeJournalStream(bool cancel) {
 // and relative to any concurrent journal blob on this same shard, carries no meaning either way:
 // tombstone application is itself LWW-guarded (MergeAccepts, mvcc.h), so whichever of the three
 // lands last for a given key resolves the same way regardless of ordering (rdb_load.cc's
-// HandleTombstones says the same on the read side). That guarantee was completed by P4-3 Task 6
-// (rdb_load.cc's HandleTombstones `install` lambda): before it, a tombstone landing against a
-// RESIDENT LIVE key or a resident TOMBSTONE was not yet compared via MergeAccepts on the apply
-// side, so this claim held only for the "no prior entry at all" case. It now holds unconditionally.
+// HandleTombstones says the same on the read side) -- UNDER merge_lww_ specifically. That
+// guarantee was completed by P4-3 Task 6 (rdb_load.cc's HandleTombstones `install` lambda): before
+// it, a tombstone landing against a RESIDENT LIVE key or a resident TOMBSTONE was not yet compared
+// via MergeAccepts on the apply side, so the claim held only for the "no prior entry at all" case.
+// Under merge_lww_ it now holds unconditionally (review fix I3: an earlier version of this
+// sentence overclaimed unconditionally for every loader). A non-merge load (a local RDB file,
+// DEBUG LOAD/RESTORE, or a plain Dragonfly replica's full sync) instead keeps D-7's separate,
+// simpler rule -- skip a resident live key, otherwise install/overwrite unconditionally -- which
+// needs no ordering guarantee either, since it never depends on comparing against the key stream's
+// own outcome in the first place.
 //
 // Write side only -- gated on IsActiveReplica() and a non-empty tombstone table per db (D-7); the
 // read side (RdbLoader::HandleTombstones) is unconditional. An inactive node's DbTable::mvcc is
