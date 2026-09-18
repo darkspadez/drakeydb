@@ -72,8 +72,18 @@ struct DbTableStats {
   // drakeydb: P4-1 Task 5 -- number of entries in DbTable::mvcc (active mode only; stays 0
   // otherwise). Maintained in DbSlice::SetMvcc/EraseMvcc.
   size_t mvcc_entries = 0;
-  // stays 0 until P4-5; declared now so Task 10's invariant compiles.
+  // drakeydb: P4-3 Task 2 -- number of mvcc_entries above that are tombstones (a kExplicit/
+  // kExpired delete's slot, kept instead of erased so a peer's stale copy cannot resurrect it).
+  // Maintained in DbSlice::SetTombstone; the dense invariant (mvcc->size() - mvcc_tombstones ==
+  // prime.size(), db_slice.cc) is what this field exists to satisfy -- a tombstone slot has no
+  // live prime counterpart.
   size_t mvcc_tombstones = 0;
+  // drakeydb: P4-3 Task 2 -- a kExplicit/kExpired delete that WOULD have earned a tombstone but
+  // hit --multi_master_max_tombstones (this shard already has as many as the cap allows) and
+  // degraded to an erase instead. Purely diagnostic: makes that degradation visible in INFO/
+  // benchmark output rather than a silent, unbounded fallback to today's resurrection-on-full-sync
+  // behavior. Maintained in DbSlice::PerformDeletionAtomic (db_slice.cc).
+  size_t mvcc_tombstones_dropped = 0;
 
   // drakeydb: P4-2 Task 4 -- heap bytes held by the mvcc side table's own duplicated copy of
   // every key over CompactObj::kInlineLen (16 B). DashTable::mem_usage() (dash.h) only counts
@@ -201,6 +211,12 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
   // the side table's, so without a second cursor here it accumulates mimalloc fragmentation for
   // the process's lifetime. See DbSlice::DefragTableSegments (db_slice.cc).
   MvccTable::Cursor mvcc_defrag_cursor;
+  // drakeydb: P4-3 Task 3 -- the idle-task tombstone GC's own traversal position, independent of
+  // mvcc_defrag_cursor above: the two walks run on unrelated schedules (this one driven by
+  // --multi_master_tombstone_gc_budget on every idle tick once mvcc_enabled_, defrag only on an
+  // explicit MEMORY DEFRAGSEGMENTS) and must not perturb each other's progress through the table.
+  // See DbSlice::TombstoneGcStep (db_slice.cc).
+  MvccTable::Cursor mvcc_gc_cursor;
 
   struct SampleTopKeys {
     TopKeys* top_keys = nullptr;

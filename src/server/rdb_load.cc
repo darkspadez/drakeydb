@@ -3345,7 +3345,47 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     return;
   }
 
-  auto op_res = db_slice->AddOrUpdate(db_cntx, item->key, std::move(pv), item->expire_ms);
+  // drakeydb: P4-3 Task 4 -- merge-LWW for a peer-mode full sync (merge_lww_ is only ever set true
+  // by replica.cc's two peer-mode call sites; every other loader keeps the pre-existing
+  // last-loaded-wins behavior below unconditionally).
+  //
+  // Hazard 1 fix (task-4-report.md fix report) -- a compare made here, before any table mutation,
+  // is NOT authoritative: the mutation below (AddOrFind, formerly AddOrUpdate) reaches
+  // DbSlice::AddOrFindInternal's PreUpdateBlocking, or its insert branch's own CallChangeCallbacks
+  // (db_slice.cc), either of which -- per db_slice.cc's own comments on the member-expiry reaper, a
+  // prior instance of this exact hazard class -- CAN synchronously block (ThreadLocalMutex::lock's
+  // cond_var_.wait via SerializeBucketLocked, or BucketDependencies::Wait) whenever a BGSAVE/
+  // full-sync SliceSnapshot is concurrently registered on this shard. A concurrent peer apply
+  // landing in that window can change item->key's stored stamp after a pre-mutation compare ran
+  // but before any mutation happened -- so PreUpdateBlocking's yield must be BEHIND the decision,
+  // not in front of it. The check below is kept anyway as a FAST PATH ONLY: it cheaply rejects the
+  // common case (stored side already newer) without inserting an empty PrimeValue{} for a key
+  // about to be dropped regardless -- the authoritative recheck is the second one, after AddOrFind
+  // returns (see below).
+  //
+  // GetMvcc's stored side already includes TOMBSTONES (Task 2/11 leave a delete's stamp in this
+  // same side table instead of erasing it) -- that is what stops a peer's stale snapshot
+  // resurrecting a key we deleted, and it is also why tombstone application is itself LWW-guarded:
+  // whichever of {a tombstone record, this key stream, the concurrent journal blob} lands last for
+  // a given key, MergeAccepts resolves it the same way, so no ordering constraint is needed
+  // between them.
+  //
+  // ShouldDiscardKey (below, called from ReadAndDispatchObject) looks like a cheaper home for this
+  // check and is wrong: it runs on the loader fiber, not the target shard, so it would read this
+  // shard's mvcc side table cross-thread.
+  const MvccStamp incoming = item->has_mvcc ? item->mvcc : MvccStamp{};
+  if (merge_lww_ && !MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming))
+    return;  // fast path only; the authoritative check runs again below
+
+  // drakeydb: P4-3 Task 4, Hazard 1 fix -- AddOrFind, not AddOrUpdate: AddOrFindInternal's own
+  // find-or-insert, including PreUpdateBlocking (found branch) or CallChangeCallbacks (insert
+  // branch), is the LAST yield point before any mutation of this key (db_slice.cc). Verified by
+  // reading every statement between that point and the function's return in both branches:
+  // TouchTopKeysIfNeeded, TouchHllIfNeeded, AccountObjectMemory, and the various events_/stats
+  // counters are all plain, non-fiber-aware bookkeeping -- no further yield. Everything from here
+  // down to the value assignment below is therefore effectively atomic with respect to this key's
+  // mvcc stamp.
+  auto op_res = db_slice->AddOrFind(db_cntx, item->key, std::nullopt);
   if (!op_res) {
     LOG(ERROR) << "OOM failed to add key '" << item->key << "' in DB " << db_ind;
     ec_ = RdbError(errc::out_of_memory);
@@ -3354,6 +3394,36 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   }
 
   DbSlice::ItAndUpdater& updater = *op_res;
+
+  if (merge_lww_) {
+    // The authoritative compare -- see the comment above AddOrFind for why only this one, run
+    // after AddOrFind's own last-possible yield, can be trusted.
+    if (!MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming)) {
+      // Nothing happened: do not let ~AutoUpdater's implicit Run() fire PostUpdate's watch/
+      // tracking/mvcc-arm side effects for a write that never logically occurred.
+      updater.post_updater.Cancel();
+      if (updater.is_new) {
+        // The only way a FRESH insert can be rejected: a concurrent apply tombstoned this exact
+        // key, with a stamp beating ours, during AddOrFind's own yield above. Undo the insert as
+        // if it had never happened -- see RollbackFreshInsert's doc comment (db_slice.h/.cc).
+        db_slice->RollbackFreshInsert(db_cntx.db_index, updater.it);
+      }
+      return;  // stored side wins; the deserialized value is dropped (D-8 accepts that cost)
+    }
+  }
+
+  // drakeydb: P4-3 Task 4, Hazard 1 fix -- mirrors AddOrUpdateInternal's post-find work exactly
+  // (db_slice.cc): the same three public primitives, called the same way, so a merge-accepted
+  // write -- or any write at all when merge_lww_ is false -- is byte-for-byte the same mutation
+  // AddOrUpdate would have performed.
+  db_slice->ReleaseOffloadedValue(db_cntx.db_index, item->key, &updater.it->second);
+  updater.it->second = std::move(pv);
+  if (item->expire_ms) {
+    db_slice->AddExpire(db_cntx.db_index, updater.it, item->expire_ms);
+  } else {
+    db_slice->RemoveExpire(db_cntx.db_index, updater.it);
+  }
+
   updater.it->first.SetSticky(item->is_sticky);
   if (item->has_mc_flags) {
     updater.it->second.SetFlag(true);
@@ -3386,7 +3456,10 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   // claim here ("costs one predictable branch") was true of the guard but not of the call as
   // originally written, which paid for that outer round-trip -- allocating or not, depending on
   // tag -- regardless of mvcc_enabled(). See task-10-report.md fix round 1.
-  db_slice->SetMvcc(db_cntx.db_index, item->key, item->has_mvcc ? item->mvcc : MvccStamp{});
+  //
+  // `incoming` (computed above, before AddOrFind) is the same value this used to recompute inline
+  // (item->has_mvcc ? item->mvcc : MvccStamp{}) -- reused here rather than recomputed.
+  db_slice->SetMvcc(db_cntx.db_index, item->key, incoming);
 
   if (!override_existing_keys_ && !updater.is_new) {
     LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind << " of type "

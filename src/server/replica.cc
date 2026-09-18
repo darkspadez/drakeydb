@@ -778,6 +778,12 @@ error_code Replica::InitiatePSync() {
     loader.SetLoadOriginHash(peer_origin_hash_);
     if (IsPeerMode()) {
       loader.SetOverrideExistingKeys(true);  // drakeydb: merge
+      // drakeydb: P4-3 Task 4 -- last-loaded-wins (SetOverrideExistingKeys above, left untouched)
+      // is replaced by an actual LWW compare for a peer-mode link specifically: a peer's full sync
+      // must merge into this node's own dataset, not blindly replace a concurrently-newer resident
+      // value. peer_origin_hash_ is this link's authenticated author identity, same as the
+      // SetLoadOriginHash call just above.
+      loader.SetMergeLww(true, peer_origin_hash_);
       // drakeydb: Phase 3 fix wave -- this legacy Redis/KeyDB-protocol loader is peer-aware
       // (merge above) but was missing the origin tag on its embedded journal-blob apply path.
       // Unreachable today (a redis-protocol master emits no RDB_OPCODE_JOURNAL_BLOB), but P7
@@ -1429,6 +1435,23 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
   // added by the journal change. This is an expected and valid scenario, so to avoid unnecessary
   // warnings, we enable SetOverrideExistingKeys(true).
   rdb_loader_->SetOverrideExistingKeys(true);
+
+  if (peer_mode_) {
+    // drakeydb: P4-3 Task 4 -- SetOverrideExistingKeys above is left exactly as it is (Global
+    // Constraints: it has three live callers, and this exact call site, reached by a PLAIN
+    // Dragonfly replica's full sync too when peer_mode_ is false, must keep loading verbatim for
+    // that caller). Guarded on peer_mode_ specifically, unlike SetOverrideExistingKeys just above:
+    // this method is the only full-sync path a plain (non-peer) Replica of a Dragonfly master also
+    // reaches, so an unguarded SetMergeLww(true, ...) here would make a plain replica start
+    // rejecting resident-but-stale-looking writes its master already legitimately applied --
+    // silent divergence from a master that itself did nothing wrong.
+    // origin_hash: this flow's own link identity, resolved from the origin_idx already set on
+    // executor_ at construction (SetApplyOrigin above) via MvccStamper::tlocal()->OriginHash --
+    // the same mapping InitiateDflySync's shard_cb registers for this thread before this flow's
+    // sync fiber (this method) ever starts running (replica.cc, shard_cb comment).
+    const uint32_t origin_idx = executor_->connection_context()->repl_origin_idx;
+    rdb_loader_->SetMergeLww(true, MvccStamper::tlocal()->OriginHash(origin_idx));
+  }
 
   // Load incoming rdb stream.
   if (std::error_code ec = rdb_loader_->Load(&ps); ec) {

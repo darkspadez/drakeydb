@@ -346,6 +346,22 @@ class RdbLoader : protected RdbLoaderBase {
     load_origin_hash_ = origin_hash;
   }
 
+  // drakeydb: P4-3 Task 4 -- gates the merge-LWW compare CreateObjectOnShard (rdb_load.cc) runs
+  // immediately before its AddOrUpdate call. `enable`: only an authenticated peer-mode full sync
+  // may set this true (the two call sites are replica.cc:780 and :1431, both already, or newly,
+  // guarded on peer mode); every other loader -- a local RDB file load, DEBUG LOAD/restore, and a
+  // plain Dragonfly replica's full sync -- leaves merge_lww_ at its default false and keeps
+  // loading verbatim (last-loaded-wins), exactly as before this task. `sender_origin_hash`:
+  // captured for parity with SetLoadOriginHash/load_origin_hash_ immediately above, and reserved
+  // for a future record that (like KeyDB's mvcc-tstamp aux) carries no origin_hash of its own --
+  // Task 4's own compare never needs it: every RDB_OPCODE_DF_MVCC-carrying Item already carries
+  // its author's origin_hash inline (Item::mvcc.origin_hash), and an Item without one falls back
+  // to D-7's {0,0}, which MergeAccepts (mvcc.h) already handles without a substitute hash.
+  void SetMergeLww(bool enable, uint64_t sender_origin_hash) {
+    merge_lww_ = enable;
+    merge_origin_hash_ = sender_origin_hash;
+  }
+
   std::error_code Load(::io::Source* src);
 
   void set_source_limit(size_t n) {
@@ -505,6 +521,9 @@ class RdbLoader : protected RdbLoaderBase {
   size_t table_used_memory_ = 0;
   // See SetLoadOriginHash's doc comment above.
   uint64_t load_origin_hash_ = 0;
+  // See SetMergeLww's doc comment above.
+  bool merge_lww_ = false;
+  uint64_t merge_origin_hash_ = 0;
   bool warned_missing_mvcc_origin_ = false;
   ScriptMgr* script_mgr_;
   std::vector<ItemsBuf> shard_buf_;

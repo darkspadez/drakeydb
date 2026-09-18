@@ -1414,9 +1414,11 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
     if (!stamp) {
       StrAppend(&out, "state:absent shard:", sid);
     } else if (stamp->IsTombstone()) {
-      // P4-5 sets this bit; nothing does yet, but the field format is already fixed by that
-      // future task's dependency on this one, so the branch is wired in now rather than left
-      // for P4-5 to discover DEBUG MVCC never accounted for it.
+      // drakeydb: P4-3 Task 2 -- this branch was wired in ahead of anything setting the bit, so
+      // it would not be left for this task to discover DEBUG MVCC never accounted for it. Since
+      // Task 2, MvccStamper::Commit (mvcc.cc) sets kTombstoneBit on the live kExplicit delete
+      // path (PerformDeletionAtomic, db_slice.cc), so this branch is now reachable in production,
+      // not just a forward-compatible stub.
       StrAppend(&out, "state:tombstone mvcc:", stamp->Mvcc(), " ms:", stamp->MsPart(),
                 " origin:", absl::Hex(stamp->origin_hash, absl::kZeroPad16), " shard:", sid);
     } else {

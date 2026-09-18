@@ -2671,6 +2671,473 @@ TEST_F(RdbMvccTest, LoadFallsBackToZeroStampWhenOpcodeAbsent) {
          "fallback must survive Task 2's new opcode-aware path";
 }
 
+// drakeydb: P4-3 Task 4 -- merge-LWW on the full-sync load path. A peer-mode full sync must merge
+// into this node's own dataset via a real MvccStamp compare (mvcc.h's MergeAccepts), not blindly
+// overwrite a resident value the way every OTHER loader still does (the guard test at the bottom
+// of this group proves that). This first case: the incoming snapshot's stamp is STALE relative to
+// the resident value, so SetMergeLww(true, ...) must reject the incoming write outright -- both
+// the resident VALUE and its STAMP must survive completely untouched.
+TEST_F(RdbMvccTest, MergeLwwRejectsStaleIncomingLeavingResidentValueAndStampUntouched) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x2000, kSelfHash};
+  const MvccStamp kIncomingStamp{0x1000, kPeerHash};  // Mvcc() 0x1000 < 0x2000: strictly older
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
+  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "resident_v")
+      << "a stale incoming snapshot value must never overwrite a newer resident value";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kResidentStamp)
+      << "the resident stamp must also survive untouched -- MergeAccepts rejected the whole write "
+         "before AddOrUpdate/SetMvcc ever ran";
+}
+
+// The reverse of the case above: the incoming snapshot's stamp is NEWER than the resident one, so
+// SetMergeLww(true, ...) must accept it -- both the VALUE and the STAMP get installed from the
+// snapshot, exactly like the pre-Task-4 unconditional path already did for every key.
+TEST_F(RdbMvccTest, MergeLwwAcceptsNewerIncomingInstallingValueAndStamp) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x2000, kSelfHash};
+  const MvccStamp kIncomingStamp{0x3000, kPeerHash};  // Mvcc() 0x3000 > 0x2000: strictly newer
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
+  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "incoming_v");
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kIncomingStamp);
+}
+
+// Owner decision, 2026-08-30 (mvcc.h): ties are won by the STORED side. An incoming record whose
+// stamp is byte-identical to the resident one must never churn the key -- the two carry different
+// VALUES here specifically so this test can tell "the tie was resolved by MvccStamp equality"
+// (operator< never returns true for equal stamps, mvcc.h) apart from "the value happened to match
+// already".
+TEST_F(RdbMvccTest, MergeLwwExactTieKeepsResidentValue) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const MvccStamp kTiedStamp{0x2000, kPeerHash};
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kTiedStamp);
+  });
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kTiedStamp.packed);
+  absl::little_endian::Store64(block + 9, kTiedStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v_must_not_apply");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "resident_v") << "an exact stamp tie must favor the STORED side";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kTiedStamp);
+}
+
+// The guard: the exact same stale-incoming-vs-newer-resident snapshot as
+// MergeLwwRejectsStaleIncomingLeavingResidentValueAndStampUntouched above, but loaded WITHOUT ever
+// calling SetMergeLww -- proving the merge compare is opt-in, not a global behavior change. This
+// is what a plain Dragonfly replica's full sync and DEBUG LOAD/restore still do (neither call site
+// SetOverrideExistingKeys sits at is touched by this task): last-loaded-wins, exactly as before.
+TEST_F(RdbMvccTest, WithoutMergeLwwStaleSnapshotStillOverwrites) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x2000, kSelfHash};
+  const MvccStamp kIncomingStamp{0x1000, kPeerHash};  // "stale" only matters under merge-LWW
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
+  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  // No SetMergeLww call anywhere below: merge_lww_ stays at its default false.
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "incoming_v")
+      << "without SetMergeLww, the loader must keep overwriting verbatim (plain replicas, DEBUG "
+         "LOAD/restore)";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kIncomingStamp);
+}
+
+// The resurrection guard. A resident TOMBSTONE (a delete this node already committed -- Task
+// 2/11) is NEWER than the incoming snapshot's value, so MergeAccepts -- which compares via
+// operator< (masks bit 63, mvcc.h) -- must reject the incoming write the same way it would reject
+// a stale live value: the deleted key must not resurrect, and the tombstone itself (both its
+// IsTombstone() flag and its exact stamp) must survive untouched. Installs the tombstone directly
+// via DbSlice::SetTombstone rather than an actual DEL, so the test controls its stamp precisely
+// without depending on Task 2/11's own delete-path plumbing.
+TEST_F(RdbMvccTest, MergeLwwTombstoneNewerThanIncomingGuardsAgainstResurrection) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kTombstoneStamp = MvccStamp{0x5000, kSelfHash}.AsTombstone();
+  const MvccStamp kIncomingStamp{0x1000, kPeerHash};  // older than the tombstone's own Mvcc()
+
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetTombstone(0, std::string_view{"k"},
+                                                                       kTombstoneStamp);
+  });
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
+  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil) << "a stale incoming value must not resurrect a key "
+                                               "this node already tombstoned";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kTombstoneStamp) << "the tombstone must survive exactly as installed";
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold: the rejected write touched nothing";
+}
+
+// The other direction: a resident TOMBSTONE OLDER than the incoming value. MergeAccepts must
+// accept the incoming write -- the key resurrects with the snapshot's value -- and
+// DbSlice::SetMvcc's own bookkeeping (the live-key setter Task 4 calls unconditionally on accept)
+// must clear the tombstone flag and release its mvcc_tombstones credit as a side effect, with no
+// extra code needed in CreateObjectOnShard for this: SetMvcc masks bit 63 on every write and
+// decrements mvcc_tombstones whenever it overwrites a slot that was one (db_slice.cc, verified by
+// reading SetMvcc, not assumed).
+TEST_F(RdbMvccTest, MergeLwwOlderTombstoneLosesToIncomingAndClearsCleanly) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kTombstoneStamp = MvccStamp{0x1000, kSelfHash}.AsTombstone();
+  const MvccStamp kIncomingStamp{0x5000, kPeerHash};  // newer than the tombstone's own Mvcc()
+
+  size_t tombstones_before = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetTombstone(0, std::string_view{"k"}, kTombstoneStamp);
+    tombstones_before = db_slice.MutableStats(0)->mvcc_tombstones;
+  });
+  ASSERT_GT(tombstones_before, 0u);
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
+  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "incoming_v")
+      << "a newer incoming value must resurrect a key whose tombstone is older than it";
+
+  std::optional<MvccStamp> got;
+  size_t tombstones_after = 0, mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    tombstones_after = db_slice.MutableStats(0)->mvcc_tombstones;
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kIncomingStamp) << "the installed stamp must be the incoming one, tombstone bit "
+                                     "cleared by SetMvcc's own masking";
+  EXPECT_FALSE(got->IsTombstone());
+  EXPECT_EQ(tombstones_after, tombstones_before - 1)
+      << "SetMvcc must release the tombstone's mvcc_tombstones credit when it overwrites the slot";
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after the tombstone clears";
+}
+
+// drakeydb: P4-3 Task 4, Hazard 1 fix -- the race itself, forced deterministically rather than
+// hoped for. AddOrFindInternal's PreUpdateBlocking (db_slice.cc) synchronously calls every
+// registered DbSlice::ChangeConsumerInterface -- the exact mechanism SerializerBase::OnChange uses
+// to block a concurrent mutator while a BGSAVE/full-sync SliceSnapshot is serializing a bucket
+// (Hazard 1, task-4-report.md). A plain ChangeConsumerInterface that blocks on its FIRST call and
+// passes every later call straight through reproduces that same contention without needing a real
+// SliceSnapshot, large values, or SerializerBase::stream_mu_: the loader's own AddOrFind call is
+// call #1 (it blocks here, mid-PreUpdateBlocking, strictly before any mutation); a plain
+// concurrent SET's own FindMutable->PreUpdateBlocking is call #2 (passes straight through,
+// completing normally). No sleeps, no timing assumptions: WaitEntered()/Release() are a
+// util::fb2::Done pair, so the interleaving is exact every run.
+//
+// The loader runs on its own joinable fiber (LaunchFiber, not Await) specifically so this test's
+// own (calling) fiber is free to run the concurrent SET and call Release() while the loader fiber
+// is genuinely parked inside OnChange -- Await would block the calling fiber for the loader's
+// entire Load() call, leaving no fiber free to drive the "concurrent" side at all.
+TEST_F(RdbMvccTest, MergeLwwRaceConcurrentWriteDuringYieldBeatsStaleSnapshot) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x2000, kSelfHash};
+  // Beats kResidentStamp at the fast-path pre-check, BEFORE AddOrFind's yield -- the whole point
+  // is that this stamp must still lose once a fresher write lands during that yield.
+  const MvccStamp kIncomingStamp{0x3000, kPeerHash};
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
+  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "stale_incoming_v");
+  const std::string rdb = WrapInRdb(body);
+
+  class BlockFirstCallChangeConsumer final : public DbSlice::ChangeConsumerInterface {
+   public:
+    void OnChange(DbIndex, const ChangeReq&) override {
+      if (calls_++ == 0) {
+        entered_.Notify();
+        release_.Wait();
+      }
+    }
+    void WaitEntered() {
+      entered_.Wait();
+    }
+    void Release() {
+      release_.Notify();
+    }
+
+   private:
+    int calls_ = 0;
+    util::fb2::Done entered_;
+    util::fb2::Done release_;
+  } consumer;
+
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  std::error_code load_ec;
+
+  util::fb2::Fiber loader_fiber = pp_->at(0)->LaunchFiber([&] {
+    EngineShard* shard = EngineShard::tlocal();
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    // RegisterOnChange DCHECKs the shard's intent lock is held (see #7153); the lock is released
+    // again immediately after -- production only ever needs it held for the registering call
+    // itself (e.g. a DFLY SYNC command's own transaction), never for as long as the consumer stays
+    // registered.
+    shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+    db_slice.RegisterOnChange(&consumer);
+    shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    load_ec = loader.Load(&src);
+
+    db_slice.UnregisterOnChange(&consumer);
+  });
+
+  // Blocks THIS (the test's own) fiber until the loader fiber is genuinely parked inside
+  // OnChange's call #1 -- i.e. mid-PreUpdateBlocking, strictly before AddOrFind has mutated
+  // anything.
+  consumer.WaitEntered();
+
+  // The concurrent write: a plain SET on the very same key, from a completely independent path,
+  // mints and commits a real, fresh HopStamp -- standing in for "another peer's stable-sync apply
+  // landing on this shard thread during LOADING" per main_service.cc's is_replicating admission
+  // rule that motivates Hazard 1 in the first place. Its own FindMutable->PreUpdateBlocking call
+  // is OnChange's call #2 above, which passes straight through, so this completes normally.
+  ASSERT_EQ(Run({"set", "k", "concurrent_v"}), "OK");
+
+  consumer.Release();
+  loader_fiber.Join();
+
+  ASSERT_FALSE(load_ec) << load_ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "concurrent_v")
+      << "the write that landed during AddOrFind's own yield must win, even though the loader's "
+         "incoming snapshot stamp passed the earlier, non-authoritative fast-path pre-check";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_NE(*got, kIncomingStamp)
+      << "the stale incoming stamp must not have been installed over the concurrent write's own, "
+         "freshly-minted stamp";
+}
+
+// drakeydb: P4-3 Task 4, Hazard 1 fix -- the `is_new && reject` rollback path, driven directly
+// against the real DbSlice API rather than through a second live race (the only way to reach it is
+// itself a race -- see RollbackFreshInsert's own doc comment, db_slice.h -- so this test
+// constructs the POST-YIELD state by hand: it calls the exact same sequence CreateObjectOnShard
+// runs, in the exact same order, just without an actual concurrent fiber in between). Proves
+// RollbackFreshInsert leaves no prime entry and an intact dense invariant.
+TEST_F(RdbMvccTest, MergeLwwRejectedFreshInsertRollsBackCleanly) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kIncomingStamp{0x1000, kPeerHash};
+  // Newer than kIncomingStamp -- simulates a concurrent apply tombstoning this exact, previously
+  // absent key during AddOrFind's own yield, the only way a FRESH insert can be rejected.
+  const MvccStamp kTombstoneStamp = MvccStamp{0x5000, kSelfHash}.AsTombstone();
+
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    ASSERT_FALSE(db_slice.GetMvcc(0, std::string_view{"k"}).has_value())
+        << "key must start absent for this to exercise the insert branch";
+
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, 0};
+    // The exact call CreateObjectOnShard makes (rdb_load.cc): AddOrFind, not AddOrUpdate.
+    auto op_res = db_slice.AddOrFind(db_cntx, std::string_view{"k"}, std::nullopt);
+    ASSERT_TRUE(op_res.ok());
+    DbSlice::ItAndUpdater& updater = *op_res;
+    ASSERT_TRUE(updater.is_new);
+    ASSERT_EQ(updater.it->second.MallocUsed(), 0u);
+
+    // Stand-in for "a concurrent apply tombstoned this key during the yield above".
+    db_slice.SetTombstone(0, std::string_view{"k"}, kTombstoneStamp);
+
+    // The exact decision CreateObjectOnShard runs after AddOrFind returns.
+    ASSERT_FALSE(MergeAccepts(db_slice.GetMvcc(0, std::string_view{"k"}), kIncomingStamp));
+    updater.post_updater.Cancel();
+    db_slice.RollbackFreshInsert(0, updater.it);
+  });
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil)
+      << "the rolled-back insert must leave no prime entry behind";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value()) << "the tombstone itself must be untouched by the rollback";
+  EXPECT_EQ(*got, kTombstoneStamp);
+  EXPECT_EQ(mismatches, 0u)
+      << "dense invariant must hold: RollbackFreshInsert's own DCHECK plus this O(size) check";
+}
+
 // drakeydb: P4-2 Task 2, review round 1 (Important, finding 1) -- covers D-7's "parses, discards"
 // compatibility row, which neither test above exercises: both use the ACTIVE RdbMvccTest
 // fixture, and the pytest plain-replica gate

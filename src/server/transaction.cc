@@ -716,9 +716,18 @@ void Transaction::RunCallback(EngineShard* shard) {
   // at a time, so "the epoch" and "this callback" coincide for as long as that invariant holds.
   auto& db_slice = GetDbSlice(shard->shard_id());
   const bool mvcc_enabled = db_slice.mvcc_enabled();
-  absl::Cleanup epoch_end = [mvcc_enabled] {
+  // drakeydb: P4-3 Task 2 review fix (I3) -- &db_slice, not [=this]/by-value: rolls back any
+  // tombstone arm PerformDeletionAtomic (db_slice.cc) left uncommitted (this command's own
+  // journal commit never landed -- it returned non-OK, or took a NO_AUTOJOURNAL branch that
+  // skipped its own RecordJournal). Always the right DbSlice for any arm this callback itself
+  // could have created: PerformDeletionAtomic only ArmTombstones under its own ns_ ==
+  // GetDefaultNamespace() gate (review fix C2), so a tombstone arm only ever exists here when
+  // this transaction's own namespace is the default one -- exactly what db_slice already is.
+  absl::Cleanup epoch_end = [mvcc_enabled, &db_slice] {
     if (mvcc_enabled)
-      MvccStamper::tlocal()->EndOfWriteEpoch();
+      MvccStamper::tlocal()->EndOfWriteEpoch([&db_slice](DbIndex db, std::string_view key) {
+        db_slice.RollbackUncommittedTombstone(db, key);
+      });
   };
 
   shard->set_running_tx(this);
@@ -1568,9 +1577,13 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
   // thread-local, not fiber- or transaction-local -- see RunCallback's comment for the
   // running_tx_ serialization invariant this relies on.
   const bool mvcc_enabled = db_slice.mvcc_enabled();
-  absl::Cleanup epoch_end = [mvcc_enabled] {
+  // drakeydb: P4-3 Task 2 review fix (I3) -- see RunCallback's identical comment above for why
+  // &db_slice is always the right target here too.
+  absl::Cleanup epoch_end = [mvcc_enabled, &db_slice] {
     if (mvcc_enabled)
-      MvccStamper::tlocal()->EndOfWriteEpoch();
+      MvccStamper::tlocal()->EndOfWriteEpoch([&db_slice](DbIndex db, std::string_view key) {
+        db_slice.RollbackUncommittedTombstone(db, key);
+      });
   };
 
   // In NON_ATOMIC mode SquashedHopCb is invoked directly, without a wrapping RunCallback,
