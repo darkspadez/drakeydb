@@ -4767,4 +4767,354 @@ TEST_F(RdbMvccTest, SnapshotKeepsTheMvccOpcodeAcrossAMidSaveFlush) {
          "table instead of the captured one the value came from";
 }
 
+// drakeydb: P4-3 Task 12 -- the regression this task exists to fix (task-12-brief.md, controller
+// ruling 2026-09-18). Task 4 routed EVERY incoming key on a merge_lww_ peer link through the
+// ordinary MergeAccepts compare, including one with no RDB_OPCODE_DF_MVCC record at all -- exactly
+// what a real Redis/KeyDB master's RDB produces, since it cannot emit that opcode. Such a key's
+// `incoming` stamp is {0,0}, the strict minimum of operator< (mvcc.h), so it lost to EVERY resident
+// key -- test_active_replica_merges_redis_full_sync_via_synthetic_uuid (multimaster_test.py) failed
+// its "last wins" assertion because of exactly this. The ruling: {0,0} on an authenticated peer
+// link means NO AUTHORITY INFORMATION, not "older than everything" -- such a key must OVERRIDE the
+// resident value instead (CreateObjectOnShard's own comment, rdb_load.cc, carries the full ruling).
+//
+// The resident stamp's Mvcc() component is set to the largest representable value specifically so
+// this test cannot pass "by accident": if a future change silently re-routed unstamped keys back
+// through MergeAccepts, no real HopStamp could ever compare greater than this, and the test would
+// fail exactly like the pytest regression this task fixes (see task-12-report.md's falsification).
+TEST_F(RdbMvccTest, MergeLwwUnstampedIncomingOverridesResidentWithFreshPeerAttributedStamp) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{MvccClock::kStampMask, kSelfHash};  // max representable Mvcc()
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body;
+  body.push_back(RDB_TYPE_STRING);  // no RDB_OPCODE_DF_MVCC block: unstamped, like a real Redis RDB
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "incoming_v")
+      << "an unstamped peer key must override the resident value regardless of the resident stamp";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_FALSE(got->Empty())
+      << "the written stamp must not be {0,0} -- that would carry the least possible authority and "
+         "lose every future merge on this node forever, defeating the point of overriding at all";
+  EXPECT_NE(got->Mvcc(), 0u) << "must carry a freshly minted HopStamp, not a zero placeholder";
+  EXPECT_EQ(got->origin_hash, kPeerHash)
+      << "the write must be attributed to the peer link's origin (merge_origin_hash_), so it "
+         "behaves like a local write authored on behalf of that peer";
+  EXPECT_NE(*got, kResidentStamp) << "guard against a vacuous pass";
+}
+
+// The reverse of the case above: a STAMPED incoming key on the same merge_lww_ link is entirely
+// unaffected by Task 12 -- it still goes through the ordinary MergeAccepts compare and loses to a
+// newer resident value, exactly as
+// MergeLwwRejectsStaleIncomingLeavingResidentValueAndStampUntouched (Task 4) already proves. Pinned
+// again here, explicitly, as Task 12's own "no change for stamped keys" regression guard rather
+// than relying solely on that pre-existing test's continued passing.
+TEST_F(RdbMvccTest, MergeLwwStampedIncomingStillGoesThroughMergeAccepts) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x2000, kSelfHash};
+  const MvccStamp kIncomingStamp{0x1000, kPeerHash};  // Mvcc() 0x1000 < 0x2000: strictly older
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
+  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "resident_v")
+      << "a STAMPED incoming key must still lose to a newer resident value -- Task 12's override "
+         "rule applies only to an unstamped incoming key, never a stamped one";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kResidentStamp);
+}
+
+// drakeydb: P4-3 Task 12 -- merge_origin_hash_ == 0 should never happen on a real peer link
+// (SetMergeLww's only caller, replica.cc, always passes peer_origin_hash_, which the ownership
+// comment there notes stays "unknown origin" (0) only for a non-peer Replica -- a path that never
+// sets merge_lww_ true at all), but the override write must not silently produce {mvcc, 0} in that
+// case either -- indistinguishable from a genuine self origin, misattributing the write. Falls
+// back to this node's own origin hash (PeerRegistry::kSelfIdx) instead.
+TEST_F(RdbMvccTest, MergeLwwUnstampedIncomingWithZeroOriginHashFallsBackToSelfOrigin) {
+  ASSERT_TRUE(IsActiveReplica());
+  ASSERT_EQ(Run({"set", "control", "v"}), "OK");
+  std::optional<MvccStamp> control_stamp;
+  shard_set->Await(0, [&] {
+    control_stamp = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(
+        0, std::string_view{"control"});
+  });
+  ASSERT_TRUE(control_stamp.has_value());
+  const uint64_t self_origin_hash = control_stamp->origin_hash;
+  ASSERT_NE(self_origin_hash, 0u) << "guard against a vacuous pass";
+
+  std::string body;
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, /*sender_origin_hash=*/0);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "incoming_v");
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(got->origin_hash, self_origin_hash)
+      << "merge_origin_hash_ == 0 must fall back to this node's own origin hash, not write 0";
+}
+
+// drakeydb: P4-3 Task 12 carried item (b) -- FindMutable's own ExpireIfNeeded call (inside the
+// merge-apply's delete branch, rdb_load.cc, HandleTombstones) can lazily expire an already-expired
+// RESIDENT key itself before this callback ever gets to decide anything about the peer's own
+// incoming tombstone. That lazy expiry goes through PerformDeletionAtomic's kExpired branch (Task
+// 11), which ArmTombstone's the key exactly like a kExplicit delete would -- expecting
+// RecordExpiryBlocking's own journal Commit() to consume that arm. That only happens when this
+// shard's journal is actually running (ExpireIfNeeded's own `if (journal && journal_expiry)`
+// gate, db_slice.cc); an active-replica node's journal is normally always on from boot
+// (server_family.cc), but this test forces it off on shard 0 specifically to reach the narrower
+// case the brief calls out -- without an explicit Disarm on every path out of the merge-apply
+// block, that arm sits pending until some LATER, unrelated command's epoch end
+// (Transaction::RunCallback, transaction.cc) rolls it back via RollbackUncommittedTombstone --
+// erasing whatever this callback itself installed at that exact mvcc slot in the meantime, which
+// in this scenario is the peer's own real tombstone. See task-12-report.md for the verbatim
+// falsification (removing the Disarm call in the "no live key" fallthrough reproduces this:
+// `got_after` comes back empty instead of the peer's tombstone).
+TEST_F(RdbMvccTest, MergeLwwTombstoneOnLazilyExpiredResidentKeySurvivesLaterEpochEnd) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  // A whole-key TTL that has already elapsed by the time the load below runs FindMutable on it,
+  // but nothing has touched it since, so it is still physically present -- ExpireIfNeeded discovers
+  // this lazily (same recipe as multi_master_test.cc's
+  // ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc for the analogous applied-command case).
+  ASSERT_EQ(Run({"set", "k", "resident_v", "px", "10"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  MvccStamp{0x1000, kSelfHash});
+    // Force this shard's journal off, so ExpireIfNeeded's lazy expiry below skips
+    // RecordExpiryBlocking entirely (its own `journal && journal_expiry` gate, db_slice.cc) and
+    // leaves the kExpired delete's tombstone ARM genuinely uncommitted -- the exact precondition
+    // this test exists to exercise. Does not affect mvcc_enabled()/the epoch-end mechanism below,
+    // which is gated on that alone, not on journal state.
+    EngineShard::tlocal()->set_journal(false);
+  });
+  AdvanceTime(50);
+
+  std::string body = BuildTombstoneSection(0, {{"k", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  // Read the mvcc slot directly -- no command dispatch, hence no Transaction::RunCallback epoch
+  // end yet -- to pin down that the peer's tombstone landed correctly immediately after load,
+  // before any later epoch-end machinery has had a chance to run at all.
+  std::optional<MvccStamp> got_right_after_load;
+  shard_set->Await(0, [&] {
+    got_right_after_load =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got_right_after_load.has_value())
+      << "the peer's tombstone must be installed right after load";
+  EXPECT_EQ(*got_right_after_load, kIncomingTombstone);
+
+  // Any ordinary command reaches Transaction::RunCallback's epoch-end cleanup (transaction.cc),
+  // which rolls back any tombstone arm still pending from before -- including this GET itself,
+  // the very first command dispatched since the load. If the loader's own Disarm call
+  // (rdb_load.cc) were skipped, this is exactly where the peer's tombstone would get silently
+  // erased (confirmed by the falsification in task-12-report.md: removing that Disarm call makes
+  // `got_after_one_epoch` below come back empty, not merely the assertion above).
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil);
+
+  std::optional<MvccStamp> got_after_one_epoch;
+  shard_set->Await(0, [&] {
+    got_after_one_epoch =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got_after_one_epoch.has_value())
+      << "the peer's tombstone must survive the first command dispatched after load";
+  EXPECT_EQ(*got_after_one_epoch, kIncomingTombstone);
+
+  // A second, unrelated command's epoch end must not disturb it either -- not a one-off survival.
+  EXPECT_THAT(Run({"get", "unrelated"}), kMatchNil);
+
+  std::optional<MvccStamp> got_after_second_epoch;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got_after_second_epoch = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got_after_second_epoch.has_value())
+      << "the peer's tombstone must survive a second, unrelated command's epoch end too -- an "
+         "orphaned expiry arm from FindMutable's own lazy expiry must not roll it back";
+  EXPECT_EQ(*got_after_second_epoch, kIncomingTombstone);
+  EXPECT_EQ(mismatches, 0u);
+}
+
+// drakeydb: P4-3 Task 12 carried item (c) -- the "no live key" tombstone install path (the
+// fallthrough at the end of the merge-apply block, rdb_load.cc HandleTombstones) previously
+// honoured TombstonesEnabled() alone, unlike the delete branch just above it (and
+// PerformDeletionAtomic itself, db_slice.cc), which also caps at --multi_master_max_tombstones.
+// Neither existing policy test (MergeLwwWinningTombstoneDeletesLiveKeyButInstallsNoneWhenDisabled/
+// AtCap, Task 6) exercises this branch: both use a RESIDENT key, which always returns from the
+// delete branch above and never reaches this one -- an ABSENT key is required instead.
+TEST_F(RdbMvccTest, MergeLwwTombstoneForAbsentKeyInstallsNoneWhenDisabled) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 0);
+  ASSERT_FALSE(TombstonesEnabled());
+
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "ghost"}), kMatchNil);
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  EXPECT_FALSE(got.has_value())
+      << "no tombstone may be installed for an absent key while --multi_master_tombstone_ttl=0 -- "
+         "one would be immortal, since TombstoneGcStep never reaps anything under this policy";
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold when nothing was installed";
+}
+
+// The cap-side counterpart to the disabled-policy test above, mirroring
+// MergeLwwWinningTombstoneDeletesLiveKeyButInstallsNoneAtCap's recipe for the delete branch.
+TEST_F(RdbMvccTest, MergeLwwTombstoneForAbsentKeyInstallsNoneAtCap) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_max_tombstones, 0);
+
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  size_t dropped_before = 0;
+  shard_set->Await(0, [&] {
+    dropped_before = namespaces->GetDefaultNamespace()
+                         .GetCurrentDbSlice()
+                         .MutableStats(0)
+                         ->mvcc_tombstones_dropped;
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "ghost"}), kMatchNil);
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t dropped_after = 0, mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    dropped_after = db_slice.MutableStats(0)->mvcc_tombstones_dropped;
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  EXPECT_FALSE(got.has_value())
+      << "no tombstone may be installed for an absent key once the per-shard cap "
+         "(--multi_master_max_tombstones) is reached";
+  EXPECT_EQ(dropped_after, dropped_before + 1)
+      << "the cap-induced degradation must be counted here too, exactly like the delete path's";
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold when nothing was installed";
+}
+
 }  // namespace dfly
