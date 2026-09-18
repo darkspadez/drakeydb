@@ -3118,8 +3118,9 @@ TEST_F(RdbMvccTest, MergeLwwRejectedFreshInsertRollsBackCleanly) {
 
     // The exact decision CreateObjectOnShard runs after AddOrFind returns.
     ASSERT_FALSE(MergeAccepts(db_slice.GetMvcc(0, std::string_view{"k"}), kIncomingStamp));
-    updater.post_updater.Cancel();
-    db_slice.RollbackFreshInsert(0, updater.it);
+    // drakeydb: fix round 1 (I1) -- RollbackFreshInsert now takes the whole ItAndUpdater and
+    // cancels the AutoUpdater itself; the caller no longer calls post_updater.Cancel() separately.
+    db_slice.RollbackFreshInsert(0, updater);
   });
 
   EXPECT_THAT(Run({"get", "k"}), kMatchNil)
@@ -3136,6 +3137,44 @@ TEST_F(RdbMvccTest, MergeLwwRejectedFreshInsertRollsBackCleanly) {
   EXPECT_EQ(*got, kTombstoneStamp);
   EXPECT_EQ(mismatches, 0u)
       << "dense invariant must hold: RollbackFreshInsert's own DCHECK plus this O(size) check";
+}
+
+// drakeydb: fix round 1 (I1) -- RollbackFreshInsert's own CHECK(it_updater.is_new) is what stands
+// between a correct rollback and silently erasing a live key in a release build (see its doc
+// comment, db_slice.h/.cc): MallocUsed() == 0 alone cannot tell a fresh, still-empty insert apart
+// from a resident inline/INT-encoded value -- `SET k 5` also reports 0. Proves the guard actually
+// fires on exactly that non-fresh case. CHECK, unlike DCHECK, is never compiled out under NDEBUG,
+// so this death test needs no #ifndef NDEBUG guard. "threadsafe" death-test style sidesteps the
+// classic fork()-in-a-multithreaded-process hazard this fixture's own proactor/shard thread would
+// otherwise create for the default fork-only style -- the same workaround helio uses for its one
+// surviving fiber-context death test (helio/util/fibers/fibers_test.cc,
+// PersistentWaiterStarvationDCheck); two earlier attempts there without it were disabled outright
+// (`#if 0`) for exactly this class of flakiness.
+//
+// Falsification (fix round 1): reverted the guard from CHECK to DCHECK, rebuilt in release
+// (-DNDEBUG), and confirmed this test failed to observe a crash -- RollbackFreshInsert instead
+// silently erased the live key, exactly I1's failure scenario. Restored to CHECK; verbatim output
+// recorded in task-4-report.md.
+TEST_F(RdbMvccTest, RollbackFreshInsertRefusesNonFreshEntry) {
+  ASSERT_TRUE(IsActiveReplica());
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  // Resident, inline/INT-encoded -- MallocUsed() == 0, same as AddOrFindInternal's fresh, still-
+  // empty PrimeValue{}, which is exactly the confusion this guard exists to resolve.
+  ASSERT_EQ(Run({"set", "k", "5"}), "OK");
+
+  EXPECT_DEATH(
+      {
+        shard_set->Await(0, [&] {
+          auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+          DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, 0};
+          auto op_res = db_slice.AddOrFind(db_cntx, std::string_view{"k"}, std::nullopt);
+          CHECK(op_res.ok());
+          DbSlice::ItAndUpdater& updater = *op_res;
+          CHECK(!updater.is_new) << "k is resident: AddOrFind must find it, not insert";
+          db_slice.RollbackFreshInsert(0, updater);
+        });
+      },
+      "Check failed: it_updater.is_new");
 }
 
 // drakeydb: P4-2 Task 2, review round 1 (Important, finding 1) -- covers D-7's "parses, discards"

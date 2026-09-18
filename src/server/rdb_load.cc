@@ -3399,14 +3399,21 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     // The authoritative compare -- see the comment above AddOrFind for why only this one, run
     // after AddOrFind's own last-possible yield, can be trusted.
     if (!MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming)) {
-      // Nothing happened: do not let ~AutoUpdater's implicit Run() fire PostUpdate's watch/
-      // tracking/mvcc-arm side effects for a write that never logically occurred.
-      updater.post_updater.Cancel();
       if (updater.is_new) {
-        // The only way a FRESH insert can be rejected: a concurrent apply tombstoned this exact
-        // key, with a stamp beating ours, during AddOrFind's own yield above. Undo the insert as
-        // if it had never happened -- see RollbackFreshInsert's doc comment (db_slice.h/.cc).
-        db_slice->RollbackFreshInsert(db_cntx.db_index, updater.it);
+        // drakeydb: fix round 1 (M2) -- a FRESH insert can be rejected two ways, both landing here
+        // with is_new == true: (1) a concurrent apply tombstoned this exact, previously-absent key,
+        // with a stamp beating ours, during AddOrFind's own yield above; or (2) a concurrent live
+        // SET created this same key during that yield's insert-branch CallChangeCallbacks call
+        // (db_slice.cc) -- AddOrFindInternal's insert branch never re-checks existence after that
+        // yield and force-inserts regardless. Either way, RollbackFreshInsert undoes the insert as
+        // if it had never happened, and cancels the AutoUpdater itself -- see its doc comment
+        // (db_slice.h/.cc).
+        db_slice->RollbackFreshInsert(db_cntx.db_index, updater);
+      } else {
+        // Nothing happened to a pre-existing entry: do not let ~AutoUpdater's implicit Run() fire
+        // PostUpdate's watch/tracking/mvcc-arm side effects for a write that never logically
+        // occurred.
+        updater.post_updater.Cancel();
       }
       return;  // stored side wins; the deserialized value is dropped (D-8 accepts that cost)
     }

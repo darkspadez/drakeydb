@@ -1174,10 +1174,27 @@ OpResult<DbSlice::ItAndUpdater> DbSlice::AddOrFindInternal(const Context& cntx, 
 // upon deletion" -- that growth belongs to the segment, which stays), and not the events_/
 // garbage-collection counters the insert may have bumped, which reflect real work the dash table
 // already did regardless of whether this particular key survives.
-void DbSlice::RollbackFreshInsert(DbIndex db_ind, const Iterator& it) {
+//
+// drakeydb: fix round 1 (I1) -- CHECK, not DCHECK, and it runs first, before anything else: it is
+// the ONLY thing standing between a correct rollback and silently erasing a live key in a release
+// build, because MallocUsed() == 0 (checked just below) is equally true of a resident inline or
+// INT-encoded value and cannot tell the two cases apart on its own (task-4-review.md finding I1).
+void DbSlice::RollbackFreshInsert(DbIndex db_ind, ItAndUpdater& it_updater) {
+  CHECK(it_updater.is_new) << "RollbackFreshInsert only undoes a FRESH AddOrFind insert; refusing "
+                              "to erase a pre-existing entry for key '"
+                           << it_updater.it.key() << "'";
+
+  const Iterator& it = it_updater.it;
   DCHECK(IsValid(it));
   DCHECK_EQ(it->second.MallocUsed(), 0u)
       << "RollbackFreshInsert is only valid for AddOrFindInternal's still-empty PrimeValue{}";
+
+  // Suppress ~AutoUpdater's implicit Run(): the write this rollback undoes never logically
+  // happened, so PostUpdate's watch/tracking/mvcc-arm side effects must not fire for it -- and an
+  // uncancelled Run() would otherwise DCHECK (RunInternal, above in this file) against an iterator
+  // this method is about to erase. Previously the caller's job, paired only by a doc-comment
+  // contract; folded in here so the pairing cannot be split by omission.
+  it_updater.post_updater.Cancel();
 
   auto& db = *db_arr_[db_ind];
   const string_view key = it.key();
@@ -1197,7 +1214,16 @@ void DbSlice::RollbackFreshInsert(DbIndex db_ind, const Iterator& it) {
   // The caller never called SetMvcc/EnsureMvcc for this key (it decided to reject the write before
   // doing either), so the mvcc side table has no slot for it -- erasing the prime entry above is
   // therefore the WHOLE fix, immediately restoring the dense invariant.
-  if (db.mvcc)
+  //
+  // drakeydb: fix round 1 (M1) -- scoped to the default namespace for the same reason
+  // OnCbFinishBlocking's and TEST_VerifyMvccTable's identical checks are (both in this file):
+  // DbTable::mvcc is allocated per-shard from the global IsActiveReplica() flag (table.cc), not
+  // per-namespace, so a non-default ACL namespace has a populated prime table but a permanently
+  // empty, never-armed mvcc table -- reachable by any ACL-namespaced client (acl_family.cc's
+  // NAMESPACE: directive). Without this scope such a client's rollback would trip the DCHECK below
+  // for a reason that has nothing to do with this method's own correctness. Do not "fix" it by
+  // removing the scope -- see TEST_VerifyMvccTable for the longer version of this comment.
+  if (db.mvcc && ns_ == &namespaces->GetDefaultNamespace())
     DCHECK_EQ(db.mvcc->size() - db.stats.mvcc_tombstones, db.prime.size());
 }
 

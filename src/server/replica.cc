@@ -755,8 +755,14 @@ error_code Replica::InitiatePSync() {
     absl::Cleanup cleanup = [this]() { service_.RemoveLoadingState(); };
 
     if (IsPeerMode()) {
-      // drakeydb: an active node merges the peer's snapshot into its own dataset instead of
-      // replacing it. RdbLoader already overrides existing keys (last-loaded-wins until P6).
+      // drakeydb: fix round 1 (M5) -- an active node merges the peer's snapshot into its own
+      // dataset instead of flushing first: the loader below gets SetOverrideExistingKeys(true) AND
+      // SetMergeLww(true, ...) (P4-3 Task 4), so each incoming key is compared against this node's
+      // own MVCC side table and only overwritten when the incoming stamp is actually newer (ties go
+      // to the stored side) -- see CreateObjectOnShard's own comment (rdb_load.cc) for the compare
+      // itself. Flushing first is exactly what merge-LWW makes unnecessary and wrong: it would
+      // throw away a resident key that is concurrently newer than anything in the peer's snapshot
+      // before the compare ever got a chance to protect it.
       LOG(INFO) << "Peer full sync: merging without flush " << this;
     } else if (slot_range_.has_value()) {
       JournalExecutor{&service_}.FlushSlots(slot_range_.value());
@@ -1021,8 +1027,14 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
 
       passed_full_sync_ = false;
       if (IsPeerMode()) {
-        // drakeydb: an active node merges the peer's snapshot into its own dataset instead of
-        // replacing it. RdbLoader already overrides existing keys (last-loaded-wins until P6).
+        // drakeydb: fix round 1 (M5) -- an active node merges the peer's snapshot into its own
+        // dataset instead of flushing first: each shard's DflyShardReplica::FullSyncDflyFb loader
+        // (below in this file) gets SetOverrideExistingKeys(true) AND, when peer_mode_ is set,
+        // SetMergeLww(true, ...) (P4-3 Task 4), so every incoming key is compared against this
+        // node's own MVCC side table and only overwritten when the incoming stamp is actually
+        // newer (ties go to the stored side). Flushing first is exactly what merge-LWW makes
+        // unnecessary and wrong here too: it would discard a resident key that is concurrently
+        // newer than the peer's snapshot before the per-shard compare ever ran.
         LOG(INFO) << "Peer full sync: merging without flush " << this;
       } else {
         DVLOG(1) << "Calling Flush on all slots " << this;

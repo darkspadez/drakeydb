@@ -328,22 +328,30 @@ class DbSlice {
   // concurrent apply can tombstone a key, with a stamp beating an in-flight peer snapshot's, during
   // AddOrFind's own PreUpdateBlocking/insert-branch yield -- see that call site). Only ever valid
   // for the specific empty PrimeValue{} AddOrFindInternal's insert branch just placed
-  // (db_slice.cc): MallocUsed() == 0 (DCHECK'd), no expiry, no mvcc slot (the caller must not have
-  // called SetMvcc/EnsureMvcc yet), no journal entry was ever going to be written for it (a load
-  // has no COMMAND journal entry) -- this key was never observable to any other caller. NOT a
-  // substitute for PerformDeletionAtomic: that method assumes a real, observable, possibly-non-
-  // empty key, and journals/tombstones/notifies accordingly; none of that applies here, so this
-  // mirrors, in reverse, only the key/entry-count/slot bookkeeping AddOrFindInternal's insert
-  // branch performed -- the same way PerformDeletionAtomic mirrors that same insert branch for a
-  // REAL delete, minus everything a still-empty, still-unobserved entry never needed. Restores the
-  // dense invariant (mvcc->size() - mvcc_tombstones == prime.size()) immediately, since no mvcc
-  // slot was ever created for this key to begin with -- DCHECK'd in the .cc.
+  // (db_slice.cc): MallocUsed() == 0, no expiry, no mvcc slot (the caller must not have called
+  // SetMvcc/EnsureMvcc yet), no journal entry was ever going to be written for it (a load has no
+  // COMMAND journal entry) -- this key was never observable to any other caller. NOT a substitute
+  // for PerformDeletionAtomic: that method assumes a real, observable, possibly-non-empty key, and
+  // journals/tombstones/notifies accordingly; none of that applies here, so this mirrors, in
+  // reverse, only the key/entry-count/slot bookkeeping AddOrFindInternal's insert branch performed
+  // -- the same way PerformDeletionAtomic mirrors that same insert branch for a REAL delete, minus
+  // everything a still-empty, still-unobserved entry never needed. Restores the dense invariant
+  // (mvcc->size() - mvcc_tombstones == prime.size()) immediately, since no mvcc slot was ever
+  // created for this key to begin with -- DCHECK'd in the .cc, scoped to the default namespace like
+  // its two siblings (OnCbFinishBlocking, TEST_VerifyMvccTable).
   //
-  // Caller must have already called `it_updater.post_updater.Cancel()` before this: this method
-  // does not touch it, and the AutoUpdater's own DCHECK (RunInternal, db_slice.cc) would fail if
-  // its still-live Run() (e.g. from its destructor) ran against an iterator this method just
-  // erased.
-  void RollbackFreshInsert(DbIndex db_ind, const Iterator& it);
+  // drakeydb: fix round 1 (I1) -- takes the ItAndUpdater& the caller already holds, not a bare
+  // Iterator, so this method enforces its own precondition instead of trusting the caller to get it
+  // right: CHECK(it_updater.is_new) fires in every build, not just debug (CHECK is never compiled
+  // out under NDEBUG, unlike DCHECK) if called on a pre-existing entry. That distinction matters
+  // because MallocUsed() == 0 alone cannot tell a fresh, still-empty insert apart from a live
+  // inline or INT-encoded value (e.g. `SET k 5` also reports 0) -- silently erasing the latter
+  // would drop a live key from this shard with no journal entry, no tombstone, and no
+  // client-tracking invalidation, exactly the silent-divergence class this task exists to prevent.
+  // This method also now calls `it_updater.post_updater.Cancel()` itself (previously the caller's
+  // job, paired only by a doc-comment contract) so the two halves of the contract cannot be split
+  // by omission.
+  void RollbackFreshInsert(DbIndex db_ind, ItAndUpdater& it_updater);
 
   // Same as AddOrSkip, but overwrites in case entry exists.
   OpResult<ItAndUpdater> AddOrUpdate(const Context& cntx, std::string_view key, PrimeValue obj,

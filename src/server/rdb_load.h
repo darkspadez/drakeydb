@@ -346,12 +346,19 @@ class RdbLoader : protected RdbLoaderBase {
     load_origin_hash_ = origin_hash;
   }
 
-  // drakeydb: P4-3 Task 4 -- gates the merge-LWW compare CreateObjectOnShard (rdb_load.cc) runs
-  // immediately before its AddOrUpdate call. `enable`: only an authenticated peer-mode full sync
-  // may set this true (the two call sites are replica.cc:780 and :1431, both already, or newly,
-  // guarded on peer mode); every other loader -- a local RDB file load, DEBUG LOAD/restore, and a
-  // plain Dragonfly replica's full sync -- leaves merge_lww_ at its default false and keeps
-  // loading verbatim (last-loaded-wins), exactly as before this task. `sender_origin_hash`:
+  // drakeydb: P4-3 Task 4 -- gates the merge-LWW logic CreateObjectOnShard (rdb_load.cc) runs
+  // around its AddOrFind call. There is no longer a single compare immediately before a single
+  // AddOrUpdate: Hazard 1's fix (task-4-report.md) split it into a non-authoritative fast-path
+  // compare before AddOrFind (cheaply rejects the common case without an insert) and the real,
+  // authoritative compare after AddOrFind returns -- the only point with no further yield before
+  // the value assignment -- which on rejection either cancels the AutoUpdater in place (pre-
+  // existing entry) or calls DbSlice::RollbackFreshInsert (fresh insert). See that function's own
+  // comment for why line numbers are not cited here: they drift. `enable`: only an authenticated
+  // peer-mode full sync may set this true (replica.cc's two SetMergeLww call sites, both already,
+  // or newly, guarded on peer mode -- grep SetMergeLww); every other loader -- a local RDB file
+  // load, DEBUG LOAD/restore, and a plain Dragonfly replica's full sync -- leaves merge_lww_ at its
+  // default false and keeps loading verbatim (last-loaded-wins), exactly as before this task.
+  // `sender_origin_hash`:
   // captured for parity with SetLoadOriginHash/load_origin_hash_ immediately above, and reserved
   // for a future record that (like KeyDB's mvcc-tstamp aux) carries no origin_hash of its own --
   // Task 4's own compare never needs it: every RDB_OPCODE_DF_MVCC-carrying Item already carries
