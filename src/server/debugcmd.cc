@@ -1285,8 +1285,8 @@ void DebugCmd::Inspect(string_view key, facade::CmdArgParser parser, CommandCont
 // Three forms, dispatched on what follows "MVCC":
 //   DEBUG MVCC <key>    -- shard-hops to <key>'s shard (Inspect()'s precedent, above) and prints
 //                           its stamp.
-//   DEBUG MVCC          -- per-shard aggregates (side-table entries/tombstones/bytes, this
-//                           shard's clock/unstamped-write counters).
+//   DEBUG MVCC          -- per-shard aggregates (side-table entries/tombstones/tombstones_dropped/
+//                           bytes, this shard's clock/unstamped-write counters).
 //   DEBUG MVCC VERIFY   -- runs the from-scratch dense-invariant check (DbSlice::
 //                           TEST_VerifyMvccTable) on every db of every shard.
 //
@@ -1348,6 +1348,12 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
     struct ShardMvccInfo {
       size_t entries = 0;
       size_t tombstones = 0;
+      // drakeydb: P4-3 Task 8 -- task-2-report.md's minor gap: INFO memory got
+      // mvcc_tombstones_dropped (a delete that earned a tombstone but hit
+      // --multi_master_max_tombstones and silently degraded to resurrection-on-full-sync
+      // instead), but this aggregate never surfaced the per-shard count an operator would need to
+      // tell WHICH shard is degrading. Same DbTableStats field INFO reads, summed the same way.
+      size_t tombstones_dropped = 0;
       size_t bytes = 0;
       uint64_t clock_last = 0;
       uint64_t clock_ahead_ms = 0;
@@ -1370,6 +1376,7 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
         total += db_stats;
       info.entries = total.mvcc_entries;
       info.tombstones = total.mvcc_tombstones;
+      info.tombstones_dropped = total.mvcc_tombstones_dropped;
       // drakeydb: Task 11 fix round 1 (F3, Minor) -- DbSlice::mvcc_table_memory() (db_slice.h)
       // already sums DbTable::mvcc_table_memory() over every db directly; re-deriving the same
       // number via total.mvcc_table_bytes above would just repeat that summation a second time
@@ -1388,8 +1395,9 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
     for (size_t i = 0; i < infos.size(); ++i) {
       const ShardMvccInfo& info = infos[i];
       StrAppend(&resp, i == 0 ? "" : " ", "shard", i, "_entries:", info.entries, " shard", i,
-                "_tombstones:", info.tombstones, " shard", i, "_bytes:", info.bytes, " shard", i,
-                "_clock_last:", info.clock_last, " shard", i,
+                "_tombstones:", info.tombstones, " shard", i,
+                "_tombstones_dropped:", info.tombstones_dropped, " shard", i, "_bytes:", info.bytes,
+                " shard", i, "_clock_last:", info.clock_last, " shard", i,
                 "_clock_ahead_ms:", info.clock_ahead_ms, " shard", i,
                 "_unstamped_writes:", info.unstamped_writes);
     }

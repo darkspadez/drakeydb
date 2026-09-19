@@ -1718,9 +1718,16 @@ void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult resul
   }
 
   // If autojournaling was disabled and not re-enabled the callback is writing to journal.
-  // drakeydb: P4-3 Task 7 -- routed through IsAutoJournalSuppressed() (transaction.h) so this
-  // check and that public accessor (used by SORT's WillAutoJournalVerbatim, generic_family.cc)
-  // can never drift apart.
+  // drakeydb: P4-3 Task 7 -- routed through IsAutoJournalSuppressed() (transaction.h).
+  //
+  // drakeydb: P4-3 Task 8 -- corrected stale claim: this comment used to say the public accessor
+  // was shared with SORT's own replication predicate (then WillAutoJournalVerbatim,
+  // generic_family.cc) "so the two can never drift apart". Task 7's fix round deliberately split
+  // them instead -- SORT's renamed predicate, SortSourceEffectsMustReplicate, does NOT call
+  // IsAutoJournalSuppressed(), because that method legitimately varies with GetUniqueShardCnt()
+  // for SORT alone (NO_AUTOJOURNAL is revived only for a same-shard STORE), which made SORT's
+  // source-effect replication silently depend on shard count. IsAutoJournalSuppressed() has no
+  // caller outside this function today.
   if (IsAutoJournalSuppressed()) {
     return;
   }

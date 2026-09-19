@@ -723,6 +723,8 @@ TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_table_bytes:"));
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_entries:"));
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones:"));
+  // drakeydb: P4-3 Task 8 -- mvcc_tombstones_dropped (Task 2) beside mvcc_tombstones, same gate.
+  EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones_dropped:"));
 }
 
 TEST_F(ActiveReplicaFamilyTest, ReplicaOfGrammarAndNoPeersPaths) {
@@ -755,6 +757,8 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_table_bytes:"));
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_entries:"));
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones:"));
+  // drakeydb: P4-3 Task 8 -- mvcc_tombstones_dropped must be gated identically to its siblings.
+  EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones_dropped:"));
 }
 
 // drakeydb: P4-1 Task 5 -- the side table on DbTable. Storage only; nothing writes to it outside
@@ -3090,13 +3094,26 @@ TEST_F(MvccStoreTest, DebugMvccReportsValueState) {
 
 // drakeydb: P4-3 Task 2 -- the "state:tombstone" branch (debugcmd.cc) was wired in ahead of
 // anything setting kTombstoneBit; a kExplicit DEL is now the first live path that reaches it.
+//
+// drakeydb: P4-3 Task 8 -- strengthened beyond substring presence: the task-8 brief asks this
+// test to "assert the tombstone state + stamp", so this parses the printed `mvcc:<N>` value back
+// out and cross-checks it against DbSlice::GetMvcc's own stamp for the same key (StampOf), the
+// same side-table read production code (and DEBUG MVCC itself) uses. Catches a regression where
+// the reply says "state:tombstone" but prints a stale, zero, or otherwise wrong stamp.
 TEST_F(MvccStoreTest, DebugMvccReportsTombstoneState) {
   Run({"set", "k", "v"});
   Run({"del", "k"});
+
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone());
+
   auto resp = Run({"debug", "mvcc", "k"});
-  EXPECT_THAT(resp.GetString(), testing::HasSubstr("state:tombstone"));
-  EXPECT_THAT(resp.GetString(), testing::HasSubstr("mvcc:"));
-  EXPECT_THAT(resp.GetString(), testing::HasSubstr("origin:"));
+  const std::string body = resp.GetString();
+  EXPECT_THAT(body, testing::HasSubstr("state:tombstone"));
+  EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("mvcc:", tomb->Mvcc())))
+      << "printed stamp must match the side table's own tombstone stamp: " << body;
+  EXPECT_THAT(body, testing::HasSubstr("origin:"));
 }
 
 TEST_F(MvccStoreTest, DebugMvccReportsAbsent) {
@@ -3118,6 +3135,38 @@ TEST_F(MvccStoreTest, DebugMvccWithNoKeyReportsPerShardAggregates) {
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_entries:"));
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_clock_ahead_ms:"));
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_unstamped_writes:"));
+}
+
+// drakeydb: P4-3 Task 8 -- task-2-report.md flagged this as a minor gap: INFO memory got
+// mvcc_tombstones_dropped, but the DEBUG MVCC no-key aggregate (this command) did not, leaving an
+// operator staring at DEBUG MVCC with no way to see a shard degrading to resurrection. Drives a
+// real cap-triggered drop (same shape as MvccStoreTest.DeleteAtTombstoneCapDegradesToEraseAndCounts
+// TheDrop above) rather than asserting a placeholder zero, so this fails if the aggregate's count
+// is wired to the wrong field or never incremented, not just if the label is missing.
+TEST_F(MvccStoreTest, DebugMvccAggregateReportsTombstonesDropped) {
+  absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1);
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1000000); };
+
+  unsigned n = shard_set->size();
+  std::string first, second;
+  for (int i = 0;; ++i) {
+    first = absl::StrCat("dbg-cap-first-", i);
+    second = absl::StrCat("dbg-cap-second-", i);
+    if (Shard(first, n) == Shard(second, n))
+      break;
+    CHECK_LT(i, 10000) << "could not find a same-shard key pair";
+  }
+  ShardId sid = Shard(first, n);
+
+  Run({"set", first, "v"});
+  Run({"del", first});
+  Run({"set", second, "v"});
+  Run({"del", second});  // this shard is already at cap: degrades to erase, counts as a drop
+
+  auto resp = Run({"debug", "mvcc"});
+  EXPECT_THAT(resp.GetString(),
+              testing::HasSubstr(absl::StrCat("shard", sid, "_tombstones_dropped:1")))
+      << resp.GetString();
 }
 
 // The "off means byte-identical to upstream" guard.

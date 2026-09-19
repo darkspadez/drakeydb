@@ -2071,6 +2071,16 @@ OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, Iterator
   // callback would reuse the exact same mvcc token as the first, so both entries would carry
   // identical stamps on the wire and no mismatch would actually occur.
   //
+  // Caveat (P4-3 Task 8): "memoizes for the whole write epoch" is not unconditional. HopStamp
+  // (mvcc.h/.cc) re-mints on its own, independent of EndOfWriteEpoch, if either more than
+  // kMaxEpochMs (50 ms) has elapsed since the epoch started or the wall clock has stepped
+  // backward since then -- see HopStamp's clock_stepped_back/expired checks. A hypothetical
+  // DEL-then-RPUSH pair separated by a 50+ ms stall or a clock step mid-callback could therefore
+  // still observe two different stamps. Not a live concern for this call site today (there is
+  // only ever one RecordJournal call here, the RESTORE below), but it is why "memoized" should be
+  // read as "memoized within one epoch's ~50 ms window, barring a clock step", not as an
+  // unconditional guarantee good for an arbitrarily long callback.
+  //
   // RESTORE is still the right choice, for reasons that hold regardless: it is a single journal
   // entry rather than two (half the journal traffic, and no window where a partial/interrupted
   // replication -- e.g. a partial sync resuming mid-sequence -- could leave a replica with `key`
