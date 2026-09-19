@@ -3276,6 +3276,304 @@ void RdbLoaderBase::CopyStreamId(const StreamID& src, struct streamID* dest) {
   dest->seq = src.seq;
 }
 
+// drakeydb: P4-3 final fix wave (F-1) -- extracted verbatim from HandleTombstones' merge branch
+// (below in this file), where it was Task 6's only caller, so that CreateObjectOnShard's
+// already-expired-incoming path can route through the EXACT same apply rather than growing a
+// second, drifting copy of it. Every comment below is Task 6's own, carried over unchanged except
+// where it names its (now two) callers. See rdb_load.h for the preconditions.
+void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, string_view key,
+                                           const MvccStamp& stamp, bool resident_live) {
+  DCHECK(stamp.IsTombstone());
+
+  // drakeydb: carried contract from Task 3 (db_slice.cc's TombstoneGcStep comment), enforced here
+  // rather than only at HandleTombstones' parse site so it covers BOTH callers -- Mvcc() == 0 is
+  // the exact value of a transient, mid-epoch placeholder, never a real committed tombstone, and
+  // TombstoneGcStep's reap predicate requires Mvcc() != 0, so installing one would be immortal.
+  // For CreateObjectOnShard's expired-incoming caller this is also the D-7 fallback path itself:
+  // a genuinely unstamped key on a DFLY link carries {0, 0}, whose tombstone form has Mvcc() == 0
+  // and must therefore LOSE every compare (it is the strict minimum of the order) rather than win
+  // a vacuous one against a key this node does not happen to hold. HandleTombstones rejects this
+  // case earlier, with a malformed-file warning, and never reaches here with it.
+  if (stamp.Mvcc() == 0)
+    return;
+
+  // drakeydb: P4-3 Task 6 review fix (M3, Important) -- a DbSlice with no mvcc side table
+  // (mvcc_enabled_ false) means GetMvcc always returns nullopt and MergeAccepts would always
+  // (vacuously) accept -- not a real compare. Bailing out here prevents a resident live key from
+  // being deleted with no genuine LWW decision behind it in that (unsupported, flag-race-only)
+  // scenario; both callers then fall back to their own non-merge behavior, which is already safe.
+  //
+  // drakeydb: P4-3 Task 12 carried item (d) -- db_slice->mvcc_enabled(), not `table->mvcc !=
+  // nullptr`. table->mvcc is allocated once, in DbTable's own constructor, from IsActiveReplica()
+  // AT THE TIME THAT TABLE WAS CREATED (table.cc); db_slice.mvcc_enabled_ is IsActiveReplica()
+  // cached once at DbSlice construction (Task 5). Both derive from the same flag but can be read
+  // at different moments -- a table created (or re-created via FLUSHDB's CreateDb) before a
+  // runtime flip of --active_replica would carry a stale table->mvcc verdict forever, while
+  // PerformDeletionAtomic (db_slice.cc), the delete path this function mirrors, has always gated
+  // on mvcc_enabled_ alone. Reading db_slice.mvcc_enabled() here keeps the two predicates from
+  // ever disagreeing about whether mvcc is "on" for this DbSlice.
+  if (db_slice->GetDBTable(db_index) == nullptr || !db_slice->mvcc_enabled())
+    return;
+
+  // GetMvcc's `stored` result already covers both shapes a prior entry for this key can take, with
+  // no separate code path needed for either: a resident LIVE key's stamp (bit 63 always clear --
+  // SetMvcc masks it on every write, db_slice.cc) or a resident TOMBSTONE's stamp (bit 63 set,
+  // from an earlier SetTombstone). MergeAccepts' operator< masks bit 63 too (mvcc.h), so this one
+  // compare resolves both guarded cases: "does this incoming delete beat the live value we're
+  // holding" and "does this incoming delete beat the tombstone we already recorded" (the latter
+  // matters because SetTombstone alone overwrites unconditionally and would otherwise let a stale
+  // persisted tombstone regress a newer resident tombstone's GC deadline).
+  //
+  // Because this apply is LWW-guarded, its ordering relative to the key stream and the concurrent
+  // journal blob carries no meaning: whichever of the three lands last for a given key,
+  // MergeAccepts (recomputed authoritatively after this function's own yield, below) resolves it
+  // the same way. Review fix I1's yield does not change that -- it only protects a concurrently
+  // registered SliceSnapshot from a torn read of a live value about to be deleted; it does not
+  // change what the eventual comparison decides.
+  //
+  // Fast-path pre-check only, mirroring CreateObjectOnShard's own comment on why its
+  // pre-AddOrFind compare is fast-path-only: a yield (FindMutable's PreUpdateBlocking, below) may
+  // still happen before any mutation, so only the AUTHORITATIVE recheck taken after that yield --
+  // never this one -- can be trusted for the actual decision. This one exists purely to skip
+  // FindMutable's own (small but nonzero) overhead in the common case where the tombstone
+  // obviously loses.
+  if (!MergeAccepts(db_slice->GetMvcc(db_index, key), stamp))
+    return;
+
+  DbContext db_cntx{&namespaces->GetDefaultNamespace(), db_index, GetCurrentTimeMs()};
+  DbSlice::ItAndUpdater it_updater;
+  const bool found_mutable = resident_live;
+  if (found_mutable) {
+    // drakeydb: P4-3 Task 6, review fix I1 (Important) -- give a concurrently registered
+    // SliceSnapshot fiber (mid-SerializeEntry on this exact bucket -- Task 4's own comment above
+    // CreateObjectOnShard's AddOrFind call establishes that a BGSAVE/full-sync snapshot CAN be
+    // registered while a LOAD's is_replicating apply runs on this shard) the same chance to run
+    // that AddOrFind's own found-bucket branch gives it, BEFORE this delete's prime.Erase could
+    // free the PrimeValue out from under it (ProcessBucket -> BucketDependencies::Wait,
+    // serializer_base.cc, is what makes every other mutation path safe against a mid-entry
+    // snapshot; going around it is exactly the class of hazard P4-0's member-reaper gate and Task
+    // 4's own Hazard 1 fix both exist to close). FindMutable's PreUpdateBlocking is that
+    // discipline (mirrors AddOrFind's own PreUpdateBlocking call, db_slice.cc) --
+    // CallChangeCallbacks (db_slice.cc) returns immediately when `change_cb_` is empty, so this
+    // costs nothing in the common (no concurrent snapshot) case, exactly like AddOrFind's
+    // unconditional call to the same discipline.
+    //
+    // An earlier version of this code called Del() directly on the already-found PrimeIterator
+    // instead, justified by citing the idle-task eviction sweep (FreeMemWithEvictionStepAtomic,
+    // db_slice.cc) as precedent -- wrong precedent (review fix M1): that sweep runs the delete
+    // inside its own FiberAtomicGuard, which this one-shot loader path has no equivalent for, and
+    // the eviction path that DOES reach `Del()` from inside a genuine insert
+    // (PrimeEvictionPolicy::Evict, db_slice.cc) gates on WillBlockOnJournalWrite() and journals,
+    // neither of which applied here either. There is no such guard on this path; the yield below
+    // is the actual fix.
+    //
+    // drakeydb: P4-3 Task 12 carried item (b) -- FindMutable's find-path also runs ExpireIfNeeded
+    // (db_slice.cc) whenever the resident key's whole-key TTL has already elapsed, gated on
+    // --replica_delete_expired (default true, so this runs on this loader same as everywhere
+    // else). When it fires, it deletes the key itself, with DeleteReason::kExpired --
+    // PerformDeletionAtomic's own earns_tombstone branch (db_slice.cc, P4-3 Task 11) then
+    // ArmTombstone's it exactly like a kExplicit delete would, expecting a journal Commit() that
+    // this loader never produces. Every path this can fall into below (both the
+    // authoritative-reject return just after this call, and the no-live-key fallthrough further
+    // down) must Disarm this key before returning, or a later, unrelated epoch end on this shard
+    // rolls the placeholder back via RollbackUncommittedTombstone and erases whatever this call
+    // itself wrote in its place -- the same orphaned-arm class Task 6's own review fix (I2)
+    // closed for the found-and-still-valid branch below, reached here by a different route.
+    it_updater = db_slice->FindMutable(db_cntx, key);
+  }
+
+  // drakeydb: P4-3 Task 6, review fix I1 -- the AUTHORITATIVE compare: only this one, taken after
+  // the one and only possible yield above, can be trusted -- exactly Task 4's own
+  // fast-path-then-recheck discipline (CreateObjectOnShard, above in this file), applied here to a
+  // delete instead of a write. Nothing below this point yields, so this decision and every write
+  // that follows it (the delete, the Disarm, and/or the SetTombstone call) sit on this shard's
+  // thread with nothing able to interleave between them -- the same same-thread,
+  // no-yield-between-read-and-write discipline Task 4's own authoritative recheck relies on.
+  if (!MergeAccepts(db_slice->GetMvcc(db_index, key), stamp)) {
+    if (found_mutable) {
+      it_updater.post_updater.Cancel();  // reject: fire no PostUpdate side effects
+      // drakeydb: P4-3 Task 12 carried item (b) -- FindMutable above may have just lazily expired
+      // this key (see that call's own comment) and left a tombstone arm pending, regardless of
+      // what this incoming tombstone's own merge decision turns out to be. Disarm unconditionally
+      // here: a no-op if nothing is armed (mvcc.h), load-bearing if something is -- otherwise a
+      // later epoch end would roll back a placeholder this rejection is about to leave stranded,
+      // mis-tallying it as an orphaned unstamped write and (once GC'd) making the expiry itself
+      // unresolvable.
+      MvccStamper::tlocal()->Disarm(db_index, key);
+    }
+    return;  // a concurrent write beat the incoming tombstone during the yield above
+  }
+
+  if (found_mutable && IsValid(it_updater.it)) {
+    // drakeydb: P4-3 Task 6 -- finalize the "found" event before Del(), exactly the sequence
+    // OpDelV2 (generic_family.cc) uses ("Run before Del"): Run() here arms a plain Arm() via
+    // PostUpdate, which PerformDeletionAtomic's own Disarm-then-rearm logic (db_slice.cc) expects
+    // and immediately replaces with a tombstone arm below. Calling Del() first would erase the
+    // prime entry out from under this AutoUpdater, and its own destructor's implicit Run() would
+    // then DCHECK-fail (or worse) trying to re-read a slot that no longer exists.
+    it_updater.post_updater.Run();
+
+    // drakeydb: P4-3 Task 6 -- delete through DbSlice::Del/PerformDeletionAtomic, the same
+    // primitive OpDel/OpDelV2 (generic_family.cc) use, so every ordinary bookkeeping side effect a
+    // real delete has -- blocked-XREADGROUP wakeup, doc_del_cb_ for JSON/HASH, memory accounting,
+    // tiered-storage release -- runs exactly as it would for a client-issued DEL. Two exceptions,
+    // not "exactly": the queued client-tracking invalidation message and any
+    // BlockingController::Awaken wakeup this delete queues are only ever flushed by
+    // DbSlice::OnCbFinishBlocking / BlockingController::NotifyPending, both driven from
+    // Transaction::RunCallback -- this loader, like its own key-install path
+    // (CreateObjectOnShard's PostUpdate call, above in this file), never goes through either, so
+    // those two queue but are not delivered here. Not a new gap this task introduces (review fix
+    // M4): the key-install path already has the identical deferral for the same structural reason.
+    //
+    // kExplicit (Del's default DeleteReason) is deliberate, not incidental: it is the one reason
+    // PerformDeletionAtomic (db_slice.cc) recognizes as "this delete earns a tombstone" -- the
+    // exact decision read back below, rather than re-derived.
+    //
+    // This Del() call must not be journalled as a local write -- the peer already propagated it;
+    // re-journalling it here would re-propagate a peer's authority under our own origin. It is
+    // not: DbSlice::Del/PerformDeletionAtomic never calls RecordJournal/journal::RecordEntry
+    // itself (only a command's own OpDelV2-style caller does, separately, from the transaction
+    // layer this loader never goes through) -- mirrors every other key this loader installs, none
+    // of which journal either (see RunWithoutMvccArm's call site, above in this file).
+    //
+    // drakeydb: P4-3 Task 12 carried item (b) -- narrowed from an earlier, broader claim that
+    // "this loader never journals": true of this Del() call specifically (the paragraph above),
+    // but NOT of FindMutable's own ExpireIfNeeded call, above, which can call
+    // RecordExpiryBlocking and really does journal a lazy expiry when this shard's journal is
+    // active and the key had already expired -- a separate, locally authored expiry entry, not a
+    // re-propagation of the peer's tombstone under our origin, so it does not violate the
+    // anti-echo principle this comment protects.
+    //
+    // drakeydb: P4-3 Task 12 carried item (a) -- nullptr, not a DbTable* resolved before
+    // FindMutable's PreUpdateBlocking yield above: such a pointer is a snapshot of
+    // db_arr_[db_index] from before that yield, not necessarily the CURRENT table. A FLUSHDB
+    // landing in that window (DbSlice::FlushDbIndexes, db_slice.cc) moves the old DbTable out to a
+    // deferred-destruction array and installs a brand new one at the same index --
+    // Del()/PerformDeletionAtomic would then run against the stale, exiled table object (wrong
+    // table_memory()/stats bookkeeping, and del_it itself is an iterator into that same stale
+    // table, not the live one), rather than into whatever FLUSHDB just installed. OpDelV2
+    // (generic_family.cc) already passes nullptr for exactly this reason -- passing nullptr here
+    // makes Del() re-resolve db_arr_[db_ind] fresh (db_slice.cc), matching its behavior and
+    // closing the same class of hazard.
+    db_slice->Del(db_cntx, it_updater.it, nullptr, /*async=*/false,
+                  DbSlice::DeleteReason::kExplicit);
+
+    // drakeydb: P4-3 Task 6, review fix I2 (Important) -- read the decision PerformDeletionAtomic
+    // just made instead of re-deriving TombstonesEnabled()/the per-(db, shard) cap: a tombstone
+    // placeholder ({kTombstoneBit, 0}) exists afterwards iff that call decided this kExplicit
+    // delete earns one (TombstonesEnabled() true AND this (db, shard) pair was under
+    // --multi_master_max_tombstones at the moment of the delete).
+    const std::optional<MvccStamp> post_delete = db_slice->GetMvcc(db_index, key);
+    if (post_delete.has_value() && post_delete->IsTombstone()) {
+      // drakeydb: P4-3 Task 6 -- PerformDeletionAtomic's kExplicit branch just Disarm'd any prior
+      // arm, written that {kTombstoneBit, 0} placeholder, and ArmTombstone'd this key -- all
+      // synchronously (db_slice.cc) -- *expecting* a journal entry's Commit() to eventually
+      // overwrite the placeholder with a real, minted stamp. A LOAD never journals, and nothing in
+      // this function's callers ever calls MvccStamper::EndOfWriteEpoch either, so left alone that
+      // arm would sit pending forever: until some unrelated LATER write on this shard thread
+      // finally triggers a Transaction::RunCallback epoch end, which would miscount it as an
+      // orphaned unstamped write (server_family.cc's mvcc_unstamped_writes canary) and roll the
+      // placeholder back via RollbackUncommittedTombstone, erasing the very slot the SetTombstone
+      // call below is about to (re)write out from under it. Disarm it here, immediately, so no
+      // future epoch end ever sees it: Disarm erases every arm matching (db_index, key) (mvcc.h),
+      // and nothing between Del() and this call yields, so there is no window for a real Commit()
+      // to race this Disarm.
+      MvccStamper::tlocal()->Disarm(db_index, key);
+      db_slice->SetTombstone(db_index, key, stamp);
+    }
+    // else: PerformDeletionAtomic itself decided this delete does not earn a tombstone (ttl=0, or
+    // the per-(db, shard) cap was already hit -- mvcc_tombstones_dropped already incremented in
+    // that case, db_slice.cc) -- respect that decision exactly as a local delete would: the key
+    // stays deleted (the peer's authority is honored), but no tombstone is installed here either.
+    return;
+  }
+  // else: either resident_live was false from the start, or the key vanished during the yield
+  // above -- a concurrent delete raced in (FindMutable's own internal recheck after
+  // PreUpdateBlocking, db_slice.cc, already turned that into "not found" here), OR (P4-3 Task 12
+  // carried item (b)) FindMutable's own ExpireIfNeeded call lazily deleted this key itself because
+  // its whole-key TTL had already elapsed -- see that call's own comment above for why that path
+  // can leave a tombstone arm pending. Either way there is nothing left to delete; `it_updater`'s
+  // own AutoUpdater is already a harmless no-op (default-constructed, or never assigned) and needs
+  // no explicit Cancel(). Fall through to install/update the tombstone directly, on the SAME
+  // authoritative MergeAccepts decision already taken above -- nothing has yielded since, so
+  // re-checking it a second time would be redundant, not safer.
+  //
+  // drakeydb: P4-3 Task 12 carried item (b), Task 13 review fix (I3, Important) -- Disarm before
+  // installing below, for the same reason as the authoritative-reject branch above: FindMutable,
+  // when it ran, may have lazily expired this key and left a tombstone arm pending. Must run
+  // BEFORE SetTombstone, not after: SetTombstone and the eventual Disarm target the same
+  // (db_index, key) slot, and doing this first guarantees nothing this call itself just installed
+  // can ever be the thing a stray arm's later rollback erases.
+  //
+  // SCOPED to found_mutable, NOT unconditional (Task 13 review fix I3 -- an earlier version of
+  // this fix called Disarm unconditionally here): MvccStamper::tlocal() is a per-SHARD-THREAD
+  // singleton, not per-call -- HandleTombstones dispatches its caller via shard_set->Add, and an
+  // ordinary command can yield between its own PostUpdate::Arm() (or PerformDeletionAtomic's
+  // ArmTombstone) and its eventual journal Commit() (e.g. RecordJournal blocking on a slow replica
+  // or a full ring buffer). When found_mutable is false, resident_live was false from the very
+  // start and NOTHING here has yielded or called FindMutable -- so this call could not possibly
+  // have armed anything itself for this key. Disarming anyway in that case does not target OUR OWN
+  // arm (there is none): it can instead steal a DIFFERENT, concurrent fiber's still-pending,
+  // legitimate arm for the SAME key name (e.g. a client's own `DEL k`, mid-yield in that same
+  // window) -- that fiber's eventual Commit() then finds no arm left to stamp, and its own
+  // {kTombstoneBit, 0} placeholder is never overwritten with a real, minted stamp: an immortal,
+  // unreapable tombstone (TombstoneGcStep's reap predicate requires Mvcc() != 0, db_slice.cc), a
+  // silently-lost delete. found_mutable being true, by contrast, means FindMutable DID run for
+  // this exact key on this exact call, so Disarming then can only ever target an arm this call's
+  // own FindMutable could have created. (D-14, ISSUE-REGISTER.md, tracks the residual: the steal
+  // window is still open for HandleTombstones' un-serialized shard_set->Add dispatch against a
+  // concurrent same-key client DEL on the target shard when found_mutable IS true.)
+  if (found_mutable) {
+    MvccStamper::tlocal()->Disarm(db_index, key);
+  }
+
+  // drakeydb: P4-3 Task 6, review fix I2 (Important) -- "the resident-tombstone install path obeys
+  // the same gate" as the delete path above: no live key was (or still is) resident here, so there
+  // is no PerformDeletionAtomic decision to read, but the ttl policy is identical and must be
+  // applied directly. TombstonesEnabled() == false (--multi_master_tombstone_ttl=0) means
+  // tombstones are disabled entirely on this node (multi_master.cc); installing or updating one
+  // here would create/perpetuate an entry TombstoneGcStep (db_slice.cc) can never reap -- it
+  // no-ops unconditionally whenever !TombstonesEnabled() -- immortal, the same failure CLASS
+  // (never reaped, always wins every future merge comparison) the Mvcc()==0 rejection at the top
+  // of this function exists to prevent, just reached via a different route.
+  //
+  // drakeydb: P4-3 Task 12 carried item (c) -- this install previously honoured TombstonesEnabled()
+  // alone, unlike the delete branch above (and PerformDeletionAtomic itself, db_slice.cc), which
+  // also caps at --multi_master_max_tombstones and counts a degraded-to-no-tombstone drop in
+  // mvcc_tombstones_dropped when at the cap. An unbounded install here could grow this shard's
+  // mvcc table without bound purely from peer tombstones for keys this node never even held live
+  // -- re-resolve the table fresh via db_index (not a pointer captured before the yield -- see
+  // item (a)'s comment above the Del() call for why a stale DbTable* cannot be trusted here
+  // either, on the branch of this fallthrough where FindMutable did yield) rather than reusing it
+  // or re-deriving the cap decision from a delete that never happened on this branch.
+  //
+  // drakeydb: Task 13 review fix (I4, Important) -- the cap must gate only an install that would
+  // actually GROW the table, exactly like PerformDeletionAtomic's own `table->stats.mvcc_tombstones
+  // < max` check does for a FRESH tombstone (db_slice.cc): SetTombstone's own Insert-or-overwrite
+  // (db_slice.cc) does NOT increment mvcc_tombstones when the slot it is updating is ALREADY a
+  // tombstone (`was_tombstone` guard) -- so refusing that case here at the cap is not just an
+  // unnecessary, spuriously-counted drop, it actively leaves the OLDER, already-resident tombstone
+  // stamp in place even though MergeAccepts (the authoritative recheck above, unchanged by this
+  // yield-free fallthrough) already decided `stamp` should win over it. A THIRD peer's later
+  // write, correctly losing against the newer `stamp` this call was trying to install, could then
+  // wrongly win against the stale one left behind instead -- an intermediate resurrection.
+  // `would_grow` mirrors SetTombstone's own `was_tombstone` test (absent slot, or a slot that is
+  // not currently a tombstone).
+  if (TombstonesEnabled()) {
+    DbTable* cur_table = db_slice->GetDBTable(db_index);
+    if (cur_table != nullptr) {
+      const std::optional<MvccStamp> existing = db_slice->GetMvcc(db_index, key);
+      const bool would_grow = !existing.has_value() || !existing->IsTombstone();
+      if (!would_grow ||
+          cur_table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
+        db_slice->SetTombstone(db_index, key, stamp);
+      } else {
+        ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly
+      }
+    }
+  }
+}
+
 void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, DbSlice* db_slice) {
   PrimeValue pv;
   PrimeValue* pv_ptr = &pv;
@@ -3356,10 +3654,12 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     return;
   }
 
-  if (item->expire_ms > 0 && db_cntx.time_now_ms >= item->expire_ms) {
-    VLOG(2) << "Expire key on load: " << item->key;
-    return;
-  }
+  // drakeydb: P4-3 final fix wave (F-1) -- the "drop an already-expired incoming key" gate that
+  // used to sit HERE has moved BELOW the `incoming` computation, so that a merge load can treat it
+  // as the peer's DELETE instead of a no-op. For every non-merge loader the move is a pure no-op:
+  // the only statements it now runs before the gate are the plain `incoming` initializer and a
+  // classic-PSYNC branch whose condition (`merge_lww_ && ...`) is false for them, neither of which
+  // has any side effect. See the gate's own comment below.
 
   // drakeydb: P4-3 Task 4 -- merge-LWW for a peer-mode full sync (merge_lww_ is only ever set true
   // by replica.cc's two peer-mode call sites; every other loader keeps the pre-existing
@@ -3471,6 +3771,61 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
                                 ? merge_origin_hash_
                                 : MvccStamper::tlocal()->OriginHash(PeerRegistry::kSelfIdx);
     incoming = MvccStamp{clamped_ms << MvccClock::kCounterBits, origin};
+  }
+
+  // drakeydb: P4-3 final fix wave (F-1, CRITICAL -- the adversarial review's refutation). This
+  // gate is upstream's ("Check if the key already expired", mirroring ShouldDiscardKey's own
+  // copy): an incoming key whose whole-key TTL has already elapsed is simply not installed.
+  //
+  // For every NON-merge loader that stays verbatim -- a local RDB file, DEBUG LOAD/RELOAD, and,
+  // critically, a plain Dragonfly replica's full sync, which must keep dropping an expired key
+  // exactly as upstream does (pinned by
+  // RdbMvccTest.WithoutMergeLwwExpiredIncomingIsDroppedLeavingResidentIntact, rdb_test.cc).
+  //
+  // Under merge_lww_ it was a silent, permanent correctness hole. Returning here skipped the
+  // entire merge block below: no MergeAccepts compare, no delete of the resident value the
+  // incoming write had already superseded, and no SetMvcc -- so a strictly OLDER resident value
+  // AND its stamp both survived a strictly NEWER peer write. Nothing repaired it afterwards: the
+  // sender's tombstone for that key is not in the opcode-225 section (SerializeTombstones runs in
+  // the per-shard PROLOGUE, snapshot.cc, i.e. before the key expired), and the sender's expiry DEL
+  // is dropped from every peer link by journal::PassesPeerEchoFilter's kEntryFlagExpired test
+  // (journal/types.cc), which SliceSnapshot::ConsumeJournalChange applies to the full-sync
+  // window's concurrent journal blob too. Live-reproduced at 5/40 keys permanently divergent.
+  //
+  // CONTROLLER RULING: on a MERGE load, an already-expired incoming key IS the peer's DELETE of
+  // that key. It is routed through the EXACT same Task 6 tombstone-apply path an opcode-225
+  // record takes (ApplyMergeTombstoneOnShard, above in this file -- extracted for precisely this
+  // reason), carrying a synthetic tombstone built from `incoming`:
+  //
+  //   * item->has_mvcc  -> the peer's own per-key stamp, with bit 63 set. Deliberately NOT a
+  //     freshly minted one: the value's stamp is the most authoritative thing the wire tells us
+  //     about this key, and AsTombstone's usual "must be strictly greater than the value being
+  //     deleted" precondition (mvcc.h) is satisfied against the side that matters here -- the
+  //     RESIDENT value, which only loses this compare when it is strictly older. Order-equivalence
+  //     with the peer's own live copy of that same value is correct and intended: ties favor the
+  //     stored side, so a third peer still holding that exact value neither resurrects it here nor
+  //     has it deleted there (it carries the same elapsed TTL and expires locally anyway).
+  //   * classic-PSYNC, unstamped -> the ctime-derived stamp computed just above, i.e. exactly the
+  //     authority Task 13 already grants that link's live values, no more.
+  //   * DFLY, unstamped -> D-7's {0, 0}, whose tombstone form has Mvcc() == 0 and therefore LOSES
+  //     every compare (ApplyMergeTombstoneOnShard rejects it outright rather than installing an
+  //     immortal tombstone) -- exactly what D-7 intends for a key carrying no authority.
+  //
+  // If the resident side wins, ApplyMergeTombstoneOnShard leaves it completely untouched, which
+  // is the same observable outcome as the old early return -- the difference is that it is now a
+  // DECISION rather than an accident.
+  if (item->expire_ms > 0 && db_cntx.time_now_ms >= item->expire_ms) {
+    if (merge_lww_) {
+      VLOG(2) << "Expired key on merge load treated as peer delete: " << item->key;
+      DbTable* table = db_slice->GetDBTable(db_cntx.db_index);
+      const bool resident_live =
+          table != nullptr && !table->prime.Find(string_view{item->key}).is_done();
+      ApplyMergeTombstoneOnShard(db_slice, db_cntx.db_index, item->key, incoming.AsTombstone(),
+                                 resident_live);
+      return;
+    }
+    VLOG(2) << "Expire key on load: " << item->key;
+    return;
   }
 
   if (merge_lww_ && !MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming))
@@ -3807,7 +4162,25 @@ bool RdbLoader::ShouldDiscardKey(std::string_view key, const ObjSettings& settin
    * Similarly if the RDB is the preamble of an AOF file, we want to
    * load all the keys as they are, since the log of operations later
    * assume to work in an exact keyspace state. */
-  if (ServerState::tlocal()->is_master && (settings.has_expired)) {
+  // drakeydb: P4-3 final fix wave (F-1) -- the merge twin of CreateObjectOnShard's own
+  // already-expired gate (above in this file), and in production it is the one that actually
+  // fires. `is_master` stays TRUE on an active node for the whole peer full sync:
+  // ServerFamily::ReplicaOfInternal short-circuits to ReplicaOfActive whenever IsActiveReplica()
+  // (server_family.cc), so the SetMasterFlagOnAllThreads(false) that a plain replica's REPLICAOF
+  // performs is never reached on this path. Without this guard the key is therefore discarded
+  // HERE, on the loader fiber, and never even reaches the owning shard -- the peer's delete is
+  // lost before any merge code runs.
+  //
+  // This function cannot do the merge apply itself: it runs on the loader's parsing fiber, not
+  // the target shard's thread, so it may not read that shard's mvcc side table (the same reason
+  // CreateObjectOnShard's own comment gives for refusing to host the merge compare here). So it
+  // does the one thing it safely can -- decline to discard -- and lets the fully parsed item flow
+  // down to CreateObjectOnShard, which runs on the owning shard and applies the ruling there. The
+  // cost when the peer's delete ultimately loses the compare is one deserialized value dropped on
+  // the shard instead of skipped during parse; merge_lww_ is peer-full-sync-only, so no other
+  // loader pays it at all (pinned by
+  // RdbMvccTest.WithoutMergeLwwExpiredIncomingIsDroppedLeavingResidentIntact, rdb_test.cc).
+  if (ServerState::tlocal()->is_master && (settings.has_expired) && !merge_lww_) {
     VLOG(3) << "Expire key on read: " << key;
     return true;
   }
@@ -4041,309 +4414,33 @@ error_code RdbLoader::HandleTombstones() {
           PrimeIterator prime_it;
           const bool resident_live =
               table != nullptr && !(prime_it = table->prime.Find(string_view{key})).is_done();
-          // drakeydb: P4-3 Task 6 review fix (M3, Important) -- a DbSlice with no mvcc side table
-          // (mvcc_enabled_ false) means GetMvcc always returns nullopt and MergeAccepts would
-          // always (vacuously) accept -- not a real compare. Gating the whole merge branch on this
-          // prevents a resident live key from being deleted with no genuine LWW decision behind it
-          // in that (unsupported, flag-race-only) scenario; it falls through to the same
-          // skip-and-warn / no-op-SetTombstone behavior a non-merge load uses, which is already
-          // safe here regardless (see that branch's own comments below).
-          //
-          // drakeydb: P4-3 Task 12 carried item (d) -- was `table->mvcc != nullptr`. table->mvcc
-          // is allocated once, in DbTable's own constructor, from IsActiveReplica() AT THE TIME
-          // THAT TABLE WAS CREATED (table.cc); db_slice.mvcc_enabled_ is IsActiveReplica() cached
-          // once at DbSlice construction (Task 5). Both derive from the same flag but can be read
-          // at different moments -- a table created (or re-created via FLUSHDB's CreateDb) before
-          // a runtime flip of --active_replica would carry a stale table->mvcc verdict forever,
-          // while PerformDeletionAtomic (db_slice.cc), the delete path this branch mirrors, has
-          // always gated on mvcc_enabled_ alone. Reading db_slice.mvcc_enabled() here instead keeps
-          // the two predicates from ever disagreeing about whether mvcc is "on" for this DbSlice.
+          // drakeydb: P4-3 Task 6 review fix (M3, Important), Task 12 carried item (d) -- a
+          // DbSlice with no mvcc side table (mvcc_enabled_ false) means GetMvcc always returns
+          // nullopt and MergeAccepts would always (vacuously) accept, so
+          // ApplyMergeTombstoneOnShard refuses that case outright (see its own comment on why it
+          // reads db_slice.mvcc_enabled() rather than table->mvcc). Recomputed here as well
+          // because this lambda must know whether that refusal happened: when it did, the
+          // non-merge skip-and-warn / no-op-SetTombstone path below is the correct fallback, and
+          // it is already safe for this scenario.
           const bool mvcc_ready = table != nullptr && db_slice.mvcc_enabled();
 
           // drakeydb: P4-3 Task 6 -- the merge-LWW gate for a peer-mode full sync (merge_lww is
           // captured BY VALUE from merge_lww_ above: this lambda can run on a different fiber, and
           // possibly a different thread, than the one that called SetMergeLww). A non-merge load
-          // (a local RDB file, DEBUG LOAD, or a plain Dragonfly replica's full sync) never
-          // sets merge_lww_ true (rdb_load.h's own doc comment on SetMergeLww) and falls straight
+          // (a local RDB file, DEBUG LOAD, or a plain Dragonfly replica's full sync) never sets
+          // merge_lww_ true (rdb_load.h's own doc comment on SetMergeLww) and falls straight
           // through to the pre-existing skip-and-warn / unconditional-install behavior below,
           // completely unchanged -- D-7's compatibility rule for those three loaders.
           //
-          // GetMvcc's `stored` result already covers both shapes a prior entry for this key can
-          // take, with no separate code path needed for either: a resident LIVE key's stamp (bit
-          // 63 always clear -- SetMvcc masks it on every write, db_slice.cc) or a resident
-          // TOMBSTONE's stamp (bit 63 set, from an earlier SetTombstone). MergeAccepts' operator<
-          // masks bit 63 too (mvcc.h), so this one compare resolves both guarded cases the task
-          // calls out: "does this incoming delete beat the live value we're holding" and "does
-          // this incoming delete beat the tombstone we already recorded" (the latter matters
-          // because SetTombstone alone overwrites unconditionally and would otherwise let a stale
-          // persisted tombstone regress a newer resident tombstone's GC deadline).
-          //
-          // Because this apply is LWW-guarded under merge_lww_, its ordering relative to the key
-          // stream and the concurrent journal blob carries no meaning: whichever of the three
-          // lands last for a given key, MergeAccepts (recomputed authoritatively after this
-          // branch's own yield, below) resolves it the same way. Review fix I1's yield does not
-          // change that -- it only protects a concurrently-registered SliceSnapshot from a torn
-          // read of a live value about to be deleted; it does not change what the eventual
-          // comparison decides.
+          // drakeydb: P4-3 final fix wave (F-1) -- the apply itself now lives in
+          // RdbLoader::ApplyMergeTombstoneOnShard (above in this file), shared verbatim with
+          // CreateObjectOnShard's already-expired-incoming path so the two can never drift. It
+          // returns without touching anything when the resident side wins the compare, and (per
+          // review fix M3) when this DbSlice has no mvcc side table at all -- `mvcc_ready` here is
+          // kept only so that second case still falls through to the non-merge behavior below,
+          // which is already safe for it.
           if (merge_lww && mvcc_ready) {
-            // Fast-path pre-check only, mirroring CreateObjectOnShard's own comment on why its
-            // pre-AddOrFind compare is fast-path-only: a yield (FindMutable's PreUpdateBlocking,
-            // below) may still happen before any mutation, so only the AUTHORITATIVE recheck taken
-            // after that yield -- never this one -- can be trusted for the actual decision. This
-            // one exists purely to skip FindMutable's own (small but nonzero) overhead in the
-            // common case where the tombstone obviously loses.
-            if (!MergeAccepts(db_slice.GetMvcc(db_index, key), stamp))
-              return;
-
-            DbContext db_cntx{&namespaces->GetDefaultNamespace(), db_index, GetCurrentTimeMs()};
-            DbSlice::ItAndUpdater it_updater;
-            const bool found_mutable = resident_live;
-            if (found_mutable) {
-              // drakeydb: P4-3 Task 6, review fix I1 (Important) -- give a concurrently registered
-              // SliceSnapshot fiber (mid-SerializeEntry on this exact bucket -- Task 4's own
-              // comment above CreateObjectOnShard's AddOrFind call establishes that a BGSAVE/
-              // full-sync snapshot CAN be registered while a LOAD's is_replicating apply runs on
-              // this shard) the same chance to run that AddOrFind's own found-bucket branch gives
-              // it, BEFORE this delete's prime.Erase could free the PrimeValue out from under it
-              // (ProcessBucket -> BucketDependencies::Wait, serializer_base.cc, is what makes every
-              // other mutation path safe against a mid-entry snapshot; going around it is exactly
-              // the class of hazard P4-0's member-reaper gate and Task 4's own Hazard 1 fix both
-              // exist to close). FindMutable's PreUpdateBlocking is that discipline (mirrors
-              // AddOrFind's own PreUpdateBlocking call, db_slice.cc) -- CallChangeCallbacks
-              // (db_slice.cc) returns immediately when `change_cb_` is empty, so this costs nothing
-              // in the common (no concurrent snapshot) case, exactly like AddOrFind's unconditional
-              // call to the same discipline.
-              //
-              // An earlier version of this code called Del() directly on the already-found
-              // PrimeIterator instead, justified by citing the idle-task eviction sweep
-              // (FreeMemWithEvictionStepAtomic, db_slice.cc) as precedent -- wrong precedent
-              // (review fix M1): that sweep runs the delete inside its own FiberAtomicGuard, which
-              // this one-shot loader path has no equivalent for, and the eviction path that DOES
-              // reach `Del()` from inside a genuine insert (PrimeEvictionPolicy::Evict,
-              // db_slice.cc) gates on WillBlockOnJournalWrite() and journals, neither of which
-              // applied here either. There is no such guard on this path; the yield below is the
-              // actual fix.
-              //
-              // drakeydb: P4-3 Task 12 carried item (b) -- FindMutable's find-path also runs
-              // ExpireIfNeeded (db_slice.cc) whenever the resident key's whole-key TTL has already
-              // elapsed, gated on --replica_delete_expired (default true, so this runs on this
-              // loader same as everywhere else). When it fires, it deletes the key itself, with
-              // DeleteReason::kExpired -- PerformDeletionAtomic's own earns_tombstone branch
-              // (db_slice.cc, P4-3 Task 11) then ArmTombstone's it exactly like a kExplicit delete
-              // would, expecting a journal Commit() that this loader never produces. Every path
-              // this can fall into below (both the authoritative-reject return just after this
-              // call, and the no-live-key fallthrough further down) must Disarm this key before
-              // returning, or a later, unrelated epoch end on this shard rolls the placeholder back
-              // via RollbackUncommittedTombstone and erases whatever this callback itself wrote in
-              // its place -- the same orphaned-arm class Task 6's own review fix (I2) closed for
-              // the found-and-still-valid branch below, reached here by a different route.
-              it_updater = db_slice.FindMutable(db_cntx, key);
-            }
-
-            // drakeydb: P4-3 Task 6, review fix I1 -- the AUTHORITATIVE compare: only this one,
-            // taken after the one and only possible yield above, can be trusted -- exactly Task 4's
-            // own fast-path-then-recheck discipline (CreateObjectOnShard, above in this file),
-            // applied here to a delete instead of a write. Nothing below this point yields, so this
-            // decision and every write that follows it (the delete, the Disarm, and/or the
-            // SetTombstone call) sit on this shard's thread with nothing able to interleave between
-            // them -- the same same-thread, no-yield-between-read-and-write discipline Task 4's own
-            // authoritative recheck relies on.
-            if (!MergeAccepts(db_slice.GetMvcc(db_index, key), stamp)) {
-              if (found_mutable) {
-                it_updater.post_updater.Cancel();  // reject: fire no PostUpdate side effects
-                // drakeydb: P4-3 Task 12 carried item (b) -- FindMutable above may have just
-                // lazily expired this key (see that call's own comment) and left a tombstone arm
-                // pending, regardless of what this incoming tombstone's own merge decision turns
-                // out to be. Disarm unconditionally here: a no-op if nothing is armed (mvcc.h),
-                // load-bearing if something is -- otherwise a later epoch end would roll back a
-                // placeholder this rejection is about to leave stranded, mis-tallying it as an
-                // orphaned unstamped write and (once GC'd) making the expiry itself unresolvable.
-                MvccStamper::tlocal()->Disarm(db_index, key);
-              }
-              return;  // a concurrent write beat the incoming tombstone during the yield above
-            }
-
-            if (found_mutable && IsValid(it_updater.it)) {
-              // drakeydb: P4-3 Task 6 -- finalize the "found" event before Del(), exactly the
-              // sequence OpDelV2 (generic_family.cc) uses ("Run before Del"): Run() here arms a
-              // plain Arm() via PostUpdate, which PerformDeletionAtomic's own Disarm-then-rearm
-              // logic (db_slice.cc) expects and immediately replaces with a tombstone arm below.
-              // Calling Del() first would erase the prime entry out from under this AutoUpdater,
-              // and its own destructor's implicit Run() would then DCHECK-fail (or worse) trying
-              // to re-read a slot that no longer exists.
-              it_updater.post_updater.Run();
-
-              // drakeydb: P4-3 Task 6 -- delete through DbSlice::Del/PerformDeletionAtomic, the
-              // same primitive OpDel/OpDelV2 (generic_family.cc) use, so every ordinary bookkeeping
-              // side effect a real delete has -- blocked-XREADGROUP wakeup, doc_del_cb_ for
-              // JSON/HASH, memory accounting, tiered-storage release -- runs exactly as it would
-              // for a client-issued DEL. Two exceptions, not "exactly": the queued client-tracking
-              // invalidation message and any BlockingController::Awaken wakeup this delete queues
-              // are only ever flushed by DbSlice::OnCbFinishBlocking / BlockingController::
-              // NotifyPending, both driven from Transaction::RunCallback -- this loader, like its
-              // own key-install path (CreateObjectOnShard's PostUpdate call, above in this file),
-              // never goes through either, so those two queue but are not delivered here. Not a new
-              // gap this task introduces (review fix M4): the key-install path already has the
-              // identical deferral for the same structural reason.
-              //
-              // kExplicit (Del's default DeleteReason) is deliberate, not incidental: it is the
-              // one reason PerformDeletionAtomic (db_slice.cc) recognizes as "this delete earns a
-              // tombstone" -- the exact decision read back below, rather than re-derived.
-              //
-              // This Del() call must not be journalled as a local write -- the peer already
-              // propagated it; re-journalling it here would re-propagate a peer's authority under
-              // our own origin. It is not: DbSlice::Del/PerformDeletionAtomic never calls
-              // RecordJournal/journal::RecordEntry itself (only a command's own OpDelV2-style
-              // caller does, separately, from the transaction layer this loader never goes
-              // through) -- mirrors every other key this loader installs, none of which journal
-              // either (see RunWithoutMvccArm's call site, above in this file).
-              //
-              // drakeydb: P4-3 Task 12 carried item (b) -- narrowed from an earlier, broader claim
-              // that "this loader never journals": true of this Del() call specifically (the
-              // paragraph above), but NOT of FindMutable's own ExpireIfNeeded call, above, which
-              // can call RecordExpiryBlocking and really does journal a lazy expiry when this
-              // shard's journal is active and the key had already expired -- a separate, locally
-              // authored expiry entry, not a re-propagation of the peer's tombstone under our
-              // origin, so it does not violate the anti-echo principle this comment protects.
-              //
-              // drakeydb: P4-3 Task 12 carried item (a) -- nullptr, not `table`: `table` was
-              // resolved via db_slice.GetDBTable(db_index) before FindMutable's PreUpdateBlocking
-              // yield above (this function's very first statement), so it is a snapshot of
-              // db_arr_[db_index] from before that yield, not necessarily the CURRENT table. A
-              // FLUSHDB landing in that window (DbSlice::FlushDbIndexes, db_slice.cc) moves the old
-              // DbTable out to a deferred-destruction array and installs a brand new one at the
-              // same index -- Del()/PerformDeletionAtomic would then run against the stale, exiled
-              // table object (wrong table_memory()/stats bookkeeping, and del_it itself is an
-              // iterator into that same stale table, not the live one), rather than into whatever
-              // FLUSHDB just installed. OpDelV2 (generic_family.cc) already passes nullptr for
-              // exactly this reason -- passing nullptr here makes Del() re-resolve db_arr_[db_ind]
-              // fresh (db_slice.cc), matching its behavior and closing the same class of hazard.
-              db_slice.Del(db_cntx, it_updater.it, nullptr, /*async=*/false,
-                           DbSlice::DeleteReason::kExplicit);
-
-              // drakeydb: P4-3 Task 6, review fix I2 (Important) -- read the decision
-              // PerformDeletionAtomic just made instead of re-deriving TombstonesEnabled()/the
-              // per-(db, shard) cap: a tombstone placeholder ({kTombstoneBit, 0}) exists
-              // afterwards iff that call decided this kExplicit delete earns one
-              // (TombstonesEnabled() true AND this shard was under --multi_master_max_tombstones
-              // at the moment of the delete).
-              const std::optional<MvccStamp> post_delete = db_slice.GetMvcc(db_index, key);
-              if (post_delete.has_value() && post_delete->IsTombstone()) {
-                // drakeydb: P4-3 Task 6 -- PerformDeletionAtomic's kExplicit branch just Disarm'd
-                // any prior arm, written that {kTombstoneBit, 0} placeholder, and ArmTombstone'd
-                // this key -- all synchronously (db_slice.cc) -- *expecting* a journal entry's
-                // Commit() to eventually overwrite the placeholder with a real, minted stamp. A
-                // LOAD never journals, and nothing in this lambda's caller ever calls
-                // MvccStamper::EndOfWriteEpoch either, so left alone that arm would sit pending
-                // forever: until some unrelated LATER write on this shard thread finally triggers
-                // a Transaction::RunCallback epoch end, which would miscount it as an orphaned
-                // unstamped write (server_family.cc's mvcc_unstamped_writes canary) and roll the
-                // placeholder back via RollbackUncommittedTombstone, erasing the very slot the
-                // SetTombstone call below is about to (re)write out from under it. Disarm it here,
-                // immediately, so no future epoch end ever sees it: Disarm erases every arm
-                // matching (db_index, key) (mvcc.h), and nothing between Del() and this call
-                // yields, so there is no window for a real Commit() to race this Disarm.
-                MvccStamper::tlocal()->Disarm(db_index, key);
-                db_slice.SetTombstone(db_index, key, stamp);
-              }
-              // else: PerformDeletionAtomic itself decided this delete does not earn a tombstone
-              // (ttl=0, or the per-(db, shard) cap was already hit -- mvcc_tombstones_dropped
-              // already incremented in that case, db_slice.cc) -- respect that decision exactly
-              // as a local delete would: the key stays deleted (the peer's authority is
-              // honored), but no tombstone is installed here either.
-              return;
-            }
-            // else: either resident_live was false from the start, or the key vanished during the
-            // yield above -- a concurrent delete raced in (FindMutable's own internal recheck after
-            // PreUpdateBlocking, db_slice.cc, already turned that into "not found" here), OR (P4-3
-            // Task 12 carried item (b)) FindMutable's own ExpireIfNeeded call lazily deleted this
-            // key itself because its whole-key TTL had already elapsed -- see that call's own
-            // comment above for why that path can leave a tombstone arm pending. Either way there
-            // is nothing left to delete; `it_updater`'s own AutoUpdater is already a harmless no-op
-            // (default-constructed, or never assigned) and needs no explicit Cancel(). Fall through
-            // to install/update the tombstone directly, on the SAME authoritative MergeAccepts
-            // decision already taken above -- nothing has yielded since, so re-checking it a second
-            // time would be redundant, not safer.
-            //
-            // drakeydb: P4-3 Task 12 carried item (b), Task 13 review fix (I3, Important) -- Disarm
-            // before installing below, for the same reason as the authoritative-reject branch
-            // above: FindMutable, when it ran, may have lazily expired this key and left a
-            // tombstone arm pending. Must run BEFORE SetTombstone, not after: SetTombstone and the
-            // eventual Disarm target the same (db_index, key) slot, and doing this first guarantees
-            // nothing this callback itself just installed can ever be the thing a stray arm's later
-            // rollback erases.
-            //
-            // SCOPED to found_mutable, NOT unconditional (Task 13 review fix I3 -- an earlier
-            // version of this fix called Disarm unconditionally here): MvccStamper::tlocal() is a
-            // per-SHARD-THREAD singleton, not per-callback -- this lambda is dispatched via
-            // shard_set->Add, and an ordinary command can yield between its own PostUpdate::Arm()
-            // (or PerformDeletionAtomic's ArmTombstone) and its eventual journal Commit() (e.g.
-            // RecordJournal blocking on a slow replica or a full ring buffer). When found_mutable
-            // is false, resident_live was false from the very start and NOTHING in this lambda has
-            // yielded or called FindMutable -- so this callback could not possibly have armed
-            // anything itself for this key. Disarming anyway in that case does not target OUR OWN
-            // arm (there is none): it can instead steal a DIFFERENT, concurrent fiber's still-
-            // pending, legitimate arm for the SAME key name (e.g. a client's own `DEL k`,
-            // mid-yield in that same window) -- that fiber's eventual Commit() then finds no arm
-            // left to stamp, and its own {kTombstoneBit, 0} placeholder is never overwritten with a
-            // real, minted stamp: an immortal, unreapable tombstone (TombstoneGcStep's reap
-            // predicate requires Mvcc() != 0, db_slice.cc), a silently-lost delete. found_mutable
-            // being true, by contrast, means FindMutable DID run for this exact key on this exact
-            // callback, so Disarming then can only ever target an arm this callback's own call
-            // could have created.
-            if (found_mutable) {
-              MvccStamper::tlocal()->Disarm(db_index, key);
-            }
-
-            // drakeydb: P4-3 Task 6, review fix I2 (Important) -- "the resident-tombstone install
-            // path obeys the same gate" as the delete path above: no live key was (or still is)
-            // resident here, so there is no PerformDeletionAtomic decision to read, but the ttl
-            // policy is identical and must be applied directly. TombstonesEnabled() == false
-            // (--multi_master_tombstone_ttl=0) means tombstones are disabled entirely on this node
-            // (multi_master.cc); installing or updating one here would create/perpetuate an entry
-            // TombstoneGcStep (db_slice.cc) can never reap -- it no-ops unconditionally whenever
-            // !TombstonesEnabled() -- immortal, the same failure CLASS (never reaped, always wins
-            // every future merge comparison) the Mvcc()==0 rejection above in this function exists
-            // to prevent, just reached via a different route.
-            //
-            // drakeydb: P4-3 Task 12 carried item (c) -- this install previously honoured
-            // TombstonesEnabled() alone, unlike the delete branch above (and PerformDeletionAtomic
-            // itself, db_slice.cc), which also caps at --multi_master_max_tombstones and counts a
-            // degraded-to-no-tombstone drop in mvcc_tombstones_dropped when at the cap. An
-            // unbounded install here could grow this shard's mvcc table without bound purely from
-            // peer tombstones for keys this node never even held live -- re-resolve the table
-            // fresh via db_index (not the possibly-stale `table` local -- see item (a)'s comment
-            // above the Del() call for why a captured-before-the-yield DbTable* cannot be trusted
-            // here either, on the branch of this fallthrough where FindMutable did yield) rather
-            // than reusing `table` or re-deriving the cap decision from a delete that never
-            // happened on this branch.
-            //
-            // drakeydb: Task 13 review fix (I4, Important) -- the cap must gate only an install
-            // that would actually GROW the table, exactly like PerformDeletionAtomic's own
-            // `table->stats.mvcc_tombstones < max` check does for a FRESH tombstone (db_slice.cc):
-            // SetTombstone's own Insert-or-overwrite (db_slice.cc) does NOT increment
-            // mvcc_tombstones when the slot it is updating is ALREADY a tombstone (`was_tombstone`
-            // guard) -- so refusing that case here at the cap is not just an unnecessary,
-            // spuriously-counted drop, it actively leaves the OLDER, already-resident tombstone
-            // stamp in place even though MergeAccepts (the authoritative recheck above, unchanged
-            // by this yield-free fallthrough) already decided `stamp` should win over it. A THIRD
-            // peer's later write, correctly losing against the newer `stamp` this callback was
-            // trying to install, could then wrongly win against the stale one left behind instead
-            // -- an intermediate resurrection. `would_grow` mirrors SetTombstone's own
-            // `was_tombstone` test (absent slot, or a slot that is not currently a tombstone).
-            if (TombstonesEnabled()) {
-              DbTable* cur_table = db_slice.GetDBTable(db_index);
-              if (cur_table != nullptr) {
-                const std::optional<MvccStamp> existing = db_slice.GetMvcc(db_index, key);
-                const bool would_grow = !existing.has_value() || !existing->IsTombstone();
-                if (!would_grow || cur_table->stats.mvcc_tombstones <
-                                       absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
-                  db_slice.SetTombstone(db_index, key, stamp);
-                } else {
-                  ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly
-                }
-              }
-            }
+            ApplyMergeTombstoneOnShard(&db_slice, db_index, key, stamp, resident_live);
             return;
           }
 
@@ -4394,12 +4491,42 @@ error_code RdbLoader::HandleTombstones() {
             return;
           }
 
-          // No-ops if this DbSlice's own mvcc side table doesn't exist -- see the D-7 unconditional
-          // read comment above; reachable two ways: `active` above raced with a runtime flag flip
-          // (not a supported scenario for a non-merge load), or (review fix M3) a merge_lww_ load
-          // whose `!mvcc_ready` sent it here instead of into the merge branch above. Either way
-          // SetTombstone's own guard (db_slice.cc) makes this a harmless no-op.
-          db_slice.SetTombstone(db_index, key, stamp);
+          // drakeydb: P4-3 final fix wave (I-1) -- this install honoured TombstonesEnabled()
+          // (above) but NOT the per-(database, shard) cap, unlike its merge twin
+          // (ApplyMergeTombstoneOnShard's own `if (TombstonesEnabled())` block, above in this
+          // file) and unlike PerformDeletionAtomic itself (db_slice.cc). This is the ORDINARY
+          // restart-from-own-RDB path -- a non-merge load of a file this node itself saved -- so
+          // an uncapped install here could restore a tombstone set larger than
+          // --multi_master_max_tombstones would ever have allowed a live delete to build, purely
+          // by reloading, and then keep it: TombstoneGcStep (db_slice.cc) only reaps on age, never
+          // down to the cap.
+          //
+          // `would_grow` mirrors SetTombstone's own `was_tombstone` guard (db_slice.cc) exactly,
+          // the same way the merge twin does: SetTombstone does not increment mvcc_tombstones when
+          // the slot it overwrites is ALREADY a tombstone, so refusing that case at the cap would
+          // be a spurious, miscounted drop AND would strand the older stamp. A genuine at-cap drop
+          // is counted in mvcc_tombstones_dropped, the same visible degradation signal a
+          // capped-out live delete produces (DEBUG MVCC / INFO).
+          //
+          // Re-resolving the table is also what makes the SetTombstone call below safe when this
+          // DbSlice has no mvcc side table at all -- see the D-7 unconditional read comment above;
+          // reachable two ways: `active` above raced with a runtime flag flip (not a supported
+          // scenario for a non-merge load), or (review fix M3) a merge_lww_ load whose
+          // `!mvcc_ready` sent it here instead of into the merge branch above. Either way
+          // SetTombstone's own guard (db_slice.cc) makes this a harmless no-op, and a null table
+          // here simply skips it.
+          DbTable* cur_table = db_slice.GetDBTable(db_index);
+          if (cur_table == nullptr) {
+            return;
+          }
+          const std::optional<MvccStamp> existing = db_slice.GetMvcc(db_index, key);
+          const bool would_grow = !existing.has_value() || !existing->IsTombstone();
+          if (!would_grow ||
+              cur_table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
+            db_slice.SetTombstone(db_index, key, stamp);
+          } else {
+            ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly
+          }
         };
 
     if (EngineShard::tlocal() != nullptr && EngineShard::tlocal()->shard_id() == sid) {

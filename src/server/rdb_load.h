@@ -528,6 +528,22 @@ class RdbLoader : protected RdbLoaderBase {
   // shard's thread. See the .cc for the three reject cases carried over from Task 3's contract.
   std::error_code HandleTombstones();
 
+  // drakeydb: P4-3 final fix wave (F-1) -- the single merge-LWW tombstone-apply primitive, shared
+  // verbatim by both of this loader's delete sources:
+  //   1. HandleTombstones (above), for an RDB_OPCODE_DF_TOMBSTONES record, and
+  //   2. CreateObjectOnShard (rdb_load.cc), for an incoming key whose whole-key TTL has ALREADY
+  //      elapsed -- on a merge load that IS the peer's delete of that key, not a no-op.
+  // Extracted rather than duplicated so the two can never drift: the yield-first FindMutable, the
+  // authoritative post-yield MergeAccepts recheck, the Disarm discipline, the read-back of
+  // PerformDeletionAtomic's own tombstone decision, and the ttl/cap policy on the no-live-key
+  // fallthrough are all decided in exactly one place. See the .cc for the full rationale on each.
+  //
+  // MUST run on the thread of the shard that owns `key`, and `stamp` MUST have bit 63 set
+  // (MvccStamp::AsTombstone). `resident_live` is the caller's pre-yield observation of whether
+  // `prime` holds a live entry for `key`. No-op when the resident side wins the compare.
+  static void ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, std::string_view key,
+                                         const MvccStamp& stamp, bool resident_live);
+
   // validates if the current chunk is fully read, resets the state. returns early if stop_early_ is
   // requested.
   std::error_code FinalizeCurrentChunkIfNeeded();

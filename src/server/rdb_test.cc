@@ -11,6 +11,7 @@ extern "C" {
 #include "redis/zmalloc.h"
 }
 
+#include <absl/cleanup/cleanup.h>
 #include <absl/flags/reflection.h>
 #include <mimalloc.h>
 
@@ -34,6 +35,7 @@ extern "C" {
 #include "server/rdb_load.h"
 #include "server/rdb_save.h"
 #include "server/serializer_commons.h"
+#include "server/server_state.h"
 #include "server/snapshot.h"
 #include "server/test_utils.h"
 #include "strings/human_readable.h"
@@ -3817,6 +3819,256 @@ TEST_F(RdbMvccTest, MergeLwwAcceptsNewerIncomingInstallingValueAndStamp) {
   EXPECT_EQ(*got, kIncomingStamp);
 }
 
+// ---- P4-3 final fix wave (F-1): an ALREADY-EXPIRED incoming key on a merge load ----------------
+//
+// These four pin the adversarial review's refutation. Before the fix, an incoming key whose
+// whole-key TTL had already elapsed was dropped by an early return that ran BEFORE the entire
+// merge block -- no MergeAccepts compare, no delete of the resident value, no SetMvcc -- so a
+// strictly OLDER resident value AND its stamp both survived a strictly NEWER peer write, and
+// nothing ever repaired it (the sender's tombstone is not in the opcode-225 section, which is
+// emitted from the snapshot PROLOGUE before the key expired, and the sender's expiry DEL is
+// dropped from every peer link by PassesPeerEchoFilter's kEntryFlagExpired test). Live-reproduced
+// at 5/40 keys permanently divergent.
+//
+// CONTROLLER RULING: on a merge load, an already-expired incoming key is the peer's DELETE of that
+// key, applied through the same Task 6 tombstone path as an opcode-225 record.
+//
+// Both loader gates are covered, because which one fires depends on ServerState::is_master:
+//   * is_master TRUE  -> RdbLoader::ShouldDiscardKey drops it on the PARSING fiber. This is the
+//     production case: ServerFamily::ReplicaOfInternal short-circuits to ReplicaOfActive whenever
+//     IsActiveReplica() (server_family.cc), so an active node NEVER calls
+//     SetMasterFlagOnAllThreads(false) and stays is_master==true for the whole peer full sync.
+//   * is_master FALSE -> ShouldDiscardKey passes and CreateObjectOnShard's own gate drops it.
+//
+// Each builds the exact wire bytes SaveEntry (rdb_save.cc) emits, in SaveEntry's own order:
+// RDB_OPCODE_EXPIRETIME_MS, RDB_OPCODE_DF_MVCC, type byte, key, value.
+
+namespace {
+
+// EXPIRETIME_MS = 1000 (1970-01-01T00:00:01Z -- long elapsed under any real clock), then the
+// stamp, then the string record. Mirrors RdbSerializer::SaveEntry's emit order exactly.
+std::string BuildExpiredStringEntry(std::string_view key, std::string_view value,
+                                    const MvccStamp& stamp, uint64_t expire_ms = 1000) {
+  std::string body;
+  uint8_t exp[9] = {RDB_OPCODE_EXPIRETIME_MS};
+  absl::little_endian::Store64(exp + 1, expire_ms);
+  body.append(reinterpret_cast<const char*>(exp), sizeof(exp));
+
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, stamp.packed);
+  absl::little_endian::Store64(block + 9, stamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, key);
+  AppendString(&body, value);
+  return body;
+}
+
+}  // namespace
+
+// The is_master==false route: ShouldDiscardKey passes the key through and CreateObjectOnShard's
+// own already-expired gate is what must now treat it as the peer's delete.
+TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsReplica) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x2000, kSelfHash};
+  // Vastly newer than the resident stamp -- the peer's SET that replaced our value, then expired.
+  const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body = BuildExpiredStringEntry("k", "incoming_v", kIncomingStamp);
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  // The real peer-mode condition for this route. Restored before the test returns so no later
+  // case in this binary inherits it.
+  shard_set->pool()->AwaitBrief([](unsigned, auto*) { ServerState::tlocal()->is_master = false; });
+  absl::Cleanup restore_master = [] {
+    shard_set->pool()->AwaitBrief([](unsigned, auto*) { ServerState::tlocal()->is_master = true; });
+  };
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil)
+      << "an already-expired incoming key is the peer's DELETE: our strictly older value must go";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value()) << "the synthetic tombstone must be installed";
+  EXPECT_EQ(*got, kIncomingStamp.AsTombstone())
+      << "the tombstone carries the peer's OWN stamp with bit 63 set -- never our stale one, and "
+         "never a locally minted one";
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after the delete";
+}
+
+// The is_master==true route -- the production one for an active node (see the block comment
+// above): ShouldDiscardKey must no longer discard under merge_lww_, so the item reaches the shard.
+TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsMaster) {
+  ASSERT_TRUE(IsActiveReplica());
+  // ServerState is per-proactor; the gtest thread has none, so this must be read on a proactor.
+  bool master_everywhere = true;
+  shard_set->pool()->AwaitBrief([&](unsigned, auto*) {
+    if (!ServerState::tlocal()->is_master)
+      master_everywhere = false;
+  });
+  ASSERT_TRUE(master_everywhere) << "this fixture must start out as a master on every thread";
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x2000, kSelfHash};
+  const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body = BuildExpiredStringEntry("k", "incoming_v", kIncomingStamp);
+  // Bytes after the expired entry must still parse: the item is no longer skipped during parsing,
+  // so the reader's position handling changes on this route specifically.
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil)
+      << "ShouldDiscardKey must not swallow the peer's delete on an active node";
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the expired entry must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value()) << "the synthetic tombstone must be installed";
+  EXPECT_EQ(*got, kIncomingStamp.AsTombstone());
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after the delete";
+}
+
+// The guard, so the fix above is a DECISION and not a new unconditional delete: the same expired
+// incoming key, but with a stamp STRICTLY OLDER than the resident one. The synthetic tombstone
+// must lose the MergeAccepts compare and leave both the resident value and its stamp untouched.
+TEST_F(RdbMvccTest, MergeLwwStaleExpiredIncomingLeavesResidentValueAndStampUntouched) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x2000, kSelfHash};
+  const MvccStamp kIncomingStamp{0x1000, kPeerHash};  // strictly older than the resident
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  std::string body = BuildExpiredStringEntry("k", "incoming_v", kIncomingStamp);
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "resident_v")
+      << "a peer delete older than our own value must never win";
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kResidentStamp) << "the resident stamp must survive untouched too";
+  EXPECT_FALSE(got->IsTombstone());
+  EXPECT_EQ(mismatches, 0u);
+}
+
+// The non-merge control, BOTH routes. Without SetMergeLww the pre-existing, upstream-verbatim
+// behavior must be completely unchanged: an already-expired incoming key is silently dropped and
+// whatever this node already held is left exactly as it was. This is what a plain Dragonfly
+// replica's full sync, a local RDB file load and DEBUG LOAD all do, and it is the guarantee the
+// F-1 fix must not disturb -- restoring the unconditional early return makes the three tests above
+// fail while this one keeps passing, which is precisely the falsification split we want.
+TEST_F(RdbMvccTest, WithoutMergeLwwExpiredIncomingIsDroppedLeavingResidentIntact) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x2000, kSelfHash};
+  const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};  // "newer" -- irrelevant here
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  const std::string body = BuildExpiredStringEntry("k", "incoming_v", kIncomingStamp);
+
+  auto check_intact = [&](const char* route) {
+    EXPECT_EQ(Run({"get", "k"}), "resident_v")
+        << route << ": a non-merge load must keep dropping an expired key, touching nothing";
+    std::optional<MvccStamp> got;
+    size_t mismatches = 0;
+    shard_set->Await(0, [&] {
+      auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+      got = db_slice.GetMvcc(0, std::string_view{"k"});
+      mismatches = db_slice.TEST_VerifyMvccTable(0);
+    });
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, kResidentStamp) << route;
+    EXPECT_FALSE(got->IsTombstone()) << route;
+    EXPECT_EQ(mismatches, 0u) << route;
+  };
+
+  // Route 1: is_master true -- ShouldDiscardKey's gate.
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+  check_intact("is_master=true (ShouldDiscardKey)");
+
+  // Route 2: is_master false -- CreateObjectOnShard's gate.
+  shard_set->pool()->AwaitBrief([](unsigned, auto*) { ServerState::tlocal()->is_master = false; });
+  absl::Cleanup restore_master = [] {
+    shard_set->pool()->AwaitBrief([](unsigned, auto*) { ServerState::tlocal()->is_master = true; });
+  };
+  ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+  check_intact("is_master=false (CreateObjectOnShard)");
+}
+
 // Owner decision, 2026-08-30 (mvcc.h): ties are won by the STORED side. An incoming record whose
 // stamp is byte-identical to the resident one must never churn the key -- the two carry different
 // VALUES here specifically so this test can tell "the tie was resolved by MvccStamp equality"
@@ -5546,9 +5798,71 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneUpdateForAbsentKeyIgnoresCapWhenNoGrowth) {
   ASSERT_TRUE(got.has_value());
   EXPECT_EQ(*got, kNewTombstone)
       << "updating an ALREADY-tombstoned slot does not grow mvcc_tombstones, so the "
-         "per-(db, shard) cap must not block it even at max_tombstones=0 -- a stale stamp here "
-         "would let a later, "
-         "intermediate resurrection win";
+         "per-(database, shard) cap must not block it even at max_tombstones=0 -- a stale stamp "
+         "here would let a later, intermediate resurrection win";
+}
+
+// drakeydb: P4-3 final fix wave (I-1) -- the NON-merge tombstone install (HandleTombstones'
+// fallthrough for a loader that never called SetMergeLww) honoured --multi_master_tombstone_ttl
+// but NOT --multi_master_max_tombstones, unlike its merge twin above and unlike
+// PerformDeletionAtomic itself (db_slice.cc). That path is the ORDINARY restart-from-own-RDB one:
+// a node whose file carries more tombstones than the cap currently allows would restore all of
+// them and keep them (TombstoneGcStep reaps on age, never down to the cap).
+//
+// cap = 1, two tombstones for keys this node does not hold: the first install grows
+// mvcc_tombstones from 0 to 1 and is under the cap; the second would grow it to 2 and must be
+// refused and counted. No SetMergeLww call anywhere -- this is the plain loader.
+TEST_F(RdbMvccTest, WithoutMergeLwwTombstoneInstallHonorsCapForAbsentKeys) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1);
+
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const MvccStamp kFirst = MvccStamp{0x1000, kPeerHash}.AsTombstone();
+  const MvccStamp kSecond = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+
+  size_t dropped_before = 0, tombstones_before = 0;
+  shard_set->Await(0, [&] {
+    auto* stats = namespaces->GetDefaultNamespace().GetCurrentDbSlice().MutableStats(0);
+    dropped_before = stats->mvcc_tombstones_dropped;
+    tombstones_before = stats->mvcc_tombstones;
+  });
+  ASSERT_EQ(tombstones_before, 0u) << "this fixture must start with an empty tombstone table";
+
+  // Section order is the file's order, and this fixture pins a single shard, so "ghost1" is
+  // installed first and "ghost2" is the one that hits the cap.
+  std::string body = BuildTombstoneSection(0, {{"ghost1", kFirst}, {"ghost2", kSecond}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  // No SetMergeLww: merge_lww_ stays false, so this exercises the non-merge install path.
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> first, second;
+  size_t dropped_after = 0, tombstones_after = 0, mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    first = db_slice.GetMvcc(0, std::string_view{"ghost1"});
+    second = db_slice.GetMvcc(0, std::string_view{"ghost2"});
+    auto* stats = db_slice.MutableStats(0);
+    dropped_after = stats->mvcc_tombstones_dropped;
+    tombstones_after = stats->mvcc_tombstones;
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+
+  ASSERT_TRUE(first.has_value()) << "the first tombstone is under the cap and must install";
+  EXPECT_EQ(*first, kFirst);
+  EXPECT_FALSE(second.has_value())
+      << "the second would push this (database, shard) pair over --multi_master_max_tombstones "
+         "and must be refused, exactly as the merge twin and a live delete both do";
+  EXPECT_EQ(tombstones_after, 1u);
+  EXPECT_EQ(dropped_after, dropped_before + 1)
+      << "the at-cap drop must be counted in mvcc_tombstones_dropped (DEBUG MVCC / INFO), not "
+         "silently discarded";
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold";
 }
 
 }  // namespace dfly
