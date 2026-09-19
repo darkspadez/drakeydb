@@ -3,6 +3,8 @@
 
 #include "server/multi_master.h"
 
+#include <limits>
+
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
 #include "absl/strings/str_cat.h"
@@ -17,9 +19,39 @@ ABSL_FLAG(bool, active_replica, false,
 ABSL_FLAG(bool, multi_master, false,
           "drakeydb: let REPLICAOF attach several masters at once (fan-in). Requires "
           "--active_replica (KeyDB multi-master). Boot-only.");
+// drakeydb: P4-3 Task 2 -- an explicit DEL keeps its mvcc side-table slot (with kTombstoneBit
+// set) instead of erasing it, so a peer's stale snapshot cannot resurrect a key we deleted.
+// kEvicted/kSlotFlush are unaffected: they always erase (see PerformDeletionAtomic, db_slice.cc).
+// kExpired joined kExplicit in P4-3 Task 11, once ExpireIfNeeded/DeleteReapedContainer were
+// reordered to journal after deleting -- see DeleteReason's comment (db_slice.h) for the history.
+// Seconds, not ms, to match
+// --tombstone_ttl-style operator-facing flags elsewhere; a tombstone's own GC deadline math
+// (MvccStamp::DeadlineMs) takes ms, so callers convert.
+ABSL_FLAG(uint64_t, multi_master_tombstone_ttl, 600,
+          "drakeydb: seconds a tombstone (a deleted key's stamp, kept instead of erased) is "
+          "retained before DbSlice::TombstoneGcStep's idle-task GC reclaims it. This value also "
+          "gates TombstonesEnabled(): 0 disables tombstoning entirely -- every delete erases its "
+          "slot immediately, same as kEvicted/kSlotFlush -- and the GC step itself no-ops.");
+// drakeydb: P4-3 Task 8, controller fix (I1) -- "per-shard" was imprecise: table->stats
+// (db_slice.cc's cap check) lives on a DbTable, one per (SELECT-able database, shard) pair, not
+// one per shard overall. A node with N databases can therefore hold up to N times this many live
+// tombstones on a single shard -- one independent cap per db index.
+ABSL_FLAG(uint64_t, multi_master_max_tombstones, 1000000,
+          "drakeydb: cap on live tombstones per (database, shard) pair -- NOT a single per-shard "
+          "total: a node with N SELECT-able databases can hold up to N times this many on one "
+          "shard. A delete that would push its own (database, shard) pair's tombstone count past "
+          "this degrades to an erase instead (counted in mvcc_tombstones_dropped), trading "
+          "resurrection risk for bounded memory on a shard that never gets an idle moment for GC "
+          "to catch up.");
+ABSL_FLAG(uint32_t, multi_master_tombstone_gc_budget, 64,
+          "drakeydb: mvcc side-table buckets DbSlice::TombstoneGcStep (db_slice.cc) visits per "
+          "idle-task GC tick when reclaiming tombstones older than "
+          "--multi_master_tombstone_ttl. Bounds one tick's total work, spread across however "
+          "many SELECT-able databases still need visiting -- not a per-database allowance.");
 ABSL_DECLARE_FLAG(std::string, cluster_mode);
 ABSL_DECLARE_FLAG(std::string, tiered_prefix);
 ABSL_DECLARE_FLAG(bool, experimental_cascaded_partial_sync);
+ABSL_DECLARE_FLAG(bool, cache_mode);
 
 namespace dfly {
 
@@ -29,6 +61,10 @@ bool IsActiveReplica() {
 
 bool IsMultiMaster() {
   return absl::GetFlag(FLAGS_multi_master);
+}
+
+bool TombstonesEnabled() {
+  return absl::GetFlag(FLAGS_multi_master_tombstone_ttl) != 0;
 }
 
 bool ValidateMultiMasterFlags() {
@@ -51,10 +87,65 @@ bool ValidateMultiMasterFlags() {
     LOG(ERROR) << "--active_replica is incompatible with --experimental_cascaded_partial_sync";
     return false;
   }
+  // drakeydb: P4-3 Task 3 -- guards Task 1 review Finding 6 (task-1-review.md, carried forward by
+  // progress.md): a negative value reaching this uint64_t flag (e.g. built from a signed source
+  // upstream of absl's own flag parser, which already rejects a literal "-1" on the command line)
+  // sign-converts to a value near UINT64_MAX. TombstoneGcStep (db_slice.cc) multiplies this by
+  // 1000 for MvccStamp::DeadlineMs's ms domain and adds MsPart() (mvcc.h); with a wrapped ttl that
+  // sum overflows uint64 and wraps to a deadline in the PAST, so the very first GC tick would reap
+  // every live tombstone, silently reopening the resurrection window Task 2 closed.
+  // kMaxTombstoneTtlSeconds is far beyond any real deployment's needs (~136 years) but comfortably
+  // below the region where that overflow becomes reachable, so no legitimate operator value can
+  // ever trip it.
+  constexpr uint64_t kMaxTombstoneTtlSeconds = std::numeric_limits<uint32_t>::max();
+  if (absl::GetFlag(FLAGS_multi_master_tombstone_ttl) > kMaxTombstoneTtlSeconds) {
+    LOG(ERROR) << "--multi_master_tombstone_ttl ("
+               << absl::GetFlag(FLAGS_multi_master_tombstone_ttl)
+               << "s) is implausibly large -- likely a sign-converted negative value; refusing "
+                  "to start";
+    return false;
+  }
+  // drakeydb: P4-3 Task 3, review fix (C1), Critical -- 0 buckets/tick can never make progress,
+  // so DbSlice::TombstoneGcStep (db_slice.cc) treats it identically to "GC has nothing to do" and
+  // no-ops -- but before that fix, 0 was indistinguishable from "ran out of budget mid-lap", and
+  // the on-idle wrapper (the DbSlice constructor) maps that into the proactor's highest
+  // re-scheduling frequency with no backoff: reproduced directly, this returned true on 5/5
+  // consecutive calls while doing zero work, which pegs a shard's core at 100% forever. Reject at
+  // boot so a misconfigured value never reaches that path; TombstoneGcStep's own guard remains as
+  // a backstop for a value set after boot (e.g. a future CONFIG SET, or a test's absl::SetFlag).
+  if (absl::GetFlag(FLAGS_multi_master_tombstone_gc_budget) == 0) {
+    LOG(ERROR) << "--multi_master_tombstone_gc_budget must be >= 1 (0 buckets/tick can never "
+                  "reclaim a tombstone, and is treated as a misconfiguration, not a valid "
+                  "'never run' setting -- use --multi_master_tombstone_ttl=0 for that)";
+    return false;
+  }
+  // drakeydb: P4-3 Task 2 -- not a validation failure (both flags are independently legal), but a
+  // resurrection-semantics gotcha worth surfacing at boot: --cache_mode evicts under memory
+  // pressure, and eviction (kEvicted, PerformDeletionAtomic) deliberately writes no tombstone --
+  // the peer's copy is authoritative, so resurrection on that peer's next full sync is the whole
+  // point. An explicit DEL (or, since P4-3 Task 11, an expiry) on the SAME key still tombstones
+  // normally; only the memory-pressure-evicted keys are a deliberate design choice, not a gap.
+  if (TombstonesEnabled() && absl::GetFlag(FLAGS_cache_mode)) {
+    LOG(WARNING) << "--active_replica with --cache_mode: eviction cannot free tombstones and "
+                    "evicted keys deliberately get none (kEvicted is a capacity decision, not a "
+                    "deletion), so a key evicted here for memory pressure can be resurrected by a "
+                    "peer's full sync -- an explicit DEL on this node still tombstones and is "
+                    "immune to that";
+  }
+  // drakeydb: P4-3 Task 8, controller fix (I6) -- this warning still described the pre-P4-3
+  // world (full-sync merge unconditionally overwriting with whatever loaded last, "until P6").
+  // P4-3 landed merge-LWW for full sync; the warning now names what actually remains true:
+  // stable-sync (steady-state, post-full-sync) applies are still arrival-order, not compared
+  // against a local stamp at all -- MergeAccepts (mvcc.h) has no caller outside the full-sync
+  // loader (rdb_load.cc) today. See docs/multi-master.md for the full merge/tombstone contract.
   LOG(WARNING) << "--active_replica: known limitations -- a local read (e.g. HTTL) can lazily "
-                  "expire and delete a peer's not-yet-expired key under clock skew, and full-sync "
-                  "merge is last-loaded-wins until P6 (a peer sync can overwrite newer local "
-                  "writes); see docs/PLAN.md";
+                  "expire and delete a peer's not-yet-expired key under clock skew; full-sync "
+                  "merge is last-write-wins per key since P4-3 (ties favor the stored side; a "
+                  "classic-protocol peer's unstamped keys use an approximate snapshot-time "
+                  "authority and can resurrect an older delete -- see docs/multi-master.md), but "
+                  "STEADY-STATE stable-sync applies (ordinary replicated writes after the initial "
+                  "sync) remain arrival-order until P4-4 -- a peer's write can still overwrite a "
+                  "newer local write if it simply arrives later; see docs/PLAN.md";
   return true;
 }
 

@@ -142,8 +142,9 @@ void JournalStreamer::ConsumeJournalChange(const JournalChangeItem& item) {
     // a corner case) would otherwise never reach either marker block below: both live only on the
     // write path, past this early return. Left uncorrected, journal_rec_executed_ never advances
     // while the master's true LSN races ahead, and the eventual reconnect (or ring-buffer
-    // eviction before it) forces a full resync whose last-loaded-wins merge (rdb_load.cc) can
-    // resurrect stale values.
+    // eviction before it) forces a full resync. Since P4-3, a peer link's full-sync merge
+    // (rdb_load.cc) is LWW-guarded by MVCC stamp comparison rather than last-loaded-wins, so it
+    // no longer blindly resurrects stale values -- but the extra resync churn is still costly.
     //
     // A dropped entry is, by definition, already fully resolved (this link correctly chose not
     // to forward it) -- so on the SAME timer as the write-path periodic marker below (reusing

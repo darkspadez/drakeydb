@@ -387,6 +387,26 @@ class Transaction {
   // Re-enable auto journal for commands marked as NO_AUTOJOURNAL. Call during setup.
   void ReviveAutoJournal();
 
+  // drakeydb: P4-3 Task 7 -- true iff this transaction's auto-journal is currently suppressed,
+  // i.e. LogAutoJournalOnShard (transaction.cc) will NOT record the causing command verbatim.
+  // A purely static `cid->opt_mask() & CO::NO_AUTOJOURNAL` read cannot distinguish "always
+  // suppressed" from "suppressed by default, revived for this transaction", which is exactly the
+  // distinction a conditionally-reviving NO_AUTOJOURNAL command (RENAME, and now SORT) needs.
+  // Defined out-of-line (transaction.cc): CommandId is only forward-declared here, and opt_mask()
+  // plus CO::NO_AUTOJOURNAL need its full definition (command_registry.h), which transaction.h
+  // deliberately does not pull in.
+  //
+  // drakeydb: P4-3 Task 8 -- corrected stale claim. This used to say SORT's own replication
+  // predicate (then named WillAutoJournalVerbatim, generic_family.cc) called this accessor to
+  // stay in sync with it. Task 7's fix round found that wrong: this method varies with
+  // GetUniqueShardCnt() for SORT (NO_AUTOJOURNAL is revived only for a same-shard STORE), but
+  // "does SORT's source-side effect need to reach peers" is a property of the command family, not
+  // of one call's shard count, so gating on this method silently dropped that effect for every
+  // cross-shard SORT ... STORE. The renamed predicate, SortSourceEffectsMustReplicate
+  // (generic_family.cc), deliberately does NOT call this accessor; today this method has no
+  // caller outside LogAutoJournalOnShard itself.
+  bool IsAutoJournalSuppressed() const;
+
   // Clear all state to make transaction re-usable
   void Refurbish();
 

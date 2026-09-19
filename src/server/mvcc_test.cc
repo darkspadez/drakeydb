@@ -7,6 +7,9 @@
 #include <gmock/gmock.h>
 #include <xxhash.h>
 
+#include <map>
+#include <optional>
+
 #include "base/gtest.h"
 #include "server/table.h"
 
@@ -127,6 +130,41 @@ TEST(MvccStampTest, MsPartIgnoresTombstoneBit) {
   EXPECT_EQ(t.MsPart(), 9'999u);
 }
 
+// drakeydb: P4-3 Task 1 -- the merge-LWW decision, pinned before anything in the phase calls it.
+// Owner decision, 2026-08-30: ties are won by the STORED side.
+TEST(MvccStamp, MergeAcceptsFavoursTheStoredSideOnATie) {
+  const MvccStamp a{0x1000, 0xAAAA};
+  EXPECT_FALSE(MergeAccepts(a, a));                         // exact tie -> keep stored
+  EXPECT_FALSE(MergeAccepts(MvccStamp{}, MvccStamp{}));     // {0,0} vs {0,0} -> keep stored
+  EXPECT_TRUE(MergeAccepts(std::nullopt, MvccStamp{}));     // nothing stored -> write
+  EXPECT_TRUE(MergeAccepts(MvccStamp{}, a));                // unversioned loses to stamped
+  EXPECT_FALSE(MergeAccepts(a, MvccStamp{}));               // stamped beats unversioned
+  EXPECT_TRUE(MergeAccepts(a, MvccStamp{0x1000, 0xBBBB}));  // equal mvcc, higher origin wins
+}
+
+// drakeydb: P4-3 Task 1 review fix -- the original version of this test used tiny counter-only
+// literals (0x2000/0x3000/0x4000, all < 1<<20) for the mvcc, so MsPart() == 0 for every one of
+// them: DeadlineMs(ttl) == ttl regardless of whether MsPart() is added at all, and a mutant
+// `DeadlineMs() { return ttl_ms; }` still passed. It also never asserted origin_hash on the
+// tombstone, so a mutant AsTombstone() that dropped origin_hash still passed too. Both mutations
+// are falsified in the fix report. See task-1-report.md for the verbatim before/after.
+TEST(MvccStamp, ATombstoneComparesByItsStampNotItsBit) {
+  constexpr uint64_t kLiveMs = 2'000;
+  constexpr uint64_t kTombMs = 4'321;  // deliberately not round, and not zero after >> kCounterBits
+  constexpr uint64_t kLaterMs = 9'000;
+  constexpr uint64_t kTombOrigin = 0xDDDDu;  // distinct from every other origin used in this test
+  const MvccStamp live{kLiveMs << MvccClock::kCounterBits, 0xAAAA};
+  const MvccStamp later{kLaterMs << MvccClock::kCounterBits, 0xAAAA};
+  const MvccStamp tomb = MvccStamp{kTombMs << MvccClock::kCounterBits, kTombOrigin}.AsTombstone();
+
+  EXPECT_TRUE(tomb.IsTombstone());
+  EXPECT_EQ(tomb.Mvcc(), kTombMs << MvccClock::kCounterBits);  // bit 63 masked out of the value
+  EXPECT_EQ(tomb.origin_hash, kTombOrigin) << "AsTombstone must carry origin_hash through as-is";
+  EXPECT_FALSE(MergeAccepts(tomb, live));  // newer tombstone beats an older resurrection
+  EXPECT_TRUE(MergeAccepts(tomb, later));  // a later write beats the tombstone
+  EXPECT_EQ(tomb.DeadlineMs(600'000), kTombMs + 600'000);
+}
+
 TEST(NodeUuidHashTest, StableAndDistinct) {
   const string a = "6f1c4c3e-0000-4000-8000-000000000001";
   const string b = "6f1c4c3e-0000-4000-8000-000000000002";
@@ -172,6 +210,22 @@ MvccStamper* FreshStamper() {
   s->SetSelfUuid("6f1c4c3e-0000-4000-8000-00000000000a");
   return s;
 }
+
+// drakeydb: P4-3 Task 2 review fix (I3) -- EndOfWriteEpoch now requires an EraseFn (mvcc.h) so
+// every call site consciously handles rolling back an abandoned tombstone placeholder. Tests that
+// don't care about that (nothing armed via ArmTombstone) pass this no-op instead of a DbSlice.
+MvccStamper::EraseFn NoopErase() {
+  return [](DbIndex, std::string_view) {};
+}
+
+// Records what EndOfWriteEpoch's erase_fn was called with, so EndOfEpochRollsBack... below needs
+// no DbSlice either -- same reasoning as Recorder above, for Commit.
+struct EraseRecorder {
+  std::vector<std::pair<DbIndex, std::string>> erased;
+  MvccStamper::EraseFn Fn() {
+    return [this](DbIndex db, std::string_view key) { erased.emplace_back(db, std::string(key)); };
+  }
+};
 }  // namespace
 
 TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
@@ -189,17 +243,58 @@ TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
   EXPECT_EQ(s->stats().unstamped_writes, 0u);
 }
 
+// drakeydb: P4-3 Task 2 -- Commit() ORs kTombstoneBit into the stamp handed to an ArmTombstone'd
+// key's CommitFn call, and ONLY that arm's: a plain Arm() of a different key committed in the
+// same call must come out bare. Both share the exact same (mvcc, origin_hash) -- Commit has no
+// clock of its own and mints nothing itself, so a tombstone arm's stamp differs from a plain arm
+// committed in the same call by that one bit alone.
+TEST(MvccStamperTest, CommitMarksOnlyTombstoneArms) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "live");
+  s->ArmTombstone(0, "dead");
+  std::map<std::string, MvccStamp> got;
+  s->Commit(0x5000, 0,
+            [&](DbIndex, std::string_view k, const MvccStamp& st) { got[std::string(k)] = st; });
+  ASSERT_EQ(got.size(), 2u);
+  EXPECT_FALSE(got["live"].IsTombstone());
+  EXPECT_TRUE(got["dead"].IsTombstone());
+  EXPECT_EQ(got["live"].Mvcc(), got["dead"].Mvcc());  // same epoch stamp, one bit apart
+  EXPECT_EQ(got["live"].origin_hash, got["dead"].origin_hash);
+}
+
 TEST(MvccStamperTest, EndOfEpochDropsUncommittedArms) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
   s->Arm(0, "orphan");
-  s->EndOfWriteEpoch();
+  s->EndOfWriteEpoch(NoopErase());
   s->Commit(1, 0, rec.Fn());
 
   EXPECT_TRUE(rec.writes.empty()) << "an arm with no journal entry must not be stamped";
   EXPECT_EQ(s->stats().unstamped_writes, 1u)
       << "and the drop must be counted -- this is the production canary for read paths "
          "that mutate without journaling";
+}
+
+// drakeydb: P4-3 Task 2 review fix (I3) -- the root fix for a stuck {kTombstoneBit, 0}
+// placeholder: PerformDeletionAtomic (db_slice.cc) writes that placeholder synchronously,
+// expecting the delete's own journal commit to overwrite it with a real stamp. When that commit
+// never happens, EndOfWriteEpoch must roll the placeholder back (erase_fn), not just drop the arm
+// silently -- and must do so ONLY for tombstone arms; a plain, uncommitted Arm() has no
+// placeholder of its own to undo (EnsureMvcc's zero-authority slot is a legitimate "write is
+// pending" marker, not an abandoned one, and is left for a later write or GC to resolve).
+TEST(MvccStamperTest, EndOfEpochRollsBackOnlyUncommittedTombstoneArms) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "live-orphan");
+  s->ArmTombstone(0, "dead-orphan");
+  EraseRecorder erase_rec;
+  s->EndOfWriteEpoch(erase_rec.Fn());
+
+  ASSERT_EQ(erase_rec.erased.size(), 1u)
+      << "only the tombstone arm is an abandoned placeholder that needs rolling back";
+  EXPECT_EQ(erase_rec.erased[0].first, 0u);
+  EXPECT_EQ(erase_rec.erased[0].second, "dead-orphan");
+  EXPECT_EQ(s->stats().unstamped_writes, 2u)
+      << "both arms still count toward the canary -- rollback doesn't hide that this happened";
 }
 
 TEST(MvccStamperTest, DisarmRemovesOnlyTheNamedKey) {
@@ -270,7 +365,7 @@ TEST(MvccStamperTest, HopStampIsStableWithinEpochAndAdvancesAfter) {
   for (int i = 0; i < 5; ++i)
     EXPECT_EQ(s->HopStamp(kNow), first) << "iteration " << i;
 
-  s->EndOfWriteEpoch();
+  s->EndOfWriteEpoch(NoopErase());
   EXPECT_GT(s->HopStamp(kNow), first);
 }
 
@@ -328,6 +423,105 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
   ASSERT_EQ(rec.writes.size(), 256u);
   for (int i = 0; i < 256; ++i)
     EXPECT_EQ(rec.writes[i].key, keys[i]) << "arm " << i << " was corrupted by later growth";
+}
+
+// drakeydb: P4-3 Task 11, review ruling I2 -- CommitOwnTombstone's headline contract: it commits
+// (and removes) ONLY the named key's own tombstone arm, minting its own stamp independently of
+// whatever an ordinary Commit() call elsewhere in the same epoch would use. A sibling PLAIN arm
+// for a different key must survive untouched, so a later ordinary Commit() call still sees and
+// correctly stamps it -- this is what lets RecordExpiryBlocking (tx_base.cc) give an expiring
+// key's own tombstone a fresh self stamp while a sibling key swept from a replicated multi-key
+// command still gets that command's real author stamp (see
+// ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc, multi_master_test.cc).
+TEST(MvccStamperTest, CommitOwnTombstoneMintsSelfStampAndSparesSiblingArm) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "sibling");
+  s->ArmTombstone(0, "victim");
+
+  constexpr uint64_t kNowMs = 123'456'789;
+  const uint64_t expected_mvcc = s->HopStamp(kNowMs);  // memoized -- CommitOwnTombstone below
+                                                       // must return this same value, not a
+                                                       // second, different mint.
+
+  Recorder victim_rec;
+  EXPECT_TRUE(s->CommitOwnTombstone(0, "victim", kNowMs, victim_rec.Fn()));
+  ASSERT_EQ(victim_rec.writes.size(), 1u);
+  EXPECT_EQ(victim_rec.writes[0].key, "victim");
+  EXPECT_TRUE(victim_rec.writes[0].stamp.IsTombstone());
+  EXPECT_EQ(victim_rec.writes[0].stamp.Mvcc(), expected_mvcc);
+  EXPECT_EQ(victim_rec.writes[0].stamp.origin_hash,
+            NodeUuidHash("6f1c4c3e-0000-4000-8000-00000000000a"))
+      << "must always be self-originated, regardless of anything an ambient replicated-apply "
+         "context might otherwise carry";
+
+  // The sibling arm must be untouched: a later, ordinary Commit() call (using a DIFFERENT
+  // mvcc/origin, standing in for a replicated command's real author stamp) must still see and
+  // correctly stamp it, and must NOT see "victim" again (already committed and removed above).
+  constexpr uint32_t kPeerIdx = 3;
+  s->RegisterOriginHash(kPeerIdx, 0xBEEFu);
+  Recorder sibling_rec;
+  s->Commit(999, kPeerIdx, sibling_rec.Fn());
+  ASSERT_EQ(sibling_rec.writes.size(), 1u)
+      << "the victim's tombstone arm must already be gone -- CommitOwnTombstone above must have "
+         "removed it, or this ordinary Commit() would see and re-stamp it too";
+  EXPECT_EQ(sibling_rec.writes[0].key, "sibling");
+  EXPECT_FALSE(sibling_rec.writes[0].stamp.IsTombstone());
+  EXPECT_EQ(sibling_rec.writes[0].stamp.Mvcc(), 999u);
+  EXPECT_EQ(sibling_rec.writes[0].stamp.origin_hash, 0xBEEFu);
+}
+
+// No tombstone arm for the named key -- e.g. TombstonesEnabled() was false, or
+// PerformDeletionAtomic degraded to a plain erase at the tombstone cap -- must be a harmless
+// no-op: no mint, no call to fn, and any OTHER arm must be left alone for the caller's own
+// subsequent ordinary Commit() to handle exactly as if CommitOwnTombstone had never been called.
+TEST(MvccStamperTest, CommitOwnTombstoneIsANoopWhenNothingIsArmed) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "unrelated");
+
+  Recorder rec;
+  EXPECT_FALSE(s->CommitOwnTombstone(0, "missing", 123, rec.Fn()));
+  EXPECT_TRUE(rec.writes.empty());
+
+  Recorder rec2;
+  s->Commit(7, 0, rec2.Fn());
+  ASSERT_EQ(rec2.writes.size(), 1u) << "the unrelated arm must have survived the no-op call above";
+  EXPECT_EQ(rec2.writes[0].key, "unrelated");
+}
+
+// A plain (non-tombstone) arm for the exact same key must not be mistaken for a tombstone arm --
+// CommitOwnTombstone's contract is specifically "the named key's TOMBSTONE arm", matching
+// ArmTombstone alone, never a plain Arm().
+TEST(MvccStamperTest, CommitOwnTombstoneIgnoresAPlainArmOfTheSameKey) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+
+  Recorder rec;
+  EXPECT_FALSE(s->CommitOwnTombstone(0, "k", 123, rec.Fn()));
+  EXPECT_TRUE(rec.writes.empty());
+
+  Recorder rec2;
+  s->Commit(7, 0, rec2.Fn());
+  ASSERT_EQ(rec2.writes.size(), 1u) << "the plain arm for \"k\" must still be armed and unstamped";
+  EXPECT_EQ(rec2.writes[0].key, "k");
+  EXPECT_FALSE(rec2.writes[0].stamp.IsTombstone());
+}
+
+// CommitOwnTombstone is scoped by db_index, matching Disarm/Commit's own scoping
+// (DisarmIsScopedToTheDbIndex above) -- a tombstone arm for the same key name on a DIFFERENT db
+// must not be matched.
+TEST(MvccStamperTest, CommitOwnTombstoneIsScopedToTheDbIndex) {
+  MvccStamper* s = FreshStamper();
+  s->ArmTombstone(1, "k");
+
+  Recorder rec;
+  EXPECT_FALSE(s->CommitOwnTombstone(0, "k", 123, rec.Fn()));
+  EXPECT_TRUE(rec.writes.empty());
+
+  Recorder rec2;
+  s->Commit(7, 0, rec2.Fn());
+  ASSERT_EQ(rec2.writes.size(), 1u) << "db=1's tombstone arm must still be armed";
+  EXPECT_EQ(rec2.writes[0].key, "k");
+  EXPECT_TRUE(rec2.writes[0].stamp.IsTombstone());
 }
 
 // ---------------------------------------------------------------------------

@@ -46,8 +46,10 @@ struct MasterContext {
 
 // drakeydb: configuration of a peer-mode Replica -- an active node consuming from one of its
 // masters. A peer-mode Replica never flips the process into read-only replica mode, never flushes
-// the local dataset on full sync (it merges; last-loaded-wins until P6), serializes its full syncs
-// through `sync_gate`, refuses self/duplicate peer uuids, and registers the peer uuid.
+// the local dataset on full sync (it merges via merge-LWW since P4-3: ties favor the stored side,
+// MergeAccepts/mvcc.h -- see docs/multi-master.md for the full contract, including the
+// classic-protocol-peer resurrection exposure), serializes its full syncs through `sync_gate`,
+// refuses self/duplicate peer uuids, and registers the peer uuid.
 struct ReplicaPeerMode {
   SyncGate* sync_gate = nullptr;                  // null: full syncs are not serialized (tests)
   PeerRegistry* registry = nullptr;               // null: peer uuids are not registered (tests)

@@ -69,3 +69,22 @@ constexpr uint8_t RDB_OPCODE_SHARD_DOC_INDEX = 223;
 
 // Used to tag a chunk of serialized data with its stream id
 constexpr uint8_t RDB_OPCODE_TAGGED_CHUNK = 224;
+
+// drakeydb: P4-3 Task 5 -- persists tombstones (bit-63-flagged mvcc slots, Task 2/11) through the
+// RDB so a peer's delete survives our own restart and can still be applied on the next merge
+// (Task 6). Payload: [db_index][count][count x {key, packed, origin_hash}] -- db_index and count
+// are RDB-length-encoded (SaveLen/LoadLen); key is an RDB string (SaveString/FetchGenericString);
+// packed and origin_hash are 16 raw LE bytes, exactly like RDB_OPCODE_DF_MVCC's per-key stamp
+// above -- packed retains bit 63 on the wire.
+//
+// Emitted from the per-shard PROLOGUE (SliceSnapshot::Start, snapshot.cc, beside
+// SearchSerializer::Serialize), not an epilogue: RdbSaver has no per-shard epilogue hook
+// (SaveEpilog, rdb_save.cc, is global -- it only sends EOF+checksum). The section's position
+// relative to the key stream and any concurrent journal blob carries no meaning: tombstone
+// application is itself LWW-guarded (MergeAccepts, mvcc.h), so whichever of the three lands last
+// for a given key resolves the same way regardless of ordering.
+//
+// Write side is active-only and skipped for an empty table (D-7); read side (like
+// RDB_OPCODE_DF_MVCC) is UNCONDITIONAL -- every loader must consume this section's bytes in
+// full, whether or not it ends up installing anything (RdbLoader::HandleTombstones).
+constexpr uint8_t RDB_OPCODE_DF_TOMBSTONES = 225;

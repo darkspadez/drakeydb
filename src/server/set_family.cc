@@ -1671,12 +1671,19 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
       // on a peer cannot be relied on to reproduce this emptying: OpFieldExpire
       // (generic_family.cc) -- a lagging peer can arm an already-expired member instead of also
       // discovering it expired -- and OpFetchSortEntries/OpFetchContainerElements's SORT case
-      // (generic_family.cc, keyed off WillAutoJournalVerbatim, not a hardcoded command name) --
-      // SORT auto-journals verbatim, so a peer replays it against its own still-populated copy
-      // instead of deriving this DEL; SORT_RO shares the call site but never auto-journals, so it
-      // still gets the suppressed default. Echo-safe regardless -- see each call site's own
-      // comment for the full argument. Every other caller relies on the default and is
-      // unaffected.
+      // (generic_family.cc, gated on SortSourceEffectsMustReplicate -- renamed from
+      // WillAutoJournalVerbatim in P4-3 Task 7's fix round; see set_family.h's DeleteSetIfEmpty
+      // comment). Corrected (P4-3 Task 8): an earlier version of this comment claimed the reason
+      // was "SORT auto-journals verbatim, so a peer replays it against its own still-populated
+      // copy instead of deriving this DEL" -- that mechanism no longer holds now that a
+      // cross-shard SORT ... STORE hand-journals a RESTORE of the computed result rather than
+      // relying on a peer's verbatim replay at all. The real reason this DEL must still be
+      // forwarded plainly rather than derived: neither of SORT's two replication forms
+      // (same-shard verbatim replay, or cross-shard RESTORE) re-discovers this lazy member expiry
+      // on its own, so a peer that never receives this DEL keeps a stale, non-empty key. SORT_RO
+      // shares the call site but never auto-journals, so it still gets the suppressed default.
+      // Echo-safe regardless -- see each call site's own comment for the full argument. Every
+      // other caller relies on the default and is unaffected.
       if (derived) {
         RecordDerivedDelete(db_cntx, key);
       } else {
