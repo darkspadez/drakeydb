@@ -3402,8 +3402,9 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   // drakeydb peer, or a whole non-active drakeydb master, would override this node's ENTIRE
   // resident dataset -- a direct D-7 violation. And "override" really meant "this peer's clock is
   // +infinity for the whole sync": it would clobber a concurrent third-peer apply arriving during
-  // LOADING (permanent, un-journalled divergence) and resurrect every locally tombstoned key on
-  // that link.
+  // LOADING (permanent, un-journalled divergence) and unconditionally resurrect EVERY locally
+  // tombstoned key on that link, regardless of when either side's delete, or the peer's own copy
+  // of the key, actually happened.
   //
   // The replacement: only on a classic-PSYNC link (merge_classic_protocol_, set exclusively by
   // replica.cc's legacy Redis/KeyDB-protocol call site -- never the DFLY multi-shard one), an
@@ -3418,6 +3419,24 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   // relative ordering between keys written at different real times on the sender). Falls back to
   // this node's own `now` (still clamped -- a no-op then) if ctime was absent or unusable
   // (rdb_ctime_ms_ == 0), logged once per loader.
+  //
+  // Corrected, post-review: this NARROWS D-8's tombstone-resurrection exposure on a classic link,
+  // it does NOT eliminate it. GetMvcc's stored side still includes tombstones (see the comment
+  // above this one), and MergeAccepts still masks bit 63 -- so an unstamped key's ctime-derived
+  // stamp beats ANY resident tombstone strictly OLDER than min(ctime+999, now), exactly as it
+  // would beat any other resident value that old. A classic-PSYNC peer carries no per-key write
+  // time at all, only this one whole-snapshot timestamp, so there is no way to tell "this peer's
+  // copy is a legitimate rewrite made after our delete" from "this is just the peer's stale,
+  // pre-delete copy" -- for a live full sync, "older than roughly the snapshot's fork time"
+  // describes essentially every tombstone this node held before the sync began. Confirmed
+  // empirically (not just by construction): write a key on the Redis master, then write-and-DELETE
+  // it locally, wait, full-sync -- the local tombstone is replaced and the peer's (older) value
+  // wins, reproducibly. D-8's guard still closes the gap for anything deleted AFTER the peer's own
+  // fork point (the scenario test_active_replica_merges_redis_full_sync_via_synthetic_uuid,
+  // multimaster_test.py, and this file's own MergeLwwClassicUnstampedIncomingRespectsTombstone
+  // NewerThanCtime exercise); it does not close it for anything deleted before that point (see
+  // this file's own MergeLwwClassicUnstampedIncomingResurrectsTombstoneOlderThanCtime, which pins
+  // this exposure directly rather than leaving it untested).
   if (merge_lww_ && merge_classic_protocol_ && !item->has_mvcc) {
     uint64_t ctime_ms = rdb_ctime_ms_;
     if (ctime_ms == 0) {

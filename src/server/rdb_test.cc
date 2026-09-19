@@ -4882,6 +4882,123 @@ TEST_F(RdbMvccTest, MergeLwwClassicUnstampedIncomingWinsAgainstResidentWrittenBe
   EXPECT_EQ(got->origin_hash, kPeerHash);
 }
 
+// drakeydb: P4-3 Task 13, re-review fix -- pins the D-8 exposure this rule NARROWS but does not
+// ELIMINATE (see CreateObjectOnShard's own comment, rdb_load.cc, for the corrected account: an
+// earlier version of that comment claimed the ctime rule stops a classic peer from resurrecting
+// locally tombstoned keys; it does not). GetMvcc's stored side includes tombstones, and
+// MergeAccepts masks bit 63 -- so an unstamped classic key's ctime-derived stamp beats ANY
+// resident tombstone strictly OLDER than min(ctime+999, now), same as it would beat any other
+// resident value that old. A classic-PSYNC peer carries no per-key write time at all, only this
+// one whole-snapshot timestamp, so there is no way to distinguish "this peer's copy is a
+// legitimate rewrite made after our delete" from "this is just the peer's stale pre-delete copy"
+// -- the resurrection risk this test pins is real, not a test artifact (the reviewer confirmed it
+// empirically against a live server: delete a key locally, wait, full-sync from a peer whose own
+// copy predates the local delete -- the tombstone is replaced, 3/3 runs).
+//
+// Paired with MergeLwwClassicUnstampedIncomingRespectsTombstoneNewerThanCtime below so neither
+// test is vacuous against a stub that always accepts or always rejects: a stub that always
+// REJECTS the incoming key would fail THIS test (the tombstone would wrongly survive); a stub
+// that always ACCEPTS it would fail the other one (the newer tombstone would wrongly be cleared).
+TEST_F(RdbMvccTest, MergeLwwClassicUnstampedIncomingResurrectsTombstoneOlderThanCtime) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const int64_t kCtimeSec = 1'000'000;
+  const uint64_t kCtimeMs = static_cast<uint64_t>(kCtimeSec) * 1000;
+  // Strictly older than min(ctime+999, now): the local delete happened well before the snapshot's
+  // own ctime, so it carries no information the classic peer's snapshot could have "seen".
+  const MvccStamp kResidentTombstone =
+      MvccStamp{(kCtimeMs - 5000) << MvccClock::kCounterBits, kSelfHash}.AsTombstone();
+
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetTombstone(0, std::string_view{"k"},
+                                                                       kResidentTombstone);
+  });
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "ctime");
+  AppendString(&body, absl::StrCat(kCtimeSec));
+  body.push_back(RDB_TYPE_STRING);  // unstamped, like a real Redis RDB
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash, /*classic_protocol=*/true);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "incoming_v")
+      << "a resident tombstone OLDER than the snapshot's (clamped) ctime must be beaten by an "
+         "unstamped classic key -- this is the D-8 exposure the ctime rule narrows but does not "
+         "eliminate, not a bug in this specific test";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_FALSE(got->IsTombstone()) << "the tombstone must have been cleared, not just out-raced";
+}
+
+// The converse of the case above: a resident tombstone NEWER than min(ctime+999, now) must survive
+// -- D-8's guard still closes the gap for anything deleted AFTER the peer's own fork point, which
+// is the scenario test_active_replica_merges_redis_full_sync_via_synthetic_uuid (multimaster_test)
+// and MergeLwwClassicUnstampedIncomingLosesToResidentWrittenAfterCtime above both already exercise
+// for a resident LIVE value; this test is the same guarantee for a resident TOMBSTONE specifically.
+TEST_F(RdbMvccTest, MergeLwwClassicUnstampedIncomingRespectsTombstoneNewerThanCtime) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const int64_t kCtimeSec = 1'000'000;
+  const uint64_t kCtimeMs = static_cast<uint64_t>(kCtimeSec) * 1000;
+  // Strictly newer than min(ctime+999, now) == ctime+999 here (ctime is far below any real "now"
+  // in this process's lifetime, so the clamp is a no-op): the local delete happened AFTER the
+  // snapshot was taken.
+  const MvccStamp kResidentTombstone =
+      MvccStamp{(kCtimeMs + 999 + 5000) << MvccClock::kCounterBits, kSelfHash}.AsTombstone();
+
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetTombstone(0, std::string_view{"k"},
+                                                                       kResidentTombstone);
+  });
+
+  std::string body;
+  body.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&body, "ctime");
+  AppendString(&body, absl::StrCat(kCtimeSec));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "incoming_v");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash, /*classic_protocol=*/true);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil)
+      << "a resident tombstone NEWER than the snapshot's (clamped) ctime must survive -- the "
+         "unstamped classic key must lose to it, exactly like it would lose to any other "
+         "resident value that new";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kResidentTombstone) << "the resident tombstone must survive untouched";
+}
+
 // drakeydb: P4-3 Task 13 -- C2 pinned: on the DFLY multi-shard protocol (classic_protocol left at
 // its default, false), an unstamped incoming key keeps D-7's {0,0} fallback and therefore still
 // loses to ANY stamped resident value, exactly as it did before Task 12 ever existed. This is the
