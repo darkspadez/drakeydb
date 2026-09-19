@@ -1353,8 +1353,9 @@ TEST(JournalDeathTest, NonPeerModeStillDchecksMismatchedLsnMarker) {
 // so a 100%-filtered link (the steady state for a read-mostly node whose peer writes heavily, in
 // a mesh -- not a corner case) would emit nothing at all, ever: journal_rec_executed_ would never
 // advance while the master's true LSN raced ahead, and the eventual reconnect (or ring-buffer
-// eviction before it) would force a full resync whose last-loaded-wins merge (rdb_load.cc) can
-// resurrect stale values.
+// eviction before it) would force a full resync. Since P4-3, a peer link's full-sync merge
+// (rdb_load.cc) is LWW-guarded by MVCC stamp comparison rather than last-loaded-wins, so it no
+// longer blindly resurrects stale values -- but the extra resync churn is still costly.
 //
 // drakeydb: Phase 3 T6b fix-round-2 -- the original round-1 version of this test proved "keeps
 // refreshing" with a real ~4.5s sleep between the two RecordEntry calls, needed to clear

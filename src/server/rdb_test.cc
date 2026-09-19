@@ -5418,7 +5418,7 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneForAbsentKeyInstallsNoneAtCap) {
     mismatches = db_slice.TEST_VerifyMvccTable(0);
   });
   EXPECT_FALSE(got.has_value())
-      << "no tombstone may be installed for an absent key once the per-shard cap "
+      << "no tombstone may be installed for an absent key once the per-(db, shard) cap "
          "(--multi_master_max_tombstones) is reached";
   EXPECT_EQ(dropped_after, dropped_before + 1)
       << "the cap-induced degradation must be counted here too, exactly like the delete path's";
@@ -5545,8 +5545,9 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneUpdateForAbsentKeyIgnoresCapWhenNoGrowth) {
   });
   ASSERT_TRUE(got.has_value());
   EXPECT_EQ(*got, kNewTombstone)
-      << "updating an ALREADY-tombstoned slot does not grow mvcc_tombstones, so the per-shard cap "
-         "must not block it even at max_tombstones=0 -- a stale stamp here would let a later, "
+      << "updating an ALREADY-tombstoned slot does not grow mvcc_tombstones, so the "
+         "per-(db, shard) cap must not block it even at max_tombstones=0 -- a stale stamp here "
+         "would let a later, "
          "intermediate resurrection win";
 }
 

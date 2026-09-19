@@ -228,8 +228,8 @@ Governing choices:
    `{varint origin_idx, varint mvcc, varint flags}` (flags bit0 = expiry-DEL). Active masters
    refuse replication consumers that didn't negotiate the fork protocol, so stock readers never
    see v2.
-4. **Fork protocol version** (`kDrakeydbReplVersion`, `node_identity.h`; originally 66, bumped by
-   P4-2 for RDB opcode 221; **67 as of P4-3**, for opcode 225 — see `docs/multi-master.md`), sent
+4. **Fork protocol version** (`kDrakeydbReplVersion`, `node_identity.h`; originally 65, bumped to
+   66 by P4-2 for RDB opcode 221; **67 as of P4-3**, for opcode 225 — see `docs/multi-master.md`), sent
    via existing `REPLCONF DRAKEY-VERSION` — far above upstream's VER6 so future upstream bumps
    never collide. Non-active nodes interop with stock Dragonfly unchanged.
 5. **Persistent node UUID** in `<dir>/drakeydb.uuid` (fixes KeyDB's per-boot regeneration),
@@ -739,7 +739,7 @@ metric; `--multi_master_stream_lww` off = KeyDB-parity arrival order.
 **Verify:** pytest — concurrent conflicting SETs on A and B converge to the higher-mvcc value on
 both (KeyDB's "MVCC Updates Correctly" parity incl. its 2 ms slop).
 
-## Phase 6 — Merge-on-full-sync LWW ✅ delivered by P4-3 (above, pending merge)
+## Phase 6 — Merge-on-full-sync LWW (implemented by P4-3, above; branch pending merge)
 `mvcc-tstamp` per-key aux save/load; LWW hook at `rdb_load.cc:3238`.
 **Verify:** `rdb_test.cc` aux round-trip; pytest — node with newer local writes full-syncs from a
 peer holding older values → newer survive ("Active Replica Merges Database On Sync" parity);

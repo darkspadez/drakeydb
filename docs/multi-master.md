@@ -116,9 +116,11 @@ against this node's stale live value, the value itself is deleted here too — i
 absent on both sides, with no resurrection and no oscillation. What does **not** converge is the
 MVCC metadata, because this node's own merge-apply tombstone-install gate is `TombstonesEnabled()`
 too: this node never installs an MVCC tombstone of its own for that key, so `DEBUG MVCC <key>`
-reports `state:absent` here forever, while the peer that sent the delete keeps reporting
-`state:tombstone` for the same key — a divergence that persists indefinitely, not just until the
-next full sync. The practical consequence is a second-order resurrection risk: with no stamp of
+reports `state:absent` here, while the peer that sent the delete keeps reporting `state:tombstone`
+for the same key — a divergence that is bounded by the *peer's* own tombstone TTL, not this node's:
+the peer's `TombstoneGcStep` (`db_slice.cc`) reaps its tombstone once that TTL elapses, after which
+both sides report `state:absent`. Until then, the practical consequence is a second-order
+resurrection risk: with no stamp of
 its own to defend that key, this `ttl=0` node has nothing to compare a *later*, stale write from a
 *third* peer against, so that stale write is accepted unconditionally
 (`MergeAccepts(std::nullopt, incoming)` always accepts) — resurrecting the value even though the

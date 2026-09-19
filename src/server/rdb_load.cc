@@ -4223,9 +4223,10 @@ error_code RdbLoader::HandleTombstones() {
 
               // drakeydb: P4-3 Task 6, review fix I2 (Important) -- read the decision
               // PerformDeletionAtomic just made instead of re-deriving TombstonesEnabled()/the
-              // per-shard cap: a tombstone placeholder ({kTombstoneBit, 0}) exists afterwards iff
-              // that call decided this kExplicit delete earns one (TombstonesEnabled() true AND
-              // this shard was under --multi_master_max_tombstones at the moment of the delete).
+              // per-(db, shard) cap: a tombstone placeholder ({kTombstoneBit, 0}) exists
+              // afterwards iff that call decided this kExplicit delete earns one
+              // (TombstonesEnabled() true AND this shard was under --multi_master_max_tombstones
+              // at the moment of the delete).
               const std::optional<MvccStamp> post_delete = db_slice.GetMvcc(db_index, key);
               if (post_delete.has_value() && post_delete->IsTombstone()) {
                 // drakeydb: P4-3 Task 6 -- PerformDeletionAtomic's kExplicit branch just Disarm'd
@@ -4246,10 +4247,10 @@ error_code RdbLoader::HandleTombstones() {
                 db_slice.SetTombstone(db_index, key, stamp);
               }
               // else: PerformDeletionAtomic itself decided this delete does not earn a tombstone
-              // (ttl=0, or the per-shard cap was already hit -- mvcc_tombstones_dropped already
-              // incremented in that case, db_slice.cc) -- respect that decision exactly as a local
-              // delete would: the key stays deleted (the peer's authority is honored), but no
-              // tombstone is installed here either.
+              // (ttl=0, or the per-(db, shard) cap was already hit -- mvcc_tombstones_dropped
+              // already incremented in that case, db_slice.cc) -- respect that decision exactly
+              // as a local delete would: the key stays deleted (the peer's authority is
+              // honored), but no tombstone is installed here either.
               return;
             }
             // else: either resident_live was false from the start, or the key vanished during the

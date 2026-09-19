@@ -352,8 +352,8 @@ class RdbLoader : protected RdbLoaderBase {
   // compare before AddOrFind (cheaply rejects the common case without an insert) and the real,
   // authoritative compare after AddOrFind returns -- the only point with no further yield before
   // the value assignment -- which on rejection either cancels the AutoUpdater in place (pre-
-  // existing entry) or calls DbSlice::RollbackFreshInsert (fresh insert). See that function's own
-  // comment for why line numbers are not cited here: they drift. `enable`: only an authenticated
+  // existing entry) or calls DbSlice::RollbackFreshInsert (fresh insert); line numbers are not
+  // cited here because they drift. `enable`: only an authenticated
   // peer-mode full sync may set this true (replica.cc's two SetMergeLww call sites, both already,
   // or newly, guarded on peer mode -- grep SetMergeLww); every other loader -- a local RDB file
   // load, DEBUG LOAD/restore, and a plain Dragonfly replica's full sync -- leaves merge_lww_ at its
