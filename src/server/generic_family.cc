@@ -1786,27 +1786,35 @@ template <typename F> bool Iterate(const PrimeValue& pv, F&& func) {
 
 // drakeydb: P4-0 fix-wave -- true iff this transaction's causing command will auto-journal
 // itself verbatim (Transaction::LogAutoJournalOnShard, transaction.cc), the predicate that
-// distinguishes SORT (CO::JOURNALED, no NO_AUTOJOURNAL -- auto-journals) from SORT_RO
-// (CO::READONLY -- never auto-journals), the two commands reaching OpFetchSortEntries /
-// OpFetchContainerElements below through the same call sites. Derived from the transaction's own
-// CommandId rather than a hardcoded command name, so it stays correct if either command's
-// registration changes: mirrors LogAutoJournalOnShard's full gate, `(IsJournaled() ||
-// NO_KEY_TRANSACTIONAL) && !NO_AUTOJOURNAL`, not just its JOURNALED/NO_AUTOJOURNAL half. Omitting
-// the NO_KEY_TRANSACTIONAL disjunct would be the dangerous direction: a NO_KEY_TRANSACTIONAL,
-// non-JOURNALED command still auto-journals there, so a predicate that missed it would return
-// false while the command actually auto-journals verbatim -- silently reopening the exact
-// divergence this PR closes, for whichever future call site trusted the predicate. No behavior
-// change for either current caller: SORT and SORT_RO are both keyed (firstkey=1) and neither sets
-// NO_KEY_TRANSACTIONAL, so this disjunct is a no-op for both today. Deliberately omits
-// LogAutoJournalOnShard's re_enabled_auto_journal_ check: that only matters for a
-// CO::NO_AUTOJOURNAL command that opts back in via Transaction::ReviveAutoJournal(), and every
-// command reaching this predicate today is either CO::JOURNALED without CO::NO_AUTOJOURNAL
-// (SORT) or CO::READONLY (SORT_RO) -- neither can ever call ReviveAutoJournal(), which DCHECKs
-// CO::NO_AUTOJOURNAL is set on the command.
+// distinguishes SORT from SORT_RO (CO::READONLY -- never auto-journals), the two commands
+// reaching OpFetchSortEntries / OpFetchContainerElements below through the same call sites.
+// Derived from the transaction's own CommandId rather than a hardcoded command name, so it stays
+// correct if either command's registration changes: mirrors LogAutoJournalOnShard's full gate,
+// `(IsJournaled() || NO_KEY_TRANSACTIONAL) && !(NO_AUTOJOURNAL && !re_enabled_auto_journal_)`,
+// not just its static JOURNALED/NO_AUTOJOURNAL half. Omitting the NO_KEY_TRANSACTIONAL disjunct
+// would be the dangerous direction: a NO_KEY_TRANSACTIONAL, non-JOURNALED command still
+// auto-journals there, so a predicate that missed it would return false while the command
+// actually auto-journals verbatim -- silently reopening the exact divergence this PR closes, for
+// whichever future call site trusted the predicate. No behavior change for either current
+// caller: SORT and SORT_RO are both keyed (firstkey=1) and neither sets NO_KEY_TRANSACTIONAL, so
+// this disjunct is a no-op for both today.
+//
+// drakeydb: P4-3 Task 7 -- SORT is now registered CO::NO_AUTOJOURNAL (see its CI{} entry below),
+// reviving auto-journal per-transaction via Transaction::ReviveAutoJournal() only when it is
+// actually safe to replay verbatim (SortGeneric, GetUniqueShardCnt() == 1). A purely static read
+// of `cid->opt_mask() & CO::NO_AUTOJOURNAL` -- this function's shape before Task 7 -- would now
+// return false for EVERY SORT, including the single-shard case that DOES revive and DOES still
+// auto-journal verbatim, wrongly disabling CaptureSortMembersBeforeExpiry's SREM compensation for
+// a scenario Task 7 never intended to touch. Transaction::IsAutoJournalSuppressed() (transaction.h)
+// is the dynamic-aware replacement: it mirrors LogAutoJournalOnShard's own
+// `NO_AUTOJOURNAL && !re_enabled_auto_journal_` check exactly (same private state, read the same
+// way), so this predicate and the dispatcher's actual decision can never disagree. SORT_RO still
+// never sets NO_AUTOJOURNAL or calls ReviveAutoJournal(), so IsAutoJournalSuppressed() is
+// unconditionally false for it, same as before Task 7.
 bool WillAutoJournalVerbatim(const Transaction* tx) {
   const CommandId* cid = tx->GetCId();
   bool auto_journals = cid->IsJournaled() || (cid->opt_mask() & CO::NO_KEY_TRANSACTIONAL);
-  return auto_journals && !(cid->opt_mask() & CO::NO_AUTOJOURNAL);
+  return auto_journals && !tx->IsAutoJournalSuppressed();
 }
 
 // SORT mutates a TTL-bearing set while fetching it: DenseSet iteration removes expired members.
@@ -1980,6 +1988,21 @@ OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, Iterator
                            IteratorEnd&& end_it, bool has_get_patterns) {
   uint32_t len = 0;
 
+  // drakeydb: P4-3 Task 7 -- SORT is now CO::NO_AUTOJOURNAL (see its registration below) with
+  // SortGeneric reviving auto-journal only when GetUniqueShardCnt() == 1 (src and this STORE
+  // destination land on the same shard, or there is no STORE at all -- see the comment at that
+  // call site). When that didn't happen, nothing else will journal this shard's write: a
+  // multi-shard SORT ... STORE's auto-journal (had SORT stayed CO::JOURNALED without
+  // NO_AUTOJOURNAL) fires once per participating shard on the concluding hop regardless of which
+  // shard actually wrote (Transaction::RunCallback/LogAutoJournalOnShard, transaction.cc), and
+  // since GetUniqueShardCnt() != 1 there, its payload is built from GetShardArgs(shard_id) --
+  // just THIS shard's own key slice -- dropping BY/GET/LIMIT/STORE and the other key entirely
+  // (see CrossShardStoreHandJournalsRestoreOfDestinationEffect, multi_master_test.cc, and
+  // task-7-report.md for the pinned mechanism). Hand-journal the resulting EFFECT below instead:
+  // this also makes a replica's `dst` converge regardless of its own copy of `src`, since the
+  // replica never re-sorts anything -- it just applies the already-computed result.
+  const bool hand_journal = op_args.shard->journal() && op_args.tx->GetUniqueShardCnt() != 1;
+
   // If we are about to overwrite an existing indexed document (HASH/JSON),
   // remove it from search indices first to avoid duplicate entries.
   // Use FindMutable (not FindReadOnly) because HNSW preservation may modify the PrimeValue.
@@ -2010,6 +2033,12 @@ OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, Iterator
     auto it_res = op_args.GetDbSlice().FindMutable(op_args.db_cntx, key);
     if (IsValid(it_res.it)) {
       op_args.GetDbSlice().DelMutable(op_args.db_cntx, std::move(it_res));
+      // DelMutable above runs its own post_updater synchronously (DbSlice::DelMutable) and
+      // PerformDeletionAtomic arms any tombstone inline, before returning -- so, unlike the
+      // AddOrUpdate branch below, there is no separate "arm before journal" step needed here.
+      if (hand_journal) {
+        RecordJournal(op_args, "DEL"sv, ArgSlice{key});
+      }
     }
     return 0;
   }
@@ -2017,9 +2046,38 @@ OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, Iterator
   PrimeValue pv;
   pv.InitRobj(OBJ_LIST, kEncodingQL2, ql_v2);
 
+  // Captured from `pv` before it is moved into AddOrUpdate below: a single RESTORE ... REPLACE
+  // hand-journal entry (the same pattern Renamer::DeserializeDest below uses for cross-shard
+  // RENAME/COPY) is one atomic replace with exactly one arm -- unlike a DEL-then-RPUSH pair,
+  // which would arm-and-commit twice for what is really one local mutation. A second commit
+  // would find nothing left armed (MvccStamper::Commit sweeps and consumes every currently-armed
+  // key on its first call) and mint the SECOND entry's stamp without ever attaching it to `key`,
+  // leaving the author's own value stamped from the first (fictitious, no-op) entry while a
+  // replica applying both entries in order ends up stamped from the second -- an author/replica
+  // stamp mismatch. Computed unconditionally-cheap-to-skip via `hand_journal` below, not
+  // unconditionally, so the common (single-shard, auto-journal-revived) path pays nothing extra.
+  OpResult<string> dump;
+  if (hand_journal) {
+    dump = DumpToString(key, pv, op_args);
+    LOG_IF(DFATAL, !dump.ok()) << "SORT STORE could not serialize its own freshly-built list for "
+                                  "hand-journaling; the destination will not replicate to key '"
+                               << key << "': " << dump.status();
+  }
+
   // This would overwrite existing value if any with new list.
   auto op_res = op_args.GetDbSlice().AddOrUpdate(op_args.db_cntx, key, std::move(pv), 0);
   RETURN_ON_BAD_STATUS(op_res);
+
+  if (hand_journal && dump.ok()) {
+    // drakeydb: arm before journal -- the AutoUpdater must run before RecordJournal's synchronous
+    // Commit, or the commit sees nothing armed and `key` is never stamped even though its
+    // RESTORE was propagated (the P4-1 "propagated but not stamped" defect class, fixed
+    // repeatedly elsewhere in this file -- see Renamer::DeserializeDest's identical comment).
+    op_res->post_updater.Run();
+
+    absl::InlinedVector<std::string_view, 4> args{key, "0"sv, *dump, "REPLACE"sv};
+    RecordJournal(op_args, "RESTORE"sv, args);
+  }
 
   return len;
 }
@@ -2276,6 +2334,21 @@ OpStatus PopulateSortEntriesFromByPattern(const SortParams& params,
 }
 
 void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_only) {
+  // drakeydb: P4-3 Task 7 -- SORT is registered CO::NO_AUTOJOURNAL; SORT_RO is not (and must
+  // never call ReviveAutoJournal -- its DCHECK requires CO::NO_AUTOJOURNAL on the command, which
+  // SORT_RO's CO::READONLY registration never sets). Revive here, before this transaction's first
+  // Execute() hop below (ReviveAutoJournal's own "call during setup" contract, and
+  // RenameGeneric's identical precedent above), exactly when it is safe to replay SORT verbatim:
+  // GetUniqueShardCnt() == 1 covers both "no STORE at all" (only `key` is ever a scheduled key)
+  // and "STORE whose destination hashes to the same shard as `key`" (transaction.cc's key-index
+  // extraction folds STORE's destination into a `bonus` key that still collapses to one shard).
+  // A cross-shard STORE takes the multi-key scheduling path instead (GetUniqueShardCnt() != 1)
+  // and stays NO_AUTOJOURNAL; OpStore's hand-journal (above) carries its destination's effect in
+  // that case instead.
+  if (!is_read_only && cmd_cntx->tx()->GetUniqueShardCnt() == 1) {
+    cmd_cntx->tx()->ReviveAutoJournal();
+  }
+
   std::string_view key = parser.Next();
   SortParams params;
   params.is_read_only = is_read_only;
@@ -3058,7 +3131,18 @@ void GenericFamily::Register(CommandRegistry* registry) {
       << CI{"UNLINK", CO::JOURNALED | CO::NO_AUTOJOURNAL, -2, 1, -1, acl::kUnlink}.SetAsyncHandler(
              CmdDel)
       << CI{"STICK", CO::JOURNALED, -2, 1, -1, acl::kStick}.HFUNC(Stick)
-      << CI{"SORT", CO::JOURNALED | CO::STORE_LAST_KEY, -2, 1, 1, acl::kSort}.HFUNC(Sort)
+      // drakeydb: P4-3 Task 7 -- NO_AUTOJOURNAL added. SORT's dispatcher-level auto-journal used
+      // to fire unconditionally for the concluding hop; that is exactly what silently dropped a
+      // cross-shard STORE's destination effect (a per-shard payload split meant for independent
+      // multi-key commands like DEL/MSET, nonsensical for SORT -- see OpStore's hand-journal
+      // comment and CrossShardStoreHandJournalsRestoreOfDestinationEffect, multi_master_test.cc).
+      // SortGeneric revives auto-journal itself (Transaction::ReviveAutoJournal) whenever it is
+      // actually safe to replay SORT verbatim -- GetUniqueShardCnt() == 1, i.e. no STORE at all,
+      // or a STORE landing on the same shard as the source -- so every existing single-shard
+      // behavior (including the lazy-member-expiry SREM compensation gated on
+      // WillAutoJournalVerbatim, above) is unchanged.
+      << CI{"SORT", CO::JOURNALED | CO::STORE_LAST_KEY | CO::NO_AUTOJOURNAL, -2, 1, 1, acl::kSort}
+             .HFUNC(Sort)
       << CI{"SORT_RO", CO::READONLY, -2, 1, 1, acl::kSortRO}.HFUNC(Sort_RO)
       << CI{"MOVE", CO::JOURNALED | CO::GLOBAL_TRANS | CO::NO_AUTOJOURNAL, 3, 1, 1, acl::kMove}
              .HFUNC(Move)

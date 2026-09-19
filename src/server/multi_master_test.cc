@@ -3893,6 +3893,143 @@ TEST_F(MultiShardOriginJournalFamilyTest, AddOrGetEmitsOriginOnNewIndexOnly) {
       [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
 }
 
+namespace {
+// drakeydb: P4-3 Task 7 -- like OriginOpcodeCapturingConsumer above, but decodes and keeps the
+// full argument list (ParsedEntry::cmd.view(), cmd name first) rather than just origin/opcode
+// metadata. That is the only way to prove or disprove that a cross-shard auto-journaled
+// command's per-shard payload still carries enough information for a replica to reconstruct the
+// command's effect -- the question Task 7's diagnosis turns on for SORT ... STORE.
+struct DecodedJournalEntry {
+  ShardId shard_id;
+  std::vector<std::string> args;
+};
+
+class DecodingEntryCapturingConsumer : public journal::JournalConsumerInterface {
+ public:
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    io::BytesSource source{item.journal_item.data};
+    JournalReader reader{&source, 0};
+    journal::ParsedEntry parsed;
+    CHECK(!reader.ReadEntry(&parsed));
+
+    std::vector<std::string> args;
+    for (std::string_view sv : parsed.cmd.view())
+      args.emplace_back(sv);
+
+    util::fb2::LockGuard lk(mu_);
+    entries.push_back({EngineShard::tlocal()->shard_id(), std::move(args)});
+  }
+  void ThrottleIfNeeded() override {
+  }
+
+  util::fb2::Mutex mu_;
+  std::vector<DecodedJournalEntry> entries;  // guarded by mu_
+};
+}  // namespace
+
+// drakeydb: P4-3 Task 7. The issue register (D-3) records that `SORT ... STORE` does not
+// replicate, reproduced with --active_replica off, and the trap (see the task brief) is that
+// SORT was registered CO::JOURNALED with no NO_AUTOJOURNAL (generic_family.cc) -- normally
+// meaning the dispatcher auto-journals SORT's verbatim command, which should be enough for a
+// replica to reproduce the STORE. Step 1's diagnosis proved that assumption wrong specifically
+// when source and destination hash to DIFFERENT shards:
+//
+// Mechanism (pre-fix), with evidence -- see task-7-report.md for the full account:
+//  - CO::STORE_LAST_KEY makes the destination key a genuine second locked/scheduled key
+//    (Transaction's key-index parser sets `bonus` to the STORE keyword's argument,
+//    transaction.cc:1940-1948), so a cross-shard SORT ... STORE takes the multi-key
+//    BuildShardIndex/InitShardData path (transaction.cc:209-264) instead of the single-key fast
+//    path (InitByKeys's `NumArgs() == 1` check, transaction.cc:310), leaving unique_shard_cnt_ ==
+//    2 -- one shard for `src`, one for `dst`.
+//  - DispatchHop (transaction.cc:1020-1058) runs RunCallback on every active/keyed shard for
+//    every hop, including the concluding one, so Transaction::LogAutoJournalOnShard
+//    (transaction.cc:1700-1736) fired on BOTH shards once COORD_CONCLUDING was set -- regardless
+//    of whether that particular shard's callback actually performed the STORE write.
+//  - Since unique_shard_cnt_ != 1, LogAutoJournalOnShard's payload was NOT the full verbatim
+//    command (transaction.cc:1727-1732): it was built from GetShardArgs(shard_id)
+//    (transaction.cc:1456-1468), which slices out only THAT shard's own key argument. The source
+//    shard therefore journaled a bare "SORT <src>" and the destination shard journaled a bare
+//    "SORT <dst>" -- both missing BY/GET/LIMIT/STORE and the other key entirely. Neither entry,
+//    nor both together, could reconstruct the STORE effect: a replica applying them verbatim
+//    never created `dst`. Ruled out explicitly at the time: auto-journal DID fire (on both
+//    shards, not suppressed), IsOmittableWrite was never involved (SORT never sets
+//    is_omittable_operation), and STORE_LAST_KEY's *routing* was already correct (the local
+//    `lrange dst` sanity check below always passed) -- the bug was purely in what
+//    LogAutoJournalOnShard chose to journal for a >1-shard transaction.
+//
+// The fix (Step 2): SORT is now CO::NO_AUTOJOURNAL, reviving verbatim auto-journal only when
+// GetUniqueShardCnt() == 1 (SortGeneric, generic_family.cc). A cross-shard STORE stays
+// NO_AUTOJOURNAL, so nothing else journals the destination shard's write; OpStore instead hand-
+// journals a single "RESTORE dst 0 <dump> REPLACE" -- the destination's actual resulting EFFECT,
+// not a re-sortable recipe -- using the same arm-before-journal pattern Renamer::DeserializeDest
+// (RENAME/COPY, this file) already established for exactly this "cross-shard destination write
+// needs its own hand journal entry" shape. This test now pins that behavior; it is the same test
+// that pinned the bug during Step 1's diagnosis (see its earlier revision in git history / the
+// report for the pre-fix assertions), inverted to pin the fix instead.
+//
+// Falsifying: reverting Step 2 (dropping SORT's CO::NO_AUTOJOURNAL, or SortGeneric's
+// ReviveAutoJournal call, or OpStore's hand-journal block) reproduces the original bug -- this
+// test then fails exactly as it did pre-fix: dst_entry becomes null (no destination entry at
+// all) or reverts to a bare "SORT <dst>" with no RESTORE/REPLACE. Verified in task-7-report.md.
+TEST_F(MultiShardOriginJournalFamilyTest, CrossShardStoreHandJournalsRestoreOfDestinationEffect) {
+  const size_t num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "test requires more than one shard to be meaningful";
+
+  const std::string src = "sort-src";
+  const ShardId src_sid = Shard(src, num_shards);
+  std::string dst;
+  for (int i = 0;; ++i) {
+    dst = absl::StrCat("sort-dst", i);
+    if (Shard(dst, num_shards) != src_sid)
+      break;
+    CHECK_LT(i, 10000) << "could not find a destination key hashing to a different shard";
+  }
+  const ShardId dst_sid = Shard(dst, num_shards);
+  ASSERT_NE(src_sid, dst_sid) << "test setup must exercise two distinct shards";
+
+  Run({"rpush", src, "3", "1", "2"});
+
+  DecodingEntryCapturingConsumer consumer;
+  std::vector<uint32_t> consumer_ids(num_shards, 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+
+  auto resp = Run({"sort", src, "store", dst});
+  EXPECT_EQ(3, resp.GetInt());
+  EXPECT_THAT(Run({"lrange", dst, "0", "-1"}).GetVec(), testing::ElementsAre("1", "2", "3"));
+
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+  const DecodedJournalEntry* src_entry = nullptr;
+  const DecodedJournalEntry* dst_entry = nullptr;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    for (const auto& e : consumer.entries) {
+      if (e.shard_id == src_sid)
+        src_entry = &e;
+      if (e.shard_id == dst_sid)
+        dst_entry = &e;
+    }
+  }
+  // The source shard journals nothing: SORT is CO::NO_AUTOJOURNAL and this cross-shard STORE
+  // does not revive it (GetUniqueShardCnt() != 1), and there is no lazy member-expiry SREM to
+  // compensate for (`src` is a plain TTL-less list here). A regression back to the pre-fix
+  // per-shard auto-journal split would show up here as a bare "SORT <src>" entry.
+  EXPECT_EQ(nullptr, src_entry) << "the source shard must not journal anything for this STORE";
+
+  // The destination shard hand-journals exactly one RESTORE ... REPLACE entry: the resulting
+  // EFFECT (a serialized list blob), not a re-sortable "SORT <dst>" recipe -- so a replica
+  // converges on `dst` regardless of its own copy of `src`.
+  ASSERT_NE(nullptr, dst_entry) << "the destination shard must hand-journal the STORE effect";
+  ASSERT_GE(dst_entry->args.size(), 4u) << "RESTORE key ttl dump REPLACE";
+  EXPECT_EQ("RESTORE", dst_entry->args[0]);
+  EXPECT_EQ(dst, dst_entry->args[1]);
+  EXPECT_EQ("REPLACE", dst_entry->args.back());
+}
+
 // drakeydb: P4-0 Task 2b -- boots with active_replica=true (ActiveReplicaFamilyTest, above) so
 // DbSlice::DeleteExpiredStep's member-expiry reaper -- gated on IsActiveReplica(), Step 4 of the
 // task brief -- actually runs; OriginJournalFamilyTest does not set the flag. Also

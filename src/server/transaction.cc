@@ -1718,7 +1718,10 @@ void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult resul
   }
 
   // If autojournaling was disabled and not re-enabled the callback is writing to journal.
-  if ((cid_->opt_mask() & CO::NO_AUTOJOURNAL) && !re_enabled_auto_journal_) {
+  // drakeydb: P4-3 Task 7 -- routed through IsAutoJournalSuppressed() (transaction.h) so this
+  // check and that public accessor (used by SORT's WillAutoJournalVerbatim, generic_family.cc)
+  // can never drift apart.
+  if (IsAutoJournalSuppressed()) {
     return;
   }
 
@@ -1755,6 +1758,10 @@ void Transaction::ReviveAutoJournal() {
   DCHECK(cid_->opt_mask() & CO::NO_AUTOJOURNAL);
   DCHECK_EQ(run_barrier_.DEBUG_Count(), 0u);  // Can't be changed while dispatching
   re_enabled_auto_journal_ = true;
+}
+
+bool Transaction::IsAutoJournalSuppressed() const {
+  return (cid_->opt_mask() & CO::NO_AUTOJOURNAL) && !re_enabled_auto_journal_;
 }
 
 void Transaction::CancelBlocking(const std::function<OpStatus(ArgSlice)>& status_cb) {

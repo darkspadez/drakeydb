@@ -387,6 +387,21 @@ class Transaction {
   // Re-enable auto journal for commands marked as NO_AUTOJOURNAL. Call during setup.
   void ReviveAutoJournal();
 
+  // drakeydb: P4-3 Task 7 -- true iff this transaction's auto-journal is currently suppressed,
+  // i.e. LogAutoJournalOnShard (transaction.cc) will NOT record the causing command verbatim.
+  // Mirrors that function's own `(cid_->opt_mask() & CO::NO_AUTOJOURNAL) &&
+  // !re_enabled_auto_journal_` check exactly, reading the same private state the same way, so a
+  // caller outside Transaction (SORT's WillAutoJournalVerbatim, generic_family.cc) can predict
+  // the dispatcher's real decision -- including after a NO_AUTOJOURNAL command calls
+  // ReviveAutoJournal() during setup -- without duplicating or drifting from it. A purely static
+  // `cid->opt_mask() & CO::NO_AUTOJOURNAL` read cannot distinguish "always suppressed" from
+  // "suppressed by default, revived for this transaction", which is exactly the distinction a
+  // conditionally-reviving NO_AUTOJOURNAL command (RENAME, and now SORT) needs its callers to see.
+  // Defined out-of-line (transaction.cc): CommandId is only forward-declared here, and opt_mask()
+  // plus CO::NO_AUTOJOURNAL need its full definition (command_registry.h), which transaction.h
+  // deliberately does not pull in.
+  bool IsAutoJournalSuppressed() const;
+
   // Clear all state to make transaction re-usable
   void Refurbish();
 
