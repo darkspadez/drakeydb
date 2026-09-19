@@ -98,7 +98,7 @@ restriction below) rather than being a separate gap.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--multi_master_tombstone_ttl` | `600` (seconds) | How long a tombstone is retained before the idle-task GC (`DbSlice::TombstoneGcStep`) reclaims it. **`0` disables tombstoning entirely**, on both the write and the load side: a live delete erases immediately instead of arming a tombstone (identical to pre-Phase-4 behavior), loading an already-persisted tombstone from an RDB file (your own prior `SAVE`, `DEBUG LOAD`/`RESTORE`, or a peer's full sync) skips installing it instead (logging one warning), and the GC step itself no-ops. See the restart caveat below for what this means across a TTL change. |
+| `--multi_master_tombstone_ttl` | `600` (seconds) | How long a tombstone is retained before the idle-task GC (`DbSlice::TombstoneGcStep`) reclaims it. **`0` disables tombstoning entirely**, on both the write and the load side: a live delete erases immediately instead of arming a tombstone (identical to pre-Phase-4 behavior), loading an already-persisted tombstone skips installing it instead, and the GC step itself no-ops. The skip is **not** silent-or-loud the same way everywhere: reloading your own prior `SAVE`/`DEBUG LOAD` file logs one warning per process (`rdb_load.cc`'s non-merge install gate), but a peer's full sync hits a separate gate on the merge-apply branch that logs nothing at all — see the mesh-divergence note below for what that means operationally. `RESTORE` never reaches either gate: it restores a single key via `RdbRestoreValue`, never Dragonfly's RDB opcode loop, so it can never carry or skip a tombstone section. See the restart caveat below for what this means across a TTL change. |
 | `--multi_master_max_tombstones` | `1000000` | Cap on live tombstones **per (database, shard) pair, not per shard overall**: `table->stats` (`db_slice.cc`) lives on one `DbTable` per `SELECT`-able database index on each shard, so a node with N databases can hold up to N times this many tombstones on a single shard. A delete that would push its own (database, shard) pair over this cap **degrades to a plain erase instead of arming a tombstone** — see "Hitting the cap" below. |
 | `--multi_master_tombstone_gc_budget` | `64` | Side-table buckets the idle-task GC visits per tick. Must be `>= 1` (validated at boot); bounds one GC tick's total work across however many databases still need visiting. |
 
@@ -109,6 +109,20 @@ older file written while tombstoning was on. If you re-enable tombstoning by res
 nonzero TTL, deletes made **before** that restart have no tombstone to protect them — only deletes
 made after the flip get the protection. There is no way to retroactively tombstone a delete that
 already happened while tombstoning was off.
+
+**A `ttl=0` node in a mesh never agrees with a peer's tombstone at the MVCC level.** The peer's
+delete authority is still real and still applies: when a peer's tombstone wins a full-sync merge
+against this node's stale live value, the value itself is deleted here too — it converges to
+absent on both sides, with no resurrection and no oscillation. What does **not** converge is the
+MVCC metadata, because this node's own merge-apply tombstone-install gate is `TombstonesEnabled()`
+too: this node never installs an MVCC tombstone of its own for that key, so `DEBUG MVCC <key>`
+reports `state:absent` here forever, while the peer that sent the delete keeps reporting
+`state:tombstone` for the same key — a divergence that persists indefinitely, not just until the
+next full sync. The practical consequence is a second-order resurrection risk: with no stamp of
+its own to defend that key, this `ttl=0` node has nothing to compare a *later*, stale write from a
+*third* peer against, so that stale write is accepted unconditionally
+(`MergeAccepts(std::nullopt, incoming)` always accepts) — resurrecting the value even though the
+correct peer's tombstone is still live and unexpired elsewhere in the mesh.
 
 **Sizing the TTL against expected partition length.** A tombstone protects a delete only for as
 long as it is retained: if a peer is partitioned (network split, long maintenance window, extended

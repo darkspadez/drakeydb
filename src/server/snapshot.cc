@@ -176,7 +176,7 @@ void SliceSnapshot::FinalizeJournalStream(bool cancel) {
 // via MergeAccepts on the apply side, so the claim held only for the "no prior entry at all" case.
 // Under merge_lww_ it now holds unconditionally (review fix I3: an earlier version of this
 // sentence overclaimed unconditionally for every loader). A non-merge load (a local RDB file,
-// DEBUG LOAD/RESTORE, or a plain Dragonfly replica's full sync) instead keeps D-7's separate,
+// DEBUG LOAD, or a plain Dragonfly replica's full sync) instead keeps D-7's separate,
 // simpler rule -- skip a resident live key, otherwise install/overwrite unconditionally -- which
 // needs no ordering guarantee either, since it never depends on comparing against the key stream's
 // own outcome in the first place.

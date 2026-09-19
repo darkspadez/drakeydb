@@ -182,6 +182,14 @@ async def _apply_random_ops(rng, c_a, c_b, key_space, count, round_idx, model):
     exist (returns 0) is NOT recorded and does NOT mark `touched` -- it had no effect, so it must
     not be allowed to out-rank a real prior write via `_Model`'s seq fallback, and it is not a
     genuine contest participant for I-2's purposes either.
+
+    Fix-round note: a `DEL` can return 0 precisely BECAUSE this key's own earlier short TTL (from
+    a PRIOR `expire` op this round, on the SAME side) already elapsed -- touching an expired key
+    triggers Dragonfly's own lazy-expiry check before the DEL itself runs, which is what actually
+    arms the tombstone (kExpired), while the DEL command that observed nothing there reports 0.
+    So `expiring.discard(...)` must NOT run on the no-op path: discarding here would drop the
+    pending settle-time read-back for exactly the round that needs it, and the model would never
+    learn this write happened at all (silently losing it, rather than merely deferring it).
     """
     expiring = set()
     touched = defaultdict(set)
@@ -198,9 +206,9 @@ async def _apply_random_ops(rng, c_a, c_b, key_space, count, round_idx, model):
             expiring.discard((side, key))
         elif kind == "del":
             deleted = await c.execute_command("del", key)
-            expiring.discard((side, key))
             if not deleted:
-                continue
+                continue  # leaves any pending `expiring` entry alone -- see the docstring note
+            expiring.discard((side, key))
             stamp, _ = await _read_one(c, key)
             model.record(key, model.next_seq(), "del", side, stamp, None)
             touched[key].add(side)

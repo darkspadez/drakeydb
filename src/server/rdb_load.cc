@@ -4021,7 +4021,7 @@ error_code RdbLoader::HandleTombstones() {
           // ahead of the branch. This section is a PROLOGUE, parsed and (if active) installed
           // before this shard's own key stream even begins, so at this exact moment `table->prime`
           // can only hold whatever this DbSlice already held BEFORE this file started loading (a
-          // non-flushing load onto an already-populated database, e.g. DEBUG LOAD / RESTORE, or a
+          // non-flushing load onto an already-populated database, e.g. DEBUG LOAD, or a
           // merge-mode full sync landing on existing data) -- it can never yet hold a later key
           // from THIS SAME file, since those haven't been parsed yet.
           //
@@ -4063,7 +4063,7 @@ error_code RdbLoader::HandleTombstones() {
           // drakeydb: P4-3 Task 6 -- the merge-LWW gate for a peer-mode full sync (merge_lww is
           // captured BY VALUE from merge_lww_ above: this lambda can run on a different fiber, and
           // possibly a different thread, than the one that called SetMergeLww). A non-merge load
-          // (a local RDB file, DEBUG LOAD/RESTORE, or a plain Dragonfly replica's full sync) never
+          // (a local RDB file, DEBUG LOAD, or a plain Dragonfly replica's full sync) never
           // sets merge_lww_ true (rdb_load.h's own doc comment on SetMergeLww) and falls straight
           // through to the pre-existing skip-and-warn / unconditional-install behavior below,
           // completely unchanged -- D-7's compatibility rule for those three loaders.
@@ -4351,7 +4351,7 @@ error_code RdbLoader::HandleTombstones() {
           // account). Installing a tombstone over a pre-existing resident value would incorrectly
           // delete it and violate the dense invariant (mvcc->size() - mvcc_tombstones ==
           // prime.size(), db_slice.cc); skip instead. Reached for a non-merge load (the D-7
-          // compatibility rule: a local RDB file, DEBUG LOAD/RESTORE, and a plain Dragonfly
+          // compatibility rule: a local RDB file, DEBUG LOAD, and a plain Dragonfly
           // replica's full sync must never delete a resident value on account of a tombstone
           // record) -- and, per review fix M3, also for a merge_lww_ load whose DbSlice has no
           // mvcc side table at all (`!mvcc_ready` above), since the `if (merge_lww && mvcc_ready)`
@@ -4380,7 +4380,7 @@ error_code RdbLoader::HandleTombstones() {
           // reaped -- immortal, the exact failure class Task 3's Mvcc()==0 rejection (this
           // function, above) and TombstoneGcStep's own reap predicate both exist to prevent,
           // reached here via a third route this function's other two gates do not cover: a
-          // non-merge load (a local RDB file, DEBUG LOAD/RESTORE, or a plain Dragonfly replica's
+          // non-merge load (a local RDB file, DEBUG LOAD, or a plain Dragonfly replica's
           // full sync) of a file carrying an opcode 225 tombstone section -- most concretely, this
           // node's own prior SAVE/BGSAVE output, reloaded after an operator flips
           // --multi_master_tombstone_ttl to 0 and restarts. Checked BEFORE the mvcc-table-missing
