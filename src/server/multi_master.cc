@@ -32,11 +32,17 @@ ABSL_FLAG(uint64_t, multi_master_tombstone_ttl, 600,
           "retained before DbSlice::TombstoneGcStep's idle-task GC reclaims it. This value also "
           "gates TombstonesEnabled(): 0 disables tombstoning entirely -- every delete erases its "
           "slot immediately, same as kEvicted/kSlotFlush -- and the GC step itself no-ops.");
+// drakeydb: P4-3 Task 8, controller fix (I1) -- "per-shard" was imprecise: table->stats
+// (db_slice.cc's cap check) lives on a DbTable, one per (SELECT-able database, shard) pair, not
+// one per shard overall. A node with N databases can therefore hold up to N times this many live
+// tombstones on a single shard -- one independent cap per db index.
 ABSL_FLAG(uint64_t, multi_master_max_tombstones, 1000000,
-          "drakeydb: per-shard cap on live tombstones. A delete that would push a shard's "
-          "tombstone count past this degrades to an erase instead (counted in "
-          "mvcc_tombstones_dropped), trading resurrection risk for bounded memory on a shard "
-          "that never gets an idle moment for GC to catch up.");
+          "drakeydb: cap on live tombstones per (database, shard) pair -- NOT a single per-shard "
+          "total: a node with N SELECT-able databases can hold up to N times this many on one "
+          "shard. A delete that would push its own (database, shard) pair's tombstone count past "
+          "this degrades to an erase instead (counted in mvcc_tombstones_dropped), trading "
+          "resurrection risk for bounded memory on a shard that never gets an idle moment for GC "
+          "to catch up.");
 ABSL_FLAG(uint32_t, multi_master_tombstone_gc_budget, 64,
           "drakeydb: mvcc side-table buckets DbSlice::TombstoneGcStep (db_slice.cc) visits per "
           "idle-task GC tick when reclaiming tombstones older than "
@@ -126,10 +132,20 @@ bool ValidateMultiMasterFlags() {
                     "peer's full sync -- an explicit DEL on this node still tombstones and is "
                     "immune to that";
   }
+  // drakeydb: P4-3 Task 8, controller fix (I6) -- this warning still described the pre-P4-3
+  // world (full-sync merge unconditionally overwriting with whatever loaded last, "until P6").
+  // P4-3 landed merge-LWW for full sync; the warning now names what actually remains true:
+  // stable-sync (steady-state, post-full-sync) applies are still arrival-order, not compared
+  // against a local stamp at all -- MergeAccepts (mvcc.h) has no caller outside the full-sync
+  // loader (rdb_load.cc) today. See docs/multi-master.md for the full merge/tombstone contract.
   LOG(WARNING) << "--active_replica: known limitations -- a local read (e.g. HTTL) can lazily "
-                  "expire and delete a peer's not-yet-expired key under clock skew, and full-sync "
-                  "merge is last-loaded-wins until P6 (a peer sync can overwrite newer local "
-                  "writes); see docs/PLAN.md";
+                  "expire and delete a peer's not-yet-expired key under clock skew; full-sync "
+                  "merge is last-write-wins per key since P4-3 (ties favor the stored side; a "
+                  "classic-protocol peer's unstamped keys use an approximate snapshot-time "
+                  "authority and can resurrect an older delete -- see docs/multi-master.md), but "
+                  "STEADY-STATE stable-sync applies (ordinary replicated writes after the initial "
+                  "sync) remain arrival-order until P4-4 -- a peer's write can still overwrite a "
+                  "newer local write if it simply arrives later; see docs/PLAN.md";
   return true;
 }
 

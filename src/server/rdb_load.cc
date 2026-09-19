@@ -4372,6 +4372,27 @@ error_code RdbLoader::HandleTombstones() {
             return;
           }
 
+          // drakeydb: P4-3 Task 8, controller fix (I4, code defect) -- TombstonesEnabled() must
+          // gate this install exactly like it already gates the merge-branch's own fallthrough
+          // install above (the `if (TombstonesEnabled())` block guarding this function's OTHER
+          // SetTombstone call): --multi_master_tombstone_ttl=0 makes TombstoneGcStep (db_slice.cc)
+          // unconditionally no-op, so a tombstone installed here while disabled can never be
+          // reaped -- immortal, the exact failure class Task 3's Mvcc()==0 rejection (this
+          // function, above) and TombstoneGcStep's own reap predicate both exist to prevent,
+          // reached here via a third route this function's other two gates do not cover: a
+          // non-merge load (a local RDB file, DEBUG LOAD/RESTORE, or a plain Dragonfly replica's
+          // full sync) of a file carrying an opcode 225 tombstone section -- most concretely, this
+          // node's own prior SAVE/BGSAVE output, reloaded after an operator flips
+          // --multi_master_tombstone_ttl to 0 and restarts. Checked BEFORE the mvcc-table-missing
+          // no-op below so the warning fires on the actually-relevant cause when both are true.
+          if (!TombstonesEnabled()) {
+            LOG_FIRST_N(WARNING, 1) << "RDB_OPCODE_DF_TOMBSTONES entry for key '"
+                                    << absl::CHexEscape(key) << "' in DB " << db_index
+                                    << " skipped -- tombstoning is disabled on this node "
+                                       "(--multi_master_tombstone_ttl=0)";
+            return;
+          }
+
           // No-ops if this DbSlice's own mvcc side table doesn't exist -- see the D-7 unconditional
           // read comment above; reachable two ways: `active` above raced with a runtime flag flip
           // (not a supported scenario for a non-merge load), or (review fix M3) a merge_lww_ load

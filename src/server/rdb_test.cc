@@ -2782,6 +2782,52 @@ TEST_F(RdbMvccTest, SaveTimeGcDropsExpiredTombstone) {
          "live dataset first, so a surviving slot here can only have come from the file";
 }
 
+// drakeydb: P4-3 Task 8, controller fix (I4) -- TDD pin for a code defect the review caught: the
+// LOAD side had NO --multi_master_tombstone_ttl=0 gate on a non-merge tombstone install (this
+// install lambda's final, unconditional SetTombstone call, rdb_load.cc), while TombstoneGcStep
+// (db_slice.cc) unconditionally no-ops at ttl=0 -- an active node booted with
+// --multi_master_tombstone_ttl=0 that loads a file carrying a persisted tombstone section (e.g.
+// its own prior SAVE, taken while the ttl was still nonzero) would install an IMMORTAL tombstone:
+// never reapable, and permanently authoritative over any future merge for that key -- the exact
+// failure class Task 3's Mvcc()==0 rejection (this file's own tests, above) and this function's
+// resident_live guard both exist to prevent, reached here via a third route neither covers.
+// SAVE happens first, while ttl is still nonzero, so the tombstone is genuinely written to the
+// file (contrast SaveTimeGcDropsExpiredTombstone above, which tests the SAVE-time drop this test
+// must NOT trigger); ttl then flips to 0; `DEBUG RELOAD NOSAVE` reloads from that already-written
+// file under the new, disabled setting -- the only way to exercise the LOAD-time gate
+// independently of the SAVE-time one.
+TEST_F(RdbMvccTest, LoadSkipsTombstoneInstallWhenTombstoningDisabled) {
+  ASSERT_TRUE(IsActiveReplica());
+  ASSERT_EQ(Run({"set", "k1", "v1"}), "OK");
+  ASSERT_THAT(Run({"del", "k1"}), IntArg(1));
+
+  std::optional<MvccStamp> before;
+  shard_set->Await(0, [&] {
+    before =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k1"});
+  });
+  ASSERT_TRUE(before.has_value());
+  ASSERT_TRUE(before->IsTombstone());
+
+  ASSERT_EQ(Run({"save", "df"}), "OK");  // tombstone written to disk while ttl is still nonzero
+
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 0);
+
+  ASSERT_EQ(Run({"debug", "reload", "NOSAVE"}), "OK");  // reload from disk under ttl=0
+
+  std::optional<MvccStamp> after;
+  size_t tombstones_after = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    after = db_slice.GetMvcc(0, std::string_view{"k1"});
+    tombstones_after = db_slice.GetDBTable(0)->stats.mvcc_tombstones;
+  });
+  EXPECT_FALSE(after.has_value())
+      << "tombstoning is disabled (ttl=0) on this node -- installing this tombstone from the file "
+         "would create one TombstoneGcStep can never reap (it unconditionally no-ops at ttl=0)";
+  EXPECT_EQ(tombstones_after, 0u);
+}
+
 // drakeydb: P4-3 Task 5 review fix (I2) -- SerializeTombstones (snapshot.cc) now chunks a db's
 // tombstones into bounded RDB_OPCODE_DF_TOMBSTONES sections (kChunkSize = 1000) instead of
 // materializing and emitting the whole db in one section, to bound peak memory and let the
