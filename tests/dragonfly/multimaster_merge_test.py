@@ -67,6 +67,42 @@ EXPIRE_SETTLE_S = 0.6
 # the tombstone-merge path works across shards needs a small batch of keys, not a single "K".
 PIN_KEYS = [f"K{i}" for i in range(12)]
 
+# ---- Straddling-TTL mode (P4-3 final fix wave, F-1) ----------------------------------------
+#
+# The blind spot this closes: every `expire` op above is SETTLED before `_reattach_both` runs --
+# `_settle_expiries` sleeps past the TTL *and* forces a `GET` on the authoring node, which reaps
+# the key. So no key ever crossed the reattach boundary either (a) still live with a pending TTL
+# or (b) expired-but-not-yet-reaped, and those two states are exactly what F-1 needs. The
+# adversarial review called `EXPIRE_SETTLE_S` a structural blind spot rather than a tuning knob:
+# raising the op/round/shard count or changing the seed cannot reach either state.
+#
+# This mode converts a small fraction of `expire` ops into *straddling* ones. They are armed LAST
+# in the round (after `_settle_expiries`, immediately before `_reattach_both`) so the straddling
+# SET is unambiguously the newest write on its key for the round -- which makes the expected
+# outcome deterministic (the key must end ABSENT on both nodes) without having to predict which
+# of the three sync-window phases each key happens to land in:
+#
+#   (a) TTL still live when the snapshot serializes it -> the peer adopts value + TTL and expires
+#       it independently;
+#   (b) TTL already elapsed but NOT yet reaped -> the peer receives a key with an elapsed
+#       `expire_ms`. This is F-1: before the fix, both loader gates dropped it before any
+#       `MergeAccepts` compare, so the peer silently KEPT its own strictly older value;
+#   (c) TTL elapsed and already reaped -> the author's tombstone travels in the opcode-225
+#       section and the peer adopts it verbatim.
+STRADDLE_FRACTION = float(os.environ.get("MULTIMASTER_FUZZ_STRADDLE", "0.15"))
+STRADDLE_TTL_MS_RANGE = (100, 900)
+# Armed, then this long before reattaching: the shorter half of STRADDLE_TTL_MS_RANGE has just
+# elapsed when the full sync starts (phase (b)) while the longer half is still live (phase (a)).
+STRADDLE_PRESYNC_S = 0.35
+# Phase (b) needs the authoring node's ACTIVE-expire sweep to still be behind when its snapshot
+# serializes the key. On a real, loaded server that is the normal state (the review measured a
+# ~5.7 s sweep lag behind 300k keys); on a 50-key fuzzer table the default --hz=100 sweep reaps
+# within a few ms, so phase (b) would essentially never occur. Lowering the background-task
+# frequency reproduces the same lag without paying for a 300k-key DEBUG POPULATE on every round's
+# full sync. It does not change WHAT is reaped, only when -- every read path's own lazy-expiry
+# check (and therefore every assertion below) is unaffected by --hz.
+STRADDLE_HZ = int(os.environ.get("MULTIMASTER_FUZZ_HZ", "1"))
+
 
 async def _read_one(c, key):
     """One key's ground truth on one node: its DEBUG MVCC stamp, plus its value when live."""
@@ -151,7 +187,33 @@ async def _reattach_both(c_a, a, c_b, b):
     await wait_available_async([c_a, c_b])
 
 
-async def _wait_converged(c_a, c_b, keys, label, timeout=30):
+def _comparable(entry, stamp_free):
+    """What two peers must agree on for one key.
+
+    Normally: everything -- value AND the full `{mvcc, origin}` stamp (see this module's
+    docstring on why a value-only assertion is structurally blind).
+
+    `stamp_free` is for keys whose winning write was an **expiry** (P4-3 final fix wave, F-2).
+    An expiry tombstone's stamp is minted LOCALLY, by the node that reaped the key
+    (`CommitOwnTombstone`/`RecordExpiryBlocking`, `tx_base.cc`), and expiry DELs are deliberately
+    dropped from every peer link (`kEntryFlagExpired` in `journal::PassesPeerEchoFilter`,
+    `journal/types.cc`, applied to the full-sync journal blob too, `snapshot.cc`). So when the
+    same TTL fires on two peers -- which is the normal outcome whenever the TTL itself
+    replicated, i.e. every straddling key in phase (a) above -- each node legitimately holds a
+    DIFFERENT `{mvcc, origin}` for the same key, and `DEBUG MVCC` legitimately differs between
+    them. What must still converge is existence and value: absent on both.
+
+    Exact tombstone-stamp propagation for an expiry that was reaped on ONE node only is still
+    pinned, with a full `{mvcc, origin}` equality assertion, by
+    `test_resurrection_pin_natural_expiry_deletes_stale_value_on_full_sync` below -- this
+    relaxation is scoped to the fuzzer, which cannot tell the two situations apart.
+    """
+    if stamp_free:
+        return {"value": entry["value"]}
+    return entry
+
+
+async def _wait_converged(c_a, c_b, keys, label, timeout=30, stamp_free_keys=frozenset()):
     """Bounded poll on DEBUG MVCC agreement -- not a fixed sleep -- so this both (a) tolerates a
     full sync that legitimately takes a variable amount of time and (b) still fails promptly (at
     `timeout`) if the two sides settle on genuinely different stamps rather than merely being
@@ -162,7 +224,10 @@ async def _wait_converged(c_a, c_b, keys, label, timeout=30):
         snap_a = await _snapshot(c_a, keys)
         snap_b = await _snapshot(c_b, keys)
         for key in keys:
-            assert snap_a[key] == snap_b[key], f"{label} key={key}: a={snap_a[key]} b={snap_b[key]}"
+            free = key in stamp_free_keys
+            assert _comparable(snap_a[key], free) == _comparable(
+                snap_b[key], free
+            ), f"{label} key={key}: a={snap_a[key]} b={snap_b[key]}"
         return snap_a, snap_b
 
     return await converged()
@@ -176,12 +241,14 @@ async def _apply_random_ops(rng, c_a, c_b, key_space, count, round_idx, model):
     read-back on the authoring node -- EXPIRE's read-back is deferred to `_settle_expiries`,
     since the key is still live (with a pending TTL) at the point this function issues it.
 
-    Returns `(expiring, touched)`: `expiring` is the `(side, key)` pairs that got a short TTL
-    this round, for the caller to settle; `touched` maps key -> the set of sides that wrote it
-    this round, for the I-2 coverage assertions. A `DEL` against a key that turns out not to
-    exist (returns 0) is NOT recorded and does NOT mark `touched` -- it had no effect, so it must
-    not be allowed to out-rank a real prior write via `_Model`'s seq fallback, and it is not a
-    genuine contest participant for I-2's purposes either.
+    Returns `(expiring, touched, straddling)`: `expiring` is the `(side, key)` pairs that got a
+    short TTL this round, for the caller to settle; `straddling` is the `(side, key)` pairs whose
+    `expire` op was converted to the straddling mode (see STRADDLE_FRACTION above) and is armed by
+    the caller AFTER settling, immediately before reattach; `touched` maps key -> the set of sides
+    that wrote it this round, for the I-2 coverage assertions. A `DEL` against a key that turns
+    out not to exist (returns 0) is NOT recorded and does NOT mark `touched` -- it had no effect,
+    so it must not be allowed to out-rank a real prior write via `_Model`'s seq fallback, and it
+    is not a genuine contest participant for I-2's purposes either.
 
     Fix-round note: a `DEL` can return 0 precisely BECAUSE this key's own earlier short TTL (from
     a PRIOR `expire` op this round, on the SAME side) already elapsed -- touching an expired key
@@ -192,6 +259,7 @@ async def _apply_random_ops(rng, c_a, c_b, key_space, count, round_idx, model):
     learn this write happened at all (silently losing it, rather than merely deferring it).
     """
     expiring = set()
+    straddling = set()
     touched = defaultdict(set)
     for i in range(count):
         key = f"k{rng.randrange(key_space)}"
@@ -212,12 +280,19 @@ async def _apply_random_ops(rng, c_a, c_b, key_space, count, round_idx, model):
             stamp, _ = await _read_one(c, key)
             model.record(key, model.next_seq(), "del", side, stamp, None)
             touched[key].add(side)
+        elif rng.random() < STRADDLE_FRACTION:
+            # Straddling expire (F-1): deferred to _arm_straddling_expiries so its TTL is armed
+            # last, right before reattach, and therefore lands INSIDE the sync window. Nothing is
+            # issued here -- but the key still counts as touched by this side, because this side
+            # is about to write it.
+            straddling.add((side, key))
+            touched[key].add(side)
         else:  # expire: (re-)write, then arm a short TTL so it expires before reattach
             await c.execute_command("set", key, f"v-{round_idx}-{i}-ttl")
             await c.execute_command("pexpire", key, rng.randint(*EXPIRE_TTL_MS_RANGE))
             expiring.add((side, key))
             touched[key].add(side)
-    return expiring, touched
+    return expiring, touched, straddling
 
 
 async def _settle_expiries(c_a, c_b, expiring, model):
@@ -232,11 +307,38 @@ async def _settle_expiries(c_a, c_b, expiring, model):
         model.record(key, model.next_seq(), "expire", side, stamp, value)
 
 
+async def _arm_straddling_expiries(rng, c_a, c_b, straddling, round_idx, model):
+    """Arm the round's straddling TTLs (F-1) and record them in the model as expiry deletes.
+
+    Deliberately NOT settled: no sleep past the TTL, no forced GET. The point is for the key to
+    cross the reattach boundary either still-live or expired-but-unreaped.
+
+    The model entry uses the SET's own read-back stamp as its `real` ordering key. That is not
+    the stamp of the eventual tombstone (an expiry tombstone is minted locally at reap time, and
+    is therefore strictly newer) -- it is only used to decide WHICH write wins this key, and
+    since these ops are issued last in the round, the value's stamp already out-ranks every other
+    write on that key this round. The winning entry's `kind` is "expire", which is what makes the
+    final assertion drop to existence+value (see `_comparable`).
+
+    Returns the maximum TTL armed, in seconds (0.0 if nothing was armed).
+    """
+    max_ttl_ms = 0
+    for side, key in sorted(straddling):
+        c = c_a if side == "a" else c_b
+        ttl_ms = rng.randint(*STRADDLE_TTL_MS_RANGE)
+        await c.execute_command("set", key, f"v-{round_idx}-straddle-{side}")
+        stamp, _ = await _read_one(c, key)
+        await c.execute_command("pexpire", key, ttl_ms)
+        model.record(key, model.next_seq(), "expire", side, stamp, None)
+        max_ttl_ms = max(max_ttl_ms, ttl_ms)
+    return max_ttl_ms / 1000.0
+
+
 async def _run_fuzzer(df_factory, seed, rounds, ops_per_round, extra_a=None, extra_b=None):
     rng = random.Random(seed)
     keys = [f"k{i}" for i in range(KEY_SPACE)]
-    a = df_factory.create(**active_args(proactor_threads=4, **(extra_a or {})))
-    b = df_factory.create(**active_args(proactor_threads=4, **(extra_b or {})))
+    a = df_factory.create(**active_args(proactor_threads=4, hz=STRADDLE_HZ, **(extra_a or {})))
+    b = df_factory.create(**active_args(proactor_threads=4, hz=STRADDLE_HZ, **(extra_b or {})))
     df_factory.start_all([a, b])
     c_a, c_b = a.client(), b.client()
 
@@ -260,10 +362,12 @@ async def _run_fuzzer(df_factory, seed, rounds, ops_per_round, extra_a=None, ext
     for round_idx in range(rounds):
         await _detach_both(c_a, c_b)
         seq_before = model.seq
-        expiring, touched = await _apply_random_ops(
+        expiring, touched, straddling = await _apply_random_ops(
             rng, c_a, c_b, KEY_SPACE, ops_per_round, round_idx, model
         )
         await _settle_expiries(c_a, c_b, expiring, model)
+        straddle_ttl_s = await _arm_straddling_expiries(rng, c_a, c_b, straddling, round_idx, model)
+        straddle_keys = {key for _, key in straddling}
 
         # I-2: a coverage oracle. A fuzzer round that never pits both sides against the same key
         # proves nothing about the merge; MULTIMASTER_FUZZ_OPS=0 must fail here, not pass
@@ -279,13 +383,36 @@ async def _run_fuzzer(df_factory, seed, rounds, ops_per_round, extra_a=None, ext
             if winner["seq"] > seq_before and winner["kind"] in ("del", "expire"):
                 any_delete_won_a_contest = True
 
+        if straddling:
+            # Let the shorter TTLs elapse (phase (b)) while the longer ones stay live (phase
+            # (a)), then sync. Deliberately no GET here: touching the key would reap it on the
+            # author and turn every straddler into the already-covered phase (c).
+            await asyncio.sleep(STRADDLE_PRESYNC_S)
+
         await _reattach_both(c_a, a, c_b, b)
-        got_a, got_b = await _wait_converged(c_a, c_b, keys, f"seed={seed} round={round_idx}")
+
+        if straddling:
+            # Post-sync: give every straddling TTL time to elapse on BOTH nodes, then force the
+            # lazy-expiry check on both so the comparison below is not racing a pending reap.
+            # This observes the merged state; it cannot repair it -- a key the merge wrongly left
+            # holding the peer's stale, TTL-less value (F-1) reads back exactly that value here.
+            await asyncio.sleep(straddle_ttl_s + EXPIRE_SETTLE_S)
+            for key in straddle_keys:
+                await c_a.get(key)
+                await c_b.get(key)
+
+        # F-2: an expiry's tombstone stamp is per-node by design, so expiry winners are compared
+        # on existence + value only. SET/DEL winners keep full {mvcc, origin} equality.
+        stamp_free = {k for k, exp in model.expected.items() if exp["kind"] == "expire"}
+        got_a, got_b = await _wait_converged(
+            c_a, c_b, keys, f"seed={seed} round={round_idx}", stamp_free_keys=stamp_free
+        )
 
         for key in keys:
             got = got_a[key]
-            assert (
-                got == got_b[key]
+            free = key in stamp_free
+            assert _comparable(got, free) == _comparable(
+                got_b[key], free
             ), f"seed={seed} round={round_idx} key={key}: {got} != {got_b[key]}"
 
             exp = model.expected.get(key)
@@ -301,7 +428,7 @@ async def _run_fuzzer(df_factory, seed, rounds, ops_per_round, extra_a=None, ext
                 f"expected {exp['value']!r} (kind={exp['kind']}, side={exp['side']}), got "
                 f"{got['value']!r} (stamp={got['stamp']})"
             )
-            if exp["real"] is not None:
+            if exp["real"] is not None and not free:
                 got_real = None
                 if got["stamp"].get("mvcc") is not None:
                     got_real = (int(got["stamp"]["mvcc"]), int(got["stamp"]["origin"], 16))
@@ -309,6 +436,10 @@ async def _run_fuzzer(df_factory, seed, rounds, ops_per_round, extra_a=None, ext
                     f"seed={seed} round={round_idx} key={key}: winner stamp mismatch -- model "
                     f"expected {exp}, got {got['stamp']}"
                 )
+            # `free` (an expiry winner): F-2 -- the surviving tombstone stamp is whichever node
+            # reaped the key, so it is not predictable and not required to match across nodes.
+            # The `got["value"] == exp["value"]` assertion above (exp["value"] is None for every
+            # expiry) is what catches a resurrection, and it is what F-1 fails on.
             # else: the model's winning write left no discoverable stamp on its own author (e.g.
             # --multi_master_tombstone_ttl=0 erasing a delete's tombstone) -- the value check
             # above is what catches a resurrection in that case; there is no real stamp left
@@ -334,6 +465,13 @@ async def test_merge_fuzzer_random_two_node(df_factory: DflyInstanceFactory):
     that node erases with no tombstone, so a stale value on the other side resurrects it on
     reattach) -- `_Model`'s value check catches the resurrection even though the offending node's
     own DEBUG MVCC can no longer show any trace of the delete that should have won.
+
+    Falsifying, second: the straddling-TTL mode (STRADDLE_FRACTION above) was run against the
+    pre-fix binary (`3a227349`) and fails there -- restoring `CreateObjectOnShard`'s /
+    `ShouldDiscardKey`'s unconditional "drop an already-expired incoming key" early return
+    (`rdb_load.cc`) reproduces it: the receiving node keeps its own strictly older value for a
+    key the peer had already overwritten and expired. Set `MULTIMASTER_FUZZ_STRADDLE=0` to turn
+    the mode off (it must then stop detecting that regression, which is the point of the knob).
     """
     seed = int(os.environ.get("MULTIMASTER_FUZZ_SEED", random.randrange(2**31)))
     rounds = int(os.environ.get("MULTIMASTER_FUZZ_ROUNDS", DEFAULT_ROUNDS))
