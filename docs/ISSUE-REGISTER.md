@@ -15,6 +15,12 @@ can tell a live-proven defect from a static argument.
 
 Related: [UPSTREAM-SYNC.md](UPSTREAM-SYNC.md) (merge workflow), [PLAN.md](PLAN.md) (phase plan).
 
+**Namespace note:** this register's `U-N`/`D-N` ids are its own namespace, assigned in the order
+entries are added here. Code comments and `.superpowers/sdd/*/task-N-report.md` files also cite
+`D-N` ids from the *design spec*'s own decisions table (e.g. `docs/superpowers/specs/
+2026-08-25-phase4-mvcc-lww-design.md`'s "D-8, merge-on-full-sync LWW") — a different, unrelated
+numbering. When in doubt which one a citation means, check which document it appears in.
+
 ---
 
 ## Part 1 — Upstream Dragonfly bugs
@@ -93,9 +99,17 @@ release builds read out of bounds.
 (`F proactor_base.cc:190 Check failed: on_idle_next_ < on_idle_arr_.size() (1 vs. 1)`) once a
 second on-idle task (the tombstone GC) was registered above a pre-existing one (defrag) and the
 shutdown path removed them out of order. Root cause confirmed by reading `RemoveOnIdleTask`
-directly; since `helio/` is off-limits to edit, the actual fix landed on our side instead (the GC
-task now unregisters itself before `EngineShardSet::PreShutdown` removes defrag, avoiding the
-ordering that trips this defect rather than fixing the defect itself).
+directly. Since `helio/` is off-limits to edit, the actual fix landed on our side instead, and not
+via the self-unregistering-task design first tried (round 2: the GC task returning `-1` from its
+own callback behind an alive-flag) — round 2 was found INSUFFICIENT (4/20 still failed, because
+`PreShutdown` removing defrag completes before `~DbSlice` ever runs to flip the flag) and dropped.
+The landed fix (round 3, deterministic) reorders removal instead of self-unregistering:
+`main_service.cc`'s `Service::Shutdown` calls `namespaces->StopTombstoneGc()` (`:1240`) BEFORE
+`shard_set->PreShutdown()` (`:1242`), so the GC task (registered with a lower id than defrag) is
+always removed first, leaving a hole rather than shrinking the array below a possibly-stale
+`on_idle_next_`. This avoids the ordering that trips the defect; it does not fix
+`RemoveOnIdleTask` itself, which remains reachable by a different task-registration order (see
+U-5).
 
 **Status:** not filed.
 
@@ -150,10 +164,16 @@ the file.
 `CMS.MERGE dest numkeys src1 [src2 ...]` is variadic-keys and can span multiple shards. Because
 it carries no `NO_AUTOJOURNAL` and never hand-journals, Dragonfly's ordinary per-shard
 auto-journal (`LogAutoJournalOnShard`, `transaction.cc`) fires on every participating shard and
-builds each shard's journal entry from `GetShardArgs` — i.e. only the keys that shard owns. For a
-merge whose sources span shards, that produces a `CMS.MERGE <dest> <numkeys> <one src key>`
-entry with fewer arguments than the command's own declared arity (`-4`, requiring at least 3 args
-after the name), which a replica rejects outright rather than silently corrupting state.
+builds each shard's journal entry from `GetShardArgs` — and `GetShardArgs` carries only the
+**keys** this shard owns from the command's own key spec, not the full argv: `DetermineKeys`
+(`transaction.cc:~1904-1911`) scopes CMS.MERGE's key range to `src1..srcN` alone (`bonus = 0`
+separately marks `dest`, at argv index 0, as a lone bonus key — the same mechanism `SORT ...
+STORE` uses for its destination), and `numkeys` is never a key at all, so it never appears in any
+shard's `GetShardArgs` output regardless. A shard that owns one or more source keys but not
+`dest` therefore auto-journals a bare `CMS.MERGE <one src key on this shard>` — missing `dest`,
+missing `numkeys`, and missing every other shard's source keys — 2 total arguments (command name
++ one key) against the command's own declared minimum arity (`-4`, at least 4), which a replica
+parses and rejects outright rather than silently corrupting state.
 
 **How established:** found by static reading during P4-3 Task 7's review, by analogy with the
 `SORT ... STORE` defect that same task fixed (same shape: variadic/cross-shard command,

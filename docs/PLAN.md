@@ -228,9 +228,10 @@ Governing choices:
    `{varint origin_idx, varint mvcc, varint flags}` (flags bit0 = expiry-DEL). Active masters
    refuse replication consumers that didn't negotiate the fork protocol, so stock readers never
    see v2.
-4. **Fork protocol version = 66** (`kDrakeydbReplVersion`; bumped by P4-2 for RDB opcode 221),
-   sent via existing `REPLCONF DRAKEY-VERSION` — far above upstream's VER6 so future upstream
-   bumps never collide. Non-active nodes interop with stock Dragonfly unchanged.
+4. **Fork protocol version** (`kDrakeydbReplVersion`, `node_identity.h`; originally 66, bumped by
+   P4-2 for RDB opcode 221; **67 as of P4-3**, for opcode 225 — see `docs/multi-master.md`), sent
+   via existing `REPLCONF DRAKEY-VERSION` — far above upstream's VER6 so future upstream bumps
+   never collide. Non-active nodes interop with stock Dragonfly unchanged.
 5. **Persistent node UUID** in `<dir>/drakeydb.uuid` (fixes KeyDB's per-boot regeneration),
    exchanged KeyDB-style: `REPLCONF UUID <36char>` → `+<peer uuid> <peer ms-clock>` (clock echo
    enables skew warnings). Works against DF and real KeyDB masters.
@@ -683,12 +684,15 @@ operator-facing writeup: [`docs/multi-master.md`](multi-master.md). Summary:
   (Task 4's Hazard 1 fix) so a concurrent peer apply during `LOADING` cannot slip a stale write in
   ahead of the check.
 - **Tombstones**: an explicit `DEL`/`UNLINK` or an expiry now arms a tombstone (`ArmTombstone`,
-  `MvccStamper::Commit`) instead of erasing the slot outright; `kEvicted`/`kSlotFlush` still erase
-  with no tombstone (eviction is a capacity decision, not a deletion). An idle-task GC
-  (`DbSlice::TombstoneGcStep`) reclaims expired tombstones on the default namespace only, and a
-  per-shard cap degrades over-cap deletes to a plain erase, counted in the new
-  `mvcc_tombstones_dropped` metric (`INFO memory` and `DEBUG MVCC`'s aggregate, the latter closed
-  by Task 8). Three new flags: `--multi_master_tombstone_ttl` (0 disables tombstoning),
+  `MvccStamper::Commit`) instead of erasing the slot outright, on the **default namespace only**
+  (`kEvicted`/`kSlotFlush` still erase with no tombstone -- eviction is a capacity decision, not a
+  deletion; an ACL-namespace delete gets no tombstone either, regardless of the flags below). An
+  idle-task GC (`DbSlice::TombstoneGcStep`) reclaims expired tombstones on the default namespace
+  only, and a cap **per (database, shard) pair** -- not a single per-shard total; `table->stats`
+  lives on one `DbTable` per `SELECT`-able database index on each shard -- degrades over-cap
+  deletes to a plain erase, counted in the new `mvcc_tombstones_dropped` metric (`INFO memory` and
+  `DEBUG MVCC`'s aggregate, the latter closed by Task 8). Three new flags:
+  `--multi_master_tombstone_ttl` (0 disables tombstoning, on both the write and RDB-load side),
   `--multi_master_max_tombstones`, `--multi_master_tombstone_gc_budget` (>= 1).
 - **Wire**: `RDB_OPCODE_DF_TOMBSTONES = 225` persists tombstones per shard (write side
   active-only, read side unconditional, same shape as opcode 221); `kDrakeydbReplVersion` bumped
@@ -713,11 +717,21 @@ operator-facing writeup: [`docs/multi-master.md`](multi-master.md). Summary:
   `DEBUG MVCC <key>` tombstone test to check the printed stamp rather than only its presence,
   corrected four stale comments left over from Task 7's `WillAutoJournalVerbatim` rename, wrote
   `docs/multi-master.md`, and recorded this phase's upstream/deferred findings (U-4 through U-8,
-  D-11 through D-13) in `docs/ISSUE-REGISTER.md`. `multi_master_test` **138/138 passed, 1 skipped**
-  (the pre-existing root-user self-skip) after these changes; a full-phase exit-gate sweep
-  (`ctest -L DFLY`, the pytest `multimaster`/`replication` suites) is this branch's remaining step
-  before merge, not part of Task 8's own scope. Every task's falsification is recorded verbatim in
-  `task-1..13-report.md` (same ledger directory).
+  D-11 through D-13) in `docs/ISSUE-REGISTER.md`. Review of that work found one real code defect
+  (I4: the RDB load path's non-merge tombstone install had no `--multi_master_tombstone_ttl=0`
+  gate, unlike every other install site, so a node booted with tombstoning disabled that loaded a
+  file carrying a persisted tombstone section installed an unreapable, immortal one — fixed,
+  pinned by `RdbMvccTest.LoadSkipsTombstoneInstallWhenTombstoningDisabled`, falsified) and eight
+  documentation-accuracy findings (imprecise or stale claims in `docs/multi-master.md`,
+  `docs/differences.md`, the flag help text, the boot-time limitations warning, and
+  `docs/ISSUE-REGISTER.md` itself), all corrected in a follow-up round. `multi_master_test` and
+  `rdb_test` both pass in full after both rounds. A full-phase exit-gate sweep is **not** this
+  branch's only remaining step before merge: Task 9 (the randomized multi-shard merge fuzzer and
+  end-to-end pytest coverage, `task-9-brief.md`), Task 10 (the exit gate itself —
+  `ctest -L DFLY`, the pytest `multimaster`/`replication` suites, `task-10-brief.md`), a
+  whole-branch review, and an adversarial pass all remain, none of them part of Task 8's own
+  scope. Every task's falsification is recorded verbatim in `task-1..13-report.md` and
+  `task-8-fix-report.md` (same ledger directory).
 
 ## Phase 5 — Streaming LWW guard
 Command classifier + pre-exec compare/drop in `JournalExecutor`; `multimaster_lww_dropped`
@@ -725,7 +739,7 @@ metric; `--multi_master_stream_lww` off = KeyDB-parity arrival order.
 **Verify:** pytest — concurrent conflicting SETs on A and B converge to the higher-mvcc value on
 both (KeyDB's "MVCC Updates Correctly" parity incl. its 2 ms slop).
 
-## Phase 6 — Merge-on-full-sync LWW ✅ delivered by P4-3 (above)
+## Phase 6 — Merge-on-full-sync LWW ✅ delivered by P4-3 (above, pending merge)
 `mvcc-tstamp` per-key aux save/load; LWW hook at `rdb_load.cc:3238`.
 **Verify:** `rdb_test.cc` aux round-trip; pytest — node with newer local writes full-syncs from a
 peer holding older values → newer survive ("Active Replica Merges Database On Sync" parity);

@@ -9,9 +9,20 @@ active-replica RDB section (opcode 221, the stock-Dragonfly cliff) — this page
 
 An active-replica node (`--active_replica`) stamps every locally written or peer-merged key with
 an MVCC stamp `{clock, origin_hash}` (`src/server/mvcc.h`). When such a node receives a **full
-sync** from a peer — another drakeydb active node, a classic Redis/KeyDB master, or its own
-restart-from-RDB — every incoming key is compared against whatever this node currently has stored
-for that key, and only overwrites it if the incoming stamp is genuinely newer.
+sync from a peer** — another drakeydb active node, or a classic Redis/KeyDB master — every
+incoming key is compared against whatever this node currently has stored for that key, and only
+overwrites it if the incoming stamp is genuinely newer.
+
+**Merge-LWW is full-sync-only.** `MergeAccepts` (`src/server/mvcc.h`) has no caller outside the
+full-sync loader (`rdb_load.cc`); `merge_lww_` is set only by `replica.cc`'s two peer-mode call
+sites. This node's own restart-from-RDB (a local RDB file, `DEBUG LOAD`, `DEBUG RELOAD`, `RESTORE`)
+is **not** a merge source — it loads verbatim, exactly like pre-Phase-4 Dragonfly, overwriting
+whatever was resident with no comparison at all (pinned by
+`RdbMvccTest.WithoutMergeLwwStaleSnapshotStillOverwrites`, `src/server/rdb_test.cc`). And
+**steady-state (stable-sync) replicated writes are not merge-compared either**: once the initial
+full sync completes, ordinary commands streamed from a peer link apply in plain arrival order,
+with no stamp comparison against the local value — that guard is planned for P4-4, not yet built.
+Merge-LWW's protection is specifically, and only, the moment of a full sync.
 
 **The comparison rule, in one sentence: ties are won by the stored side.** An incoming write is
 installed only when it is *strictly* newer than what is already there (`MergeAccepts`,
@@ -29,11 +40,21 @@ resolves it (again by the tie rule above).
 Not every peer can tell you a per-key write time:
 
 - **A drakeydb active peer speaking the DFLY multi-shard protocol** carries a real, per-key
-  `{mvcc, origin_hash}` stamp on the wire (RDB opcode 221, `RDB_OPCODE_DF_MVCC`). Merge-LWW
-  compares that stamp directly against the stored one. This is the precise, intended case.
+  `{mvcc, origin_hash}` stamp on the wire (RDB opcode 221, `RDB_OPCODE_DF_MVCC`) for every key it
+  has ever stamped. Merge-LWW compares that stamp directly against the stored one. This is the
+  precise, intended case. **If a DFLY-protocol key genuinely arrives unstamped** (`{0,0}` — should
+  not happen for a key an active peer ever wrote, but can happen for data the peer itself only
+  ever loaded verbatim, e.g. a plain sub-replica's own resident data), it keeps `{0,0}` and always
+  loses: `MergeAccepts` never accepts an all-zero incoming stamp over anything already resident.
+  There is no ctime-style fallback on this path — the rule below applies **only** to
+  classic-protocol links, never to DFLY-protocol ones. (This distinction is deliberate: an earlier
+  version of the merge rule applied a ctime-like override regardless of protocol, and review found
+  it could clobber a DFLY peer's own resident dataset; narrowing it to
+  `merge_classic_protocol_` only is what Task 13 changed it to.)
 - **A classic-protocol peer** — a plain Redis master, a KeyDB master without its own
-  `mvcc-tstamp` aux, or any other RDB source with no per-key stamp — has no such information.
-  For these links, an unstamped key is assigned an approximate authority derived from the
+  `mvcc-tstamp` aux, or any other RDB source with no per-key stamp — has no per-key stamp to send
+  at all. For these links **only** (`merge_lww_ && merge_classic_protocol_ && !item->has_mvcc`,
+  `rdb_load.cc`), an unstamped key is assigned an approximate authority derived from the
   snapshot's own `ctime` (its whole-file save timestamp, 1-second granularity), clamped so it can
   never claim to be newer than this node's own clock: `stamp = min(ctime_ms + 999, now_ms)`. That
   key then runs through the exact same tie-break compare as a stamped one.
@@ -65,13 +86,29 @@ as before this phase. This is intentional: eviction is a local capacity decision
 fact about the dataset, and the peer's copy is treated as authoritative for that key. See the
 `--cache_mode` section below for the operational consequence.
 
+**Tombstones are default-namespace-only.** `PerformDeletionAtomic`'s tombstone-earning check
+(`db_slice.cc`) is gated on `ns_ == &namespaces->GetDefaultNamespace()`. A delete in an ACL
+namespace (`ACL NAMESPACE:` / `AUTH`-selected non-default namespace) gets no tombstone at all,
+regardless of the tombstone flags — it behaves exactly like a pre-Phase-4 delete, and is fully
+exposed to resurrection by any peer's full sync. This mirrors the journal wire's own limitation
+(non-default namespaces have no replicated identity — see `DEBUG MVCC`'s own default-namespace-only
+restriction below) rather than being a separate gap.
+
 ### The three tombstone flags
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--multi_master_tombstone_ttl` | `600` (seconds) | How long a tombstone is retained before the idle-task GC (`DbSlice::TombstoneGcStep`) reclaims it. **`0` disables tombstoning entirely** — every delete erases immediately, identical to pre-Phase-4 behavior, and the GC step no-ops. |
-| `--multi_master_max_tombstones` | `1000000` | Per-shard cap on live tombstones. A delete that would push a shard over this cap **degrades to a plain erase instead of arming a tombstone** — see "Hitting the cap" below. |
+| `--multi_master_tombstone_ttl` | `600` (seconds) | How long a tombstone is retained before the idle-task GC (`DbSlice::TombstoneGcStep`) reclaims it. **`0` disables tombstoning entirely**, on both the write and the load side: a live delete erases immediately instead of arming a tombstone (identical to pre-Phase-4 behavior), loading an already-persisted tombstone from an RDB file (your own prior `SAVE`, `DEBUG LOAD`/`RESTORE`, or a peer's full sync) skips installing it instead (logging one warning), and the GC step itself no-ops. See the restart caveat below for what this means across a TTL change. |
+| `--multi_master_max_tombstones` | `1000000` | Cap on live tombstones **per (database, shard) pair, not per shard overall**: `table->stats` (`db_slice.cc`) lives on one `DbTable` per `SELECT`-able database index on each shard, so a node with N databases can hold up to N times this many tombstones on a single shard. A delete that would push its own (database, shard) pair over this cap **degrades to a plain erase instead of arming a tombstone** — see "Hitting the cap" below. |
 | `--multi_master_tombstone_gc_budget` | `64` | Side-table buckets the idle-task GC visits per tick. Must be `>= 1` (validated at boot); bounds one GC tick's total work across however many databases still need visiting. |
+
+**Flipping the TTL from `0` to a nonzero value across a restart protects only future deletes.**
+A node run with `--multi_master_tombstone_ttl=0` writes no tombstones for its own live deletes,
+and (see the row above) will not even *install* an already-persisted tombstone it loads from an
+older file written while tombstoning was on. If you re-enable tombstoning by restarting with a
+nonzero TTL, deletes made **before** that restart have no tombstone to protect them — only deletes
+made after the flip get the protection. There is no way to retroactively tombstone a delete that
+already happened while tombstoning was off.
 
 **Sizing the TTL against expected partition length.** A tombstone protects a delete only for as
 long as it is retained: if a peer is partitioned (network split, long maintenance window, extended
@@ -84,14 +121,16 @@ no cost to setting it much higher other than the tombstone's own memory (one MVC
 independent of the tombstoned key's own now-freed prime-table slot) and the risk of hitting
 `--multi_master_max_tombstones` sooner on a delete-heavy shard.
 
-**Hitting the cap degrades to resurrection.** When a shard's tombstone count is already at
-`--multi_master_max_tombstones`, the next delete on that shard does not error and does not block —
-it silently falls back to a plain erase, trading resurrection risk for bounded memory. This is
-**visible, not silent**: it increments `mvcc_tombstones_dropped`, reported both in `INFO memory`
-(beside `mvcc_tombstones`) and in `DEBUG MVCC`'s per-shard aggregate
-(`shard<N>_tombstones_dropped:`). A non-zero, growing `mvcc_tombstones_dropped` on a shard means
-that shard's delete-resurrection protection is currently degraded and either the cap needs
-raising or the delete rate needs investigating.
+**Hitting the cap degrades to resurrection.** When a (database, shard) pair's tombstone count is
+already at `--multi_master_max_tombstones`, the next delete for a key on that database and shard
+does not error and does not block — it silently falls back to a plain erase, trading resurrection
+risk for bounded memory. This is **visible, not silent**: it increments `mvcc_tombstones_dropped`,
+reported both in `INFO memory` (beside `mvcc_tombstones`, summed across every database) and in
+`DEBUG MVCC`'s per-shard aggregate (`shard<N>_tombstones_dropped:`, also summed across every
+database on that shard). A non-zero, growing `mvcc_tombstones_dropped` means at least one
+(database, shard) pair's delete-resurrection protection is currently degraded and either the cap
+needs raising or the delete rate needs investigating; the aggregate does not tell you which
+database.
 
 ### `FLUSHALL`/`FLUSHDB` destroys every tombstone, mesh-wide
 
