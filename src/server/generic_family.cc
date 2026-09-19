@@ -1784,37 +1784,44 @@ template <typename F> bool Iterate(const PrimeValue& pv, F&& func) {
   }
 }
 
-// drakeydb: P4-0 fix-wave -- true iff this transaction's causing command will auto-journal
-// itself verbatim (Transaction::LogAutoJournalOnShard, transaction.cc), the predicate that
-// distinguishes SORT from SORT_RO (CO::READONLY -- never auto-journals), the two commands
-// reaching OpFetchSortEntries / OpFetchContainerElements below through the same call sites.
-// Derived from the transaction's own CommandId rather than a hardcoded command name, so it stays
-// correct if either command's registration changes: mirrors LogAutoJournalOnShard's full gate,
-// `(IsJournaled() || NO_KEY_TRANSACTIONAL) && !(NO_AUTOJOURNAL && !re_enabled_auto_journal_)`,
-// not just its static JOURNALED/NO_AUTOJOURNAL half. Omitting the NO_KEY_TRANSACTIONAL disjunct
-// would be the dangerous direction: a NO_KEY_TRANSACTIONAL, non-JOURNALED command still
-// auto-journals there, so a predicate that missed it would return false while the command
-// actually auto-journals verbatim -- silently reopening the exact divergence this PR closes, for
-// whichever future call site trusted the predicate. No behavior change for either current
-// caller: SORT and SORT_RO are both keyed (firstkey=1) and neither sets NO_KEY_TRANSACTIONAL, so
-// this disjunct is a no-op for both today.
+// drakeydb: P4-0 fix-wave, corrected in P4-3 Task 7's fix round (C1/C2 review) -- true iff this
+// is SORT (CO::JOURNALED) rather than SORT_RO (CO::READONLY -- never auto-journals), the two
+// commands reaching OpFetchSortEntries / OpFetchContainerElements below through the same call
+// sites. Derived from the transaction's own CommandId rather than a hardcoded command name, so it
+// stays correct if either command's registration changes.
 //
-// drakeydb: P4-3 Task 7 -- SORT is now registered CO::NO_AUTOJOURNAL (see its CI{} entry below),
-// reviving auto-journal per-transaction via Transaction::ReviveAutoJournal() only when it is
-// actually safe to replay verbatim (SortGeneric, GetUniqueShardCnt() == 1). A purely static read
-// of `cid->opt_mask() & CO::NO_AUTOJOURNAL` -- this function's shape before Task 7 -- would now
-// return false for EVERY SORT, including the single-shard case that DOES revive and DOES still
-// auto-journal verbatim, wrongly disabling CaptureSortMembersBeforeExpiry's SREM compensation for
-// a scenario Task 7 never intended to touch. Transaction::IsAutoJournalSuppressed() (transaction.h)
-// is the dynamic-aware replacement: it mirrors LogAutoJournalOnShard's own
-// `NO_AUTOJOURNAL && !re_enabled_auto_journal_` check exactly (same private state, read the same
-// way), so this predicate and the dispatcher's actual decision can never disagree. SORT_RO still
-// never sets NO_AUTOJOURNAL or calls ReviveAutoJournal(), so IsAutoJournalSuppressed() is
-// unconditionally false for it, same as before Task 7.
-bool WillAutoJournalVerbatim(const Transaction* tx) {
+// This used to be named WillAutoJournalVerbatim and mirror LogAutoJournalOnShard's full gate,
+// including its NO_AUTOJOURNAL half -- correct back when "SORT auto-journals at all" and "SORT
+// auto-journals verbatim" were the same fact, because SORT never had CO::NO_AUTOJOURNAL. Task 7
+// gave SORT CO::NO_AUTOJOURNAL unconditionally (reviving it per-transaction only for a same-shard
+// STORE -- see SortGeneric/OpStore below) to stop a cross-shard STORE's destination effect from
+// being silently dropped. That split the two facts apart: SORT's own source-side lazy-member-
+// expiry effects (the SREM/DEL compensation below) must reach peers whenever a journal exists at
+// all, in EITHER of SORT's two now-possible forms (verbatim same-shard, or hand-journaled RESTORE
+// cross-shard, OpStore) -- this function answers exactly that "does src's mutation need to reach
+// peers" question, which is a property of the command family (SORT vs SORT_RO), not of this
+// call's shard count.
+//
+// The first Task 7 patch got this wrong: it kept the name and gated on
+// Transaction::IsAutoJournalSuppressed() (which now legitimately varies with
+// GetUniqueShardCnt() for SORT alone, since that IS what LogAutoJournalOnShard itself checks),
+// making this function false for every cross-shard SORT ... STORE -- silently dropping the
+// SREM/derived-DEL compensation for that case entirely (caught by review probe: cross-shard
+// partial expiry produced zero SREM entries; cross-shard full expiry flipped the DEL to
+// kEntryFlagDerived, which PassesPeerEchoFilter drops from every peer link). Deliberately omits
+// NO_AUTOJOURNAL/IsAutoJournalSuppressed() entirely, unlike LogAutoJournalOnShard's own decision:
+// `cid->IsJournaled() || NO_KEY_TRANSACTIONAL` is the STATIC half only, true for SORT and false
+// for SORT_RO regardless of shard count -- see
+// MultiShardOriginJournalFamilyTest.CrossShardSourceEffectsReplicateLikeSameShard
+// (multi_master_test.cc) for the multi-shard regression pin. No behavior change for either
+// current caller: SORT and SORT_RO are both keyed (firstkey=1) and neither sets
+// NO_KEY_TRANSACTIONAL, so that disjunct is a no-op for both today; it stays for the same reason
+// it always did -- a NO_KEY_TRANSACTIONAL, non-JOURNALED command would still reach
+// LogAutoJournalOnShard's own auto-journal gate, so a predicate that missed it here would
+// silently reopen the exact divergence this whole comment chain is about.
+bool SortSourceEffectsMustReplicate(const Transaction* tx) {
   const CommandId* cid = tx->GetCId();
-  bool auto_journals = cid->IsJournaled() || (cid->opt_mask() & CO::NO_KEY_TRANSACTIONAL);
-  return auto_journals && !tx->IsAutoJournalSuppressed();
+  return cid->IsJournaled() || (cid->opt_mask() & CO::NO_KEY_TRANSACTIONAL);
 }
 
 // SORT mutates a TTL-bearing set while fetching it: DenseSet iteration removes expired members.
@@ -1824,7 +1831,7 @@ bool WillAutoJournalVerbatim(const Transaction* tx) {
 absl::flat_hash_set<string> CaptureSortMembersBeforeExpiry(const OpArgs& op_args,
                                                            const PrimeValue* pv) {
   absl::flat_hash_set<string> members;
-  if (!op_args.shard->journal() || !WillAutoJournalVerbatim(op_args.tx) ||
+  if (!op_args.shard->journal() || !SortSourceEffectsMustReplicate(op_args.tx) ||
       pv->ObjType() != OBJ_SET || !pv->HasMemberExpiration()) {
     return members;
   }
@@ -1902,18 +1909,20 @@ OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_v
   // IterateSet may trigger lazy member expiry on sets with member-level TTL.
   // If all members expired, delete the now-empty key.
   //
-  // drakeydb: P4-0 fix-wave -- derived=false for SORT (see WillAutoJournalVerbatim above): SORT
-  // auto-journals verbatim, so a peer replays it against its own, still-populated copy instead
-  // of independently deriving this DEL -- the exact FIELDEXPIRE hazard, same fix. SORT_RO shares
-  // this call site but never auto-journals, so it still gets derived=true (the default). Same
-  // accepted cost as FIELDEXPIRE's carve-out (see OpFieldExpire's comment above): the forwarded
-  // DEL is unconditional, so it destroys any members a concurrent peer write added that this
-  // node never saw -- arguably wider exposure here, since plain `SORT key` (no STORE) is a
-  // read-shaped use of a command CO::JOURNALED still classifies as a write.
+  // drakeydb: P4-0 fix-wave, corrected in P4-3 Task 7's fix round -- derived=false for SORT (see
+  // SortSourceEffectsMustReplicate above, formerly WillAutoJournalVerbatim): SORT's own source
+  // effect must reach peers as an ordinary (non-derived) DEL regardless of whether SORT's outer
+  // STORE effect happens to be same-shard (verbatim replay) or cross-shard (hand-journaled
+  // RESTORE, OpStore) -- the exact FIELDEXPIRE hazard, same fix, now independent of shard count.
+  // SORT_RO shares this call site but never journals at all, so it still gets derived=true (the
+  // default). Same accepted cost as FIELDEXPIRE's carve-out (see OpFieldExpire's comment above):
+  // the forwarded DEL is unconditional, so it destroys any members a concurrent peer write added
+  // that this node never saw -- arguably wider exposure here, since plain `SORT key` (no STORE)
+  // is a read-shaped use of a command CO::JOURNALED still classifies as a write.
   bool key_deleted =
       obj_type == OBJ_SET && it->second.Size() == 0 &&
       SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
-                                  /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
+                                  /*derived=*/!SortSourceEffectsMustReplicate(op_args.tx));
   JournalSortPartialExpiry(op_args, key, possible_expired, key_deleted);
 
   if (!success)
@@ -1955,18 +1964,20 @@ OpResult<pair<vector<string>, CompactObjType>> OpFetchContainerElements(const Op
 
   // IterateSet may trigger lazy member expiry.  Clean up empty set.
   //
-  // drakeydb: P4-0 fix-wave -- derived=false for SORT (see WillAutoJournalVerbatim above): SORT
-  // auto-journals verbatim, so a peer replays it against its own, still-populated copy instead
-  // of independently deriving this DEL -- the exact FIELDEXPIRE hazard, same fix. SORT_RO shares
-  // this call site but never auto-journals, so it still gets derived=true (the default). Same
-  // accepted cost as FIELDEXPIRE's carve-out (see OpFieldExpire's comment above): the forwarded
-  // DEL is unconditional, so it destroys any members a concurrent peer write added that this
-  // node never saw -- arguably wider exposure here, since plain `SORT key` (no STORE) is a
-  // read-shaped use of a command CO::JOURNALED still classifies as a write.
+  // drakeydb: P4-0 fix-wave, corrected in P4-3 Task 7's fix round -- derived=false for SORT (see
+  // SortSourceEffectsMustReplicate above, formerly WillAutoJournalVerbatim): SORT's own source
+  // effect must reach peers as an ordinary (non-derived) DEL regardless of whether SORT's outer
+  // STORE effect happens to be same-shard (verbatim replay) or cross-shard (hand-journaled
+  // RESTORE, OpStore) -- the exact FIELDEXPIRE hazard, same fix, now independent of shard count.
+  // SORT_RO shares this call site but never journals at all, so it still gets derived=true (the
+  // default). Same accepted cost as FIELDEXPIRE's carve-out (see OpFieldExpire's comment above):
+  // the forwarded DEL is unconditional, so it destroys any members a concurrent peer write added
+  // that this node never saw -- arguably wider exposure here, since plain `SORT key` (no STORE)
+  // is a read-shaped use of a command CO::JOURNALED still classifies as a write.
   bool key_deleted =
       obj_type == OBJ_SET && it->second.Size() == 0 &&
       SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
-                                  /*derived=*/!WillAutoJournalVerbatim(op_args.tx));
+                                  /*derived=*/!SortSourceEffectsMustReplicate(op_args.tx));
   JournalSortPartialExpiry(op_args, key, possible_expired, key_deleted);
 
   return std::make_pair(std::move(elements), obj_type);
@@ -2048,14 +2059,27 @@ OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, Iterator
 
   // Captured from `pv` before it is moved into AddOrUpdate below: a single RESTORE ... REPLACE
   // hand-journal entry (the same pattern Renamer::DeserializeDest below uses for cross-shard
-  // RENAME/COPY) is one atomic replace with exactly one arm -- unlike a DEL-then-RPUSH pair,
-  // which would arm-and-commit twice for what is really one local mutation. A second commit
-  // would find nothing left armed (MvccStamper::Commit sweeps and consumes every currently-armed
-  // key on its first call) and mint the SECOND entry's stamp without ever attaching it to `key`,
-  // leaving the author's own value stamped from the first (fictitious, no-op) entry while a
-  // replica applying both entries in order ends up stamped from the second -- an author/replica
-  // stamp mismatch. Computed unconditionally-cheap-to-skip via `hand_journal` below, not
-  // unconditionally, so the common (single-shard, auto-journal-revived) path pays nothing extra.
+  // RENAME/COPY), not a DEL-then-RPUSH pair.
+  //
+  // drakeydb: P4-3 Task 7 fix round (I1) -- a prior version of this comment claimed a two-entry
+  // DEL-then-RPUSH pair would cause an author/replica stamp mismatch, reasoning that the second
+  // RecordJournal's Commit() would find nothing armed (having already been swept by the first)
+  // and mint an independent, different stamp. That reasoning was wrong: MvccStamper::HopStamp
+  // (mvcc.cc) memoizes its minted value for the whole write epoch (reset only by
+  // RunCallback's own trailing EndOfWriteEpoch(), transaction.cc, which runs after every
+  // RecordJournal call this callback could make) -- a second RecordJournal call within the same
+  // callback would reuse the exact same mvcc token as the first, so both entries would carry
+  // identical stamps on the wire and no mismatch would actually occur.
+  //
+  // RESTORE is still the right choice, for reasons that hold regardless: it is a single journal
+  // entry rather than two (half the journal traffic, and no window where a partial/interrupted
+  // replication -- e.g. a partial sync resuming mid-sequence -- could leave a replica with `key`
+  // deleted but never rebuilt); it carries the exact serialized bytes of the resulting value
+  // rather than a sequence of appends whose encoding/ordering must be independently reproduced;
+  // and -- shared with a hypothetical DEL+RPUSH pair, not a point in RESTORE's favor specifically
+  // -- it makes replication depend only on the computed result, never on the replica's own copy
+  // of `src`. Only actually dumped below when `hand_journal` is set, so the common (single-shard,
+  // auto-journal-revived) path pays nothing extra.
   OpResult<string> dump;
   if (hand_journal) {
     dump = DumpToString(key, pv, op_args);
@@ -3139,8 +3163,10 @@ void GenericFamily::Register(CommandRegistry* registry) {
       // SortGeneric revives auto-journal itself (Transaction::ReviveAutoJournal) whenever it is
       // actually safe to replay SORT verbatim -- GetUniqueShardCnt() == 1, i.e. no STORE at all,
       // or a STORE landing on the same shard as the source -- so every existing single-shard
-      // behavior (including the lazy-member-expiry SREM compensation gated on
-      // WillAutoJournalVerbatim, above) is unchanged.
+      // behavior is unchanged. The lazy-member-expiry SREM/DEL compensation (gated on
+      // SortSourceEffectsMustReplicate, above) is independent of this and always fires whenever a
+      // journal exists, same-shard or cross-shard -- fixed in Task 7's own review round after a
+      // first pass wrongly tied it to shard count too.
       << CI{"SORT", CO::JOURNALED | CO::STORE_LAST_KEY | CO::NO_AUTOJOURNAL, -2, 1, 1, acl::kSort}
              .HFUNC(Sort)
       << CI{"SORT_RO", CO::READONLY, -2, 1, 1, acl::kSortRO}.HFUNC(Sort_RO)

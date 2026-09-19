@@ -2246,6 +2246,12 @@ def _parse_mvcc(reply) -> dict:
 # of whatever data the shard holds -- so a throwaway active_replica probe with the SAME
 # proactor_threads discovers the same placement a plain node with that proactor_threads would use.
 # The probe is discarded before the real test's nodes are created.
+#
+# drakeydb: P4-3 Task 7 fix round (M5) -- returns the two keys' shard ids too (as discovered by
+# the probe), not just the key names, so a plain-replication caller (which cannot itself call
+# DEBUG MVCC to double check) can still self-guard against silently collapsing to a same-shard
+# pair -- the same self-guard test_sort_store_replicates_cross_shard_stamped already had via its
+# own DEBUG MVCC calls.
 async def _find_cross_shard_sort_keys(df_factory: DflyInstanceFactory, proactor_threads, tmp_path):
     probe = df_factory.create(
         proactor_threads=proactor_threads,
@@ -2262,7 +2268,7 @@ async def _find_cross_shard_sort_keys(df_factory: DflyInstanceFactory, proactor_
             dst_shard = _parse_mvcc(await c.execute_command("debug", "mvcc", dst))["shard"]
             if dst_shard != src_shard:
                 await c.aclose()
-                return src, dst
+                return src, dst, src_shard, dst_shard
         await c.aclose()
         raise AssertionError("could not find a destination key hashing to a different shard")
     finally:
@@ -2279,7 +2285,10 @@ async def _find_cross_shard_sort_keys(df_factory: DflyInstanceFactory, proactor_
 # appears on the replica and this test times out inside keys_replicated() / fails the lrange
 # assertion. Verified in task-7-report.md.
 async def test_sort_store_replicates_cross_shard_plain(df_factory: DflyInstanceFactory, tmp_path):
-    src, dst = await _find_cross_shard_sort_keys(df_factory, 4, tmp_path)
+    src, dst, src_shard, dst_shard = await _find_cross_shard_sort_keys(df_factory, 4, tmp_path)
+    assert src_shard != dst_shard, (
+        "test setup must exercise two distinct shards, " f"got src={src_shard} dst={dst_shard}"
+    )
 
     master = df_factory.create(proactor_threads=4, dir=str(tmp_path / "master"))
     replica = df_factory.create(proactor_threads=4, dir=str(tmp_path / "replica"))
@@ -2315,7 +2324,13 @@ async def test_sort_store_replicates_cross_shard_plain(df_factory: DflyInstanceF
 # each key's shard, asserted >= 2 distinct shards touched so this can't silently collapse to the
 # single-shard (auto-journal-revived, already-worked) case.
 async def test_sort_store_replicates_cross_shard_stamped(df_factory: DflyInstanceFactory, tmp_path):
-    src, dst = await _find_cross_shard_sort_keys(df_factory, 4, tmp_path)
+    src, dst, probe_src_shard, probe_dst_shard = await _find_cross_shard_sort_keys(
+        df_factory, 4, tmp_path
+    )
+    assert probe_src_shard != probe_dst_shard, (
+        "test setup must exercise two distinct shards, "
+        f"got src={probe_src_shard} dst={probe_dst_shard}"
+    )
 
     master = df_factory.create(**active_args(proactor_threads=4, dir=str(tmp_path / "master")))
     replica = df_factory.create(**active_args(proactor_threads=4, dir=str(tmp_path / "replica")))
@@ -2339,6 +2354,13 @@ async def test_sort_store_replicates_cross_shard_stamped(df_factory: DflyInstanc
     dst_stamp_master = _parse_mvcc(await c_master.execute_command("debug", "mvcc", dst))
     dst_stamp_replica = _parse_mvcc(await c_replica.execute_command("debug", "mvcc", dst))
 
+    # drakeydb: P4-3 Task 7 fix round (M2) -- guards against a vacuous pass: without this, both
+    # sides reading back mvcc:0 (i.e. dst was never actually stamped at all -- the RESTORE
+    # hand-journal landed but OpStore's arm-before-journal step was skipped or a no-op) would
+    # still satisfy the equality check below, since "0" == "0".
+    assert (
+        dst_stamp_master["mvcc"] != "0"
+    ), f"dst was never stamped on the author: {dst_stamp_master}"
     assert (
         dst_stamp_master["mvcc"] == dst_stamp_replica["mvcc"]
     ), f"dst: {dst_stamp_master} != {dst_stamp_replica}"

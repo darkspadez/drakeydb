@@ -3631,18 +3631,24 @@ TEST_F(OriginJournalFamilyTest, FieldExpireCausedDeleteIsNotFlaggedDerived) {
 }
 
 // drakeydb: P4-0 fix-wave -- SORT is the same defect class as FIELDEXPIRE above, caught by an
-// adversarial review pass: SORT (CO::JOURNALED, no NO_AUTOJOURNAL, generic_family.cc) auto-
-// journals verbatim just like FIELDEXPIRE, so OpFetchContainerElements/OpFetchSortEntries'
-// derived DEL must also reach peers -- same hazard, same fix (WillAutoJournalVerbatim,
-// generic_family.cc, keyed off the transaction's own CommandId, not a hardcoded name). SORT_RO
-// shares those exact call sites but is CO::READONLY and never auto-journals, so it must keep the
-// suppressed default -- this is the "cannot be a literal false" requirement the predicate exists
-// for. One consumer registration spans both halves; LastDel isolates each half's own DEL because
-// the two halves use disjoint keys run strictly in sequence.
+// adversarial review pass: SORT's own source-side effects must reach peers just like FIELDEXPIRE,
+// so OpFetchContainerElements/OpFetchSortEntries' derived DEL must also reach peers -- same
+// hazard, same fix (SortSourceEffectsMustReplicate, generic_family.cc -- renamed from
+// WillAutoJournalVerbatim in P4-3 Task 7's fix round, when SORT gained CO::NO_AUTOJOURNAL and
+// this predicate had to stop depending on whether SORT's own STORE effect happens to replay
+// verbatim or hand-journal, since it answers a different, shard-count-independent question:
+// does src's mutation need to reach peers at all -- keyed off the transaction's own CommandId,
+// not a hardcoded name). SORT_RO shares those exact call sites but is CO::READONLY and never
+// journals at all, so it must keep the suppressed default -- this is the "cannot be a literal
+// false" requirement the predicate exists for. One consumer registration spans both halves;
+// LastDel isolates each half's own DEL because the two halves use disjoint keys run strictly in
+// sequence. See CrossShardSourceEffectsReplicateLikeSameShard below for the same invariant
+// pinned across shards, not just within one.
 //
-// Falsifying: hardcoding WillAutoJournalVerbatim to always return false (or reverting either
-// SORT call site's `!WillAutoJournalVerbatim(...)` back to the derived=true default) makes
-// SORT's DEL come back flagged kEntryFlagDerived -- verified by hand during development.
+// Falsifying: hardcoding SortSourceEffectsMustReplicate to always return false (or reverting
+// either SORT call site's `!SortSourceEffectsMustReplicate(...)` back to the derived=true
+// default) makes SORT's DEL come back flagged kEntryFlagDerived -- verified by hand during
+// development.
 TEST_F(OriginJournalFamilyTest, SortDerivedDeleteReachesPeersButSortRoStaysSuppressed) {
   OriginFlagCapturingConsumer consumer;
   uint32_t consumer_id = 0;
@@ -3902,6 +3908,7 @@ namespace {
 struct DecodedJournalEntry {
   ShardId shard_id;
   std::vector<std::string> args;
+  uint8_t entry_flags;  // journal::kEntryFlagDerived / kEntryFlagExpired, see journal/types.h
 };
 
 class DecodingEntryCapturingConsumer : public journal::JournalConsumerInterface {
@@ -3917,7 +3924,8 @@ class DecodingEntryCapturingConsumer : public journal::JournalConsumerInterface 
       args.emplace_back(sv);
 
     util::fb2::LockGuard lk(mu_);
-    entries.push_back({EngineShard::tlocal()->shard_id(), std::move(args)});
+    entries.push_back(
+        {EngineShard::tlocal()->shard_id(), std::move(args), item.journal_item.entry_flags});
   }
   void ThrottleIfNeeded() override {
   }
@@ -3925,6 +3933,18 @@ class DecodingEntryCapturingConsumer : public journal::JournalConsumerInterface 
   util::fb2::Mutex mu_;
   std::vector<DecodedJournalEntry> entries;  // guarded by mu_
 };
+
+// Returns a key named `prefix<i>` (i starting at 0) that hashes to a different shard than
+// `avoid_sid` under this process's actual shard count -- the same linear-probe shape
+// MvccStoreTest::ApplyOnePeerWriteToEveryShard (this file) uses to target a specific shard.
+std::string FindKeyOnDifferentShard(std::string_view prefix, ShardId avoid_sid, size_t num_shards) {
+  for (int i = 0;; ++i) {
+    std::string candidate = absl::StrCat(prefix, i);
+    if (Shard(candidate, num_shards) != avoid_sid)
+      return candidate;
+    CHECK_LT(i, 10000) << "could not find a '" << prefix << "' key hashing to a different shard";
+  }
+}
 }  // namespace
 
 // drakeydb: P4-3 Task 7. The issue register (D-3) records that `SORT ... STORE` does not
@@ -3977,13 +3997,7 @@ TEST_F(MultiShardOriginJournalFamilyTest, CrossShardStoreHandJournalsRestoreOfDe
 
   const std::string src = "sort-src";
   const ShardId src_sid = Shard(src, num_shards);
-  std::string dst;
-  for (int i = 0;; ++i) {
-    dst = absl::StrCat("sort-dst", i);
-    if (Shard(dst, num_shards) != src_sid)
-      break;
-    CHECK_LT(i, 10000) << "could not find a destination key hashing to a different shard";
-  }
+  const std::string dst = FindKeyOnDifferentShard("sort-dst", src_sid, num_shards);
   const ShardId dst_sid = Shard(dst, num_shards);
   ASSERT_NE(src_sid, dst_sid) << "test setup must exercise two distinct shards";
 
@@ -4028,6 +4042,116 @@ TEST_F(MultiShardOriginJournalFamilyTest, CrossShardStoreHandJournalsRestoreOfDe
   EXPECT_EQ("RESTORE", dst_entry->args[0]);
   EXPECT_EQ(dst, dst_entry->args[1]);
   EXPECT_EQ("REPLACE", dst_entry->args.back());
+}
+
+// drakeydb: P4-3 Task 7 fix round (C1/C2 review).
+// CrossShardStoreHandJournalsRestoreOfDestinationEffect above proves the DESTINATION side of a
+// cross-shard SORT ... STORE; this test proves the SOURCE side, which the first pass of the fix
+// broke silently (see SortSourceEffectsMustReplicate's comment, above, for the full mechanism this
+// pins). Pinned in its own multi-shard fixture specifically because the pre-existing same-shard
+// coverage for both invariants (SortPartialExpiryJournalsSourceEffectBeforeDestinationEffect,
+// SortDerivedDeleteReachesPeersButSortRoStaysSuppressed, both above) runs under
+// OriginJournalFamilyTest, which pins num_shards=1 -- so neither test could ever have caught a
+// shard-count-dependent regression in these source-side effects. This one deliberately does not
+// pin the shard count, the same way CrossShardStoreHandJournalsRestoreOfDestinationEffect above
+// does not.
+//
+// Falsifying (C1): reverting SortSourceEffectsMustReplicate to gate on
+// Transaction::IsAutoJournalSuppressed() (as the first Task 7 patch did) makes the partial-expiry
+// half fail -- no SREM entry is captured on the source shard at all.
+// Falsifying (C2): the same revert makes the full-expiry half fail -- the DEL entry on the
+// source shard comes back with entry_flags & journal::kEntryFlagDerived set, which
+// PassesPeerEchoFilter (journal/types.cc) would then drop from every peer link.
+TEST_F(MultiShardOriginJournalFamilyTest, CrossShardSourceEffectsReplicateLikeSameShard) {
+  const size_t num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "test requires more than one shard to be meaningful";
+
+  // -- Partial expiry: SREM must reach the source shard's journal, cross-shard STORE or not --
+  // mirrors SortPartialExpiryJournalsSourceEffectBeforeDestinationEffect's sorted-path case
+  // above, with `dst` forced onto a different shard than `src`.
+  {
+    const std::string src = "sort-partial-src";
+    const ShardId src_sid = Shard(src, num_shards);
+    const std::string dst = FindKeyOnDifferentShard("sort-partial-dst", src_sid, num_shards);
+    ASSERT_NE(src_sid, Shard(dst, num_shards)) << "test setup must exercise two distinct shards";
+
+    EXPECT_EQ(Run({"sadd", src, "1", "2"}).GetInt(), 2);
+    Run({"fieldexpire", src, "1", "1"});
+    AdvanceTime(1100);
+
+    DecodingEntryCapturingConsumer consumer;
+    std::vector<uint32_t> consumer_ids(num_shards, 0);
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      journal::StartInThread();
+      consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+    });
+
+    Run({"sort", src, "store", dst});
+
+    EXPECT_EQ(Run({"scard", src}).GetInt(), 1);
+    EXPECT_EQ(Run({"sismember", src, "2"}).GetInt(), 1);
+    EXPECT_EQ(Run({"llen", dst}).GetInt(), 1);
+    EXPECT_EQ(Run({"lindex", dst, "0"}), "2");
+
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+    const DecodedJournalEntry* srem_entry = nullptr;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      for (const auto& e : consumer.entries) {
+        if (e.shard_id == src_sid && !e.args.empty() && e.args[0] == "SREM")
+          srem_entry = &e;
+      }
+    }
+    ASSERT_NE(nullptr, srem_entry)
+        << "cross-shard SORT ... STORE must still journal the source's own partial-expiry SREM, "
+           "exactly like a same-shard STORE does";
+    EXPECT_THAT(srem_entry->args, testing::ElementsAre("SREM", src, "1"));
+  }
+
+  // -- Full expiry: the source's own DEL must NOT be flagged derived, cross-shard STORE or not --
+  // mirrors SortDerivedDeleteReachesPeersButSortRoStaysSuppressed's SORT half above, with `dst`
+  // forced onto a different shard than `src`.
+  {
+    const std::string src = "sort-full-src";
+    const ShardId src_sid = Shard(src, num_shards);
+    const std::string dst = FindKeyOnDifferentShard("sort-full-dst", src_sid, num_shards);
+    ASSERT_NE(src_sid, Shard(dst, num_shards)) << "test setup must exercise two distinct shards";
+
+    EXPECT_EQ(Run({"sadd", src, "m"}).GetInt(), 1);
+    Run({"fieldexpire", src, "1", "m"});
+    AdvanceTime(1100);
+
+    DecodingEntryCapturingConsumer consumer;
+    std::vector<uint32_t> consumer_ids(num_shards, 0);
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      journal::StartInThread();
+      consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+    });
+
+    Run({"sort", src, "by", "nosort", "store", dst});
+
+    EXPECT_EQ(Run({"exists", src}).GetInt(), 0);
+
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+    const DecodedJournalEntry* del_entry = nullptr;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      for (const auto& e : consumer.entries) {
+        if (e.shard_id == src_sid && !e.args.empty() && e.args[0] == "DEL")
+          del_entry = &e;
+      }
+    }
+    ASSERT_NE(nullptr, del_entry)
+        << "cross-shard SORT ... STORE must still journal the source's own full-expiry DEL, "
+           "exactly like a same-shard STORE does";
+    EXPECT_FALSE(del_entry->entry_flags & journal::kEntryFlagDerived)
+        << "SORT's own source-side DEL must reach peers regardless of STORE's shard count, or "
+           "PassesPeerEchoFilter silently drops it from every peer link";
+  }
 }
 
 // drakeydb: P4-0 Task 2b -- boots with active_replica=true (ActiveReplicaFamilyTest, above) so
