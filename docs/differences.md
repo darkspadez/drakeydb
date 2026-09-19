@@ -33,11 +33,22 @@ This is a **one-way door for incompatible consumers**: a snapshot written by an 
 only be loaded by a drakeydb binary (the read side understands opcode 221 unconditionally, active
 or not) — never by a stock Dragonfly. Negotiated drakeydb full sync deliberately carries the same
 snapshot stream, including opcode 221. Peer admission requires fork protocol version 66 (the first
-version that understands this opcode) before a single byte is sent, so an older drakeydb, stock
-Dragonfly, or plain Redis consumer can never receive it from an active node. The compatibility
-cliff therefore appears when an active snapshot **file** is copied by hand onto a stock
-Dragonfly's `--dir` (or loaded there via `DEBUG RELOAD`), while compatible drakeydb replication
-preserves the stamps. To cross back deliberately, load the file with a current drakeydb under
-`--active_replica=false` and save it again; the non-active write side omits opcode 221, producing a
-stock-compatible snapshot at the cost of discarding all stamps. A non-active drakeydb node's own
-snapshots are stock-compatible for the same reason.
+version that understands this opcode; the current version is higher still — see
+`docs/multi-master.md`) before a single byte is sent, so an older drakeydb, stock Dragonfly, or
+plain Redis consumer can never receive it from an active node. The compatibility cliff therefore
+appears when an active snapshot **file** is copied by hand onto a stock Dragonfly's `--dir` (or
+loaded there via `DEBUG RELOAD`), while compatible drakeydb replication preserves the stamps. To
+cross back deliberately, load the file with a current drakeydb under `--active_replica=false` and
+save it again; the non-active write side omits opcode 221, producing a stock-compatible snapshot
+at the cost of discarding all stamps. A non-active drakeydb node's own snapshots are
+stock-compatible for the same reason.
+
+## Merge LWW, tombstones, and mesh operator guidance (drakeydb fork)
+
+P4-3 adds a second, related one-way door: RDB opcode 225 (`RDB_OPCODE_DF_TOMBSTONES`), a per-shard
+delete-tombstone section with the same "write side active-only, read side unconditional" shape as
+opcode 221 above, plus a merge-on-full-sync last-write-wins rule for what happens when two active
+nodes (or an active node and a classic Redis/KeyDB master) full-sync from each other. See
+[`docs/multi-master.md`](multi-master.md) for the full operator page: what the merge rule does and
+does not guarantee, the three tombstone flags and how to size them, the `FLUSHALL`/`FLUSHDB`
+tombstone-wipe hazard, the `--cache_mode` interaction, and the current fork protocol version.

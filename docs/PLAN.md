@@ -11,7 +11,7 @@
 | **P1 — Identity foundations** | ✅ **complete, verified** | branch `feat/phase1-identity`, commits `9e653ab3..9c491fac` |
 | **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3) **merged** as `cd8e0602` — see [Phase 2](#phase-2) |
 | **P3 — Origin-tagged journal + active pair/mesh** | ✅ **complete, verified** | PR [#4](https://github.com/darkspadez/drakeydb/pull/4), branch `feat/phase3-origin-journal`, 30 commits `6b0c995a..7bddd7fe` — see [Phase 3](#phase-3) |
-| **P4 — MVCC store + stamping + wire** | 🚧 **in progress; P4-0 through P4-2 delivered** | see [Phase 4](#phase-4--mvcc-store--stamping--wire) |
+| **P4 — MVCC store + stamping + wire** | 🚧 **in progress; P4-0 through P4-3 delivered** | see [Phase 4](#phase-4--mvcc-store--stamping--wire) |
 | P5–P9 | not started | — |
 
 **P0 verification record** (Ubuntu 24.04 arm64 container, OrbStack): debug build produces
@@ -649,7 +649,8 @@ comparison against the receiving node's own stored stamp** — `RdbLoader::Creat
 calls `SetMvcc` unconditionally (`rdb_load.cc:3369`), so an active↔active merge still always
 takes the sender's data regardless of recency. P4-2 makes the stamps durable and transportable;
 it does not yet arbitrate conflicts with them. The merge-on-full-sync LWW hook and tombstone
-persistence (`RDB_OPCODE_DF_TOMBSTONES = 225`) remain future work (Phase 6 below).
+persistence (`RDB_OPCODE_DF_TOMBSTONES = 225`) remain future work (Phase 6 below) — **delivered by
+P4-3, below.**
 
 **P4-2 verified** (Task 6 exit gate, Ubuntu 24.04 arm64 container `drakeydb-p2`, OrbStack): full
 `ninja -j4 dragonfly` (no work to do — already warning-free from the task rounds) +
@@ -670,13 +671,61 @@ leg, which the ledger records as established by static argument (sole apply site
 change) rather than an observed failing run; host pre-commit clean on the two doc files this
 task touched.
 
+**P4-3 delivered** (branch `feat/phase4-3-merge-lww-tombstones`, Tasks 1-8, 11-13, ledger
+`.superpowers/sdd/2026-08-30-phase4-3-merge-lww-tombstones/progress.md`): merge-on-full-sync LWW
+and delete tombstones, closing the gap the "Not in scope for P4-2" note above described. Full
+operator-facing writeup: [`docs/multi-master.md`](multi-master.md). Summary:
+
+- **Merge-LWW** (`MergeAccepts`, `src/server/mvcc.h`): an incoming key from a full sync overwrites
+  the stored one only when strictly newer; equal stamps favor the stored side (owner decision,
+  2026-08-30). Wired into the loader (`RdbLoader::CreateObjectOnShard`, `rdb_load.cc`) via
+  `SetMergeLww`, with the authoritative compare running after `AddOrFind`'s own last yield point
+  (Task 4's Hazard 1 fix) so a concurrent peer apply during `LOADING` cannot slip a stale write in
+  ahead of the check.
+- **Tombstones**: an explicit `DEL`/`UNLINK` or an expiry now arms a tombstone (`ArmTombstone`,
+  `MvccStamper::Commit`) instead of erasing the slot outright; `kEvicted`/`kSlotFlush` still erase
+  with no tombstone (eviction is a capacity decision, not a deletion). An idle-task GC
+  (`DbSlice::TombstoneGcStep`) reclaims expired tombstones on the default namespace only, and a
+  per-shard cap degrades over-cap deletes to a plain erase, counted in the new
+  `mvcc_tombstones_dropped` metric (`INFO memory` and `DEBUG MVCC`'s aggregate, the latter closed
+  by Task 8). Three new flags: `--multi_master_tombstone_ttl` (0 disables tombstoning),
+  `--multi_master_max_tombstones`, `--multi_master_tombstone_gc_budget` (>= 1).
+- **Wire**: `RDB_OPCODE_DF_TOMBSTONES = 225` persists tombstones per shard (write side
+  active-only, read side unconditional, same shape as opcode 221); `kDrakeydbReplVersion` bumped
+  66 → 67 so a pre-P4-3 peer is refused at handshake rather than hard-failing mid-stream on the new
+  opcode.
+- **Classic-protocol peers** (a plain Redis/KeyDB master, or any RDB source with no per-key
+  stamp): an unstamped key is given the snapshot's own `ctime`-derived authority
+  (`min(ctime_ms + 999, now_ms)`) rather than D-7's `{0,0}`, replacing an earlier, withdrawn
+  unconditional-override rule that could clobber a node's entire resident dataset. This narrows,
+  but does not close, a tombstone-resurrection exposure on classic links: a classic snapshot
+  carries one whole-file timestamp, not a per-key write time, so it cannot distinguish a
+  legitimate post-delete rewrite from a stale pre-delete copy. Documented plainly (not just
+  reasoned about) in `docs/multi-master.md` and tracked as D-12 in `docs/ISSUE-REGISTER.md`.
+- **`SORT ... STORE`** now replicates its destination cross-shard via a hand-journaled
+  `RESTORE ... REPLACE` (closing D-3), and its source-side lazy-member-expiry compensation
+  (`SREM`/`DEL`) reaches peers regardless of `STORE`'s shard count — closing two Criticals a
+  same-shard-only test suite had never exercised. A same-shard `SORT ... STORE` still journals the
+  sort recipe rather than its computed result (tracked as D-13, deliberately not fixed here — see
+  `docs/ISSUE-REGISTER.md`).
+- **Task 8** (this task) closed a minor gap Task 2's own report flagged (`DEBUG MVCC`'s aggregate
+  never surfaced `mvcc_tombstones_dropped`, unlike `INFO memory`), strengthened the
+  `DEBUG MVCC <key>` tombstone test to check the printed stamp rather than only its presence,
+  corrected four stale comments left over from Task 7's `WillAutoJournalVerbatim` rename, wrote
+  `docs/multi-master.md`, and recorded this phase's upstream/deferred findings (U-4 through U-8,
+  D-11 through D-13) in `docs/ISSUE-REGISTER.md`. `multi_master_test` **138/138 passed, 1 skipped**
+  (the pre-existing root-user self-skip) after these changes; a full-phase exit-gate sweep
+  (`ctest -L DFLY`, the pytest `multimaster`/`replication` suites) is this branch's remaining step
+  before merge, not part of Task 8's own scope. Every task's falsification is recorded verbatim in
+  `task-1..13-report.md` (same ledger directory).
+
 ## Phase 5 — Streaming LWW guard
 Command classifier + pre-exec compare/drop in `JournalExecutor`; `multimaster_lww_dropped`
 metric; `--multi_master_stream_lww` off = KeyDB-parity arrival order.
 **Verify:** pytest — concurrent conflicting SETs on A and B converge to the higher-mvcc value on
 both (KeyDB's "MVCC Updates Correctly" parity incl. its 2 ms slop).
 
-## Phase 6 — Merge-on-full-sync LWW
+## Phase 6 — Merge-on-full-sync LWW ✅ delivered by P4-3 (above)
 `mvcc-tstamp` per-key aux save/load; LWW hook at `rdb_load.cc:3238`.
 **Verify:** `rdb_test.cc` aux round-trip; pytest — node with newer local writes full-syncs from a
 peer holding older values → newer survive ("Active Replica Merges Database On Sync" parity);
@@ -712,7 +761,7 @@ metrics; 4-node chaos pytest (random kills + seeder + convergence assert).
 | 4 | Clock skew breaks LWW | Hybrid stamp absorbs small skew; handshake skew warning + metric; NTP documented as hard requirement |
 | 5 | Concurrent same-key RMW diverges (arrival order) | Same hole as KeyDB; loud docs; LWW guard covers state commands; recommend per-node key ownership for RMW |
 | 6 | MVCC side-table memory (~40-48 B/key) | Active-mode-only allocation; INFO metric; documented; CompactObj growth explicitly rejected |
-| 7 | Delete resurrection during merge (no tombstones) | KeyDB-identical hole (their fix is dead code); documented; serialized handshakes shrink the window; tombstone table = v2 |
+| 7 | Delete resurrection during merge (no tombstones) | **Mitigated by P4-3**: explicit/expired deletes now leave a tombstone (bounded by `--multi_master_tombstone_ttl`/`--multi_master_max_tombstones`), compared via the same merge-LWW rule as any other key. Residual: classic-protocol (unstamped) peers narrow but do not close the window (D-12); `FLUSHALL`/`FLUSHDB` still wipes all tombstones. See `docs/multi-master.md` |
 | 8 | FLUSHALL floods mesh / races merge-sync | Parity behavior + test; global cmds already rendezvous via `MultiShardExecution`; ops guidance; future `--multi_master_protect_flush` |
 
 ## Upstream sync workflow (ongoing)
