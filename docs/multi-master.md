@@ -35,7 +35,11 @@ active-expire sweep runs behind. On a *merge* load such a key is not silently dr
 applied as a delete for that key, carrying the incoming key's own stamp with the tombstone bit
 set, through exactly the same `MergeAccepts` compare and tombstone-install path an opcode-225
 tombstone record takes. If this node's own value for that key is newer, it wins and nothing
-changes; if it is older, it is deleted and the peer's stamp is recorded as a tombstone. Without
+changes; if it is older, it is deleted and the peer's stamp is recorded as a tombstone. That
+tombstone carries the peer's *write-time* stamp, so its GC deadline is `write time +
+--multi_master_tombstone_ttl`: for a key whose TTL was longer than the tombstone TTL it is born
+already reapable and gives this node almost no resurrection-protection window (the delete itself
+still stands). Without
 this, a peer's `SET k v2 PX 1000` issued during a partition would leave this node holding the
 older `v1` forever — the peer's tombstone is not in the snapshot's prologue-emitted opcode-225
 section (the key had not expired yet when that ran) and its expiry `DEL` never crosses a peer

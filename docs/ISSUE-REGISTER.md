@@ -394,3 +394,35 @@ this is an untested risk, not a reproduced defect.
 
 **Owner:** unassigned; wants a three-node pytest topology (fan-in mesh already exists in
 `multimaster_test.py`, so the fixture cost is low). **From:** P4-3 final review.
+
+### D-16. A synthetic expiry tombstone can be born GC-eligible
+
+**Where:** `src/server/rdb_load.cc`, the merge-load path for an incoming key whose TTL has already
+elapsed (`ApplyMergeTombstoneOnShard`, added by the P4-3 final fix wave for adversarial finding
+F-1); `DbSlice::TombstoneGcStep` reaps when `DeadlineMs(ttl) <= now`, and `DeadlineMs` is
+`MsPart() + ttl` (`src/server/mvcc.h`).
+
+The synthetic tombstone reuses the peer's *value write-time* stamp (bit 63 set) so that it compares
+exactly as the peer's authority would. Its GC deadline is therefore `write_time + tombstone_ttl`,
+not `reap_time + tombstone_ttl`. For any key whose own TTL exceeded `--multi_master_tombstone_ttl`
+(default 600 s — e.g. `SET k v EX 3600`), the tombstone installed on the receiver is already past
+its deadline, is reaped on the next idle GC pass, and is excluded from outgoing opcode-225
+sections. The delete stands; what is lost is the resurrection-protection window, asymmetrically
+with the author, which mints a fresh reap-time stamp with the full window.
+
+Failure scenario (three peers): C partitioned before A's `SET k v2 EX 3600`; A's key expires and
+A's sweep lags; full sync A→B applies the synthetic tombstone, which is GC'd within an idle tick;
+C rejoins and full-syncs to B carrying its older live `k` → B has no tombstone → `MergeAccepts`
+accepts → `k` resurrects on B (not on A) until A's next full sync to B. Strictly better than the
+pre-fix state, which kept the stale value with no delete at all.
+
+Why not mint a fresh receiver-side stamp: that would fabricate authority the peer never carried,
+which D-7 forbids and which the P4-2 review reversed a controller ruling to prevent. The honest
+alternatives are a separate reap-deadline field (rejected by D-10 for the 16-byte layout) or
+clamping the deadline to `max(write_time, receive_time) + ttl` at install — a design choice for
+the owner.
+
+**How established:** static analysis in the scoped re-review of the P4-3 final fix wave; the
+three-peer scenario is unmeasured (see D-15).
+
+**Status:** open. **Owner:** P4-4 or P4-5 (tombstone lifecycle). **From:** P4-3 final fix wave.
