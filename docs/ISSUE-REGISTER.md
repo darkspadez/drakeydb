@@ -222,12 +222,23 @@ enclosing journal entry, which is a design change.
 
 **Owner:** unassigned (revisit if ties become observable). **From:** P4-1.
 
-### D-5. A non-active node still emits `node_uuid:` in INFO replication
+### D-5. `--active_replica`-off byte-identity has two documented exceptions
 
-So "byte-identical with `--active_replica` off" is true for the journal wire, the RDB file, and
-INFO memory, but not for INFO as a whole.
+1. A non-active node still emits `node_uuid:` in INFO replication (P1/P3).
+2. Since P4-3, a **cross-shard `SORT ... STORE` hand-journals its effect** (`RESTORE <dst>`) on
+   every node, active or not (`generic_family.cc` — `SORT` is `CO::NO_AUTOJOURNAL`, `OpStore`
+   hand-journals when `GetUniqueShardCnt() != 1`). This is a deliberate owner ruling, not an
+   oversight: upstream's per-shard auto-journal payload is built from `GetShardArgs(shard_id)` and
+   dropped the destination effect entirely, so a **plain replica did not converge** on a
+   cross-shard `SORT ... STORE` before P4-3. Gating the fix on `--active_replica` would re-open
+   that bug for plain replicas purely to preserve the slogan, so it stays on for everyone.
 
-**Owner:** unassigned; introduced in P1/P3. **From:** P4-1.
+So "byte-identical with `--active_replica` off" is true for the journal wire *except* cross-shard
+`SORT ... STORE`, true for the RDB file and INFO memory, and not true for INFO as a whole. Stated
+that way in `docs/UPSTREAM-SYNC.md`, `docs/PLAN.md` and `docs/differences.md`.
+
+**Owner:** unassigned; (1) introduced in P1/P3, (2) ruled deliberate in P4-3. **From:** P4-1,
+restated P4-3 final review.
 
 ### D-8. Both stamp forms for one key are untested
 
@@ -331,3 +342,55 @@ pattern-key-dependent edge case was left for a future owner decision.
 
 **Owner:** unassigned; owner to decide whether the divergence-under-`BY`-pattern case is worth the
 added journal size. **From:** P4-3 Task 7.
+
+### D-14. `HandleTombstones`' cross-shard dispatch can still steal a concurrent same-key arm
+
+**Where:** `src/server/rdb_load.cc` — `HandleTombstones` dispatches its per-key apply with
+`shard_set->Add(sid, ...)`, fire-and-forget and unserialized against ordinary command traffic on
+that shard. Inside `RdbLoader::ApplyMergeTombstoneOnShard`, the `found_mutable` branch calls
+`MvccStamper::tlocal()->Disarm(db_index, key)`, and `MvccStamper::tlocal()` is a per-**shard
+thread** singleton, not per-callback.
+
+Task 13's review fix (I3) scoped that `Disarm` to `found_mutable`, which closes the case where
+this callback never touched the key at all. The residual: when `found_mutable` IS true, the
+`Disarm` erases *every* arm matching `(db_index, key)` on that thread — including a different,
+concurrent fiber's still-pending, legitimate arm for the same key name (e.g. a client's own
+`DEL k` that yielded between `ArmTombstone` and its journal `Commit()`, on a slow replica or a
+full ring buffer). That fiber's `Commit()` then finds no arm to stamp and its `{kTombstoneBit, 0}`
+placeholder is never overwritten with a real, minted stamp: an immortal, unreapable tombstone
+(`TombstoneGcStep`'s reap predicate requires `Mvcc() != 0`), i.e. a silently-lost delete.
+
+The window requires a full sync's tombstone section and a client `DEL`/expiry for the *same key*
+to interleave inside one shard thread's yield. Closing it properly needs arm identity (an owner
+token on each arm, so `Disarm` can only cancel its own), not a narrower scope.
+
+**How established:** static reading during P4-3 Task 13's review and re-confirmed in the final
+whole-branch review; not reproduced. `RdbMvccTest.MergeLwwTombstoneInstallForAbsentKeyDoesNot
+StealConcurrentArm` pins the half that IS closed.
+
+**Owner:** unassigned; needs per-arm ownership in `MvccStamper`. **From:** P4-3 Tasks 6/13, final
+review.
+
+### D-15. Tombstone merge is only ever tested with two peers
+
+**Where:** every tombstone/merge test in the branch — `rdb_test.cc`'s `RdbMvcc*` cases,
+`multi_master_test.cc`, `tests/dragonfly/multimaster_merge_test.py` (both the fuzzer and the three
+resurrection pins) — uses exactly **two** nodes, or one node plus a hand-built RDB stream.
+
+The merge rule itself is pairwise and stateless, so two peers exercise the decision function
+fully. What is untested is the *composition*: three or more peers where a stale intermediate value
+can sit between two nodes' stamps. Concretely — the reasoning that motivated Task 13's
+`would_grow` cap fix and several `Disarm` scopings is all of the form "a THIRD peer's later write,
+correctly losing against the newer stamp, could wrongly win against a stale one left behind". That
+argument has never been run. The same applies to the P4-3 final fix wave's synthetic expiry
+tombstone (it carries the incoming *value's* stamp, so it is order-equivalent to that value on a
+third peer that still holds it live — ties favor the stored side, which is why it is believed
+safe, but that too is reasoned rather than measured) and to F-2's per-node expiry stamps, where a
+third peer holding a value stamped *between* the two nodes' tombstones is exactly the case the
+adversarial review flagged as unbounded in general.
+
+**How established:** coverage audit during P4-3's final whole-branch review. No failure is known;
+this is an untested risk, not a reproduced defect.
+
+**Owner:** unassigned; wants a three-node pytest topology (fan-in mesh already exists in
+`multimaster_test.py`, so the fixture cost is low). **From:** P4-3 final review.

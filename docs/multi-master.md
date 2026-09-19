@@ -29,6 +29,20 @@ installed only when it is *strictly* newer than what is already there (`MergeAcc
 `src/server/mvcc.h`); equal stamps never churn. This is a deliberate owner decision (2026-08-30),
 not an oversight — it is what makes a retried or duplicated apply idempotent.
 
+**An already-expired incoming key is the peer's DELETE.** A full sync can ship a key whose
+whole-key TTL has already elapsed — the normal state of an expiring key on a loaded server, whose
+active-expire sweep runs behind. On a *merge* load such a key is not silently dropped: it is
+applied as a delete for that key, carrying the incoming key's own stamp with the tombstone bit
+set, through exactly the same `MergeAccepts` compare and tombstone-install path an opcode-225
+tombstone record takes. If this node's own value for that key is newer, it wins and nothing
+changes; if it is older, it is deleted and the peer's stamp is recorded as a tombstone. Without
+this, a peer's `SET k v2 PX 1000` issued during a partition would leave this node holding the
+older `v1` forever — the peer's tombstone is not in the snapshot's prologue-emitted opcode-225
+section (the key had not expired yet when that ran) and its expiry `DEL` never crosses a peer
+link (see "An expiry's tombstone stamp is per-node" below). A **non-merge** load — a local RDB
+file, `DEBUG LOAD`, a plain Dragonfly replica's full sync — keeps dropping an already-expired key
+verbatim, exactly as upstream does.
+
 **What it does not do:** merge-LWW only ever compares against *this node's own resident stamp*
 for a key. It has no notion of a global "true" value, no quorum, and no read-repair outside a
 full sync. Two nodes can each accept different values for the same key from different partitions
@@ -85,6 +99,24 @@ deletes. A peer's incoming write for that key is then just another candidate in 
 as before this phase. This is intentional: eviction is a local capacity decision, not a durable
 fact about the dataset, and the peer's copy is treated as authoritative for that key. See the
 `--cache_mode` section below for the operational consequence.
+
+**An expiry's tombstone stamp is per-node, by design.** A `kExpired` tombstone is minted
+*locally*, by whichever node actually reaps the key, from that node's own clock and under its own
+`origin` (`RecordExpiryBlocking`/`CommitOwnTombstone`, `tx_base.cc`) — an expiry is always a local
+decision (D-10). And an expiry `DEL` is deliberately **not** forwarded on a peer link:
+`journal::PassesPeerEchoFilter` (`journal/types.cc`) drops every entry carrying
+`kEntryFlagExpired`, and `SliceSnapshot::ConsumeJournalChange` applies the same filter to a full
+sync's concurrent journal blob. Both are intentional — an expiry that replicated as a foreign
+delete would re-propagate one node's clock as authority over another's.
+
+The consequence, which is **correct and expected**: when the same TTL fires on two peers (the
+normal case, since the TTL itself replicates), each node ends up holding a *different*
+`{mvcc, origin}` tombstone for that key. `DEBUG MVCC <key>` on the two nodes will legitimately
+disagree — different `mvcc`, different `origin`, possibly several seconds apart — while both
+report the key as **absent** and both return nil for `GET`. Values and absence converge; an
+expiry tombstone's stamp is not a mesh-wide consensus value and should not be compared across
+nodes. (A tombstone for an expiry reaped on exactly one node *does* propagate verbatim, via the
+opcode-225 section of the next full sync from that node; it is the two-sided case that differs.)
 
 **Tombstones are default-namespace-only.** `PerformDeletionAtomic`'s tombstone-earning check
 (`db_slice.cc`) is gated on `ns_ == &namespaces->GetDefaultNamespace()`. A delete in an ACL
@@ -187,6 +219,12 @@ reminder of this split, not because the combination is unsupported.
 
 All three `DEBUG MVCC` forms require `--active_replica` and are local-only (default namespace
 only — the journal wire has no namespace identity to carry a non-default one's state).
+
+**Do not diff `DEBUG MVCC <key>` across peers for an expired key.** Two nodes that each expired
+the same key hold different `{mvcc, origin}` tombstones for it, by design — see "An expiry's
+tombstone stamp is per-node" above. Both will report `state:tombstone` (or `absent`, once the
+tombstone is GC'd) and both will return nil; only the stamps differ. For a `DEL`, and for an
+expiry reaped on exactly one node, the stamps do match across peers.
 
 ## Compatibility: the RDB one-way doors
 

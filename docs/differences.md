@@ -53,3 +53,30 @@ nodes (or an active node and a classic Redis/KeyDB master) full-sync from each o
 [`docs/multi-master.md`](multi-master.md) for the full operator page: what the merge rule does and
 does not guarantee, the three tombstone flags and how to size them, the `FLUSHALL`/`FLUSHDB`
 tombstone-wipe hazard, the `--cache_mode` interaction, and the current fork protocol version.
+
+## Cross-shard `SORT ... STORE` journals its result (drakeydb fork)
+
+Since P4-3, a `SORT ... STORE dst` whose source key and `dst` land on **different shards**
+journals its *effect* — a `RESTORE dst <serialized list>` — instead of the `SORT` command itself.
+This applies on **every** node, including one running with `--active_replica=false`; it is the one
+journal-wire difference from upstream that is not flag-gated.
+
+It is a bug fix, not a fork feature. Upstream registers `SORT` as `CO::JOURNALED` and lets the
+dispatcher auto-journal it, but for a multi-shard transaction that auto-journal fires once per
+participating shard on the concluding hop and builds its payload from `GetShardArgs(shard_id)` —
+this shard's own key slice only, dropping `BY`/`GET`/`LIMIT`/`STORE` and the other key entirely.
+The destination write was therefore **never replicated at all**, so a plain Dragonfly replica
+silently did not converge on a cross-shard `SORT ... STORE`. drakeydb marks `SORT`
+`CO::NO_AUTOJOURNAL` and has `SortGeneric` revive the auto-journal only when
+`GetUniqueShardCnt() == 1` (no `STORE`, or a `STORE` landing on the source's shard — every
+single-shard behavior is unchanged and still replays the `SORT` command verbatim).
+
+Consequences:
+
+- A replica no longer re-sorts anything for the cross-shard case; it applies the already-computed
+  result, so it converges regardless of its own copy of the source key.
+- The journal entry for that case is larger (the serialized destination list rather than the
+  command), and reads as `RESTORE` rather than `SORT` in any journal-level tooling.
+- The same-shard case still journals the sort *recipe*, which leaves a narrow residual where a
+  `BY`/`GET` pattern key (not a transaction key) differs between nodes — tracked as D-13 in
+  [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md).

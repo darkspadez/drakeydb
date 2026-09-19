@@ -253,7 +253,7 @@ Governing choices:
 
 | Path | Contents |
 |---|---|
-| `src/server/node_identity.h/.cc` | UUID create/load/persist, `--node_uuid` override, `kDrakeydbReplVersion = 66` |
+| `src/server/node_identity.h/.cc` | UUID create/load/persist, `--node_uuid` override, `kDrakeydbReplVersion = 67` (P4-3) |
 | `src/server/multi_master.h/.cc` | `PeerRegistry` (uuid ↔ origin_idx, 0 = self, P1). **P2 (done):** `active_replica`/`multi_master` flags, `IsActiveReplica()`/`IsMultiMaster()`, `ValidateMultiMasterFlags()`, `ParsePeerReplicaOfArgs()`, `RenderPeerReplicationInfo()`. `MvccClock` (P4, not yet built) |
 | `src/server/peer_replication.h/.cc` (new, P2) | `SyncGate` (FIFO ticket queue, cancellable, deferred while the process is LOADING for another reason, notifies under its mutex), `PeerReplicationManager` (peer links keyed by stored endpoint; add/remove/no-one; replace-vs-append by `--multi_master`) |
 | `src/server/multi_master_test.cc` | C++ units (registry; **P2:** flag validation, arg parser, INFO renderer, `ActiveReplicaFamilyTest`) |
@@ -770,7 +770,7 @@ metrics; 4-node chaos pytest (random kills + seeder + convergence assert).
 | # | Risk | Mitigation |
 |---|---|---|
 | 1 | Serialize-once journal vs per-consumer filtering (ring-buffer partial replay must filter without reparsing) | `JournalItem.origin_idx` memory-side field; filter in live + `MaybePartialStreamLSNs` paths; C++ mixed-origin backlog test |
-| 2 | Upstream owns the deprecated varint / journal code | Version constant 65 dodges upstream VERs; `docs/UPSTREAM-SYNC.md` watchlist; multimaster pytest suite is the merge gate; framing diff is ~30 lines in one low-churn file |
+| 2 | Upstream owns the deprecated varint / journal code | Version constant 67 (originally 65) dodges upstream VERs; `docs/UPSTREAM-SYNC.md` watchlist; multimaster pytest suite is the merge gate; framing diff is ~30 lines in one low-churn file |
 | 3 | LSN/partial-sync semantics across peers | Each peer pair is its own lineage; peer-mode `Replica` never adopts lineage / never `StartJournalAtOwnLSN`; cascaded flag mutually exclusive with active mode; per-peer restart partial-sync test |
 | 4 | Clock skew breaks LWW | Hybrid stamp absorbs small skew; handshake skew warning + metric; NTP documented as hard requirement |
 | 5 | Concurrent same-key RMW diverges (arrival order) | Same hole as KeyDB; loud docs; LWW guard covers state commands; recommend per-node key ownership for RMW |
@@ -782,8 +782,12 @@ metrics; 4-node chaos pytest (random kills + seeder + convergence assert).
 
 See `docs/UPSTREAM-SYNC.md`. Summary: merge (not rebase) `upstream/main` monthly + after upstream
 releases; fork changes stay additive and flag-gated so `--active_replica`-off behavior is
-byte-identical to upstream; verification gate = build + `ctest -L DFLY` + replication pytest
-subset + multimaster suite.
+byte-identical to upstream **except** cross-shard `SORT ... STORE`, which journals its effect
+(`RESTORE <dst>`) on every node since P4-3 — upstream's own per-shard auto-journal payload dropped
+that effect entirely, so a plain replica silently did not converge; the fix is deliberately
+ungated (see `docs/UPSTREAM-SYNC.md` and `docs/differences.md`). INFO replication's `node_uuid:`
+line is the other documented exception (D-5). Verification gate = build + `ctest -L DFLY` +
+replication pytest subset + multimaster suite.
 
 ## Non-goals for v1
 

@@ -79,7 +79,8 @@ struct DbTableStats {
   // live prime counterpart.
   size_t mvcc_tombstones = 0;
   // drakeydb: P4-3 Task 2 -- a kExplicit/kExpired delete that WOULD have earned a tombstone but
-  // hit --multi_master_max_tombstones (this shard already has as many as the cap allows) and
+  // hit --multi_master_max_tombstones (this (database, shard) pair -- i.e. THIS DbTable, not the
+  // shard overall -- already holds as many as the cap allows) and
   // degraded to an erase instead. Purely diagnostic: makes that degradation visible in INFO/
   // benchmark output rather than a silent, unbounded fallback to today's resurrection-on-full-sync
   // behavior. Maintained in DbSlice::PerformDeletionAtomic (db_slice.cc).

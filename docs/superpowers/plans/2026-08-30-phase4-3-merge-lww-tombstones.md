@@ -11,7 +11,7 @@ bounded tombstones that survive a peer's absence, persist through RDB, and are a
 **Architecture:** Deletes stop erasing the side-table slot and instead leave a tombstone: the same
 16-byte `MvccStamp` with bit 63 set, minted through the existing arm/commit machinery so a
 tombstone carries exactly the stamp its own journal entry carried. Tombstones are bounded by a TTL
-plus a hard per-shard cap enforced inline (an idle-task GC cannot be relied on precisely when
+plus a hard per-(database, shard) cap enforced inline (an idle-task GC cannot be relied on when
 tombstones accumulate). `RdbLoader::CreateObjectOnShard` compares the incoming stamp against the
 stored one — value *or* tombstone — immediately before `AddOrUpdate`, on the target shard's thread,
 and skips the write when the stored side wins. Tombstones ride the RDB in their own opcode so a
@@ -171,7 +171,8 @@ Test `src/server/multi_master_test.cc`, `src/server/mvcc_test.cc`
     slot, maintaining `mvcc_entries`, `mvcc_tombstones`, and `mvcc_key_dup_bytes`.
   - `size_t DbTableStats::mvcc_tombstones_dropped` (new; bump `kDbSz` 104 → 112 and add to `ADD()`).
   - Flags in `multi_master.cc`: `--multi_master_tombstone_ttl` (seconds, default `600`, `0`
-    disables tombstoning entirely), `--multi_master_max_tombstones` (default `1000000`, per shard),
+    disables tombstoning entirely), `--multi_master_max_tombstones` (default `1000000`, per
+    (database, shard) pair -- one `DbTable`'s count, not a shard overall),
     `--multi_master_tombstone_gc_budget` (default `64` buckets). Accessors in `multi_master.h`.
 
 **Why the arm/commit route rather than minting at deletion:** a tombstone must carry *exactly* the

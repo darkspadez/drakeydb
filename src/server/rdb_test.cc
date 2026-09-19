@@ -3471,8 +3471,10 @@ TEST_F(RdbMvccTest, MergeLwwWinningTombstoneDeletesLiveKeyButInstallsNoneWhenDis
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after a plain (non-tombstoning) erase";
 }
 
-// drakeydb: P4-3 Task 6, review fix I2 (Important) -- the second half: at the per-shard tombstone
-// cap (--multi_master_max_tombstones), PerformDeletionAtomic degrades a kExplicit delete to a
+// drakeydb: P4-3 Task 6, review fix I2 (Important) -- the second half: at the per-(database,
+// shard) tombstone cap (--multi_master_max_tombstones, which caps each DbTable's own count, not a
+// shard overall -- see the flag's help in multi_master.cc), PerformDeletionAtomic degrades a
+// kExplicit delete to a
 // plain erase (counted in mvcc_tombstones_dropped) instead of arming a tombstone placeholder --
 // the merge-apply path must read and respect that exact decision instead of installing the peer's
 // tombstone anyway. max_tombstones=0 makes every delete hit the cap trivially (mvcc_tombstones(0)
@@ -5747,7 +5749,7 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyDoesNotStealConcurrentAr
   EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
 }
 
-// drakeydb: P4-3 Task 13 review fix (I4, Important) -- the per-shard tombstone cap
+// drakeydb: P4-3 Task 13 review fix (I4, Important) -- the per-(database, shard) tombstone cap
 // (--multi_master_max_tombstones) must gate only an install that would actually GROW the table:
 // SetTombstone's own Insert-or-overwrite (db_slice.cc) does NOT increment mvcc_tombstones when the
 // slot it is updating is ALREADY a tombstone. An earlier version of this fix applied the cap

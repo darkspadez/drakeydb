@@ -1708,9 +1708,10 @@ TEST_F(MvccStoreTest, EvictedDeleteLeavesNoSlotOrTombstoneCredit) {
 // tombstone degrades to an erase instead (today's pre-Task-2, resurrection-on-full-sync
 // behavior), and the degradation is counted in mvcc_tombstones_dropped rather than silently
 // dropped or left to grow the side table unbounded. "first"/"second" must land on the SAME shard:
-// the cap is enforced per-shard (table->stats.mvcc_tombstones, PerformDeletionAtomic), so two
-// keys on different shards would each see their own shard's count start at 0 and neither would
-// degrade.
+// the cap is enforced per (DATABASE, SHARD) pair -- table->stats.mvcc_tombstones lives on one
+// DbTable per SELECT-able db index on each shard (PerformDeletionAtomic, db_slice.cc), NOT a
+// single per-shard budget -- so two keys on different shards (or in different databases) would
+// each see their own pair's count start at 0 and neither would degrade.
 TEST_F(MvccStoreTest, DeleteAtTombstoneCapDegradesToEraseAndCountsTheDrop) {
   absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1);
   absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1000000); };
