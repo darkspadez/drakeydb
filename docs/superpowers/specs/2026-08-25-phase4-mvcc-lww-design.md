@@ -777,7 +777,7 @@ not yet expired and which then legitimately writes the key *later* still wins.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--multi_master_tombstone_ttl` | 600 s | Retention window; must exceed the worst expected peer partition. `0` disables tombstones. |
-| `--multi_master_max_tombstones` | 1,000,000 / shard | Hard cap. |
+| `--multi_master_max_tombstones` | 1,000,000 per (database, shard) pair | Hard cap. As built (P4-3) this caps each `DbTable`'s own count, not a shard overall: a node with N databases can hold up to N times this many on one shard. |
 | `--multi_master_tombstone_gc_budget` | 64 buckets | Work per GC step. |
 
 *Primary GC:* a proactor idle task registered from `DbSlice`'s constructor (the same
@@ -792,7 +792,9 @@ writing a tombstone and increment `mvcc_tombstones_dropped`. That degrades to
 today's KeyDB-parity resurrection behaviour rather than to an OOM, and the counter
 makes the degradation visible.
 
-At the default cap the worst case is ~41 MB per shard, and because tombstone bytes
+At the default cap the worst case is ~41 MB per (database, shard) pair — as built (P4-3) the cap
+is per `DbTable`, not per shard overall, so a node using N databases can reach N times that on one
+shard — and because tombstone bytes
 count against `maxmemory` (D-4) while eviction cannot free them, the cap is what
 prevents a structure eviction cannot touch from driving eviction pressure.
 

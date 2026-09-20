@@ -89,6 +89,12 @@ class SliceSnapshot : public SerializerBase, public journal::JournalConsumerInte
   void ThrottleIfNeeded() final;
 
  private:
+  // drakeydb: P4-3 Task 5 -- per-shard PROLOGUE emit of RDB_OPCODE_DF_TOMBSTONES, called from
+  // Start()'s fiber body beside SearchSerializer::Serialize, before IterateBucketsFb. See
+  // rdb_extensions.h for the wire format and why this slot (not an epilogue) was chosen; see the
+  // .cc for the write-gate (IsActiveReplica() + non-empty table) and the save-time GC.
+  void SerializeTombstones();
+
   // Main snapshotting fiber that iterates over all buckets in the db slice.
   void IterateBucketsFb(bool send_full_sync_cut);
 

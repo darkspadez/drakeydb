@@ -38,6 +38,10 @@
 #include "server/server_family.h"
 #include "server/snapshot.h"
 #include "server/test_utils.h"
+extern "C" {
+#include "redis/crc64.h"
+}
+
 #include "util/fibers/fibers.h"
 #include "util/fibers/pool.h"
 
@@ -65,7 +69,11 @@ bool WriteStringToFileForTest(const std::string& path, std::string_view content)
 }  // namespace
 
 TEST(NodeIdentity, VersionConstant) {
-  EXPECT_EQ(66u, kDrakeydbReplVersion);
+  // drakeydb: P4-3 Task 5 review fix (M2) -- bumped 66 -> 67 alongside kDrakeydbReplVersion
+  // itself (node_identity.h): P4-3's snapshot stream adds opcode 225, so a P4-2-era peer
+  // advertising the old 66 must be refused before full sync, not admitted and hard-failed on an
+  // opcode it cannot parse.
+  EXPECT_EQ(67u, kDrakeydbReplVersion);
 }
 
 TEST(NodeUuid, GenerateIsValidV4) {
@@ -294,6 +302,39 @@ TEST(MultiMasterFlags, ActiveReplicaRejectsIncompatibleFlags) {
   absl::SetFlag(&FLAGS_experimental_cascaded_partial_sync, true);
   EXPECT_FALSE(ValidateMultiMasterFlags());
   absl::SetFlag(&FLAGS_experimental_cascaded_partial_sync, false);
+  EXPECT_TRUE(ValidateMultiMasterFlags());
+}
+
+// drakeydb: P4-3 Task 3 -- Task 1 review Finding 6 (task-1-review.md): a negative value reaching
+// --multi_master_tombstone_ttl (a uint64_t flag) sign-converts to a value near UINT64_MAX.
+// TombstoneGcStep's ttl_s*1000 + MsPart() sum (db_slice.cc, mvcc.h) would overflow uint64 and
+// wrap to a deadline in the past, reaping every live tombstone on the first GC tick. absl's own
+// flag parser already rejects a literal "-1" on the command line for a uint64_t flag (it never
+// reaches AbslParseFlag's negative branch), so this exercises the belt-and-suspenders guard
+// directly via SetFlag, the same way a signed-source caller upstream of the CLI parser could.
+TEST(MultiMasterFlags, TombstoneTtlRejectsSignConvertedValue) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_active_replica, true);
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, static_cast<uint64_t>(-1));
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+  EXPECT_TRUE(ValidateMultiMasterFlags());
+}
+
+// drakeydb: P4-3 Task 3, review fix (C1), Critical -- a budget of 0 buckets/tick can never make
+// progress. Before this fix DbSlice::TombstoneGcStep (db_slice.cc) treated that identically to
+// "ran out of budget mid-lap, more work queued" and reported pending work forever; the on-idle
+// wrapper (the DbSlice constructor) maps a pending report into the proactor's highest
+// re-scheduling frequency with no backoff, so this pegs a shard's core at 100% doing zero work.
+// Reject at boot so a misconfigured value never reaches that path.
+TEST(MultiMasterFlags, TombstoneGcBudgetRejectsZero) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_active_replica, true);
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 0);
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
   EXPECT_TRUE(ValidateMultiMasterFlags());
 }
 
@@ -682,6 +723,8 @@ TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_table_bytes:"));
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_entries:"));
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones:"));
+  // drakeydb: P4-3 Task 8 -- mvcc_tombstones_dropped (Task 2) beside mvcc_tombstones, same gate.
+  EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones_dropped:"));
 }
 
 TEST_F(ActiveReplicaFamilyTest, ReplicaOfGrammarAndNoPeersPaths) {
@@ -714,6 +757,8 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_table_bytes:"));
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_entries:"));
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones:"));
+  // drakeydb: P4-3 Task 8 -- mvcc_tombstones_dropped must be gated identically to its siblings.
+  EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones_dropped:"));
 }
 
 // drakeydb: P4-1 Task 5 -- the side table on DbTable. Storage only; nothing writes to it outside
@@ -873,6 +918,35 @@ class MvccStoreTest : public BaseFamilyTest {
     return keys;
   }
 };
+
+namespace {
+// drakeydb: Phase 4, P4-1 Task 10 -- sums TEST_VerifyMvccTable(0) (db_slice.cc) across every
+// shard. Each shard's callback writes to its own index of `per_shard`, never a shared accumulator
+// -- shard_set->RunBriefInParallel dispatches onto each shard's own proactor thread, so a naive
+// `mismatches += ...` shared across threads would be a data race (this fixture does not pin
+// num_shards=1, unlike OriginJournalFamilyTest elsewhere in this file, so relying on it would be
+// exactly the single-proactor-only trap: it would happen to pass here but be silently wrong).
+// Routes through Namespace::GetDbSlice (the ReaperJournalFamilyTest precedent above in this
+// file), not a nonexistent EngineShard::db_slice() -- and deliberately through
+// GetDefaultNamespace() specifically, which is what makes TEST_VerifyMvccTable's own default-
+// namespace gate (db_slice.cc) actually engage here instead of short-circuiting to 0.
+//
+// drakeydb: P4-3 Task 2 -- moved ahead of TEST_F(MvccStoreTest, SideTableIsAllocatedInActiveMode)
+// (was originally defined much later in this file, after its first caller); a free function must
+// be declared/defined before its first use in the same translation unit, and
+// SameShardRenameToFreshDestKeepsTheInvariant below is now this helper's earliest caller.
+size_t SumMvccMismatchesAcrossShards() {
+  std::vector<size_t> per_shard(shard_set->size(), 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    per_shard[shard->shard_id()] = db_slice.TEST_VerifyMvccTable(0);
+  });
+  size_t total = 0;
+  for (size_t m : per_shard)
+    total += m;
+  return total;
+}
+}  // namespace
 
 TEST_F(MvccStoreTest, SideTableIsAllocatedInActiveMode) {
   Run({"set", "k", "v"});
@@ -1117,7 +1191,15 @@ TEST_F(MvccStoreTest, TableBytesAccountsForDuplicatedKeyHeapBytes) {
 // Falsification (task-4-report.md, fix round 1): moving the `-=` after Erase() makes the final
 // EXPECT_EQ below fail with mvcc_table_bytes stuck above baseline by the total un-subtracted
 // duplicated-key bytes.
+// drakeydb: P4-3 Task 2 -- since Task 2, a plain DEL tombstones (keeps the slot, and so its
+// duplicated-key heap bytes) instead of erasing. This test is about EraseMvcc's own accounting
+// specifically ("on a REAL delete", per its name), which tombstoning-by-default would defeat --
+// --multi_master_tombstone_ttl=0 opts back into the pre-Task-2 always-erase behavior for exactly
+// that purpose (see TombstonesEnabled(), multi_master.h).
 TEST_F(MvccStoreTest, EraseAccountsForDuplicatedKeyHeapBytesOnRealDelete) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 0);
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
   Run({"set", "k", "v"});
   size_t baseline = GetMetrics().db_stats[0].mvcc_table_bytes;
 
@@ -1325,7 +1407,15 @@ TEST_F(MvccStoreTest, PureWriteWorkloadLeavesNoUnstampedWrites) {
 // with changes, from {0,0} to the persisted stamp.
 TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) {
   constexpr uint64_t kPendingMvcc = 0x1234'5678;
-  const MvccStamp kPersistedStamp{0xAAAABBBBCCCC1111ULL, 0xDEADBEEFULL};
+  // drakeydb: P4-3 Task 3, review fix (C2i) -- leading nibble changed from 0xA to 0x2 (otherwise
+  // an arbitrary, purely-for-recognizability constant, unrelated to this test's actual subject):
+  // 0xA's top bit set bit 63 of the packed stamp, i.e. the tombstone bit, incidentally. SetMvcc
+  // (the live-key setter this test exercises below) now masks that bit on every write -- a live
+  // key carrying it is invalid state -- so the unmasked original value could never round-trip
+  // through SetMvcc verbatim again, which is exactly what this constant is asked to do below.
+  // This test is about arm/commit isolation, not tombstones, so the fix is the constant, not the
+  // new masking behavior.
+  const MvccStamp kPersistedStamp{0x2AAABBBBCCCC1111ULL, 0xDEADBEEFULL};
   std::optional<MvccStamp> prepared_stamp;
   std::optional<MvccStamp> pending_stamp;
   std::optional<MvccStamp> loaded_stamp;
@@ -1463,28 +1553,481 @@ TEST_F(MvccStoreTest, NonDefaultNamespaceWriteLeavesNoStampAnywhere) {
          "unguarded arm would stamp this unrelated, never-written key instead";
 }
 
-// drakeydb: P4-1 Task 8 -- PerformDeletionAtomic must disarm and erase on every delete path, or a
-// pending arm can re-stamp a key that no longer exists (see the DoesNotResurrectAStamp case
-// below) and the mvcc side table leaks an entry for a dead key.
-TEST_F(MvccStoreTest, DeleteErasesTheStamp) {
+// drakeydb: P4-3 Task 3, review fix round 5 (R1) -- a namespace created at RUNTIME must register
+// no tombstone-GC on-idle task on any shard.
+//
+// helio's RemoveOnIdleTask (proactor_base.cc, not ours to edit) pops only TRAILING empty slots and
+// never clamps ProactorBase::on_idle_next_, while RunOnIdleTasks short-circuits only on a fully
+// EMPTY array. The invariant every registration site must keep is therefore: never remove a
+// trailing on-idle task while an earlier-registered one is still live -- doing so shrinks the
+// array below a cursor that may still point at the old top index, and a later idle tick indexes
+// past the end (DCHECK_LT in a debug build, an out-of-bounds read in a release one).
+//
+// The DEFAULT namespace's task keeps that invariant by construction order: EngineShardSet::Init
+// builds its DbSlices (engine_shard_set.cc) BEFORE StartPeriodicHeartbeatFiber registers
+// "defrag", so it is id 0 and "defrag" is id 1, and Service::Shutdown removes id 0 first
+// (main_service.cc, via Namespaces::StopTombstoneGc, ahead of PreShutdown) -- leaving a hole,
+// popping nothing. A namespace created at runtime -- production reaches this through
+// ServerFamily::DoAuth's `cntx->ns = &namespaces->GetOrInsert(cred.ns)` for an ACL user carrying
+// a NAMESPACE: directive (server_family.cc), which is exactly the GetOrInsert call this test
+// makes -- builds its DbSlices AFTER "defrag" is already registered, so its task would land at an
+// id ABOVE "defrag"'s. The same StopTombstoneGc fan-out would then remove a TRAILING task with
+// two live entries beneath it, and the array WOULD shrink.
+//
+// This test pins the gate rather than the abort deliberately: the abort additionally requires
+// on_idle_next_ to be sitting at the top index at that exact moment (the budget-exhausted exit),
+// which nothing in reach can force without editing helio. The gate is the property that makes the
+// abort unreachable, and it is otherwise entirely invisible -- a non-default namespace's
+// tombstone count is already always 0 (the F1 gate asserted below), so nothing else observes
+// whether the task exists.
+TEST_F(MvccStoreTest, NonDefaultNamespaceRegistersNoTombstoneGcTask) {
+  Namespace& ns1 = namespaces->GetOrInsert("ns1-gc");
+
+  for (ShardId sid = 0; sid < shard_set->size(); ++sid) {
+    shard_set->Await(sid, [&] {
+      EXPECT_TRUE(namespaces->GetDefaultNamespace().GetDbSlice(sid).TEST_HasTombstoneGcTask())
+          << "sanity, shard " << sid
+          << ": the default namespace on an --active_replica node must register the GC task, or "
+             "the non-default assertion below passes vacuously";
+      EXPECT_FALSE(ns1.GetDbSlice(sid).TEST_HasTombstoneGcTask())
+          << "shard " << sid
+          << ": a runtime-created namespace registers its GC task ABOVE \"defrag\", so removing "
+             "it at shutdown pops a trailing slot while live tasks remain -- it must not register "
+             "one at all";
+    });
+  }
+
+  // The gate must not have changed what a non-default namespace's deletes do: still erase, never
+  // tombstone (PerformDeletionAtomic's own F1 gate, db_slice.cc), exactly as before this fix.
+  const std::string_view key = "ns-gc-key";
+  ASSERT_EQ(RunViaNamespace(&ns1, {"set", key, "v"}), "OK");
+  ASSERT_EQ(RunViaNamespace(&ns1, {"del", key}).GetInt(), 1);
+
+  const ShardId sid = Shard(key, shard_set->size());
+  std::optional<MvccStamp> ns1_stamp;
+  size_t ns1_tombstones = 0;
+  shard_set->Await(sid, [&] {
+    ns1_stamp = ns1.GetDbSlice(sid).GetMvcc(0, key);
+    ns1_tombstones = ns1.GetDbSlice(sid).GetStats().db_stats[0].mvcc_tombstones;
+  });
+  EXPECT_FALSE(ns1_stamp.has_value())
+      << "a non-default-namespace DEL must leave no slot behind at all -- not a tombstone the "
+         "(now absent) GC task would have had to reclaim";
+  EXPECT_EQ(ns1_tombstones, 0u);
+  EXPECT_THAT(RunViaNamespace(&ns1, {"get", key}), ArgType(RespExpr::NIL));
+}
+
+// drakeydb: P4-1 Task 8; updated P4-3 Task 2 -- PerformDeletionAtomic must disarm on every delete
+// path, or a pending arm can re-stamp a key that no longer exists (see the DoesNotResurrectAStamp
+// case below). Before Task 2 this meant an erase and an absent stamp; since Task 2 a plain DEL
+// (kExplicit) tombstones instead -- see ExplicitAndExpiredDeletesLeaveTombstonesEvictionDoesNot
+// below for the full delete-reason matrix this is one slice of.
+TEST_F(MvccStoreTest, DeleteTombstonesTheStamp) {
   Run({"set", "k", "v"});
   ASSERT_TRUE(StampOf("k").has_value());
   Run({"del", "k"});
-  EXPECT_FALSE(StampOf("k").has_value()) << "a deleted key must not leave a stamp behind";
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value()) << "a deleted key must keep its slot, as a tombstone";
+  EXPECT_TRUE(tomb->IsTombstone());
 }
 
 // OpDelV2 arms the key (post_updater.Run()) before deleting and journals after. Without the
-// disarm, Commit writes a stamp for a key that is already gone.
+// disarm, Commit would write the DEL's own stamp onto BOTH the live pre-delete arm and the
+// tombstone arm -- harmless numerically (same mvcc either way, see MvccStamperTest.
+// CommitMarksOnlyTombstoneArms in mvcc_test.cc), but Disarm existing first is still what keeps a
+// key armed twice before deletion (e.g. HDEL emptying a hash, see HdelEmptyingHashDoesNotResurrect
+// AStamp below) from leaving a stray, un-tombstoned arm for Commit to mis-stamp.
 TEST_F(MvccStoreTest, DeleteInSameCallbackDoesNotResurrectAStamp) {
   Run({"set", "k", "v"});
   // drakeydb: review fix round 1 (minor) -- guard the precondition. Without this, a total
   // stamping failure (e.g. Arm/Commit wired wrong) would leave "k" unstamped from the SET
-  // already, and the EXPECT_FALSE below would pass for the wrong reason.
+  // already, and the assertions below would pass for the wrong reason.
   ASSERT_TRUE(StampOf("k").has_value());
   Run({"del", "k"});
-  EXPECT_FALSE(StampOf("k").has_value())
-      << "the DEL's own journal entry must not re-stamp the key it just removed";
-  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u);
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value())
+      << "the DEL's own journal entry must stamp the tombstone it armed, not leave the key absent";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 1u)
+      << "the tombstone still occupies one mvcc_entries slot -- it is not erased";
+}
+
+// drakeydb: P4-3 Task 2 -- the delete-reason matrix; this task's headline test. kExplicit earns a
+// tombstone at least as new as the value it replaces. kEvicted/kSlotFlush are capacity/topology
+// decisions, not deletions -- a peer's copy is authoritative there, so resurrection on that
+// peer's next full sync is the intended outcome, and the slot is erased exactly as every reason
+// was before this task (see EvictedDeleteLeavesNoSlotOrTombstoneCredit below).
+//
+// kExpired is DELIBERATELY not exercised here as a tombstoning reason -- it shares
+// PerformDeletionAtomic's earns_tombstone branch with kExplicit (db_slice.cc), so
+// ExplicitDeleteLeavesATombstoneAtLeastAsNewAsTheValue below only needs to pin kExplicit's own
+// stamp-freshness property; kExpired's equivalent coverage is
+// LazyExpiryEarnsATombstoneWithSelfOrigin (this file) and
+// ReaperJournalFamilyTest.MemberExpiryReaperDeleteEarnsATombstone (further down this file).
+//
+// drakeydb: P4-3 Task 11 -- until this task, kExpired was excluded here on purpose: two real
+// call sites (DbSlice::ExpireIfNeeded, DbSlice::DeleteReapedContainer) journaled the DEL before
+// calling Del()/PerformDeletionAtomic, so the tombstone arm that reason would need was created
+// too late for any Commit() to consume it (the STOP finding from Task 2's report). Task 11
+// reordered both sites -- delete first, journal after, matching every kExplicit site -- closing
+// that gap; see the reorder's own comments in db_slice.cc for the fix and DeleteReason's comment
+// (db_slice.h) for the resolution.
+TEST_F(MvccStoreTest, ExplicitDeleteLeavesATombstoneAtLeastAsNewAsTheValue) {
+  Run({"set", "gone", "v"});
+  auto before_stamp = StampOf("gone");
+  ASSERT_TRUE(before_stamp.has_value())
+      << "the SET above must leave a stamp -- without one this test would dereference nullopt "
+         "(undefined behavior) instead of failing here";
+  const MvccStamp before = *before_stamp;
+  Run({"del", "gone"});
+  auto tomb = StampOf("gone");
+  ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_GE(tomb->Mvcc(), before.Mvcc());  // the tombstone is at least as new as the value
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 1u);
+}
+
+// drakeydb: P4-3 Task 2 -- driven directly via DbSlice::DelMutable(..., kEvicted), the same entry
+// point production eviction uses (FreeMemWithEvictionStepAtomic, db_slice.cc), rather than
+// actually forcing the server into a low-memory eviction sweep: this test is about
+// PerformDeletionAtomic's reason branch, not about reproducing eviction's own trigger conditions.
+TEST_F(MvccStoreTest, EvictedDeleteLeavesNoSlotOrTombstoneCredit) {
+  Run({"set", "evictme", "v"});
+  ASSERT_TRUE(StampOf("evictme").has_value());
+
+  shard_set->Await(Shard("evictme", shard_set->size()), [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    DbContext cntx{&namespaces->GetDefaultNamespace(), 0, GetCurrentTimeMs()};
+    auto it_upd = db_slice.FindMutable(cntx, "evictme");
+    ASSERT_TRUE(IsValid(it_upd.it));
+    db_slice.DelMutable(cntx, std::move(it_upd), DbSlice::DeleteReason::kEvicted);
+  });
+
+  EXPECT_FALSE(StampOf("evictme").has_value())
+      << "eviction is a capacity decision, not a deletion -- it must still erase, not tombstone";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+}
+
+// drakeydb: P4-3 Task 2 -- at --multi_master_max_tombstones, a delete that would have earned a
+// tombstone degrades to an erase instead (today's pre-Task-2, resurrection-on-full-sync
+// behavior), and the degradation is counted in mvcc_tombstones_dropped rather than silently
+// dropped or left to grow the side table unbounded. "first"/"second" must land on the SAME shard:
+// the cap is enforced per (DATABASE, SHARD) pair -- table->stats.mvcc_tombstones lives on one
+// DbTable per SELECT-able db index on each shard (PerformDeletionAtomic, db_slice.cc), NOT a
+// single per-shard budget -- so two keys on different shards (or in different databases) would
+// each see their own pair's count start at 0 and neither would degrade.
+TEST_F(MvccStoreTest, DeleteAtTombstoneCapDegradesToEraseAndCountsTheDrop) {
+  absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1);
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1000000); };
+
+  unsigned n = shard_set->size();
+  std::string first, second;
+  for (int i = 0;; ++i) {
+    first = absl::StrCat("cap-first-", i);
+    second = absl::StrCat("cap-second-", i);
+    if (Shard(first, n) == Shard(second, n))
+      break;
+    CHECK_LT(i, 10000) << "could not find a same-shard key pair";
+  }
+
+  Run({"set", first, "v"});
+  Run({"del", first});
+  auto first_tomb = StampOf(first);
+  ASSERT_TRUE(first_tomb.has_value());
+  EXPECT_TRUE(first_tomb->IsTombstone());
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_tombstones_dropped, 0u);
+
+  Run({"set", second, "v"});
+  Run({"del", second});
+  EXPECT_FALSE(StampOf(second).has_value())
+      << "this shard is already at its tombstone cap, so this delete must degrade to an erase";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 1u)
+      << "the cap must not be exceeded -- the degraded delete must not add a second tombstone";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones_dropped, 1u);
+}
+
+// drakeydb: P4-3 Task 3 -- the idle-task GC that reclaims a tombstone once
+// MvccStamp::DeadlineMs(ttl_ms) has passed, bounded per call by
+// --multi_master_tombstone_gc_budget (MvccTable::Traverse calls, each visiting at most one
+// non-empty logical bucket). Drives DbSlice::TombstoneGcStep() directly, per shard, the same way
+// SumMvccMismatchesAcrossShards above drives TEST_VerifyMvccTable directly, rather than waiting
+// on the real on-idle scheduler (registered from the DbSlice constructor) -- this proves the step
+// function itself is correct regardless of when/how often the scheduler happens to call it.
+TEST_F(MvccStoreTest, TombstoneGcReapsExpiredTombstonesWithinBudget) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);        // seconds
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 1);  // buckets/step -- see below
+  absl::Cleanup restore = [] {
+    absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+    absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
+  };
+
+  constexpr int kExpiring = 200;
+  for (int i = 0; i < kExpiring; ++i)
+    Run({"set", absl::StrCat("gc-expiring-", i), "v"});
+  for (int i = 0; i < kExpiring; ++i)
+    Run({"del", absl::StrCat("gc-expiring-", i)});
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, static_cast<size_t>(kExpiring));
+
+  AdvanceTime(2000);  // past the 1s (1000ms) deadline the first batch's tombstones carry
+
+  constexpr int kSurvivors = 10;
+  for (int i = 0; i < kSurvivors; ++i)
+    Run({"set", absl::StrCat("gc-survivor-", i), "v"});
+  for (int i = 0; i < kSurvivors; ++i)
+    Run({"del", absl::StrCat("gc-survivor-", i)});
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, static_cast<size_t>(kExpiring + kSurvivors))
+      << "both batches must be tombstoned (not yet reaped) before any GC step runs";
+
+  // One step per shard, budget=1 bucket: ExpireTablePolicy's kBucketNum=56 buckets/segment
+  // (dash.h) cannot possibly be drained of kExpiring=200 tombstones by visiting just one, so this
+  // is what proves the budget actually bounds a single step's work instead of draining the whole
+  // table in one call.
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    db_slice.TombstoneGcStep();
+  });
+  EXPECT_GT(GetMetrics().db_stats[0].mvcc_tombstones, static_cast<size_t>(kSurvivors))
+      << "a budget of 1 bucket must not reap all " << kExpiring
+      << " expired tombstones in a single step";
+
+  // Drive every shard's GC to completion. pending[shard] tracks whether THAT shard still has more
+  // work, mirroring SumMvccMismatchesAcrossShards' per-shard-slot pattern above -- each shard's
+  // own thread only ever writes its own slot, so nothing here needs a lock or an atomic.
+  std::vector<uint8_t> pending(shard_set->size(), 1);
+  auto any_pending = [&pending] {
+    for (uint8_t v : pending) {
+      if (v)
+        return true;
+    }
+    return false;
+  };
+  int guard = 0;
+  while (any_pending()) {
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      pending[shard->shard_id()] = db_slice.TombstoneGcStep() ? 1 : 0;
+    });
+    ASSERT_LT(++guard, 100000) << "TombstoneGcStep never converged";
+  }
+
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, static_cast<size_t>(kSurvivors))
+      << "expired tombstones must be fully reaped; unexpired survivors from the second batch "
+         "must not be";
+}
+
+// drakeydb: P4-3 Task 3, self-review finding (Critical) -- PerformDeletionAtomic (db_slice.cc)
+// writes a SYNCHRONOUS zero-authority placeholder (MvccStamp{kTombstoneBit, 0}, so Mvcc()==0)
+// before the delete's own journal commit lands. That placeholder's DeadlineMs(ttl_ms) is just
+// ttl_ms (MsPart()==0), which is always <= any real now_ms, so unless TombstoneGcStep excludes it
+// explicitly, it looks permanently "expired" for as long as it exists -- and that window is real:
+// journal::RecordEntry's AddLogRecord (journal.cc) can yield on JournalStreamer::ThrottleIfNeeded
+// whenever a peer link is backpressured, before Commit() overwrites the placeholder with the
+// delete's real, minted stamp. If TombstoneGcStep ran during that yield and erased the
+// placeholder, the eventual Commit() -> SetExistingMvcc would CHECK-fail ("MVCC slot must be
+// prepared before journal commit") the instant the delete's own commit resumed. Reproduces the
+// placeholder's exact shape directly (SetTombstone), the way PerformDeletionAtomic creates it,
+// rather than actually stalling a peer link to hit the yield window.
+TEST_F(MvccStoreTest, TombstoneGcSkipsAnUncommittedPlaceholder) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  const std::string key = "gc-placeholder";
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetTombstone(0, key, MvccStamp{MvccClock::kTombstoneBit, 0});
+
+    // Drive the GC to the end of its lap over this (tiny) table, so the placeholder gets at
+    // least one real chance to be (wrongly) reaped if the Mvcc() != 0 guard is missing.
+    int guard = 0;
+    while (db_slice.TombstoneGcStep())
+      ASSERT_LT(++guard, 100000) << "TombstoneGcStep never converged";
+
+    auto stamp = db_slice.GetMvcc(0, key);
+    ASSERT_TRUE(stamp.has_value())
+        << "GC erased a placeholder tombstone that was still mid-epoch (uncommitted)";
+    EXPECT_TRUE(stamp->IsTombstone());
+    EXPECT_EQ(stamp->Mvcc(), 0u);
+    EXPECT_EQ(db_slice.GetStats().db_stats[0].mvcc_tombstones, 1u);
+
+    // The eventual journal commit (Commit()'s CommitFn calls this) must still find the slot --
+    // this is exactly what would CHECK-fail ("MVCC slot must be prepared before journal commit")
+    // had GC erased it out from under the pending arm.
+    db_slice.SetExistingMvcc(0, key, MvccStamp{MvccClock::kTombstoneBit | (5000ULL << 20), 42});
+  });
+}
+
+// drakeydb: P4-3 Task 3, review fix (C1), Critical -- the reviewer's own repro: with
+// --multi_master_tombstone_gc_budget=0 (bypassing ValidateMultiMasterFlags via absl::SetFlag,
+// the same way a future CONFIG SET could), TombstoneGcStep returned true on every one of 5
+// consecutive calls despite doing zero work, because "budget==0 with a database left to try" was
+// treated identically to "ran out of budget mid-lap, real progress was made". The on-idle
+// wrapper (the DbSlice constructor, db_slice.cc) maps a true return into kOnIdleMaxLevel with no
+// backoff, so this would peg a shard's proactor core at 100% forever. Real expired work is set
+// up first so a false return below is provably the zero-budget guard, not just "nothing to do".
+TEST_F(MvccStoreTest, TombstoneGcStepNeverReportsPendingWithZeroBudget) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 0);
+  absl::Cleanup restore = [] {
+    absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+    absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
+  };
+
+  const std::string key = "gc-zero-budget";
+  Run({"set", key, "v"});
+  Run({"del", key});
+  AdvanceTime(2000);
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 1u);
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < 5; ++i)
+      EXPECT_FALSE(db_slice.TombstoneGcStep()) << "iteration " << i;
+  });
+}
+
+// drakeydb: P4-3 Task 3, review fix (C2i), Critical -- rdb_load.cc's opcode-221 path
+// (CreateObjectOnShard, rdb_load.cc:3389) installs a wire-read stamp through SetMvcc verbatim,
+// with no bit-63 check unlike the KeyDB aux path (rdb_load.cc:3170) -- so a corrupted or
+// malicious stream (or a plain-replica full sync, or DEBUG LOAD) carrying a bit-63-set stamp for
+// a LIVE key used to plant a slot TombstoneGcStep's IsTombstone() check would treat as reapable.
+// Erasing it would underflow mvcc_tombstones (an unsigned counter) to roughly UINT64_MAX, after
+// which PerformDeletionAtomic's `mvcc_tombstones < max_tombstones` cap check can never pass
+// again, silently disabling tombstoning on that shard forever. Fixed by masking bit 63 in
+// SetMvcc itself (the live-key setter) rather than trusting every caller to never pass one.
+TEST_F(MvccStoreTest, LiveKeyStampMasksTombstoneBitAndSurvivesGc) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  const std::string key = "loader-live-key";
+  Run({"set", key, "v"});  // a real, live prime key
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    // Simulates the opcode-221 wire stamp install for this key, corrupted or malicious, with
+    // bit 63 set -- exactly what SetMvcc receives verbatim from rdb_load.cc, unmasked.
+    const MvccStamp wire_stamp{MvccClock::kTombstoneBit | (7000ULL << 20), 99};
+    db_slice.SetMvcc(0, key, wire_stamp);
+
+    auto stored = db_slice.GetMvcc(0, key);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_FALSE(stored->IsTombstone())
+        << "SetMvcc must mask bit 63 -- it is the live-key setter, SetTombstone is the only "
+           "legitimate bit-63 writer";
+    EXPECT_EQ(stored->Mvcc(), wire_stamp.Mvcc());
+    EXPECT_EQ(stored->origin_hash, wire_stamp.origin_hash);
+  });
+
+  AdvanceTime(2000);  // past the 1s deadline this stamp would carry if it were a real tombstone
+
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    db_slice.TombstoneGcStep();
+  });
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    auto stored = db_slice.GetMvcc(0, key);
+    ASSERT_TRUE(stored.has_value()) << "GC must not erase a live key's (masked) stamp";
+    EXPECT_FALSE(stored->IsTombstone());
+  });
+  EXPECT_EQ(Run({"get", key}), "v");
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+}
+
+// drakeydb: P4-3 Task 3, review fix (C2ii), Critical -- IsTombstone() alone is not a safe erase
+// predicate on a dense table: it only reflects what a producer CLAIMED, not what prime
+// independently holds. Constructs that shape directly via SetTombstone (the one legitimate
+// bit-63 writer) on a key that still has a live prime entry -- the state a producer that bypasses
+// SetMvcc's mask (C2i above, any future one, not just today's loader) could otherwise leave --
+// and confirms GC leaves it alone by confirming, against prime itself, that a candidate has no
+// live counterpart before erasing.
+TEST_F(MvccStoreTest, GcDoesNotEraseATombstoneFlaggedSlotWithALivePrimeKey) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  const std::string key = "tombstone-shaped-but-live";
+  Run({"set", key, "v"});
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetTombstone(0, key, MvccStamp{MvccClock::kTombstoneBit | (7000ULL << 20), 99});
+  });
+
+  AdvanceTime(2000);  // past the 1s deadline
+
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    db_slice.TombstoneGcStep();
+  });
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    auto stored = db_slice.GetMvcc(0, key);
+    ASSERT_TRUE(stored.has_value())
+        << "GC erased a tombstone-flagged slot that still has a live prime key";
+    EXPECT_TRUE(stored->IsTombstone());
+    EXPECT_EQ(db_slice.GetStats().db_stats[0].key_count, 1u)
+        << "the live prime key must still be there too";
+  });
+
+  // Clean up the invariant-violating state this test intentionally injected (a tombstone-bit
+  // slot coexisting with a live prime key -- the exact shape under test): a real DEL's own
+  // placeholder-write logic re-establishes the dense invariant before this test ends, unlike a
+  // direct EraseMvcc/SetTombstone here, which would not go through OnCbFinishBlocking the way
+  // this fixture's later commands (including TearDown) do.
+  Run({"del", key});
+}
+
+// drakeydb: P4-3 Task 3, review fix (I3), Critical -- with a bucket budget smaller than one
+// database's own lap length, always starting TombstoneGcStep's for-loop at database 0
+// deterministically starved every later database forever (see the definition, db_slice.cc, for
+// why: db0's own persisted cursor can land back on "start a new lap" in EXACTLY the tick the
+// budget also runs out for db1's turn). Reproduced with two databases: a backlog on db0 far
+// larger than one budget=1 step can visit, and a small one on db1 -- before this fix, db1's
+// tombstones were never reaped no matter how many steps ran.
+TEST_F(MvccStoreTest, TombstoneGcServicesEveryDatabaseUnderRoundRobin) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);        // seconds
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 1);  // buckets/step
+  absl::Cleanup restore = [] {
+    absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+    absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
+  };
+
+  constexpr int kDb0Keys = 200;  // large enough that no single budget=1 step ever drains it
+  for (int i = 0; i < kDb0Keys; ++i)
+    Run({"set", absl::StrCat("db0-key-", i), "v"});
+  for (int i = 0; i < kDb0Keys; ++i)
+    Run({"del", absl::StrCat("db0-key-", i)});
+
+  Run({"select", "1"});
+  constexpr int kDb1Keys = 3;  // small: fits comfortably inside a handful of budget=1 steps
+  for (int i = 0; i < kDb1Keys; ++i)
+    Run({"set", absl::StrCat("db1-key-", i), "v"});
+  for (int i = 0; i < kDb1Keys; ++i)
+    Run({"del", absl::StrCat("db1-key-", i)});
+  Run({"select", "0"});
+
+  AdvanceTime(2000);  // past the 1s deadline both batches' tombstones carry
+
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, static_cast<size_t>(kDb0Keys));
+  ASSERT_EQ(GetMetrics().db_stats[1].mvcc_tombstones, static_cast<size_t>(kDb1Keys));
+
+  // Drive enough steps that db1's tiny backlog would have to be fully reaped by now if it ever
+  // gets a turn at all -- but nowhere near enough to drain db0's much larger one, so this proves
+  // db1 was serviced WITHOUT waiting for db0 to finish first.
+  for (int step = 0; step < 20; ++step) {
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      db_slice.TombstoneGcStep();
+    });
+  }
+
+  EXPECT_EQ(GetMetrics().db_stats[1].mvcc_tombstones, 0u)
+      << "database 1 must be serviced without waiting for database 0's much larger backlog to "
+         "finish first";
+  EXPECT_GT(GetMetrics().db_stats[0].mvcc_tombstones, 0u)
+      << "sanity check: database 0's backlog must still be far from drained after only 20 "
+         "budget=1 steps, otherwise this test isn't distinguishing round-robin from luck";
 }
 
 // drakeydb: review fix round 1 (F1) -- "a"/"b" restored (the brief's original pair). Verified
@@ -1500,13 +2043,275 @@ TEST_F(MvccStoreTest, DeleteInSameCallbackDoesNotResurrectAStamp) {
 // bug, which made the suite green without the bug being fixed -- exactly the "test routes around
 // a known failure" pattern this fork's review process exists to catch. Restored to "a"/"b" so
 // this test proves the fix instead of avoiding what it was meant to cover.
+// drakeydb: P4-3 Task 2 -- RENAME's source removal goes through DelSrc/OpRen's default
+// DeleteReason::kExplicit, same as a plain DEL, so since Task 2 the source is left as a
+// tombstone rather than erased.
 TEST_F(MvccStoreTest, RenameMovesTheStampByRecreatingIt) {
   Run({"set", "a", "v"});
   ASSERT_TRUE(StampOf("a").has_value());
   Run({"rename", "a", "b"});
-  EXPECT_FALSE(StampOf("a").has_value());
-  ASSERT_TRUE(StampOf("b").has_value()) << "the destination is armed and committed by RENAME's "
-                                           "own journal entry";
+  auto src_tomb = StampOf("a");
+  ASSERT_TRUE(src_tomb.has_value()) << "the source key keeps its slot, as a tombstone";
+  EXPECT_TRUE(src_tomb->IsTombstone());
+  auto dest_stamp = StampOf("b");
+  ASSERT_TRUE(dest_stamp.has_value()) << "the destination is armed and committed by RENAME's "
+                                         "own journal entry";
+  EXPECT_FALSE(dest_stamp->IsTombstone());
+}
+
+// drakeydb: P4-3 Task 2 -- the same-shard fast path (OpRen, generic_family.cc) relies on the
+// DEFERRED auto-journal mechanism (CO::NO_AUTOJOURNAL + ReviveAutoJournal()): RENAME's own
+// journal entry is written by Transaction::LogAutoJournalOnShard AFTER OpRen's callback returns,
+// which is AFTER DbSlice::OnCbFinishBlocking's O(1) dense-invariant DCHECK already ran
+// (Transaction::RunCallback calls OnCbFinishBlocking before LogAutoJournalOnShard --
+// transaction.cc). ArmTombstone alone only touches the thread-local arm list, not db.mvcc, so
+// without PerformDeletionAtomic's synchronous placeholder write (db_slice.cc, mirroring
+// EnsureMvcc's placeholder for a plain write) the source key's slot still looked like a live,
+// non-tombstone stamp with no prime key at that checkpoint.
+//
+// Falsifying: commenting out the `SetTombstone(table->index, del_it.key(), MvccStamp{
+// MvccClock::kTombstoneBit, 0})` call in PerformDeletionAtomic (db_slice.cc) reproduces
+// `Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (2 vs. 1)`
+// here -- see task-2-report.md for the verbatim abort.
+TEST_F(MvccStoreTest, SameShardRenameToFreshDestKeepsTheInvariant) {
+  unsigned n = shard_set->size();
+  std::string k, r;
+  for (int i = 0;; ++i) {
+    k = absl::StrCat("k", i);
+    r = absl::StrCat("r", i);
+    if (Shard(k, n) == Shard(r, n))
+      break;
+    CHECK_LT(i, 10000) << "could not find a same-shard k/r pair";
+  }
+  Run({"set", k, "v"});
+  Run({"rename", k, r});
+
+  auto src_tomb = StampOf(k);
+  ASSERT_TRUE(src_tomb.has_value());
+  EXPECT_TRUE(src_tomb->IsTombstone());
+  auto dest = StampOf(r);
+  ASSERT_TRUE(dest.has_value());
+  EXPECT_FALSE(dest->IsTombstone());
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-3 Task 2 -- verification duty #1's own regression coverage (see task-2-report.md).
+// Renamer::DeserializeDest (generic_family.cc), for a destination that already exists, calls
+// DelMutable(dest_key_) -- a REAL kExplicit delete, so it ArmTombstone's dest_key_ -- and THEN
+// loader.Add(dest_key_, ...) + add_res->post_updater.Run() re-arms the SAME key live, both still
+// inside the one callback RENAME's own single journal entry commits from (one HopStamp, no
+// EndOfWriteEpoch in between): armed_ ends up holding a [tombstone-arm, live-arm] pair for
+// dest_key_, both consumed by ONE Commit() call. This is exactly the "one callback reusing a
+// single hop stamp for both a write and a delete of the same key" shape verification duty #1
+// asks about -- established here to exist, but confirmed (by this test) to self-correct: only
+// ONE journal entry ("RESTORE ... REPLACE") ever reaches the wire, SetTombstone/SetExistingMvcc's
+// was_tombstone bookkeeping nets the transient tombstone credit back to zero as the live arm's
+// commit immediately follows it in the same Commit() call, and the destination ends up live, not
+// tombstoned -- so no independently-propagated tombstone stamp ever ties against a value's stamp
+// for a peer to reject. See the report for why this differs from the STOP-worthy case the brief
+// describes.
+TEST_F(MvccStoreTest, RenameOntoAnExistingDestSelfCorrectsToALiveStamp) {
+  Run({"set", "a", "v1"});
+  Run({"set", "b", "v0"});
+  auto b_before = StampOf("b");
+  ASSERT_TRUE(b_before.has_value());
+  ASSERT_FALSE(b_before->IsTombstone());
+  const size_t tombstones_before = GetMetrics().db_stats[0].mvcc_tombstones;
+
+  Run({"rename", "a", "b"});
+
+  auto src_tomb = StampOf("a");
+  ASSERT_TRUE(src_tomb.has_value()) << "the source key keeps its slot, as a tombstone";
+  EXPECT_TRUE(src_tomb->IsTombstone());
+
+  auto dest = StampOf("b");
+  ASSERT_TRUE(dest.has_value());
+  EXPECT_FALSE(dest->IsTombstone())
+      << "the destination's OLD value was tombstoned and re-armed live in the same Commit() call "
+         "-- the live arm must win, not leave the destination looking deleted";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, tombstones_before + 1)
+      << "exactly one net-new tombstone (the source) -- the destination's transient tombstone "
+         "credit must not leak";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: second-round review fix (Important #1) -- builds a RESTORE payload that PASSES
+// GetRdbVersion's version+crc64 footer check (generic_family.cc), which runs at the COMMAND
+// level before the transaction is even scheduled, but fails RdbRestoreValue::Add's actual RDB
+// body deserialization once OpRestore (generic_family.cc) is running -- letting
+// RestoreReplaceFailureRollsBackTheOrphanedTombstone below reach OpRestore's own
+// DelMutable-then-fail sequence for real, rather than being rejected before ever touching the
+// existing key. \xFF is not a valid RDB object-type tag; the footer's version+crc64 are computed
+// correctly for that one invalid byte, exactly as GetRdbVersion expects: version (2 bytes LE)
+// then crc64 of (body + version) (8 bytes LE) -- see GetRdbVersion's own comment for the layout.
+std::string InvalidRestorePayloadWithValidFooter() {
+  std::string prefix(1, '\xFF');
+  constexpr uint16_t kVersion = 2;  // comfortably under RDB_VERSION; any accepted value works
+  prefix.push_back(static_cast<char>(kVersion & 0xFF));
+  prefix.push_back(static_cast<char>((kVersion >> 8) & 0xFF));
+  uint64_t crc = crc64(0, reinterpret_cast<const unsigned char*>(prefix.data()), prefix.size());
+  std::string payload = prefix;
+  for (int i = 0; i < 8; ++i)
+    payload.push_back(static_cast<char>((crc >> (8 * i)) & 0xFF));
+  return payload;
+}
+
+// drakeydb: second-round review fix (Important #1) -- I3's PRODUCTION half
+// (DbSlice::RollbackUncommittedTombstone, db_slice.cc) had no coverage: the only committed I3
+// test (mvcc_test.cc) drives MvccStamper::EndOfWriteEpoch directly with a mock EraseFn, so
+// neither RollbackUncommittedTombstone itself nor any of the eight real call-site wirings
+// (transaction.cc x2, db_slice.cc x6) was exercised -- gutting RollbackUncommittedTombstone to a
+// no-op left mvcc_test 30/30 and multi_master_test green. This drives a real, unmocked
+// never-commits path end to end: RESTORE key 0 <payload> REPLACE on an existing key runs
+// OpRestore (generic_family.cc), which DelMutable's the existing value (default reason
+// kExplicit, so it ArmTombstones under this task's own gate) BEFORE attempting
+// RdbRestoreValue::Add on the caller-supplied payload -- when that Add fails, OpRestore returns
+// the error status directly, RESTORE being CO::JOURNALED (auto-journal, not NO_AUTOJOURNAL) means
+// Transaction::LogAutoJournalOnShard's `if (result.status != OpStatus::OK) return;`
+// (transaction.cc) skips journaling entirely, so no Commit() ever consumes the tombstone arm --
+// exactly the "auto-journaled command returning non-OK" class of orphaning path I3 exists for.
+TEST_F(MvccStoreTest, RestoreReplaceFailureRollsBackTheOrphanedTombstone) {
+  Run({"set", "k", "v1"});
+  ASSERT_TRUE(StampOf("k").has_value());
+
+  auto res = Run({"restore", "k", "0", InvalidRestorePayloadWithValidFooter(), "REPLACE"});
+  ASSERT_THAT(res, ArgType(RespExpr::ERROR))
+      << "sanity: an invalid RDB body must fail, or this test proves nothing about the "
+         "never-commits path";
+
+  auto st = StampOf("k");
+  EXPECT_FALSE(st.has_value())
+      << "RollbackUncommittedTombstone (db_slice.cc), wired for real through "
+         "MvccStamper::EndOfWriteEpoch and Transaction::RunCallback's epoch_end cleanup, must "
+         "erase the orphaned placeholder OpRestore's failed commit left behind";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-3 Task 2 review fix (C1, Critical) -- EnsureMvcc (db_slice.cc) did not clear a
+// slot's tombstone flag when a deleted key was re-created: PostUpdate calls EnsureMvcc
+// synchronously, before Arm(), at the exact moment prime.size() grows back for the new value, but
+// (before this fix) the stale kTombstoneBit stayed set and mvcc_tombstones was not decremented
+// until the new write's own (possibly deferred) journal commit -- a window
+// OnCbFinishBlocking's O(1) DCHECK can observe for any auto-journaled command. Three
+// reproductions, matching the controller-supplied recipes exactly.
+//
+// Falsifying: reverting EnsureMvcc's tombstone-clearing branch (db_slice.cc) reproduces
+// `Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (0 vs. 1)`
+// on this test; see the report's fix-report addendum for the verbatim abort.
+TEST_F(MvccStoreTest, RecreateAfterExplicitDeleteClearsTheTombstone) {
+  Run({"set", "k", "v"});
+  Run({"del", "k"});
+  auto k_tomb = StampOf("k");
+  ASSERT_TRUE(k_tomb.has_value())
+      << "the DEL's own journal entry must stamp the tombstone it armed";
+  EXPECT_TRUE(k_tomb->IsTombstone());
+
+  Run({"lpush", "k", "a"});
+
+  auto st = StampOf("k");
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->IsTombstone()) << "a live re-create must clear the tombstone flag";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-3 Task 2 review fix (C1, Critical) -- same bug, via a container command emptying
+// (and so kExplicit-deleting, DeleteHw-style) and then immediately re-creating the SAME key,
+// rather than a standalone DEL.
+TEST_F(MvccStoreTest, RecreateAfterContainerEmptiedByCommandClearsTheTombstone) {
+  Run({"lpush", "q", "a"});
+  Run({"lpop", "q"});
+  auto q_tomb = StampOf("q");
+  ASSERT_TRUE(q_tomb.has_value())
+      << "LPOP must leave the emptied list's key as a tombstone, not erase its slot";
+  EXPECT_TRUE(q_tomb->IsTombstone());
+
+  Run({"lpush", "q", "b"});
+
+  auto st = StampOf("q");
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->IsTombstone());
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-3 Task 2 review fix (C1, Critical) -- the single-command variant: OpRestore
+// (generic_family.cc) deletes an existing key itself (DelMutable, default reason kExplicit, so it
+// tombstones) then re-adds the restored value, all inside ONE auto-journaled RESTORE command
+// (CO::JOURNALED, not NO_AUTOJOURNAL) -- so the eventual commit is deferred past
+// OnCbFinishBlocking's check exactly like a deferred/auto-journaled write, unlike DEL's own
+// explicit, synchronous RecordJournal.
+TEST_F(MvccStoreTest, RestoreReplaceRecreatesClearingTheTombstone) {
+  Run({"set", "k", "v1"});
+  std::string dump = Run({"dump", "k"}).GetString();
+  Run({"set", "k", "v2"});  // still live with a different value, so RESTORE below truly replaces
+
+  Run({"restore", "k", "0", dump, "REPLACE"});
+
+  auto st = StampOf("k");
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->IsTombstone());
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-3 Task 2 review fix (C2, Critical) -- PerformDeletionAtomic's mvcc branch was not
+// namespace-gated, unlike PostUpdate's own F1 gate and the DCHECK it exists to keep true: a
+// non-default-namespace kExplicit DEL still tombstoned, and unlike Disarm/EraseMvcc (a harmless,
+// guaranteed no-op miss there, since nothing in that namespace is ever armed or EnsureMvcc'd),
+// SetTombstone's insert-tolerant Insert() call actually created a permanent, orphaned slot no
+// Commit() could ever reach (RecordEntry only ever targets the default namespace).
+//
+// drakeydb: second-round review fix -- the slot-state assertions below (ns1_stamp/mvcc_entries/
+// mvcc_tombstones) do NOT isolate this fix on their own: I3's EndOfWriteEpoch rollback (below in
+// this file) independently cleans up the very same orphaned placeholder at the end of THIS
+// command's own RunCallback, since EndOfWriteEpoch always fires regardless of namespace
+// (mvcc_enabled_ is DbSlice-wide). Reverting only the C2 gate still passes those assertions.
+// mvcc_unstamped_writes is the assertion that actually isolates C2: I3's rollback erases the
+// stale SLOT, but it cannot undo the fact that ArmTombstone was called at all -- without the
+// gate, PostUpdate never arms a non-default-namespace key (its own F1 gate), but
+// PerformDeletionAtomic's ArmTombstone call did, unconditionally, adding one entry to armed_ that
+// EndOfWriteEpoch then finds still pending (nothing in this namespace ever commits it) and counts
+// toward unstamped_writes -- the "a read-mutation path is over-arming" canary
+// (server_family.cc:3143-3150) that healthy operation keeps at 0. With the gate in place, that
+// ArmTombstone call never happens, so the counter never moves.
+//
+// Falsifying: reverting the ns_ == GetDefaultNamespace() gate on PerformDeletionAtomic's mvcc
+// block (db_slice.cc) reproduces mvcc_entries/mvcc_tombstones going 0->1 AND
+// mvcc_unstamped_writes going 0->1 (1 vs. 0) on this test; see the report's fix-report addendum
+// for the verbatim measurements.
+TEST_F(MvccStoreTest, NonDefaultNamespaceDeleteLeavesNoOrphanedTombstone) {
+  Namespace& ns1 = namespaces->GetOrInsert("ns1-c2");
+  ASSERT_EQ(RunViaNamespace(&ns1, {"set", "gone", "v"}), "OK");
+  ASSERT_EQ(RunViaNamespace(&ns1, {"del", "gone"}).GetInt(), 1);
+
+  const ShardId sid = Shard("gone", shard_set->size());
+  std::optional<MvccStamp> ns1_stamp;
+  DbSlice::Stats slice_stats;
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = ns1.GetDbSlice(sid);
+    ns1_stamp = db_slice.GetMvcc(0, "gone");
+    slice_stats = db_slice.GetStats();
+  });
+  EXPECT_FALSE(ns1_stamp.has_value())
+      << "a non-default-namespace delete must not create an orphaned tombstone slot -- no "
+         "journal commit can ever reach it to release it";
+  DbStats total;
+  for (const auto& db_stats : slice_stats.db_stats)
+    total += db_stats;
+  EXPECT_EQ(total.mvcc_entries, 0u);
+  EXPECT_EQ(total.mvcc_tombstones, 0u);
+
+  // Summed across every shard, matching PureWriteWorkloadLeavesNoUnstampedWrites' established
+  // convention (this file) -- the specific shard "gone" hashes to is enough to prove the point,
+  // but summing costs nothing and rules out a wrong-shard assumption.
+  std::atomic<uint64_t> unstamped{0};
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { unstamped += MvccStamper::tlocal()->stats().unstamped_writes; });
+  EXPECT_EQ(unstamped.load(), 0u)
+      << "a non-default-namespace delete must never call ArmTombstone at all -- I3's rollback "
+         "erasing the resulting slot afterward is not the same as this never having armed";
 }
 
 // drakeydb: review fix round 2 -- the reviewer's bonus finding: GenericFamily::Copy always
@@ -1526,20 +2331,59 @@ TEST_F(MvccStoreTest, CopyStampsTheDestinationRegardlessOfShardPlacement) {
                                            "own journal entry (via the same DeserializeDest)";
 }
 
-TEST_F(MvccStoreTest, ExpiryErasesTheStamp) {
+// drakeydb: P4-3 Task 11 -- resolves the STOP finding Task 2 left behind (see
+// ExplicitDeleteLeavesATombstoneAtLeastAsNewAsTheValue's comment above and DeleteReason's
+// comment, db_slice.h). DbSlice::ExpireIfNeeded now calls Del()/PerformDeletionAtomic BEFORE
+// RecordExpiryBlocking, so the tombstone arm PerformDeletionAtomic places for this kExpired
+// delete is consumed by this DEL's own Commit(), exactly the way an explicit DEL's arm is.
+// Supersedes ExpiryErasesTheStamp, which pinned the pre-Task-11 erase behavior for the same
+// scenario -- this test is its replacement, not an addition.
+//
+// Falsifying: reverting the ExpireIfNeeded reorder (db_slice.cc) so RecordExpiryBlocking runs
+// before Del() again reproduces the orphaned-arm symptom: EndOfWriteEpoch's rollback (Task 2's
+// I3) erases the synchronous zero-authority placeholder before any Commit() lands a real stamp
+// on it, so StampOf comes back nullopt instead of a tombstone. Verbatim run in task-11-report.md.
+TEST_F(MvccStoreTest, LazyExpiryEarnsATombstoneWithSelfOrigin) {
+  // An ordinary self-authored write, purely so this test can compare its origin_hash against the
+  // expiry tombstone's below without hardcoding this node's uuid hash.
+  Run({"set", "control", "v"});
+  auto control_stamp = StampOf("control");
+  ASSERT_TRUE(control_stamp.has_value());
+  const uint64_t self_origin_hash = control_stamp->origin_hash;
+
   Run({"set", "k", "v", "px", "10"});
   ASSERT_TRUE(StampOf("k").has_value());
   AdvanceTime(50);
-  Run({"get", "k"});  // triggers lazy expiry
-  EXPECT_FALSE(StampOf("k").has_value());
+  Run({"get", "k"});  // triggers lazy expiry (DbSlice::ExpireIfNeeded, the read path)
+
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value())
+      << "a lazily-expired key must keep its slot, as a tombstone -- not an absent slot";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_NE(tomb->Mvcc(), 0u)
+      << "must carry the expiry DEL's own real, minted stamp -- not the zero-authority "
+         "{kTombstoneBit, 0} placeholder PerformDeletionAtomic writes synchronously, which "
+         "EndOfWriteEpoch rolls back if nothing ever commits over it";
+  EXPECT_EQ(tomb->origin_hash, self_origin_hash)
+      << "an expiry is always a local decision (RecordExpiryBlocking pins origin_idx to "
+         "kSelfIdx) -- it must never be attributed to a peer";
 }
 
-TEST_F(MvccStoreTest, MultiKeyDeleteErasesEveryStamp) {
+// drakeydb: P4-1 Task 8; updated P4-3 Task 2 -- a multi-key DEL is still kExplicit for every key
+// it touches, so since Task 2 each deleted key keeps its slot as a tombstone instead of being
+// erased; the untouched key is unaffected either way.
+TEST_F(MvccStoreTest, MultiKeyDeleteTombstonesEveryStamp) {
   Run({"mset", "k1", "v1", "k2", "v2", "k3", "v3"});
   Run({"del", "k1", "k2"});
-  EXPECT_FALSE(StampOf("k1").has_value());
-  EXPECT_FALSE(StampOf("k2").has_value());
-  EXPECT_TRUE(StampOf("k3").has_value());
+  auto t1 = StampOf("k1");
+  auto t2 = StampOf("k2");
+  ASSERT_TRUE(t1.has_value());
+  EXPECT_TRUE(t1->IsTombstone());
+  ASSERT_TRUE(t2.has_value());
+  EXPECT_TRUE(t2->IsTombstone());
+  auto k3_stamp = StampOf("k3");
+  ASSERT_TRUE(k3_stamp.has_value());
+  EXPECT_FALSE(k3_stamp->IsTombstone());
 }
 
 // drakeydb: review fix round 2 (F3) -- five NO_AUTOJOURNAL commands that build their own explicit
@@ -1700,6 +2544,75 @@ TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   EXPECT_EQ(st2->origin_hash, peer_hash);
 }
 
+// drakeydb: P4-3 Task 11, review ruling I2 -- a lazy expiry firing while applying a peer's
+// command must mint its OWN fresh self stamp for its tombstone, never inherit that peer
+// command's mvcc/origin (db_cntx.repl_mvcc/repl_origin_idx) -- an expiry is always a local
+// decision (D-10), regardless of whose command happened to trigger it. Before this fix,
+// RecordExpiryBlocking (tx_base.cc) forwarded db_cntx.repl_mvcc/repl_origin_idx unconditionally
+// (review wave 2, F4) so a sibling key swept into the SAME Commit() call mid a replicated
+// multi-key command would correctly retain the author's stamp (see
+// ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc above) -- but that same forwarding also
+// reached the EXPIRING key's own tombstone arm, with no way to tell the two apart. If the
+// peer's forwarded stamp predates the expired key's own prior stamp (clock skew, or simply an
+// old command applied late, as here), the resulting tombstone is OLDER than the value it
+// replaces and a peer's still-live copy of the same key would resurrect it forever.
+//
+// The simplest repro needs no multi-key command at all: replaying a peer's plain DEL of a key
+// that is ALREADY (lazily, not yet swept) expired routes through DbSlice::FindMutable ->
+// FindInternal -> ExpireIfNeeded BEFORE GenericFamily::OpDelV2 ever gets a valid iterator for it
+// (IsValid(it.it) is false, so OpDelV2 just skips it and journals nothing of its own, per its
+// journal_args/deleted_cnt bookkeeping) -- the ONLY journal entry this command produces is the
+// expiry's own RecordExpiryBlocking call, so whatever it stamps "j" with is exactly, and only,
+// what this test observes; nothing else can overwrite it afterward the way k2's resurrection
+// masks the same transient stamp in the sibling test above.
+//
+// kOldPeerMvcc is deliberately tiny (far smaller than any real HopStamp, which is derived from
+// wall-clock ms) so a stamp that wrongly inherited it would be strictly OLDER than "j"'s own
+// prior live stamp -- exactly the resurrection hazard the ruling describes.
+//
+// Falsifying: removing the MvccStamper::tlocal()->CommitOwnTombstone(...) call at the top of
+// RecordExpiryBlocking (tx_base.cc) reproduces this -- see task-11-report.md's fix report for
+// the verbatim failure (tomb->Mvcc() comes back equal to kOldPeerMvcc, tomb->origin_hash equal
+// to peer_hash, instead of a fresh self stamp).
+TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp) {
+  constexpr uint32_t kPeerIdx = 11;
+  constexpr uint64_t kOldPeerMvcc = 0x1000ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-0000-4000-8000-0000000000ee");
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
+
+  // An ordinary self-authored write, purely so this test can compare its origin_hash against the
+  // expiry tombstone's below without hardcoding this node's uuid hash (same technique as
+  // LazyExpiryEarnsATombstoneWithSelfOrigin above).
+  Run({"set", "control", "v"});
+  auto control_stamp = StampOf("control");
+  ASSERT_TRUE(control_stamp.has_value());
+  const uint64_t self_origin_hash = control_stamp->origin_hash;
+
+  Run({"set", "j", "v", "px", "10"});
+  auto before_stamp = StampOf("j");
+  ASSERT_TRUE(before_stamp.has_value());
+  const MvccStamp before = *before_stamp;
+  AdvanceTime(50);
+
+  // Apply a peer's DEL of "j" as if replicated. "j" is already lazily expired but not yet
+  // physically removed, so this command's own FindMutable lookup discovers and expires it.
+  ApplyReplicatedCommand({"del", "j"}, kPeerIdx, kOldPeerMvcc);
+
+  auto tomb = StampOf("j");
+  ASSERT_TRUE(tomb.has_value())
+      << "the applied peer DEL's own lazy expiry of j must still leave a tombstone";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_GT(tomb->Mvcc(), before.Mvcc())
+      << "must be a freshly minted self stamp, strictly newer than the value it replaces -- not "
+         "the peer's old mvcc, or a peer's still-live copy of j would resurrect it";
+  EXPECT_NE(tomb->Mvcc(), kOldPeerMvcc);
+  EXPECT_EQ(tomb->origin_hash, self_origin_hash)
+      << "an expiry is always a local decision -- it must be self-originated even while applying "
+         "a peer's command, never attributed to that peer";
+  EXPECT_NE(tomb->origin_hash, peer_hash);
+}
+
 // drakeydb: Phase 4 Task 9, fix round (F1v2) -- proves ExecuteTx applies an author's mvcc AND
 // origin_hash correctly regardless of which shard a replicated write's key lands on, which
 // AppliedWriteKeepsAuthorStampVerbatim above cannot: that test touches exactly one key/shard, so
@@ -1830,39 +2743,6 @@ TEST_F(MvccStoreTest, DerivedDeleteFromAppliedWriteKeepsAuthorStamp) {
   EXPECT_EQ(del->origin_idx, kPeerIdx);
 }
 
-namespace {
-// drakeydb: Phase 4, P4-1 Task 10 -- sums TEST_VerifyMvccTable(0) (db_slice.cc) across every
-// shard. Each shard's callback writes to its own index of `per_shard`, never a shared accumulator
-// -- shard_set->RunBriefInParallel dispatches onto each shard's own proactor thread, so a naive
-// `mismatches += ...` shared across threads would be a data race (this fixture does not pin
-// num_shards=1, unlike OriginJournalFamilyTest elsewhere in this file, so relying on it would be
-// exactly the single-proactor-only trap: it would happen to pass here but be silently wrong).
-// Routes through Namespace::GetDbSlice (the ReaperJournalFamilyTest precedent above in this
-// file), not a nonexistent EngineShard::db_slice() -- and deliberately through
-// GetDefaultNamespace() specifically, which is what makes TEST_VerifyMvccTable's own default-
-// namespace gate (db_slice.cc) actually engage here instead of short-circuiting to 0.
-size_t SumMvccMismatchesAcrossShards() {
-  std::vector<size_t> per_shard(shard_set->size(), 0);
-  shard_set->RunBriefInParallel([&](EngineShard* shard) {
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    per_shard[shard->shard_id()] = db_slice.TEST_VerifyMvccTable(0);
-  });
-  size_t total = 0;
-  for (size_t m : per_shard)
-    total += m;
-  return total;
-}
-}  // namespace
-
-// drakeydb: Phase 4, P4-1 Task 10 -- the dense-invariant regression test: after a mixed
-// write/delete/rename workload, every live prime key must have exactly one mvcc stamp and every
-// stamp must have exactly one live prime key. TEST_VerifyMvccTable (db_slice.cc) does the real
-// work; this drives SET (arm+commit), DEL (PerformDeletionAtomic's EraseMvcc), and RENAME
-// (arms/commits the destination) against it in one interleaved pass.
-//
-// Falsifying: see task-10-report.md for the verbatim run -- commenting out the EraseMvcc call in
-// PerformDeletionAtomic (db_slice.cc) makes this fail with a non-zero mismatch count and
-// "mvcc: stamp with no live key" LOG(ERROR) lines, one per deleted key.
 TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
   for (int i = 0; i < 200; ++i) {
     Run({"set", absl::StrCat("k", i), "v"});
@@ -1895,12 +2775,21 @@ TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
 // Falsifying: restoring Disarm's early `return` after the first erase (mvcc.cc) reproduces that
 // exact DCHECK abort inside this test's own HDEL call -- see final-fix-report.md for the verbatim
 // output.
+//
+// drakeydb: P4-3 Task 2 -- HDEL emptying a hash reaches PerformDeletionAtomic via DeleteHw's
+// default DeleteReason::kExplicit (hset_family.cc), same as a plain DEL, so since Task 2 "h"
+// keeps its slot as a tombstone instead of being erased. What this test still pins is the shape
+// the comment above documents: the stray leftover arm a single-match Disarm would have left
+// behind must not desync mvcc_entries/mvcc_tombstones (SumMvccMismatchesAcrossShards) even though
+// it no longer produces an absent stamp.
 TEST_F(MvccStoreTest, HdelEmptyingHashDoesNotResurrectAStamp) {
   Run({"hset", "h", "f", "v"});
   ASSERT_TRUE(StampOf("h").has_value());
   Run({"hdel", "h", "f"});
-  EXPECT_FALSE(StampOf("h").has_value())
-      << "the HDEL's own journal entry must not re-stamp the key it just emptied";
+  auto tomb = StampOf("h");
+  ASSERT_TRUE(tomb.has_value())
+      << "the HDEL's own journal entry must stamp the tombstone it armed, not leave the key absent";
+  EXPECT_TRUE(tomb->IsTombstone());
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
@@ -1917,7 +2806,17 @@ TEST_F(MvccStoreTest, HdelEmptyingHashDoesNotResurrectAStamp) {
 //
 // Falsifying: restoring Disarm's early `return` (mvcc.cc) reproduces the same
 // mvcc->size()/prime->size() DCHECK abort as the HDEL test above -- see final-fix-report.md.
-TEST_F(MvccStoreTest, FieldExpireEmptyingHashDoesNotResurrectAStamp) {
+//
+// drakeydb: P4-3 Task 11 -- renamed from FieldExpireEmptyingHashDoesNotResurrectAStamp and
+// flipped its final assertion. HSetFamily::DeleteIfEmpty's derived DEL is DeleteReason::kExpired
+// and already deleted before journaling (one of the "three other" sites named in DeleteReason's
+// comment, db_slice.h) -- it needed no reordering -- but PerformDeletionAtomic's earns_tombstone
+// branch (db_slice.cc) cannot distinguish which kExpired call site it came from: now that kExpired
+// joins kExplicit there, this delete earns a tombstone too, exactly like HdelEmptyingHashDoes
+// NotResurrectAStamp above. What this test still pins is unchanged: the double-arm shape must not
+// desync mvcc_entries/mvcc_tombstones (SumMvccMismatchesAcrossShards), whether the result is an
+// erase (pre-Task-11) or a tombstone (post-Task-11).
+TEST_F(MvccStoreTest, FieldExpireEmptyingHashEarnsATombstone) {
   ASSERT_EQ(Run({"hset", "feh", "f", "v"}).GetInt(), 1);
   Run({"fieldexpire", "feh", "1", "f"});
   AdvanceTime(1100);
@@ -1925,13 +2824,20 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingHashDoesNotResurrectAStamp) {
 
   // Guard against a vacuous pass: the hash must have actually been cleaned up.
   ASSERT_EQ(Run({"exists", "feh"}).GetInt(), 0);
-  EXPECT_FALSE(StampOf("feh").has_value())
-      << "the derived DEL's own journal entry must not re-stamp the key it just emptied";
+  auto tomb = StampOf("feh");
+  ASSERT_TRUE(tomb.has_value())
+      << "the derived DEL's own journal entry must stamp the tombstone it armed, not leave the "
+         "key absent";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_NE(tomb->Mvcc(), 0u)
+      << "must carry the derived DEL's own real, minted stamp -- not a stuck zero-authority "
+         "{kTombstoneBit, 0} placeholder (review M3: this test's own has_value()+IsTombstone() "
+         "checks above would both pass for a stuck placeholder too)";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
 // drakeydb: review wave 2 (F1, CRITICAL) -- the SET counterpart of
-// FieldExpireEmptyingHashDoesNotResurrectAStamp above: OpFieldExpire's is_set branch calls
+// FieldExpireEmptyingHashEarnsATombstone above: OpFieldExpire's is_set branch calls
 // SetFamily::DeleteSetIfEmpty (set_family.cc) instead of HSetFamily::DeleteIfEmpty, but takes the
 // identical second-FindMutable/second-arm shape. Same recipe as
 // OriginJournalFamilyTest.FieldExpireCausedDeleteIsNotFlaggedDerived (this file), which pins this
@@ -1939,7 +2845,12 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingHashDoesNotResurrectAStamp) {
 //
 // Falsifying: restoring Disarm's early `return` (mvcc.cc) reproduces the same
 // mvcc->size()/prime->size() DCHECK abort as the two tests above -- see final-fix-report.md.
-TEST_F(MvccStoreTest, FieldExpireEmptyingSetDoesNotResurrectAStamp) {
+//
+// drakeydb: P4-3 Task 11 -- renamed from FieldExpireEmptyingSetDoesNotResurrectAStamp; see
+// FieldExpireEmptyingHashEarnsATombstone's comment above for why this now tombstones instead of
+// erasing (SetFamily::DeleteSetIfEmpty is the SET-side analog of the "three other" sites named in
+// DeleteReason's comment, db_slice.h).
+TEST_F(MvccStoreTest, FieldExpireEmptyingSetEarnsATombstone) {
   ASSERT_EQ(Run({"sadd", "fes", "m"}).GetInt(), 1);
   Run({"fieldexpire", "fes", "1", "m"});
   AdvanceTime(1100);
@@ -1947,8 +2858,15 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingSetDoesNotResurrectAStamp) {
 
   // Guard against a vacuous pass: the set must have actually been cleaned up.
   ASSERT_EQ(Run({"exists", "fes"}).GetInt(), 0);
-  EXPECT_FALSE(StampOf("fes").has_value())
-      << "the derived DEL's own journal entry must not re-stamp the key it just emptied";
+  auto tomb = StampOf("fes");
+  ASSERT_TRUE(tomb.has_value())
+      << "the derived DEL's own journal entry must stamp the tombstone it armed, not leave the "
+         "key absent";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_NE(tomb->Mvcc(), 0u)
+      << "must carry the derived DEL's own real, minted stamp -- not a stuck zero-authority "
+         "{kTombstoneBit, 0} placeholder (review M3: this test's own has_value()+IsTombstone() "
+         "checks above would both pass for a stuck placeholder too)";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
@@ -2194,6 +3112,30 @@ TEST_F(MvccStoreTest, DebugMvccReportsValueState) {
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("origin:"));
 }
 
+// drakeydb: P4-3 Task 2 -- the "state:tombstone" branch (debugcmd.cc) was wired in ahead of
+// anything setting kTombstoneBit; a kExplicit DEL is now the first live path that reaches it.
+//
+// drakeydb: P4-3 Task 8 -- strengthened beyond substring presence: the task-8 brief asks this
+// test to "assert the tombstone state + stamp", so this parses the printed `mvcc:<N>` value back
+// out and cross-checks it against DbSlice::GetMvcc's own stamp for the same key (StampOf), the
+// same side-table read production code (and DEBUG MVCC itself) uses. Catches a regression where
+// the reply says "state:tombstone" but prints a stale, zero, or otherwise wrong stamp.
+TEST_F(MvccStoreTest, DebugMvccReportsTombstoneState) {
+  Run({"set", "k", "v"});
+  Run({"del", "k"});
+
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone());
+
+  auto resp = Run({"debug", "mvcc", "k"});
+  const std::string body = resp.GetString();
+  EXPECT_THAT(body, testing::HasSubstr("state:tombstone"));
+  EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("mvcc:", tomb->Mvcc())))
+      << "printed stamp must match the side table's own tombstone stamp: " << body;
+  EXPECT_THAT(body, testing::HasSubstr("origin:"));
+}
+
 TEST_F(MvccStoreTest, DebugMvccReportsAbsent) {
   EXPECT_THAT(Run({"debug", "mvcc", "nope"}).GetString(), testing::HasSubstr("state:absent"));
 }
@@ -2213,6 +3155,38 @@ TEST_F(MvccStoreTest, DebugMvccWithNoKeyReportsPerShardAggregates) {
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_entries:"));
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_clock_ahead_ms:"));
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_unstamped_writes:"));
+}
+
+// drakeydb: P4-3 Task 8 -- task-2-report.md flagged this as a minor gap: INFO memory got
+// mvcc_tombstones_dropped, but the DEBUG MVCC no-key aggregate (this command) did not, leaving an
+// operator staring at DEBUG MVCC with no way to see a shard degrading to resurrection. Drives a
+// real cap-triggered drop (same shape as MvccStoreTest.DeleteAtTombstoneCapDegradesToEraseAndCounts
+// TheDrop above) rather than asserting a placeholder zero, so this fails if the aggregate's count
+// is wired to the wrong field or never incremented, not just if the label is missing.
+TEST_F(MvccStoreTest, DebugMvccAggregateReportsTombstonesDropped) {
+  absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1);
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1000000); };
+
+  unsigned n = shard_set->size();
+  std::string first, second;
+  for (int i = 0;; ++i) {
+    first = absl::StrCat("dbg-cap-first-", i);
+    second = absl::StrCat("dbg-cap-second-", i);
+    if (Shard(first, n) == Shard(second, n))
+      break;
+    CHECK_LT(i, 10000) << "could not find a same-shard key pair";
+  }
+  ShardId sid = Shard(first, n);
+
+  Run({"set", first, "v"});
+  Run({"del", first});
+  Run({"set", second, "v"});
+  Run({"del", second});  // this shard is already at cap: degrades to erase, counts as a drop
+
+  auto resp = Run({"debug", "mvcc"});
+  EXPECT_THAT(resp.GetString(),
+              testing::HasSubstr(absl::StrCat("shard", sid, "_tombstones_dropped:1")))
+      << resp.GetString();
 }
 
 // The "off means byte-identical to upstream" guard.
@@ -2479,6 +3453,33 @@ TEST_F(OriginJournalFamilyTest, ExpiredKeyDelCarriesExpiryFlagUserDelDoesNot) {
 
   EXPECT_TRUE(dels[1].entry_flags & journal::kEntryFlagExpired);
   EXPECT_EQ(PeerRegistry::kSelfIdx, dels[1].origin_idx);
+
+  // drakeydb: P4-3 Task 11, Step 4 -- the brief's explicit non-active-replica ordering check:
+  // "expiring-key"'s own baseline write (its SET) must still be journaled before the expiry's
+  // mutation (its DEL) after ExpireIfNeeded's reorder in db_slice.cc. That reorder only moved
+  // RecordExpiryBlocking relative to Del() INSIDE ExpireIfNeeded; PerformDeletionAtomic's
+  // FiberAtomicGuard does NOT span that whole region (it is scoped to that one function, and the
+  // jumped-over region includes the events_recording block's channel_store->SendMessages, which
+  // may suspend -- see ExpireIfNeeded's own comment, db_slice.cc, for the corrected invariant
+  // after review). What actually prevents another command's entry from landing in between here:
+  // this GET dispatches through Transaction::RunCallback, and running_tx_ (set for the callback's
+  // whole duration) blocks EngineShard::PollExecution/::Heartbeat from dispatching any OTHER
+  // transaction on this shard thread until the callback returns (engine_shard.cc:614,799) -- so no
+  // other command's journal entry can be emitted in the window this reorder crosses, regardless of
+  // whether anything inside it yields. This fixture never sets --active_replica, so this is
+  // exactly a non-active replica's view of the wire.
+  int last_set_idx = -1, expiry_del_idx = -1;
+  for (size_t i = 0; i < consumer.entries.size(); ++i) {
+    if (consumer.entries[i].cmd == "SET")
+      last_set_idx = static_cast<int>(i);
+    if (consumer.entries[i].cmd == "DEL" &&
+        (consumer.entries[i].entry_flags & journal::kEntryFlagExpired))
+      expiry_del_idx = static_cast<int>(i);
+  }
+  ASSERT_NE(-1, last_set_idx) << "expiring-key's own SET must have been captured";
+  ASSERT_NE(-1, expiry_del_idx) << "the expiry DEL must have been captured";
+  EXPECT_LT(last_set_idx, expiry_del_idx)
+      << "the key's baseline (its SET) must be journaled before its mutation (the expiry DEL)";
 }
 
 // drakeydb: Phase 3 T4 acceptance case. A DEL derived from a collection command emptying its key
@@ -2699,18 +3700,24 @@ TEST_F(OriginJournalFamilyTest, FieldExpireCausedDeleteIsNotFlaggedDerived) {
 }
 
 // drakeydb: P4-0 fix-wave -- SORT is the same defect class as FIELDEXPIRE above, caught by an
-// adversarial review pass: SORT (CO::JOURNALED, no NO_AUTOJOURNAL, generic_family.cc) auto-
-// journals verbatim just like FIELDEXPIRE, so OpFetchContainerElements/OpFetchSortEntries'
-// derived DEL must also reach peers -- same hazard, same fix (WillAutoJournalVerbatim,
-// generic_family.cc, keyed off the transaction's own CommandId, not a hardcoded name). SORT_RO
-// shares those exact call sites but is CO::READONLY and never auto-journals, so it must keep the
-// suppressed default -- this is the "cannot be a literal false" requirement the predicate exists
-// for. One consumer registration spans both halves; LastDel isolates each half's own DEL because
-// the two halves use disjoint keys run strictly in sequence.
+// adversarial review pass: SORT's own source-side effects must reach peers just like FIELDEXPIRE,
+// so OpFetchContainerElements/OpFetchSortEntries' derived DEL must also reach peers -- same
+// hazard, same fix (SortSourceEffectsMustReplicate, generic_family.cc -- renamed from
+// WillAutoJournalVerbatim in P4-3 Task 7's fix round, when SORT gained CO::NO_AUTOJOURNAL and
+// this predicate had to stop depending on whether SORT's own STORE effect happens to replay
+// verbatim or hand-journal, since it answers a different, shard-count-independent question:
+// does src's mutation need to reach peers at all -- keyed off the transaction's own CommandId,
+// not a hardcoded name). SORT_RO shares those exact call sites but is CO::READONLY and never
+// journals at all, so it must keep the suppressed default -- this is the "cannot be a literal
+// false" requirement the predicate exists for. One consumer registration spans both halves;
+// LastDel isolates each half's own DEL because the two halves use disjoint keys run strictly in
+// sequence. See CrossShardSourceEffectsReplicateLikeSameShard below for the same invariant
+// pinned across shards, not just within one.
 //
-// Falsifying: hardcoding WillAutoJournalVerbatim to always return false (or reverting either
-// SORT call site's `!WillAutoJournalVerbatim(...)` back to the derived=true default) makes
-// SORT's DEL come back flagged kEntryFlagDerived -- verified by hand during development.
+// Falsifying: hardcoding SortSourceEffectsMustReplicate to always return false (or reverting
+// either SORT call site's `!SortSourceEffectsMustReplicate(...)` back to the derived=true
+// default) makes SORT's DEL come back flagged kEntryFlagDerived -- verified by hand during
+// development.
 TEST_F(OriginJournalFamilyTest, SortDerivedDeleteReachesPeersButSortRoStaysSuppressed) {
   OriginFlagCapturingConsumer consumer;
   uint32_t consumer_id = 0;
@@ -2961,6 +3968,343 @@ TEST_F(MultiShardOriginJournalFamilyTest, AddOrGetEmitsOriginOnNewIndexOnly) {
       [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
 }
 
+namespace {
+// drakeydb: P4-3 Task 7 -- like OriginOpcodeCapturingConsumer above, but decodes and keeps the
+// full argument list (ParsedEntry::cmd.view(), cmd name first) rather than just origin/opcode
+// metadata. That is the only way to prove or disprove that a cross-shard auto-journaled
+// command's per-shard payload still carries enough information for a replica to reconstruct the
+// command's effect -- the question Task 7's diagnosis turns on for SORT ... STORE.
+struct DecodedJournalEntry {
+  ShardId shard_id;
+  std::vector<std::string> args;
+  uint8_t entry_flags;  // journal::kEntryFlagDerived / kEntryFlagExpired, see journal/types.h
+};
+
+class DecodingEntryCapturingConsumer : public journal::JournalConsumerInterface {
+ public:
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    io::BytesSource source{item.journal_item.data};
+    JournalReader reader{&source, 0};
+    journal::ParsedEntry parsed;
+    CHECK(!reader.ReadEntry(&parsed));
+
+    std::vector<std::string> args;
+    for (std::string_view sv : parsed.cmd.view())
+      args.emplace_back(sv);
+
+    util::fb2::LockGuard lk(mu_);
+    entries.push_back(
+        {EngineShard::tlocal()->shard_id(), std::move(args), item.journal_item.entry_flags});
+  }
+  void ThrottleIfNeeded() override {
+  }
+
+  util::fb2::Mutex mu_;
+  std::vector<DecodedJournalEntry> entries;  // guarded by mu_
+};
+
+// Returns a key named `prefix<i>` (i starting at 0) that hashes to a different shard than
+// `avoid_sid` under this process's actual shard count -- the same linear-probe shape
+// MvccStoreTest::ApplyOnePeerWriteToEveryShard (this file) uses to target a specific shard.
+std::string FindKeyOnDifferentShard(std::string_view prefix, ShardId avoid_sid, size_t num_shards) {
+  for (int i = 0;; ++i) {
+    std::string candidate = absl::StrCat(prefix, i);
+    if (Shard(candidate, num_shards) != avoid_sid)
+      return candidate;
+    CHECK_LT(i, 10000) << "could not find a '" << prefix << "' key hashing to a different shard";
+  }
+}
+}  // namespace
+
+// drakeydb: P4-3 Task 7. The issue register (D-3) records that `SORT ... STORE` does not
+// replicate, reproduced with --active_replica off, and the trap (see the task brief) is that
+// SORT was registered CO::JOURNALED with no NO_AUTOJOURNAL (generic_family.cc) -- normally
+// meaning the dispatcher auto-journals SORT's verbatim command, which should be enough for a
+// replica to reproduce the STORE. Step 1's diagnosis proved that assumption wrong specifically
+// when source and destination hash to DIFFERENT shards:
+//
+// Mechanism (pre-fix), with evidence -- see task-7-report.md for the full account:
+//  - CO::STORE_LAST_KEY makes the destination key a genuine second locked/scheduled key
+//    (Transaction's key-index parser sets `bonus` to the STORE keyword's argument,
+//    transaction.cc:1940-1948), so a cross-shard SORT ... STORE takes the multi-key
+//    BuildShardIndex/InitShardData path (transaction.cc:209-264) instead of the single-key fast
+//    path (InitByKeys's `NumArgs() == 1` check, transaction.cc:310), leaving unique_shard_cnt_ ==
+//    2 -- one shard for `src`, one for `dst`.
+//  - DispatchHop (transaction.cc:1020-1058) runs RunCallback on every active/keyed shard for
+//    every hop, including the concluding one, so Transaction::LogAutoJournalOnShard
+//    (transaction.cc:1700-1736) fired on BOTH shards once COORD_CONCLUDING was set -- regardless
+//    of whether that particular shard's callback actually performed the STORE write.
+//  - Since unique_shard_cnt_ != 1, LogAutoJournalOnShard's payload was NOT the full verbatim
+//    command (transaction.cc:1727-1732): it was built from GetShardArgs(shard_id)
+//    (transaction.cc:1456-1468), which slices out only THAT shard's own key argument. The source
+//    shard therefore journaled a bare "SORT <src>" and the destination shard journaled a bare
+//    "SORT <dst>" -- both missing BY/GET/LIMIT/STORE and the other key entirely. Neither entry,
+//    nor both together, could reconstruct the STORE effect: a replica applying them verbatim
+//    never created `dst`. Ruled out explicitly at the time: auto-journal DID fire (on both
+//    shards, not suppressed), IsOmittableWrite was never involved (SORT never sets
+//    is_omittable_operation), and STORE_LAST_KEY's *routing* was already correct (the local
+//    `lrange dst` sanity check below always passed) -- the bug was purely in what
+//    LogAutoJournalOnShard chose to journal for a >1-shard transaction.
+//
+// The fix (Step 2): SORT is now CO::NO_AUTOJOURNAL, reviving verbatim auto-journal only when
+// GetUniqueShardCnt() == 1 (SortGeneric, generic_family.cc). A cross-shard STORE stays
+// NO_AUTOJOURNAL, so nothing else journals the destination shard's write; OpStore instead hand-
+// journals a single "RESTORE dst 0 <dump> REPLACE" -- the destination's actual resulting EFFECT,
+// not a re-sortable recipe -- using the same arm-before-journal pattern Renamer::DeserializeDest
+// (RENAME/COPY, this file) already established for exactly this "cross-shard destination write
+// needs its own hand journal entry" shape. This test now pins that behavior; it is the same test
+// that pinned the bug during Step 1's diagnosis (see its earlier revision in git history / the
+// report for the pre-fix assertions), inverted to pin the fix instead.
+//
+// Falsifying: reverting Step 2 (dropping SORT's CO::NO_AUTOJOURNAL, or SortGeneric's
+// ReviveAutoJournal call, or OpStore's hand-journal block) reproduces the original bug -- this
+// test then fails exactly as it did pre-fix: dst_entry becomes null (no destination entry at
+// all) or reverts to a bare "SORT <dst>" with no RESTORE/REPLACE. Verified in task-7-report.md.
+TEST_F(MultiShardOriginJournalFamilyTest, CrossShardStoreHandJournalsRestoreOfDestinationEffect) {
+  const size_t num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "test requires more than one shard to be meaningful";
+
+  const std::string src = "sort-src";
+  const ShardId src_sid = Shard(src, num_shards);
+  const std::string dst = FindKeyOnDifferentShard("sort-dst", src_sid, num_shards);
+  const ShardId dst_sid = Shard(dst, num_shards);
+  ASSERT_NE(src_sid, dst_sid) << "test setup must exercise two distinct shards";
+
+  Run({"rpush", src, "3", "1", "2"});
+
+  DecodingEntryCapturingConsumer consumer;
+  std::vector<uint32_t> consumer_ids(num_shards, 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+
+  auto resp = Run({"sort", src, "store", dst});
+  EXPECT_EQ(3, resp.GetInt());
+  EXPECT_THAT(Run({"lrange", dst, "0", "-1"}).GetVec(), testing::ElementsAre("1", "2", "3"));
+
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+  const DecodedJournalEntry* src_entry = nullptr;
+  const DecodedJournalEntry* dst_entry = nullptr;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    for (const auto& e : consumer.entries) {
+      if (e.shard_id == src_sid)
+        src_entry = &e;
+      if (e.shard_id == dst_sid)
+        dst_entry = &e;
+    }
+  }
+  // The source shard journals nothing: SORT is CO::NO_AUTOJOURNAL and this cross-shard STORE
+  // does not revive it (GetUniqueShardCnt() != 1), and there is no lazy member-expiry SREM to
+  // compensate for (`src` is a plain TTL-less list here). A regression back to the pre-fix
+  // per-shard auto-journal split would show up here as a bare "SORT <src>" entry.
+  EXPECT_EQ(nullptr, src_entry) << "the source shard must not journal anything for this STORE";
+
+  // The destination shard hand-journals exactly one RESTORE ... REPLACE entry: the resulting
+  // EFFECT (a serialized list blob), not a re-sortable "SORT <dst>" recipe -- so a replica
+  // converges on `dst` regardless of its own copy of `src`.
+  ASSERT_NE(nullptr, dst_entry) << "the destination shard must hand-journal the STORE effect";
+  ASSERT_GE(dst_entry->args.size(), 4u) << "RESTORE key ttl dump REPLACE";
+  EXPECT_EQ("RESTORE", dst_entry->args[0]);
+  EXPECT_EQ(dst, dst_entry->args[1]);
+  EXPECT_EQ("REPLACE", dst_entry->args.back());
+}
+
+// drakeydb: P4-3 review wave (CodeRabbit, Major) -- the sorted same-shard STORE path's
+// destination effect must survive its own fetch having deleted the source.
+//
+// OpFetchSortEntries lazily walks a fully-expired set, finds it empty, deletes the key and
+// journals the non-derived source DEL -- and still reports success with zero entries, so the
+// author runs OpStore(empty) and clears `dst`. The same-shard peer applies that source DEL first
+// and then hits SortGeneric's missing-source early return, which never reaches OpStore -- so
+// without this fix `dst` keeps a stale value there forever while the author has none. (The
+// cross-shard path was already correct: OpStore hand-journals its destination effect in that case
+// unconditionally, see CrossShardStoreHandJournalsRestoreOfDestinationEffect above.) The fix
+// extends hand-journaling to exactly this same-shard case -- the destination DEL the author
+// actually executed -- leaving the ordinary same-shard recipe replay (D-13's accepted exposure)
+// untouched.
+//
+// Pinned under OriginJournalFamilyTest's num_shards=1 fixture deliberately: src and dst must land
+// on ONE shard, or the STORE takes the cross-shard path that was already correct.
+//
+// Falsifying: reverting the `source_deleted_by_fetch` hand-journal extension in OpStore drops the
+// destination's DEL from the journal (dst_del comes back null) while the author's own `exists`
+// still reports the destination deleted -- verified by hand during development.
+TEST_F(OriginJournalFamilyTest, FullExpirySortStoreJournalsDestinationDelete) {
+  ASSERT_EQ(1u, shard_set->size()) << "this test pins the same-shard STORE path";
+
+  DecodingEntryCapturingConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size(), 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+
+  const std::string src = "sort-full-src";
+  const std::string dst = "sort-full-dst";
+  ASSERT_EQ(Shard(src, shard_set->size()), Shard(dst, shard_set->size()));
+
+  EXPECT_EQ(Run({"sadd", src, "m"}).GetInt(), 1);
+  Run({"rpush", dst, "stale"});
+  Run({"fieldexpire", src, "1", "m"});
+  AdvanceTime(1100);
+
+  // The author's observable behavior is unchanged: reply 0, source gone, destination cleared.
+  EXPECT_EQ(Run({"sort", src, "store", dst}).GetInt(), 0);
+  EXPECT_EQ(Run({"exists", src}).GetInt(), 0);
+  EXPECT_EQ(Run({"exists", dst}).GetInt(), 0);
+
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+  const DecodedJournalEntry* src_del = nullptr;
+  const DecodedJournalEntry* dst_del = nullptr;
+  size_t src_del_idx = 0;
+  size_t dst_del_idx = 0;
+  size_t sort_idx = 0;
+  bool saw_sort = false;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    for (size_t i = 0; i < consumer.entries.size(); ++i) {
+      const DecodedJournalEntry& e = consumer.entries[i];
+      if (e.args == std::vector<std::string>{"DEL", src}) {
+        src_del = &e;
+        src_del_idx = i;
+      } else if (e.args == std::vector<std::string>{"DEL", dst}) {
+        dst_del = &e;
+        dst_del_idx = i;
+      } else if (!e.args.empty() && e.args[0] == "SORT") {
+        saw_sort = true;
+        sort_idx = i;
+      }
+    }
+  }
+
+  ASSERT_NE(nullptr, src_del) << "the source's own lazy-expiry DEL must still be journaled";
+  EXPECT_FALSE(src_del->entry_flags & journal::kEntryFlagDerived);
+  ASSERT_NE(nullptr, dst_del)
+      << "the destination's delete must be journaled, or a peer applying the source DEL and then "
+         "skipping the SORT (source missing) keeps dst's stale value forever";
+  EXPECT_LT(src_del_idx, dst_del_idx)
+      << "the source effect must precede the destination effect, as in the partial-expiry case";
+  ASSERT_TRUE(saw_sort) << "SORT itself must still auto-journal verbatim on this same-shard path";
+  EXPECT_LT(dst_del_idx, sort_idx)
+      << "the destination effect must be journaled before the concluding verbatim SORT entry";
+}
+
+// drakeydb: P4-3 Task 7 fix round (C1/C2 review).
+// CrossShardStoreHandJournalsRestoreOfDestinationEffect above proves the DESTINATION side of a
+// cross-shard SORT ... STORE; this test proves the SOURCE side, which the first pass of the fix
+// broke silently (see SortSourceEffectsMustReplicate's comment, above, for the full mechanism this
+// pins). Pinned in its own multi-shard fixture specifically because the pre-existing same-shard
+// coverage for both invariants (SortPartialExpiryJournalsSourceEffectBeforeDestinationEffect,
+// SortDerivedDeleteReachesPeersButSortRoStaysSuppressed, both above) runs under
+// OriginJournalFamilyTest, which pins num_shards=1 -- so neither test could ever have caught a
+// shard-count-dependent regression in these source-side effects. This one deliberately does not
+// pin the shard count, the same way CrossShardStoreHandJournalsRestoreOfDestinationEffect above
+// does not.
+//
+// Falsifying (C1): reverting SortSourceEffectsMustReplicate to gate on
+// Transaction::IsAutoJournalSuppressed() (as the first Task 7 patch did) makes the partial-expiry
+// half fail -- no SREM entry is captured on the source shard at all.
+// Falsifying (C2): the same revert makes the full-expiry half fail -- the DEL entry on the
+// source shard comes back with entry_flags & journal::kEntryFlagDerived set, which
+// PassesPeerEchoFilter (journal/types.cc) would then drop from every peer link.
+TEST_F(MultiShardOriginJournalFamilyTest, CrossShardSourceEffectsReplicateLikeSameShard) {
+  const size_t num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "test requires more than one shard to be meaningful";
+
+  // -- Partial expiry: SREM must reach the source shard's journal, cross-shard STORE or not --
+  // mirrors SortPartialExpiryJournalsSourceEffectBeforeDestinationEffect's sorted-path case
+  // above, with `dst` forced onto a different shard than `src`.
+  {
+    const std::string src = "sort-partial-src";
+    const ShardId src_sid = Shard(src, num_shards);
+    const std::string dst = FindKeyOnDifferentShard("sort-partial-dst", src_sid, num_shards);
+    ASSERT_NE(src_sid, Shard(dst, num_shards)) << "test setup must exercise two distinct shards";
+
+    EXPECT_EQ(Run({"sadd", src, "1", "2"}).GetInt(), 2);
+    Run({"fieldexpire", src, "1", "1"});
+    AdvanceTime(1100);
+
+    DecodingEntryCapturingConsumer consumer;
+    std::vector<uint32_t> consumer_ids(num_shards, 0);
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      journal::StartInThread();
+      consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+    });
+
+    Run({"sort", src, "store", dst});
+
+    EXPECT_EQ(Run({"scard", src}).GetInt(), 1);
+    EXPECT_EQ(Run({"sismember", src, "2"}).GetInt(), 1);
+    EXPECT_EQ(Run({"llen", dst}).GetInt(), 1);
+    EXPECT_EQ(Run({"lindex", dst, "0"}), "2");
+
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+    const DecodedJournalEntry* srem_entry = nullptr;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      for (const auto& e : consumer.entries) {
+        if (e.shard_id == src_sid && !e.args.empty() && e.args[0] == "SREM")
+          srem_entry = &e;
+      }
+    }
+    ASSERT_NE(nullptr, srem_entry)
+        << "cross-shard SORT ... STORE must still journal the source's own partial-expiry SREM, "
+           "exactly like a same-shard STORE does";
+    EXPECT_THAT(srem_entry->args, testing::ElementsAre("SREM", src, "1"));
+  }
+
+  // -- Full expiry: the source's own DEL must NOT be flagged derived, cross-shard STORE or not --
+  // mirrors SortDerivedDeleteReachesPeersButSortRoStaysSuppressed's SORT half above, with `dst`
+  // forced onto a different shard than `src`.
+  {
+    const std::string src = "sort-full-src";
+    const ShardId src_sid = Shard(src, num_shards);
+    const std::string dst = FindKeyOnDifferentShard("sort-full-dst", src_sid, num_shards);
+    ASSERT_NE(src_sid, Shard(dst, num_shards)) << "test setup must exercise two distinct shards";
+
+    EXPECT_EQ(Run({"sadd", src, "m"}).GetInt(), 1);
+    Run({"fieldexpire", src, "1", "m"});
+    AdvanceTime(1100);
+
+    DecodingEntryCapturingConsumer consumer;
+    std::vector<uint32_t> consumer_ids(num_shards, 0);
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      journal::StartInThread();
+      consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+    });
+
+    Run({"sort", src, "by", "nosort", "store", dst});
+
+    EXPECT_EQ(Run({"exists", src}).GetInt(), 0);
+
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+    const DecodedJournalEntry* del_entry = nullptr;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      for (const auto& e : consumer.entries) {
+        if (e.shard_id == src_sid && !e.args.empty() && e.args[0] == "DEL")
+          del_entry = &e;
+      }
+    }
+    ASSERT_NE(nullptr, del_entry)
+        << "cross-shard SORT ... STORE must still journal the source's own full-expiry DEL, "
+           "exactly like a same-shard STORE does";
+    EXPECT_FALSE(del_entry->entry_flags & journal::kEntryFlagDerived)
+        << "SORT's own source-side DEL must reach peers regardless of STORE's shard count, or "
+           "PassesPeerEchoFilter silently drops it from every peer link";
+  }
+}
+
 // drakeydb: P4-0 Task 2b -- boots with active_replica=true (ActiveReplicaFamilyTest, above) so
 // DbSlice::DeleteExpiredStep's member-expiry reaper -- gated on IsActiveReplica(), Step 4 of the
 // task brief -- actually runs; OriginJournalFamilyTest does not set the flag. Also
@@ -3041,6 +4385,47 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteCarriesDerivedFlag) {
   peer_check.entry_flags = del->entry_flags;
   EXPECT_FALSE(journal::PassesPeerEchoFilter(peer_check))
       << "reaper DEL must never reach a mesh peer -- the peer derives its own";
+}
+
+// drakeydb: P4-3 Task 11 -- the DeleteReapedContainer equivalent of MvccStoreTest's
+// LazyExpiryEarnsATombstoneWithSelfOrigin above (multi_master_test.cc): DeleteReapedContainer now
+// calls Del()/PerformDeletionAtomic BEFORE RecordDerivedDelete too, so the derived DEL's own
+// Commit() lands the tombstone's real stamp instead of leaving PerformDeletionAtomic's
+// synchronous placeholder for EndOfWriteEpoch to roll back. Reads the stamp from inside the same
+// shard_set->RunBriefInParallel callback that drives DeleteExpiredStep, on this fixture's single
+// shard/thread, so there is no yield between the reap and the read -- mirroring StampOf's own
+// same-shard-thread precondition in MvccStoreTest.
+//
+// Falsifying: reverting the DeleteReapedContainer reorder (db_slice.cc) reproduces the orphaned-
+// arm symptom -- `tomb` comes back nullopt (I3's rollback erases the uncommitted placeholder)
+// instead of a real tombstone. Verbatim run in task-11-report.md.
+TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteEarnsATombstone) {
+  EXPECT_EQ(Run({"sadd", "rs-tomb", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "rs-tomb", "1", "m"});
+  AdvanceTime(1100);
+
+  std::optional<MvccStamp> tomb;
+  uint64_t self_origin_hash = 0;
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+    db_slice.DeleteExpiredStep(db_cntx, 100);
+    tomb = db_slice.GetMvcc(0, "rs-tomb");
+    self_origin_hash = MvccStamper::tlocal()->OriginHash(0);
+  });
+
+  // Guard against a vacuous pass: the container must have actually been reaped.
+  EXPECT_EQ(Run({"exists", "rs-tomb"}).GetInt(), 0);
+
+  ASSERT_TRUE(tomb.has_value())
+      << "the reaper's derived DEL must earn a tombstone, not leave the slot absent";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_NE(tomb->Mvcc(), 0u)
+      << "must carry the derived DEL's own real, minted stamp -- not the zero-authority "
+         "{kTombstoneBit, 0} placeholder PerformDeletionAtomic writes synchronously";
+  EXPECT_EQ(tomb->origin_hash, self_origin_hash)
+      << "a reaper-derived delete is a local decision -- must be self-originated, never "
+         "attributed to a peer";
 }
 
 TEST_F(ReaperJournalFamilyTest, LocalOnlyReaperDoesNotJournalNamespaceBlindDelete) {

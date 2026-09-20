@@ -47,14 +47,15 @@ void DbTableStats::AddTypeMemoryUsage(unsigned type, int64_t delta) {
 DbTableStats& DbTableStats::operator+=(const DbTableStats& o) {
   constexpr size_t kDbSz = sizeof(DbTableStats) - sizeof(memory_usage_by_type);
   // drakeydb: P4-1 Task 5 -- +16 for mvcc_entries/mvcc_tombstones. P4-2 Task 4 -- +8 for
-  // mvcc_key_dup_bytes (96 -> 104).
-  static_assert(kDbSz == 104);
+  // mvcc_key_dup_bytes (96 -> 104). P4-3 Task 2 -- +8 for mvcc_tombstones_dropped (104 -> 112).
+  static_assert(kDbSz == 112);
 
   ADD(inline_keys);
   ADD(expire_count);
   ADD(member_expire_count);
   ADD(mvcc_entries);
   ADD(mvcc_tombstones);
+  ADD(mvcc_tombstones_dropped);
   ADD(mvcc_key_dup_bytes);
   ADD(obj_memory_usage);
   ADD(tiered_entries);
@@ -141,6 +142,7 @@ void DbTable::Clear() {
   expire_cursor = PrimeTable::Cursor::end();
   segment_defrag_cursor = PrimeTable::Cursor::end();
   mvcc_defrag_cursor = MvccTable::Cursor::end();
+  mvcc_gc_cursor = MvccTable::Cursor::end();
 }
 
 // drakeydb: P4-2, final review (Critical) -- see the declaration in table.h for why this lives on

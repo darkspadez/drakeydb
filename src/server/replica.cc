@@ -755,8 +755,14 @@ error_code Replica::InitiatePSync() {
     absl::Cleanup cleanup = [this]() { service_.RemoveLoadingState(); };
 
     if (IsPeerMode()) {
-      // drakeydb: an active node merges the peer's snapshot into its own dataset instead of
-      // replacing it. RdbLoader already overrides existing keys (last-loaded-wins until P6).
+      // drakeydb: fix round 1 (M5) -- an active node merges the peer's snapshot into its own
+      // dataset instead of flushing first: the loader below gets SetOverrideExistingKeys(true) AND
+      // SetMergeLww(true, ...) (P4-3 Task 4), so each incoming key is compared against this node's
+      // own MVCC side table and only overwritten when the incoming stamp is actually newer (ties go
+      // to the stored side) -- see CreateObjectOnShard's own comment (rdb_load.cc) for the compare
+      // itself. Flushing first is exactly what merge-LWW makes unnecessary and wrong: it would
+      // throw away a resident key that is concurrently newer than anything in the peer's snapshot
+      // before the compare ever got a chance to protect it.
       LOG(INFO) << "Peer full sync: merging without flush " << this;
     } else if (slot_range_.has_value()) {
       JournalExecutor{&service_}.FlushSlots(slot_range_.value());
@@ -778,6 +784,19 @@ error_code Replica::InitiatePSync() {
     loader.SetLoadOriginHash(peer_origin_hash_);
     if (IsPeerMode()) {
       loader.SetOverrideExistingKeys(true);  // drakeydb: merge
+      // drakeydb: P4-3 Task 4 -- last-loaded-wins (SetOverrideExistingKeys above, left untouched)
+      // is replaced by an actual LWW compare for a peer-mode link specifically: a peer's full sync
+      // must merge into this node's own dataset, not blindly replace a concurrently-newer resident
+      // value. peer_origin_hash_ is this link's authenticated author identity, same as the
+      // SetLoadOriginHash call just above.
+      //
+      // drakeydb: P4-3 Task 13 -- classic_protocol=true: this is the legacy Redis/KeyDB-protocol
+      // (classic PSYNC) full-sync path (see the P4-2 Task 3 comment on SetLoadOriginHash just
+      // above -- a KeyDB active-replica master, or a real Redis master, can only ever reach this
+      // loader, never DflyShardReplica's DFLY-protocol one). CreateObjectOnShard's own comment
+      // (rdb_load.cc) explains why this link type gets ctime-based authority for an unstamped key
+      // instead of D-7's {0,0} fallback.
+      loader.SetMergeLww(true, peer_origin_hash_, /*classic_protocol=*/true);
       // drakeydb: Phase 3 fix wave -- this legacy Redis/KeyDB-protocol loader is peer-aware
       // (merge above) but was missing the origin tag on its embedded journal-blob apply path.
       // Unreachable today (a redis-protocol master emits no RDB_OPCODE_JOURNAL_BLOB), but P7
@@ -1015,8 +1034,14 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
 
       passed_full_sync_ = false;
       if (IsPeerMode()) {
-        // drakeydb: an active node merges the peer's snapshot into its own dataset instead of
-        // replacing it. RdbLoader already overrides existing keys (last-loaded-wins until P6).
+        // drakeydb: fix round 1 (M5) -- an active node merges the peer's snapshot into its own
+        // dataset instead of flushing first: each shard's DflyShardReplica::FullSyncDflyFb loader
+        // (below in this file) gets SetOverrideExistingKeys(true) AND, when peer_mode_ is set,
+        // SetMergeLww(true, ...) (P4-3 Task 4), so every incoming key is compared against this
+        // node's own MVCC side table and only overwritten when the incoming stamp is actually
+        // newer (ties go to the stored side). Flushing first is exactly what merge-LWW makes
+        // unnecessary and wrong here too: it would discard a resident key that is concurrently
+        // newer than the peer's snapshot before the per-shard compare ever ran.
         LOG(INFO) << "Peer full sync: merging without flush " << this;
       } else {
         DVLOG(1) << "Calling Flush on all slots " << this;
@@ -1429,6 +1454,29 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
   // added by the journal change. This is an expected and valid scenario, so to avoid unnecessary
   // warnings, we enable SetOverrideExistingKeys(true).
   rdb_loader_->SetOverrideExistingKeys(true);
+
+  if (peer_mode_) {
+    // drakeydb: P4-3 Task 4 -- SetOverrideExistingKeys above is left exactly as it is (Global
+    // Constraints: it has three live callers, and this exact call site, reached by a PLAIN
+    // Dragonfly replica's full sync too when peer_mode_ is false, must keep loading verbatim for
+    // that caller). Guarded on peer_mode_ specifically, unlike SetOverrideExistingKeys just above:
+    // this method is the only full-sync path a plain (non-peer) Replica of a Dragonfly master also
+    // reaches, so an unguarded SetMergeLww(true, ...) here would make a plain replica start
+    // rejecting resident-but-stale-looking writes its master already legitimately applied --
+    // silent divergence from a master that itself did nothing wrong.
+    // origin_hash: this flow's own link identity, resolved from the origin_idx already set on
+    // executor_ at construction (SetApplyOrigin above) via MvccStamper::tlocal()->OriginHash --
+    // the same mapping InitiateDflySync's shard_cb registers for this thread before this flow's
+    // sync fiber (this method) ever starts running (replica.cc, shard_cb comment).
+    const uint32_t origin_idx = executor_->connection_context()->repl_origin_idx;
+    // drakeydb: P4-3 Task 13 -- classic_protocol left at its default (false): this is the DFLY
+    // multi-shard protocol's own loader, never reachable by a classic-PSYNC (Redis/KeyDB) master.
+    // An unstamped key here keeps D-7's {0,0} fallback and keeps losing every merge -- see
+    // CreateObjectOnShard's own comment (rdb_load.cc) for why that matters (C2): SaveEntry omits
+    // RDB_OPCODE_DF_MVCC outright for a {0,0} stamp, so an unversioned drakeydb peer, or a whole
+    // non-active drakeydb master, must never be able to override this node's resident dataset.
+    rdb_loader_->SetMergeLww(true, MvccStamper::tlocal()->OriginHash(origin_idx));
+  }
 
   // Load incoming rdb stream.
   if (std::error_code ec = rdb_loader_->Load(&ps); ec) {

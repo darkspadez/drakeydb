@@ -2899,6 +2899,11 @@ string ServerFamily::FormatInfoMetrics(
       append("mvcc_table_bytes", total.mvcc_table_bytes);
       append("mvcc_entries", total.mvcc_entries);
       append("mvcc_tombstones", total.mvcc_tombstones);
+      // drakeydb: P4-3 Task 2 -- a delete that earned a tombstone but hit
+      // --multi_master_max_tombstones and degraded to an erase instead; see DbTableStats'
+      // mvcc_tombstones_dropped (table.h) for why this must stay visible rather than a silent,
+      // unbounded fallback to pre-Task-2 resurrection-on-full-sync behavior.
+      append("mvcc_tombstones_dropped", total.mvcc_tombstones_dropped);
     }
     append("small_string_bytes", m.small_string_bytes);
     append("pipeline_cache_bytes", m.facade_stats.conn_stats.pipeline_cmd_cache_bytes);

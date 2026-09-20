@@ -346,6 +346,41 @@ class RdbLoader : protected RdbLoaderBase {
     load_origin_hash_ = origin_hash;
   }
 
+  // drakeydb: P4-3 Task 4 -- gates the merge-LWW logic CreateObjectOnShard (rdb_load.cc) runs
+  // around its AddOrFind call. There is no longer a single compare immediately before a single
+  // AddOrUpdate: Hazard 1's fix (task-4-report.md) split it into a non-authoritative fast-path
+  // compare before AddOrFind (cheaply rejects the common case without an insert) and the real,
+  // authoritative compare after AddOrFind returns -- the only point with no further yield before
+  // the value assignment -- which on rejection either cancels the AutoUpdater in place (pre-
+  // existing entry) or calls DbSlice::RollbackFreshInsert (fresh insert); line numbers are not
+  // cited here because they drift. `enable`: only an authenticated
+  // peer-mode full sync may set this true (replica.cc's two SetMergeLww call sites, both already,
+  // or newly, guarded on peer mode -- grep SetMergeLww); every other loader -- a local RDB file
+  // load, DEBUG LOAD/restore, and a plain Dragonfly replica's full sync -- leaves merge_lww_ at its
+  // default false and keeps loading verbatim (last-loaded-wins), exactly as before this task.
+  //
+  // `sender_origin_hash`: drakeydb: P4-3 Task 13 correction -- an earlier version of this comment
+  // called this parameter "reserved for a future record" and claimed "Task 4's own compare never
+  // needs it". Both were true only of Task 4's own logic and are WRONG now: CreateObjectOnShard's
+  // classic-PSYNC unstamped-key path (see `classic_protocol` below, and that function's own
+  // comment) stamps such a key with `sender_origin_hash` directly -- it is load-bearing, not
+  // reserved. Still doubles as parity with SetLoadOriginHash/load_origin_hash_ immediately above
+  // for every OTHER (stamped-item) case, where it remains unused: an Item carrying its own
+  // RDB_OPCODE_DF_MVCC record already has its author's origin_hash inline (Item::mvcc.origin_hash).
+  //
+  // `classic_protocol`: drakeydb: P4-3 Task 13 -- distinguishes replica.cc's two call sites, which
+  // Task 12's original (withdrawn) rule conflated. True only for the legacy Redis/KeyDB-protocol
+  // (classic PSYNC) full-sync path: the only one a KeyDB active-replica master's RDB stream, or a
+  // real Redis master's, can ever reach -- neither speaks the DFLY multi-shard protocol, so
+  // DflyShardReplica's own loader (the other call site) never needs this true. Defaults to false
+  // so every pre-existing (DFLY-link) call site compiles unchanged and keeps D-7's {0,0} fallback
+  // for an unstamped key, exactly as before this task.
+  void SetMergeLww(bool enable, uint64_t sender_origin_hash, bool classic_protocol = false) {
+    merge_lww_ = enable;
+    merge_origin_hash_ = sender_origin_hash;
+    merge_classic_protocol_ = classic_protocol;
+  }
+
   std::error_code Load(::io::Source* src);
 
   void set_source_limit(size_t n) {
@@ -487,6 +522,27 @@ class RdbLoader : protected RdbLoaderBase {
   // locals don't accumulate in Load()'s stack frame.
   std::error_code HandleVectorIndex();
   std::error_code HandleShardDocIndex();
+  // drakeydb: P4-3 Task 5 -- read side of RDB_OPCODE_DF_TOMBSTONES (rdb_extensions.h), mirroring
+  // HandleShardDocIndex's shape: always fully consumes the section's bytes (D-7's unconditional
+  // read), installing a tombstone per entry only when active and only on that key's owning
+  // shard's thread. See the .cc for the three reject cases carried over from Task 3's contract.
+  std::error_code HandleTombstones();
+
+  // drakeydb: P4-3 final fix wave (F-1) -- the single merge-LWW tombstone-apply primitive, shared
+  // verbatim by both of this loader's delete sources:
+  //   1. HandleTombstones (above), for an RDB_OPCODE_DF_TOMBSTONES record, and
+  //   2. CreateObjectOnShard (rdb_load.cc), for an incoming key whose whole-key TTL has ALREADY
+  //      elapsed -- on a merge load that IS the peer's delete of that key, not a no-op.
+  // Extracted rather than duplicated so the two can never drift: the yield-first FindMutable, the
+  // authoritative post-yield MergeAccepts recheck, the Disarm discipline, the read-back of
+  // PerformDeletionAtomic's own tombstone decision, and the ttl/cap policy on the no-live-key
+  // fallthrough are all decided in exactly one place. See the .cc for the full rationale on each.
+  //
+  // MUST run on the thread of the shard that owns `key`, and `stamp` MUST have bit 63 set
+  // (MvccStamp::AsTombstone). `resident_live` is the caller's pre-yield observation of whether
+  // `prime` holds a live entry for `key`. No-op when the resident side wins the compare.
+  static void ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, std::string_view key,
+                                         const MvccStamp& stamp, bool resident_live);
 
   // validates if the current chunk is fully read, resets the state. returns early if stop_early_ is
   // requested.
@@ -505,7 +561,32 @@ class RdbLoader : protected RdbLoaderBase {
   size_t table_used_memory_ = 0;
   // See SetLoadOriginHash's doc comment above.
   uint64_t load_origin_hash_ = 0;
+  // See SetMergeLww's doc comment above.
+  bool merge_lww_ = false;
+  uint64_t merge_origin_hash_ = 0;
+  // drakeydb: P4-3 Task 13 (reviewer-adopted ctime-authority rule, replacing Task 12's withdrawn
+  // unconditional override) -- true only for replica.cc's classic-PSYNC call site (a real
+  // Redis/KeyDB master, which cannot emit RDB_OPCODE_DF_MVCC at all). See SetMergeLww's doc
+  // comment and CreateObjectOnShard's own comment (rdb_load.cc) for why this link type matters:
+  // an unstamped key on THIS kind of link is stamped from the snapshot's own `ctime` aux and
+  // still runs through the ordinary MergeAccepts compare, never bypassed; on the DFLY multi-shard
+  // protocol (this stays false) an unstamped key keeps D-7's {0,0} fallback and keeps losing,
+  // exactly as before Task 12.
+  bool merge_classic_protocol_ = false;
+  // drakeydb: P4-3 Task 13 -- this snapshot's own "ctime" aux (HandleAux, rdb_load.cc), converted
+  // to milliseconds; 0 if the aux was absent or malformed (real Redis/KeyDB RDBs always emit it,
+  // but a synthetic or truncated file might not). CreateObjectOnShard falls back to its own `now`
+  // in that case (logged once, warned_missing_rdb_ctime_ below) -- still clamped to `now`, so this
+  // degrades to "just now", never to something unsafe.
+  uint64_t rdb_ctime_ms_ = 0;
+  bool warned_missing_rdb_ctime_ = false;
   bool warned_missing_mvcc_origin_ = false;
+  // drakeydb: P4-3 Task 5 -- HandleTombstones' two format-validation warnings (mvcc.h's carried
+  // Task 3 contract: Mvcc() == 0 would be immortal; bit 63 clear is not a tombstone at all), each
+  // rate-limited to once per loader instance -- both parsing-thread-only checks (before any
+  // per-shard dispatch), so a plain bool is race-free here, unlike a per-shard check would be.
+  bool warned_tombstone_zero_mvcc_ = false;
+  bool warned_tombstone_not_flagged_ = false;
   ScriptMgr* script_mgr_;
   std::vector<ItemsBuf> shard_buf_;
 

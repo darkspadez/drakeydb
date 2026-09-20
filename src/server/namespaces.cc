@@ -17,7 +17,10 @@ namespace dfly {
 
 using namespace std;
 
-Namespace::Namespace() {
+Namespace::Namespace(bool is_default) : is_default_(is_default) {
+  // is_default_ is initialized above, before the DbSlices below are built: DbSlice's constructor
+  // reads it back via ns->IsDefault() to decide whether to register the tombstone GC idle task
+  // (round 5, R1 -- see the declaration, namespaces.h).
   shard_db_slices_.resize(shard_set->size());
   shard_blocking_controller_.resize(shard_set->size());
   shard_set->RunBriefInParallel([&](EngineShard* es) {
@@ -117,6 +120,25 @@ void Namespaces::SetExpiredEventsRecording(bool enable) {
   });
 }
 
+// drakeydb: P4-3 Task 3, review fix round 4; wording corrected round 5 (R3) -- see the
+// declaration (namespaces.h) for the exact on-idle removal-order invariant this serves and why
+// only the default namespace ever has a task to stop. Mirrors SetExpiredEventsRecording's
+// fan-out above (mu_ serializes this with concurrent namespace creation the same way); does not
+// need the lock for anything it writes -- there is no Namespaces-level state to update here --
+// but takes it anyway so a namespace cannot be inserted mid-iteration and be missed or read
+// half-constructed, exactly the hazard SetExpiredEventsRecording's own comment names.
+void Namespaces::StopTombstoneGc() {
+  util::fb2::LockGuard guard(mu_);
+  shard_set->pool()->AwaitFiberOnAll([&](unsigned, util::ProactorBase*) {
+    EngineShard* shard = EngineShard::tlocal();
+    if (shard) {
+      for (auto& entry : ABSL_TS_UNCHECKED_READ(namespaces_)) {
+        entry.second.GetDbSlice(shard->shard_id()).StopTombstoneGc();
+      }
+    }
+  });
+}
+
 Namespace& Namespaces::GetOrInsert(std::string_view ns) {
   {
     // Try to look up under a shared lock
@@ -135,7 +157,11 @@ Namespace& Namespaces::GetOrInsert(std::string_view ns) {
       return it->second;
     }
 
-    Namespace& new_ns = namespaces_[ns];
+    // drakeydb: P4-3 Task 3, review fix round 5 (R1) -- try_emplace, not operator[]: Namespace is
+    // no longer default-constructible, and the empty name is the ONLY thing that identifies the
+    // default namespace at construction time (Namespaces::Namespaces() reaches here via
+    // GetOrInsert(""), before default_namespace_ or the global `namespaces` pointer exist).
+    Namespace& new_ns = namespaces_.try_emplace(std::string(ns), ns.empty()).first->second;
     // Not published yet (mu_ is held), so plain writes are safe.
     for (ShardId sid = 0; sid < shard_set->size(); ++sid) {
       new_ns.GetDbSlice(sid).SetExpiredEventsRecording(expired_events_recording_default_);

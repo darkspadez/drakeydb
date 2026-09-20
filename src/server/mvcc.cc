@@ -61,6 +61,20 @@ void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
   armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size())});
 }
 
+// drakeydb: P4-3 Task 2 -- see the declaration (mvcc.h) for the contract. Identical to Arm()
+// above except for the tombstone flag; kept as a separate function (not an Arm(..., bool) overload
+// with a default) so every existing Arm() call site -- and its "arms a LIVE key" reading -- stays
+// unambiguous at the call site, matching ArmTombstone's own single caller being the one place that
+// actually means "arm a deletion".
+void MvccStamper::ArmTombstone(DbIndex db_index, std::string_view key) {
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn armed a tombstone -- Commit() is mid-iteration over "
+                                 "armed_/arena_, both of which this call can reallocate, "
+                                 "corrupting that iteration";
+  const uint32_t off = static_cast<uint32_t>(arena_.size());
+  arena_.append(key);
+  armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/true});
+}
+
 // drakeydb: Phase 4, review wave 2 (F1, CRITICAL) -- erases EVERY arm matching (db_index, key),
 // not just the first. A key can be armed more than once before it is deleted: e.g. HDEL emptying
 // a hash arms it via ExecuteW's own it_res->post_updater.Run() (hset_family.cc), then DeleteHw
@@ -113,6 +127,13 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
   DCHECK(mvcc != 0);
 
   const MvccStamp stamp{mvcc, OriginHash(origin_idx)};
+  // drakeydb: P4-3 Task 2 -- the tombstone-flagged sibling of `stamp` above, sharing the same
+  // mvcc/origin_hash and differing only in kTombstoneBit. Computed once per Commit() call (not
+  // per-arm) since every tombstone arm in this call shares the same committed mvcc/origin_idx --
+  // identical in spirit to `stamp` itself. mvcc is never re-derived or re-minted here: Commit has
+  // no clock of its own (see the DCHECK above), so a tombstone arm gets exactly the same mvcc as
+  // a plain arm in the same call would, with only the bit differing.
+  const MvccStamp tomb_stamp{mvcc | MvccClock::kTombstoneBit, stamp.origin_hash};
   ++commit_depth_;
   // RAII, not bare statements after the loop: Commit is a generic primitive and its callback may
   // throw (the unit suite exercises that contract), even though journal::RecordEntry now supplies
@@ -125,10 +146,41 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
     arena_.clear();  // keeps capacity
   };
   for (const Armed& a : armed_)
-    fn(a.db_index, ArmedKey(a), stamp);
+    fn(a.db_index, ArmedKey(a), a.tombstone ? tomb_stamp : stamp);
 }
 
-void MvccStamper::EndOfWriteEpoch() {
+// drakeydb: P4-3 Task 11, review ruling I2 -- see the declaration (mvcc.h) for the contract.
+// RecordExpiryBlocking (tx_base.cc) is the only caller, and calls this BEFORE its own
+// journal::RecordEntry -> Commit(): an expiry's own tombstone must always get a freshly minted
+// self stamp, decoupled from whatever ambient (possibly a replicated peer's, possibly old) mvcc/
+// origin that later Commit() call would otherwise apply to every currently armed key, including
+// this one, if it were still armed by then.
+bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uint64_t now_ms,
+                                     const CommitFn& fn) {
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn called CommitOwnTombstone() re-entrantly -- this "
+                                 "call erases from armed_ mid-iteration, which would corrupt an "
+                                 "outer Commit()/EndOfWriteEpoch() call's own in-progress "
+                                 "iteration over the same container";
+  for (auto it = armed_.begin(); it != armed_.end(); ++it) {
+    if (it->db_index == db_index && it->tombstone && ArmedKey(*it) == key) {
+      const MvccStamp stamp{HopStamp(now_ms) | MvccClock::kTombstoneBit, OriginHash(0)};
+      ++commit_depth_;
+      // RAII, matching Commit()'s own exception-safety contract (fn may throw): erase this one
+      // arm and restore commit_depth_ whether or not fn throws. Does not touch arena_ -- same as
+      // Disarm() above, an erased Armed entry's slice of arena_ becomes unreferenced garbage,
+      // reclaimed wholesale the next time Commit()/EndOfWriteEpoch() clears it.
+      absl::Cleanup restore_depth = [this, it] {
+        --commit_depth_;
+        armed_.erase(it);
+      };
+      fn(db_index, ArmedKey(*it), stamp);
+      return true;
+    }
+  }
+  return false;
+}
+
+void MvccStamper::EndOfWriteEpoch(const EraseFn& erase_fn) {
   // The fourth mutator of armed_/arena_ (with Arm/Disarm/Commit, all DCHECK'd above): guards
   // against a CommitFn that calls back into EndOfWriteEpoch() while Commit() is mid-iteration,
   // which would clear armed_/arena_ out from under that loop exactly as a nested Arm()/Disarm()/
@@ -136,11 +188,24 @@ void MvccStamper::EndOfWriteEpoch() {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn ended the write epoch -- Commit() is mid-iteration "
                                  "over armed_/arena_, which this call would clear out from under "
                                  "it";
-  stats_.unstamped_writes += armed_.size();
-  armed_.clear();
-  arena_.clear();
-  hop_stamp_ = 0;
-  hop_started_ms_ = 0;
+  // drakeydb: P4-3 Task 2 review fix (I3) -- commit_depth_ guards this loop's own iteration over
+  // armed_/arena_ the same way Commit()'s loop guards itself: erase_fn must not call back into
+  // Arm()/Disarm()/Commit()/EndOfWriteEpoch(). RAII, not a bare decrement after the loop, so a
+  // throwing erase_fn (EraseMvcc touches a DashTable, which can in principle throw) still leaves
+  // commit_depth_ at 0 and armed_/arena_/hop_stamp_ cleared, exactly like Commit()'s own guard.
+  ++commit_depth_;
+  absl::Cleanup restore_depth = [this] {
+    --commit_depth_;
+    stats_.unstamped_writes += armed_.size();
+    armed_.clear();
+    arena_.clear();
+    hop_stamp_ = 0;
+    hop_started_ms_ = 0;
+  };
+  for (const Armed& a : armed_) {
+    if (a.tombstone)
+      erase_fn(a.db_index, ArmedKey(a));
+  }
 }
 
 void MvccStamper::TEST_Reset() {

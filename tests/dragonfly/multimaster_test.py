@@ -2240,6 +2240,143 @@ def _parse_mvcc(reply) -> dict:
     return dict(part.split(":", 1) for part in text.split())
 
 
+# drakeydb: P4-3 Task 7 -- DEBUG MVCC refuses outright without --active_replica (debugcmd.cc), so
+# this can't be resolved directly on a plain-replication pair. Sharding (server/sharding.cc,
+# `Shard()`) is a pure function of the key and shard count -- independent of --active_replica and
+# of whatever data the shard holds -- so a throwaway active_replica probe with the SAME
+# proactor_threads discovers the same placement a plain node with that proactor_threads would use.
+# The probe is discarded before the real test's nodes are created.
+#
+# drakeydb: P4-3 Task 7 fix round (M5) -- returns the two keys' shard ids too (as discovered by
+# the probe), not just the key names, so a plain-replication caller (which cannot itself call
+# DEBUG MVCC to double check) can still self-guard against silently collapsing to a same-shard
+# pair -- the same self-guard test_sort_store_replicates_cross_shard_stamped already had via its
+# own DEBUG MVCC calls.
+async def _find_cross_shard_sort_keys(df_factory: DflyInstanceFactory, proactor_threads, tmp_path):
+    probe = df_factory.create(
+        proactor_threads=proactor_threads,
+        active_replica="true",
+        dir=str(tmp_path / "shard-probe"),
+    )
+    probe.start()
+    try:
+        # Nested finally: the throwaway client is closed on every exit path, including an
+        # exception from execute_command/_parse_mvcc -- the two explicit aclose() calls this
+        # replaces only covered the return and the assertion below.
+        c = probe.client()
+        try:
+            src = "sort-src"
+            src_shard = _parse_mvcc(await c.execute_command("debug", "mvcc", src))["shard"]
+            for i in range(64):
+                dst = f"sort-dst{i}"
+                dst_shard = _parse_mvcc(await c.execute_command("debug", "mvcc", dst))["shard"]
+                if dst_shard != src_shard:
+                    return src, dst, src_shard, dst_shard
+            raise AssertionError("could not find a destination key hashing to a different shard")
+        finally:
+            await c.aclose()
+    finally:
+        probe.stop()
+
+
+# drakeydb: P4-3 Task 7, Step 1/3. The issue register (D-3) records `SORT ... STORE` not
+# replicating, reproduced with --active_replica off -- this is that exact reproduction, on a real
+# two-process master/replica pair, with src/dst forced onto different shards (the case the C++
+# diagnosis in multi_master_test.cc -- CrossShardStoreHandJournalsRestoreOfDestinationEffect --
+# pins at the journal-entry level; this test pins the same fix at the end-to-end replication
+# level). Falsifying: reverting Step 2's fix (SORT's CO::NO_AUTOJOURNAL, SortGeneric's
+# ReviveAutoJournal call, or OpStore's hand-journal block) reproduces D-3 exactly -- `dst` never
+# appears on the replica and this test times out inside keys_replicated() / fails the lrange
+# assertion. Verified in task-7-report.md.
+async def test_sort_store_replicates_cross_shard_plain(df_factory: DflyInstanceFactory, tmp_path):
+    src, dst, src_shard, dst_shard = await _find_cross_shard_sort_keys(df_factory, 4, tmp_path)
+    assert src_shard != dst_shard, (
+        "test setup must exercise two distinct shards, " f"got src={src_shard} dst={dst_shard}"
+    )
+
+    master = df_factory.create(proactor_threads=4, dir=str(tmp_path / "master"))
+    replica = df_factory.create(proactor_threads=4, dir=str(tmp_path / "replica"))
+    df_factory.start_all([master, replica])
+    c_master, c_replica = master.client(), replica.client()
+
+    # Plain (non-active) replication: connected_masters/masterN (wait_for_peers) are gated on
+    # IsActiveReplica() (RenderPeerReplicationInfo, server_family.cc) and stay absent here --
+    # wait_available_async is the mode-agnostic "replica reached stable sync" wait used elsewhere
+    # in this file (e.g. test_uuid_exchange_master_and_replica_info above) for exactly this case.
+    assert await c_replica.execute_command(f"REPLICAOF localhost {master.port}") == "OK"
+    await wait_available_async(c_replica)
+
+    await c_master.rpush(src, "3", "1", "2")
+    resp = await c_master.execute_command("sort", src, "store", dst)
+    assert resp == 3
+    assert await c_master.lrange(dst, 0, -1) == ["1", "2", "3"]
+
+    @assert_eventually(timeout=30)
+    async def dst_replicated():
+        assert await c_replica.lrange(dst, 0, -1) == ["1", "2", "3"]
+
+    await dst_replicated()
+
+
+# drakeydb: P4-3 Task 7, Step 3. The active-mode counterpart to the plain-replication test above:
+# with --active_replica on, `dst` is locally stamped on the author (every write is armed in
+# PostUpdate) and must carry the SAME stamp on the applier -- OpStore's hand-journal RESTORE entry
+# only fixes replication if it also propagates the stamp, since an unstamped-but-present `dst`
+# would still be exactly the merge-LWW hazard D-3 warned about (a key with authority no peer
+# shares). Cross-shard src/dst (proactor_threads=4) exercises the path
+# CrossShardStoreHandJournalsRestoreOfDestinationEffect pins at the unit level; DEBUG MVCC reports
+# each key's shard, asserted >= 2 distinct shards touched so this can't silently collapse to the
+# single-shard (auto-journal-revived, already-worked) case.
+async def test_sort_store_replicates_cross_shard_stamped(df_factory: DflyInstanceFactory, tmp_path):
+    src, dst, probe_src_shard, probe_dst_shard = await _find_cross_shard_sort_keys(
+        df_factory, 4, tmp_path
+    )
+    assert probe_src_shard != probe_dst_shard, (
+        "test setup must exercise two distinct shards, "
+        f"got src={probe_src_shard} dst={probe_dst_shard}"
+    )
+
+    master = df_factory.create(**active_args(proactor_threads=4, dir=str(tmp_path / "master")))
+    replica = df_factory.create(**active_args(proactor_threads=4, dir=str(tmp_path / "replica")))
+    df_factory.start_all([master, replica])
+    c_master, c_replica = master.client(), replica.client()
+
+    await attach(c_replica, master)
+    await wait_for_peers(c_replica, 1)
+
+    await c_master.rpush(src, "3", "1", "2")
+    resp = await c_master.execute_command("sort", src, "store", dst)
+    assert resp == 3
+
+    @assert_eventually(timeout=30)
+    async def dst_replicated():
+        assert await c_replica.lrange(dst, 0, -1) == ["1", "2", "3"]
+
+    await dst_replicated()
+
+    src_stamp_master = _parse_mvcc(await c_master.execute_command("debug", "mvcc", src))
+    dst_stamp_master = _parse_mvcc(await c_master.execute_command("debug", "mvcc", dst))
+    dst_stamp_replica = _parse_mvcc(await c_replica.execute_command("debug", "mvcc", dst))
+
+    # drakeydb: P4-3 Task 7 fix round (M2) -- guards against a vacuous pass: without this, both
+    # sides reading back mvcc:0 (i.e. dst was never actually stamped at all -- the RESTORE
+    # hand-journal landed but OpStore's arm-before-journal step was skipped or a no-op) would
+    # still satisfy the equality check below, since "0" == "0".
+    assert (
+        dst_stamp_master["mvcc"] != "0"
+    ), f"dst was never stamped on the author: {dst_stamp_master}"
+    assert (
+        dst_stamp_master["mvcc"] == dst_stamp_replica["mvcc"]
+    ), f"dst: {dst_stamp_master} != {dst_stamp_replica}"
+    assert (
+        dst_stamp_master["origin"] == dst_stamp_replica["origin"]
+    ), f"dst: both must name the master as the author: {dst_stamp_master} != {dst_stamp_replica}"
+    assert src_stamp_master["shard"] != dst_stamp_master["shard"], (
+        "test setup must exercise two distinct shards, "
+        f"got src={src_stamp_master['shard']} dst={dst_stamp_master['shard']}"
+    )
+
+
 # drakeydb: P4-2 Task 5. test_replicated_key_stamp_matches_origin above writes AFTER attach, so it
 # only ever exercises the incremental journal-command stream (replica.cc's per-command
 # SetApplyMvcc). This test writes BEFORE B attaches, so B's initial sync is a genuine full sync of

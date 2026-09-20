@@ -16,6 +16,7 @@
 #include "server/engine_shard_set.h"
 #include "server/execution_state.h"
 #include "server/journal/journal.h"
+#include "server/multi_master.h"
 #include "server/rdb_extensions.h"
 #include "server/rdb_save.h"
 #include "server/search/global_hnsw_index.h"
@@ -47,6 +48,15 @@ thread_local absl::flat_hash_set<SliceSnapshot*> tl_slice_snapshots;
 // Controls the chunks size for pushing serialized data. The larger the chunk the more CPU
 // it may require (especially with compression), and less responsive the server may be.
 constexpr size_t kMinBlobSize = 8_KB;
+
+// drakeydb: P4-3 Task 5 review fix (I2) -- hoisted out of IterateBucketsFb (below) so
+// SerializeTombstones can share the identical yield threshold instead of re-deriving it; a
+// function-local static (not a namespace-scope `const`) avoids any static-init-order question
+// around base::CycleClock::Frequency() -- computed lazily, once, on first call.
+uint64_t CyclesPerJiffy() {
+  static const uint64_t kCyclesPerJiffy = base::CycleClock::Frequency() >> 16;  // ~15usec.
+  return kCyclesPerJiffy;
+}
 
 }  // namespace
 
@@ -118,6 +128,10 @@ void SliceSnapshot::Start(bool stream_journal, SnapshotFlush allow_flush) {
       SearchSerializer::Serialize(serializer_.get(), db_slice_,
                                   std::bind(&SliceSnapshot::PushSerialized, this, false));
     }
+    // drakeydb: P4-3 Task 5 -- unlike serialize_index above (search-specific, version-gated),
+    // this runs unconditionally: RDB_OPCODE_DF_TOMBSTONES's own write-gate (IsActiveReplica() +
+    // non-empty table, checked inside) decides whether anything is actually emitted.
+    this->SerializeTombstones();
     this->IterateBucketsFb(stream_journal);
     UnregisterChangeListener();
     consumer_->Finalize();
@@ -150,6 +164,112 @@ void SliceSnapshot::FinalizeJournalStream(bool cancel) {
   }
 }
 
+// drakeydb: P4-3 Task 5 -- see snapshot.h's doc comment for why this runs from the per-shard
+// PROLOGUE (called from Start() above, beside SearchSerializer::Serialize) instead of an
+// epilogue: RdbSaver has no per-shard epilogue hook. Ordering relative to IterateBucketsFb below,
+// and relative to any concurrent journal blob on this same shard, carries no meaning either way:
+// tombstone application is itself LWW-guarded (MergeAccepts, mvcc.h), so whichever of the three
+// lands last for a given key resolves the same way regardless of ordering (rdb_load.cc's
+// HandleTombstones says the same on the read side) -- UNDER merge_lww_ specifically. That
+// guarantee was completed by P4-3 Task 6 (rdb_load.cc's HandleTombstones `install` lambda): before
+// it, a tombstone landing against a RESIDENT LIVE key or a resident TOMBSTONE was not yet compared
+// via MergeAccepts on the apply side, so the claim held only for the "no prior entry at all" case.
+// Under merge_lww_ it now holds unconditionally (review fix I3: an earlier version of this
+// sentence overclaimed unconditionally for every loader). A non-merge load (a local RDB file,
+// DEBUG LOAD, or a plain Dragonfly replica's full sync) instead keeps D-7's separate,
+// simpler rule -- skip a resident live key, otherwise install/overwrite unconditionally -- which
+// needs no ordering guarantee either, since it never depends on comparing against the key stream's
+// own outcome in the first place.
+//
+// Write side only -- gated on IsActiveReplica() and a non-empty tombstone table per db (D-7); the
+// read side (RdbLoader::HandleTombstones) is unconditional. An inactive node's DbTable::mvcc is
+// always null (table.cc), so the per-db `!db->mvcc` check below already makes this a no-op then
+// too, but the explicit IsActiveReplica() gate up front makes that first-class rather than
+// incidental, and avoids the table.size()-driven work below entirely on the far more common
+// (inactive) path.
+void SliceSnapshot::SerializeTombstones() {
+  if (!IsActiveReplica())
+    return;
+
+  // drakeydb: D-10 save-time GC -- a tombstone already past its GC deadline is dropped HERE
+  // rather than shipped: nothing on the load side ever re-evaluates a persisted tombstone's
+  // deadline against "now" (TombstoneGcStep, db_slice.cc, only walks the LIVE table on an idle
+  // tick; a loaded tombstone just sits there until that GC eventually reaps it), so an
+  // already-expired one would otherwise ride the RDB and its own TTL semantics indefinitely.
+  const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
+  const uint64_t now_ms = GetCurrentTimeMs();
+  std::string scratch;
+
+  // drakeydb: P4-3 Task 5 review fix (I2) -- bounds this section's peak RAM to one chunk's worth
+  // of tombstones, not the whole db's (a whole-db materialize + single trailing push was ~2
+  // copies of every tombstone in RAM at the default cap, with no yield/throttle for the entire
+  // span). Emits one RDB_OPCODE_DF_TOMBSTONES section PER CHUNK instead of one section for the
+  // whole db; the loader (HandleTombstones, rdb_load.cc) already treats any number of sections
+  // per db as ordinary repeats of the same opcode, so a db needing multiple chunks is invisible
+  // on the read side. Matches SearchSerializer's own HNSW node batching (serialization_utils.cc,
+  // kBatchSize = 1000).
+  constexpr size_t kChunkSize = 1000;
+
+  for (DbIndex db_indx = 0; db_indx < db_array_.size(); ++db_indx) {
+    auto& db = db_array_[db_indx];
+    if (!db || !db->mvcc)
+      continue;
+
+    std::vector<std::pair<std::string, MvccStamp>> chunk;
+    // drakeydb: P4-3 Task 5 review fix (I1) -- SaveTombstoneSection (rdb_save.h/.cc) writes the
+    // whole chunk as one all-or-nothing unit; on failure it logs and drops just this chunk
+    // (already rolled back out of the buffer by SaveTombstoneSection's own transaction), leaving
+    // no partial opcode/payload behind for the next opcode byte to desync against.
+    auto flush_chunk = [&] {
+      if (chunk.empty())
+        return;
+      if (auto ec = serializer_->SaveTombstoneSection(db_indx, chunk); ec)
+        LOG(ERROR) << "Failed to save tombstone section for db " << db_indx << ": " << ec.message();
+      chunk.clear();
+      // drakeydb: review fix (I2) -- same push/yield/throttle shape IterateBucketsFb uses after
+      // every bucket (below in this file), reused here via the shared CyclesPerJiffy() so this
+      // section's flow control matches the bucket path's instead of bypassing it.
+      PushSerialized(false);
+      if (use_background_mode_) {
+        ThisFiber::Yield();
+      } else if (ThisFiber::GetRunningTimeCycles() > CyclesPerJiffy()) {
+        ThisFiber::Yield();
+      }
+      ServerState::tlocal()->GetEgressThrottler().Throttle();
+    };
+
+    detail::DashCursor cursor;
+    do {
+      {
+        // drakeydb: review fix (I2) -- scoped tightly around the Traverse call only (unlike the
+        // original version, which let the guard's scope span the chunk-size check and the
+        // potentially-yielding flush_chunk() call below): flush_chunk() may call
+        // ThisFiber::Yield()/Throttle(), which must never happen while a FiberAtomicGuard is
+        // still live.
+        //
+        // Mirrors TombstoneGcStep's own guard (db_slice.cc) for the identical reason: a
+        // Mvcc() == 0 slot is never a real, committed tombstone -- only a synchronous
+        // placeholder PerformDeletionAtomic writes mid-epoch, before the delete's own journal
+        // commit overwrites it with a real, minted stamp. Never ship that placeholder: a loaded
+        // tombstone with Mvcc() == 0 would be immortal (RdbLoader::HandleTombstones rejects one
+        // anyway, but this is the cleaner place to never produce one in the first place).
+        FiberAtomicGuard g;
+        cursor = db->mvcc->Traverse(cursor, [&](auto it) {
+          if (!it->second.IsTombstone() || it->second.Mvcc() == 0)
+            return;
+          if (it->second.DeadlineMs(ttl_ms) <= now_ms)
+            return;
+          chunk.emplace_back(std::string(it->first.GetSlice(&scratch)), it->second);
+        });
+      }
+      if (chunk.size() >= kChunkSize)
+        flush_chunk();
+    } while (cursor);
+
+    flush_chunk();
+  }
+}
+
 // The algorithm is to go over all the buckets and serialize those with
 // version < snapshot_version_. In order to serialize each physical bucket exactly once we update
 // bucket version to snapshot_version_ once it has been serialized.
@@ -163,8 +283,6 @@ void SliceSnapshot::FinalizeJournalStream(bool cancel) {
 
 // Serializes all the entries with version less than snapshot_version_.
 void SliceSnapshot::IterateBucketsFb(bool send_full_sync_cut) {
-  const uint64_t kCyclesPerJiffy = base::CycleClock::Frequency() >> 16;  // ~15usec.
-
   for (DbIndex db_indx = 0; db_indx < db_array_.size(); ++db_indx) {
     stats_.keys_total += db_slice_->DbSize(db_indx);
   }
@@ -196,7 +314,7 @@ void SliceSnapshot::IterateBucketsFb(bool send_full_sync_cut) {
         PushSerialized(false);
       } else {
         if (!PushSerialized(false)) {
-          if (!use_background_mode_ && ThisFiber::GetRunningTimeCycles() > kCyclesPerJiffy) {
+          if (!use_background_mode_ && ThisFiber::GetRunningTimeCycles() > CyclesPerJiffy()) {
             ThisFiber::Yield();
           }
         }

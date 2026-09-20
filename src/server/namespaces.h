@@ -25,7 +25,21 @@ class EngineShard;
 // Each Namespace contains per-shard DbSlice, as well as a BlockingController.
 class Namespace {
  public:
-  Namespace();
+  // drakeydb: P4-3 Task 3, review fix round 5 (R1) -- `is_default` must be supplied by the
+  // creator (Namespaces::GetOrInsert, the only one) rather than derived here, because a
+  // Namespace is constructed while the global `namespaces` registry (common.h) that owns it is
+  // still mid-construction: Namespaces::Namespaces() reaches GetOrInsert("") before the global
+  // pointer is assigned and before default_namespace_ is set, so neither
+  // `namespaces->GetDefaultNamespace()` nor `this == namespaces->default_namespace_` is a legal
+  // comparison from inside this constructor. The flag is set before shard_db_slices_ is
+  // populated, so each DbSlice's own constructor can read it (DbSlice::DbSlice, db_slice.cc).
+  explicit Namespace(bool is_default);
+
+  // True only for the registry's default (empty-named) namespace. Fixed at construction; a
+  // namespace is never renamed or promoted.
+  bool IsDefault() const {
+    return is_default_;
+  }
 
   DbSlice& GetCurrentDbSlice();
 
@@ -34,6 +48,7 @@ class Namespace {
   BlockingController* GetBlockingController(ShardId sid);
 
  private:
+  const bool is_default_;
   std::vector<std::unique_ptr<DbSlice>> shard_db_slices_;
   std::vector<std::unique_ptr<BlockingController>> shard_blocking_controller_;
 
@@ -65,6 +80,30 @@ class Namespaces {
 
   // Applies to all namespaces and becomes the default for namespaces created later.
   void SetExpiredEventsRecording(bool enable) ABSL_LOCKS_EXCLUDED(mu_);
+
+  // drakeydb: P4-3 Task 3, review fix round 4; wording corrected round 5 (R3) -- idempotently
+  // stops the tombstone GC idle task (DbSlice::StopTombstoneGc, db_slice.h) on every
+  // (namespace, shard) DbSlice. Mirrors SetExpiredEventsRecording's fan-out shape above.
+  //
+  // Called from Service::Shutdown (main_service.cc) BEFORE EngineShardSet::PreShutdown. The
+  // invariant that ordering serves is NOT "this crash cannot happen"; it is narrower and worth
+  // stating exactly, because helio's RemoveOnIdleTask (proactor_base.cc) pops only TRAILING
+  // empty slots and never clamps ProactorBase::on_idle_next_:
+  //
+  //   never remove a TRAILING on-idle task while an EARLIER-registered one is still live.
+  //
+  // Doing so shrinks the array below a possibly-stale cursor, and a later tick then indexes past
+  // the end. The default namespace's GC task satisfies the invariant by construction: it is
+  // registered before "defrag" (EngineShardSet::Init builds namespaces at :121, then
+  // StartPeriodicHeartbeatFiber registers "defrag" at :130) and removed before it (here, at
+  // main_service.cc, ahead of PreShutdown) -- so removing it leaves a HOLE, not a shrink.
+  // Non-default namespaces register no GC task at all (round 5, R1: DbSlice's constructor gates
+  // on Namespace::IsDefault()), precisely because one created at RUNTIME would land ABOVE
+  // "defrag" and this fan-out would then remove a trailing task with live entries beneath it.
+  // The fan-out still visits every namespace -- it is a no-op for the ones that never registered
+  // (DbSlice::StopTombstoneGc returns early on nullopt) and stays correct if the registration
+  // gate ever changes shape.
+  void StopTombstoneGc() ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
   util::fb2::SharedMutex mu_{};
