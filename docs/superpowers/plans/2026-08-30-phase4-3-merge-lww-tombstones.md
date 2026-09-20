@@ -501,10 +501,14 @@ Create `docs/multi-master.md`; Modify `docs/differences.md`, `docs/PLAN.md`,
   `proactor_threads=4` (→ 3 shards, since `num_shards` defaults to `proactor_threads - 1`). Seeded
   `random.Random(seed)` so failures reproduce; print the seed on failure. Each round: partition
   (detach), apply a random mix of SET/DEL/EXPIRE to both sides over a shared key space, reattach,
-  wait for convergence, then assert **both nodes hold identical values *and* identical stamps for
-  every key** — stamp equality is what makes this a real LWW test rather than a value-convergence
-  test. Assert the winner is the higher `{mvcc, origin_hash}` in each conflict, not merely that the
-  two agree. Mark it `@pytest.mark.slow` (register the marker in `tests/pytest.ini` if absent) and
+  wait for convergence, then assert **both nodes hold identical values *and*, for every key whose
+  winning write was not an expiry, identical `{mvcc, origin}` stamps** — stamp equality is what
+  makes this a real LWW test rather than a value-convergence test. Expiry winners are compared on
+  existence + value only: an expiry tombstone's stamp is minted locally by whichever node reaped
+  the key, so it is per-node by design (`docs/multi-master.md`, "An expiry's tombstone stamp is
+  per-node, by design"; as implemented, F-2's `_comparable`/`stamp_free` split). Assert the winner
+  is the higher `{mvcc, origin_hash}` in each non-expiry conflict, not merely that the two agree.
+  Mark it `@pytest.mark.slow` (register the marker in `tests/pytest.ini` if absent) and
   keep the default round count modest enough for CI.
 
 - [ ] **Step 2: Prove the fuzzer can fail.** Run it against a build with Task 4's `MergeAccepts`

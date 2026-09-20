@@ -1674,7 +1674,11 @@ TEST_F(MvccStoreTest, DeleteInSameCallbackDoesNotResurrectAStamp) {
 // (db_slice.h) for the resolution.
 TEST_F(MvccStoreTest, ExplicitDeleteLeavesATombstoneAtLeastAsNewAsTheValue) {
   Run({"set", "gone", "v"});
-  const MvccStamp before = *StampOf("gone");
+  auto before_stamp = StampOf("gone");
+  ASSERT_TRUE(before_stamp.has_value())
+      << "the SET above must leave a stamp -- without one this test would dereference nullopt "
+         "(undefined behavior) instead of failing here";
+  const MvccStamp before = *before_stamp;
   Run({"del", "gone"});
   auto tomb = StampOf("gone");
   ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone";
@@ -2049,9 +2053,10 @@ TEST_F(MvccStoreTest, RenameMovesTheStampByRecreatingIt) {
   auto src_tomb = StampOf("a");
   ASSERT_TRUE(src_tomb.has_value()) << "the source key keeps its slot, as a tombstone";
   EXPECT_TRUE(src_tomb->IsTombstone());
-  ASSERT_TRUE(StampOf("b").has_value()) << "the destination is armed and committed by RENAME's "
-                                           "own journal entry";
-  EXPECT_FALSE(StampOf("b")->IsTombstone());
+  auto dest_stamp = StampOf("b");
+  ASSERT_TRUE(dest_stamp.has_value()) << "the destination is armed and committed by RENAME's "
+                                         "own journal entry";
+  EXPECT_FALSE(dest_stamp->IsTombstone());
 }
 
 // drakeydb: P4-3 Task 2 -- the same-shard fast path (OpRen, generic_family.cc) relies on the
@@ -2108,8 +2113,9 @@ TEST_F(MvccStoreTest, SameShardRenameToFreshDestKeepsTheInvariant) {
 TEST_F(MvccStoreTest, RenameOntoAnExistingDestSelfCorrectsToALiveStamp) {
   Run({"set", "a", "v1"});
   Run({"set", "b", "v0"});
-  ASSERT_TRUE(StampOf("b").has_value());
-  ASSERT_FALSE(StampOf("b")->IsTombstone());
+  auto b_before = StampOf("b");
+  ASSERT_TRUE(b_before.has_value());
+  ASSERT_FALSE(b_before->IsTombstone());
   const size_t tombstones_before = GetMetrics().db_stats[0].mvcc_tombstones;
 
   Run({"rename", "a", "b"});
@@ -2196,7 +2202,10 @@ TEST_F(MvccStoreTest, RestoreReplaceFailureRollsBackTheOrphanedTombstone) {
 TEST_F(MvccStoreTest, RecreateAfterExplicitDeleteClearsTheTombstone) {
   Run({"set", "k", "v"});
   Run({"del", "k"});
-  ASSERT_TRUE(StampOf("k")->IsTombstone());
+  auto k_tomb = StampOf("k");
+  ASSERT_TRUE(k_tomb.has_value())
+      << "the DEL's own journal entry must stamp the tombstone it armed";
+  EXPECT_TRUE(k_tomb->IsTombstone());
 
   Run({"lpush", "k", "a"});
 
@@ -2213,7 +2222,10 @@ TEST_F(MvccStoreTest, RecreateAfterExplicitDeleteClearsTheTombstone) {
 TEST_F(MvccStoreTest, RecreateAfterContainerEmptiedByCommandClearsTheTombstone) {
   Run({"lpush", "q", "a"});
   Run({"lpop", "q"});
-  ASSERT_TRUE(StampOf("q")->IsTombstone());
+  auto q_tomb = StampOf("q");
+  ASSERT_TRUE(q_tomb.has_value())
+      << "LPOP must leave the emptied list's key as a tombstone, not erase its slot";
+  EXPECT_TRUE(q_tomb->IsTombstone());
 
   Run({"lpush", "q", "b"});
 
@@ -2335,7 +2347,9 @@ TEST_F(MvccStoreTest, LazyExpiryEarnsATombstoneWithSelfOrigin) {
   // An ordinary self-authored write, purely so this test can compare its origin_hash against the
   // expiry tombstone's below without hardcoding this node's uuid hash.
   Run({"set", "control", "v"});
-  const uint64_t self_origin_hash = StampOf("control")->origin_hash;
+  auto control_stamp = StampOf("control");
+  ASSERT_TRUE(control_stamp.has_value());
+  const uint64_t self_origin_hash = control_stamp->origin_hash;
 
   Run({"set", "k", "v", "px", "10"});
   ASSERT_TRUE(StampOf("k").has_value());
@@ -2367,8 +2381,9 @@ TEST_F(MvccStoreTest, MultiKeyDeleteTombstonesEveryStamp) {
   EXPECT_TRUE(t1->IsTombstone());
   ASSERT_TRUE(t2.has_value());
   EXPECT_TRUE(t2->IsTombstone());
-  ASSERT_TRUE(StampOf("k3").has_value());
-  EXPECT_FALSE(StampOf("k3")->IsTombstone());
+  auto k3_stamp = StampOf("k3");
+  ASSERT_TRUE(k3_stamp.has_value());
+  EXPECT_FALSE(k3_stamp->IsTombstone());
 }
 
 // drakeydb: review fix round 2 (F3) -- five NO_AUTOJOURNAL commands that build their own explicit
@@ -2570,10 +2585,14 @@ TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp) {
   // expiry tombstone's below without hardcoding this node's uuid hash (same technique as
   // LazyExpiryEarnsATombstoneWithSelfOrigin above).
   Run({"set", "control", "v"});
-  const uint64_t self_origin_hash = StampOf("control")->origin_hash;
+  auto control_stamp = StampOf("control");
+  ASSERT_TRUE(control_stamp.has_value());
+  const uint64_t self_origin_hash = control_stamp->origin_hash;
 
   Run({"set", "j", "v", "px", "10"});
-  const MvccStamp before = *StampOf("j");
+  auto before_stamp = StampOf("j");
+  ASSERT_TRUE(before_stamp.has_value());
+  const MvccStamp before = *before_stamp;
   AdvanceTime(50);
 
   // Apply a peer's DEL of "j" as if replicated. "j" is already lazily expired but not yet
@@ -4092,6 +4111,88 @@ TEST_F(MultiShardOriginJournalFamilyTest, CrossShardStoreHandJournalsRestoreOfDe
   EXPECT_EQ("RESTORE", dst_entry->args[0]);
   EXPECT_EQ(dst, dst_entry->args[1]);
   EXPECT_EQ("REPLACE", dst_entry->args.back());
+}
+
+// drakeydb: P4-3 review wave (CodeRabbit, Major) -- the sorted same-shard STORE path's
+// destination effect must survive its own fetch having deleted the source.
+//
+// OpFetchSortEntries lazily walks a fully-expired set, finds it empty, deletes the key and
+// journals the non-derived source DEL -- and still reports success with zero entries, so the
+// author runs OpStore(empty) and clears `dst`. The same-shard peer applies that source DEL first
+// and then hits SortGeneric's missing-source early return, which never reaches OpStore -- so
+// without this fix `dst` keeps a stale value there forever while the author has none. (The
+// cross-shard path was already correct: OpStore hand-journals its destination effect in that case
+// unconditionally, see CrossShardStoreHandJournalsRestoreOfDestinationEffect above.) The fix
+// extends hand-journaling to exactly this same-shard case -- the destination DEL the author
+// actually executed -- leaving the ordinary same-shard recipe replay (D-13's accepted exposure)
+// untouched.
+//
+// Pinned under OriginJournalFamilyTest's num_shards=1 fixture deliberately: src and dst must land
+// on ONE shard, or the STORE takes the cross-shard path that was already correct.
+//
+// Falsifying: reverting the `source_deleted_by_fetch` hand-journal extension in OpStore drops the
+// destination's DEL from the journal (dst_del comes back null) while the author's own `exists`
+// still reports the destination deleted -- verified by hand during development.
+TEST_F(OriginJournalFamilyTest, FullExpirySortStoreJournalsDestinationDelete) {
+  ASSERT_EQ(1u, shard_set->size()) << "this test pins the same-shard STORE path";
+
+  DecodingEntryCapturingConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size(), 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+
+  const std::string src = "sort-full-src";
+  const std::string dst = "sort-full-dst";
+  ASSERT_EQ(Shard(src, shard_set->size()), Shard(dst, shard_set->size()));
+
+  EXPECT_EQ(Run({"sadd", src, "m"}).GetInt(), 1);
+  Run({"rpush", dst, "stale"});
+  Run({"fieldexpire", src, "1", "m"});
+  AdvanceTime(1100);
+
+  // The author's observable behavior is unchanged: reply 0, source gone, destination cleared.
+  EXPECT_EQ(Run({"sort", src, "store", dst}).GetInt(), 0);
+  EXPECT_EQ(Run({"exists", src}).GetInt(), 0);
+  EXPECT_EQ(Run({"exists", dst}).GetInt(), 0);
+
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+  const DecodedJournalEntry* src_del = nullptr;
+  const DecodedJournalEntry* dst_del = nullptr;
+  size_t src_del_idx = 0;
+  size_t dst_del_idx = 0;
+  size_t sort_idx = 0;
+  bool saw_sort = false;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    for (size_t i = 0; i < consumer.entries.size(); ++i) {
+      const DecodedJournalEntry& e = consumer.entries[i];
+      if (e.args == std::vector<std::string>{"DEL", src}) {
+        src_del = &e;
+        src_del_idx = i;
+      } else if (e.args == std::vector<std::string>{"DEL", dst}) {
+        dst_del = &e;
+        dst_del_idx = i;
+      } else if (!e.args.empty() && e.args[0] == "SORT") {
+        saw_sort = true;
+        sort_idx = i;
+      }
+    }
+  }
+
+  ASSERT_NE(nullptr, src_del) << "the source's own lazy-expiry DEL must still be journaled";
+  EXPECT_FALSE(src_del->entry_flags & journal::kEntryFlagDerived);
+  ASSERT_NE(nullptr, dst_del)
+      << "the destination's delete must be journaled, or a peer applying the source DEL and then "
+         "skipping the SORT (source missing) keeps dst's stale value forever";
+  EXPECT_LT(src_del_idx, dst_del_idx)
+      << "the source effect must precede the destination effect, as in the partial-expiry case";
+  ASSERT_TRUE(saw_sort) << "SORT itself must still auto-journal verbatim on this same-shard path";
+  EXPECT_LT(dst_del_idx, sort_idx)
+      << "the destination effect must be journaled before the concluding verbatim SORT entry";
 }
 
 // drakeydb: P4-3 Task 7 fix round (C1/C2 review).

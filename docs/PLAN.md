@@ -698,8 +698,10 @@ operator-facing writeup: [`docs/multi-master.md`](multi-master.md). Summary:
   active-only, read side unconditional, same shape as opcode 221); `kDrakeydbReplVersion` bumped
   66 → 67 so a pre-P4-3 peer is refused at handshake rather than hard-failing mid-stream on the new
   opcode.
-- **Classic-protocol peers** (a plain Redis/KeyDB master, or any RDB source with no per-key
-  stamp): an unstamped key is given the snapshot's own `ctime`-derived authority
+- **Classic-PSYNC peers** (a plain Redis/KeyDB master — exactly the links that set
+  `classic_protocol`, i.e. the loader's `merge_classic_protocol_`; a DFLY-protocol full sync or a
+  local RDB load with unstamped keys still gets D-7's `{0,0}`): an unstamped key is given the
+  snapshot's own `ctime`-derived authority
   (`min(ctime_ms + 999, now_ms)`) rather than D-7's `{0,0}`, replacing an earlier, withdrawn
   unconditional-override rule that could clobber a node's entire resident dataset. This narrows,
   but does not close, a tombstone-resurrection exposure on classic links: a classic snapshot
@@ -717,7 +719,8 @@ operator-facing writeup: [`docs/multi-master.md`](multi-master.md). Summary:
   `DEBUG MVCC <key>` tombstone test to check the printed stamp rather than only its presence,
   corrected four stale comments left over from Task 7's `WillAutoJournalVerbatim` rename, wrote
   `docs/multi-master.md`, and recorded this phase's upstream/deferred findings (U-4 through U-8,
-  D-11 through D-13) in `docs/ISSUE-REGISTER.md`. Review of that work found one real code defect
+  D-11 through D-16 by the end of the phase) in `docs/ISSUE-REGISTER.md`. Review of that work
+  found one real code defect
   (I4: the RDB load path's non-merge tombstone install had no `--multi_master_tombstone_ttl=0`
   gate, unlike every other install site, so a node booted with tombstoning disabled that loaded a
   file carrying a persisted tombstone section installed an unreapable, immortal one — fixed,
@@ -725,12 +728,17 @@ operator-facing writeup: [`docs/multi-master.md`](multi-master.md). Summary:
   documentation-accuracy findings (imprecise or stale claims in `docs/multi-master.md`,
   `docs/differences.md`, the flag help text, the boot-time limitations warning, and
   `docs/ISSUE-REGISTER.md` itself), all corrected in a follow-up round. `multi_master_test` and
-  `rdb_test` both pass in full after both rounds. A full-phase exit-gate sweep is **not** this
+  `rdb_test` both pass in full after both rounds. A full-phase exit-gate sweep was **not** this
   branch's only remaining step before merge: Task 9 (the randomized multi-shard merge fuzzer and
   end-to-end pytest coverage, `task-9-brief.md`), Task 10 (the exit gate itself —
   `ctest -L DFLY`, the pytest `multimaster`/`replication` suites, `task-10-brief.md`), a
-  whole-branch review, and an adversarial pass all remain, none of them part of Task 8's own
-  scope. Every task's falsification is recorded verbatim in `task-1..13-report.md` and
+  whole-branch review, and an adversarial pass have all since landed on this branch. The
+  adversarial pass found one Critical (F-1: an incoming key whose TTL had already elapsed was
+  dropped as a no-op on a merge load, so the peer's already-reaped delete lost permanently to an
+  older resident value — 5/40 keys in a live repro, 0/40 after), fixed in a dedicated wave (the
+  synthetic expiry tombstone, `RdbLoader::ApplyMergeTombstoneOnShard`) whose residual
+  tombstone-lifecycle exposures are registered as D-14 through D-16. Every task's falsification is
+  recorded verbatim in `task-1..13-report.md` and
   `task-8-fix-report.md` (same ledger directory).
 
 ## Phase 5 — Streaming LWW guard

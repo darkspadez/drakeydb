@@ -1871,8 +1871,14 @@ void JournalSortPartialExpiry(const OpArgs& op_args, string_view key,
 }
 
 // Create a SortEntryList from given key
+//
+// drakeydb: P4-3 review wave -- `source_deleted` reports whether THIS fetch is what deleted the
+// source: its lazy-expiry walk emptied a set and DeleteSetIfEmpty removed it. A caller that
+// requested a STORE must then hand-journal its destination effect even on the same-shard path,
+// because the verbatim recipe replay will never reach its OpStore (see OpStore's own
+// source_deleted_by_fetch comment).
 OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_view key,
-                                            SortEntryList* dest) {
+                                            SortEntryList* dest, bool* source_deleted) {
   using namespace container_utils;
 
   auto it = op_args.GetDbSlice().FindReadOnly(op_args.db_cntx, key);
@@ -1923,6 +1929,7 @@ OpResult<CompactObjType> OpFetchSortEntries(const OpArgs& op_args, std::string_v
       obj_type == OBJ_SET && it->second.Size() == 0 &&
       SetFamily::DeleteSetIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, it->second,
                                   /*derived=*/!SortSourceEffectsMustReplicate(op_args.tx));
+  *source_deleted = key_deleted;
   JournalSortPartialExpiry(op_args, key, possible_expired, key_deleted);
 
   if (!success)
@@ -1994,9 +2001,18 @@ string OpFetchStringValue(const OpArgs& op_args, std::string_view key) {
   return it->second.ToString();
 }
 
+// drakeydb: P4-3 review wave (CodeRabbit, Major) -- `source_deleted_by_fetch` extends the
+// hand-journal below to the one same-shard case the verbatim recipe replay cannot reproduce: when
+// this command's own fetch emptied and deleted the source (OpFetchSortEntries), a peer replaying
+// the same-shard `SORT ... STORE` applies the fetch's source DEL first, early-returns on the
+// now-missing source, and never runs this store -- so the destination delete the author executed
+// would never reach it, leaving a stale destination there (the cross-shard path already
+// hand-journals unconditionally). Only that case passes true: an ordinary same-shard STORE keeps
+// the recipe replay and the unchanged journal size (D-13's accepted exposure is unrelated).
 template <typename IteratorBegin, typename IteratorEnd>
 OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, IteratorBegin&& start_it,
-                           IteratorEnd&& end_it, bool has_get_patterns) {
+                           IteratorEnd&& end_it, bool has_get_patterns,
+                           bool source_deleted_by_fetch) {
   uint32_t len = 0;
 
   // drakeydb: P4-3 Task 7 -- SORT is now CO::NO_AUTOJOURNAL (see its registration below) with
@@ -2012,7 +2028,8 @@ OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, Iterator
   // task-7-report.md for the pinned mechanism). Hand-journal the resulting EFFECT below instead:
   // this also makes a replica's `dst` converge regardless of its own copy of `src`, since the
   // replica never re-sorts anything -- it just applies the already-computed result.
-  const bool hand_journal = op_args.shard->journal() && op_args.tx->GetUniqueShardCnt() != 1;
+  const bool hand_journal =
+      op_args.shard->journal() && (op_args.tx->GetUniqueShardCnt() != 1 || source_deleted_by_fetch);
 
   // If we are about to overwrite an existing indexed document (HASH/JSON),
   // remove it from search indices first to avoid duplicate entries.
@@ -2239,6 +2256,10 @@ struct SortVisitor {
   CompactObjType result_type;
   CommandContext* cmd_cntx;
   vector<string> raw_elements;
+  // drakeydb: P4-3 review wave -- true when OpFetchSortEntries deleted the source on this
+  // command's own fetch; see OpStore's source_deleted_by_fetch comment for why the STORE below
+  // must then hand-journal its destination effect even on the same-shard path.
+  bool source_deleted_by_fetch = false;
 
   template <typename T> void operator()(T& entries) {
     using value_t = typename std::decay_t<decltype(entries)>::value_type;
@@ -2304,8 +2325,8 @@ struct SortVisitor {
         ShardId shard_id = shard->shard_id();
         if (shard_id == dest_sid) {
           auto [start_it, end_it] = GetSortRange(entries, params.bounds);
-          store_len =
-              OpStore(t->GetOpArgs(shard), store_key_sv, start_it, end_it, has_get_patterns);
+          store_len = OpStore(t->GetOpArgs(shard), store_key_sv, start_it, end_it, has_get_patterns,
+                              source_deleted_by_fetch);
         }
         return OpStatus::OK;
       };
@@ -2475,6 +2496,13 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
     auto sorted_entries =
         MakeSortEntryList(params.alpha);  // Numeric or alpha depending on params.alpha
     OpStatus sort_status = OpStatus::OK;
+    // drakeydb: P4-3 review wave (CodeRabbit, Major) -- set by OpFetchSortEntries below when its
+    // own lazy-expiry walk deleted the source key. The STORE path then hand-journals its
+    // destination effect even when source and destination share a shard: the same-shard verbatim
+    // recipe replay applies this fetch's DEL first and early-returns on the now-missing source
+    // (the sort_status != OK path below) without ever reaching OpStore, silently dropping the
+    // destination delete a peer would need to converge.
+    bool source_deleted_by_fetch = false;
 
     // Handle BY pattern with external key lookups
     if (params.by_pattern) {
@@ -2486,7 +2514,8 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
       auto fetch_cb = [&](Transaction* t, EngineShard* shard) {
         // in case of SORT option, we fetch only on the source shard
         if (shard->shard_id() == source_sid) {
-          fetch_result = OpFetchSortEntries(t->GetOpArgs(shard), key, &sorted_entries);
+          fetch_result = OpFetchSortEntries(t->GetOpArgs(shard), key, &sorted_entries,
+                                            &source_deleted_by_fetch);
           // A failed SORT may still have journaled an SREM for members removed by lazy expiry,
           // but the failed SORT itself must not be auto-journaled. Propagate the operation status
           // to Transaction::LogAutoJournalOnShard instead of masking it with OK.
@@ -2510,7 +2539,8 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
       return static_cast<RedisReplyBuilder*>(cmd_cntx->rb())->SendEmptyArray();
     }
 
-    SortVisitor visitor{params, source_type, cmd_cntx, std::move(raw_elements)};
+    SortVisitor visitor{params, source_type, cmd_cntx, std::move(raw_elements),
+                        source_deleted_by_fetch};
     std::visit(visitor, sorted_entries);
     return;
   }
@@ -2559,8 +2589,10 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
 
     auto store_cb = [&](Transaction* t, EngineShard* shard) {
       if (shard->shard_id() == dest_sid) {
+        // The unsorted fetch early-returns when its own lazy expiry emptied the source
+        // (OpFetchContainerElements), so a deleted source can never reach this store.
         store_len = OpStore(t->GetOpArgs(shard), store_key_sv, entries.begin(), entries.end(),
-                            has_get_patterns);
+                            has_get_patterns, /*source_deleted_by_fetch=*/false);
       }
       return OpStatus::OK;
     };

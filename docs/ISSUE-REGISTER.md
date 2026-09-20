@@ -296,8 +296,10 @@ operational problem). **From:** P4-3 Task 12.
 `RdbMvccTest.MergeLwwClassicUnstampedIncomingResurrectsTombstoneOlderThanCtime`
 (`src/server/rdb_test.cc`).
 
-A classic-protocol peer (plain Redis, or any RDB source with no per-key `mvcc-tstamp`) carries
-exactly one whole-snapshot timestamp, not a per-key write time. `MergeAccepts` masks the
+A classic-protocol peer (plain Redis or KeyDB — specifically the classic-PSYNC links that set
+`merge_classic_protocol_` in the loader; a DFLY-protocol full sync or a local RDB load with
+unstamped keys gets D-7's `{0,0}`, not ctime authority) carries exactly one whole-snapshot
+timestamp, not a per-key write time. `MergeAccepts` masks the
 tombstone bit for its comparison, so a resident tombstone loses to *any* unstamped incoming key
 whose ctime-derived stamp is newer — indistinguishable, from the classic side's single timestamp,
 from a legitimate post-delete rewrite. This replaced Task 12's withdrawn unconditional-override

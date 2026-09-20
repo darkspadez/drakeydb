@@ -2260,17 +2260,21 @@ async def _find_cross_shard_sort_keys(df_factory: DflyInstanceFactory, proactor_
     )
     probe.start()
     try:
+        # Nested finally: the throwaway client is closed on every exit path, including an
+        # exception from execute_command/_parse_mvcc -- the two explicit aclose() calls this
+        # replaces only covered the return and the assertion below.
         c = probe.client()
-        src = "sort-src"
-        src_shard = _parse_mvcc(await c.execute_command("debug", "mvcc", src))["shard"]
-        for i in range(64):
-            dst = f"sort-dst{i}"
-            dst_shard = _parse_mvcc(await c.execute_command("debug", "mvcc", dst))["shard"]
-            if dst_shard != src_shard:
-                await c.aclose()
-                return src, dst, src_shard, dst_shard
-        await c.aclose()
-        raise AssertionError("could not find a destination key hashing to a different shard")
+        try:
+            src = "sort-src"
+            src_shard = _parse_mvcc(await c.execute_command("debug", "mvcc", src))["shard"]
+            for i in range(64):
+                dst = f"sort-dst{i}"
+                dst_shard = _parse_mvcc(await c.execute_command("debug", "mvcc", dst))["shard"]
+                if dst_shard != src_shard:
+                    return src, dst, src_shard, dst_shard
+            raise AssertionError("could not find a destination key hashing to a different shard")
+        finally:
+            await c.aclose()
     finally:
         probe.stop()
 
