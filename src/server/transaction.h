@@ -611,7 +611,26 @@ class Transaction {
 
   // Log command in shard's journal, if this is a write command with auto-journaling enabled.
   // Should be called immediately after the last hop.
-  void LogAutoJournalOnShard(EngineShard* shard, RunnableResult shard_result);
+  // drakeydb: P4-4 -- `lww_dropped` has no default: every caller must say explicitly whether the
+  // hop it is logging for actually ran its callback. RunCallback passes its own veto flag;
+  // RunSquashedMultiCb always passes false (its own LWW tripwire is task A4).
+  void LogAutoJournalOnShard(EngineShard* shard, RunnableResult shard_result, bool lww_dropped);
+
+  // drakeydb: P4-4 -- the generic single-key LWW veto shared by RunCallback (task A3). True iff
+  // this shard's own callback for the current command must be skipped because a strictly newer
+  // (or tied, favoring stored) local stamp already exists for its one key. Only classifies
+  // kSingleKey journaled names (SET, SETNX, GETSET, GETDEL, PEXPIREAT, PERSIST, RESTORE);
+  // kMultiKeySelfGuarded (MSET, DEL) and kUnguarded names always return false here -- MSET/DEL
+  // guard themselves per-key inside their own Op functions (A7/A8) because GetShardArgs on MSET
+  // yields keys AND values in one contiguous range, which this generic helper cannot tell apart.
+  //
+  // The compare runs HERE, inside RunCallback, under this key's shard-thread execution (which
+  // Dragonfly's intent-lock scheduling serializes against every other write to the same key) --
+  // never pre-dispatch. A pre-dispatch check reads the stamp before the key is actually locked
+  // for this hop; a local write could land in the window between that read and the apply, and the
+  // dropped peer write would then never be retried -- a permanent, silent divergence instead of a
+  // merely reordered one.
+  bool ShouldDropForLww(EngineShard* shard);
 
   // Whether the callback can be run directly on this fiber without dispatching on the shard queue.
   // It checks internally that there are no possible suspension points.

@@ -826,14 +826,20 @@ class MvccStoreTest : public BaseFamilyTest {
   // calling thread, and shard_set->Await would run this directly on shard 0's own
   // TxQueue-processing fiber, self-deadlocking the moment a dispatched command needs that same
   // queue to schedule a hop.
+  // drakeydb: P4-4 Task A3 -- extended with `lww_guard`, forwarded verbatim to
+  // JournalExecutor::SetApplyLwwGuard (a per-link setting, so it is set once here alongside
+  // SetApplyOrigin/SetApplyMvcc rather than per entry -- see that method's own comment,
+  // executor.h). Every pre-existing caller now passes false, preserving its prior meaning
+  // (unguarded apply); new A3 tests pass true to exercise the veto.
   facade::DispatchResult ApplyReplicatedCommand(std::vector<std::string> args, uint32_t origin_idx,
-                                                uint64_t mvcc) {
+                                                uint64_t mvcc, bool lww_guard) {
     facade::DispatchResult dispatch_result = facade::DispatchResult::ERROR;
     pp_->at(0)
         ->LaunchFiber([&] {
           JournalExecutor executor(service_.get());
           executor.SetApplyOrigin(origin_idx);
           executor.SetApplyMvcc(mvcc);
+          executor.SetApplyLwwGuard(lww_guard);
 
           journal::ParsedEntry::CmdData cmd_data;
           cmd_data.Assign(args.begin(), args.end(), args.size());
@@ -937,6 +943,39 @@ class MvccStoreTest : public BaseFamilyTest {
                                              << "' (target shard " << target_shard << ")";
     }
     return keys;
+  }
+
+  // drakeydb: P4-4 Task A3 -- registers `origin_idx` -> `origin_hash` on EVERY shard thread, the
+  // same shape AppliedWriteKeepsAuthorStampVerbatim (above) and ApplyOnePeerWriteToEveryShard
+  // (above) both use directly: MvccStamper::tlocal() is per-thread, and ShouldDropForLww's own
+  // IncomingStamp call (transaction.cc) runs on whichever shard thread owns the guarded key, so
+  // registering on only one thread would DCHECK-fail (or silently fail open in release) the
+  // moment a test's key lands on a different shard.
+  void RegisterPeerOriginHash(uint32_t origin_idx, uint64_t origin_hash) {
+    shard_set->pool()->AwaitBrief([origin_idx, origin_hash](unsigned, auto*) {
+      MvccStamper::tlocal()->RegisterOriginHash(origin_idx, origin_hash);
+    });
+  }
+
+  // drakeydb: P4-4 Task A3 -- ServerState::Stats::multimaster_lww_dropped is thread-local (one
+  // ServerState per shard/proactor thread), same shape as unstamped_writes
+  // (PureWriteWorkloadLeavesNoUnstampedWrites, above) -- summed across every shard rather than
+  // read off shard 0, since a guarded test's key can land on any of them.
+  uint64_t TotalLwwDropped() {
+    std::atomic<uint64_t> total{0};
+    shard_set->pool()->AwaitBrief(
+        [&](unsigned, auto*) { total += ServerState::tlocal()->stats.multimaster_lww_dropped; });
+    return total.load();
+  }
+
+  // drakeydb: P4-4 Task A3 -- see TotalLwwDropped above; every drop test also asserts this did NOT
+  // advance (global-constraints.md's test-discipline rule), proving the veto took the "return
+  // OpStatus::OK without ever arming the key" path rather than arming and then abandoning it.
+  uint64_t TotalUnstampedWrites() {
+    std::atomic<uint64_t> total{0};
+    shard_set->pool()->AwaitBrief(
+        [&](unsigned, auto*) { total += MvccStamper::tlocal()->stats().unstamped_writes; });
+    return total.load();
   }
 };
 
@@ -2497,7 +2536,7 @@ TEST_F(MvccStoreTest, AppliedWriteKeepsAuthorStampVerbatim) {
 
   shard_set->pool()->AwaitBrief(
       [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
-  ApplyReplicatedCommand({"set", "k", "v"}, kPeerIdx, kAuthorMvcc);
+  ApplyReplicatedCommand({"set", "k", "v"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
 
   auto st = StampOf("k");
   ASSERT_TRUE(st.has_value());
@@ -2548,7 +2587,7 @@ TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   Run({"set", k2, "old", "px", "10"});
   AdvanceTime(50);
 
-  ApplyReplicatedCommand({"mset", k1, "v1", k2, "v2"}, kPeerIdx, kAuthorMvcc);
+  ApplyReplicatedCommand({"mset", k1, "v1", k2, "v2"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
 
   auto st1 = StampOf(k1);
   ASSERT_TRUE(st1.has_value());
@@ -2618,7 +2657,7 @@ TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp) {
 
   // Apply a peer's DEL of "j" as if replicated. "j" is already lazily expired but not yet
   // physically removed, so this command's own FindMutable lookup discovers and expires it.
-  ApplyReplicatedCommand({"del", "j"}, kPeerIdx, kOldPeerMvcc);
+  ApplyReplicatedCommand({"del", "j"}, kPeerIdx, kOldPeerMvcc, /*lww_guard=*/false);
 
   auto tomb = StampOf("j");
   ASSERT_TRUE(tomb.has_value())
@@ -2745,7 +2784,7 @@ TEST_F(MvccStoreTest, DerivedDeleteFromAppliedWriteKeepsAuthorStamp) {
 
   Run({"hset", "h", "f", "v"});  // local write; its own entry is irrelevant to this test
 
-  ApplyReplicatedCommand({"hdel", "h", "f"}, kPeerIdx, kAuthorMvcc);
+  ApplyReplicatedCommand({"hdel", "h", "f"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
 
   shard_set->RunBriefInParallel(
       [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
@@ -2762,6 +2801,394 @@ TEST_F(MvccStoreTest, DerivedDeleteFromAppliedWriteKeepsAuthorStamp) {
   EXPECT_EQ(del->mvcc, kAuthorMvcc) << "a derived DEL caused by an applied write must reproduce "
                                        "the author's stamp, not mint a fresh local one";
   EXPECT_EQ(del->origin_idx, kPeerIdx);
+}
+
+// drakeydb: P4-4 Task A3 -- the generic single-key LWW veto's core case: a guarded peer link must
+// drop a replicated SET whose author stamp is not strictly newer than the key's own stored stamp,
+// leaving the local value AND its stamp completely untouched while still reporting the hop as
+// successfully applied (never forcing a resync), and recording exactly one drop with no
+// unstamped write left behind.
+//
+// Falsifying (see task-A3-report.md for the verbatim run): removing ShouldDropForLww's veto
+// (transaction.cc), i.e. making it always `return false`, makes the first EXPECT_EQ below observe
+// "peer" instead of "local".
+TEST_F(MvccStoreTest, StalePeerSetDroppedUnderLwwGuard) {
+  constexpr uint32_t kPeerIdx = 20;
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;  // far smaller than any real HopStamp
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000020");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  ASSERT_GT(before_stamp->Mvcc(), kStaleMvcc)
+      << "sanity: the local stamp must actually be newer than the peer's for this to be a "
+         "meaningful drop";
+
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, kStaleMvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK)
+      << "a dropped write must still report success -- signaling it any other way would force a "
+         "full resync on every LWW conflict";
+
+  EXPECT_EQ(Run({"get", "k"}), "local")
+      << "the stale peer SET must never overwrite the newer local value";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, *before_stamp) << "a dropped write must not disturb the stamp either";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u) << "a drop must never arm-then-abandon the key";
+}
+
+// drakeydb: P4-4 Task A3 -- the guard's sibling/control for the test above: the IDENTICAL stale
+// SET, with the link's guard bit off, must apply exactly as arrival-order replication always
+// has -- proving the drop above is caused by the guard, not some unrelated side effect of
+// ApplyReplicatedCommand or of a stale mvcc by itself.
+TEST_F(MvccStoreTest, StalePeerSetAppliesWithoutLwwGuard) {
+  constexpr uint32_t kPeerIdx = 21;
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000021");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, kStaleMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer")
+      << "without the guard, replication is plain arrival order -- the peer's write applies "
+         "regardless of its (older) mvcc";
+  auto st = StampOf("k");
+  ASSERT_TRUE(st.has_value());
+  EXPECT_EQ(st->Mvcc(), kStaleMvcc);
+  EXPECT_EQ(st->origin_hash, peer_hash);
+}
+
+// drakeydb: P4-4 Task A3 -- F1 (multimaster_lww.h): a zero incoming mvcc (a classic Redis/KeyDB
+// link, or a DFLY link to a non-active node) must NEVER be guarded, even on a link whose guard
+// bit is on: IncomingStamp(0, ...) returns nullopt and ShouldDropForLww fails open on that alone.
+//
+// Falsifying (see task-A3-report.md): making ShouldDropForLww treat a nullopt `incoming` as
+// {0, 0} instead of failing open reproduces the failure this guards against -- the first
+// EXPECT_EQ below would observe "local" instead of "peer" (MergeAccepts(stored, {0,0}) is false
+// for any already-stamped key, so the write would be wrongly dropped).
+TEST_F(MvccStoreTest, UnstampedIncomingNeverGuarded) {
+  constexpr uint32_t kPeerIdx = 22;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000022");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, /*mvcc=*/0, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer") << "mvcc == 0 must fail open even with the guard bit on";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped) << "an unstamped apply must never count as a drop";
+}
+
+// drakeydb: P4-4 Task A3 -- a genuinely newer peer write must apply with the incoming author's
+// stamp EXACTLY -- not max(local, incoming), and not a freshly-minted local stamp -- proving the
+// guard only vetoes strictly-older writes, never interferes with a legitimate one.
+TEST_F(MvccStoreTest, NewerPeerSetAppliesWithExactIncomingStamp) {
+  constexpr uint32_t kPeerIdx = 23;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000023");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const uint64_t newer_mvcc = before_stamp->Mvcc() + 1;
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, newer_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer");
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(after_stamp->Mvcc(), newer_mvcc)
+      << "the applied stamp must be the incoming author's stamp EXACTLY -- not a max() with the "
+         "local stamp, and not a freshly-minted local one";
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash)
+      << "must record the AUTHOR's origin hash, never this node's own";
+}
+
+// drakeydb: P4-4 Task A3 -- exact-tie half (a): incoming mvcc == stored mvcc, with the peer's
+// origin_hash GREATER than self's. MergeAccepts orders lexicographically on (Mvcc(), origin_hash)
+// (mvcc.h), so a tie must be broken by origin_hash alone, and the greater one must win/apply.
+// self_hash is read off a throwaway control write rather than hardcoded, since it depends on this
+// process's randomly-generated boot uuid (same technique as
+// LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp, above).
+TEST_F(MvccStoreTest, ExactTieAppliesWhenIncomingOriginHashIsGreater) {
+  constexpr uint32_t kPeerIdx = 24;
+
+  ASSERT_EQ(Run({"set", "control", "v"}), "OK");
+  auto control_stamp = StampOf("control");
+  ASSERT_TRUE(control_stamp.has_value());
+  const uint64_t self_hash = control_stamp->origin_hash;
+  const uint64_t peer_hash = self_hash + 1;  // deterministically greater than self's
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  ASSERT_EQ(before_stamp->origin_hash, self_hash);
+
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult res = ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx,
+                                                      before_stamp->Mvcc(), /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer")
+      << "an exact mvcc tie with a GREATER incoming origin_hash must apply";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(after_stamp->Mvcc(), before_stamp->Mvcc());
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash);
+  EXPECT_EQ(TotalLwwDropped(), before_dropped);
+}
+
+// drakeydb: P4-4 Task A3 -- exact-tie half (b): same setup as above, but the peer's origin_hash is
+// SMALLER than self's -- owner decision 2026-08-30 (mvcc.h): ties favor the STORED side, so this
+// must drop.
+TEST_F(MvccStoreTest, ExactTieDroppedWhenIncomingOriginHashIsSmaller) {
+  constexpr uint32_t kPeerIdx = 25;
+
+  ASSERT_EQ(Run({"set", "control", "v"}), "OK");
+  auto control_stamp = StampOf("control");
+  ASSERT_TRUE(control_stamp.has_value());
+  const uint64_t self_hash = control_stamp->origin_hash;
+  ASSERT_GT(self_hash, 0u) << "sanity: need room below self_hash for a strictly smaller peer hash";
+  const uint64_t peer_hash = self_hash - 1;  // deterministically smaller than self's
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult res = ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx,
+                                                      before_stamp->Mvcc(), /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "local")
+      << "an exact mvcc tie with a SMALLER incoming origin_hash must drop -- ties favor the "
+         "stored side";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, *before_stamp);
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 Task A3 -- a dropped write must suppress its auto-journal too, not just its own
+// callback: SETNX, GETDEL, PERSIST, RESTORE and GETSET journal verbatim via
+// Transaction::LogAutoJournalOnShard (no explicit RecordJournal of their own), so without the
+// suppression a drop would still forward the client's original command to sub-replicas even
+// though this node's own copy was never touched. SET and PEXPIREAT are included too, even though
+// they journal explicitly (RecordJournal, inside SetCmd::RecordJournal / OpExpire) rather than via
+// auto-journal -- both simply never reach their own RecordJournal call at all, since the callback
+// that contains it never runs on a drop.
+//
+// Falsifying (see task-A3-report.md): removing LogAutoJournalOnShard's `if (lww_dropped) return;`
+// early return (transaction.cc) reproduces the failure this test exists to catch -- every
+// `EXPECT_EQ(consumer.commands.load(), pre)` below instead observes `pre + 1`.
+TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyCommand) {
+  constexpr uint32_t kPeerIdx = 26;
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000026");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  class CountingJournalConsumer final : public journal::JournalConsumerInterface {
+   public:
+    void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+      if (item.journal_item.opcode == journal::Op::COMMAND)
+        ++commands;
+    }
+    void ThrottleIfNeeded() override {
+    }
+    std::atomic<size_t> commands{0};
+  } consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  {  // SET -- manually journaled (SetCmd::RecordJournal).
+    SCOPED_TRACE("SET");
+    ASSERT_EQ(Run({"set", "sj_set", "local"}), "OK");
+    auto before = StampOf("sj_set");
+    ASSERT_TRUE(before.has_value());
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"set", "sj_set", "peer"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"get", "sj_set"}), "local");
+    EXPECT_EQ(StampOf("sj_set"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  {  // SETNX -- auto-journaled verbatim.
+    SCOPED_TRACE("SETNX");
+    ASSERT_EQ(Run({"set", "sj_setnx", "local"}), "OK");
+    auto before = StampOf("sj_setnx");
+    ASSERT_TRUE(before.has_value());
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"setnx", "sj_setnx", "peer"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"get", "sj_setnx"}), "local");
+    EXPECT_EQ(StampOf("sj_setnx"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  {  // GETSET -- auto-journaled verbatim.
+    SCOPED_TRACE("GETSET");
+    ASSERT_EQ(Run({"set", "sj_getset", "local"}), "OK");
+    auto before = StampOf("sj_getset");
+    ASSERT_TRUE(before.has_value());
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"getset", "sj_getset", "peer"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"get", "sj_getset"}), "local");
+    EXPECT_EQ(StampOf("sj_getset"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  {  // GETDEL -- auto-journaled verbatim; also proves the key is not actually deleted.
+    SCOPED_TRACE("GETDEL");
+    ASSERT_EQ(Run({"set", "sj_getdel", "local"}), "OK");
+    auto before = StampOf("sj_getdel");
+    ASSERT_TRUE(before.has_value());
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"getdel", "sj_getdel"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"exists", "sj_getdel"}).GetInt(), 1) << "the key must NOT be deleted";
+    EXPECT_EQ(Run({"get", "sj_getdel"}), "local");
+    EXPECT_EQ(StampOf("sj_getdel"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  {  // PERSIST -- auto-journaled verbatim; also proves the TTL survives.
+    SCOPED_TRACE("PERSIST");
+    ASSERT_EQ(Run({"set", "sj_persist", "local", "px", "100000"}), "OK");
+    auto before = StampOf("sj_persist");
+    ASSERT_TRUE(before.has_value());
+    ASSERT_GT(Run({"pttl", "sj_persist"}).GetInt(), 0) << "sanity: must actually have a TTL";
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"persist", "sj_persist"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_GT(Run({"pttl", "sj_persist"}).GetInt(), 0) << "the TTL must survive the drop";
+    EXPECT_EQ(StampOf("sj_persist"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  {  // PEXPIREAT -- manually journaled (OpExpire's own RecordJournal); also proves no TTL is set.
+    SCOPED_TRACE("PEXPIREAT");
+    ASSERT_EQ(Run({"set", "sj_pexpireat", "local"}), "OK");
+    auto before = StampOf("sj_pexpireat");
+    ASSERT_TRUE(before.has_value());
+    ASSERT_EQ(Run({"ttl", "sj_pexpireat"}).GetInt(), -1) << "sanity: no TTL yet";
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    const std::string future_ms = absl::StrCat(GetCurrentTimeMs() + 1'000'000);
+    auto res = ApplyReplicatedCommand({"pexpireat", "sj_pexpireat", future_ms}, kPeerIdx,
+                                      kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"ttl", "sj_pexpireat"}).GetInt(), -1)
+        << "the key must remain without a TTL -- the drop must never set one";
+    EXPECT_EQ(StampOf("sj_pexpireat"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  {  // RESTORE -- auto-journaled verbatim.
+    SCOPED_TRACE("RESTORE");
+    ASSERT_EQ(Run({"set", "sj_restore", "local"}), "OK");
+    std::string dump = Run({"dump", "sj_restore"}).GetString();
+    auto before = StampOf("sj_restore");
+    ASSERT_TRUE(before.has_value());
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"restore", "sj_restore", "0", dump, "REPLACE"}, kPeerIdx,
+                                      kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"get", "sj_restore"}), "local");
+    EXPECT_EQ(StampOf("sj_restore"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  std::move(unregister_consumer).Invoke();
+  EXPECT_EQ(TotalUnstampedWrites(), 0u) << "none of the drops above may arm-then-abandon a key";
+}
+
+// drakeydb: P4-4 Task A3 -- out-of-scope classes must be left completely alone by this task's
+// generic veto: INCR is kUnguarded (delta-journaled RMW -- dropping a delta would permanently
+// lose it, not just reorder it), and DEL/MSET are kMultiKeySelfGuarded (their own per-key guard is
+// tasks A7/A8, not this one) -- GetShardArgs on MSET yields keys AND values in one contiguous
+// range, which is exactly why this generic single-key helper must never touch it. All three must
+// still apply a stale peer write, and none may ever be counted as an LWW drop by this task.
+TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
+  constexpr uint32_t kPeerIdx = 27;
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000027");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  {  // INCR -- kUnguarded.
+    SCOPED_TRACE("INCR");
+    ASSERT_EQ(Run({"incr", "sj_incr"}).GetInt(), 1);
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"incr", "sj_incr"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(Run({"get", "sj_incr"}), "2")
+        << "INCR is unguarded -- a stale mvcc must never veto it";
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "INCR must never count as an LWW drop";
+  }
+
+  {  // DEL -- kMultiKeySelfGuarded; A8's own guard does not exist yet.
+    SCOPED_TRACE("DEL");
+    ASSERT_EQ(Run({"set", "sj_del", "local"}), "OK");
+    ASSERT_TRUE(StampOf("sj_del").has_value());
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"del", "sj_del"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(Run({"exists", "sj_del"}).GetInt(), 0)
+        << "before A8 adds DEL's own per-key guard, a stale peer DEL must still apply";
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped)
+        << "this generic single-key veto must never classify or count DEL";
+  }
+
+  {  // MSET -- kMultiKeySelfGuarded; A7's own guard does not exist yet.
+    SCOPED_TRACE("MSET");
+    ASSERT_EQ(Run({"set", "sj_msk1", "local1"}), "OK");
+    ASSERT_EQ(Run({"set", "sj_msk2", "local2"}), "OK");
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"mset", "sj_msk1", "peer1", "sj_msk2", "peer2"}, kPeerIdx,
+                                      kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(Run({"get", "sj_msk1"}), "peer1")
+        << "before A7 adds MSET's own per-key guard, a stale peer MSET must still apply";
+    EXPECT_EQ(Run({"get", "sj_msk2"}), "peer2");
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped)
+        << "this generic single-key veto must never classify or count MSET";
+  }
 }
 
 TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
