@@ -32,6 +32,7 @@
 #include "server/journal/serializer.h"
 #include "server/journal/tx_executor.h"
 #include "server/journal/types.h"
+#include "server/multimaster_lww.h"
 #include "server/node_identity.h"
 #include "server/rdb_load.h"
 #include "server/replica.h"
@@ -69,11 +70,11 @@ bool WriteStringToFileForTest(const std::string& path, std::string_view content)
 }  // namespace
 
 TEST(NodeIdentity, VersionConstant) {
-  // drakeydb: P4-3 Task 5 review fix (M2) -- bumped 66 -> 67 alongside kDrakeydbReplVersion
-  // itself (node_identity.h): P4-3's snapshot stream adds opcode 225, so a P4-2-era peer
-  // advertising the old 66 must be refused before full sync, not admitted and hard-failed on an
-  // opcode it cannot parse.
-  EXPECT_EQ(67u, kDrakeydbReplVersion);
+  // drakeydb: P4-4 -- bumped 67 -> 68 alongside kDrakeydbReplVersion itself (node_identity.h):
+  // this phase adds the streaming LWW guard plus an applied-write stamp floor change to apply
+  // semantics, so a mixed 67/68 mesh must be refused at handshake, not admitted and left to
+  // silently diverge.
+  EXPECT_EQ(68u, kDrakeydbReplVersion);
 }
 
 TEST(NodeUuid, GenerateIsValidV4) {
@@ -759,6 +760,26 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones:"));
   // drakeydb: P4-3 Task 8 -- mvcc_tombstones_dropped must be gated identically to its siblings.
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones_dropped:"));
+}
+
+// drakeydb: P4-4 Task A1 -- NoteLwwDrop touches ServerState::tlocal(), which only resolves on a
+// pool proactor thread (see this file's own ApplyReplicatedCommand/
+// ApplyOnePeerWriteToEveryShard comments above for the SIGSEGV this fixture already learned that
+// lesson from); mvcc_test.cc's plain TESTs run on the gtest main thread instead, so this one test
+// lives here rather than beside ClassifyJournaledCommand/LwwGuardActive/LwwShouldDropKey/
+// IncomingStamp in mvcc_test.cc. Three calls, not one, so a bug that sets the counter to a fixed
+// value (e.g. `= 1` instead of `+= 1`) would still be caught.
+TEST_F(MultiMasterFamilyTest, NoteLwwDropIncrementsCounterByExactlyOnePerCall) {
+  auto& shard_set_ref = *shard_set;
+  uint64_t before = 0, after = 0;
+  shard_set_ref.Await(0, [&] { before = ServerState::tlocal()->stats.multimaster_lww_dropped; });
+
+  shard_set_ref.Await(0, [&] { NoteLwwDrop("SET", "k1"); });
+  shard_set_ref.Await(0, [&] { NoteLwwDrop("MSET", "k2"); });
+  shard_set_ref.Await(0, [&] { NoteLwwDrop("DEL", "k3"); });
+
+  shard_set_ref.Await(0, [&] { after = ServerState::tlocal()->stats.multimaster_lww_dropped; });
+  EXPECT_EQ(after - before, 3u);
 }
 
 // drakeydb: P4-1 Task 5 -- the side table on DbTable. Storage only; nothing writes to it outside

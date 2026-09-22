@@ -11,6 +11,7 @@
 #include <optional>
 
 #include "base/gtest.h"
+#include "server/multimaster_lww.h"
 #include "server/table.h"
 
 namespace dfly {
@@ -554,6 +555,119 @@ TEST(MvccStamperTest, CommitDepthRecoversAfterCommitFnThrows) {
       << "a throwing Commit() must not leak the pre-throw arm list into a later, unrelated commit";
   EXPECT_EQ(rec.writes[0].key, "k2");
 }
+
+// ---------------------------------------------------------------------------
+// multimaster_lww.h: the streaming LWW guard's pure decision module (P4-4 Task A1). Behaviour-
+// free -- these tests are the only caller until A2-A12 wire the module in.
+// ---------------------------------------------------------------------------
+
+TEST(MultimasterLwwTest, ClassifyJournaledCommandMatchesEveryTableRow) {
+  EXPECT_EQ(ClassifyJournaledCommand("DEL"), LwwClass::kMultiKeySelfGuarded);
+  EXPECT_EQ(ClassifyJournaledCommand("GETDEL"), LwwClass::kSingleKey);
+  EXPECT_EQ(ClassifyJournaledCommand("GETSET"), LwwClass::kSingleKey);
+  EXPECT_EQ(ClassifyJournaledCommand("MSET"), LwwClass::kMultiKeySelfGuarded);
+  EXPECT_EQ(ClassifyJournaledCommand("PERSIST"), LwwClass::kSingleKey);
+  EXPECT_EQ(ClassifyJournaledCommand("PEXPIREAT"), LwwClass::kSingleKey);
+  EXPECT_EQ(ClassifyJournaledCommand("RESTORE"), LwwClass::kSingleKey);
+  EXPECT_EQ(ClassifyJournaledCommand("SET"), LwwClass::kSingleKey);
+  EXPECT_EQ(ClassifyJournaledCommand("SETNX"), LwwClass::kSingleKey);
+}
+
+TEST(MultimasterLwwTest, ClassifyJournaledCommandIsCaseInsensitive) {
+  EXPECT_EQ(ClassifyJournaledCommand("set"), LwwClass::kSingleKey);
+  EXPECT_EQ(ClassifyJournaledCommand("Set"), LwwClass::kSingleKey);
+  EXPECT_EQ(ClassifyJournaledCommand("sEtNx"), LwwClass::kSingleKey);
+  EXPECT_EQ(ClassifyJournaledCommand("del"), LwwClass::kMultiKeySelfGuarded);
+  EXPECT_EQ(ClassifyJournaledCommand("mSeT"), LwwClass::kMultiKeySelfGuarded);
+}
+
+TEST(MultimasterLwwTest, ClassifyJournaledCommandUnknownNamesAreUnguarded) {
+  for (std::string_view name : {"INCR", "APPEND", "PFADD", "UNLINK", "SORT", ""})
+    EXPECT_EQ(ClassifyJournaledCommand(name), LwwClass::kUnguarded) << name;
+}
+
+TEST(MultimasterLwwTest, LwwGuardActiveTruthTable) {
+  EXPECT_FALSE(LwwGuardActive(/*link_guard=*/false, /*incoming_mvcc=*/0));
+  EXPECT_FALSE(LwwGuardActive(/*link_guard=*/false, /*incoming_mvcc=*/42));
+  EXPECT_FALSE(LwwGuardActive(/*link_guard=*/true, /*incoming_mvcc=*/0));
+  EXPECT_TRUE(LwwGuardActive(/*link_guard=*/true, /*incoming_mvcc=*/42));
+}
+
+TEST(MultimasterLwwTest, LwwShouldDropKeyNothingStoredNeverDrops) {
+  const MvccStamp incoming{1000, 7};
+  EXPECT_FALSE(LwwShouldDropKey(std::nullopt, incoming));
+}
+
+TEST(MultimasterLwwTest, LwwShouldDropKeyStoredOlderDoesNotDrop) {
+  const std::optional<MvccStamp> stored = MvccStamp{500, 7};
+  const MvccStamp incoming{1000, 7};
+  EXPECT_FALSE(LwwShouldDropKey(stored, incoming));
+}
+
+TEST(MultimasterLwwTest, LwwShouldDropKeyStoredNewerDrops) {
+  const std::optional<MvccStamp> stored = MvccStamp{1000, 7};
+  const MvccStamp incoming{500, 7};
+  EXPECT_TRUE(LwwShouldDropKey(stored, incoming));
+}
+
+TEST(MultimasterLwwTest, LwwShouldDropKeyExactTieDrops) {
+  const std::optional<MvccStamp> stored = MvccStamp{1000, 7};
+  const MvccStamp incoming{1000, 7};
+  EXPECT_TRUE(LwwShouldDropKey(stored, incoming)) << "ties favor the stored side";
+}
+
+TEST(MultimasterLwwTest, LwwShouldDropKeyEqualMvccHigherIncomingOriginDoesNotDrop) {
+  const std::optional<MvccStamp> stored = MvccStamp{1000, 5};
+  const MvccStamp incoming{1000, 9};
+  EXPECT_FALSE(LwwShouldDropKey(stored, incoming));
+}
+
+TEST(MultimasterLwwTest, LwwShouldDropKeyEqualMvccLowerIncomingOriginDrops) {
+  const std::optional<MvccStamp> stored = MvccStamp{1000, 9};
+  const MvccStamp incoming{1000, 5};
+  EXPECT_TRUE(LwwShouldDropKey(stored, incoming));
+}
+
+// The tombstone bit (63) must be masked out of the comparison, not compared as part of the raw
+// packed value: a stored tombstone with an otherwise OLDER ms would, compared raw, look "newer"
+// than an un-tombstoned incoming write purely because bit 63 dominates the integer's magnitude --
+// wrongly dropping the incoming write. Masked comparison (Mvcc(), origin_hash) must see it as
+// older and keep the incoming write.
+TEST(MultimasterLwwTest, LwwShouldDropKeyTombstoneBitIsMaskedNotComparedRaw) {
+  constexpr uint64_t kOlderMs = 100, kNewerMs = 200;
+  const std::optional<MvccStamp> stored =
+      MvccStamp{kOlderMs << MvccClock::kCounterBits, /*origin_hash=*/5}.AsTombstone();
+  const MvccStamp incoming{kNewerMs << MvccClock::kCounterBits, /*origin_hash=*/5};
+  ASSERT_GT(stored->packed, incoming.packed) << "raw packed comparison must favor `stored` here "
+                                                "-- otherwise this test proves nothing";
+  EXPECT_FALSE(LwwShouldDropKey(stored, incoming));
+}
+
+TEST(MultimasterLwwTest, IncomingStampRegisteredOriginFormsTheStamp) {
+  MvccStamper* s = FreshStamper();
+  s->RegisterOriginHash(3, 0xABCDEFu);
+  const std::optional<MvccStamp> got = IncomingStamp(/*mvcc=*/555, /*origin_idx=*/3);
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(got->Mvcc(), 555u);
+  EXPECT_EQ(got->origin_hash, 0xABCDEFu);
+}
+
+// mvcc == 0 must short-circuit before the origin lookup: an unregistered origin_idx here must
+// not trip IncomingStamp's DCHECK (see IncomingStampUnregisteredOriginDies below).
+TEST(MultimasterLwwTest, IncomingStampZeroMvccIsNullopt) {
+  FreshStamper();
+  EXPECT_FALSE(IncomingStamp(/*mvcc=*/0, /*origin_idx=*/3).has_value());
+}
+
+#ifndef NDEBUG
+// An unregistered origin with a non-zero mvcc means a caller invoked this before the peer's
+// handshake registered its hash -- IncomingStamp DCHECKs that never happens rather than silently
+// forming a bogus {mvcc, 0} stamp that would compare wrong for every key.
+TEST(MultimasterLwwDeathTest, IncomingStampUnregisteredOriginDies) {
+  FreshStamper();
+  EXPECT_DEBUG_DEATH(IncomingStamp(/*mvcc=*/1, /*origin_idx=*/99), "no registered hash");
+}
+#endif  // NDEBUG
 
 #ifndef NDEBUG
 // Hole 1(b): a CommitFn that called Commit() again used to clear armed_/arena_ out from under the

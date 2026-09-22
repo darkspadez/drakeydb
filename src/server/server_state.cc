@@ -64,7 +64,7 @@ ServerState::Stats::Stats(unsigned num_shards)
 }
 
 ServerState::Stats& ServerState::Stats::Add(const ServerState::Stats& other) {
-  static_assert(sizeof(Stats) == 30 * 8, "Stats size mismatch");
+  static_assert(sizeof(Stats) == 31 * 8, "Stats size mismatch");
 
 #define ADD(x) this->x += (other.x)
 
@@ -114,6 +114,7 @@ ServerState::Stats& ServerState::Stats::Add(const ServerState::Stats& other) {
   }
 
   ADD(stored_cmd_bytes);
+  ADD(multimaster_lww_dropped);
   return *this;
 #undef ADD
 }

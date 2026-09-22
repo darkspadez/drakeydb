@@ -147,6 +147,13 @@ class ServerState {  // public struct - to allow initialization.
 
     // Memory size of stored commands during multi-exec in connections
     size_t stored_cmd_bytes = 0;
+
+    // drakeydb: P4-4 -- count of replicated writes dropped by the streaming LWW guard (peer
+    // link only; see multimaster_lww.h). Deliberately placed at the end of the struct, not next
+    // to conn_timeout_events (uint32_t) above: that field's 4 bytes of trailing padding would
+    // silently absorb a same-sized field there without tripping the sizeof() static_assert in
+    // Stats::Add.
+    uint64_t multimaster_lww_dropped = 0;
   };
 
   // Unsafe version.
