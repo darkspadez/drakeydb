@@ -17,6 +17,7 @@
 
 #include "base/gtest.h"
 #include "facade/facade_test.h"
+#include "server/command_registry.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/executor.h"
 #include "server/journal/serializer.h"
@@ -25,12 +26,14 @@
 #include "server/journal/tx_executor.h"
 #include "server/journal/types.h"
 #include "server/multi_master.h"
+#include "server/multimaster_lww.h"
 #include "server/node_identity.h"
 #include "server/rdb_load.h"
 #include "server/rdb_load_context.h"
 #include "server/rdb_save.h"
 #include "server/replica.h"
 #include "server/test_utils.h"
+#include "server/transaction.h"
 #include "util/fibers/fibers.h"
 #include "util/fibers/pool.h"
 
@@ -530,6 +533,24 @@ class DflyShardReplicaOriginTest : public BaseFamilyTest {
     return flow.executor_->connection_context()->repl_origin_idx;
   }
 
+  // drakeydb: P4-4 Task A2 -- constructs a DflyShardReplica with `peer_mode` (origin_idx fixed at
+  // an arbitrary non-self value; irrelevant to the guard bit) and returns the streaming LWW guard
+  // bit observed on its JournalExecutor's ConnectionContext. Same off-socket, no-I/O construction
+  // as ObservedOriginIdx above, and for the same reason (friendship is not inherited into a
+  // TEST_F body). Caller controls FLAGS_active_replica/FLAGS_multi_master_stream_lww directly
+  // (absl::FlagSaver in the TEST_F body) since the constructor reads both once at flow setup.
+  bool ObservedLwwGuard(bool peer_mode) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    constexpr uint32_t kSomePeerIdx = 3;  // != PeerRegistry::kSelfIdx; irrelevant to the guard bit.
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, kSomePeerIdx, peer_mode);
+    return flow.executor_->connection_context()->repl_lww_guard;
+  }
+
   // drakeydb: Phase 3 T7b -- constructs a DflyShardReplica with `origin_idx`, replays a
   // hand-crafted "SET key replayed-value" through its rdb_loader_ (the full-sync
   // concurrent-journal-blob apply path, RdbLoaderBase::HandleJournalBlob -- reaching rdb_loader_,
@@ -581,6 +602,40 @@ TEST_F(DflyShardReplicaOriginTest, ConstructorThreadsOriginIntoExecutor) {
   });
 }
 
+// drakeydb: P4-4 Task A2 -- proves DflyShardReplica's constructor threads the streaming LWW
+// guard's per-link bit (peer_mode && IsActiveReplica() && FLAGS_multi_master_stream_lww, read
+// ONCE here) into its JournalExecutor's ConnectionContext, and that every one of the three gates
+// independently suppresses it. A plain replica (peer_mode == false) is the most important case:
+// it must NEVER be guarded, regardless of the other two flags.
+//
+// Falsifying (verified by hand): hardcoding SetApplyLwwGuard(false) in the constructor
+// (replica.cc) makes the first EXPECT_TRUE below fail (observes false instead of true); the three
+// EXPECT_FALSE checks are unaffected by that change (already false). Restoring the real
+// expression and instead hardcoding SetApplyLwwGuard(true) makes the peer_mode=false and flag=off
+// EXPECT_FALSE checks fail instead (observe true).
+TEST_F(DflyShardReplicaOriginTest, ConstructorThreadsLwwGuardIntoExecutor) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_active_replica, true);
+  absl::SetFlag(&FLAGS_multi_master_stream_lww, true);
+  pp_->at(0)->Await([&] {
+    // Guarded: a peer link, on an active node, with the flag on.
+    EXPECT_TRUE(ObservedLwwGuard(/*peer_mode=*/true));
+
+    // A plain replica (non-peer link) is NEVER guarded -- the most important case.
+    EXPECT_FALSE(ObservedLwwGuard(/*peer_mode=*/false));
+  });
+
+  absl::SetFlag(&FLAGS_multi_master_stream_lww, false);
+  pp_->at(0)->Await(
+      [&] { EXPECT_FALSE(ObservedLwwGuard(/*peer_mode=*/true)) << "flag off must disable it"; });
+  absl::SetFlag(&FLAGS_multi_master_stream_lww, true);
+
+  absl::SetFlag(&FLAGS_active_replica, false);
+  pp_->at(0)->Await([&] {
+    EXPECT_FALSE(ObservedLwwGuard(/*peer_mode=*/true)) << "a non-active node must never guard";
+  });
+}
+
 // drakeydb: Phase 3 T7b -- a peer's FULL SYNC has a second apply path besides the stable-sync
 // executor_ ConstructorThreadsOriginIntoExecutor above covers: the concurrent journal blob
 // embedded in the full sync itself, replayed via rdb_loader_ (RdbLoaderBase::HandleJournalBlob).
@@ -620,6 +675,46 @@ TEST_F(DflyShardReplicaOriginTest, FullSyncJournalBlobAppliesAndReJournalsWithFl
   // The writes genuinely applied -- not merely got tagged with the right origin.
   EXPECT_EQ(Run({"GET", peer_key}), "replayed-value");
   EXPECT_EQ(Run({"GET", self_key}), "replayed-value");
+}
+
+// drakeydb: P4-4 Task A2 -- Transaction-level plumbing: SetReplOrigin's new `lww_guard` argument
+// reaches IsLwwGuarded() and GetDbContext().repl_lww_guard directly (no dispatch/journal
+// involved), and a squashed-multi stub built from a guarded parent (the parent/shard_id/slot_id
+// constructor, transaction.cc) inherits the bit. Constructs Transactions directly with a real
+// command id from the service's registry (mirroring transaction_test.cc's MakeTx pattern), since
+// IsLwwGuarded()/GetDbContext() need no scheduling/InitByArgs to exercise.
+//
+// Falsifying (verified by hand): dropping the `repl_lww_guard_ = lww_guard;` line from
+// SetReplOrigin (transaction.h) makes the first EXPECT_TRUE and the stub's EXPECT_TRUE below fail
+// (both observe false); the F1 (zero-mvcc) and lww_guard=false checks are unaffected, since they
+// already expect false. Separately, dropping `repl_lww_guard_ = parent->repl_lww_guard_;` from
+// the squashed-stub constructor (transaction.cc) makes only the stub's EXPECT_TRUE fail, with the
+// parent's own checks above it unaffected -- isolating the stub-inheritance line specifically.
+TEST_F(BaseFamilyTest, ReplOriginLwwGuardReachesTransactionDbContextAndStub) {
+  const CommandId* set_cid = service_->FindCmd("SET");
+  ASSERT_NE(set_cid, nullptr);
+
+  boost::intrusive_ptr<Transaction> tx(new Transaction{set_cid});
+
+  tx->SetReplOrigin(/*origin_idx=*/1, /*mvcc=*/5, /*lww_guard=*/true);
+  EXPECT_TRUE(tx->IsLwwGuarded());
+  EXPECT_TRUE(tx->GetDbContext().repl_lww_guard);
+
+  // F1: a zero mvcc (classic Redis/KeyDB link, or a DFLY link to a non-active node) is never
+  // guarded, even with the link bit set.
+  tx->SetReplOrigin(/*origin_idx=*/1, /*mvcc=*/0, /*lww_guard=*/true);
+  EXPECT_FALSE(tx->IsLwwGuarded());
+
+  // Link bit off -> never guarded, even with a real stamp.
+  tx->SetReplOrigin(/*origin_idx=*/1, /*mvcc=*/5, /*lww_guard=*/false);
+  EXPECT_FALSE(tx->IsLwwGuarded());
+
+  // A squashed stub built from a guarded parent inherits the bit (bypasses SetReplOrigin/
+  // PrepareTransaction entirely -- see the parent/shard_id/slot_id constructor).
+  tx->SetReplOrigin(/*origin_idx=*/1, /*mvcc=*/5, /*lww_guard=*/true);
+  boost::intrusive_ptr<Transaction> stub(new Transaction{tx.get(), /*shard_id=*/0, std::nullopt});
+  EXPECT_TRUE(stub->IsLwwGuarded());
+  EXPECT_TRUE(stub->GetDbContext().repl_lww_guard);
 }
 
 // drakeydb: Phase 3 T6b -- verifies DflyShardReplica threads `peer_mode` from construction into

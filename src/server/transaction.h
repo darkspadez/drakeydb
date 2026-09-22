@@ -21,6 +21,7 @@
 #include "server/cluster_support.h"
 #include "server/common.h"
 #include "server/journal/types.h"
+#include "server/multimaster_lww.h"
 #include "server/tx_base.h"
 #include "util/fibers/synchronization.h"
 
@@ -351,6 +352,9 @@ class Transaction {
     DbContext ctx{namespace_, db_index_, time_now_ms_};
     ctx.repl_origin_idx = repl_origin_idx_;
     ctx.repl_mvcc = repl_mvcc_;
+    // drakeydb: P4-4 -- mirrors repl_origin_idx_/repl_mvcc_ above; see DbContext::repl_lww_guard
+    // (tx_base.h).
+    ctx.repl_lww_guard = repl_lww_guard_;
     return ctx;
   }
 
@@ -379,9 +383,21 @@ class Transaction {
   // per dispatch in PrepareTransaction (main_service.cc); squashed-multi stub transactions
   // instead inherit it directly from their parent (see the parent/shard_id/slot_id constructor)
   // since they never go through PrepareTransaction.
-  void SetReplOrigin(uint32_t origin_idx, uint64_t mvcc) {
+  // drakeydb: P4-4 -- `lww_guard` (the connection's repl_lww_guard) has no default: every caller
+  // must decide explicitly rather than silently defaulting to unguarded or guarded. Behaviour-
+  // free until task A3 reads IsLwwGuarded() below.
+  void SetReplOrigin(uint32_t origin_idx, uint64_t mvcc, bool lww_guard) {
     repl_origin_idx_ = origin_idx;
     repl_mvcc_ = mvcc;
+    repl_lww_guard_ = lww_guard;
+  }
+
+  // drakeydb: P4-4 -- true only on a guarded peer link (repl_lww_guard_) AND a non-zero author
+  // stamp (F1: a zero mvcc -- classic Redis/KeyDB link, or a DFLY link to a non-active node --
+  // is never guarded). Delegates to A1's single predicate (multimaster_lww.h) rather than
+  // re-implementing the rule; nothing calls this yet (the veto is task A3).
+  bool IsLwwGuarded() const {
+    return LwwGuardActive(repl_lww_guard_, repl_mvcc_);
   }
 
   // Re-enable auto journal for commands marked as NO_AUTOJOURNAL. Call during setup.
@@ -696,6 +712,11 @@ class Transaction {
   // that header into one of the most widely-included headers in the tree.
   uint32_t repl_origin_idx_{0};
   uint64_t repl_mvcc_{0};
+
+  // drakeydb: P4-4 -- the streaming LWW guard's per-link bit, mirroring repl_origin_idx_/
+  // repl_mvcc_ above (see SetReplOrigin/IsLwwGuarded). False for an ordinary client-issued
+  // transaction and for a non-guarded apply (plain replica, classic link, flag off).
+  bool repl_lww_guard_{false};
 
   std::atomic_uint32_t use_count_{0};  // transaction exists only as an intrusive_ptr
 

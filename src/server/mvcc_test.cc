@@ -557,8 +557,9 @@ TEST(MvccStamperTest, CommitDepthRecoversAfterCommitFnThrows) {
 }
 
 // ---------------------------------------------------------------------------
-// multimaster_lww.h: the streaming LWW guard's pure decision module (P4-4 Task A1). Behaviour-
-// free -- these tests are the only caller until A2-A12 wire the module in.
+// multimaster_lww.h: the streaming LWW guard's pure decision module (P4-4 Task A1). These tests
+// exercise the module in isolation; see peer_replication_test.cc for its callers
+// (Transaction::IsLwwGuarded, DflyShardReplica's constructor).
 // ---------------------------------------------------------------------------
 
 TEST(MultimasterLwwTest, ClassifyJournaledCommandMatchesEveryTableRow) {

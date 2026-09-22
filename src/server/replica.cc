@@ -37,6 +37,7 @@ extern "C" {
 #include "server/journal/serializer.h"
 #include "server/main_service.h"
 #include "server/multi_master.h"
+#include "server/multimaster_lww.h"
 #include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/node_identity.h"
@@ -1720,6 +1721,15 @@ DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext m
   // here at flow setup, not per entry. Also read back by StableSyncDflyReadFb's PING re-record
   // below, via executor_->connection_context()->repl_origin_idx.
   executor_->SetApplyOrigin(origin_idx);
+  // drakeydb: P4-4 Task A2 -- the streaming LWW guard's per-link bit (see
+  // ConnectionContext::repl_lww_guard, JournalExecutor::SetApplyLwwGuard,
+  // Transaction::IsLwwGuarded). Read ONCE here, at flow setup, matching SetApplyOrigin above --
+  // never per entry (journal.cc:26-32 documents an uncached absl::GetFlag on a hot path as a
+  // known defect class in this codebase). A plain replica (peer_mode == false) is never guarded
+  // regardless of the flag or IsActiveReplica(); this constructor does not yield (see the long
+  // comment below), and reading a flag does not yield either.
+  executor_->SetApplyLwwGuard(peer_mode && IsActiveReplica() &&
+                              absl::GetFlag(FLAGS_multi_master_stream_lww));
   // drakeydb: Phase 4, fix round (F1v2) -- the origin_idx -> author hash registration this flow
   // needs (see Replica::peer_origin_hash_'s doc comment) is deliberately NOT done here. An
   // earlier version of this constructor called shard_set->pool()->AwaitBrief(...) at this exact

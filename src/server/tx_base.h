@@ -86,6 +86,11 @@ struct DbContext {
   // instead of reproducing the author's).
   uint64_t repl_mvcc = 0;
 
+  // drakeydb: P4-4 -- mirrors Transaction::repl_lww_guard_/ConnectionContext::repl_lww_guard: true
+  // iff this apply came in over a guarded peer link. Copied by Transaction::GetDbContext()
+  // (transaction.h); nothing reads it yet (the veto is task A3).
+  bool repl_lww_guard = false;
+
   // Convenience method.
   DbSlice& GetDbSlice(ShardId shard_id) const;
 };

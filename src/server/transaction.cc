@@ -174,8 +174,12 @@ Transaction::Transaction(const Transaction* parent, ShardId shard_id, std::optio
   // is the single construction point for every squashed-multi stub, incl. the general
   // multi_command_squasher.cc path) so a squashed MULTI/EXEC applied from a peer journals under
   // that peer's origin instead of echoing back to it as self-originated.
+  // drakeydb: P4-4 -- also inherit repl_lww_guard_ the same way: this ctor assigns members
+  // directly and bypasses SetReplOrigin (and thus PrepareTransaction), so a squashed stub built
+  // from a guarded parent would otherwise silently lose the bit.
   repl_origin_idx_ = parent->repl_origin_idx_;
   repl_mvcc_ = parent->repl_mvcc_;
+  repl_lww_guard_ = parent->repl_lww_guard_;
 }
 
 Transaction::~Transaction() {

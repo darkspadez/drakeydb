@@ -109,7 +109,10 @@ MultiCommandSquasher::ShardExecInfo& MultiCommandSquasher::PrepareShardInfo(Shar
       // (not via PrepareTransaction, and with no parent to inherit from), so it would otherwise
       // always journal as kSelfIdx regardless of the connection's actual apply-origin. cntx_ is
       // the same ConnectionContext PrepareTransaction reads from for the atomic/top-level case.
-      sinfo.local_tx->SetReplOrigin(cntx_->repl_origin_idx, cntx_->repl_mvcc);
+      // drakeydb: P4-4 -- also copies repl_lww_guard the same way; see
+      // ConnectionContext::repl_lww_guard.
+      sinfo.local_tx->SetReplOrigin(cntx_->repl_origin_idx, cntx_->repl_mvcc,
+                                    cntx_->repl_lww_guard);
     }
     num_shards_++;
   }

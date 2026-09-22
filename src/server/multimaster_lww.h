@@ -18,9 +18,10 @@ ABSL_DECLARE_FLAG(bool, multi_master_stream_lww);
 
 namespace dfly {
 
-// drakeydb: P4-4 -- the streaming LWW guard's pure decision module: no caller yet (A2-A12 wire
-// this in). Every function here is behaviour-free until then -- nothing in production reads
-// FLAGS_multi_master_stream_lww or calls any function below.
+// drakeydb: P4-4 -- the streaming LWW guard's pure decision module. FLAGS_multi_master_stream_lww
+// is read once per peer link, at flow setup, by DflyShardReplica's constructor (replica.cc);
+// LwwGuardActive backs Transaction::IsLwwGuarded() (transaction.h). Nothing yet acts on the
+// result -- the veto is task A3.
 
 // A journaled command's guard classification. kUnguarded commands are never LWW-compared; a
 // kSingleKey command's OWN journaled write is compared under the key's lock; a
