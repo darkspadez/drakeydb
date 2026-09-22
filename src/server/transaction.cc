@@ -1621,6 +1621,19 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
   DCHECK(multi_ && multi_->role == SQUASHED_STUB);
   DCHECK_EQ(unique_shard_cnt_, 1u);
 
+  // drakeydb: P4-4 -- fail-open tripwire (Task A4), not a guard: bypasses RunCallback's
+  // ShouldDropForLww veto entirely. Reachable in production only from the classic Redis/KeyDB
+  // link (replica.cc -> DispatchSquashedBatch -> MultiCommandSquasher), which never carries an
+  // mvcc, so IsLwwGuarded() should never be true here -- and no squash-path SetReplOrigin site
+  // refreshes repl_mvcc_ per command, so a real guard would compare a stale, batch-level stamp.
+  // A future change that makes this reachable (e.g. P7 stamping a KeyDB link) must fix that
+  // first, then guard here like RunCallback; until then, this only logs and applies unguarded.
+  if (IsLwwGuarded()) {
+    LOG(DFATAL) << "multi-master LWW guard reached RunSquashedMultiCb: repl_mvcc_ is "
+                   "batch-level here, not per-command, and cannot be safely compared -- "
+                   "applying unguarded";
+  }
+
   auto* shard = EngineShard::tlocal();
   auto& db_slice = GetDbSlice(shard->shard_id());
 

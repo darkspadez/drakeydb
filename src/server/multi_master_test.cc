@@ -3749,6 +3749,44 @@ class OriginJournalFamilyTest : public MultiMasterFamilyTest {
     num_threads_ = 1;
     absl::SetFlag(&FLAGS_num_shards, 1);
   }
+
+  // drakeydb: P4-4 Task A4 -- drives ONE command through a REAL MULTI/EXEC squash on a single
+  // JournalExecutor, the only way (short of calling RunSquashedMultiCb directly) to reach a
+  // SQUASHED_STUB from outside transaction.cc. Unlike MvccStoreTest's ApplyReplicatedCommand
+  // (which builds a fresh JournalExecutor per call), MULTI's queued state lives on the executor's
+  // own ConnectionContext, so MULTI and EXEC must share one instance -- the same reason
+  // SquashedStubInheritsParentOrigin (above) keeps its own `executor` alive across all four
+  // dispatch calls. origin_idx/mvcc/lww_guard are set once on the executor (SetApplyOrigin/
+  // SetApplyMvcc/SetApplyLwwGuard), matching how a real peer link configures them once at flow
+  // setup, not per command -- see MultiCommandSquasher::PrepareShardInfo's SetReplOrigin copy and
+  // Transaction's squashed-stub ctor (transaction.cc), which is what carries them onto the stub.
+  facade::DispatchResult ExecSquashedGuardedCommand(std::vector<std::string> cmd_args,
+                                                    uint32_t origin_idx, uint64_t mvcc,
+                                                    bool lww_guard) {
+    facade::DispatchResult multi_res = facade::DispatchResult::ERROR;
+    facade::DispatchResult cmd_res = facade::DispatchResult::ERROR;
+    facade::DispatchResult exec_res = facade::DispatchResult::ERROR;
+    pp_->at(0)
+        ->LaunchFiber([&] {
+          JournalExecutor executor(service_.get());
+          executor.SetApplyOrigin(origin_idx);
+          executor.SetApplyMvcc(mvcc);
+          executor.SetApplyLwwGuard(lww_guard);
+
+          auto dispatch = [&](std::vector<std::string> parts) {
+            journal::ParsedEntry::CmdData cmd_data;
+            cmd_data.Assign(parts.begin(), parts.end(), parts.size());
+            return executor.Execute(0, cmd_data);
+          };
+          multi_res = dispatch({"MULTI"});
+          cmd_res = dispatch(cmd_args);
+          exec_res = dispatch({"EXEC"});
+        })
+        .Join();
+    EXPECT_EQ(facade::DispatchResult::OK, multi_res);
+    EXPECT_EQ(facade::DispatchResult::OK, cmd_res);
+    return exec_res;
+  }
 };
 
 // drakeydb: Phase 3 T3 acceptance case. Proves the apply-origin plumbing end to end: a command
@@ -3896,6 +3934,73 @@ TEST_F(OriginJournalFamilyTest, SquashedStubInheritsParentOrigin) {
   }
 
   pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+}
+
+#ifndef NDEBUG
+// drakeydb: P4-4 Task A4 acceptance case for the fail-open tripwire (transaction.cc,
+// RunSquashedMultiCb). RunSquashedMultiCb is a second run point that bypasses RunCallback (and
+// its ShouldDropForLww veto) entirely; in production it is reachable only from a classic
+// Redis/KeyDB link, which never carries an mvcc, so IsLwwGuarded() can never be true there today.
+// This test builds the case the brief says production cannot reach yet: a JournalExecutor whose
+// link is marked guarded (SetApplyLwwGuard(true)) with a non-zero author stamp
+// (SetApplyMvcc(kGuardedMvcc)), driving a real MULTI/SET/EXEC so MultiCommandSquasher builds a
+// SQUASHED_STUB that inherits both (its own SetReplOrigin copy, plus the squashed-stub
+// constructor in transaction.cc) -- exactly the seam the tripwire exists to catch.
+//
+// "threadsafe" death-test style avoids forking mid-flight of this fixture's own proactor/shard
+// threads -- the same workaround and rationale as
+// RdbMvccTest.RollbackFreshInsertRefusesNonFreshEntry (rdb_test.cc). Wrapped in #ifndef NDEBUG
+// because LOG(DFATAL) compiles to LOG(FATAL) (aborts) only when NDEBUG is undefined; under NDEBUG
+// it is LOG(ERROR) (fails open, does not abort), matching EXPECT_DEBUG_DEATH's own documented
+// behavior of the two build types (mvcc_test.cc's death tests use the identical guard for the same
+// reason).
+//
+// Falsification: with the `if (IsLwwGuarded())` block deleted from RunSquashedMultiCb, this test
+// fails with (verbatim, recorded in the task report):
+//   Death test: ExecSquashedGuardedCommand(...)
+//       Result: failed to die.
+//    Error msg:
+//   [  DEATH   ]
+TEST_F(OriginJournalFamilyTest, GuardedSquashedStubTripwireFiresInDebug) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  constexpr uint32_t kPeerOrigin = 11;
+  constexpr uint64_t kGuardedMvcc = 42;
+
+  EXPECT_DEBUG_DEATH(
+      ExecSquashedGuardedCommand({"SET", "guarded-squash-key", "v"}, kPeerOrigin, kGuardedMvcc,
+                                 /*lww_guard=*/true),
+      "multi-master LWW guard reached RunSquashedMultiCb");
+}
+#endif  // NDEBUG
+
+// drakeydb: P4-4 Task A4 -- the tripwire's non-guarded control: a squashed stub built from an
+// unguarded link (repl_lww_guard=false) must NOT trip, and must actually apply the write, exactly
+// like today's only production caller (a classic Redis/KeyDB link via DispatchSquashedBatch).
+// Distinguishes "the tripwire never fires" from "the tripwire fires and then fails open anyway" --
+// this test would still pass under either bug, but GuardedSquashedStubTripwireFiresInDebug (above)
+// and ZeroMvccSquashedStubNeverTripsTripwire (below) each isolate one of IsLwwGuarded()'s two
+// factors (repl_lww_guard_ and repl_mvcc_ respectively), so together the three tests cover both.
+TEST_F(OriginJournalFamilyTest, NonGuardedSquashedStubNeverTripsTripwire) {
+  constexpr uint32_t kPeerOrigin = 12;
+  constexpr uint64_t kAuthorMvcc = 42;
+
+  facade::DispatchResult exec_res = ExecSquashedGuardedCommand(
+      {"SET", "unguarded-squash-key", "v"}, kPeerOrigin, kAuthorMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(facade::DispatchResult::OK, exec_res);
+  EXPECT_EQ("v", Run({"get", "unguarded-squash-key"}));
+}
+
+// drakeydb: P4-4 Task A4 -- the tripwire's other non-guarded control: F1's rule (mvcc == 0 is
+// never guarded, classic Redis/KeyDB links never carry one) holds even on a link that otherwise
+// claims to be guarded -- LwwGuardActive (multimaster_lww.h) requires both a set guard bit AND a
+// non-zero mvcc, and IsLwwGuarded() is exactly what RunSquashedMultiCb's tripwire now reads.
+TEST_F(OriginJournalFamilyTest, ZeroMvccSquashedStubNeverTripsTripwire) {
+  constexpr uint32_t kPeerOrigin = 13;
+
+  facade::DispatchResult exec_res = ExecSquashedGuardedCommand(
+      {"SET", "zero-mvcc-squash-key", "v"}, kPeerOrigin, /*mvcc=*/0, /*lww_guard=*/true);
+  EXPECT_EQ(facade::DispatchResult::OK, exec_res);
+  EXPECT_EQ("v", Run({"get", "zero-mvcc-squash-key"}));
 }
 
 namespace {
