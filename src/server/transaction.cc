@@ -742,7 +742,7 @@ void Transaction::RunCallback(EngineShard* shard) {
   // own EngineShard*), so the veto decision must never live on the Transaction itself -- doing so
   // would race across shards for a multi-key command. See ShouldDropForLww's own comment
   // (transaction.h) for why the compare runs here, under the key's lock, rather than pre-dispatch.
-  const bool lww_dropped = ShouldDropForLww(shard);
+  const bool lww_dropped = ShouldDropForLww(shard, db_slice);
 
   RunnableResult result;
   try {
@@ -800,7 +800,7 @@ void Transaction::RunCallback(EngineShard* shard) {
   // entry exists. See server/mvcc.h.
 }
 
-bool Transaction::ShouldDropForLww(EngineShard* shard) {
+bool Transaction::ShouldDropForLww(EngineShard* shard, DbSlice& db_slice) const {
   if (!IsLwwGuarded())
     return false;
 
@@ -829,7 +829,7 @@ bool Transaction::ShouldDropForLww(EngineShard* shard) {
     return false;  // Unregistered origin; IncomingStamp already DCHECKed this should not happen.
 
   const std::string_view key = keys.Front();
-  const std::optional<MvccStamp> stored = GetDbSlice(shard->shard_id()).GetMvcc(db_index_, key);
+  const std::optional<MvccStamp> stored = db_slice.GetMvcc(db_index_, key);
   if (!LwwShouldDropKey(stored, *incoming))
     return false;
 

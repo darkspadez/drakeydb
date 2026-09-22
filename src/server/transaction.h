@@ -629,8 +629,9 @@ class Transaction {
   // never pre-dispatch. A pre-dispatch check reads the stamp before the key is actually locked
   // for this hop; a local write could land in the window between that read and the apply, and the
   // dropped peer write would then never be retried -- a permanent, silent divergence instead of a
-  // merely reordered one.
-  bool ShouldDropForLww(EngineShard* shard);
+  // merely reordered one. `db_slice` is the caller's own GetDbSlice(shard->shard_id()) -- passed
+  // in rather than looked up again here.
+  bool ShouldDropForLww(EngineShard* shard, DbSlice& db_slice) const;
 
   // Whether the callback can be run directly on this fiber without dispatching on the shard queue.
   // It checks internally that there are no possible suspension points.

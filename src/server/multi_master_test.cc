@@ -2809,9 +2809,8 @@ TEST_F(MvccStoreTest, DerivedDeleteFromAppliedWriteKeepsAuthorStamp) {
 // successfully applied (never forcing a resync), and recording exactly one drop with no
 // unstamped write left behind.
 //
-// Falsifying (see task-A3-report.md for the verbatim run): removing ShouldDropForLww's veto
-// (transaction.cc), i.e. making it always `return false`, makes the first EXPECT_EQ below observe
-// "peer" instead of "local".
+// Falsifying: removing ShouldDropForLww's veto (transaction.cc), i.e. making it always
+// `return false`, makes the first EXPECT_EQ below observe "peer" instead of "local".
 TEST_F(MvccStoreTest, StalePeerSetDroppedUnderLwwGuard) {
   constexpr uint32_t kPeerIdx = 20;
   constexpr uint64_t kStaleMvcc = 0x1000ULL;  // far smaller than any real HopStamp
@@ -2868,25 +2867,41 @@ TEST_F(MvccStoreTest, StalePeerSetAppliesWithoutLwwGuard) {
 
 // drakeydb: P4-4 Task A3 -- F1 (multimaster_lww.h): a zero incoming mvcc (a classic Redis/KeyDB
 // link, or a DFLY link to a non-active node) must NEVER be guarded, even on a link whose guard
-// bit is on: IncomingStamp(0, ...) returns nullopt and ShouldDropForLww fails open on that alone.
-//
-// Falsifying (see task-A3-report.md): making ShouldDropForLww treat a nullopt `incoming` as
-// {0, 0} instead of failing open reproduces the failure this guards against -- the first
-// EXPECT_EQ below would observe "local" instead of "peer" (MergeAccepts(stored, {0,0}) is false
-// for any already-stamped key, so the write would be wrongly dropped).
+// bit is on. Two independent layers enforce this: IsLwwGuarded() itself requires repl_mvcc_ != 0
+// (LwwGuardActive), which short-circuits ShouldDropForLww before IncomingStamp is ever called;
+// IncomingStamp(0, ...) also independently returns nullopt on its own (its own fail-open
+// contract, documented in multimaster_lww.h). Either one alone already prevents this specific
+// entry from being vetoed -- removing only one of the two does not reproduce a visible failure
+// here. Disabling BOTH (dropping the mvcc half of IsLwwGuarded AND IncomingStamp's own
+// `mvcc == 0` check) does: the GET below then observes "local" instead of "peer", the stamp
+// checks below observe the pre-apply stamp unchanged instead of a freshly-minted, strictly newer
+// one, and the drop counter advances by one instead of staying flat.
 TEST_F(MvccStoreTest, UnstampedIncomingNeverGuarded) {
-  constexpr uint32_t kPeerIdx = 22;
-  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000022");
-  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+  ASSERT_EQ(Run({"set", "control", "v"}), "OK");
+  const uint64_t self_hash = StampOf("control")->origin_hash;
 
   ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
 
+  // origin_idx is kSelfIdx here (not a registered peer): this reproduces the "classic Redis/KeyDB
+  // link" sub-case of F1 verbatim (no peer identity AND no mvcc on the wire), while still forcing
+  // lww_guard=true to prove the fail-open holds even if a link's guard bit were (wrongly) set for
+  // such a flow. With no peer origin on the wire, RecordEntry's fresh HopStamp mint attributes to
+  // THIS node (OriginHash(kSelfIdx) == self_hash), so a real peer's hash never needs registering.
   const uint64_t before_dropped = TotalLwwDropped();
-  facade::DispatchResult res =
-      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, /*mvcc=*/0, /*lww_guard=*/true);
+  facade::DispatchResult res = ApplyReplicatedCommand({"set", "k", "peer"}, PeerRegistry::kSelfIdx,
+                                                      /*mvcc=*/0, /*lww_guard=*/true);
   EXPECT_EQ(res, facade::DispatchResult::OK);
 
   EXPECT_EQ(Run({"get", "k"}), "peer") << "mvcc == 0 must fail open even with the guard bit on";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_GT(after_stamp->Mvcc(), before_stamp->Mvcc())
+      << "an mvcc==0 apply still mints a fresh HopStamp on commit -- strictly newer than whatever "
+         "was there before, never a no-op and never the incoming (nonexistent) mvcc verbatim";
+  EXPECT_EQ(after_stamp->origin_hash, self_hash)
+      << "with no peer origin on the wire, the freshly-minted stamp is attributed to THIS node";
   EXPECT_EQ(TotalLwwDropped(), before_dropped) << "an unstamped apply must never count as a drop";
 }
 
@@ -2994,9 +3009,17 @@ TEST_F(MvccStoreTest, ExactTieDroppedWhenIncomingOriginHashIsSmaller) {
 // auto-journal -- both simply never reach their own RecordJournal call at all, since the callback
 // that contains it never runs on a drop.
 //
-// Falsifying (see task-A3-report.md): removing LogAutoJournalOnShard's `if (lww_dropped) return;`
-// early return (transaction.cc) reproduces the failure this test exists to catch -- every
-// `EXPECT_EQ(consumer.commands.load(), pre)` below instead observes `pre + 1`.
+// Falsifying: removing LogAutoJournalOnShard's `if (lww_dropped) return;` early return
+// (transaction.cc) -- while leaving RunCallback's own veto (ShouldDropForLww) intact, so the
+// callback still never runs -- reproduces the failure this test exists to catch for the five
+// auto-journaled blocks (SETNX, GETSET, GETDEL, PERSIST, RESTORE): each
+// `EXPECT_EQ(consumer.commands.load(), pre)` observes `pre + 1` instead, because the skipped
+// callback's forced `OpStatus::OK` result now sails through the pre-existing
+// `result.status != OpStatus::OK` gate. The SET and PEXPIREAT blocks do NOT fail under this
+// falsification alone: their own journal call (SetCmd::RecordJournal / OpExpire's RecordJournal)
+// lives inside the callback body, which the still-intact veto keeps from ever running, so this
+// specific removal has nothing to expose for those two -- the callback-skip in RunCallback is
+// what covers them, not this early return.
 TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyCommand) {
   constexpr uint32_t kPeerIdx = 26;
   constexpr uint64_t kStaleMvcc = 0x1000ULL;
@@ -3037,17 +3060,28 @@ TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyC
     EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
   }
 
-  {  // SETNX -- auto-journaled verbatim.
+  {  // SETNX -- auto-journaled verbatim. sj_setnx is deleted (tombstoned), not merely left
+     // absent or live: on a LIVE pre-existing key, SETNX's own IF_NOTEXIST precondition makes an
+     // actually-applied write indistinguishable from a dropped one -- SetCmd::Set returns
+     // SKIPPED either way, leaving value/stamp/journal count identically untouched, which would
+     // make every check below pass regardless of whether the veto ever fired. A tombstoned key
+     // still carries a real MVCC stamp for ShouldDropForLww to compare against (DbSlice::GetMvcc
+     // returns it regardless of liveness), but SETNX's own precondition IS satisfied on it (the
+     // key does not exist), so an actually-applied SETNX would create it with "peer" -- giving
+     // this block a real, observable difference between applied and dropped.
     SCOPED_TRACE("SETNX");
     ASSERT_EQ(Run({"set", "sj_setnx", "local"}), "OK");
+    ASSERT_EQ(Run({"del", "sj_setnx"}).GetInt(), 1);
     auto before = StampOf("sj_setnx");
     ASSERT_TRUE(before.has_value());
+    ASSERT_TRUE(before->IsTombstone());
     const size_t pre = consumer.commands.load();
     const uint64_t pre_dropped = TotalLwwDropped();
     auto res = ApplyReplicatedCommand({"setnx", "sj_setnx", "peer"}, kPeerIdx, kStaleMvcc, true);
     EXPECT_EQ(res, facade::DispatchResult::OK);
     EXPECT_EQ(consumer.commands.load(), pre);
-    EXPECT_EQ(Run({"get", "sj_setnx"}), "local");
+    EXPECT_EQ(Run({"exists", "sj_setnx"}).GetInt(), 0)
+        << "a dropped SETNX on a tombstoned key must NOT create it -- an applied one would";
     EXPECT_EQ(StampOf("sj_setnx"), before);
     EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
   }
@@ -3118,10 +3152,14 @@ TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyC
     EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
   }
 
-  {  // RESTORE -- auto-journaled verbatim.
+  {  // RESTORE -- auto-journaled verbatim. The dump is of a DIFFERENT key's value than
+     // sj_restore's own current one, so an incorrectly-applied RESTORE...REPLACE is actually
+     // observable: restoring the key's own unchanged dump verbatim would leave the value
+     // identical either way and prove nothing about whether the callback ran.
     SCOPED_TRACE("RESTORE");
     ASSERT_EQ(Run({"set", "sj_restore", "local"}), "OK");
-    std::string dump = Run({"dump", "sj_restore"}).GetString();
+    ASSERT_EQ(Run({"set", "sj_restore_donor", "peer_would_win"}), "OK");
+    std::string dump = Run({"dump", "sj_restore_donor"}).GetString();
     auto before = StampOf("sj_restore");
     ASSERT_TRUE(before.has_value());
     const size_t pre = consumer.commands.load();
@@ -3130,7 +3168,8 @@ TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyC
                                       kStaleMvcc, true);
     EXPECT_EQ(res, facade::DispatchResult::OK);
     EXPECT_EQ(consumer.commands.load(), pre);
-    EXPECT_EQ(Run({"get", "sj_restore"}), "local");
+    EXPECT_EQ(Run({"get", "sj_restore"}), "local")
+        << "a dropped RESTORE must not replace the key with the donor's different value";
     EXPECT_EQ(StampOf("sj_restore"), before);
     EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
   }
@@ -3154,11 +3193,20 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
   {  // INCR -- kUnguarded.
     SCOPED_TRACE("INCR");
     ASSERT_EQ(Run({"incr", "sj_incr"}).GetInt(), 1);
+    auto before = StampOf("sj_incr");
+    ASSERT_TRUE(before.has_value());
     const uint64_t pre_dropped = TotalLwwDropped();
     auto res = ApplyReplicatedCommand({"incr", "sj_incr"}, kPeerIdx, kStaleMvcc, true);
     EXPECT_EQ(res, facade::DispatchResult::OK);
     EXPECT_EQ(Run({"get", "sj_incr"}), "2")
         << "INCR is unguarded -- a stale mvcc must never veto it";
+    auto after = StampOf("sj_incr");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->Mvcc(), kStaleMvcc)
+        << "the incoming author's stamp is committed verbatim -- proof the write actually ran, "
+           "not merely that the value happened to look right";
+    EXPECT_EQ(after->origin_hash, peer_hash);
+    EXPECT_NE(*after, *before) << "sanity: the stamp must have actually advanced";
     EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "INCR must never count as an LWW drop";
   }
 
@@ -3171,6 +3219,13 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
     EXPECT_EQ(res, facade::DispatchResult::OK);
     EXPECT_EQ(Run({"exists", "sj_del"}).GetInt(), 0)
         << "before A8 adds DEL's own per-key guard, a stale peer DEL must still apply";
+    auto tomb = StampOf("sj_del");
+    ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+    EXPECT_TRUE(tomb->IsTombstone());
+    EXPECT_EQ(tomb->Mvcc(), kStaleMvcc)
+        << "the applied DEL's own tombstone carries the incoming author's stamp verbatim -- "
+           "proof it actually applied rather than being silently vetoed";
+    EXPECT_EQ(tomb->origin_hash, peer_hash);
     EXPECT_EQ(TotalLwwDropped(), pre_dropped)
         << "this generic single-key veto must never classify or count DEL";
   }
@@ -3186,6 +3241,16 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
     EXPECT_EQ(Run({"get", "sj_msk1"}), "peer1")
         << "before A7 adds MSET's own per-key guard, a stale peer MSET must still apply";
     EXPECT_EQ(Run({"get", "sj_msk2"}), "peer2");
+    auto st1 = StampOf("sj_msk1");
+    auto st2 = StampOf("sj_msk2");
+    ASSERT_TRUE(st1.has_value());
+    ASSERT_TRUE(st2.has_value());
+    EXPECT_EQ(st1->Mvcc(), kStaleMvcc)
+        << "MSET's own commit stamps every key with the incoming author's stamp verbatim -- "
+           "proof it actually applied rather than being silently vetoed";
+    EXPECT_EQ(st1->origin_hash, peer_hash);
+    EXPECT_EQ(st2->Mvcc(), kStaleMvcc);
+    EXPECT_EQ(st2->origin_hash, peer_hash);
     EXPECT_EQ(TotalLwwDropped(), pre_dropped)
         << "this generic single-key veto must never classify or count MSET";
   }
