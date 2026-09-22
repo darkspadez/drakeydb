@@ -969,8 +969,8 @@ class MvccStoreTest : public BaseFamilyTest {
   }
 
   // drakeydb: P4-4 Task A3 -- see TotalLwwDropped above; every drop test also asserts this did NOT
-  // advance (global-constraints.md's test-discipline rule), proving the veto took the "return
-  // OpStatus::OK without ever arming the key" path rather than arming and then abandoning it.
+  // advance, proving the veto took the "return OpStatus::OK without ever arming the key" path
+  // rather than arming and then abandoning it.
   uint64_t TotalUnstampedWrites() {
     std::atomic<uint64_t> total{0};
     shard_set->pool()->AwaitBrief(
@@ -2865,43 +2865,46 @@ TEST_F(MvccStoreTest, StalePeerSetAppliesWithoutLwwGuard) {
   EXPECT_EQ(st->origin_hash, peer_hash);
 }
 
-// drakeydb: P4-4 Task A3 -- F1 (multimaster_lww.h): a zero incoming mvcc (a classic Redis/KeyDB
-// link, or a DFLY link to a non-active node) must NEVER be guarded, even on a link whose guard
-// bit is on. Two independent layers enforce this: IsLwwGuarded() itself requires repl_mvcc_ != 0
-// (LwwGuardActive), which short-circuits ShouldDropForLww before IncomingStamp is ever called;
-// IncomingStamp(0, ...) also independently returns nullopt on its own (its own fail-open
-// contract, documented in multimaster_lww.h). Either one alone already prevents this specific
-// entry from being vetoed -- removing only one of the two does not reproduce a visible failure
-// here. Disabling BOTH (dropping the mvcc half of IsLwwGuarded AND IncomingStamp's own
-// `mvcc == 0` check) does: the GET below then observes "local" instead of "peer", the stamp
-// checks below observe the pre-apply stamp unchanged instead of a freshly-minted, strictly newer
-// one, and the drop counter advances by one instead of staying flat.
+// drakeydb: P4-4 Task A3 -- F1 (multimaster_lww.h): a zero incoming mvcc must NEVER be guarded,
+// even on a real peer link whose guard bit is on -- the "DFLY link to a non-active node" shape
+// (a classic Redis/KeyDB link, by contrast, never sets peer_mode_ at all, so its guard bit is
+// never on in production; this test isolates the F1 rule itself, on a registered PEER origin,
+// rather than reproducing the classic-link shape literally -- see F2/review-fix-round-2 for why
+// kSelfIdx would not exercise the real case). Two independent layers enforce F1: IsLwwGuarded()
+// itself requires repl_mvcc_ != 0 (LwwGuardActive), which short-circuits ShouldDropForLww before
+// IncomingStamp is ever called; IncomingStamp(0, ...) also independently returns nullopt on its
+// own (its own fail-open contract, documented in multimaster_lww.h). Either one alone already
+// prevents this specific entry from being vetoed -- removing only one of the two does not
+// reproduce a visible failure here. Disabling BOTH (dropping the mvcc half of IsLwwGuarded AND
+// IncomingStamp's own `mvcc == 0` check) does: the GET below then observes "local" instead of
+// "peer", and BOTH surviving-stamp checks below observe the pre-apply stamp unchanged instead of
+// a freshly-minted stamp under the peer's origin.
 TEST_F(MvccStoreTest, UnstampedIncomingNeverGuarded) {
-  ASSERT_EQ(Run({"set", "control", "v"}), "OK");
-  const uint64_t self_hash = StampOf("control")->origin_hash;
+  constexpr uint32_t kPeerIdx = 22;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000022");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
 
   ASSERT_EQ(Run({"set", "k", "local"}), "OK");
   auto before_stamp = StampOf("k");
   ASSERT_TRUE(before_stamp.has_value());
 
-  // origin_idx is kSelfIdx here (not a registered peer): this reproduces the "classic Redis/KeyDB
-  // link" sub-case of F1 verbatim (no peer identity AND no mvcc on the wire), while still forcing
-  // lww_guard=true to prove the fail-open holds even if a link's guard bit were (wrongly) set for
-  // such a flow. With no peer origin on the wire, RecordEntry's fresh HopStamp mint attributes to
-  // THIS node (OriginHash(kSelfIdx) == self_hash), so a real peer's hash never needs registering.
   const uint64_t before_dropped = TotalLwwDropped();
-  facade::DispatchResult res = ApplyReplicatedCommand({"set", "k", "peer"}, PeerRegistry::kSelfIdx,
-                                                      /*mvcc=*/0, /*lww_guard=*/true);
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, /*mvcc=*/0, /*lww_guard=*/true);
   EXPECT_EQ(res, facade::DispatchResult::OK);
 
   EXPECT_EQ(Run({"get", "k"}), "peer") << "mvcc == 0 must fail open even with the guard bit on";
   auto after_stamp = StampOf("k");
   ASSERT_TRUE(after_stamp.has_value());
+  // journal::RecordEntry (journal.cc:141) mints a fresh local HopStamp whenever entry.mvcc == 0,
+  // and MvccStamper::Commit (mvcc.cc:129) attributes that mint to entry.origin_idx verbatim --
+  // the LINK's peer index, not this node's own -- so the resulting stamp carries the peer's
+  // origin_hash even though the entry itself carried no author mvcc.
   EXPECT_GT(after_stamp->Mvcc(), before_stamp->Mvcc())
       << "an mvcc==0 apply still mints a fresh HopStamp on commit -- strictly newer than whatever "
          "was there before, never a no-op and never the incoming (nonexistent) mvcc verbatim";
-  EXPECT_EQ(after_stamp->origin_hash, self_hash)
-      << "with no peer origin on the wire, the freshly-minted stamp is attributed to THIS node";
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash)
+      << "the freshly-minted stamp is attributed to the LINK's peer origin, not this node's own";
   EXPECT_EQ(TotalLwwDropped(), before_dropped) << "an unstamped apply must never count as a drop";
 }
 
@@ -3064,11 +3067,13 @@ TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyC
      // absent or live: on a LIVE pre-existing key, SETNX's own IF_NOTEXIST precondition makes an
      // actually-applied write indistinguishable from a dropped one -- SetCmd::Set returns
      // SKIPPED either way, leaving value/stamp/journal count identically untouched, which would
-     // make every check below pass regardless of whether the veto ever fired. A tombstoned key
-     // still carries a real MVCC stamp for ShouldDropForLww to compare against (DbSlice::GetMvcc
-     // returns it regardless of liveness), but SETNX's own precondition IS satisfied on it (the
-     // key does not exist), so an actually-applied SETNX would create it with "peer" -- giving
-     // this block a real, observable difference between applied and dropped.
+     // make the value/stamp/journal-count checks below pass regardless of whether the veto ever
+     // fired (the drop counter would still distinguish them, but a single surviving assertion is
+     // a thin foundation for this block's whole point). A tombstoned key still carries a real
+     // MVCC stamp for ShouldDropForLww to compare against (DbSlice::GetMvcc returns it regardless
+     // of liveness), but SETNX's own precondition IS satisfied on it (the key does not exist), so
+     // an actually-applied SETNX would create it with "peer" -- giving this block a real,
+     // observable difference between applied and dropped.
     SCOPED_TRACE("SETNX");
     ASSERT_EQ(Run({"set", "sj_setnx", "local"}), "OK");
     ASSERT_EQ(Run({"del", "sj_setnx"}).GetInt(), 1);
