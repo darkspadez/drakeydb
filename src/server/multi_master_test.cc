@@ -4167,6 +4167,136 @@ TEST_F(MvccStoreTest, DelLwwIsNotDroppedAgainstAnOlderTombstone) {
 }
 
 // ---------------------------------------------------------------------------
+// P4-4 Task A11b: DELEX journals its RESULT (DEL), never its own name (generic_family.cc). A bare
+// `DELEX key` delegates to CmdDel/OpDelV2, which already has its own per-key guard (Task A8) --
+// the defect this task closes was purely in the AUTO-JOURNAL epilogue re-forwarding "DELEX key"
+// verbatim regardless of what OpDelV2 decided, since the generic single-key veto never classifies
+// DELEX (same reason it never classifies DEL/MSET -- see UnguardedAndSelfGuardedClassesAreNot-
+// VetoedByThisTask, Task A3, above). The conditional forms now hand-journal "DEL key" themselves;
+// see this file's EmittedNamePinsMatchClassifiedGuardedNames (Task A11, below) for proof of the
+// exact shape emitted, and DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesTheSurvivor /
+// DelLwwAllKeysStaleJournalsNothingAndLeavesLsnUnchanged (Task A8, above) for OpDelV2's own guard
+// on the "DEL key" this task's conditional path now emits.
+// ---------------------------------------------------------------------------
+
+// drakeydb: P4-4 Task A11b -- the receiver-side regression this task fixes: a guarded, STALE bare
+// `DELEX key` from a peer must be dropped by OpDelV2's own per-key guard (exactly like a stale
+// DEL) AND must forward nothing downstream. Before this task, DELEX's own auto-journal epilogue
+// forwarded "DELEX key" verbatim regardless of the drop -- a plain (never-guarded) replica further
+// downstream would apply that forwarded DELEX and diverge from its master -- a dropped write must
+// journal nothing, full stop.
+//
+// Falsified: reverting the CO::NO_AUTOJOURNAL added to DELEX's registration (generic_family.cc)
+// while keeping everything else made this test's live consumer see a "DELEX delex_leak_k" entry
+// (pre_entries + 1, not + 0).
+TEST_F(MvccStoreTest, DelexBareStaleAuthorLeakClosedByNoAutoJournal) {
+  constexpr uint32_t kPeerIdx = 76;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a11b-4000-8000-000000000076");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "delex_leak_k", "local"}), "OK");
+  auto before = StampOf("delex_leak_k");
+  ASSERT_TRUE(before.has_value());
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  ASSERT_GT(before->Mvcc(), kStaleMvcc) << "sanity: S must be newer than the stale author mvcc";
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res =
+      ApplyReplicatedCommand({"delex", "delex_leak_k"}, kPeerIdx, kStaleMvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", "delex_leak_k"}).GetInt(), 1)
+      << "a stale bare DELEX must be dropped by OpDelV2's own per-key guard, same as a stale DEL";
+  EXPECT_EQ(Run({"get", "delex_leak_k"}), "local");
+  auto after = StampOf("delex_leak_k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(*after, *before) << "a dropped key is never armed, so its stamp is untouched";
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), pre_entries)
+      << "DELEX is CO::NO_AUTOJOURNAL: a dropped bare DELEX must forward nothing downstream -- no "
+         "COMMAND journal entry, of any name, may reach a live consumer for it";
+}
+
+// drakeydb: P4-4 Task A11b -- the conditional forms' own result-journal (Delex's conditional cb,
+// generic_family.cc) hands a receiver plain "DEL key", so its receiver-side behavior is exactly
+// OpDelV2's existing per-key guard: an incoming stamp NEWER than the stored stamp deletes and
+// tombstones with the author's stamp verbatim; OLDER is dropped, stamp untouched. This test proves
+// that integration -- that the exact entry shape a conditional DELEX now emits (pinned separately
+// by EmittedNamePinsMatchClassifiedGuardedNames, Task A11, below) is not mishandled on receipt --
+// not OpDelV2's guard logic itself, which DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesThe-
+// Survivor (Task A8, above) already covers in full.
+TEST_F(MvccStoreTest, DelexConditionalResultDelNewerDeletesOlderDropped) {
+  constexpr uint32_t kPeerIdx = 77;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a11b-4000-8000-000000000077");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  {  // NEWER than the local stamp: deletes, tombstone = author stamp verbatim.
+    SCOPED_TRACE("newer");
+    ASSERT_EQ(Run({"set", "delex_res_new", "local"}), "OK");
+    auto before = StampOf("delex_res_new");
+    ASSERT_TRUE(before.has_value());
+    const uint64_t newer_mvcc = before->Mvcc() + 1;
+
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"del", "delex_res_new"}, kPeerIdx, newer_mvcc,
+                                      /*lww_guard=*/true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+
+    EXPECT_EQ(Run({"exists", "delex_res_new"}).GetInt(), 0);
+    auto tomb = StampOf("delex_res_new");
+    ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+    EXPECT_TRUE(tomb->IsTombstone());
+    EXPECT_EQ(*tomb, (MvccStamp{newer_mvcc, peer_hash}).AsTombstone())
+        << "the guard already guarantees incoming > stored for anything that survives it, so the "
+           "committed tombstone is the author's stamp verbatim, never floored";
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped);
+  }
+
+  {  // OLDER than the local stamp: dropped, stamp untouched.
+    SCOPED_TRACE("older");
+    ASSERT_EQ(Run({"set", "delex_res_old", "local"}), "OK");
+    auto before = StampOf("delex_res_old");
+    ASSERT_TRUE(before.has_value());
+    ASSERT_GT(before->Mvcc(), 1u) << "sanity: needs room below to construct an older mvcc";
+    const uint64_t older_mvcc = before->Mvcc() - 1;
+
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"del", "delex_res_old"}, kPeerIdx, older_mvcc,
+                                      /*lww_guard=*/true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+
+    EXPECT_EQ(Run({"exists", "delex_res_old"}).GetInt(), 1)
+        << "DEL's own per-key guard must drop a key whose incoming stamp is older than that key's "
+           "own stored stamp";
+    EXPECT_EQ(Run({"get", "delex_res_old"}), "local");
+    auto after = StampOf("delex_res_old");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(*after, *before) << "a dropped key is never armed, so its stamp is untouched";
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+    EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // P4-4 Task A9: the pre-dispatch SETNX->SET / RESTORE->+REPLACE rewrite (ApplyLwwRewrites,
 // multimaster_lww.h), wired into JournalExecutor::Execute (executor.cc) end to end. See
 // mvcc_test.cc's MultimasterLwwTest.ApplyLwwRewrites* suite for the rewrite function in
@@ -5358,9 +5488,12 @@ namespace {
 //    otherwise leaves content untouched; STICK flips a bookkeeping bit on the key's metadata;
 //    XSETID rewrites the stream's internal ID counters, not its entries).
 //
-// DELEX is named individually: a bare `DELEX key` is unconditional -- it delegates straight to
-// CmdDel (generic_family.cc) -- but the conditional forms (IFEQ/IFNE/IFDEQ/IFDNE) are a
-// SETNX-class trap: their predicate compares the STORED VALUE, not merely the key's existence.
+// DELEX is absent from this table entirely (Task A11b): it is CO::NO_AUTOJOURNAL, and both its
+// bare form (delegates to CmdDel/OpDelV2, which journals "DEL key" itself) and its conditional
+// forms (IFEQ/IFNE/IFDEQ/IFDNE; Delex's own conditional cb, generic_family.cc, hand-journals "DEL
+// key" only when the predicate actually deletes) now journal their RESULT under DEL's own name --
+// so DELEX never reaches this table's forward loop at all (CO::NO_AUTOJOURNAL commands are
+// skipped there before the guarded/known-unguarded check runs).
 //
 // Four entries are open concerns, deliberately not reclassified here: BF.LOADCHUNK's cursor==1
 // init phase overwrites any existing key wholesale (OpLoadChunk, bloom_family.cc); CMS.MERGE
@@ -5390,8 +5523,6 @@ constexpr std::string_view kKnownUnguardedAutoJournaled[] = {
     "CMS.MERGE",  // concern: resets dest then writes the weighted sum of sources
     "DECR",
     "DECRBY",
-    "DELEX",  // conditional forms (IFEQ/IFNE/IFDEQ/IFDNE) are a SETNX-class trap on the STORED
-              // VALUE; bare form delegates straight to CmdDel
     "FIELDEXPIRE",
     "FLUSHALL",
     "FLUSHDB",
@@ -5863,6 +5994,41 @@ TEST_F(MvccStoreTest, EmittedNamePinsMatchClassifiedGuardedNames) {
     EXPECT_EQ(e[0], "RESTORE");
     EXPECT_EQ(e[1], "k17");
     EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+
+  // drakeydb: P4-4 Task A11b -- DELEX is now CO::NO_AUTOJOURNAL and hand-journals its RESULT, so
+  // it is pinned here like every other result-journaled command above rather than living in
+  // kKnownUnguardedAutoJournaled (it no longer auto-journals at all, verbatim or otherwise).
+
+  // Bare DELEX key -> DEL, kMultiKeySelfGuarded (via CmdDel/OpDelV2's own explicit RecordJournal;
+  // DELEX's own auto-journal epilogue is suppressed, so this is the only entry).
+  {
+    Run({"set", "k19", "v"});
+    auto e = run1({"delex", "k19"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "DEL");
+    EXPECT_EQ(e[1], "k19");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  // DELEX key IFEQ v, predicate holds (deletes) -> DEL, kMultiKeySelfGuarded (Delex's own
+  // conditional cb hand-journals the RESULT, not the recipe).
+  {
+    Run({"set", "k20", "match"});
+    auto e = run1({"delex", "k20", "IFEQ", "match"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "DEL");
+    EXPECT_EQ(e[1], "k20");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  // DELEX key IFEQ v, predicate fails (no delete) -> journals nothing at all: NO_AUTOJOURNAL, and
+  // the conditional cb's explicit RecordJournal call never runs on this path.
+  {
+    Run({"set", "k21", "nomatch"});
+    auto entries = capture_cmd({"delex", "k21", "IFNE", "nomatch"});
+    EXPECT_EQ(entries.size(), 0u) << "a predicate that does not hold must journal nothing";
+    EXPECT_EQ(Run({"exists", "k21"}).GetInt(), 1) << "the key must survive an unmet predicate";
   }
 }
 

@@ -1511,6 +1511,18 @@ void GenericFamily::Delex(facade::CmdArgParser parser, CommandContext* cmd_cntx)
     // Delete if condition is met
     if (should_delete) {
       db_slice.DelMutable(tx->GetDbContext(), std::move(*it_res));
+
+      // drakeydb: P4-4 Task A11b -- DELEX is CO::NO_AUTOJOURNAL, so nothing journals this delete
+      // unless we do it here. Journaling the RESULT ("DEL key"), not the recipe ("DELEX key IFEQ
+      // v"), mirrors OpDelV2's own "Del then RecordJournal" order (this Op function's own
+      // tombstone commits above, so the entry below is for an already-committed delete) and
+      // means a receiver applies a guarded DEL against its OWN value instead of re-evaluating this
+      // predicate against a value that may already differ -- the same SETNX->SET precedent Task
+      // A9 established for SETNX. A failed predicate (should_delete == false, below) journals
+      // nothing at all: NO_AUTOJOURNAL plus no explicit RecordJournal call is exactly "nothing".
+      auto op_args = tx->GetOpArgs(es);
+      if (op_args.shard->journal())
+        RecordJournal(op_args, "DEL"sv, ArgSlice{key});
       return 1;
     }
 
@@ -3184,7 +3196,15 @@ void GenericFamily::Register(CommandRegistry* registry) {
   registry->StartFamily();
   *registry
       << CI{"DEL", CO::JOURNALED | CO::NO_AUTOJOURNAL, -2, 1, -1, acl::kDel}.SetAsyncHandler(CmdDel)
-      << CI{"DELEX", CO::JOURNALED | CO::FAST, -2, 1, 1, acl::kDel}.HFUNC(Delex)
+      // drakeydb: P4-4 Task A11b -- NO_AUTOJOURNAL added. A bare `DELEX key` delegates to CmdDel,
+      // which already journals `DEL key` explicitly (OpDelV2); without NO_AUTOJOURNAL here, the
+      // transaction epilogue ALSO auto-journaled `DELEX key` verbatim under DELEX's own cid_ (the
+      // generic single-key veto only classifies kSingleKey names, never DELEX) -- a double journal
+      // that, on a guarded receiver, forwarded a delete OpDelV2's own per-key guard had just
+      // dropped. The conditional forms (IFEQ/IFNE/IFDEQ/IFDNE) now hand-journal their own result
+      // (see Delex below) instead of relying on auto-journal to forward the recipe verbatim.
+      << CI{"DELEX", CO::JOURNALED | CO::NO_AUTOJOURNAL | CO::FAST, -2, 1, 1, acl::kDel}.HFUNC(
+             Delex)
       /* Redis compatibility:
        * We don't allow PING during loading since in Redis PING is used as
        * failure detection, and a loading server is considered to be
