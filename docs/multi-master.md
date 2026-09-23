@@ -136,20 +136,33 @@ wasteful, steady state, not a fault that should force a resync.
 `MSET`/`DEL` (multi-key, self-guarded — see the per-key split below). Every other journaled name is
 unguarded; an unrecognized name fails open, never closed. The master already normalizes several
 client-facing commands onto one of those names before journaling — `SETEX`/`SET ... EX` → `SET`,
-`UNLINK` → `DEL`, the `EXPIRE` family and `GETEX`'s own expiry path → `PEXPIREAT`/`DEL`/`PERSIST`,
-`MSETNX` → `MSET`, `GAT` → `PEXPIREAT`/`DEL`/`PERSIST` (a separate call site from `GETEX`'s own,
-which independently picks the same three names) — so those inherit the guard through whichever
-guarded name they land on. State-carrying RMW results that journal under a guarded name are
+`UNLINK` → `DEL`, the `EXPIRE` family → `PEXPIREAT`/`DEL` (it only ever sets or clears a TTL, never
+removes one, so it never journals `PERSIST`), `MSETNX` → `MSET`, and `GETEX`'s own expiry path and
+`GAT` (a separate call site, picking the same three names independently) → `PEXPIREAT`/`DEL`/
+`PERSIST` — so those inherit the guard through whichever guarded name they land on. State-carrying
+RMW results that journal under a guarded name are
 deliberately guarded too, because a journaled `SET`/`DEL`/`RESTORE` is a blind full-state write on
 the receiver exactly like any other: `PFMERGE` → `SET` (`hll_family.cc`), `BITOP` → `SET`/`DEL`
-(`bitops_family.cc`), a `*STORE`-family command's empty-result delete (e.g. a cross-shard
-`SORT ... STORE`) → `DEL`, that same command's non-empty result → `RESTORE ... REPLACE`, `COPY`
-(same-shard or cross-shard — it always goes through the RESTORE-journaling path, never the
-verbatim-recipe one) → `RESTORE ... REPLACE`, and a cross-shard `RENAME`'s `DEL` src +
-`RESTORE ... REPLACE` dest. **Delta-journaled RMW is deliberately never guarded** — `INCR`,
+(`bitops_family.cc`), a `*STORE`-family command's empty result → `DEL` (every `*STORE` command
+below gets this treatment, guarded), a cross-shard `SORT ... STORE`'s *non*-empty result →
+`RESTORE ... REPLACE` specifically (the set/zset `*STORE` commands' own non-empty result does NOT
+get this treatment — see the residual exposure just below), `COPY` (same-shard or cross-shard — it
+always goes through the RESTORE-journaling path, never the verbatim-recipe one) →
+`RESTORE ... REPLACE`, and a cross-shard `RENAME`'s `DEL` src + `RESTORE ... REPLACE` dest.
+**Delta-journaled RMW is deliberately never guarded** — `INCR`,
 `APPEND`, `LPUSH`, `HSET`-style commands, `PFADD`, and similar always resolve by plain arrival
 order, guard on or off: dropping a delta permanently loses it rather than merely reordering it, and
 there is no full "result" to journal instead.
+
+**A non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE` or `ZUNIONSTORE`/`ZINTERSTORE`/
+`ZDIFFSTORE`/`ZRANGESTORE` result over an EXISTING destination is a known gap, not yet fixed.**
+Unlike `SORT ... STORE`'s own destination write, these commands' overwrite path journals `DEL`
+(guarded) and `SADD`/`ZADD` (delta-journaled, unguarded) as two SEPARATE entries — so a guarded
+receiver whose own destination is newer correctly drops the `DEL`, but then blindly applies the
+unguarded add on top of its own untouched, newer value anyway, producing a third state neither
+node ever actually held. Their own EMPTY-result case (destination becomes/stays absent) does not
+have this problem — it journals a bare, guarded `DEL` with no add to follow. See
+[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md) (D-21).
 
 **A same-shard `RENAME`/`RENAMENX`, a same-shard `SORT ... STORE`, an exact (non-approximate,
 non-`MAXLEN`) `XTRIM`, and a handful of name-ambiguous commands are unguarded by design, not by
@@ -160,7 +173,11 @@ journal the client's own command verbatim under its own name — none of `RENAME
 instead, and is guarded). Separately, `JSON.SET`/`JSON.MERGE`/`JSON.DEL`/`JSON.FORGET`/
 `JSON.CLEAR` at the root (`"$"`) path are full-value writes under a name that cannot tell that path
 from an ordinary partial one, so guarding the name would also guard-and-drop their everyday partial
-uses — left unguarded, resolving by arrival order like any other unguarded command. See
+uses; `CMS.MERGE` (always a full reset-then-recompute of the destination sketch, but journaled
+under its own name rather than a guarded one) and `BF.LOADCHUNK`'s `cursor == 1` init phase
+(overwrites any existing key wholesale, same name as every other, incremental chunk) are the same
+class of problem for a different reason — all left unguarded, resolving by arrival order like any
+other unguarded command. See
 [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md) (D-18) for the full account.
 
 **Two commands are rewritten on the receiver before dispatch, so their journaled form reproduces
@@ -187,31 +204,54 @@ was never atomic across shards under replication even before this guard existed 
 flow with no cross-shard barrier — the per-key split only adds the possibility of a *single
 shard's* own partial application, on top of an atomicity gap that already existed one level up.
 
-**Classic (non-DFLY-protocol) links, and a DFLY link to a non-active peer, are never guarded — by
-construction, not by a runtime check on the data.** `Replica::ConsumeRedisStream` (`replica.cc`)
-never touches `JournalExecutor` at all: it builds its own bare `ConnectionContext` directly and
-sets `repl_origin_idx` on it, but never calls `SetApplyLwwGuard`, so `repl_lww_guard` stays at its
-default `false` for every command this stream ever dispatches — regardless of which of its two
-dispatch paths a given command takes. `MultiCommandSquasher::TrySquash` rejects a non-transactional
-command, a `CO::BLOCKING` one, a `CO::GLOBAL_TRANS` one (multi-shard commands and similar), and a
-few others outright; for those, `DispatchSquashedBatch` returns having processed nothing, and
-`ConsumeRedisStream`'s own fallback dispatches that one command through the ordinary
-`DispatchCommand` → `Transaction::RunCallback` → `ShouldDropForLww` path instead — same
-`ConnectionContext`, so `IsLwwGuarded()` still reads false there. Everything else in the batch runs
-through the squasher's own per-command stub, `Transaction::RunSquashedMultiCb`, instead of
-`RunCallback`; that stub never calls `ShouldDropForLww` at all (its `repl_mvcc_` is set once for
-the whole squashed batch, never refreshed per command, so it could not be safely compared per key
-even if the guard bit were somehow set) — it carries only a `LOG(DFATAL)` tripwire for the case
-where `IsLwwGuarded()` reads true there anyway, and even then still runs the command unguarded
-rather than dropping it. That tripwire is a backstop for the single-shard-squashed-command case
-specifically; it is not what makes the *other* commands on this link — multi-shard, blocking, and
-anything else the squasher rejects — unguarded, since those never reach the squasher's stub at all.
-Separately, and independently of any of this: a classic link's entries carry `mvcc == 0` regardless
-(no per-key write time to send at all), and so does a DFLY-protocol peer link to a peer that is
-itself non-active (`--active_replica=false` there means nothing on that peer's own side was ever
-stamped, so anything it forwards is unstamped too) — `LwwGuardActive` (`multimaster_lww.h`)
-excludes both on that basis alone, so even a hypothetical bug that set `repl_lww_guard` true on one
-of these links would still fail open.
+**Classic (non-DFLY-protocol) links are never guarded, by construction. A DFLY link to a
+non-active peer is guarded exactly like any other peer link, by construction — but never actually
+drops anything, because every entry it carries fails the guard's own per-entry data check
+instead.** These are two different mechanisms, not one.
+
+`Replica::ConsumeRedisStream` (`replica.cc`) never touches `JournalExecutor` at all: it builds its
+own bare `ConnectionContext`, sets only `repl_origin_idx` on it, and never calls
+`SetApplyLwwGuard`, so `repl_lww_guard` stays at its default `false` for the whole classic link's
+lifetime — a structural property of the link, fixed before a single command ever dispatches
+(independently, this protocol also never carries a per-key `mvcc` at all, so `LwwGuardActive`
+would exclude it a second way even if the bit were somehow true). The stream's batching does not
+change any of that. `Service::DispatchSquashedBatch` (`main_service.cc`) collects a run of
+commands, stopping at the first one it cannot batch at all (an unknown command, `MULTI`/`EXEC`,
+`EVAL`, a blocking command, an admin command, a connection-state command, or a subscribe-family
+one) and returns how many it consumed; `ConsumeRedisStream`'s own loop dispatches whatever it
+stopped on through an ordinary `DispatchCommand` call before retrying the batch from there.
+Whatever it *did* collect gets handed, once per batch, to one **non-atomic**
+`MultiCommandSquasher` — built over a `Transaction` started with
+`StartMultiNonAtomic(Transaction::DEFAULT)`, never atomic, since this is a replication stream, not
+a client `MULTI`/`EXEC`. Inside it, `TrySquash` rejects any command that is
+not transactional, is `CO::BLOCKING`, is `CO::GLOBAL_TRANS`, or spans more than one shard's keys;
+those run through `ExecuteStandalone`, directly on that same non-atomic `Transaction`. Everything
+`TrySquash` *does* accept is grouped per shard and later dispatched by `SquashedHopCb`, which — in
+non-atomic mode — runs directly on each shard's own thread against a per-shard `Transaction` built
+with `StartMultiNonAtomic(Transaction::SHARD_LOCAL)`.
+
+Neither of those two transactions is ever a `SQUASHED_STUB`: that role — and the
+`RunSquashedMultiCb` path it triggers inside `Transaction::Execute` — is produced only by the
+*other* stub constructor (`Transaction(parent, shard_id, ...)`), which only *atomic* squashing (a
+client's own `MULTI`/`EXEC` being squashed) ever uses. So every command from a classic link,
+squashed or not, dispatches through the ordinary `Transaction::Execute` → `RunCallback` →
+`ShouldDropForLww` path instead, with `repl_lww_guard_` copied from the connection's own
+(always-`false`) bit either way (both `MultiCommandSquasher`'s non-atomic per-shard construction
+and `Service::DispatchSquashedBatch`'s own batch-level `Transaction` call `SetReplOrigin` with it).
+`RunSquashedMultiCb`'s own `LOG(DFATAL)` tripwire guards the atomic-squash path only; the classic
+link never reaches that function at all.
+
+A DFLY-protocol peer link to a peer that is itself non-active is a genuinely different case. The
+guard *bit* is set exactly the way it would be for any other peer link — `peer_mode_ &&
+IsActiveReplica() && --multi_master_stream_lww` depends only on THIS node's own state, never on
+whether the remote peer is active — so `repl_lww_guard` reads `true` there too. What keeps it from
+ever dropping anything is `LwwGuardActive`'s other half, `incoming_mvcc != 0`, evaluated fresh for
+every entry: a non-active peer never stamps anything on its own side (`MvccEnabled()` is false
+there), so it writes journal framing v1 — the format with no `mvcc` field on the wire at all (see
+`docs/UPSTREAM-SYNC.md`'s framing-version row) — and every entry it ever sends therefore decodes
+here with `mvcc == 0`, excluded by `LwwGuardActive` on that basis alone, every single time. That is
+a runtime fact about each entry's own data, not a structural property of the link the way the
+classic case above is.
 
 **`DEBUG MVCC`'s `origin:` field can end up naming no real node in the mesh.** The applied-write
 stamp floor (`FloorAppliedStamp`, `mvcc.h`) that protects an *unguarded* applied write (arrival
@@ -219,9 +259,11 @@ order — guard off, a delta-RMW command, or a plain replica) whose author stamp
 key's stored stamp `S` commits `{S.mvcc, S.origin_hash - 1}` instead of that older stamp verbatim —
 one tick below `S`, keeping the key's stamp monotone for practical purposes, so a later, clean full
 sync from a peer holding `S` still wins the next merge compare and the two copies re-converge.
-(Edge case: if `S.origin_hash` is itself `0` — a placeholder shape, not a real registered origin —
-the floor instead lands at `{S.mvcc - 1, UINT64_MAX}`, dropping the `mvcc` field by one tick rather
-than decrementing a hash of `0`.) The cost is that the resulting `origin_hash` is an arbitrary
+(Edge case: `FloorAppliedStamp` already excludes `S.Mvcc() == 0` — the fresh-key/uncommitted-
+placeholder shape — before reaching this branch at all, so `S.origin_hash == 0` here means a real,
+non-zero-`mvcc` stamp whose hash field happens to be exactly `0`; the floor then lands at
+`{S.mvcc - 1, UINT64_MAX}`, dropping the `mvcc` field by one tick instead of underflowing a hash of
+`0`.) The cost is that the resulting `origin_hash` is an arbitrary
 derived number, not any node's own registered hash, so `DEBUG MVCC <key>`'s `origin:` line can show
 a value that matches no peer in the mesh once this has happened even once. Extend the "do not diff
 `DEBUG MVCC` across peers" rule (see Observability, below) to cover this case too, alongside an
@@ -441,5 +483,10 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
   accepted here while a peer that saw the `DEL` against a still-live value holds a newer
   tombstone — a divergence a subsequent full sync from that peer repairs while its tombstone is
   still live, but not otherwise. Owned by P4-5 (tombstone lifecycle).
+- **D-21** — a non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`/`ZUNIONSTORE`/`ZINTERSTORE`/
+  `ZDIFFSTORE`/`ZRANGESTORE` result over an existing destination journals `DEL` (guarded) then
+  `SADD`/`ZADD` (delta, unguarded) as two entries; a guarded receiver with a newer destination
+  drops the `DEL` but still applies the add, merging a stale result into its own newer value.
+  Owner: open.
 
 See that document for the full list, upstream-bug cross-references, and each entry's owning phase.

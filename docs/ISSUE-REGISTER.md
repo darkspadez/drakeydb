@@ -545,3 +545,33 @@ documented here rather than fixed, since a real fix belongs with the rest of the
 tombstone-lifecycle work.
 
 **Owner:** P4-5 (tombstone lifecycle). **From:** P4-4.
+
+### D-21. `*STORE`'s `DEL` + add split can merge a stale result into a newer destination
+
+**Where:** `SetFamily::OpAdd` (`src/server/set_family.cc:520-636`) — `SINTERSTORE`/`SUNIONSTORE`/
+`SDIFFSTORE`'s destination write, when the destination already existed (`overwrite`), journals
+`DEL key` followed unconditionally by `SADD key <members...>` as two SEPARATE entries.
+`ZSetFamily::OpAdd` (`src/server/zset_family.cc`, its `zparams.override` branch, ~line 2054) does
+the identical thing for `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`/`ZRANGESTORE`'s destination write:
+`DEL key` then unconditionally `ZADD key <score member>...`. `DEL` is in the guarded table;
+`SADD`/`ZADD` are delta-journaled RMW and are not.
+
+On a guarded receiver whose own `key` is newer than the incoming author stamp, the `DEL` entry is
+correctly dropped (it is stale) — but the `SADD`/`ZADD` entry that follows it in the SAME applied
+command is unguarded and applies unconditionally, blindly adding the author's freshly-computed
+members into whatever this receiver's own, untouched, newer destination value already was. The
+result is neither the author's fresh set/zset (which the receiver's newer value should have kept)
+nor a value either node ever actually held — a third, merged state manufactured by the split
+itself, and one no future `MergeAccepts` compare can undo, since nothing records that this ever
+happened as a single logical write.
+
+**How established:** static reading of both `OpAdd` implementations' journaling branches; not
+reproduced with a live two-node divergence. Same shape as the `*STORE`-family empty-result case
+already guarded (`DEL` alone, when the result is empty) and as cross-shard `SORT ... STORE`'s own
+`RESTORE ... REPLACE` result-journaling (D-13's sibling, already guarded) — this is the
+non-empty-result case those two commands' own set/zset equivalents never received the same
+treatment for.
+
+**Owner:** open. Fix path if wanted: journal the destination's result as state
+(`RESTORE ... REPLACE`, one entry, guarded — the same treatment cross-shard `SORT ... STORE`
+already gets) instead of a `DEL` + delta-add pair, for all six affected commands. **From:** P4-4.
