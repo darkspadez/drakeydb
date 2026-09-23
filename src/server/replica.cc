@@ -1479,9 +1479,10 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
     rdb_loader_->SetMergeLww(true, MvccStamper::tlocal()->OriginHash(origin_idx));
     // drakeydb: P4-4 Task A10 -- this flow's THIRD applier (RdbLoaderBase::HandleJournalBlob's own
     // journal_executor_, replaying the concurrent journal blob embedded in this same full sync)
-    // must agree with executor_ (the stable-sync applier, set up in this class's constructor
-    // above) on whether the link is LWW-guarded. See ApplyPeerFullSyncLwwGuard's own comment for
-    // why this is a separate method rather than inlined here.
+    // must agree with executor_ (the stable-sync applier, set up in this class's constructor --
+    // below in this file -- via executor_->SetApplyLwwGuard) on whether the link is LWW-guarded.
+    // See ApplyPeerFullSyncLwwGuard's own comment for why this is a separate method rather than
+    // inlined here.
     ApplyPeerFullSyncLwwGuard();
   }
 
@@ -1531,7 +1532,7 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
 // itself needs a live master connection (Sock()), which this codebase's unit tests never
 // exercise directly (see AdoptAuthoritativeLsn's own tests' comments for why). Threads this
 // flow's per-link LWW guard bit -- already decided once, at construction, onto executor_'s
-// ConnectionContext (see the constructor's SetApplyLwwGuard call, above in this file) -- onto
+// ConnectionContext (see the constructor's SetApplyLwwGuard call, below in this file) -- onto
 // rdb_loader_'s OWN journal-blob applier (RdbLoaderBase::HandleJournalBlob), so the two appliers
 // of one link can never disagree: this reads the value back from executor_ rather than
 // recomputing peer_mode_ && IsActiveReplica() && the flag a second time.
