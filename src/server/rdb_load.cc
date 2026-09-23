@@ -2991,6 +2991,12 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
     // the stable-sync path (replica.cc). journal_executor_ is reused across every JOURNAL_BLOB
     // opcode in this load, so this runs once per loader, not per entry.
     journal_executor_->SetApplyOrigin(apply_origin_idx_);
+    // drakeydb: P4-4 Task A10 -- same one-time-per-loader placement as SetApplyOrigin immediately
+    // above, for the streaming LWW guard: this loader's concurrent-journal-blob applier now
+    // agrees with that same link's stable-sync executor_ (DflyShardReplica, replica.cc) on
+    // whether writes are LWW-guarded, instead of always applying in plain arrival order while the
+    // RDB key stream beside it is merge-compared (see CreateObjectOnShard's merge_lww_ use).
+    journal_executor_->SetApplyLwwGuard(apply_lww_guard_);
   }
 
   io::BytesSource bs{io::Buffer(journal_blob)};

@@ -27,6 +27,7 @@
 #include "server/journal/types.h"
 #include "server/multi_master.h"
 #include "server/multimaster_lww.h"
+#include "server/namespaces.h"
 #include "server/node_identity.h"
 #include "server/rdb_load.h"
 #include "server/rdb_load_context.h"
@@ -482,6 +483,27 @@ std::string MakeJournalSet(std::string_view key, std::string_view val) {
   return serializer.Flush(RdbSerializer::FlushState::kFlushEndEntry);
 }
 
+// drakeydb: P4-4 Task A10 -- mirrors MakeJournalSet immediately above, but with extended framing
+// (JournalWriter's second ctor argument) so the entry's `mvcc` field actually rides the wire --
+// MakeJournalSet's legacy (v1) framing always writes/reads mvcc as 0 (see JournalWriter::Write's
+// COMMAND case, serializer.cc), which would make every replayed entry look unstamped (fail-open,
+// never guarded) regardless of what HandleJournalBlob's loader-level SetApplyLwwGuard is set to.
+// Needed to feed a REAL, non-zero author stamp through RdbLoaderBase::HandleJournalBlob, so the
+// guard's drop-or-apply decision has something to actually compare.
+std::string MakeJournalSetWithMvcc(std::string_view key, std::string_view val, uint64_t mvcc) {
+  io::StringSink sink;
+  JournalWriter writer(&sink, /*extended_framing=*/true);
+  std::array<std::string_view, 2> kv{key, val};
+  journal::Entry entry(1, journal::Op::COMMAND, 0, std::nullopt,
+                       journal::Entry::Payload("SET", ArgSlice{kv.data(), kv.size()}));
+  entry.mvcc = mvcc;
+  writer.Write(entry);
+
+  RdbSerializer serializer(CompressionMode::NONE);
+  CHECK(!serializer.WriteJournalEntry(std::move(sink).str()));
+  return serializer.Flush(RdbSerializer::FlushState::kFlushEndEntry);
+}
+
 // drakeydb: Phase 3 T7b -- mirrors rdb_test.cc's WrapInRdb (file-local there, so duplicated here
 // rather than shared across translation units for one 8-line helper): wraps a raw body in the
 // magic/EOF/checksum framing RdbLoader::Load() requires. The all-zero checksum is the same
@@ -589,6 +611,86 @@ class DflyShardReplicaOriginTest : public BaseFamilyTest {
         << "the replayed SET was never re-journaled on this node";
     return *capture.last_command_origin_idx;
   }
+
+  // drakeydb: P4-4 Task A10 -- registers `origin_idx` -> `origin_hash` on EVERY shard thread
+  // (MvccStamper::tlocal() is per-thread), mirroring MvccStoreTest::RegisterPeerOriginHash
+  // (multi_master_test.cc): ShouldDropForLww's IncomingStamp call runs on whichever shard thread
+  // owns the guarded key, so registering on only shard 0 would DCHECK-fail (or fail open in
+  // release) the moment a key lands elsewhere.
+  void RegisterPeerOriginHash(uint32_t origin_idx, uint64_t origin_hash) {
+    shard_set->pool()->AwaitBrief([origin_idx, origin_hash](unsigned, auto*) {
+      MvccStamper::tlocal()->RegisterOriginHash(origin_idx, origin_hash);
+    });
+  }
+
+  // drakeydb: P4-4 Task A10 -- the THIRD applier this task guards: constructs a DflyShardReplica
+  // with peer_mode=true (ObservedReplayedOriginIdx above already covers this loader's origin
+  // threading) and sets rdb_loader_'s OWN SetApplyLwwGuard(guard_on) directly -- exactly what
+  // ApplyPeerFullSyncLwwGuard (replica.cc) sets it to in production, not a reimplementation of the
+  // guard/compare logic itself (that lives in Transaction::ShouldDropForLww/MergeAccepts, both
+  // untouched here) -- then feeds a hand-built, extended-framing journal blob carrying a guarded
+  // "SET key peer-value" stamped `incoming_mvcc` (author `origin_idx`) through
+  // flow.rdb_loader_->Load() (RdbLoaderBase::HandleJournalBlob). `key` must hash to shard 0, same
+  // convention and reason as ObservedReplayedOriginIdx above (this always runs on pp_->at(0)); the
+  // caller is responsible for having already given `key` a resident value and stamp before this
+  // runs. Runs entirely off-socket, same as ObservedReplayedOriginIdx.
+  void RunGuardedJournalBlobLoad(bool guard_on, uint32_t origin_idx, std::string_view key,
+                                 uint64_t incoming_mvcc) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, origin_idx, /*peer_mode=*/true);
+    flow.rdb_loader_->SetApplyLwwGuard(guard_on);
+
+    std::string rdb = WrapInRdbForTest(MakeJournalSetWithMvcc(key, "peer-value", incoming_mvcc));
+    io::BytesSource src{io::Buffer(rdb)};
+    std::error_code ec = flow.rdb_loader_->Load(&src);
+    CHECK(!ec) << ec.message();
+  }
+
+  // drakeydb: P4-4 Task A10 -- same journal-blob technique as RunGuardedJournalBlobLoad above, but
+  // exercises the REAL production forwarding call (DflyShardReplica::ApplyPeerFullSyncLwwGuard,
+  // replica.cc) instead of setting rdb_loader_'s guard directly: constructs a flow with the given
+  // `peer_mode` (the constructor alone decides executor_'s guard bit -- see A2's
+  // ConstructorThreadsLwwGuardIntoExecutor; the caller sets FLAGS_active_replica/
+  // FLAGS_multi_master_stream_lww beforehand), then calls the real flow.ApplyPeerFullSyncLwwGuard()
+  // to thread that bit onto rdb_loader_ exactly as FullSyncDflyFb's peer_mode_ block does in
+  // production, before replaying the same guarded journal blob RunGuardedJournalBlobLoad uses.
+  void RunProductionGuardedJournalBlobLoad(bool peer_mode, uint32_t origin_idx,
+                                           std::string_view key, uint64_t incoming_mvcc) {
+    DflyShardReplica::ServerContext ctx{"127.0.0.1", 1, {}};
+    MasterContext master_context;
+    master_context.num_flows = 1;
+    auto multi_shard_exe = std::make_shared<MultiShardExecution>();
+    RdbLoadContext load_context;
+    DflyShardReplica flow(ctx, master_context, /*flow_id=*/0, service_.get(), multi_shard_exe,
+                          &load_context, origin_idx, peer_mode);
+    flow.ApplyPeerFullSyncLwwGuard();
+
+    std::string rdb = WrapInRdbForTest(MakeJournalSetWithMvcc(key, "peer-value", incoming_mvcc));
+    io::BytesSource src{io::Buffer(rdb)};
+    std::error_code ec = flow.rdb_loader_->Load(&src);
+    CHECK(!ec) << ec.message();
+  }
+};
+
+// drakeydb: P4-4 Task A10 -- --active_replica is boot-only (DbTable reads it at construction; see
+// RdbMvccTest's own comment, rdb_test.cc), so the two new LWW-guard tests below (which read back
+// MVCC stamps via db_slice.SetMvcc/GetMvcc) need it set before BaseFamilyTest::SetUp() runs --
+// gtest always constructs the fixture object before calling SetUp(), so setting it here (rather
+// than overriding SetUp() itself) is guaranteed early enough, mirroring RdbMvccTest's own
+// constructor exactly (rdb_test.cc). A dedicated subclass, rather than changing
+// DflyShardReplicaOriginTest itself, keeps that fixture's OTHER tests' default (inactive)
+// behavior exactly as it was -- none of them touch the mvcc side table.
+class DflyShardReplicaLwwGuardTest : public DflyShardReplicaOriginTest {
+ protected:
+  DflyShardReplicaLwwGuardTest() {
+    absl::SetFlag(&FLAGS_active_replica, true);
+  }
+  absl::FlagSaver saver_;
 };
 
 TEST_F(DflyShardReplicaOriginTest, ConstructorThreadsOriginIntoExecutor) {
@@ -675,6 +777,167 @@ TEST_F(DflyShardReplicaOriginTest, FullSyncJournalBlobAppliesAndReJournalsWithFl
   // The writes genuinely applied -- not merely got tagged with the right origin.
   EXPECT_EQ(Run({"GET", peer_key}), "replayed-value");
   EXPECT_EQ(Run({"GET", self_key}), "replayed-value");
+}
+
+// drakeydb: P4-4 Task A10 -- there are THREE applier paths, not two: besides executor_ (stable
+// sync, A3/A7/A8/A9) and the RDB key-stream merge (merge_lww_, P4-3), a peer full sync also
+// replays its embedded CONCURRENT journal blob via rdb_loader_ (RdbLoaderBase::HandleJournalBlob),
+// which builds its own journal_executor_. Proves that loader-level applier honors its OWN
+// SetApplyLwwGuard(bool) exactly like the stable-sync path: guarded, a stale peer write (mvcc
+// 0x1000, strictly less than a resident local value's mvcc 0x2000) loses the compare and both the
+// value and its stamp survive untouched; unguarded, the same stale write applies unconditionally
+// (plain arrival order -- no compare is even run). Its committed stamp is NOT the peer's raw
+// 0x1000 verbatim, though: Task A5's FloorAppliedStamp (mvcc.cc, unrelated to A10's own guard --
+// it fires for ANY applied write, guarded or not, whose author mvcc is older than the key's own)
+// floors it to one tick below the stored stamp instead, so an applied write can never rewind a
+// key's stamp. With stored.origin_hash != 0, that floor is exactly {stored.Mvcc(),
+// stored.origin_hash - 1} (FloorAppliedStamp's own last branch) -- computed here from that
+// documented rule, not copied from an observed test run.
+//
+// Falsifying (verified by hand): hardcoding
+// journal_executor_->SetApplyLwwGuard(false) at its one call site inside HandleJournalBlob's
+// lazy-construction block (rdb_load.cc) makes the guarded sub-test's first EXPECT_EQ fail
+// (observes "peer-value" instead of "local"); the unguarded sub-test is unaffected, since it
+// already expects the unguarded outcome. This test calls RdbLoader::SetApplyLwwGuard directly
+// (bypassing replica.cc entirely), so it also fails to COMPILE if that setter or
+// RdbLoaderBase::apply_lww_guard_ is removed.
+TEST_F(DflyShardReplicaLwwGuardTest, PeerFullSyncJournalBlobHonorsLwwGuard) {
+  constexpr uint32_t kPeerIdx = 21;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  constexpr uint64_t kPeerHash = 0x2121212121212121ULL;
+  const MvccStamp kLocalStamp{0x2000, 0x1111111111111111ULL};
+  constexpr uint64_t kIncomingMvcc = 0x1000;  // Mvcc() 0x1000 < 0x2000: strictly stale.
+
+  RegisterPeerOriginHash(kPeerIdx, kPeerHash);
+
+  // ObservedReplayedOriginIdx's own comment explains why a shard-0 key matters: this helper's
+  // Load() always runs on the pp_->at(0) fiber below.
+  auto shard0_key = [&](std::string_view prefix) {
+    std::string key;
+    for (unsigned i = 0; i < 1000; ++i) {
+      key = absl::StrCat(prefix, i);
+      if (Shard(key, shard_set->size()) == 0)
+        return key;
+    }
+    ADD_FAILURE() << "could not find a shard-0 key for prefix " << prefix;
+    return key;
+  };
+
+  auto stamp_of = [&](const std::string& key) {
+    std::optional<MvccStamp> out;
+    shard_set->Await(
+        0, [&] { out = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, key); });
+    return out;
+  };
+
+  {
+    const std::string key = shard0_key("a10-guarded-");
+    ASSERT_EQ(Run({"SET", key, "local"}), "OK");
+    shard_set->Await(0, [&] {
+      namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, key, kLocalStamp);
+    });
+
+    pp_->at(0)->Await(
+        [&] { RunGuardedJournalBlobLoad(/*guard_on=*/true, kPeerIdx, key, kIncomingMvcc); });
+
+    EXPECT_EQ(Run({"GET", key}), "local") << "guarded: the stale peer write must be dropped";
+    std::optional<MvccStamp> stamp = stamp_of(key);
+    ASSERT_TRUE(stamp.has_value());
+    EXPECT_EQ(*stamp, kLocalStamp) << "guarded: the resident stamp must also survive untouched";
+  }
+
+  {
+    const std::string key = shard0_key("a10-unguarded-");
+    ASSERT_EQ(Run({"SET", key, "local"}), "OK");
+    shard_set->Await(0, [&] {
+      namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, key, kLocalStamp);
+    });
+
+    pp_->at(0)->Await(
+        [&] { RunGuardedJournalBlobLoad(/*guard_on=*/false, kPeerIdx, key, kIncomingMvcc); });
+
+    EXPECT_EQ(Run({"GET", key}), "peer-value")
+        << "unguarded: the stale peer write must still apply (plain arrival order)";
+    std::optional<MvccStamp> stamp = stamp_of(key);
+    ASSERT_TRUE(stamp.has_value());
+    // A5's FloorAppliedStamp, not A10's guard: kLocalStamp.origin_hash != 0, so the floor is
+    // {stored.Mvcc(), stored.origin_hash - 1} -- see this test's own top comment.
+    EXPECT_EQ(*stamp, (MvccStamp{kLocalStamp.Mvcc(), kLocalStamp.origin_hash - 1}))
+        << "unguarded: an applied write's stamp is floored one tick below the stored stamp, "
+           "never rewound to the peer's older mvcc verbatim";
+  }
+}
+
+// drakeydb: P4-4 Task A10 -- the flow-level counterpart to PeerFullSyncJournalBlobHonorsLwwGuard
+// above: proves rdb_loader_ ends up guarded IFF executor_ is, via the REAL production call
+// (DflyShardReplica::ApplyPeerFullSyncLwwGuard, replica.cc -- factored out of FullSyncDflyFb's
+// peer_mode_ block purely so it is directly callable here without a live socket; see its own
+// comment). Reuses A2's exact per-link matrix (peer_mode x IsActiveReplica() x
+// FLAGS_multi_master_stream_lww): a peer link on an active node with the flag on ends up guarded;
+// a plain (non-peer) replica's loader never does, regardless of the other two gates -- the most
+// important case, matching ConstructorThreadsLwwGuardIntoExecutor's own framing for executor_.
+//
+// Falsifying (verified by hand): hardcoding
+// rdb_loader_->SetApplyLwwGuard(false) inside ApplyPeerFullSyncLwwGuard's body (replica.cc) makes
+// the peer_mode=true sub-test's first EXPECT_EQ fail (observes "peer-value" instead of "local");
+// the peer_mode=false sub-test is unaffected (already expects the unguarded outcome). Hardcoding
+// SetApplyLwwGuard(true) there instead flips that unaffected sub-test to fail (observes "local"
+// instead of "peer-value"), proving both directions are covered.
+TEST_F(DflyShardReplicaLwwGuardTest, ApplyPeerFullSyncLwwGuardMirrorsExecutorGuard) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_active_replica, true);
+  absl::SetFlag(&FLAGS_multi_master_stream_lww, true);
+
+  constexpr uint32_t kPeerIdx = 23;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
+  constexpr uint64_t kPeerHash = 0x2323232323232323ULL;
+  const MvccStamp kLocalStamp{0x2000, 0x1111111111111111ULL};
+  constexpr uint64_t kIncomingMvcc = 0x1000;  // Mvcc() 0x1000 < 0x2000: strictly stale.
+
+  RegisterPeerOriginHash(kPeerIdx, kPeerHash);
+
+  auto shard0_key = [&](std::string_view prefix) {
+    std::string key;
+    for (unsigned i = 0; i < 1000; ++i) {
+      key = absl::StrCat(prefix, i);
+      if (Shard(key, shard_set->size()) == 0)
+        return key;
+    }
+    ADD_FAILURE() << "could not find a shard-0 key for prefix " << prefix;
+    return key;
+  };
+
+  {
+    // Peer link, active node, flag on: rdb_loader_ must end up guarded, exactly like executor_
+    // (A2's ConstructorThreadsLwwGuardIntoExecutor).
+    const std::string key = shard0_key("a10-flow-guarded-");
+    ASSERT_EQ(Run({"SET", key, "local"}), "OK");
+    shard_set->Await(0, [&] {
+      namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, key, kLocalStamp);
+    });
+
+    pp_->at(0)->Await([&] {
+      RunProductionGuardedJournalBlobLoad(/*peer_mode=*/true, kPeerIdx, key, kIncomingMvcc);
+    });
+
+    EXPECT_EQ(Run({"GET", key}), "local")
+        << "peer_mode=true: rdb_loader_ must be guarded, same as executor_";
+  }
+
+  {
+    // Plain (non-peer) replica: rdb_loader_ must NEVER be guarded, regardless of the other gates
+    // -- the most important case, matching A2's own framing for executor_.
+    const std::string key = shard0_key("a10-flow-unguarded-");
+    ASSERT_EQ(Run({"SET", key, "local"}), "OK");
+    shard_set->Await(0, [&] {
+      namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, key, kLocalStamp);
+    });
+
+    pp_->at(0)->Await([&] {
+      RunProductionGuardedJournalBlobLoad(/*peer_mode=*/false, kPeerIdx, key, kIncomingMvcc);
+    });
+
+    EXPECT_EQ(Run({"GET", key}), "peer-value")
+        << "peer_mode=false: rdb_loader_ must never be guarded";
+  }
 }
 
 // drakeydb: P4-4 Task A2 -- Transaction-level plumbing: SetReplOrigin's new `lww_guard` argument

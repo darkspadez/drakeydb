@@ -1477,6 +1477,12 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
     // RDB_OPCODE_DF_MVCC outright for a {0,0} stamp, so an unversioned drakeydb peer, or a whole
     // non-active drakeydb master, must never be able to override this node's resident dataset.
     rdb_loader_->SetMergeLww(true, MvccStamper::tlocal()->OriginHash(origin_idx));
+    // drakeydb: P4-4 Task A10 -- this flow's THIRD applier (RdbLoaderBase::HandleJournalBlob's own
+    // journal_executor_, replaying the concurrent journal blob embedded in this same full sync)
+    // must agree with executor_ (the stable-sync applier, set up in this class's constructor
+    // above) on whether the link is LWW-guarded. See ApplyPeerFullSyncLwwGuard's own comment for
+    // why this is a separate method rather than inlined here.
+    ApplyPeerFullSyncLwwGuard();
   }
 
   // Load incoming rdb stream.
@@ -1516,6 +1522,21 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
                       "Error finding journal offset in stream");
   }
   VLOG(1) << "FullSyncDflyFb finished after reading " << rdb_loader_->bytes_read() << " bytes";
+}
+
+// drakeydb: P4-4 Task A10 -- factored out of FullSyncDflyFb's peer_mode_ block (its only caller)
+// into its own method, rather than inlined next to the SetMergeLww call above it, purely so a
+// unit test can drive it directly on a socket-free DflyShardReplica the same way
+// DflyShardReplicaPeerModeTest already drives AdoptAuthoritativeLsn below -- FullSyncDflyFb
+// itself needs a live master connection (Sock()), which this codebase's unit tests never
+// exercise directly (see AdoptAuthoritativeLsn's own tests' comments for why). Threads this
+// flow's per-link LWW guard bit -- already decided once, at construction, onto executor_'s
+// ConnectionContext (see the constructor's SetApplyLwwGuard call, above in this file) -- onto
+// rdb_loader_'s OWN journal-blob applier (RdbLoaderBase::HandleJournalBlob), so the two appliers
+// of one link can never disagree: this reads the value back from executor_ rather than
+// recomputing peer_mode_ && IsActiveReplica() && the flag a second time.
+void DflyShardReplica::ApplyPeerFullSyncLwwGuard() {
+  rdb_loader_->SetApplyLwwGuard(executor_->connection_context()->repl_lww_guard);
 }
 
 // drakeydb: Phase 3 T6b -- see replica.h's declaration for the summary; called from
