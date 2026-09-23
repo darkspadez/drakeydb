@@ -5315,6 +5315,489 @@ TEST_F(MvccStoreTest, DebugMvccAggregateReportsTombstonesDropped) {
       << resp.GetString();
 }
 
+namespace {
+
+// drakeydb: P4-4 Task A11 -- every command name that is CO::JOURNALED and NOT CO::NO_AUTOJOURNAL
+// (it auto-journals its own client-facing args verbatim, the same mechanism SET/RESTORE/etc. use)
+// and is deliberately ABSENT from kJournaledClasses (multimaster_lww.cc), so the streaming LWW
+// guard never compares it. Built by enumerating the live command registry (RegistryClosure
+// below) and reviewed one family at a time:
+//
+//  - numeric/string delta RMW (APPEND, BITFIELD, CL.THROTTLE, DECR, DECRBY, INCR, INCRBY,
+//    INCRBYFLOAT, PREPEND, SETBIT, SETRANGE): reads whatever is currently stored and composes the
+//    client's own args onto it -- a stale replay re-applies the SAME delta, never a blind clobber
+//    of unrelated newer content.
+//  - container element delta RMW, touching one member/field/path/entry and leaving the rest of
+//    the key's value untouched (BF.ADD, BF.MADD, CF.ADD, CF.COMPACT, CF.DEL, CF.INSERT,
+//    CMS.INCRBY, FIELDEXPIRE, GEOADD, HDEL, HEXPIRE, HGETEX, HINCRBY, HINCRBYFLOAT, HMSET, HSET,
+//    HSETEX, JSON.ARRAPPEND, JSON.ARRINSERT, JSON.ARRPOP, JSON.ARRTRIM, JSON.CLEAR, JSON.DEL,
+//    JSON.FORGET, JSON.MERGE, JSON.NUMINCRBY, JSON.NUMMULTBY, JSON.STRAPPEND, JSON.TOGGLE,
+//    LINSERT, LPOP, LPUSH, LPUSHX, LREM, LSET, LTRIM, PFADD, RPOP, RPUSH, RPUSHX, SADD, SADDEX,
+//    SREM, TOPK.ADD, TOPK.INCRBY, XACK, XAUTOCLAIM, XCLAIM, XDEL, XGROUP, ZADD, ZINCRBY, ZPOPMAX,
+//    ZPOPMIN, ZREM, ZREMRANGEBYLEX, ZREMRANGEBYRANK, ZREMRANGEBYSCORE): CF.COMPACT reorganizes
+//    internal storage deterministically, changing no logical content; JSON.MERGE applies a JSON
+//    merge-patch (OpMerge, json_family.cc), touching only the keys present in the patch, never a
+//    blind full-document replace (that's JSON.SET's path="$" case, flagged separately below).
+//  - "create if absent" recipes, erroring/no-op if the key (or, for HSETNX/CF.ADDNX/CF.INSERTNX,
+//    the member) already exists (BF.RESERVE, CF.ADDNX, CF.INSERTNX, CF.RESERVE, CMS.INITBYDIM,
+//    CMS.INITBYPROB, HSETNX, TOPK.RESERVE): a stale replay against a receiver that already has the
+//    key/member is a no-op, the same SETNX shape.
+//  - keyless/global (CO::GLOBAL_TRANS): DetermineKeys (transaction.cc) returns an EMPTY KeyIndex
+//    for these, so even a hypothetical guarded classification would have nothing to compare
+//    (FLUSHALL, FLUSHDB, FT.ALTER, FT.CREATE, FT.DROPINDEX, FT.SYNUPDATE). MOVE is the same story
+//    but is CO::NO_AUTOJOURNAL, so it never reaches this table at all.
+//  - metadata-only, touching no value bytes (SHRINK reclaims already-expired capacity and
+//    otherwise leaves content untouched; STICK flips a bookkeeping bit on the key's metadata;
+//    XSETID rewrites the stream's internal ID counters, not its entries).
+//
+// DELEX is named individually: like SETNX it is conditional, but its condition
+// (IFEQ/IFNE/IFDEQ/IFDNE) compares the STORED VALUE, not merely the key's existence -- a
+// SETNX-class trap in the "predicate on current state" sense.
+//
+// Three entries are open concerns, deliberately NOT reclassified here (a call for the controller,
+// not this test, to make): BF.LOADCHUNK's cursor==1 init phase overwrites any existing key
+// wholesale (OpLoadChunk, bloom_family.cc); CMS.MERGE resets the destination sketch, then writes
+// the weighted sum of the sources (CmdMerge, cms_family.cc) -- the same blind, state-carrying
+// full-value recompute PFMERGE's SET result is guarded for, but journaled under CMS.MERGE's own
+// name instead; JSON.SET's path can be "$" (the whole document), likewise a full-value replace at
+// that path.
+constexpr std::string_view kKnownUnguardedAutoJournaled[] = {
+    "APPEND",
+    "BF.ADD",
+    "BF.LOADCHUNK",  // concern: cursor==1 overwrites an existing key wholesale -- see report
+    "BF.MADD",
+    "BF.RESERVE",
+    "BITFIELD",
+    "CF.ADD",
+    "CF.ADDNX",
+    "CF.COMPACT",
+    "CF.DEL",
+    "CF.INSERT",
+    "CF.INSERTNX",
+    "CF.RESERVE",
+    "CL.THROTTLE",
+    "CMS.INCRBY",
+    "CMS.INITBYDIM",
+    "CMS.INITBYPROB",
+    "CMS.MERGE",  // concern: resets dest then writes the weighted sum of sources -- see report
+    "DECR",
+    "DECRBY",
+    "DELEX",  // SETNX-class trap: predicate compares the STORED VALUE (IFEQ/IFNE/IFDEQ/IFDNE)
+    "FIELDEXPIRE",
+    "FLUSHALL",
+    "FLUSHDB",
+    "FT.ALTER",
+    "FT.CREATE",
+    "FT.DROPINDEX",
+    "FT.SYNUPDATE",
+    "GEOADD",
+    "HDEL",
+    "HEXPIRE",
+    "HGETEX",
+    "HINCRBY",
+    "HINCRBYFLOAT",
+    "HMSET",
+    "HSET",
+    "HSETEX",
+    "HSETNX",
+    "INCR",
+    "INCRBY",
+    "INCRBYFLOAT",
+    "JSON.ARRAPPEND",
+    "JSON.ARRINSERT",
+    "JSON.ARRPOP",
+    "JSON.ARRTRIM",
+    "JSON.CLEAR",
+    "JSON.DEL",
+    "JSON.FORGET",
+    "JSON.MERGE",
+    "JSON.NUMINCRBY",
+    "JSON.NUMMULTBY",
+    "JSON.SET",  // concern: a "$" (root) path replaces the whole document -- see report
+    "JSON.STRAPPEND",
+    "JSON.TOGGLE",
+    "LINSERT",
+    "LPOP",
+    "LPUSH",
+    "LPUSHX",
+    "LREM",
+    "LSET",
+    "LTRIM",
+    "PFADD",
+    "PREPEND",
+    "RPOP",
+    "RPUSH",
+    "RPUSHX",
+    "SADD",
+    "SADDEX",
+    "SETBIT",
+    "SETRANGE",
+    "SHRINK",
+    "SREM",
+    "STICK",
+    "TOPK.ADD",
+    "TOPK.INCRBY",
+    "TOPK.RESERVE",
+    "XACK",
+    "XAUTOCLAIM",
+    "XCLAIM",
+    "XDEL",
+    "XGROUP",
+    "XSETID",
+    "ZADD",
+    "ZINCRBY",
+    "ZPOPMAX",
+    "ZPOPMIN",
+    "ZREM",
+    "ZREMRANGEBYLEX",
+    "ZREMRANGEBYRANK",
+    "ZREMRANGEBYSCORE",
+};
+
+constexpr bool KnownUnguardedTableIsSorted() {
+  for (std::size_t i = 1; i < std::size(kKnownUnguardedAutoJournaled); ++i) {
+    if (!(kKnownUnguardedAutoJournaled[i - 1] < kKnownUnguardedAutoJournaled[i]))
+      return false;
+  }
+  return true;
+}
+static_assert(KnownUnguardedTableIsSorted(),
+              "kKnownUnguardedAutoJournaled must stay sorted for binary_search");
+
+}  // namespace
+
+// drakeydb: P4-4 Task A11 -- registry closure: every JOURNALED command that auto-journals its own
+// args verbatim (not CO::NO_AUTOJOURNAL) must be accounted for -- either guarded
+// (ClassifyJournaledCommand != kUnguarded) or explicitly reviewed in kKnownUnguardedAutoJournaled
+// above. An upstream rename/re-normalization that drops a state-carrying write into neither bucket
+// fails here, naming the command.
+//
+// Falsifying: dropping "GETSET" from kJournaledClasses (multimaster_lww.cc) makes the forward loop
+// below fail with "GETSET is CO::JOURNALED and auto-journals verbatim but is neither...".
+// Dropping "SHRINK" from kKnownUnguardedAutoJournaled above reproduces the same failure naming
+// SHRINK instead.
+TEST_F(MvccStoreTest, RegistryClosureEveryAutoJournaledNameIsGuardedOrKnown) {
+  service_->mutable_registry()->Traverse([&](std::string_view name, const CommandId& cid) {
+    if (!(cid.opt_mask() & CO::JOURNALED) || (cid.opt_mask() & CO::NO_AUTOJOURNAL))
+      return;
+
+    const std::string upper = absl::AsciiStrToUpper(name);
+    const bool guarded = ClassifyJournaledCommand(upper) != LwwClass::kUnguarded;
+    const bool known_unguarded =
+        std::binary_search(std::begin(kKnownUnguardedAutoJournaled),
+                           std::end(kKnownUnguardedAutoJournaled), std::string_view(upper));
+
+    EXPECT_TRUE(guarded || known_unguarded)
+        << upper << " is CO::JOURNALED, auto-journals verbatim, and is neither in the guarded "
+        << "table nor in kKnownUnguardedAutoJournaled -- classify it: add it to the guarded table "
+        << "in multimaster_lww.cc or to kKnownUnguardedAutoJournaled with a reason.";
+    EXPECT_FALSE(guarded && known_unguarded)
+        << upper << " is in BOTH the guarded table (multimaster_lww.cc) and "
+        << "kKnownUnguardedAutoJournaled -- remove it from one.";
+  });
+
+  // Reverse checks: a stale kKnownUnguardedAutoJournaled entry -- upstream renamed/removed the
+  // command, or gave it CO::NO_AUTOJOURNAL, or (wrongly) added it to the guarded table too -- must
+  // fail loudly here, not silently keep vouching for a name nothing (or something guarded) emits.
+  for (std::string_view name : kKnownUnguardedAutoJournaled) {
+    const CommandId* cid = service_->mutable_registry()->Find(name);
+    ASSERT_NE(cid, nullptr) << name << " is in kKnownUnguardedAutoJournaled but no longer exists "
+                            << "in the command registry -- remove the stale entry";
+    EXPECT_TRUE(cid->opt_mask() & CO::JOURNALED)
+        << name << " is in kKnownUnguardedAutoJournaled but is no longer CO::JOURNALED";
+    EXPECT_FALSE(cid->opt_mask() & CO::NO_AUTOJOURNAL)
+        << name << " is in kKnownUnguardedAutoJournaled but is now CO::NO_AUTOJOURNAL -- it no "
+        << "longer auto-journals verbatim, so this table no longer applies to it";
+    EXPECT_EQ(ClassifyJournaledCommand(name), LwwClass::kUnguarded)
+        << name << " is in kKnownUnguardedAutoJournaled but is ALSO in the guarded table";
+  }
+}
+
+// drakeydb: P4-4 Task A11 -- emitted-name pin: for each of a set of representative CLIENT
+// commands, pins the journaled name the tree ACTUALLY emits (verified against a running build,
+// not assumed) and its ClassifyJournaledCommand classification, so a future normalization change
+// that silently moves a command onto an unguarded name fails here by name.
+//
+// Headline finding: a SAME-SHARD RENAME does NOT decompose into DEL+RESTORE, despite that being
+// the natural guess from how a cross-shard RENAME behaves (see the RENAME block below).
+// RenameGeneric (generic_family.cc) calls Transaction::ReviveAutoJournal() when
+// GetUniqueShardCnt()==1 ("safe to use RENAME with single shard"), so the ordinary auto-journal
+// path fires and journals the client's own command verbatim: a single "RENAME src dst" entry.
+// ClassifyJournaledCommand("RENAME") is kUnguarded (RENAME is not in kJournaledClasses) --
+// deliberately NOT reclassified here, a call for the controller to make. (A cross-shard RENAME
+// goes through a different path, Renamer::DelSrc/DeserializeDest, which does journal DEL src +
+// RESTORE dst -- not exercised by this row, which is same-shard.)
+//
+// Falsifying: removing "GETSET" from kJournaledClasses (multimaster_lww.cc) makes this test's own
+// GETSET block's ClassifyJournaledCommand EXPECT_EQ fail (kUnguarded instead of kSingleKey).
+// Changing the RENAME block's expected name from "RENAME" to "DEL" (the natural but wrong guess)
+// makes that EXPECT_EQ fail, proving the tree really does journal RENAME verbatim rather than
+// decomposing it.
+TEST_F(MvccStoreTest, EmittedNamePinsMatchClassifiedGuardedNames) {
+  // drakeydb: P4-4 Task A11 -- runs one CLIENT command (never a peer apply) and returns the args
+  // of every resulting COMMAND journal entry, in arrival order (args[0] is each entry's journaled
+  // name, upper-case in practice). Reuses MsetLwwJournalConsumer (task A7, above) purely for its
+  // decoding. A local lambda, not a free function: Run() is a protected BaseFamilyTest member, so
+  // this can only call it from within a member function (or a closure captured inside one) of a
+  // class derived from it -- exactly what a TEST_F body is.
+  auto capture_all = [&](std::vector<std::string> cmd) -> std::vector<std::vector<std::string>> {
+    MsetLwwJournalConsumer consumer;
+    std::vector<uint32_t> consumer_ids(shard_set->size());
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+    });
+    Run(cmd);
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+    util::fb2::LockGuard lk(consumer.mu_);
+    std::vector<std::vector<std::string>> out;
+    out.reserve(consumer.entries.size());
+    for (auto& e : consumer.entries)
+      out.push_back(e.args);
+    return out;
+  };
+  auto run1 = [&](std::vector<std::string> cmd) {
+    auto entries = capture_all(cmd);
+    EXPECT_EQ(entries.size(), 1u) << "expected exactly one journal entry";
+    return entries.empty() ? std::vector<std::string>{} : entries.front();
+  };
+
+  // SETEX / PSETEX / SET ... EX / SET ... NX (when it sets) -> SET, kSingleKey.
+  {
+    auto e = run1({"setex", "k1", "100", "v"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k1");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+  {
+    auto e = run1({"psetex", "k2", "100000", "v"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k2");
+  }
+  {
+    auto e = run1({"set", "k3", "v", "EX", "100"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k3");
+  }
+  {
+    Run({"del", "k4"});
+    auto e = run1({"set", "k4", "v", "NX"});
+    ASSERT_GE(e.size(), 3u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k4");
+    EXPECT_EQ(e[2], "v");
+  }
+
+  // GETEX k EX 100 -> the tree emits PEXPIREAT (matching the brief's own guess), kSingleKey.
+  {
+    Run({"set", "k5", "v"});
+    auto e = run1({"getex", "k5", "EX", "100"});
+    ASSERT_EQ(e.size(), 3u);
+    EXPECT_EQ(e[0], "PEXPIREAT");
+    EXPECT_EQ(e[1], "k5");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+
+  // GAT (memcache-only; registered, CO::NO_AUTOJOURNAL) -- the tree emits PEXPIREAT too, the same
+  // shape as GETEX ... EX (both route through MGetGeneric's touch path). Not reachable via plain
+  // RESP Run() (CmdGAT aborts with "GAT is a memcache-only command" outside an mc_command()
+  // context), so driven via RunMC/GetMC instead.
+  {
+    using MP = MemcacheParser;
+    Run({"set", "k18", "v"});
+    auto entries = [&] {
+      MsetLwwJournalConsumer consumer;
+      std::vector<uint32_t> consumer_ids(shard_set->size());
+      shard_set->RunBriefInParallel([&](EngineShard* shard) {
+        consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+      });
+      GetMC(MP::GAT, {absl::StrCat(TEST_current_time_ms / 1000 + 100), "k18"});
+      shard_set->RunBriefInParallel([&](EngineShard* shard) {
+        journal::UnregisterConsumer(consumer_ids[shard->shard_id()]);
+      });
+      util::fb2::LockGuard lk(consumer.mu_);
+      std::vector<std::vector<std::string>> out;
+      for (auto& e : consumer.entries)
+        out.push_back(e.args);
+      return out;
+    }();
+    ASSERT_EQ(entries.size(), 1u);
+    EXPECT_EQ(entries[0][0], "PEXPIREAT");
+    EXPECT_EQ(entries[0][1], "k18");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kSingleKey);
+  }
+
+  // GETSET k v -> auto-journaled verbatim as GETSET (F6), kSingleKey (guarded).
+  {
+    Run({"set", "k6", "old"});
+    auto e = run1({"getset", "k6", "v"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "GETSET");
+    EXPECT_EQ(e[1], "k6");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+
+  // UNLINK -> DEL, kMultiKeySelfGuarded.
+  {
+    Run({"set", "k7", "v"});
+    auto e = run1({"unlink", "k7"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "DEL");
+    EXPECT_EQ(e[1], "k7");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  // EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT -> PEXPIREAT, kSingleKey.
+  {
+    Run({"set", "k8", "v"});
+    auto e = run1({"expire", "k8", "100"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "PEXPIREAT");
+    EXPECT_EQ(e[1], "k8");
+  }
+  {
+    Run({"set", "k9", "v"});
+    auto e = run1({"pexpire", "k9", "100000"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "PEXPIREAT");
+    EXPECT_EQ(e[1], "k9");
+  }
+  {
+    Run({"set", "k10", "v"});
+    auto e = run1({"expireat", "k10", absl::StrCat(TEST_current_time_ms / 1000 + 100)});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "PEXPIREAT");
+    EXPECT_EQ(e[1], "k10");
+  }
+  {
+    Run({"set", "k11", "v"});
+    auto e = run1({"pexpireat", "k11", absl::StrCat(TEST_current_time_ms + 100000)});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "PEXPIREAT");
+    EXPECT_EQ(e[1], "k11");
+  }
+
+  // EXPIRE k -1 (existing key) -> DEL, kMultiKeySelfGuarded.
+  {
+    Run({"set", "k12", "v"});
+    auto e = run1({"expire", "k12", "-1"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "DEL");
+    EXPECT_EQ(e[1], "k12");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  const size_t n = shard_set->size();
+
+  // MSETNX a 1 b 2 (single shard) -> MSET, kMultiKeySelfGuarded.
+  {
+    std::string a = FindKeyOnShard("a11_ms_", 0, n);
+    std::string b = FindKeyOnShard("a11_ms2_", 0, n);
+    Run({"del", a, b});
+    auto e = run1({"msetnx", a, "1", b, "2"});
+    ASSERT_GE(e.size(), 3u);
+    EXPECT_EQ(e[0], "MSET");
+    EXPECT_EQ(e[1], a);
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  // RENAME src dst (same shard) -> the tree emits a single verbatim "RENAME src dst" entry, NOT
+  // "DEL src" + "RESTORE dst ... REPLACE ABSTTL" (see this test's own top comment for why).
+  // kUnguarded: RENAME is absent from kJournaledClasses. Deliberately not reclassified here.
+  {
+    std::string src = FindKeyOnShard("a11_rn_src_", 0, n);
+    std::string dst = FindKeyOnShard("a11_rn_dst_", 0, n);
+    Run({"set", src, "v"});
+    Run({"del", dst});
+    auto entries = capture_all({"rename", src, dst});
+    ASSERT_EQ(entries.size(), 1u) << "same-shard RENAME must journal exactly one entry";
+    EXPECT_EQ(entries[0][0], "RENAME");
+    EXPECT_EQ(entries[0][1], src);
+    EXPECT_EQ(entries[0][2], dst);
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kUnguarded);
+  }
+
+  // PFMERGE dst src -> SET (guarded -- a state-carrying RMW result), kSingleKey.
+  {
+    std::string dst = FindKeyOnShard("a11_pf_dst_", 0, n);
+    std::string src1 = FindKeyOnShard("a11_pf_src1_", 0, n);
+    std::string src2 = FindKeyOnShard("a11_pf_src2_", 0, n);
+    Run({"pfadd", src1, "a", "b"});
+    Run({"pfadd", src2, "c", "d"});
+    auto e = run1({"pfmerge", dst, src1, src2});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], dst);
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+
+  // BITOP AND dst a b (non-empty result) -> SET; with an empty result -> DEL (both guarded,
+  // kSingleKey / kMultiKeySelfGuarded respectively).
+  {
+    Run({"set", "pbit_a", std::string(1, '\xff')});
+    Run({"set", "pbit_b", std::string(1, '\xff')});
+    auto e = run1({"bitop", "AND", "pbdst1", "pbit_a", "pbit_b"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "pbdst1");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+  {
+    // BITOP's "empty result" is a ZERO-LENGTH result, only reachable when every source key is
+    // absent -- an AND of a present nonzero byte against a present zero byte is still a
+    // (nonempty, all-zero-bits) 1-byte result, not this case. The destination must already exist
+    // for the empty-result DEL branch to fire at all (operation.IsNewEntry() otherwise skips it).
+    Run({"del", "pbit_missing1", "pbit_missing2"});
+    Run({"set", "pbdst2", "preexisting"});
+    auto e = run1({"bitop", "AND", "pbdst2", "pbit_missing1", "pbit_missing2"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "DEL");
+    EXPECT_EQ(e[1], "pbdst2");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  // SETNX k v (sets) -> SETNX verbatim (the A9 SETNX->SET rewrite happens on the RECEIVER, not
+  // the author), kSingleKey.
+  {
+    Run({"del", "k13"});
+    auto e = run1({"setnx", "k13", "v"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "SETNX");
+    EXPECT_EQ(e[1], "k13");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+
+  // GETDEL / PERSIST (with TTL) / RESTORE -> same name, kSingleKey.
+  {
+    Run({"set", "k14", "v"});
+    auto e = run1({"getdel", "k14"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "GETDEL");
+    EXPECT_EQ(e[1], "k14");
+  }
+  {
+    Run({"set", "k15", "v", "EX", "1000"});
+    auto e = run1({"persist", "k15"});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "PERSIST");
+    EXPECT_EQ(e[1], "k15");
+  }
+  {
+    Run({"set", "k16", "v"});
+    std::string dump_blob = Run({"dump", "k16"}).GetString();
+    Run({"del", "k17"});
+    auto e = run1({"restore", "k17", "0", dump_blob});
+    ASSERT_GE(e.size(), 1u);
+    EXPECT_EQ(e[0], "RESTORE");
+    EXPECT_EQ(e[1], "k17");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+}
+
 // The "off means byte-identical to upstream" guard.
 TEST_F(BaseFamilyTest, NonActiveModeAllocatesNoMvccTable) {
   Run({"set", "k", "v"});
