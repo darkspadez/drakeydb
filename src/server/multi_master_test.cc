@@ -3437,8 +3437,11 @@ class MsetLwwJournalConsumer : public journal::JournalConsumerInterface {
 //  (a) "all-or-nothing" -- pre-scanning every pair and skipping the ENTIRE apply if any one pair
 //      would drop -- makes k1 come back missing (GET k1 empty) even though it had every right to
 //      apply on its own.
-//  (b) "always-apply" -- dropping the per-pair compare entirely -- clobbers k2 with "b" and its
-//      stamp with the peer's stale one, exactly the divergence the guard exists to prevent.
+//  (b) "always-apply" -- dropping the per-pair compare entirely -- clobbers k2's VALUE with "b"
+//      (never applied by the correct code, since k2 is genuinely stale), and its stamp is not
+//      left untouched either: A5's FloorAppliedStamp still floors the applied (older-author)
+//      write to just below k2's own prior stamp -- {k2.Mvcc(), k2.origin_hash - 1} -- rather than
+//      leaving it exactly as it was, exactly the divergence the guard exists to prevent.
 TEST_F(MvccStoreTest, MsetPartialApplyKeepsOnlyNonStaleKeysInOneJournalEntry) {
   constexpr uint32_t kPeerIdx = 40;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000040");
@@ -3553,6 +3556,7 @@ TEST_F(MvccStoreTest, MsetSkipsOnlyTheStaleMiddleKeyNotAPrefixTruncation) {
     pre_entries = consumer.entries.size();
   }
 
+  const uint64_t pre_dropped = TotalLwwDropped();
   auto res = ApplyReplicatedCommand({"mset", k1, "a", k2, "b", k3, "c"}, kPeerIdx, incoming_mvcc,
                                     /*lww_guard=*/true);
   EXPECT_EQ(res, facade::DispatchResult::OK);
@@ -3561,6 +3565,24 @@ TEST_F(MvccStoreTest, MsetSkipsOnlyTheStaleMiddleKeyNotAPrefixTruncation) {
   EXPECT_EQ(Run({"get", k2}), "local") << "the middle pair must be dropped";
   EXPECT_EQ(Run({"get", k3}), "c") << "k3 must still apply -- it is not a prefix of the pairs "
                                       "that survived, it is the LAST one";
+
+  auto k1_after = StampOf(k1);
+  ASSERT_TRUE(k1_after.has_value());
+  EXPECT_EQ(*k1_after, (MvccStamp{incoming_mvcc, peer_hash}))
+      << "k1 is fresh -- no prior stamp to floor against -- so it commits the author's stamp "
+         "verbatim";
+  auto k3_after = StampOf(k3);
+  ASSERT_TRUE(k3_after.has_value());
+  EXPECT_EQ(*k3_after, (MvccStamp{incoming_mvcc, peer_hash}))
+      << "k3 is also fresh and commits the author's stamp verbatim, exactly like k1 -- its "
+         "position AFTER the dropped middle pair changes nothing";
+  auto k2_after = StampOf(k2);
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_EQ(*k2_after, *k2_before)
+      << "the dropped middle pair is never armed -- its stamp must stay exactly what it was, not "
+         "merely floored";
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1)
+      << "exactly one pair (k2) is dropped -- k1 and k3 are fresh keys and can never be";
 
   std::move(unregister_consumer).Invoke();
   util::fb2::LockGuard lk(consumer.mu_);
@@ -3582,7 +3604,9 @@ TEST_F(MvccStoreTest, MsetSkipsOnlyTheStaleMiddleKeyNotAPrefixTruncation) {
 //
 // Falsified by adding a journal::ClearBuffer() call on the all-dropped (empty survivors) path:
 // the LSN observably advances by one across the apply (e.g. 3 -> 4) even though nothing was
-// written or journaled.
+// written or journaled. The recording consumer below is a second, independent witness of the
+// same "nothing journaled" fact -- LSN not advancing proves no entry was appended to the wire,
+// while the consumer proves no COMMAND entry was ever delivered to a live subscriber either.
 TEST_F(MvccStoreTest, MsetAllPairsStaleJournalsNothingAndLeavesLsnUnchanged) {
   constexpr uint32_t kPeerIdx = 42;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000042");
@@ -3608,6 +3632,21 @@ TEST_F(MvccStoreTest, MsetAllPairsStaleJournalsNothingAndLeavesLsnUnchanged) {
   LSN lsn_before = 0;
   shard_set->Await(sid, [&] { lsn_before = journal::GetLsn(); });
 
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
   const uint64_t pre_dropped = TotalLwwDropped();
   auto res = ApplyReplicatedCommand({"mset", k1, "peer1", k2, "peer2"}, kPeerIdx, incoming_mvcc,
                                     /*lww_guard=*/true);
@@ -3625,6 +3664,12 @@ TEST_F(MvccStoreTest, MsetAllPairsStaleJournalsNothingAndLeavesLsnUnchanged) {
   EXPECT_EQ(lsn_after, lsn_before)
       << "an entirely-dropped MSET must never advance the journal's LSN -- it wrote nothing, so "
          "nothing may be recorded, not even an empty marker";
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), pre_entries)
+      << "no COMMAND journal entry -- empty or otherwise -- may be delivered to a live consumer "
+         "for a fully-dropped MSET";
 }
 
 // drakeydb: P4-4 Task A7 -- the guard bit itself gates the split: with lww_guard=false, OpMSet
@@ -3633,10 +3678,10 @@ TEST_F(MvccStoreTest, MsetAllPairsStaleJournalsNothingAndLeavesLsnUnchanged) {
 //
 // Falsified by computing OpMSet's `guarded` from `db_cntx.repl_mvcc != 0` alone, ignoring
 // `repl_lww_guard` entirely (this test's own incoming mvcc is non-zero, so this is the same shape
-// as forcing `guarded = true` outright here): GET k2 then comes back "b" instead of "local", the
-// per-pair compare runs and counts a drop even though the link is unguarded
-// (TotalLwwDropped() advances by 1 instead of staying flat), and the journal entry shrinks to
-// just the surviving pair instead of staying the full, byte-identical command.
+// as forcing `guarded = true` outright here): the per-pair compare wrongly runs and DROPS k2 (its
+// own local stamp beats stale_mvcc), so GET k2 then comes back "local" instead of "b", and
+// TotalLwwDropped() advances by 1 instead of staying flat -- and the journal entry shrinks to
+// just the surviving pair (k1) instead of staying the full, byte-identical command.
 TEST_F(MvccStoreTest, MsetGuardOffAppliesArrivalOrderRegardlessOfStamps) {
   constexpr uint32_t kPeerIdx = 43;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000043");
@@ -3680,6 +3725,14 @@ TEST_F(MvccStoreTest, MsetGuardOffAppliesArrivalOrderRegardlessOfStamps) {
   EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "no per-pair compare may run at all with the guard "
                                                "off";
 
+  auto k2_after = StampOf(k2);
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_EQ(*k2_after, (MvccStamp{k2_before->Mvcc(), k2_before->origin_hash - 1}))
+      << "the unguarded path still applies A5's floor: an applied write whose author stamp is "
+         "older than the key's own prior stamp commits just below that prior stamp, never the "
+         "peer's raw (older) incoming mvcc verbatim -- this is what proves 'guard off' is really "
+         "the pre-A7 unguarded RMW path and not some other, untested code shape";
+
   std::move(unregister_consumer).Invoke();
   util::fb2::LockGuard lk(consumer.mu_);
   ASSERT_EQ(consumer.entries.size(), pre_entries + 1);
@@ -3703,8 +3756,10 @@ TEST_F(MvccStoreTest, MsetGuardOffAppliesArrivalOrderRegardlessOfStamps) {
 // `mvcc == 0` early return (multimaster_lww.cc). Disabling only OpMSet's layer does not reproduce
 // a visible failure here -- IncomingStamp(0, ...) still independently returns nullopt, so `split`
 // still ends up false -- the same redundancy UnstampedIncomingNeverGuarded (above) already
-// documents for the single-key veto. Disabling both at once does: GET k2 comes back "b" instead
-// of "local", and TotalLwwDropped() advances by 1 instead of staying flat.
+// documents for the single-key veto. Disabling both at once does: the per-pair compare now
+// genuinely runs against a real (mvcc=0) incoming stamp, and since k2's own stored stamp is newer
+// than {0, peer_hash}, k2 is wrongly dropped -- the GET below then observes "local" instead of
+// "b", and TotalLwwDropped() advances by 1 instead of staying flat.
 TEST_F(MvccStoreTest, MsetUnstampedIncomingAppliesAllPairsEvenWithGuardOn) {
   constexpr uint32_t kPeerIdx = 44;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000044");
@@ -3718,7 +3773,8 @@ TEST_F(MvccStoreTest, MsetUnstampedIncomingAppliesAllPairsEvenWithGuardOn) {
   ASSERT_EQ(Shard(k2, num_shards), sid);
 
   ASSERT_EQ(Run({"set", k2, "local"}), "OK");
-  ASSERT_TRUE(StampOf(k2).has_value());
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
 
   const uint64_t pre_dropped = TotalLwwDropped();
   auto res = ApplyReplicatedCommand({"mset", k1, "a", k2, "b"}, kPeerIdx, /*mvcc=*/0,
@@ -3729,6 +3785,24 @@ TEST_F(MvccStoreTest, MsetUnstampedIncomingAppliesAllPairsEvenWithGuardOn) {
   EXPECT_EQ(Run({"get", k2}), "b");
   EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "an unstamped apply must never count as a drop";
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  // drakeydb: P4-4 -- journal::RecordEntry mints a fresh local HopStamp whenever entry.mvcc == 0,
+  // and MvccStamper::Commit attributes that mint to entry.origin_idx verbatim (the LINK's peer
+  // index, not this node's own) -- see UnstampedIncomingNeverGuarded's identical single-key
+  // reasoning (above). Expectations below are derived independently of the values under test: the
+  // origin is the peer_hash registered at the top of this test, and k2's mint must be strictly
+  // newer than k2_before, captured before the apply ever ran.
+  auto k1_after = StampOf(k1);
+  ASSERT_TRUE(k1_after.has_value());
+  EXPECT_EQ(k1_after->origin_hash, peer_hash)
+      << "a fresh key's mvcc==0 mint is still attributed to the LINK's peer origin";
+  auto k2_after = StampOf(k2);
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_GT(k2_after->Mvcc(), k2_before->Mvcc())
+      << "an mvcc==0 apply still mints a fresh HopStamp on commit -- strictly newer than k2's own "
+         "prior stamp, never a no-op and never the incoming (nonexistent) mvcc verbatim";
+  EXPECT_EQ(k2_after->origin_hash, peer_hash)
+      << "the freshly-minted stamp is attributed to the LINK's peer origin, not this node's own";
 }
 
 // ---------------------------------------------------------------------------

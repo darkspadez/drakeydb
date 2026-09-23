@@ -426,6 +426,8 @@ OpStatus OpMSet(const OpArgs& op_args, const ShardArgs& args) {
   OpStatus result = OpStatus::OK;
   size_t stored = 0;
   vector<string_view> survivors;
+  if (split)
+    survivors.reserve(args.Size());
   for (auto it = args.begin(); it != args.end();) {
     string_view key = *(it++);
     string_view value = *(it++);
