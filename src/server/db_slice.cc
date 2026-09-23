@@ -1586,17 +1586,19 @@ void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
     --db.stats.mvcc_tombstones;
 }
 
-void DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
+MvccStamp DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
   auto& db = *db_arr_[db_ind];
   if (!db.mvcc)
-    return;
+    return MvccStamp{};
 
   auto [it, inserted] = db.mvcc->Insert(key, MvccStamp{});
   if (inserted) {
     ++db.stats.mvcc_entries;
     // drakeydb: P4-2 Task 4 -- same accounting as SetMvcc's insert branch above.
     db.stats.mvcc_key_dup_bytes += it->first.MallocUsed();
-  } else if (it->second.IsTombstone()) {
+    return MvccStamp{};  // nothing was here before -- Insert() itself just wrote this value
+  }
+  if (it->second.IsTombstone()) {
     // drakeydb: P4-3 Task 2 review fix (C1) -- a key re-created after being tombstoned (SET k v;
     // DEL k; LPUSH k a -- an ordinary write-after-delete, not an edge case). EnsureMvcc runs
     // synchronously inside PostUpdate, before Arm(), at the exact moment prime.size() increments
@@ -1610,9 +1612,16 @@ void DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
     // means "a live key exists here, real stamp not yet known", identical to a brand-new
     // EnsureMvcc'd slot -- mirrors PerformDeletionAtomic's own synchronous placeholder write for
     // the opposite direction (prime shrinking, not growing).
+    //
+    // drakeydb: P4-4 Task A5 fix round 1 -- capture the tombstone BEFORE clearing it: PostUpdate
+    // carries this on the arm it makes right after this call returns, so a later applied write
+    // over a just-recreated key can still floor against it (see PostUpdate's own comment).
+    const MvccStamp prev = it->second;
     it->second = MvccStamp{};
     --db.stats.mvcc_tombstones;
+    return prev;
   }
+  return it->second;  // already live -- unchanged, and IS this key's pre-mutation stamp
 }
 
 // drakeydb: P4-3 Task 2 review fix (I5) -- no longer delegates the tombstone case to SetTombstone
@@ -2005,8 +2014,25 @@ void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key, bool arm_mvcc) {
     // Prepare the side-table slot before Arm makes this key eligible for RecordEntry's
     // post-journal Commit. SetExistingMvcc can then update it without allocating after the entry
     // has already been accepted and exposed to consumers.
-    EnsureMvcc(db_ind, key);
-    MvccStamper::tlocal()->Arm(db_ind, key);
+    //
+    // drakeydb: P4-4 Task A5 fix round 1 -- carry EnsureMvcc's return (this key's stamp from
+    // BEFORE this call, whether a fresh {0,0}, an untouched live value, or a tombstone this same
+    // call just cleared) on the arm itself: by the time journal::RecordEntry's Commit() runs,
+    // the slot may no longer hold it -- EnsureMvcc's own tombstone-clearing branch (above) already
+    // overwrote it synchronously, well before Commit() ever sees this key again.
+    //
+    // KNOWN GAP, not closed by this fix: if this key was ALSO ArmTombstone'd earlier in the SAME
+    // callback (e.g. Renamer::DeserializeDest deleting an existing dest then recreating it,
+    // RenameOntoAnExistingDestSelfCorrectsToALiveStamp) EnsureMvcc's tombstone-clearing branch
+    // here fires on PerformDeletionAtomic's OWN placeholder, not the key's true pre-delete stamp
+    // -- that value lives only on the earlier ArmTombstone call's own prev_stamp, which this call
+    // has no way to see (MvccStamper exposes no "peek a pending arm for this key" query). An
+    // applied write recreating a key this way still commits its author stamp verbatim, not
+    // floored, even when that stamp is older than the key's true prior one. Closing this would
+    // need MvccStamper to let a plain Arm() inherit a coincident pending tombstone arm's own
+    // prev_stamp for the same key -- out of this fix round's scope.
+    const MvccStamp prev_stamp = EnsureMvcc(db_ind, key);
+    MvccStamper::tlocal()->Arm(db_ind, key, prev_stamp);
   }
 }
 

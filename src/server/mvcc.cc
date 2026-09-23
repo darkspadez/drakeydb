@@ -25,6 +25,15 @@ uint64_t NodeUuidHash(std::string_view uuid) {
 // so PerformDeletionAtomic's {kTombstoneBit, 0} lands here too): neither carries a real prior
 // stamp to floor against. `!(incoming < stored)` covers both "incoming is strictly newer" and an
 // exact tie -- both commit verbatim, unchanged from before this task.
+//
+// drakeydb: P4-4 Task A5 fix round 1 -- the `stored.Mvcc() == 0` check is redundant given this
+// function's only real caller's own precondition (journal::RecordEntry only floors an APPLIED
+// write, whose `incoming` is a non-zero author mvcc by definition -- see RecordEntry's `applied`
+// check -- so `incoming < stored` is already false whenever `stored.Mvcc() == 0`). Kept anyway:
+// this is a general pure function, exercised directly in mvcc_test.cc without going through that
+// caller, and a `stored.Mvcc() == 0` slot has no real prior stamp regardless of what `incoming`
+// happens to be, so relying on an undocumented caller invariant to get the right answer here would
+// make the function's own correctness depend on something this file cannot see or enforce.
 MvccStamp FloorAppliedStamp(const MvccStamp& stored, const MvccStamp& incoming) {
   if (stored.Mvcc() == 0 || !(incoming < stored))
     return incoming;
@@ -68,13 +77,14 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
   return hop_stamp_;
 }
 
-void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
+void MvccStamper::Arm(DbIndex db_index, std::string_view key, const MvccStamp& prev_stamp) {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn armed a key -- Commit() is mid-iteration over "
                                  "armed_/arena_, both of which this call can reallocate, "
                                  "corrupting that iteration";
   const uint32_t off = static_cast<uint32_t>(arena_.size());
   arena_.append(key);
-  armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size())});
+  armed_.push_back(
+      Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/false, prev_stamp});
 }
 
 // drakeydb: P4-3 Task 2 -- see the declaration (mvcc.h) for the contract. Identical to Arm()
@@ -164,7 +174,7 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
     arena_.clear();  // keeps capacity
   };
   for (const Armed& a : armed_)
-    fn(a.db_index, ArmedKey(a), a.tombstone ? tomb_stamp : stamp, a.prev_stamp);
+    fn(a.db_index, ArmedKey(a), a.tombstone ? tomb_stamp : stamp, a.tombstone, a.prev_stamp);
 }
 
 // drakeydb: P4-3 Task 11, review ruling I2 -- see the declaration (mvcc.h) for the contract.
@@ -191,10 +201,11 @@ bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uin
         --commit_depth_;
         armed_.erase(it);
       };
-      // drakeydb: P4-4 Task A5 -- passes the arm's own prev_stamp through, matching Commit()'s own
-      // call above; harmless here since this stamp is always a fresh self-mint (never an applied
-      // write), so RecordExpiryBlocking's fn (tx_base.cc) ignores this argument entirely.
-      fn(db_index, ArmedKey(*it), stamp, it->prev_stamp);
+      // drakeydb: P4-4 Task A5 fix round 1 -- passes true (this is always a tombstone arm, per
+      // the `it->tombstone` check above) and the arm's own prev_stamp through, matching Commit()'s
+      // own call above; both harmless here since this stamp is always a fresh self-mint (never an
+      // applied write), so RecordExpiryBlocking's fn (tx_base.cc) ignores both arguments entirely.
+      fn(db_index, ArmedKey(*it), stamp, /*tombstone=*/true, it->prev_stamp);
       return true;
     }
   }

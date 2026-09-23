@@ -189,18 +189,16 @@ TEST(FloorAppliedStampTest, IncomingOlderFloorsToOneOriginBelowStored) {
   const MvccStamp stored{0x5000, 0xAAAA};
   const MvccStamp incoming{0x1000, 0xFFFF};  // Mvcc() strictly less -> older, regardless of origin
   const MvccStamp got = FloorAppliedStamp(stored, incoming);
-  EXPECT_EQ(got.Mvcc(), stored.Mvcc());
-  EXPECT_EQ(got.origin_hash, stored.origin_hash - 1);
-  EXPECT_FALSE(got.IsTombstone());
+  // Whole-stamp equality, not Mvcc()/origin_hash/IsTombstone() separately: pins bit 63 (masked
+  // out of Mvcc()) at exactly 0 too, not merely "falsy by whatever IsTombstone() happens to see".
+  EXPECT_EQ(got, (MvccStamp{stored.Mvcc(), stored.origin_hash - 1}));
 }
 
 TEST(FloorAppliedStampTest, StoredOriginZeroFloorsToOneMvccTickBelowStored) {
   const MvccStamp stored{0x5000, /*origin_hash=*/0};
   const MvccStamp incoming{0x1000, 0xFFFF};
   const MvccStamp got = FloorAppliedStamp(stored, incoming);
-  EXPECT_EQ(got.Mvcc(), stored.Mvcc() - 1);
-  EXPECT_EQ(got.origin_hash, UINT64_MAX);
-  EXPECT_FALSE(got.IsTombstone());
+  EXPECT_EQ(got, (MvccStamp{stored.Mvcc() - 1, UINT64_MAX}));
 }
 
 TEST(FloorAppliedStampTest, FreshStoredSlotCommitsIncomingVerbatim) {
@@ -221,19 +219,18 @@ TEST(FloorAppliedStampTest, StoredTombstoneLiveIncomingOlderFloorsWithoutTombsto
   const MvccStamp stored = MvccStamp{0x5000, 0xAAAA}.AsTombstone();
   const MvccStamp incoming{0x1000, 0xFFFF};  // live, not a tombstone
   const MvccStamp got = FloorAppliedStamp(stored, incoming);
-  EXPECT_FALSE(got.IsTombstone())
-      << "the floor must never inherit stored's own tombstone bit -- only the NEW operation's";
-  EXPECT_EQ(got.Mvcc(), stored.Mvcc());
-  EXPECT_EQ(got.origin_hash, stored.origin_hash - 1);
+  // Whole-stamp equality pins bit 63 at exactly 0 -- the floor must never inherit stored's own
+  // tombstone bit, only the NEW operation's (incoming's, here unset).
+  EXPECT_EQ(got, (MvccStamp{stored.Mvcc(), stored.origin_hash - 1}));
 }
 
 TEST(FloorAppliedStampTest, LiveStoredTombstoneIncomingOlderFloorsWithTombstoneBit) {
   const MvccStamp stored{0x5000, 0xAAAA};                              // live
   const MvccStamp incoming = MvccStamp{0x1000, 0xFFFF}.AsTombstone();  // older, but a delete
   const MvccStamp got = FloorAppliedStamp(stored, incoming);
-  EXPECT_TRUE(got.IsTombstone()) << "the NEW operation's tombstone bit must survive the floor";
-  EXPECT_EQ(got.Mvcc(), stored.Mvcc());
-  EXPECT_EQ(got.origin_hash, stored.origin_hash - 1);
+  // Whole-stamp equality pins bit 63 at exactly 1 -- the NEW operation's tombstone bit must
+  // survive the floor.
+  EXPECT_EQ(got, (MvccStamp{stored.Mvcc(), stored.origin_hash - 1}.AsTombstone()));
 }
 
 TEST(FloorAppliedStampTest, FlooredStampOrdersBetweenStoredAndEveryPreviouslyRejectedStamp) {
@@ -291,7 +288,7 @@ struct Recorder {
   MvccStamper::CommitFn Fn() {
     // drakeydb: P4-4 Task A5 -- CommitFn grew a 4th argument (the arm's captured prev_stamp);
     // unused by every test that only cares about the committed stamp itself.
-    return [this](DbIndex db, std::string_view key, const MvccStamp& st, const MvccStamp&) {
+    return [this](DbIndex db, std::string_view key, const MvccStamp& st, bool, const MvccStamp&) {
       writes.push_back(Write{db, std::string(key), st});
     };
   }
@@ -324,8 +321,8 @@ struct EraseRecorder {
 TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
-  s->Arm(0, "k1");
-  s->Arm(0, "k2");
+  s->Arm(0, "k1", MvccStamp{});
+  s->Arm(0, "k2", MvccStamp{});
   s->Commit(4242, /* origin_idx= */ 0, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 2u);
@@ -343,12 +340,13 @@ TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
 // committed in the same call by that one bit alone.
 TEST(MvccStamperTest, CommitMarksOnlyTombstoneArms) {
   MvccStamper* s = FreshStamper();
-  s->Arm(0, "live");
-  s->ArmTombstone(0, "dead");
+  s->Arm(0, "live", MvccStamp{});
+  s->ArmTombstone(0, "dead", MvccStamp{});
   std::map<std::string, MvccStamp> got;
-  s->Commit(0x5000, 0, [&](DbIndex, std::string_view k, const MvccStamp& st, const MvccStamp&) {
-    got[std::string(k)] = st;
-  });
+  s->Commit(0x5000, 0,
+            [&](DbIndex, std::string_view k, const MvccStamp& st, bool, const MvccStamp&) {
+              got[std::string(k)] = st;
+            });
   ASSERT_EQ(got.size(), 2u);
   EXPECT_FALSE(got["live"].IsTombstone());
   EXPECT_TRUE(got["dead"].IsTombstone());
@@ -359,7 +357,7 @@ TEST(MvccStamperTest, CommitMarksOnlyTombstoneArms) {
 TEST(MvccStamperTest, EndOfEpochDropsUncommittedArms) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
-  s->Arm(0, "orphan");
+  s->Arm(0, "orphan", MvccStamp{});
   s->EndOfWriteEpoch(NoopErase());
   s->Commit(1, 0, rec.Fn());
 
@@ -378,8 +376,8 @@ TEST(MvccStamperTest, EndOfEpochDropsUncommittedArms) {
 // pending" marker, not an abandoned one, and is left for a later write or GC to resolve).
 TEST(MvccStamperTest, EndOfEpochRollsBackOnlyUncommittedTombstoneArms) {
   MvccStamper* s = FreshStamper();
-  s->Arm(0, "live-orphan");
-  s->ArmTombstone(0, "dead-orphan");
+  s->Arm(0, "live-orphan", MvccStamp{});
+  s->ArmTombstone(0, "dead-orphan", MvccStamp{});
   EraseRecorder erase_rec;
   s->EndOfWriteEpoch(erase_rec.Fn());
 
@@ -394,8 +392,8 @@ TEST(MvccStamperTest, EndOfEpochRollsBackOnlyUncommittedTombstoneArms) {
 TEST(MvccStamperTest, DisarmRemovesOnlyTheNamedKey) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
-  s->Arm(0, "keep");
-  s->Arm(0, "drop");
+  s->Arm(0, "keep", MvccStamp{});
+  s->Arm(0, "drop", MvccStamp{});
   s->Disarm(0, "drop");
   s->Commit(7, 0, rec.Fn());
 
@@ -411,8 +409,8 @@ TEST(MvccStamperTest, DisarmRemovesOnlyTheNamedKey) {
 TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
-  s->Arm(0, "k");
-  s->Arm(1, "k");
+  s->Arm(0, "k", MvccStamp{});
+  s->Arm(1, "k", MvccStamp{});
   s->Disarm(1, "k");
   s->Commit(7, 0, rec.Fn());
 
@@ -439,8 +437,8 @@ TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
 TEST(MvccStamperTest, DisarmRemovesAllArmsForTheSameKey) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
-  s->Arm(0, "h");
-  s->Arm(0, "h");
+  s->Arm(0, "h", MvccStamp{});
+  s->Arm(0, "h", MvccStamp{});
   s->Disarm(0, "h");
   s->Commit(7, 0, rec.Fn());
 
@@ -489,7 +487,7 @@ TEST(MvccStamperTest, PeerMvccIsNeverReminted) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
   s->RegisterOriginHash(3, 0xABCDEF);
-  s->Arm(0, "k");
+  s->Arm(0, "k", MvccStamp{});
   s->Commit(/* mvcc= */ 999, /* origin_idx= */ 3, rec.Fn());
 
   ASSERT_EQ(rec.writes.size(), 1u);
@@ -510,7 +508,7 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
   std::vector<std::string> keys;
   for (int i = 0; i < 256; ++i) {
     keys.push_back(absl::StrCat("key-with-a-long-enough-name-to-force-growth-", i));
-    s->Arm(0, keys.back());
+    s->Arm(0, keys.back(), MvccStamp{});
   }
   s->Commit(5, 0, rec.Fn());
 
@@ -529,8 +527,8 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
 // ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc, multi_master_test.cc).
 TEST(MvccStamperTest, CommitOwnTombstoneMintsSelfStampAndSparesSiblingArm) {
   MvccStamper* s = FreshStamper();
-  s->Arm(0, "sibling");
-  s->ArmTombstone(0, "victim");
+  s->Arm(0, "sibling", MvccStamp{});
+  s->ArmTombstone(0, "victim", MvccStamp{});
 
   constexpr uint64_t kNowMs = 123'456'789;
   const uint64_t expected_mvcc = s->HopStamp(kNowMs);  // memoized -- CommitOwnTombstone below
@@ -570,7 +568,7 @@ TEST(MvccStamperTest, CommitOwnTombstoneMintsSelfStampAndSparesSiblingArm) {
 // subsequent ordinary Commit() to handle exactly as if CommitOwnTombstone had never been called.
 TEST(MvccStamperTest, CommitOwnTombstoneIsANoopWhenNothingIsArmed) {
   MvccStamper* s = FreshStamper();
-  s->Arm(0, "unrelated");
+  s->Arm(0, "unrelated", MvccStamp{});
 
   Recorder rec;
   EXPECT_FALSE(s->CommitOwnTombstone(0, "missing", 123, rec.Fn()));
@@ -587,7 +585,7 @@ TEST(MvccStamperTest, CommitOwnTombstoneIsANoopWhenNothingIsArmed) {
 // ArmTombstone alone, never a plain Arm().
 TEST(MvccStamperTest, CommitOwnTombstoneIgnoresAPlainArmOfTheSameKey) {
   MvccStamper* s = FreshStamper();
-  s->Arm(0, "k");
+  s->Arm(0, "k", MvccStamp{});
 
   Recorder rec;
   EXPECT_FALSE(s->CommitOwnTombstone(0, "k", 123, rec.Fn()));
@@ -605,7 +603,7 @@ TEST(MvccStamperTest, CommitOwnTombstoneIgnoresAPlainArmOfTheSameKey) {
 // must not be matched.
 TEST(MvccStamperTest, CommitOwnTombstoneIsScopedToTheDbIndex) {
   MvccStamper* s = FreshStamper();
-  s->ArmTombstone(1, "k");
+  s->ArmTombstone(1, "k", MvccStamp{});
 
   Recorder rec;
   EXPECT_FALSE(s->CommitOwnTombstone(0, "k", 123, rec.Fn()));
@@ -628,16 +626,16 @@ TEST(MvccStamperTest, CommitOwnTombstoneIsScopedToTheDbIndex) {
 // subsequent Arm()/Disarm()/Commit() DCHECK-aborting forever.
 TEST(MvccStamperTest, CommitDepthRecoversAfterCommitFnThrows) {
   MvccStamper* s = FreshStamper();
-  s->Arm(0, "k");
+  s->Arm(0, "k", MvccStamp{});
   EXPECT_THROW(s->Commit(1, 0,
-                         [](DbIndex, std::string_view, const MvccStamp&, const MvccStamp&) {
+                         [](DbIndex, std::string_view, const MvccStamp&, bool, const MvccStamp&) {
                            throw std::bad_alloc{};
                          }),
                std::bad_alloc);
 
   // If commit_depth_ had leaked at 1 above, this would DCHECK-abort the whole test binary in a
   // debug build -- there is no way to observe a leaked guard other than the process not dying.
-  s->Arm(0, "k2");
+  s->Arm(0, "k2", MvccStamp{});
 
   // drakeydb: P4-1 Task 7 -- the throw-safety decision parked from Task 4 (see this file's
   // description above and the Commit() comment in mvcc.cc): armed_/arena_ are cleared
@@ -778,12 +776,13 @@ TEST(MultimasterLwwDeathTest, IncomingStampUnregisteredOriginDies) {
 // at the DCHECK before doing any damage.
 TEST(MvccStamperDeathTest, ReentrantCommitDies) {
   MvccStamper* s = FreshStamper();
-  s->Arm(0, "k");
+  s->Arm(0, "k", MvccStamp{});
   EXPECT_DEBUG_DEATH(
       s->Commit(1, 0,
-                [s](DbIndex, std::string_view, const MvccStamp&, const MvccStamp&) {
-                  s->Commit(2, 0,
-                            [](DbIndex, std::string_view, const MvccStamp&, const MvccStamp&) {});
+                [s](DbIndex, std::string_view, const MvccStamp&, bool, const MvccStamp&) {
+                  s->Commit(
+                      2, 0,
+                      [](DbIndex, std::string_view, const MvccStamp&, bool, const MvccStamp&) {});
                 }),
       "re-entrantly");
 }
@@ -791,11 +790,10 @@ TEST(MvccStamperDeathTest, ReentrantCommitDies) {
 // The hazard Commit()'s own doc comment names first: "fn must not call Arm()".
 TEST(MvccStamperDeathTest, ArmFromCommitFnDies) {
   MvccStamper* s = FreshStamper();
-  s->Arm(0, "k");
+  s->Arm(0, "k", MvccStamp{});
   EXPECT_DEBUG_DEATH(s->Commit(1, 0,
-                               [s](DbIndex, std::string_view, const MvccStamp&, const MvccStamp&) {
-                                 s->Arm(0, "reentrant");
-                               }),
+                               [s](DbIndex, std::string_view, const MvccStamp&, bool,
+                                   const MvccStamp&) { s->Arm(0, "reentrant", MvccStamp{}); }),
                      "mid-iteration");
 }
 #endif  // NDEBUG

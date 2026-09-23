@@ -5772,7 +5772,7 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyDoesNotStealConcurrentAr
     // Mirrors PerformDeletionAtomic's own synchronous placeholder write + arm (db_slice.cc) for a
     // concurrent DEL of "ghost" that has not yet reached its own journal Commit().
     db_slice.SetTombstone(0, std::string_view{"ghost"}, MvccStamp{MvccClock::kTombstoneBit, 0});
-    MvccStamper::tlocal()->ArmTombstone(0, std::string_view{"ghost"});
+    MvccStamper::tlocal()->ArmTombstone(0, std::string_view{"ghost"}, MvccStamp{});
   });
 
   std::string body = BuildTombstoneSection(0, {{"ghost", kIncomingTombstone}});
@@ -5802,7 +5802,7 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyDoesNotStealConcurrentAr
     got = db_slice.GetMvcc(0, std::string_view{"ghost"});
     arm_survived = MvccStamper::tlocal()->CommitOwnTombstone(
         0, std::string_view{"ghost"}, GetCurrentTimeMs(),
-        [](DbIndex, std::string_view, const MvccStamp&, const MvccStamp&) {});
+        [](DbIndex, std::string_view, const MvccStamp&, bool, const MvccStamp&) {});
   });
   ASSERT_TRUE(got.has_value());
   EXPECT_EQ(*got, kIncomingTombstone)

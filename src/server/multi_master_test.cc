@@ -1506,9 +1506,10 @@ TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) 
 
     MvccStamper::tlocal()->Commit(
         kPendingMvcc, 0,
-        // drakeydb: P4-4 Task A5 -- CommitFn's 4th argument (the arm's captured prev_stamp) is
-        // unused here; this test is about arm/commit isolation, not the floor.
-        [&](DbIndex db, std::string_view key, const MvccStamp& stamp, const MvccStamp&) {
+        // drakeydb: P4-4 Task A5 fix round 1 -- CommitFn's 4th (tombstone) and 5th (the arm's
+        // captured prev_stamp) arguments are both unused here; this test is about arm/commit
+        // isolation, not the floor.
+        [&](DbIndex db, std::string_view key, const MvccStamp& stamp, bool, const MvccStamp&) {
           db_slice.SetExistingMvcc(db, key, stamp);
         });
     pending_stamp = db_slice.GetMvcc(0, "pending-key");
@@ -2574,6 +2575,18 @@ TEST_F(MvccStoreTest, AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim) {
 // Falsifying: reverting RecordExpiryBlocking's `db_cntx.repl_mvcc` argument (tx_base.cc) back to
 // a hardcoded 0 makes k1's EXPECT_EQ below fail -- st->Mvcc() comes back larger than kAuthorMvcc
 // (a real HopStamp minted from the live wall clock, not this literal).
+//
+// drakeydb: P4-4 Task A5 fix round 1 -- k2's own assertions below changed: k2's LIVE recreate
+// (OpMSet's own Set() call for it, right after its lazy expiry) now floors against that expiry's
+// OWN self-minted tombstone stamp -- DbSlice::EnsureMvcc (db_slice.cc) captures whatever the slot
+// held before this write, including a tombstone it itself just cleared, and PostUpdate carries
+// that on k2's arm for exactly this purpose. That tombstone's mvcc is a real, freshly minted
+// HopStamp from the live (mocked, advanced) wall clock -- always far larger than the literal
+// kAuthorMvcc below -- so k2's committed stamp floors to just-below it, never kAuthorMvcc
+// verbatim. The exact value is not independently observable from this test without either
+// minting it a second time (impossible -- HopStamp is one-shot per epoch) or expiring k2 in a
+// separate, earlier step, which would remove the mid-MSET lazy-expiry race this test exists to
+// exercise -- so the assertions below pin the FLOORED shape, not the floor's exact value.
 TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   constexpr uint32_t kPeerIdx = 6;
   constexpr uint64_t kAuthorMvcc = 0x7777'0000'2222ULL;
@@ -2614,9 +2627,15 @@ TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
 
   auto st2 = StampOf(k2);
   ASSERT_TRUE(st2.has_value());
-  EXPECT_EQ(st2->Mvcc(), kAuthorMvcc) << "k2 itself is stamped by MSET's own trailing commit, "
-                                         "unaffected by this bug -- guards against a vacuous pass";
-  EXPECT_EQ(st2->origin_hash, peer_hash);
+  EXPECT_FALSE(st2->IsTombstone()) << "k2's recreate is a live write, not a delete -- the floor "
+                                      "must never leave it looking like a tombstone";
+  EXPECT_GT(st2->Mvcc(), kAuthorMvcc)
+      << "k2 itself IS stamped by MSET's own trailing commit (not left as the expiry's own "
+         "tombstone, and not silently dropped) -- but floored against that expiry's real, "
+         "wall-clock-minted stamp, strictly greater than the literal kAuthorMvcc, never "
+         "kAuthorMvcc verbatim";
+  EXPECT_NE(st2->origin_hash, peer_hash)
+      << "the floor lands one origin_hash below the expiry's SELF stamp -- never the peer's own";
 }
 
 // drakeydb: P4-3 Task 11, review ruling I2 -- a lazy expiry firing while applying a peer's
@@ -2863,11 +2882,11 @@ TEST_F(MvccStoreTest, StalePeerSetDroppedUnderLwwGuard) {
 // drakeydb: P4-4 Task A5 -- this test's STAMP assertions changed from its pre-A5 version: SET is
 // one of the commands ClassifyJournaledCommand (multimaster_lww.h) guards by NAME, but with the
 // link's guard bit off here A3's veto never engages -- exactly the "unguarded command" case
-// FloorAppliedStamp (mvcc.h) exists for. "k"
-// already carries a real local stamp `S` by the time this stale peer SET commits, so the applied
-// write's stamp is floored to just-below `S`, never kStaleMvcc verbatim -- committing verbatim
-// would rewind the key's stamp, letting some later, even-older write wrongly win a future
-// comparison against it.
+// FloorAppliedStamp (mvcc.h) exists for. "k" already carries a real local stamp `S` by the time
+// this stale peer SET commits, so the applied write's stamp is floored to just-below `S`, never
+// kStaleMvcc verbatim -- committing verbatim would rewind the key's stamp, letting a LATER write
+// whose stamp sits strictly between kStaleMvcc and `S` (older than `S`, but newer than this
+// write's own stale mvcc) wrongly win a future comparison against it.
 TEST_F(MvccStoreTest, StalePeerSetAppliesWithoutLwwGuard) {
   constexpr uint32_t kPeerIdx = 21;
   constexpr uint64_t kStaleMvcc = 0x1000ULL;
@@ -3227,8 +3246,9 @@ TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyC
 // "incr", ...})` setup below) that is newer than kStaleMvcc, so this is precisely the "unguarded
 // applied write with an author stamp older than S" case FloorAppliedStamp (mvcc.h) exists for --
 // none of these three commands is vetoed (that is this test's whole point), but their COMMITTED
-// stamp is still floored to just-below `S`, never kStaleMvcc verbatim, or a later, even-older
-// write could wrongly win a comparison against the rewound stamp.
+// stamp is still floored to just-below `S`, never kStaleMvcc verbatim -- verbatim would rewind
+// the key's stamp, letting a LATER write whose stamp sits strictly between kStaleMvcc and `S`
+// (older than `S`, but newer than this write's own stale mvcc) wrongly win a future comparison.
 TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
   constexpr uint32_t kPeerIdx = 27;
   constexpr uint64_t kStaleMvcc = 0x1000ULL;
@@ -3253,7 +3273,8 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
            "the Mvcc() field at S's own, never the stale kStaleMvcc verbatim";
     EXPECT_EQ(after->origin_hash, before->origin_hash - 1)
         << "floored one origin_hash below S -- never the peer's own origin_hash verbatim";
-    EXPECT_NE(*after, *before) << "sanity: the stamp must have actually advanced";
+    EXPECT_NE(*after, *before) << "sanity: the stamp must have actually changed -- the floor "
+                                  "lands BELOW before, not above it";
     EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "INCR must never count as an LWW drop";
   }
 
@@ -3379,8 +3400,9 @@ TEST_F(MvccStoreTest, UnguardedAppliedRmwWithOlderAuthorMvccFloorsInsteadOfRewin
 // guard bit off here it is simply an unguarded applied delete -- PerformDeletionAtomic's own
 // captured prev_stamp (db_slice.cc) is what lets the floor apply here at all, since by the time
 // journal::RecordEntry's Commit() runs, the slot no longer holds `S` itself (only the delete's own
-// zero-authority placeholder does). This is exactly the "derived DEL from an applied RMW that
-// empties a container, or a plain DEL applied with the guard OFF" case the brief calls out.
+// zero-authority placeholder does). This covers any unguarded applied delete whose author stamp
+// is older than the key's own -- a derived DEL from an applied RMW that empties a container, a
+// plain DEL applied with the guard OFF, or (as here) a directly-applied DEL on an unguarded link.
 TEST_F(MvccStoreTest, UnguardedAppliedDeleteWithOlderAuthorMvccFloorsTheTombstone) {
   constexpr uint32_t kPeerIdx = 31;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a5a5-4000-8000-000000000031");
@@ -3410,6 +3432,60 @@ TEST_F(MvccStoreTest, UnguardedAppliedDeleteWithOlderAuthorMvccFloorsTheTombston
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, tombstones_before + 1)
       << "mvcc_tombstones must advance by exactly one for the floored tombstone -- "
          "SetExistingMvcc keys its accounting off the NEW stamp's bit, which is still set";
+}
+
+// drakeydb: P4-4 Task A5 fix round 1 -- a LIVE applied write over a TOMBSTONED slot. Before this
+// fix, DbSlice::PostUpdate called EnsureMvcc (which resets a tombstone slot to {0,0} and returns
+// void) BEFORE Arm(), so by the time journal::RecordEntry's Commit() ran, a live lookup of this
+// key's slot saw {0,0} (fresh), never the tombstone T -- the applied write committed its stale
+// author mvcc verbatim instead of flooring against T. EnsureMvcc now returns the stamp it found
+// (T, here) and PostUpdate carries it on the plain arm itself, so the floor reads THAT, never a
+// live lookup.
+TEST_F(MvccStoreTest, UnguardedAppliedRmwOverATombstonedSlotFloorsAgainstTheTombstone) {
+  constexpr uint32_t kPeerIdx = 32;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a5a5-4000-8000-000000000032");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "v"}), "OK");
+  ASSERT_EQ(Run({"del", "k"}).GetInt(), 1);
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone()) << "sanity: k must actually be a tombstone (T), not erased";
+  constexpr uint64_t kAuthorMvcc = 0x1000ULL;  // strictly older than any real HopStamp
+  ASSERT_GT(tomb->Mvcc(), kAuthorMvcc) << "sanity: T must be newer than the author's mvcc";
+
+  const size_t tombstones_before = GetMetrics().db_stats[0].mvcc_tombstones;
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"append", "k", "x"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "k"}), "x") << "APPEND over an absent (tombstoned) key creates it fresh";
+
+  auto floored = StampOf("k");
+  ASSERT_TRUE(floored.has_value());
+  EXPECT_FALSE(floored->IsTombstone()) << "the recreated key is LIVE -- the floor must never "
+                                          "leave a live write looking like a tombstone";
+  // Whole-stamp equality: pins bit 63 at exactly 0 too, not merely IsTombstone() being falsy.
+  EXPECT_EQ(*floored, (MvccStamp{tomb->Mvcc(), tomb->origin_hash - 1}))
+      << "the plain (live) arm's own captured prev_stamp -- DbSlice::EnsureMvcc's return, carried "
+         "by PostUpdate -- is T itself, captured by EnsureMvcc's tombstone-clearing branch BEFORE "
+         "it reset the slot; the write floors against T, never the {0,0} the table would show by "
+         "the time journal::RecordEntry's Commit() actually runs, and never kAuthorMvcc verbatim";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, tombstones_before - 1)
+      << "the tombstone credit is released exactly once, by EnsureMvcc's own clear -- this plain "
+         "arm's commit must not re-tombstone it (a.tombstone is false for this arm)";
+
+  // A stale guarded SET with mvcc strictly between the APPEND's kAuthorMvcc and the ORIGINAL T
+  // must still be dropped: the floor kept the key's live stamp high enough to reject it.
+  const uint64_t before_dropped = TotalLwwDropped();
+  const uint64_t mid_mvcc = kAuthorMvcc + (tomb->Mvcc() - kAuthorMvcc) / 2;
+  ASSERT_GT(mid_mvcc, kAuthorMvcc);
+  ASSERT_LT(mid_mvcc, tomb->Mvcc());
+  res = ApplyReplicatedCommand({"set", "k", "stale"}, kPeerIdx, mid_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "k"}), "x") << "the stale guarded SET must still be dropped after the "
+                                       "floor -- the recreated value must survive";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u) << "a drop must never arm-then-abandon the key";
 }
 
 TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {

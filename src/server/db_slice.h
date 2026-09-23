@@ -393,9 +393,15 @@ class DbSlice {
   // Avoids the PrimeKey round-trip for callers that already have a string_view, notably the RDB
   // loader's explicit {0,0} fallback and tests. See db_slice.cc.
   void SetMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
-  // Ensures a zero-authority slot exists before the write enters the journal. Does not overwrite
-  // an existing stamp. This is the only allocation-capable half of journal-driven stamping.
-  void EnsureMvcc(DbIndex db_ind, std::string_view key);
+  // Ensures a zero-authority slot exists before the write enters the journal, and returns the
+  // stamp the slot held BEFORE this call -- a fresh {0,0} for a newly inserted slot, an existing
+  // live stamp left untouched, or a tombstone this call itself just cleared (see below). Callers
+  // that arm the key right after (PostUpdate, db_slice.cc) carry this on the arm as its
+  // pre-mutation stamp (drakeydb P4-4 Task A5 fix round 1): by the time journal::RecordEntry's
+  // Commit() runs, the slot no longer holds it (this call, or a later commit, has already moved
+  // it), so the arm is the only place left to find it. This is the only allocation-capable half
+  // of journal-driven stamping.
+  MvccStamp EnsureMvcc(DbIndex db_ind, std::string_view key);
   // Updates a slot prepared by EnsureMvcc. This is called only after AddLogRecord and therefore
   // must remain allocation-free; a missing slot is a fatal invariant violation -- CHECK-fails,
   // deliberately, even for a tombstone-flagged stamp (review fix I5: an earlier version of this

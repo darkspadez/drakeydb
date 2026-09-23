@@ -153,14 +153,17 @@ inline bool MergeAccepts(const std::optional<MvccStamp>& stored, const MvccStamp
 // the unapplied RMW) the SAME stamp as a clean copy of `stored` alone, and since MergeAccepts
 // favors ties to the stored side, a later merge-on-full-sync can never repair that divergence.
 //
-// Landing one origin_hash below `stored` (or one mvcc tick below it, at origin_hash 0) keeps every
-// property `max()` could not: the result is still strictly LESS than `stored`, so a clean copy
-// stamped exactly `stored` beats it on the next merge and heals the divergence; it is still
-// strictly GREATER than every stamp `stored` itself already rejected, so no previously-dropped
-// stale write starts winning; and a LOCAL write on this same key still mints strictly above
-// `stored`, so this floor never regresses ordinary local monotonicity -- only "for practical
-// purposes" monotone against a torrent of applied writes at the exact same `stored.Mvcc()`, since
-// origin_hash has only so much room below `stored.origin_hash`, a bound this phase accepts.
+// Landing one origin_hash below `stored` (or one mvcc tick below it, at origin_hash 0) keeps two
+// properties `max()` could not: the result is still strictly LESS than `stored`, so a clean copy
+// stamped exactly `stored` beats it on the next merge and heals the divergence; and it still
+// rejects every stamp `stored` itself would have rejected, EXCEPT `stored` itself -- a tie always
+// rejects itself, but the floor must not, or the clean copy above could never win and heal the
+// divergence -- so no other previously-dropped stale write starts winning either. This also means
+// the floor never RAISES the key's stamp above `stored`: it cannot make a later LOCAL write (which
+// never reads `stored` -- MvccStamper::HopStamp mints from the wall clock alone, see mvcc.cc)
+// compare any worse against a peer than `stored` itself already would have. `stored.origin_hash`
+// has only so much room below it for this to keep working against a torrent of applied writes at
+// the exact same `stored.Mvcc()`, though -- a bound this phase accepts.
 //
 // `stored.Mvcc() == 0` (a fresh {0,0} slot, or an uncommitted placeholder -- Mvcc() masks bit 63,
 // so this also covers PerformDeletionAtomic's {kTombstoneBit, 0}) has no real prior stamp to floor
@@ -184,19 +187,30 @@ uint64_t NodeUuidHash(std::string_view uuid);
 //
 // Violating it in the "stamp but do not propagate" direction causes permanent, silent divergence:
 // the node then rejects peer writes that should have won, forever.
+//
+// drakeydb: P4-4 Task A5 -- for an APPLIED write specifically, journal::RecordEntry no longer
+// commits the propagated entry's stamp verbatim: FloorAppliedStamp (mvcc.h) may floor it below
+// what the wire entry itself carries, when the author's stamp is older than the key's own. The
+// invariant above is deliberately relaxed for that one case -- the STORED stamp can end up
+// strictly less than the PROPAGATED one -- because committing verbatim there would rewind the
+// key's stamp instead, which is the worse failure (see FloorAppliedStamp's own declaration).
 class MvccStamper {
  public:
-  // drakeydb: P4-4 Task A5 -- the 4th parameter is the arm's captured PRE-mutation stamp (see
-  // ArmTombstone's 3rd argument below); it is a fresh {0,0} and MEANS NOTHING for a plain Arm()'d
-  // key -- a live write's slot still holds its true prior stamp at commit time (PostUpdate/
-  // EnsureMvcc never touch it), so a caller that wants to floor a plain arm's applied write reads
-  // that prior stamp with its own live DbSlice::GetMvcc lookup instead, discriminating the two
-  // cases by the 3rd parameter's own IsTombstone() bit (only ever set for a tombstone arm, never
-  // a plain one -- see Commit()'s comment below). Only a tombstone arm's captured value is ever
-  // meaningful, because by commit time PerformDeletionAtomic's own placeholder write (db_slice.cc)
-  // has already clobbered that key's slot with a zero-authority stand-in.
+  // drakeydb: P4-4 Task A5 fix round 1 -- the 4th parameter is true iff this arm is a tombstone
+  // (ArmTombstone'd, never a plain Arm()'d one) -- ground truth set by the SERVER's own code, at
+  // the call site that armed it, never influenced by a caller-supplied wire mvcc. A caller that
+  // needs to know whether this commit is logically a delete (e.g. to decide the final stamp's own
+  // tombstone bit) must read THIS, never the 3rd parameter's own IsTombstone(): that stamp's mvcc
+  // field is the author's wire-supplied value for an applied write, unsanitized, so it could in
+  // principle carry a stray bit 63 for an ordinary (non-delete) write. The 5th parameter is the
+  // arm's own captured PRE-mutation stamp: Arm()'s own 3rd argument for a plain arm (from
+  // DbSlice::EnsureMvcc's return, PostUpdate) or ArmTombstone's 3rd argument for a tombstone arm
+  // (from PerformDeletionAtomic's own pre-delete capture) -- both are captured at ARM time,
+  // because by commit time the slot itself may no longer hold it (EnsureMvcc's own
+  // tombstone-clearing branch, or PerformDeletionAtomic's placeholder write, may already have
+  // overwritten it, possibly well before Commit() ever runs).
   using CommitFn =
-      std::function<void(DbIndex, std::string_view, const MvccStamp&, const MvccStamp&)>;
+      std::function<void(DbIndex, std::string_view, const MvccStamp&, bool, const MvccStamp&)>;
   // drakeydb: P4-3 Task 2 review fix (I3) -- invoked by EndOfWriteEpoch below, once per arm that
   // is STILL armed (uncommitted) at epoch end AND was armed via ArmTombstone (never a plain
   // Arm()). PerformDeletionAtomic (db_slice.cc) writes a synchronous tombstone placeholder to
@@ -238,7 +252,15 @@ class MvccStamper {
   // can take a second, independent FindMutable/AutoUpdater on a key it is about to delete (e.g.
   // DeleteHw, DelMutable's other callers). Duplicates are harmless: Commit() below just calls its
   // CommitFn once per arm with the same stamp.
-  void Arm(DbIndex db_index, std::string_view key);
+  //
+  // drakeydb: P4-4 Task A5 fix round 1 -- `prev_stamp` is this key's stamp from BEFORE this
+  // write, mandatory (no default -- a caller that skipped capturing it would silently commit the
+  // author's stamp verbatim, exactly the bug this task exists to close): DbSlice::PostUpdate's
+  // own EnsureMvcc call returns it and passes it straight through. There is no live-table
+  // fallback for a caller that has none -- EnsureMvcc's tombstone-clearing branch (db_slice.cc)
+  // can overwrite the slot synchronously, well before Commit() ever runs, so the slot itself is
+  // not a reliable place to look this up later.
+  void Arm(DbIndex db_index, std::string_view key, const MvccStamp& prev_stamp);
   // drakeydb: P4-3 Task 2 -- identical bookkeeping to Arm above, except the recorded Armed entry
   // carries tombstone=true, so Commit() ORs kTombstoneBit into the stamp it hands this key's
   // CommitFn (only for this arm; a plain Arm() of a different key in the same Commit() call is
@@ -252,11 +274,12 @@ class MvccStamper {
   // (PerformDeletionAtomic, db_slice.cc) BEFORE it overwrites the slot with the synchronous
   // tombstone placeholder -- by the time Commit() below runs, the slot no longer holds it, so it
   // must be carried on the arm itself for Commit()'s caller to floor an applied delete against.
-  // Defaulted to a fresh {0,0} (meaning "no real prior stamp", see FloorAppliedStamp's own
-  // contract, mvcc.h) so every pre-A5 call site that does not care about the floor -- every
-  // ArmTombstone call in mvcc_test.cc -- keeps compiling and behaving exactly as before.
-  void ArmTombstone(DbIndex db_index, std::string_view key,
-                    const MvccStamp& prev_stamp = MvccStamp{});
+  // drakeydb: P4-4 Task A5 fix round 1 -- no default (was `= MvccStamp{}`): a defaulted
+  // parameter let a caller silently fall back to "no real prior stamp" (verbatim commit) without
+  // ever noticing it skipped the capture. Every call site now supplies one explicitly, including
+  // every test in mvcc_test.cc that does not otherwise care about the floor (passing `MvccStamp{}`
+  // there by name, not by omission).
+  void ArmTombstone(DbIndex db_index, std::string_view key, const MvccStamp& prev_stamp);
   // Erases EVERY arm matching (db_index, key), not just the first -- see the .cc for why a
   // single-match version corrupted the mvcc side table (review wave 2, F1, CRITICAL).
   void Disarm(DbIndex db_index, std::string_view key);
@@ -268,8 +291,9 @@ class MvccStamper {
   // plain Arm() of a different key in the same call still gets the bare value) -- this is the
   // ONLY place the live delete path sets that bit; see AsTombstone()'s comment above for why the
   // RDB load path (a later task) uses a separate method instead of this one setting it twice.
-  // drakeydb: P4-4 Task A5 -- fn's 4th argument is that arm's own Armed::prev_stamp, passed
-  // through verbatim (see CommitFn's own comment for what it means and when it matters).
+  // drakeydb: P4-4 Task A5 fix round 1 -- fn's 4th argument is that arm's own Armed::tombstone
+  // (ground truth), its 5th is that arm's own Armed::prev_stamp, both passed through verbatim --
+  // see CommitFn's own comment for what each means and when it matters.
   // Clears the arm list -- unconditionally,
   // even if fn throws (RAII in the .cc): a surviving armed_ after a partial failure would either
   // let EndOfWriteEpoch() over-count already-attempted keys as unstamped, or, worse, let a LATER
