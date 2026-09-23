@@ -1621,12 +1621,21 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
   DCHECK(multi_ && multi_->role == SQUASHED_STUB);
   DCHECK_EQ(unique_shard_cnt_, 1u);
 
-  // drakeydb: P4-4 -- fail-open tripwire (Task A4), not a guard: skips RunCallback's
-  // ShouldDropForLww veto. Reachable with a replicated-apply (repl_*) context only from the
-  // classic Redis/KeyDB link (replica.cc -> DispatchSquashedBatch -> MultiCommandSquasher), whose
-  // squash-path SetReplOrigin sites never refresh repl_mvcc_ per command -- so a real guard here
-  // would compare a stale, batch-level stamp. A future fix (e.g. P7 stamping a KeyDB link) must
-  // refresh that first, then guard here like RunCallback.
+  // drakeydb: P4-4 -- fail-open tripwire, not a guard: skips RunCallback's ShouldDropForLww veto.
+  // Reachable with a replicated-apply (repl_*) context only via ATOMIC squashing: SQUASHED_STUB
+  // (and thus this function, via Transaction::Execute's own role check) is only ever produced by
+  // the parent+shard_id stub constructor, which only the atomic path uses. The classic Redis/
+  // KeyDB link's own batching (replica.cc's ConsumeRedisStream -> DispatchSquashedBatch ->
+  // MultiCommandSquasher) never reaches here at all: it stays non-atomic end to end, so its
+  // per-shard local_tx is a SHARD_LOCAL transaction, not a SQUASHED_STUB one, and every command
+  // in it dispatches through ordinary RunCallback -- where ShouldDropForLww DOES run -- instead.
+  // That non-atomic path's own repl_mvcc_ is set once per shard for the WHOLE batch
+  // (MultiCommandSquasher::PrepareShardInfo's SetReplOrigin call), never refreshed per command;
+  // harmless today only because the classic link's repl_lww_guard_ is always false
+  // (ConsumeRedisStream never calls SetApplyLwwGuard) and its entries always carry mvcc 0
+  // regardless. A future link that streamed a real per-key stamp through that same non-atomic
+  // batching would need to refresh repl_mvcc_ per command before RunCallback's own veto there
+  // could be trusted.
   if (IsLwwGuarded()) {
     LOG(DFATAL) << "multi-master LWW guard reached RunSquashedMultiCb: repl_mvcc_ is "
                    "batch-level here, not per-command, and cannot be safely compared -- "

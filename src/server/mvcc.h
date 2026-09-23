@@ -160,9 +160,9 @@ inline bool MergeAccepts(const std::optional<MvccStamp>& stored, const MvccStamp
 // rejects itself, but the floor must not, or the clean copy above could never win and heal the
 // divergence -- so no other previously-dropped stale write starts winning either. This also means
 // the floor never RAISES the key's stamp above `stored`: it cannot make a later LOCAL write (which
-// floors its own mint at least one tick above whatever is currently stored, via `LocalMintFloor`
-// below, rather than minting purely from the wall clock) compare any worse against a peer than
-// `stored` itself already would have. `stored.origin_hash`
+// floors its own mint at least one tick above whatever is currently stored, capped at the stamp
+// mask, via `LocalMintFloor` below, rather than minting purely from the wall clock) compare any
+// worse against a peer than `stored` itself already would have. `stored.origin_hash`
 // has only so much room below it for this to keep working against a torrent of applied writes at
 // the exact same `stored.Mvcc()`, though -- a bound this phase accepts.
 //

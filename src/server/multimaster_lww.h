@@ -28,10 +28,11 @@ namespace dfly {
 
 // drakeydb: P4-4 -- the streaming LWW guard's pure decision module. FLAGS_multi_master_stream_lww
 // is read once per peer link, at flow setup, by DflyShardReplica's constructor (replica.cc).
-// LwwGuardActive has two callers: it backs Transaction::IsLwwGuarded() (transaction.h), which
-// Transaction::ShouldDropForLww (transaction.cc) consults for every kSingleKey command's veto;
-// and OpMSet/OpDelV2 (string_family.cc/generic_family.cc) call it directly for their own
-// self-guarded per-key veto (kMultiKeySelfGuarded, below).
+// LwwGuardActive has three direct callers: it backs Transaction::IsLwwGuarded() (transaction.h),
+// which Transaction::ShouldDropForLww (transaction.cc) consults for every kSingleKey command's
+// veto; OpMSet/OpDelV2 (string_family.cc/generic_family.cc) call it directly for their own
+// self-guarded per-key veto (kMultiKeySelfGuarded, below); and JournalExecutor::Execute
+// (journal/executor.cc) calls it directly to gate the pre-dispatch SETNX/RESTORE rewrite below.
 
 // A journaled command's guard classification. kUnguarded commands are never LWW-compared; a
 // kSingleKey command's OWN journaled write is compared under the key's lock; a
@@ -62,9 +63,10 @@ LwwClass ClassifyJournaledCommand(std::string_view journaled_name);
 // True iff this apply should be LWW-guarded: the link is a guarded peer link AND the entry
 // carries a real author stamp. A zero mvcc (classic Redis/KeyDB link, or a DFLY link to a
 // non-active node) must NEVER be guarded -- MergeAccepts(stored, {0, h}) is false for every
-// stamped key, so guarding it would silently discard the whole stream. This single predicate is
-// called by BOTH Transaction::IsLwwGuarded() (A2) and the pre-dispatch SETNX/RESTORE rewrite
-// (A9); it must be the only definition of the rule.
+// stamped key, so guarding it would silently discard the whole stream. This single predicate has
+// three direct callers -- Transaction::IsLwwGuarded(), OpMSet/OpDelV2's own per-key veto, and
+// JournalExecutor::Execute's gate on the pre-dispatch SETNX/RESTORE rewrite (see this header's
+// own top comment) -- and must be the only definition of the rule.
 constexpr bool LwwGuardActive(bool link_guard, uint64_t incoming_mvcc) {
   return link_guard && incoming_mvcc != 0;
 }

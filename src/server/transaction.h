@@ -614,10 +614,13 @@ class Transaction {
   // Should be called immediately after the last hop.
   // drakeydb: P4-4 -- `lww_dropped` has no default: every caller must say explicitly whether the
   // hop it is logging for actually ran its callback. RunCallback passes its own veto flag;
-  // RunSquashedMultiCb always passes false (its own LWW tripwire is task A4).
+  // RunSquashedMultiCb always passes false -- it never runs ShouldDropForLww at all, only a
+  // LOG(DFATAL) tripwire for the case where IsLwwGuarded() somehow reads true there anyway (see
+  // its own definition, transaction.cc).
   void LogAutoJournalOnShard(EngineShard* shard, RunnableResult shard_result, bool lww_dropped);
 
-  // drakeydb: P4-4 -- the generic single-key LWW veto shared by RunCallback (task A3). True iff
+  // drakeydb: P4-4 -- the generic single-key LWW veto RunCallback consults for its own drop
+  // decision. True iff
   // this shard's own callback for the current command must be skipped because a strictly newer
   // (or tied, favoring stored) local stamp already exists for its one key. Only classifies
   // kSingleKey journaled names (SET, SETNX, GETSET, GETDEL, PEXPIREAT, PERSIST, RESTORE);

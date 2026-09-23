@@ -3368,10 +3368,12 @@ void ServerFamily::Info(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
     sections.emplace_back(absl::AsciiStrToUpper(section_arg));
     const auto& section = sections.back();
     // drakeydb: P4-4 -- upstream 8bd2b9ed ("optimize info command", #4137) deliberately excluded
-    // both SERVER and REPLICATION from need_metrics: those two sections are the ones a client or
-    // management component polls most often, so skipping GetMetrics()'s cross-thread fan-out for
-    // them is a real latency win upstream measured and wants kept, not an oversight to blanket-
-    // reverse. But REPLICATION now reads `Metrics` fields too on an active-replica node
+    // both SERVER and REPLICATION from need_metrics (the variable itself, and the multi-section
+    // support around it, came later via 54e2de90 #6093; the current `|=` expression's exact form
+    // is from 7f1f003c #7746): those two sections are the ones a client or management component
+    // polls most often, so skipping GetMetrics()'s cross-thread fan-out for them is a real latency
+    // win upstream measured and wants kept, not an oversight to blanket-reverse. But REPLICATION
+    // now reads `Metrics` fields too on an active-replica node
     // (mvcc_clock_ahead_ms/mvcc_unstamped_writes/mvcc_stale_epoch/multimaster_lww_dropped, all
     // gated on IsActiveReplica() in add_repl_info below and always 0 -- never read -- otherwise),
     // so it must fetch metrics on THAT node only: a bare `INFO replication` used to leave
