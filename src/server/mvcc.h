@@ -260,6 +260,19 @@ class MvccStamper {
   // fallback for a caller that has none -- EnsureMvcc's tombstone-clearing branch (db_slice.cc)
   // can overwrite the slot synchronously, well before Commit() ever runs, so the slot itself is
   // not a reliable place to look this up later.
+  //
+  // drakeydb: P4-4 Task A5 fix round 2 -- if `prev_stamp` is itself an uncommitted placeholder
+  // (IsTombstone() && Mvcc() == 0 -- PerformDeletionAtomic's own synchronous stand-in,
+  // db_slice.cc), this key was ArmTombstone'd earlier in THIS SAME callback (a delete-then-
+  // recreate of the same key in one command, e.g. Renamer::DeserializeDest deleting an existing
+  // dest then recreating it -- RenameOntoAnExistingDestSelfCorrectsToALiveStamp). EnsureMvcc's own
+  // tombstone-clearing branch has no way to recover that earlier arm's true pre-delete stamp --
+  // it only ever sees PerformDeletionAtomic's placeholder, which has already overwritten it -- so
+  // this call searches armed_ for a still-pending tombstone arm on the exact same (db_index, key)
+  // and inherits ITS prev_stamp instead. Scoped to the placeholder case alone (checked before the
+  // search, never unconditionally): the common path -- a plain write with a real prior stamp, or
+  // none at all -- stays O(1) and allocation-free, and only ever pays this O(armed_.size()) scan
+  // on the rare delete-then-recreate-in-one-entry shape armed_ (per-epoch, small) is built for.
   void Arm(DbIndex db_index, std::string_view key, const MvccStamp& prev_stamp);
   // drakeydb: P4-3 Task 2 -- identical bookkeeping to Arm above, except the recorded Armed entry
   // carries tombstone=true, so Commit() ORs kTombstoneBit into the stamp it hands this key's

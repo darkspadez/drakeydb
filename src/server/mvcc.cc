@@ -81,10 +81,23 @@ void MvccStamper::Arm(DbIndex db_index, std::string_view key, const MvccStamp& p
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn armed a key -- Commit() is mid-iteration over "
                                  "armed_/arena_, both of which this call can reallocate, "
                                  "corrupting that iteration";
+  // drakeydb: P4-4 Task A5 fix round 2 -- see the declaration (mvcc.h) for the why. Gated on the
+  // placeholder check first, so the common case (a real prior stamp, or none) never pays this
+  // O(armed_.size()) scan; done BEFORE arena_.append() below, so every earlier arm's ArmedKey()
+  // is still valid to compare against (arena_ has not been touched yet by this call).
+  MvccStamp effective_prev = prev_stamp;
+  if (prev_stamp.IsTombstone() && prev_stamp.Mvcc() == 0) {
+    for (const Armed& a : armed_) {
+      if (a.tombstone && a.db_index == db_index && ArmedKey(a) == key) {
+        effective_prev = a.prev_stamp;
+        break;
+      }
+    }
+  }
   const uint32_t off = static_cast<uint32_t>(arena_.size());
   arena_.append(key);
   armed_.push_back(
-      Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/false, prev_stamp});
+      Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/false, effective_prev});
 }
 
 // drakeydb: P4-3 Task 2 -- see the declaration (mvcc.h) for the contract. Identical to Arm()

@@ -2021,16 +2021,14 @@ void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key, bool arm_mvcc) {
     // the slot may no longer hold it -- EnsureMvcc's own tombstone-clearing branch (above) already
     // overwrote it synchronously, well before Commit() ever sees this key again.
     //
-    // KNOWN GAP, not closed by this fix: if this key was ALSO ArmTombstone'd earlier in the SAME
-    // callback (e.g. Renamer::DeserializeDest deleting an existing dest then recreating it,
-    // RenameOntoAnExistingDestSelfCorrectsToALiveStamp) EnsureMvcc's tombstone-clearing branch
-    // here fires on PerformDeletionAtomic's OWN placeholder, not the key's true pre-delete stamp
-    // -- that value lives only on the earlier ArmTombstone call's own prev_stamp, which this call
-    // has no way to see (MvccStamper exposes no "peek a pending arm for this key" query). An
-    // applied write recreating a key this way still commits its author stamp verbatim, not
-    // floored, even when that stamp is older than the key's true prior one. Closing this would
-    // need MvccStamper to let a plain Arm() inherit a coincident pending tombstone arm's own
-    // prev_stamp for the same key -- out of this fix round's scope.
+    // drakeydb: P4-4 Task A5 fix round 2 -- if this key was ALSO ArmTombstone'd earlier in the
+    // SAME callback (e.g. Renamer::DeserializeDest deleting an existing dest then recreating it,
+    // RenameOntoAnExistingDestSelfCorrectsToALiveStamp), EnsureMvcc's tombstone-clearing branch
+    // above fires on PerformDeletionAtomic's OWN placeholder, not the key's true pre-delete stamp
+    // -- so `prev_stamp` below is that placeholder, not the real one. Arm() itself resolves this:
+    // it recognizes the placeholder shape and inherits the still-pending tombstone arm's own
+    // prev_stamp for this exact key instead (see its own comment, mvcc.h) -- this call site does
+    // not need to know that happens, only that the value it hands to Arm() may get superseded.
     const MvccStamp prev_stamp = EnsureMvcc(db_ind, key);
     MvccStamper::tlocal()->Arm(db_ind, key, prev_stamp);
   }
