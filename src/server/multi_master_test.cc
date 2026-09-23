@@ -4354,11 +4354,14 @@ TEST_F(MvccStoreTest, RestoreGainsReplaceAndAppliesOverOlderExistingKey) {
 
 // drakeydb: P4-4 Task A9 -- the premise the SETNX rewrite depends on, pinned directly: a
 // client-issued SETNX that does NOT set (the key already exists) must reach the journal ZERO
-// times. SetCmd::Set's own SET_IF_NOTEXIST branch (string_family.cc) returns OpStatus::SKIPPED
-// before ever calling PostEdit/RecordJournal, and Transaction::LogAutoJournalOnShard's `if
-// (result.status != OpStatus::OK) return;` gate (transaction.cc) independently suppresses the
-// auto-journal for that SKIPPED result too. If either were wrong, rewriting a replicated SETNX to
-// SET would be reproducing a phantom write the author itself never made.
+// times. SETNX has no CO::NO_AUTOJOURNAL (string_family.cc), so its only journal path is ever
+// the transaction's generic auto-journal, and that path is driven by one status value:
+// SetCmd::Set's own SET_IF_NOTEXIST branch returns OpStatus::SKIPPED for an existing key before
+// ever calling PostEdit (so RecordJournal is simply never reached), and that same SKIPPED status
+// is exactly what Transaction::LogAutoJournalOnShard's `if (result.status != OpStatus::OK)
+// return;` gate (transaction.cc) reads to suppress the auto-journal. If SET_IF_NOTEXIST ever
+// returned OK instead of SKIPPED here, rewriting a replicated SETNX to SET would be reproducing a
+// phantom write the author itself never made.
 TEST_F(MvccStoreTest, AuthorSideNoopSetnxJournalsNothing) {
   MsetLwwJournalConsumer consumer;
   std::vector<uint32_t> consumer_ids(shard_set->size());

@@ -9,8 +9,15 @@
 #include <optional>
 #include <string_view>
 
-#include "common/backed_args.h"
 #include "server/mvcc.h"
+
+// drakeydb: P4-4 -- forward declaration only: ApplyLwwRewrites below takes a pointer, so callers
+// never need the complete type from this header. Every caller of ApplyLwwRewrites already has
+// the complete type transitively (journal/executor.cc via journal/types.h; transaction.h via the
+// same); multimaster_lww.cc, which implements the function, includes common/backed_args.h itself.
+namespace cmn {
+class BackedArguments;
+}  // namespace cmn
 
 // drakeydb: P4-4 -- absl flags live at global scope (matching multi_master.h's own
 // ABSL_DECLARE_FLAG block), declared here so any caller can read it via absl::GetFlag without

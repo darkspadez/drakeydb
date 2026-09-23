@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "base/logging.h"
+#include "common/backed_args.h"
 #include "server/server_state.h"
 
 ABSL_FLAG(bool, multi_master_stream_lww, true,
