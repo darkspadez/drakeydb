@@ -7,6 +7,7 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <absl/strings/ascii.h>
+#include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -745,6 +746,11 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
   EXPECT_EQ(std::string::npos, info.find("active_replica:"));
   EXPECT_EQ(std::string::npos, info.find("connected_masters:"));
+  // drakeydb: P4-4 Task A12 -- multimaster_lww_dropped joins mvcc_unstamped_writes/
+  // mvcc_clock_ahead_ms/mvcc_stale_epoch under the exact same `if (IsActiveReplica())` gate
+  // (server_family.cc) those three already sit behind, just below them -- absent, not printed as
+  // 0, on a non-active node, since the streaming LWW guard can never engage there at all.
+  EXPECT_EQ(std::string::npos, info.find("multimaster_lww_dropped:"));
 
   // drakeydb: review wave 2 (F5, MINOR) -- server_family.cc used to append mvcc_table_bytes/
   // mvcc_entries/mvcc_tombstones to INFO memory unconditionally; a non-active node emitted all
@@ -3432,6 +3438,73 @@ class MsetLwwJournalConsumer : public journal::JournalConsumerInterface {
 };
 
 }  // namespace
+
+// drakeydb: P4-4 Task A12 -- proves the INFO field is really the cross-THREAD sum
+// (ServerState::Stats::Add, server_state.cc; folded into Metrics::coordinator_stats by
+// Metrics::InitFromThread/Merge, metrics.cc) rather than one shard's own counter: forces a drop on
+// shard 0's own key and a SECOND, independent drop on shard 1's key, so a bug that only reads (or
+// only aggregates) one thread's counter would under-report by exactly one against the
+// TotalLwwDropped() cross-check below, which reads every thread directly and bypasses the
+// Metrics aggregation path entirely.
+//
+// Falsifying: commenting out server_state.cc's `ADD(multimaster_lww_dropped);` line (so
+// Stats::Add no longer sums this field across threads) makes the parsed INFO value come back
+// short of expect_total (0, since this test's own baseline is a delta from a fresh drop count, and
+// a freshly-added field with no ADD line is simply left as whichever thread's Stats object the
+// aggregation happened to seed `result` from) while `TotalLwwDropped()` -- which reads every
+// thread directly -- still correctly reports pre_dropped + 2, isolating the break to the
+// aggregation path rather than the guard itself.
+TEST_F(MvccStoreTest, InfoReplicationShowsLwwDroppedSummedAcrossShards) {
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "this test's entire point is proving cross-THREAD aggregation -- "
+                               "with only one shard there is only one thread's counter to sum";
+
+  constexpr uint32_t kPeerIdx = 60;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000060");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const std::string k1 = FindKeyOnShard("info_lww_dropped_k1_", 0, num_shards);
+  const std::string k2 = FindKeyOnShard("info_lww_dropped_k2_", 1, num_shards);
+
+  ASSERT_EQ(Run({"set", k1, "local1"}), "OK");
+  auto k1_before = StampOf(k1);
+  ASSERT_TRUE(k1_before.has_value());
+  ASSERT_GT(k1_before->Mvcc(), 1u) << "sanity: room for a strictly older incoming mvcc below";
+  const uint64_t k1_stale_mvcc = k1_before->Mvcc() - 1;
+
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+  ASSERT_GT(k2_before->Mvcc(), 1u) << "sanity: room for a strictly older incoming mvcc below";
+  const uint64_t k2_stale_mvcc = k2_before->Mvcc() - 1;
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+
+  EXPECT_EQ(
+      ApplyReplicatedCommand({"set", k1, "peer"}, kPeerIdx, k1_stale_mvcc, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(
+      ApplyReplicatedCommand({"set", k2, "peer"}, kPeerIdx, k2_stale_mvcc, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "local1") << "shard 0's stale peer SET must be dropped";
+  EXPECT_EQ(Run({"get", k2}), "local2") << "shard 1's stale peer SET must be dropped";
+
+  const uint64_t expect_total = pre_dropped + 2;
+  ASSERT_EQ(TotalLwwDropped(), expect_total)
+      << "sanity: exactly one drop expected on each of two different shard threads";
+
+  const std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
+  const size_t pos = info.find("\nmultimaster_lww_dropped:");
+  ASSERT_NE(std::string::npos, pos) << "field must be present on an --active_replica node";
+  const size_t value_start = pos + std::string("\nmultimaster_lww_dropped:").size();
+  const size_t value_end = info.find("\r\n", value_start);
+  ASSERT_NE(std::string::npos, value_end);
+  uint64_t parsed = 0;
+  ASSERT_TRUE(absl::SimpleAtoi(info.substr(value_start, value_end - value_start), &parsed));
+  EXPECT_EQ(parsed, expect_total)
+      << "INFO must report the SUM across every shard thread, not just one";
+}
 
 // drakeydb: P4-4 Task A7 -- the headline partial-apply case: k1 is fresh (no stored stamp, so
 // MergeAccepts(nullopt, incoming) is always true -- it can never be dropped) while k2 already

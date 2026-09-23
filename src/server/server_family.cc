@@ -3149,6 +3149,16 @@ string ServerFamily::FormatInfoMetrics(
         append("mvcc_clock_ahead_ms", m.mvcc_clock_ahead_ms);
         append("mvcc_unstamped_writes", m.mvcc_unstamped_writes);
         append("mvcc_stale_epoch", m.mvcc_stale_epoch);
+        // drakeydb: P4-4 Task A12 -- replicated writes the streaming LWW guard
+        // (multimaster_lww.h, NoteLwwDrop) has dropped on this node's peer links. The counter
+        // itself lives on ServerState::Stats (per shard/proactor thread); m.coordinator_stats is
+        // already the sum over every thread by the time Print() sees it -- Metrics::InitFromThread
+        // seeds coordinator_stats from that thread's own ServerState::Stats, and Metrics::Merge
+        // folds every thread's Metrics into one via ServerState::Stats::Add (metrics.cc), same
+        // path mvcc_unstamped_writes above and every other coordinator_stats field already take.
+        // Same gate as its siblings above: the guard can only engage on an active-replica peer
+        // link, so this stays exactly 0 -- never printed -- on a non-active node.
+        append("multimaster_lww_dropped", m.coordinator_stats.multimaster_lww_dropped);
       }
     } else {
       append("role", GetFlag(FLAGS_info_replication_valkey_compatible) ? "slave" : "replica");
@@ -3357,7 +3367,13 @@ void ServerFamily::Info(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
   for (string_view section_arg : section_range) {
     sections.emplace_back(absl::AsciiStrToUpper(section_arg));
     const auto& section = sections.back();
-    need_metrics |= (section != "SERVER") && (section != "REPLICATION");
+    // drakeydb: P4-4 -- REPLICATION now reads `Metrics` fields too (mvcc_clock_ahead_ms/
+    // mvcc_unstamped_writes/mvcc_stale_epoch/multimaster_lww_dropped, all gated on
+    // IsActiveReplica() in add_repl_info below), so it can no longer skip the fetch the way
+    // SERVER still can: a bare `INFO replication` used to leave `metrics` at this function's
+    // default-constructed value, silently reporting all four fields as 0 regardless of the
+    // node's real state.
+    need_metrics |= section != "SERVER";
 
     const bool is_all = section == "ALL";
     opts.replication_memory |= is_all || (section == "MEMORY");

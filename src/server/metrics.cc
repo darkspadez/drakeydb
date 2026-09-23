@@ -506,6 +506,16 @@ void Metrics::Print(uint64_t uptime, const CommandRegistry* registry, DflyCmd* d
     AppendMetricWithoutLabels("replication_psync_count", "Pync count",
                               m.coordinator_stats.psync_requests_total, MetricType::COUNTER,
                               &resp->body());
+    // drakeydb: P4-4 Task A12 -- same counter, same gate, as INFO replication's
+    // multimaster_lww_dropped field (server_family.cc): the streaming LWW guard
+    // (multimaster_lww.h) can only engage on an active-replica peer link, so this stays 0 -- and
+    // is omitted here, not printed as 0 -- on a non-active node.
+    if (IsActiveReplica()) {
+      AppendMetricWithoutLabels(
+          "multimaster_lww_dropped_total",
+          "Replicated writes dropped on peer links by the streaming multi-master LWW guard.",
+          m.coordinator_stats.multimaster_lww_dropped, MetricType::COUNTER, &resp->body());
+    }
     AppendMetricHeader("connected_replica_lag_records", "Lag in records of a connected replica.",
                        MetricType::GAUGE, &replication_lag_metrics);
     for (const auto& replica : replicas_info) {
