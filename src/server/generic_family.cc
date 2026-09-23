@@ -1328,10 +1328,13 @@ OpResult<uint32_t> OpDelV2(const OpArgs& op_args, const ShardArgs& keys, bool as
   absl::InlinedVector<std::string_view, 5> journal_args;
 
   for (string_view key : keys) {
-    // drakeydb: P4-4 -- the skip must precede FindMutable: FindMutable can lazily expire a stale
-    // key (arming its post_updater) or otherwise touch a slot this replicated DEL has no right to
-    // touch once its own author stamp has lost the LWW compare against what's stored (or
-    // tombstoned) for `key`.
+    // drakeydb: P4-4 -- the skip must precede FindMutable: even with no lazy expiry in play,
+    // FindMutable + post_updater.Run() arms a LIVE stale key for this shard's callback, and this
+    // replicated DEL has no right to do that once its own author stamp has already lost the LWW
+    // compare against what's stored (or tombstoned) for `key`. An armed-but-never-deleted key
+    // then either gets floored by a surviving key's own journal commit in the same DEL, or -- if
+    // every key here is dropped -- is armed and abandoned uncommitted (caught by
+    // unstamped_writes).
     if (split && LwwShouldDropKey(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
       NoteLwwDrop("DEL", key);
       continue;

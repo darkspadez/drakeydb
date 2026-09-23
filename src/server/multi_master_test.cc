@@ -3264,22 +3264,23 @@ TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyC
 // counted as an LWW drop BY THIS GENERIC VETO -- Task A3's own scope -- regardless of what a
 // self-guarded command's OWN per-key logic later decides to do with the same write.
 //
-// drakeydb: P4-4 Task A7 -- MSET now has its own per-pair guard (OpMSet, string_family.cc), so
-// unlike INCR/DEL below it no longer merely floors a stale write: it drops each pair whose
-// incoming stamp does not beat that pair's own stored stamp. Both keys here already carry a
-// stamp newer than kStaleMvcc, so both pairs are dropped -- proving A7's guard, not this generic
-// veto (which never classifies MSET as a candidate at all), is what left sj_msk1/sj_msk2 alone.
+// drakeydb: P4-4 Tasks A7/A8 -- MSET and DEL now each have their own per-key guard (OpMSet,
+// string_family.cc; OpDelV2, generic_family.cc), so unlike INCR below neither merely floors a
+// stale write anymore: each drops its stale unit (pair or key) entirely, never arming it. sj_del
+// and both of sj_msk1/sj_msk2 already carry a stamp newer than kStaleMvcc, so all three are
+// dropped -- proving A7/A8's own per-key guards, not this generic veto (which never classifies
+// either command as a candidate at all), is what left sj_del/sj_msk1/sj_msk2 alone.
 //
-// drakeydb: P4-4 Task A5 -- every stamp assertion for INCR/DEL below changed from this test's
-// pre-A5 version: each of those two keys already carries a real local stamp `S` (from its own
-// `Run({"set"/"incr", ...})` setup below) that is newer than kStaleMvcc, so this is precisely the
-// "unguarded applied write with an author stamp older than S" case FloorAppliedStamp (mvcc.h)
-// exists for -- neither command is vetoed, but its COMMITTED stamp is still floored to
-// just-below `S`, never kStaleMvcc verbatim -- verbatim would rewind the key's stamp, letting a
-// LATER write whose stamp sits strictly between kStaleMvcc and `S` (older than `S`, but newer
-// than this write's own stale mvcc) wrongly win a future comparison. MSET's dropped pairs are
-// never armed at all, so they are not floored either -- their stamps stay exactly `before1`/
-// `before2`, not just-below them.
+// drakeydb: P4-4 Task A5 -- INCR's own stamp assertion below relies on FloorAppliedStamp
+// (mvcc.h): sj_incr already carries a real local stamp `S` (from its own `Run({"incr", ...})`
+// setup below) that is newer than kStaleMvcc, so this is precisely the "unguarded applied write
+// with an author stamp older than S" case FloorAppliedStamp exists for -- INCR is never vetoed
+// (it is kUnguarded), but its COMMITTED stamp is still floored to just-below `S`, never
+// kStaleMvcc verbatim -- verbatim would rewind the key's stamp, letting a LATER write whose stamp
+// sits strictly between kStaleMvcc and `S` (older than `S`, but newer than this write's own stale
+// mvcc) wrongly win a future comparison. DEL and MSET's dropped units are never armed at all (see
+// the A7/A8 paragraph above), so they are not floored either -- their stamps stay exactly
+// `before`/`before1`/`before2`, not just-below them.
 TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
   constexpr uint32_t kPeerIdx = 27;
   constexpr uint64_t kStaleMvcc = 0x1000ULL;
@@ -3321,8 +3322,13 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
     EXPECT_EQ(res, facade::DispatchResult::OK);
     EXPECT_EQ(Run({"exists", "sj_del"}).GetInt(), 1)
         << "DEL's own per-key guard must drop a key whose incoming stamp is older than that key's "
-           "own stored stamp -- this generic single-key veto never even classifies DEL as a "
-           "candidate, so this drop can only be A8's own logic inside OpDelV2";
+           "own stored stamp. This single-key sub-block alone can't distinguish that drop from a "
+           "hypothetical misclassification (DEL wrongly routed through the generic single-key "
+           "veto instead, with the same observable effect here) -- what actually pins DEL as "
+           "kMultiKeySelfGuarded is ClassifyJournaledCommandMatchesEveryTableRow (mvcc_test.cc), "
+           "and what proves the drop is a per-key compare inside OpDelV2 itself, not a "
+           "whole-command veto, is DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesTheSurvivor "
+           "(two keys, only the stale one dropped)";
     EXPECT_EQ(Run({"get", "sj_del"}), "local");
     auto after = StampOf("sj_del");
     ASSERT_TRUE(after.has_value());
@@ -3823,8 +3829,10 @@ TEST_F(MvccStoreTest, MsetUnstampedIncomingAppliesAllPairsEvenWithGuardOn) {
 // never even looked up mutably). Exactly one key must survive, and the journal must carry only its
 // own name, never a two-key DEL.
 //
-// Falsified by moving the LwwShouldDropKey skip to AFTER FindMutable/post_updater.Run() (the exact
-// shape this task's brief warns against): verbatim output captured below.
+// Falsified by moving the LwwShouldDropKey skip to AFTER FindMutable/post_updater.Run(): that
+// still arms the live, stale k2 even though the skip continues before Del() ever runs on it, and
+// k1's own surviving journal commit then floors k2's stamp too -- one origin_hash below its own
+// prior value, byte-for-byte, even though k2's existence and GET value are untouched.
 TEST_F(MvccStoreTest, DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesTheSurvivor) {
   constexpr uint32_t kPeerIdx = 70;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000070");
@@ -3976,8 +3984,8 @@ TEST_F(MvccStoreTest, DelLwwAllKeysStaleJournalsNothingAndLeavesLsnUnchanged) {
 
 // drakeydb: P4-4 Task A8 -- the guard bit itself gates the split: with lww_guard=false, OpDelV2
 // must take the byte-identical unguarded path regardless of how stale the incoming mvcc is --
-// arrival order wins, exactly as it did before this task existed. Same shape as A7's
-// MsetGuardOffAppliesArrivalOrderRegardlessOfStamps for MSET.
+// arrival order wins. Same shape as A7's MsetGuardOffAppliesArrivalOrderRegardlessOfStamps for
+// MSET.
 TEST_F(MvccStoreTest, DelLwwGuardOffAppliesArrivalOrderRegardlessOfStamps) {
   constexpr uint32_t kPeerIdx = 72;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000072");
@@ -4103,8 +4111,10 @@ TEST_F(MvccStoreTest, DelLwwDropsAgainstAnAbsentKeysNewerTombstone) {
 // drakeydb: P4-4 Task A8 -- the not-dropped sibling of the test above: an incoming DEL strictly
 // NEWER than the key's own existing tombstone must not be classified as a drop at all -- and
 // whatever the pre-existing (pre-A8) path already does for a DEL of an absent key is unchanged:
-// FindMutable finds nothing, so it is still a silent no-op, never journaled, never counted.
-TEST_F(MvccStoreTest, DelLwwAppliesAgainstAnAbsentKeysOlderTombstone) {
+// FindMutable finds nothing, so it is still a silent no-op, never journaled, never counted. Note
+// this DEL still returns OK either way -- a dropped write also returns OK and counts as applied
+// -- so `TotalLwwDropped()` below, not the dispatch result, is what actually proves not-dropped.
+TEST_F(MvccStoreTest, DelLwwIsNotDroppedAgainstAnOlderTombstone) {
   const std::string key = FindKeyOnShard("del_lww_tomb_old_", 0, shard_set->size());
   ASSERT_EQ(Run({"set", key, "v"}), "OK");
   ASSERT_EQ(Run({"del", key}).GetInt(), 1);
@@ -4117,10 +4127,27 @@ TEST_F(MvccStoreTest, DelLwwAppliesAgainstAnAbsentKeysOlderTombstone) {
   RegisterPeerOriginHash(kPeerIdx, peer_hash);
   const uint64_t incoming_mvcc = tomb->Mvcc() + 1;  // strictly newer than the tombstone.
 
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
   const uint64_t pre_dropped = TotalLwwDropped();
   auto res = ApplyReplicatedCommand({"del", key}, kPeerIdx, incoming_mvcc, /*lww_guard=*/true);
-  EXPECT_EQ(res, facade::DispatchResult::OK)
-      << "not dropped: incoming is strictly newer than the stored tombstone";
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped)
+      << "not dropped: a dropped write also returns OK and counts as applied, so this counter -- "
+         "not the dispatch result above -- is what actually proves the guard let this DEL through";
 
   EXPECT_EQ(Run({"exists", key}).GetInt(), 0)
       << "the key was already absent -- a not-dropped DEL of an absent key is still a no-op, "
@@ -4130,9 +4157,13 @@ TEST_F(MvccStoreTest, DelLwwAppliesAgainstAnAbsentKeysOlderTombstone) {
   EXPECT_EQ(*tomb_after, *tomb)
       << "nothing was armed -- the pre-existing tombstone is untouched, the same as any other DEL "
          "of a nonexistent key";
-  EXPECT_EQ(TotalLwwDropped(), pre_dropped)
-      << "this key must never be counted as a drop -- the guard let it through";
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), pre_entries)
+      << "a DEL of an absent key journals nothing, guarded or not -- FindMutable finds nothing to "
+         "delete, so journal_args stays empty and RecordJournal is never called for it";
 }
 
 // ---------------------------------------------------------------------------
@@ -4199,8 +4230,8 @@ TEST_F(MvccStoreTest, UnguardedAppliedRmwWithOlderAuthorMvccFloorsInsteadOfRewin
 }
 
 // drakeydb: P4-4 Task A5 -- the tombstone-arm sibling of the RMW test above. DEL is
-// kMultiKeySelfGuarded (its own per-key guard is a later task, not this one), so with the link's
-// guard bit off here it is simply an unguarded applied delete -- PerformDeletionAtomic's own
+// kMultiKeySelfGuarded (OpDelV2's own per-key guard, Task A8), but with the link's guard bit off
+// here it takes the same unguarded applied-delete path regardless -- PerformDeletionAtomic's own
 // captured prev_stamp (db_slice.cc) is what lets the floor apply here at all, since by the time
 // journal::RecordEntry's Commit() runs, the slot no longer holds `S` itself (only the delete's own
 // zero-authority placeholder does). This covers any unguarded applied delete whose author stamp
