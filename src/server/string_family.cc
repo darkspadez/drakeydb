@@ -33,6 +33,8 @@
 #include "server/execution_state.h"
 #include "server/family_utils.h"
 #include "server/journal/journal.h"
+#include "server/multimaster_lww.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/search/doc_index.h"
 #include "server/table.h"
@@ -406,22 +408,54 @@ OpStatus OpMSet(const OpArgs& op_args, const ShardArgs& args) {
   SetCmd::SetParams params;
   SetCmd sg(op_args, false);
 
+  // drakeydb: P4-4 -- MSET is classified kMultiKeySelfGuarded (multimaster_lww.h): GetShardArgs
+  // hands it keys AND values in one contiguous range, so the generic single-key veto
+  // (Transaction::ShouldDropForLww) deliberately skips it rather than misreading that range as
+  // one key. The per-pair LWW compare therefore has to happen right here, under this shard's own
+  // key locks, so a guarded replicated MSET applies -- and journals -- only its non-stale pairs.
+  const DbContext& db_cntx = op_args.db_cntx;
+  const bool guarded = LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc);
+  const std::optional<MvccStamp> incoming =
+      guarded ? IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx) : std::nullopt;
+  // drakeydb: P4-4 -- `incoming` is nullopt only for an unregistered origin (IncomingStamp already
+  // DCHECKed that should never happen); failing open here, same as the single-key veto, is safer
+  // than guessing.
+  const bool split = guarded && incoming.has_value();
+
+  auto& db_slice = op_args.GetDbSlice();
   OpStatus result = OpStatus::OK;
   size_t stored = 0;
+  vector<string_view> survivors;
   for (auto it = args.begin(); it != args.end();) {
     string_view key = *(it++);
     string_view value = *(it++);
+
+    if (split && LwwShouldDropKey(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
+      NoteLwwDrop("MSET", key);
+      continue;
+    }
+
     if (auto status = sg.Set(params, key, value); status != OpStatus::OK) {
       result = status;
       break;
     }
 
     stored++;
+    if (split) {
+      survivors.push_back(key);
+      survivors.push_back(value);
+    }
   }
 
   // Above loop could have parial success (e.g. OOM), replicate only what changed
   if (auto journal = op_args.shard->journal(); journal) {
-    if (stored * 2 == args.Size()) {
+    if (split) {
+      // drakeydb: P4-4 -- push_back'd above, never resize(stored * 2): a dropped MIDDLE pair
+      // breaks the "first N survived" prefix the unguarded branches below rely on, so truncating
+      // to a prefix here could journal a different key than the one actually written.
+      if (!survivors.empty())
+        RecordJournal(op_args, "MSET", survivors, op_args.tx->GetUniqueShardCnt());
+    } else if (stored * 2 == args.Size()) {
       RecordJournal(op_args, "MSET", args, op_args.tx->GetUniqueShardCnt());
       DCHECK_EQ(result, OpStatus::OK);
     } else if (stored > 0) {

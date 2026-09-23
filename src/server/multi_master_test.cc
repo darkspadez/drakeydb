@@ -3257,19 +3257,29 @@ TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyC
 
 // drakeydb: P4-4 Task A3 -- out-of-scope classes must be left completely alone by this task's
 // generic veto: INCR is kUnguarded (delta-journaled RMW -- dropping a delta would permanently
-// lose it, not just reorder it), and DEL/MSET are kMultiKeySelfGuarded (their own per-key guard is
-// tasks A7/A8, not this one) -- GetShardArgs on MSET yields keys AND values in one contiguous
-// range, which is exactly why this generic single-key helper must never touch it. All three must
-// still apply a stale peer write, and none may ever be counted as an LWW drop by this task.
+// lose it, not just reorder it), and DEL/MSET are kMultiKeySelfGuarded -- GetShardArgs on MSET
+// yields keys AND values in one contiguous range, which is exactly why this generic single-key
+// helper must never touch it (ShouldDropForLww, transaction.cc, returns false for both by
+// classification alone, before ever reaching a per-key compare). Neither DEL nor MSET is ever
+// counted as an LWW drop BY THIS GENERIC VETO -- Task A3's own scope -- regardless of what a
+// self-guarded command's OWN per-key logic later decides to do with the same write.
 //
-// drakeydb: P4-4 Task A5 -- every stamp assertion below changed from this test's pre-A5 version:
-// each of these three keys already carries a real local stamp `S` (from its own `Run({"set"/
-// "incr", ...})` setup below) that is newer than kStaleMvcc, so this is precisely the "unguarded
-// applied write with an author stamp older than S" case FloorAppliedStamp (mvcc.h) exists for --
-// none of these three commands is vetoed (that is this test's whole point), but their COMMITTED
-// stamp is still floored to just-below `S`, never kStaleMvcc verbatim -- verbatim would rewind
-// the key's stamp, letting a LATER write whose stamp sits strictly between kStaleMvcc and `S`
-// (older than `S`, but newer than this write's own stale mvcc) wrongly win a future comparison.
+// drakeydb: P4-4 Task A7 -- MSET now has its own per-pair guard (OpMSet, string_family.cc), so
+// unlike INCR/DEL below it no longer merely floors a stale write: it drops each pair whose
+// incoming stamp does not beat that pair's own stored stamp. Both keys here already carry a
+// stamp newer than kStaleMvcc, so both pairs are dropped -- proving A7's guard, not this generic
+// veto (which never classifies MSET as a candidate at all), is what left sj_msk1/sj_msk2 alone.
+//
+// drakeydb: P4-4 Task A5 -- every stamp assertion for INCR/DEL below changed from this test's
+// pre-A5 version: each of those two keys already carries a real local stamp `S` (from its own
+// `Run({"set"/"incr", ...})` setup below) that is newer than kStaleMvcc, so this is precisely the
+// "unguarded applied write with an author stamp older than S" case FloorAppliedStamp (mvcc.h)
+// exists for -- neither command is vetoed, but its COMMITTED stamp is still floored to
+// just-below `S`, never kStaleMvcc verbatim -- verbatim would rewind the key's stamp, letting a
+// LATER write whose stamp sits strictly between kStaleMvcc and `S` (older than `S`, but newer
+// than this write's own stale mvcc) wrongly win a future comparison. MSET's dropped pairs are
+// never armed at all, so they are not floored either -- their stamps stay exactly `before1`/
+// `before2`, not just-below them.
 TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
   constexpr uint32_t kPeerIdx = 27;
   constexpr uint64_t kStaleMvcc = 0x1000ULL;
@@ -3321,7 +3331,8 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
         << "this generic single-key veto must never classify or count DEL";
   }
 
-  {  // MSET -- kMultiKeySelfGuarded; A7's own guard does not exist yet.
+  {  // MSET -- kMultiKeySelfGuarded; its own per-pair guard (Task A7) now drops a stale pair
+     // entirely instead of applying-and-flooring it.
     SCOPED_TRACE("MSET");
     ASSERT_EQ(Run({"set", "sj_msk1", "local1"}), "OK");
     ASSERT_EQ(Run({"set", "sj_msk2", "local2"}), "OK");
@@ -3335,22 +3346,382 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
     auto res = ApplyReplicatedCommand({"mset", "sj_msk1", "peer1", "sj_msk2", "peer2"}, kPeerIdx,
                                       kStaleMvcc, true);
     EXPECT_EQ(res, facade::DispatchResult::OK);
-    EXPECT_EQ(Run({"get", "sj_msk1"}), "peer1")
-        << "before A7 adds MSET's own per-key guard, a stale peer MSET must still apply";
-    EXPECT_EQ(Run({"get", "sj_msk2"}), "peer2");
+    EXPECT_EQ(Run({"get", "sj_msk1"}), "local1")
+        << "MSET's own per-pair guard must drop a pair whose incoming stamp is older than that "
+           "key's own stored stamp -- this generic single-key veto never even classifies MSET as "
+           "a candidate, so this drop can only be A7's own logic inside OpMSet";
+    EXPECT_EQ(Run({"get", "sj_msk2"}), "local2");
     auto st1 = StampOf("sj_msk1");
     auto st2 = StampOf("sj_msk2");
     ASSERT_TRUE(st1.has_value());
     ASSERT_TRUE(st2.has_value());
-    EXPECT_EQ(st1->Mvcc(), before1->Mvcc())
-        << "MSET's own commit floors each key's stamp to just-below ITS OWN prior stamp -- "
-           "never the incoming author's stale mvcc verbatim";
-    EXPECT_EQ(st1->origin_hash, before1->origin_hash - 1);
-    EXPECT_EQ(st2->Mvcc(), before2->Mvcc());
-    EXPECT_EQ(st2->origin_hash, before2->origin_hash - 1);
-    EXPECT_EQ(TotalLwwDropped(), pre_dropped)
-        << "this generic single-key veto must never classify or count MSET";
+    EXPECT_EQ(*st1, *before1) << "a dropped pair is never armed, so its stamp is untouched -- "
+                                 "unlike an applied write, it is not even floored";
+    EXPECT_EQ(*st2, *before2);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 2)
+        << "both pairs are individually stale against their own stored stamps and must each be "
+           "counted once";
+    EXPECT_EQ(TotalUnstampedWrites(), 0u);
   }
+}
+
+// ---------------------------------------------------------------------------
+// P4-4 Task A7: OpMSet's own per-pair LWW guard (string_family.cc). MSET is classified
+// kMultiKeySelfGuarded (multimaster_lww.h) precisely because GetShardArgs hands it keys AND
+// values in one contiguous range, so the generic single-key veto above (Task A3) never inspects
+// it at all -- the per-pair compare has to live inside OpMSet itself, under the shard's own key
+// locks, and a guarded apply must journal exactly the pairs it actually wrote, in one journal
+// entry, never one-entry-per-key.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// drakeydb: P4-4 Task A7 -- this fixture (MvccStoreTest, via BaseFamilyTest) enables neither
+// lock_on_hashtags nor cluster mode, so a `{tag}`-style hashtag does not co-locate keys here.
+// Same-shard placement has to be found empirically and then asserted directly -- the same linear
+// probe MvccStoreTest::ApplyOnePeerWriteToEveryShard (above) already uses to find one key per
+// DIFFERENT shard, aimed here at one target shard instead.
+std::string FindKeyOnShard(std::string_view prefix, ShardId target_sid, size_t num_shards) {
+  for (int i = 0;; ++i) {
+    std::string candidate = absl::StrCat(prefix, i);
+    if (Shard(candidate, num_shards) == target_sid)
+      return candidate;
+    CHECK_LT(i, 10000) << "could not find a '" << prefix << "' key hashing to shard " << target_sid;
+  }
+}
+
+// drakeydb: P4-4 Task A7 -- captures each COMMAND journal entry's full argument list (command
+// name first), decoded with a real JournalReader exactly like this file's own
+// DecodingEntryCapturingConsumer (below, Task 7's SORT diagnosis). A bare command COUNT (this
+// file's CountingJournalConsumer) cannot show WHICH pairs a guarded MSET actually journaled, which
+// is the entire question this task's tests turn on.
+struct MsetLwwJournalEntry {
+  std::vector<std::string> args;  // args[0] is the command name, upper-case.
+};
+
+class MsetLwwJournalConsumer : public journal::JournalConsumerInterface {
+ public:
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    if (item.journal_item.opcode != journal::Op::COMMAND)
+      return;
+    io::BytesSource source{item.journal_item.data};
+    JournalReader reader{&source, 0};
+    journal::ParsedEntry parsed;
+    CHECK(!reader.ReadEntry(&parsed));
+
+    std::vector<std::string> args;
+    for (std::string_view sv : parsed.cmd.view())
+      args.emplace_back(sv);
+
+    util::fb2::LockGuard lk(mu_);
+    entries.push_back({std::move(args)});
+  }
+  void ThrottleIfNeeded() override {
+  }
+
+  util::fb2::Mutex mu_;
+  std::vector<MsetLwwJournalEntry> entries;  // guarded by mu_
+};
+
+}  // namespace
+
+// drakeydb: P4-4 Task A7 -- the headline partial-apply case: k1 is fresh (no stored stamp, so
+// MergeAccepts(nullopt, incoming) is always true -- it can never be dropped) while k2 already
+// carries a local stamp strictly newer than the incoming mvcc. Exactly one pair must survive, it
+// must commit the AUTHOR's stamp verbatim (not floored -- incoming > stored, here "stored" is
+// nullopt, so FloorAppliedStamp's floor case, which only fires when incoming < stored, never
+// applies), and the dropped pair's stamp must stay completely untouched (never armed, so not even
+// floored).
+//
+// Falsified both ways (see task report for the exact captured output):
+//  (a) "all-or-nothing" -- pre-scanning every pair and skipping the ENTIRE apply if any one pair
+//      would drop -- makes k1 come back missing (GET k1 empty) even though it had every right to
+//      apply on its own.
+//  (b) "always-apply" -- dropping the per-pair compare entirely -- clobbers k2 with "b" and its
+//      stamp with the peer's stale one, exactly the divergence the guard exists to prevent.
+TEST_F(MvccStoreTest, MsetPartialApplyKeepsOnlyNonStaleKeysInOneJournalEntry) {
+  constexpr uint32_t kPeerIdx = 40;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000040");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("mset_lww_partial_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("mset_lww_partial_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid) << "both keys must land on the SAME shard, or this test "
+                                           "proves nothing about a single shard's own journal";
+
+  ASSERT_EQ(Run({"set", k2, "local"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+  ASSERT_GT(k2_before->Mvcc(), 1u) << "sanity: room for a strictly older incoming mvcc below";
+  const uint64_t incoming_mvcc = k2_before->Mvcc() - 1;
+  ASSERT_FALSE(StampOf(k1).has_value()) << "sanity: k1 must be fresh -- no stored stamp";
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"mset", k1, "a", k2, "b"}, kPeerIdx, incoming_mvcc,
+                                    /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "a") << "a fresh key has no stored stamp to be dropped against";
+  auto k1_after = StampOf(k1);
+  ASSERT_TRUE(k1_after.has_value());
+  EXPECT_EQ(k1_after->Mvcc(), incoming_mvcc)
+      << "a surviving pair commits the incoming author's stamp EXACTLY, verbatim";
+  EXPECT_EQ(k1_after->origin_hash, peer_hash);
+
+  EXPECT_EQ(Run({"get", k2}), "local") << "k2's own stored stamp is newer than the incoming one";
+  auto k2_after = StampOf(k2);
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_EQ(*k2_after, *k2_before)
+      << "a dropped pair is never armed -- its stamp must stay exactly what it was, not merely "
+         "floored";
+
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1) << "exactly one journal entry for this MSET";
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 3u);
+  EXPECT_EQ(args[0], "MSET");
+  EXPECT_EQ(args[1], k1);
+  EXPECT_EQ(args[2], "a");
+}
+
+// drakeydb: P4-4 Task A7 -- a stale pair in the MIDDLE of the argument list must be skipped
+// without disturbing either neighbor: k1 and k3 are both fresh (never dropped), k2 alone carries
+// a stored stamp newer than the incoming mvcc. The journaled args must be exactly the surviving
+// PAIRS, in their original relative order, never a prefix of the original argument list.
+//
+// Falsified by reverting the guarded journal branch to the pre-existing prefix-truncation shape
+// (`store_args.resize(stored * 2)` against the ORIGINAL args, `stored` counting only the pairs
+// actually Set()) -- see task report for the exact captured wrong output.
+TEST_F(MvccStoreTest, MsetSkipsOnlyTheStaleMiddleKeyNotAPrefixTruncation) {
+  constexpr uint32_t kPeerIdx = 41;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000041");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("mset_lww_mid_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("mset_lww_mid_k2_", sid, num_shards);
+  const std::string k3 = FindKeyOnShard("mset_lww_mid_k3_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+  ASSERT_EQ(Shard(k3, num_shards), sid) << "all three keys must land on the SAME shard";
+
+  ASSERT_EQ(Run({"set", k2, "local"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+  ASSERT_GT(k2_before->Mvcc(), 1u);
+  const uint64_t incoming_mvcc = k2_before->Mvcc() - 1;
+  ASSERT_FALSE(StampOf(k1).has_value());
+  ASSERT_FALSE(StampOf(k3).has_value());
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  auto res = ApplyReplicatedCommand({"mset", k1, "a", k2, "b", k3, "c"}, kPeerIdx, incoming_mvcc,
+                                    /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "a");
+  EXPECT_EQ(Run({"get", k2}), "local") << "the middle pair must be dropped";
+  EXPECT_EQ(Run({"get", k3}), "c") << "k3 must still apply -- it is not a prefix of the pairs "
+                                      "that survived, it is the LAST one";
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1);
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 5u);
+  EXPECT_EQ(args[0], "MSET");
+  EXPECT_EQ(args[1], k1);
+  EXPECT_EQ(args[2], "a");
+  EXPECT_EQ(args[3], k3);
+  EXPECT_EQ(args[4], "c");
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 Task A7 -- every pair stale: nothing may change, nothing may journal, and the
+// F5 invariant (a dropped write never advances the wire's LSN, not even to mark an empty gap)
+// must hold -- read directly on the owning shard's own thread, matching journal::GetLsn()'s own
+// contract ("must be called in the context of the owning shard", journal.h).
+//
+// Falsified by adding a journal::ClearBuffer() call on the all-dropped (empty survivors) path --
+// see task report for the exact captured LSN delta.
+TEST_F(MvccStoreTest, MsetAllPairsStaleJournalsNothingAndLeavesLsnUnchanged) {
+  constexpr uint32_t kPeerIdx = 42;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000042");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("mset_lww_all_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("mset_lww_all_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k1, "local1"}), "OK");
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+  auto k1_before = StampOf(k1);
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k1_before.has_value());
+  ASSERT_TRUE(k2_before.has_value());
+  const uint64_t min_mvcc = std::min(k1_before->Mvcc(), k2_before->Mvcc());
+  ASSERT_GT(min_mvcc, 1u);
+  const uint64_t incoming_mvcc = min_mvcc - 1;  // strictly older than BOTH stored stamps.
+
+  LSN lsn_before = 0;
+  shard_set->Await(sid, [&] { lsn_before = journal::GetLsn(); });
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"mset", k1, "peer1", k2, "peer2"}, kPeerIdx, incoming_mvcc,
+                                    /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "local1");
+  EXPECT_EQ(Run({"get", k2}), "local2");
+  EXPECT_EQ(StampOf(k1), k1_before);
+  EXPECT_EQ(StampOf(k2), k2_before);
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 2) << "both pairs are individually stale";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  LSN lsn_after = 0;
+  shard_set->Await(sid, [&] { lsn_after = journal::GetLsn(); });
+  EXPECT_EQ(lsn_after, lsn_before)
+      << "an entirely-dropped MSET must never advance the journal's LSN -- it wrote nothing, so "
+         "nothing may be recorded, not even an empty marker";
+}
+
+// drakeydb: P4-4 Task A7 -- the guard bit itself gates the split: with lww_guard=false, OpMSet
+// must take the byte-identical unguarded path regardless of how stale the incoming mvcc is --
+// arrival order wins, exactly as it did before this task existed.
+//
+// Falsified by hardcoding OpMSet's `guarded` local to `db_cntx.repl_lww_guard` alone (dropping
+// LwwGuardActive's mvcc requirement, which is moot here since mvcc is real) -- see task report;
+// concretely, this is the same shape as forcing `guarded = true` outright, since this test's own
+// incoming mvcc is non-zero.
+TEST_F(MvccStoreTest, MsetGuardOffAppliesArrivalOrderRegardlessOfStamps) {
+  constexpr uint32_t kPeerIdx = 43;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000043");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("mset_lww_off_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("mset_lww_off_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k2, "local"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+  ASSERT_GT(k2_before->Mvcc(), 1u);
+  const uint64_t stale_mvcc = k2_before->Mvcc() - 1;  // would be dropped if the guard were active.
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"mset", k1, "a", k2, "b"}, kPeerIdx, stale_mvcc,
+                                    /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "a");
+  EXPECT_EQ(Run({"get", k2}), "b") << "guard off means arrival order wins regardless of stamps";
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "no per-pair compare may run at all with the guard "
+                                               "off";
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1);
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 5u) << "byte-identical unguarded path: the full verbatim command";
+  EXPECT_EQ(args[0], "MSET");
+  EXPECT_EQ(args[1], k1);
+  EXPECT_EQ(args[2], "a");
+  EXPECT_EQ(args[3], k2);
+  EXPECT_EQ(args[4], "b");
+}
+
+// drakeydb: P4-4 Task A7 -- F1 (multimaster_lww.h): mvcc == 0 must never be guarded, even with
+// the guard bit itself on -- a classic Redis/KeyDB link never carries mvcc at all, and guarding
+// it would silently discard the whole stream. LwwGuardActive's own mvcc != 0 requirement already
+// makes `guarded` false before OpMSet ever calls IncomingStamp, so the per-pair compare cannot
+// run regardless of what is (or isn't) stored for k2.
+//
+// Falsified by disabling BOTH independent fail-open layers at once (OpMSet's own `guarded`
+// computation AND IncomingStamp's `mvcc == 0` check in multimaster_lww.cc) -- disabling only one
+// of the two does not reproduce a visible failure here, the same redundancy
+// UnstampedIncomingNeverGuarded (above) already documents for the single-key veto; see task
+// report for the exact captured output.
+TEST_F(MvccStoreTest, MsetUnstampedIncomingAppliesAllPairsEvenWithGuardOn) {
+  constexpr uint32_t kPeerIdx = 44;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000044");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("mset_lww_zero_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("mset_lww_zero_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k2, "local"}), "OK");
+  ASSERT_TRUE(StampOf(k2).has_value());
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"mset", k1, "a", k2, "b"}, kPeerIdx, /*mvcc=*/0,
+                                    /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "a") << "mvcc == 0 must fail open even with the guard bit on";
+  EXPECT_EQ(Run({"get", k2}), "b");
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "an unstamped apply must never count as a drop";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
 }
 
 // ---------------------------------------------------------------------------
