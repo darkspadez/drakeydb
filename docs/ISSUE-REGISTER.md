@@ -428,3 +428,105 @@ the owner.
 three-peer scenario is unmeasured (see D-15).
 
 **Status:** open. **Owner:** P4-4 or P4-5 (tombstone lifecycle). **From:** P4-3 final fix wave.
+
+### D-18. Runtime-revived recipes and name-level full-value writes are unguarded
+
+**Where:** `src/server/generic_family.cc` — `RenameGeneric` calls `Transaction::ReviveAutoJournal`
+for a same-shard `RENAME`/`RENAMENX` ("Safe to use RENAME with single shard"), and `SortGeneric`
+does the same for a same-shard `SORT ... STORE`; `src/server/stream_family.cc`'s `CmdXTrim` does
+the same for an exact (non-approximate, non-`MAXLEN`) `XTRIM`. All three re-enable auto-journal at
+runtime and journal the client's own command verbatim, under that command's own name —
+`RENAME`/`RENAMENX`/`SORT`/`XTRIM` — and none of those four names are in `multimaster_lww.cc`'s
+guarded table, so a receiver re-executes the recipe against its own copy (arrival order), never
+LWW-compared against the destination's stored stamp. The **cross-shard** form of `RENAME`/`RENAMENX`
+and of `SORT ... STORE` takes a different path (`Renamer::DelSrc`/`DeserializeDest`, `OpStore`'s
+hand-journal) that journals *state* — `DEL` src + `RESTORE ... REPLACE` dst, or `DEL` — under
+guarded names, and so is already covered by the streaming LWW guard.
+
+Separately, and for a different reason: a handful of commands whose name alone cannot distinguish a
+full-value write from a partial one are unguarded by design, not by omission —
+`JSON.SET`/`JSON.MERGE` (a `"$"` root path replaces the whole document, but the same name also
+covers an ordinary partial patch), `JSON.DEL`/`JSON.FORGET`/`JSON.CLEAR` (same ambiguity for a
+delete/clear at an arbitrary path vs. the root), `CMS.MERGE` (always resets the destination sketch
+then writes the weighted sum of the sources — the same blind, state-carrying recompute `PFMERGE`'s
+`SET` result is guarded for, but journaled under `CMS.MERGE`'s own name instead), and
+`BF.LOADCHUNK`'s `cursor==1` init phase (overwrites any existing key wholesale). Adding any of
+these to the guarded table would also guard-and-drop their ordinary partial-write uses, which is
+worse than leaving the whole name unguarded.
+
+**How established:** static reading during the guarded-vocabulary review; not reproduced with a
+live divergent value. `MvccStoreTest.EmittedNamePinsMatchClassifiedGuardedNames` pins the four
+runtime-revived names (verified against a running build); `MvccStoreTest.
+RegistryClosureEveryAutoJournaledNameIsGuardedOrKnown` pins the JSON/`CMS.MERGE`/`BF.LOADCHUNK`
+names as a reviewed, explicitly-known-unguarded allowlist rather than an accidental gap — both
+tests fail by name if a future normalization change silently moves one of these onto, or off, a
+guarded name.
+
+**Owner:** unassigned; same-shape precedent as D-13 (same-shard `SORT ... STORE` journaling the
+recipe rather than the result) — the owner ruled there that hand-journaling the result for the
+same-shard case is correct but changes the wire format for a path that works today, and left it for
+a future decision. Fix path if wanted: journal the *result* (state) for the runtime-revived
+recipes, the same way the cross-shard forms already do. **From:** P4-4.
+
+### D-19. Duplicate plain re-arms of a re-created key in one applied entry commit verbatim
+
+**Where:** `MvccStamper::Arm` (`src/server/mvcc.cc`) inherits a pending arm's real previous stamp
+only when the NEW arm's own `prev_stamp` is tombstone-shaped with `Mvcc() == 0` (a fresh,
+just-created placeholder) — the shape `DbSlice::EnsureMvcc` (`db_slice.cc`) returns the FIRST time
+it clears an existing tombstone for a key. A SECOND `EnsureMvcc` call for the SAME key later in the
+same callback (the slot having already been reset to a plain `MvccStamp{}` by the first call) sees
+an ordinary, non-tombstone, zero placeholder — `IsTombstone()` false — so `Arm`'s inheritance scan
+never triggers for it, even though `armed_` already holds an earlier arm for this exact key
+carrying the real prior tombstone.
+
+With the streaming guard OFF (the flag false, or a plain replica mirroring such a master), an
+applied `MSET k a k b` over a previously-tombstoned `k` reaches exactly this shape: the first pair
+clears the tombstone and arms with the real prior stamp as its `prev`; the second pair arms the
+same key again with `prev = {0, 0}`. At commit time `FloorAppliedStamp` sees `stored.Mvcc() == 0`
+for that second arm and returns the author's stamp verbatim, with no floor applied — so the key can
+end up committed with a stamp *below* the tombstone it had before this entry, even though the
+tombstone's own real prior stamp was sitting one arm slot away in the same `armed_` list.
+
+**Unreachable on the guarded path**: a guarded `MSET`/`DEL` compares each pair against the key's
+*currently stored* stamp before arming it at all (`OpMSet`/`OpDelV2`'s own per-key `LwwShouldDropKey`
+check), so the first pair is dropped outright — never reaching `EnsureMvcc`/`Arm` for that key —
+whenever its own author stamp is not already newer than the real prior tombstone; the precondition
+for this defect (an arm committing below a stamp it never legitimately beat) therefore cannot arise
+there.
+
+**How established:** static reading of `Arm`'s inheritance-scan gate and `EnsureMvcc`'s
+tombstone-clearing branch during the applied-write stamp-floor work; not reproduced against a live
+two-node `MSET k a k b` scenario. Widening `Arm`'s inheritance scan to catch a plain-to-plain
+duplicate re-arm (not only a tombstone-placeholder one) would add an `O(armed_.size())` scan to
+every fresh insert, not only the already-narrow tombstone-placeholder case.
+
+**Owner:** unassigned; only reachable with the streaming guard off, so lower priority than the
+guarded-path defects above. **From:** P4-4.
+
+### D-20. A newer `DEL` of an absent key does not advance an older tombstone
+
+**Where:** `GenericFamily::OpDelV2` (`src/server/generic_family.cc`) — the per-key LWW skip check
+runs before `FindMutable`, so a guarded `DEL` whose author stamp is newer than an absent key's
+existing tombstone `T1` is NOT dropped by that check (it is not stale relative to `T1`) and falls
+through to `FindMutable`; finding nothing valid there, it simply `continue`s to the next key,
+without ever calling `db_slice.Del`/`PerformDeletionAtomic` and therefore without ever arming or
+committing any stamp for that key at all. `T1` is left exactly as it was — the incoming `DEL`'s own
+(newer) stamp is discarded, recorded nowhere.
+
+A peer that instead held a *live* value for that same key at the time would accept this same `DEL`
+and install a fresh tombstone at (approximately) the `DEL`'s own stamp — call it `T2`, with
+`T1 < T2`. If a third write arrives later stamped strictly between `T1` and `T2`, this node compares
+it only against `T1` (the only thing it has) and accepts it, installing a live value; the peer
+holding `T2` rejects the identical write as stale. The two nodes now disagree — one live, one
+tombstoned — for a write that both should have treated identically, and no further `MergeAccepts`
+compare between them repairs it: this node's live value has no stamp older than `T2` for the peer's
+tombstone to lose against, and `MergeAccepts`' tie-favors-stored rule was never designed to notice a
+tombstone that was silently never advanced.
+
+**How established:** static reading of `OpDelV2`'s per-key skip-before-`FindMutable` ordering; not
+reproduced with a live three-node scenario. Pre-existing in the tombstone mechanism since P4-3 (the
+per-key LWW skip itself is new in P4-4, but the underlying "a DEL of an absent key touches no
+tombstone" behavior is not); newly documented here rather than fixed, since a real fix belongs with
+the rest of the tombstone-lifecycle work.
+
+**Owner:** P4-5 (tombstone lifecycle). **From:** P4-4.

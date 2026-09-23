@@ -13,21 +13,35 @@ sync from a peer** — another drakeydb active node, or a classic Redis/KeyDB ma
 incoming key is compared against whatever this node currently has stored for that key, and only
 overwrites it if the incoming stamp is genuinely newer.
 
-**Merge-LWW is full-sync-only.** `MergeAccepts` (`src/server/mvcc.h`) has no caller outside the
-full-sync loader (`rdb_load.cc`); `merge_lww_` is set only by `replica.cc`'s two peer-mode call
-sites. This node's own restart-from-RDB (a local RDB file, `DEBUG LOAD`, `DEBUG RELOAD`, `RESTORE`)
-is **not** a merge source — it loads verbatim, exactly like pre-Phase-4 Dragonfly, overwriting
-whatever was resident with no comparison at all (pinned by
-`RdbMvccTest.WithoutMergeLwwStaleSnapshotStillOverwrites`, `src/server/rdb_test.cc`). And
-**steady-state (stable-sync) replicated writes are not merge-compared either**: once the initial
-full sync completes, ordinary commands streamed from a peer link apply in plain arrival order,
-with no stamp comparison against the local value — that guard is planned for P4-4, not yet built.
-Merge-LWW's protection is specifically, and only, the moment of a full sync.
+**Merge-LWW is full-sync-only; streaming (stable-sync) writes get their own, sibling compare.**
+`MergeAccepts` (`src/server/mvcc.h`) is the one comparison rule both use. The full-sync loader
+(`rdb_load.cc`; `merge_lww_` is set only by `replica.cc`'s two peer-mode call sites) calls it
+directly for a whole-key snapshot compare at full-sync time. Since P4-4, `multimaster_lww.h`'s
+`LwwShouldDropKey` calls the same function for a per-write compare on the streaming (stable-sync)
+path — see "Streaming LWW" below for that guard's own scope, gating, and vocabulary; the two
+compares are deliberately the same rule (ties favor the stored side either way) so a value can
+never look accepted on one path and rejected on the other. This node's own restart-from-RDB (a
+local RDB file, `DEBUG LOAD`, `DEBUG RELOAD`, `RESTORE`) is still **not** a merge source — it loads
+verbatim, exactly like pre-Phase-4 Dragonfly, overwriting whatever was resident with no comparison
+at all (pinned by `RdbMvccTest.WithoutMergeLwwStaleSnapshotStillOverwrites`, `src/server/
+rdb_test.cc`).
 
 **The comparison rule, in one sentence: ties are won by the stored side.** An incoming write is
 installed only when it is *strictly* newer than what is already there (`MergeAccepts`,
 `src/server/mvcc.h`); equal stamps never churn. This is a deliberate owner decision (2026-08-30),
 not an oversight — it is what makes a retried or duplicated apply idempotent.
+
+**A local write always mints a stamp strictly above whatever it is about to overwrite.** A
+locally-originated write's stamp is not simply a wall-clock tick (`MvccStamper::HopStamp`) — it is
+`max(clock tick, max over the entry's keys of stored.mvcc + 1)` (`LocalMintFloor`, `mvcc.h`, wired
+into `journal::RecordEntry`), so a local write that happens to overwrite a key already carrying a
+higher stamp (e.g. merged in earlier from a peer with a fast clock) still mints something at least
+one tick higher, so that overwrite is not silently doomed to lose the *next* full-sync merge
+against a third node. It is computed per journal entry, not a per-shard ratchet: an unrelated key's
+mint in the same epoch is unaffected. The floor is capped at the stamp's own bit-mask; at that cap
+the local write *ties* the stored stamp rather than beating it — reachable only with a corrupt,
+hostile, or (at this encoding's millisecond granularity) roughly year-2248 stamp. An expiry's own
+tombstone mint follows the identical rule, floored against the value it deletes.
 
 **An already-expired incoming key is the peer's DELETE.** A full sync can ship a key whose
 whole-key TTL has already elapsed — the normal state of an expiring key on a loaded server, whose
@@ -88,6 +102,91 @@ tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md) (D-12); it is inherent 
 classic RDB stream as a merge source, not a bug to be fixed by more tuning. A DFLY-to-DFLY link
 between two drakeydb active nodes does not have this exposure — every key it carries has a real
 per-key stamp.
+
+## Streaming LWW (stable-sync compare)
+
+**Stable-sync (steady-state) replicated writes are LWW-compared too, per peer link.** Once the
+initial full sync completes, an active-replica node's *peer* links (never a plain replica — see
+below) run every subsequently streamed guarded write through the same tie-favors-the-stored-side
+rule merge uses, gated by `--multi_master_stream_lww` (default `true`). The compare
+(`LwwShouldDropKey`, `src/server/multimaster_lww.h`) runs *inside* the transaction, under the
+write's own key lock (`Transaction::ShouldDropForLww`, or the self-guarded per-key loop inside
+`OpMSet`/`OpDelV2` for `MSET`/`DEL` — see below), never before dispatch, so it always sees the
+value the lock is actually protecting. A dropped write writes nothing, journals nothing, and still
+reports success rather than an error — a stream of drops from a stale peer link is a normal, if
+wasteful, steady state, not a fault that should force a resync.
+
+**Only a guarded peer link, carrying a real stamp, is ever compared:**
+- A **plain replica** (a consumer that never sent `REPLCONF PEER`) is never guarded — the guard bit
+  is `peer_mode_ && IsActiveReplica() && --multi_master_stream_lww`, read exactly once per link, at
+  flow setup (`DflyShardReplica`'s constructor, `replica.cc`), never re-read per entry.
+- An entry whose incoming `mvcc` is `0` is never guarded, on any link (`LwwGuardActive`,
+  `multimaster_lww.h`): a classic Redis/KeyDB link never carries an `mvcc` at all, so guarding it
+  would silently drop its entire stream.
+- A full sync's own concurrent journal blob — writes that arrive *during* that same full sync,
+  applied by the RDB loader's own second applier (`RdbLoaderBase::HandleJournalBlob`) — shares the
+  identical guard bit with the flow's stable-sync executor (`ConnectionContext::repl_lww_guard`),
+  so the two appliers of one link can never disagree about whether it is guarded.
+
+**The guarded vocabulary is keyed on the JOURNALED command name**, not the client-facing one
+(`ClassifyJournaledCommand`, `multimaster_lww.h`): `SET`, `SETNX`, `GETSET`, `GETDEL`, `PEXPIREAT`,
+`PERSIST`, `RESTORE` (single-key, compared generically before the Op function runs), and
+`MSET`/`DEL` (multi-key, self-guarded — see the per-key split below). Every other journaled name is
+unguarded; an unrecognized name fails open, never closed. The master already normalizes several
+client-facing commands onto one of those names before journaling — `SETEX`/`SET ... EX` → `SET`,
+`UNLINK` → `DEL`, the `EXPIRE` family and `GETEX`'s own expiry path → `PEXPIREAT`/`DEL`, `MSETNX` →
+`MSET`, `GAT` → `PEXPIREAT`/`DEL`/`PERSIST` — so those inherit the guard through whichever guarded
+name they land on. State-carrying RMW results that journal under a guarded name are deliberately
+guarded too, because a journaled `SET`/`DEL` is a blind full-state write on the receiver exactly
+like any other: `PFMERGE` → `SET` (`hll_family.cc`), `BITOP` → `SET`/`DEL` (`bitops_family.cc`), a
+`*STORE`-family command's empty-result delete (e.g. a cross-shard `SORT ... STORE`) → `DEL`, and a
+cross-shard `RENAME`'s `DEL` src + `RESTORE ... REPLACE` dest. **Delta-journaled RMW is
+deliberately never guarded** — `INCR`, `APPEND`, `LPUSH`, `HSET`-style commands, `PFADD`, and
+similar always resolve by plain arrival order, guard on or off: dropping a delta permanently loses
+it rather than merely reordering it, and there is no full "result" to journal instead.
+
+**Two commands are rewritten on the receiver before dispatch, unconditionally, so their journaled
+form reproduces the author's *result* rather than the author's *command*:** `SETNX` (conditional on
+non-existence — applying it verbatim on a receiver that already holds the key would be a silent
+no-op even once the guard has already let it through) becomes a plain `SET`; `RESTORE` without
+`REPLACE` errors on an existing key, and that reply-level error is reported back by
+`DispatchCommand` as an applied `OK` — so `REPLACE` is injected. Both rewrites
+(`ApplyLwwRewrites`, `multimaster_lww.h`) are unconditional name/arg edits with no lock hazard, so
+they run pre-dispatch; the stamp *compare* itself still runs inside the transaction, under the
+key's lock, exactly like every other guarded command.
+
+**A guarded `MSET`/`DEL` applies — and journals — only its non-stale keys.** `GetShardArgs` hands
+these two commands a whole run of keys (and, for `MSET`, values) rather than a single key, so the
+generic single-key veto skips them by design; `OpMSet` and `OpDelV2`
+(`string_family.cc`/`generic_family.cc`) run the per-key compare themselves, under the same
+shard's key locks, and journal exactly the surviving keys in their original relative order — never
+a prefix of the original argument list, and never all-or-nothing (one stale key in an `MSET` does
+not sink the fresh keys beside it). This is not a new atomicity hole: a cross-shard `MSET`/`DEL`
+was never atomic across shards under replication even before this guard existed — each shard's own
+`OpMSet`/`OpDelV2` call already journals its own entry independently, applied by that shard's own
+flow with no cross-shard barrier — the per-key split only adds the possibility of a *single
+shard's* own partial application, on top of an atomicity gap that already existed one level up.
+
+**Classic (non-DFLY-protocol) links bypass the guard structurally, not by a runtime check on the
+data.** A classic Redis/KeyDB master's batch replays through `MultiCommandSquasher`, whose
+per-command stub runs `Transaction::RunSquashedMultiCb` instead of the ordinary `RunCallback` — and
+that stub's `repl_mvcc_` is set once for the whole batch, never refreshed per command, so it could
+never be safely compared per key. `RunSquashedMultiCb` never calls `ShouldDropForLww`; it carries
+only a `LOG(DFATAL)` tripwire for the case where `IsLwwGuarded()` somehow reads true there anyway,
+and even then still runs the command unguarded rather than dropping it. In practice the tripwire is
+just a backstop: a classic link's entries always carry `mvcc == 0`, which `LwwGuardActive` already
+excludes on its own, with no need for this second check to ever fire.
+
+**`DEBUG MVCC`'s `origin:` field can end up naming no real node in the mesh.** The applied-write
+stamp floor (`FloorAppliedStamp`, `mvcc.h`) that protects an *unguarded* applied write (arrival
+order — guard off, a delta-RMW command, or a plain replica) whose author stamp is older than the
+key's stored stamp `S` commits `{S.mvcc, S.origin_hash - 1}` instead of that older stamp verbatim —
+one tick below `S`, keeping the key's stamp monotone for practical purposes, so a later, clean full
+sync from a peer holding `S` still wins the next merge compare and the two copies re-converge. The
+cost is that `S.origin_hash - 1` is an arbitrary derived number, not any node's own registered
+hash, so `DEBUG MVCC <key>`'s `origin:` line can show a value that matches no peer in the mesh once
+this has happened even once. Extend the "do not diff `DEBUG MVCC` across peers" rule (see
+Observability, below) to cover this case too, alongside an expiry tombstone's own per-node stamp.
 
 ## Tombstones
 
@@ -213,6 +312,11 @@ reminder of this split, not because the combination is unsupported.
 
 - `INFO memory`: `mvcc_table_bytes`, `mvcc_entries`, `mvcc_tombstones`, `mvcc_tombstones_dropped`
   (all gated on `--active_replica`; absent, not zero, on a non-active node).
+- `INFO replication`: `multimaster_lww_dropped` — replicated writes the streaming LWW guard has
+  dropped on this node's peer links, summed across every shard/proactor thread (`ServerState::
+  Stats::multimaster_lww_dropped`, `multimaster_lww.h`'s `NoteLwwDrop`). Same gate as the other
+  `mvcc_*` replication fields: gated on `--active_replica`, absent (not zero) otherwise. Also
+  exported as the Prometheus counter `dragonfly_multimaster_lww_dropped_total`, same gate.
 - `DEBUG MVCC <key>`: prints `state:value|tombstone|absent`, and for `value`/`tombstone` the raw
   `mvcc:`, `ms:`, `counter:` (value only), and `origin:` fields for that key on its own shard.
 - `DEBUG MVCC` (no key): per-shard aggregate — `shard<N>_entries`, `shard<N>_tombstones`,
@@ -224,11 +328,22 @@ reminder of this split, not because the combination is unsupported.
 All three `DEBUG MVCC` forms require `--active_replica` and are local-only (default namespace
 only — the journal wire has no namespace identity to carry a non-default one's state).
 
-**Do not diff `DEBUG MVCC <key>` across peers for an expired key.** Two nodes that each expired
-the same key hold different `{mvcc, origin}` tombstones for it, by design — see "An expiry's
-tombstone stamp is per-node" above. Both will report `state:tombstone` (or `absent`, once the
-tombstone is GC'd) and both will return nil; only the stamps differ. For a `DEL`, and for an
-expiry reaped on exactly one node, the stamps do match across peers.
+**A failed conditional delete or `SET ... NX` bumps `mvcc_unstamped_writes` even though nothing
+changed.** `DELEX key IFEQ v` (predicate false) and `SET key v NX` (key already present) both open
+the key with `FindMutable`, which arms an MVCC slot for it regardless of whether anything is
+actually written; when the predicate/condition then skips the write, nothing journals, so
+`EndOfWriteEpoch` finds that arm still pending and counts it as an unstamped write. This is benign
+— no data changed, nothing was journaled — but a lock-release-style pattern that polls a
+conditional delete or a `SET NX` in a loop (e.g. `DELEX lock IFEQ <token>`) will visibly raise this
+counter without indicating any real problem.
+
+**Do not diff `DEBUG MVCC <key>` across peers.** Two nodes that each expired the same key hold
+different `{mvcc, origin}` tombstones for it, by design — see "An expiry's tombstone stamp is
+per-node" above. Both will report `state:tombstone` (or `absent`, once the tombstone is GC'd) and
+both will return nil; only the stamps differ. For a `DEL`, and for an expiry reaped on exactly one
+node, the stamps do match across peers. The applied-write stamp floor (see "Streaming LWW" above)
+is the same kind of case: a floored stamp's `origin:` is a number derived from, not equal to, a
+real registered origin hash, so it is not comparable to any peer's own reporting either.
 
 ## Compatibility: the RDB one-way doors
 
@@ -243,10 +358,13 @@ Two RDB opcodes are drakeydb-specific and hard-fail an older loader:
 
 Both opcodes are written **only** by an active-replica node's save path, and the read side parses
 them unconditionally (any drakeydb binary, active or not, consumes and — if not active — discards
-them). `kDrakeydbReplVersion` (currently `67`) is the fork's own replication protocol version,
-exchanged via `REPLCONF DRAKEY-VERSION` before a single RDB byte is sent; an active node refuses
-to admit a consumer advertising a version older than its own, so a pre-P4-3 drakeydb peer is
-refused *before* full sync rather than being admitted and hard-failing mid-stream on opcode 225.
+them). `kDrakeydbReplVersion` (currently `68`, bumped from `67` in P4-4) is the fork's own
+replication protocol version, exchanged via `REPLCONF DRAKEY-VERSION` before a single RDB byte is
+sent; an active node refuses to admit a consumer advertising a version older than its own, so a
+pre-P4-3 drakeydb peer is refused *before* full sync rather than being admitted and hard-failing
+mid-stream on opcode 225 — and, since the P4-4 bump, a pre-P4-4 peer (one that predates the
+streaming LWW guard) is refused at that same handshake step too, even though it carries no new RDB
+opcode of its own to hard-fail on. Upgrade a mesh in lockstep (see below).
 
 **The remaining one-way door is a file handed by hand.** Live drakeydb-to-drakeydb replication is
 protected by the version gate above; there is no way to receive an incompatible stream over the

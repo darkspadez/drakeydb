@@ -243,6 +243,10 @@ Governing choices:
    DEL/UNLINK, EXPIRE family, PERSIST, RESTORE, COPY, GETSET/GETDEL) behind
    `--multi_master_stream_lww` (default on). RMW commands (INCR/APPEND/LPUSH/HSET…) resolve by
    arrival order — same as KeyDB (see caveats).
+
+   This guarded set is superseded by P4-4 (see `docs/multi-master.md`'s "Streaming LWW" section
+   for the actual, journaled-name-keyed vocabulary the shipped guard uses) — left as-is above
+   rather than rewritten, since this bullet predates that implementation.
 8. **Origin/mvcc apply-context rides ConnectionContext → Transaction.** `JournalExecutor` sets
    `{repl_origin_id, repl_mvcc}` beside the existing `is_replicating` (`conn_context.h:352`);
    consumed in `Transaction::LogAutoJournalOnShard`/`LogJournalOnShard` **and** the manual
@@ -746,6 +750,10 @@ Command classifier + pre-exec compare/drop in `JournalExecutor`; `multimaster_lw
 metric; `--multi_master_stream_lww` off = KeyDB-parity arrival order.
 **Verify:** pytest — concurrent conflicting SETs on A and B converge to the higher-mvcc value on
 both (KeyDB's "MVCC Updates Correctly" parity incl. its 2 ms slop).
+
+Superseded by P4-4 (see `docs/multi-master.md`): the compare this stub sketches as living
+pre-exec, in `JournalExecutor`, instead runs inside the transaction, under each write's own key
+lock — left as-is above rather than rewritten, since this section predates that decision.
 
 ## Phase 6 — Merge-on-full-sync LWW (implemented by P4-3, above; branch pending merge)
 `mvcc-tstamp` per-key aux save/load; LWW hook at `rdb_load.cc:3238`.
