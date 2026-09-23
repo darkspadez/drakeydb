@@ -253,13 +253,17 @@ class MvccStamper {
   // DeleteHw, DelMutable's other callers). Duplicates are harmless for an ORDINARY plain arm:
   // Commit() below just calls its CommitFn once per arm with the same stamp.
   //
-  // KNOWN RESIDUAL, deliberately parked, not fixed: for a key deleted then recreated within this
-  // SAME callback (see fix round 2's comment below), only the FIRST plain re-arm inherits the
-  // tombstone arm's true prior stamp. By the time a SECOND plain Arm() call for that same key
-  // runs, the table has already been reset to a genuine {0,0} by the first re-arm's own
-  // EnsureMvcc call -- indistinguishable from a genuinely fresh key -- so it floors (verbatim)
-  // against THAT instead, and Commit() processing arms in order means this second, wrong commit
-  // silently overwrites the first re-arm's correct floor.
+  // KNOWN RESIDUAL, deliberately parked, not fixed: if a key is armed as a PLAIN arm more than
+  // once in the same callback, and the FIRST such arm's own EnsureMvcc call cleared a tombstone
+  // -- whether a same-callback pending ArmTombstone's placeholder (fix round 2's inheritance
+  // case, see Arm()'s own comment below) or an ALREADY-COMMITTED tombstone left over from an
+  // earlier, separate command (e.g. an unguarded applied `MSET k a k b` touching the same
+  // tombstoned key twice: the first pair's EnsureMvcc clears it and correctly inherits/captures
+  // its true prior stamp, the second pair's own EnsureMvcc call then sees the already-cleared
+  // {0,0}) -- only that FIRST arm's prev_stamp reflects a real prior stamp. Every SUBSEQUENT
+  // plain arm for the same key in the same callback sees the already-cleared {0,0}, floors
+  // (verbatim) against it, and Commit() processing arms in registration order means this later,
+  // wrong commit silently overwrites the first arm's correct floor.
   //
   // drakeydb: P4-4 Task A5 fix round 1 -- `prev_stamp` is this key's stamp from BEFORE this
   // write, mandatory (no default -- a caller that skipped capturing it would silently commit the
@@ -382,23 +386,24 @@ class MvccStamper {
     uint32_t off;
     uint32_t len;
     // drakeydb: P4-3 Task 2 -- true for an ArmTombstone()'d entry; Commit() ORs kTombstoneBit
-    // into the stamp it hands this arm's CommitFn call, and only this arm's. `= false`, not a
-    // bare declaration -- purely defensive today (both Arm() and ArmTombstone(), mvcc.cc, already
-    // fully specify all 5 fields of every Armed{} they construct; see prev_stamp's own comment
-    // below for the identical reasoning).
-    bool tombstone = false;
+    // into the stamp it hands this arm's CommitFn call, and only this arm's.
+    //
+    // No default member initializer, deliberately (P4-4 Task A5 fix round 4): both Arm() and
+    // ArmTombstone() (mvcc.cc) already fully specify all 5 fields of every Armed{} they
+    // construct, so nothing needs one -- and giving it one would SUPPRESS
+    // -Wmissing-field-initializers (-Wextra, -Werror in CI) for a FUTURE aggregate-init that
+    // forgot a field, silently defaulting `tombstone` to false and `prev_stamp` (below) to
+    // "nothing to floor against" instead of failing the build loudly. See prev_stamp's own
+    // comment below for the identical reasoning.
+    bool tombstone;
     // drakeydb: P4-4 Task A5 -- this arm's captured pre-mutation stamp: ArmTombstone's own 3rd
     // argument for a tombstone arm (PerformDeletionAtomic's pre-delete capture, db_slice.cc), or
     // Arm()'s own 3rd argument for a plain arm (DbSlice::EnsureMvcc's return, PostUpdate --
     // possibly itself replaced by an inherited tombstone arm's own prev_stamp, fix round 2, see
     // Arm()'s own comment). Handed to Commit()'s CommitFn verbatim as that call's 5TH argument;
     // the journal.cc lambda reads it for BOTH arm kinds, never a live table lookup (fix round 1).
-    // `{}`, not a bare declaration, matching `tombstone`'s own `= false` above -- purely
-    // defensive today: both current callers (Arm(), ArmTombstone(), mvcc.cc) already fully
-    // specify all 5 fields of every Armed{} they construct, so nothing relies on this default,
-    // but a FUTURE partial aggregate-init would otherwise silently default to "nothing to floor
-    // against" instead, with no -Wmissing-field-initializers warning to flag the omission.
-    MvccStamp prev_stamp{};
+    // No default member initializer either, for the same reason `tombstone` above has none.
+    MvccStamp prev_stamp;
   };
 
   std::string_view ArmedKey(const Armed& a) const {

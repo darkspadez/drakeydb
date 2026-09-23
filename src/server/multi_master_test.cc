@@ -2576,20 +2576,19 @@ TEST_F(MvccStoreTest, AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim) {
 // a hardcoded 0 makes k1's EXPECT_EQ below fail -- st->Mvcc() comes back larger than kAuthorMvcc
 // (a real HopStamp minted from the live wall clock, not this literal).
 //
-// drakeydb: P4-4 Task A5 fix round 1 -- k2's own assertions below changed: k2's LIVE recreate
-// (OpMSet's own Set() call for it, right after its lazy expiry) now floors against that expiry's
-// OWN self-minted tombstone stamp E -- DbSlice::EnsureMvcc (db_slice.cc) captures whatever the
-// slot held before this write, including a tombstone it itself just cleared, and PostUpdate
-// carries that on k2's arm for exactly this purpose. E's mvcc is a real, freshly minted HopStamp
-// from the live (mocked, advanced) wall clock, so it is not independently predictable from this
-// test without either minting it a second time (impossible -- HopStamp is one-shot per epoch) or
-// expiring k2 in a separate, earlier step, which would remove the mid-MSET lazy-expiry race this
-// test exists to exercise. The assertions below still pin the floor EXACTLY, though: E.Mvcc() is
-// whatever k2's own committed stamp's Mvcc() turns out to be (the floor preserves that field
-// unchanged, so reading it back off the result and using it to build the expected comparison
-// stamp is not circular), and origin_hash/bit 63 are independently known regardless (one below
-// this node's own registered self hash, never a tombstone) -- fix round 3 tightened this from a
-// looser shape check to a single whole-stamp comparison.
+// drakeydb: P4-4 Task A5 -- k2's LIVE recreate (OpMSet's own Set() call for it, right after its
+// lazy expiry) floors against that expiry's OWN self-minted tombstone stamp E -- DbSlice::
+// EnsureMvcc (db_slice.cc) captures whatever the slot held before this write, including a
+// tombstone it itself just cleared, and PostUpdate carries that on k2's arm for exactly this
+// purpose. E is minted by RecordExpiryBlocking's CommitOwnTombstone -> HopStamp(db_cntx.
+// time_now_ms) (tx_base.cc, mvcc.cc), and MvccClock::Next(now_ms) = max(now_ms << kCounterBits,
+// last_ + 1). This fixture's clock is frozen (GetCurrentTimeMs() returns TEST_current_time_ms,
+// engine_shard_set.h) and AdvanceTime only ever moves it forward, so E.Mvcc() is predicted below,
+// independently and exactly, BEFORE the apply ever runs: `now_ms` is read directly, and shard 0's
+// own clock().last() reflects k2's own earlier local SET (the only prior mint on this shard --
+// EndOfWriteEpoch resets hop_stamp_/hop_started_ms_ after every command, but never clock_ itself,
+// mvcc.cc, so `last_` persists across commands). k1's own assertions are unrelated to any of
+// this -- see the comment above for that half.
 TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   constexpr uint32_t kPeerIdx = 6;
   constexpr uint64_t kAuthorMvcc = 0x7777'0000'2222ULL;
@@ -2616,7 +2615,18 @@ TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   // (above in this file) uses for the analogous member-TTL case. AdvanceTime (mocked clock, no
   // real sleep) keeps this deterministic.
   Run({"set", k2, "old", "px", "10"});
+  auto p_before_expiry = StampOf(k2);  // P: k2's own live stamp, captured BEFORE it expires
+  ASSERT_TRUE(p_before_expiry.has_value());
   AdvanceTime(50);
+
+  // Predict E.Mvcc() independently, from MvccClock::Next's own formula, BEFORE the apply below
+  // ever runs -- see the comment above the test for why this is exact, not a guess: nothing else
+  // mints on shard 0 between this read and the expiry's own HopStamp call inside the apply.
+  const uint64_t now_ms_before_apply = GetCurrentTimeMs();
+  uint64_t last_before_apply = 0;
+  shard_set->Await(0, [&] { last_before_apply = MvccStamper::tlocal()->clock().last(); });
+  const uint64_t predicted_e_mvcc =
+      std::max(now_ms_before_apply << MvccClock::kCounterBits, last_before_apply + 1);
 
   ApplyReplicatedCommand({"mset", k1, "v1", k2, "v2"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
 
@@ -2630,19 +2640,23 @@ TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
 
   auto st2 = StampOf(k2);
   ASSERT_TRUE(st2.has_value());
-  ASSERT_GT(st2->Mvcc(), kAuthorMvcc)
-      << "sanity: k2 must be stamped by MSET's own trailing commit (not left as the expiry's own "
-         "tombstone, and not silently dropped), floored against that expiry's real, wall-clock-"
-         "minted stamp E -- strictly greater than the literal kAuthorMvcc, never kAuthorMvcc "
-         "verbatim";
+  EXPECT_EQ(st2->Mvcc(), predicted_e_mvcc)
+      << "verifies the prediction above: E.Mvcc() must be EXACTLY max(now_ms << kCounterBits, "
+         "last_ + 1) as computed BEFORE the apply ran, not merely 'some value bigger than "
+         "kAuthorMvcc' -- a wrong capture (e.g. flooring against P instead of E) would produce "
+         "P->Mvcc(), which is a real HopStamp too and would otherwise pass a looser check";
+  EXPECT_GT(st2->Mvcc(), p_before_expiry->Mvcc())
+      << "E must be strictly newer than P: both are minted by the SAME shard's MvccClock, which "
+         "is strictly monotone across every mint regardless of how many epochs (commands) pass "
+         "in between (mvcc.h) -- this holds for any correct capture, so it is a meaningful extra "
+         "guard rail alongside the exact prediction above, not a substitute for it";
   uint64_t self_origin_hash = 0;
   shard_set->pool()->AwaitBrief(
       [&](unsigned, auto*) { self_origin_hash = MvccStamper::tlocal()->OriginHash(0); });
-  // Whole-stamp equality: st2->Mvcc() IS E.Mvcc() (the floor preserves the mvcc field
-  // unchanged), so this pins origin_hash at EXACTLY self_origin_hash - 1 -- one below E's own
-  // self-mint, never the peer's -- and bit 63 at EXACTLY 0 -- a live write, never left looking
-  // like a tombstone -- in one comparison, rather than three separate, weaker checks.
-  EXPECT_EQ(*st2, (MvccStamp{st2->Mvcc(), self_origin_hash - 1}));
+  // Whole-stamp equality against the INDEPENDENTLY predicted E (never st2's own Mvcc(), never
+  // P's): pins origin_hash at EXACTLY self_origin_hash - 1 -- one below E's own self-mint, never
+  // the peer's -- and bit 63 at EXACTLY 0 -- a live write, never left looking like a tombstone.
+  EXPECT_EQ(*st2, (MvccStamp{predicted_e_mvcc, self_origin_hash - 1}));
 }
 
 // drakeydb: P4-3 Task 11, review ruling I2 -- a lazy expiry firing while applying a peer's

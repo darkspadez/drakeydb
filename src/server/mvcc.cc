@@ -26,9 +26,9 @@ uint64_t NodeUuidHash(std::string_view uuid) {
 // stamp to floor against. `!(incoming < stored)` covers both "incoming is strictly newer" and an
 // exact tie -- both commit verbatim, unchanged from before this task.
 //
-// drakeydb: P4-4 Task A5 fix round 1 (correction in fix round 3) -- the `stored.Mvcc() == 0`
-// check is NOT strictly redundant, despite this function's only real caller gating on
-// journal::RecordEntry's `applied` flag (`mvcc != 0` on the caller-supplied RAW wire value):
+// drakeydb: P4-4 Task A5 -- the `stored.Mvcc() == 0` check is NOT strictly redundant, despite
+// this function's only real caller gating on journal::RecordEntry's `applied` flag (`mvcc != 0`
+// on the caller-supplied RAW wire value):
 // `applied` only guarantees the raw wire mvcc is nonzero, not that its MASKED Mvcc() is -- a
 // wire value of EXACTLY `MvccClock::kTombstoneBit` (bit 63 set, every other bit clear) is
 // `applied` (nonzero as a raw integer) yet has `incoming.Mvcc() == 0`. If `stored` ALSO has
@@ -38,9 +38,9 @@ uint64_t NodeUuidHash(std::string_view uuid) {
 // `stored.Mvcc() | tomb_bit` collapses to just the tombstone bit (or 0), discarding `incoming`'s
 // own value entirely -- instead of recognizing there is no real prior stamp to floor against.
 // This is a general pure function regardless, exercised directly in mvcc_test.cc without going
-// through that caller, so relying on ANY caller invariant here -- even one that turned out to
-// hold -- would make the function's own correctness depend on something this file cannot see or
-// enforce.
+// through that caller, so relying on a caller invariant here would make the function's own
+// correctness depend on something this file cannot see or enforce -- and, as shown above, this
+// particular one does not even hold.
 MvccStamp FloorAppliedStamp(const MvccStamp& stored, const MvccStamp& incoming) {
   if (stored.Mvcc() == 0 || !(incoming < stored))
     return incoming;
