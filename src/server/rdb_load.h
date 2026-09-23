@@ -301,10 +301,10 @@ class RdbLoaderBase {
   // order while the RDB key stream beside it is merge-compared (merge_lww_ above). Set via
   // RdbLoader::SetApplyLwwGuard before Load() runs -- unlike apply_origin_idx_ above, this is NOT
   // set in DflyShardReplica's constructor: it is set in FullSyncDflyFb's peer_mode_ block, via
-  // DflyShardReplica::ApplyPeerFullSyncLwwGuard() (replica.cc), immediately before that same
-  // block's call to Load(). Stays false for every other loader (local RDB file load, plain
-  // replica's full sync, a test construction that never calls the setter), matching
-  // apply_origin_idx_'s own default story.
+  // DflyShardReplica::ApplyPeerFullSyncLwwGuard() (replica.cc), before FullSyncDflyFb's call to
+  // Load(). Stays false for every other loader (local RDB file load, plain replica's full sync, a
+  // test construction that never calls the setter), matching apply_origin_idx_'s own default
+  // story.
   bool apply_lww_guard_ = false;
 
   // State for the tagged chunk currently being parsed

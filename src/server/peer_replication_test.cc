@@ -519,11 +519,11 @@ std::string WrapInRdbForTest(std::string_view body) {
   return out;
 }
 
-// drakeydb: P4-4 Task A10 fix round 1 -- shared by PeerFullSyncJournalBlobHonorsLwwGuard and
-// ApplyPeerFullSyncLwwGuardMirrorsExecutorGuard below (each originally hand-rolled its own
-// equivalent loop; deduped in fix round 1): a key that hashes to shard 0, for the same reason
-// ObservedReplayedOriginIdx's own comment gives -- both tests' Load() calls always run on the
-// pp_->at(0) fiber.
+// drakeydb: P4-4 Task A10 -- shared by PeerFullSyncJournalBlobHonorsLwwGuard,
+// ApplyPeerFullSyncLwwGuardMirrorsExecutorGuard, and
+// FullSyncJournalBlobAppliesAndReJournalsWithFlowsOrigin below: a key that hashes to shard 0, for
+// the same reason ObservedReplayedOriginIdx's own comment gives -- all three tests' Load() calls
+// always run on the pp_->at(0) fiber.
 std::string Shard0Key(std::string_view prefix) {
   std::string key;
   for (unsigned i = 0; i < 1000; ++i) {
@@ -640,7 +640,7 @@ class DflyShardReplicaOriginTest : public BaseFamilyTest {
     });
   }
 
-  // drakeydb: P4-4 Task A10 fix round 1 -- shared tail for the RunXxxJournalBlobLoad helpers
+  // drakeydb: P4-4 Task A10 -- shared tail for the RunXxxJournalBlobLoad helpers
   // below: builds a guarded "SET key peer-value" journal blob stamped `incoming_mvcc` and feeds
   // it through `flow`'s rdb_loader_ (RdbLoaderBase::HandleJournalBlob) -- the caller must already
   // have set `flow`'s guard (however it wants to exercise that) before this runs. Not deduped
@@ -701,7 +701,7 @@ class DflyShardReplicaOriginTest : public BaseFamilyTest {
     ReplayGuardedSetBlob(&flow, key, incoming_mvcc);
   }
 
-  // drakeydb: P4-4 Task A10 fix round 1 -- pins that ApplyPeerFullSyncLwwGuard reads back
+  // drakeydb: P4-4 Task A10 -- pins that ApplyPeerFullSyncLwwGuard reads back
   // executor_'s guard bit as FROZEN AT CONSTRUCTION, never re-derived from the CURRENT flag value:
   // constructs a peer-mode flow while FLAGS_multi_master_stream_lww is ON (so executor_'s guard,
   // decided once at construction, is true), flips the flag OFF, THEN calls the real
@@ -801,18 +801,8 @@ TEST_F(DflyShardReplicaOriginTest, FullSyncJournalBlobAppliesAndReJournalsWithFl
   // Pick key names that hash to shard 0: ObservedReplayedOriginIdx registers its capturing
   // journal listener on shard 0 only (matching the pp_->at(0) fiber below), so a key hashing to
   // any other shard would silently miss the entry instead of failing loudly.
-  auto shard0_key = [&](std::string_view prefix) {
-    std::string key;
-    for (unsigned i = 0; i < 1000; ++i) {
-      key = absl::StrCat(prefix, i);
-      if (Shard(key, shard_set->size()) == 0)
-        return key;
-    }
-    ADD_FAILURE() << "could not find a shard-0 key for prefix " << prefix;
-    return key;
-  };
-  const std::string peer_key = shard0_key("t7b-peer-key-");
-  const std::string self_key = shard0_key("t7b-self-key-");
+  const std::string peer_key = Shard0Key("t7b-peer-key-");
+  const std::string self_key = Shard0Key("t7b-self-key-");
 
   constexpr uint32_t kPeerIdx = 11;  // some peer's PeerRegistry index; != PeerRegistry::kSelfIdx.
   pp_->at(0)->Await([&] {
@@ -934,22 +924,27 @@ TEST_F(DflyShardReplicaLwwGuardTest, PeerFullSyncJournalBlobHonorsLwwGuard) {
 // the mvcc side table these tests' stamp assertions read via db_slice.SetMvcc/GetMvcc); it is NOT
 // varied here, so this is NOT A2's full three-gate matrix. What IS covered, over
 // (peer_mode x FLAGS_multi_master_stream_lww): peer_mode=true + flag=true -> guarded (the
-// method's normal use); peer_mode=false -> never guarded regardless of the flag, matching A2's own
-// framing for executor_ -- the most important case; peer_mode=true + flag=OFF -> unguarded. That
-// third case is the one cell that actually distinguishes "reads back executor_'s bit" from a
-// broken "SetApplyLwwGuard(peer_mode_)" implementation -- without it, the first two cases alone
-// are equally consistent with either. A fourth case pins that the read happens ONCE, at
-// executor_'s own construction, never freshly re-derived: constructs the flow with the flag ON
-// (executor_ ends up guarded), flips the flag OFF, THEN calls ApplyPeerFullSyncLwwGuard() --
-// still expects guarded, since a correct implementation never re-reads the flag at that point.
+// method's normal use); peer_mode=false (flag on) -> never guarded, matching A2's own framing for
+// executor_ -- the most important case (not separately re-run with the flag off here:
+// ApplyPeerFullSyncLwwGuard has no peer_mode-dependent branch of its own, only a verbatim read of
+// executor_'s bit, and A2's ConstructorThreadsLwwGuardIntoExecutor already covers executor_ under
+// peer_mode=false regardless of the flag); peer_mode=true + flag=OFF -> unguarded. That third case
+// is the one cell that actually distinguishes "reads back executor_'s bit" from a broken
+// "SetApplyLwwGuard(peer_mode_)" implementation -- without it, the first two cases alone are
+// equally consistent with either. A fourth case pins that the read happens ONCE, at executor_'s
+// own construction, never freshly re-derived: constructs the flow with the flag ON (executor_
+// ends up guarded), flips the flag OFF, THEN calls ApplyPeerFullSyncLwwGuard() -- still expects
+// guarded, since a correct implementation never re-reads the flag at that point.
 //
 // Falsifying (verified by hand): hardcoding
 // rdb_loader_->SetApplyLwwGuard(false) inside ApplyPeerFullSyncLwwGuard's body (replica.cc) makes
-// the peer_mode=true+flag=true sub-test's EXPECT_EQ fail (observes "peer-value" instead of
-// "local"); the other three sub-tests are unaffected (all already expect the unguarded outcome or
-// are otherwise not this branch). Hardcoding SetApplyLwwGuard(true) there instead flips exactly
-// the opposite three sub-tests to fail, leaving only peer_mode=true+flag=true unaffected --
-// together the two hardcodings cover all four cases. Separately, replacing the body with
+// BOTH the peer_mode=true+flag=true sub-test's EXPECT_EQ fail (observes "peer-value" instead of
+// "local") AND the frozen-despite-flip sub-test's EXPECT_EQ fail (same failure) -- the other two
+// (peer_mode=false, peer_mode=true+flag=OFF) are unaffected, since both already expect the
+// unguarded outcome. Hardcoding SetApplyLwwGuard(true) there instead flips exactly those other two
+// -- peer_mode=false and peer_mode=true+flag=OFF -- to fail (observe "local" instead of
+// "peer-value"), leaving peer_mode=true+flag=true and the frozen case unaffected: together the two
+// hardcodings cover all four cases. Separately, replacing the body with
 // rdb_loader_->SetApplyLwwGuard(peer_mode_) (dropping IsActiveReplica()/the flag entirely) makes
 // ONLY the peer_mode=true+flag=OFF sub-test fail (observes "local" instead of "peer-value"); the
 // other three are unaffected, since peer_mode_ alone happens to agree with the real expression on
