@@ -4237,13 +4237,16 @@ TEST_F(MvccStoreTest, DelexBareStaleAuthorLeakClosedByNoAutoJournal) {
 }
 
 // drakeydb: P4-4 Task A11b -- the conditional forms' own result-journal (Delex's conditional cb,
-// generic_family.cc) hands a receiver plain "DEL key", so its receiver-side behavior is exactly
-// OpDelV2's existing per-key guard: an incoming stamp NEWER than the stored stamp deletes and
-// tombstones with the author's stamp verbatim; OLDER is dropped, stamp untouched. This test proves
-// that integration -- that the exact entry shape a conditional DELEX now emits (pinned separately
-// by EmittedNamePinsMatchClassifiedGuardedNames, Task A11, below) is not mishandled on receipt --
-// not OpDelV2's guard logic itself, which DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesThe-
-// Survivor (Task A8, above) already covers in full.
+// generic_family.cc) hands a receiver plain "DEL key" -- exactly the shape a live capture pins in
+// EmittedNamePinsMatchClassifiedGuardedNames (Task A11, below). That shape is a fixed constant
+// ("DEL" plus the key, never anything else), so this test applies it directly rather than
+// capturing and replaying a live conditional DELEX invocation -- doing so would exercise the same
+// fixed constant a second time, not add coverage. What this test actually checks is OpDelV2's
+// existing per-key guard against that shape: an incoming stamp NEWER than the stored stamp
+// deletes and tombstones with the author's stamp verbatim; OLDER is dropped, stamp untouched --
+// both already covered in full by DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesTheSurvivor
+// (Task A8, above), so this is a targeted interaction check (does the shape DELEX now emits land
+// on that guard correctly), not new guard coverage.
 TEST_F(MvccStoreTest, DelexConditionalResultDelNewerDeletesOlderDropped) {
   constexpr uint32_t kPeerIdx = 77;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a11b-4000-8000-000000000077");
@@ -6005,21 +6008,35 @@ TEST_F(MvccStoreTest, EmittedNamePinsMatchClassifiedGuardedNames) {
   {
     Run({"set", "k19", "v"});
     auto e = run1({"delex", "k19"});
-    ASSERT_GE(e.size(), 2u);
+    ASSERT_EQ(e.size(), 2u) << "DEL's own journal args are exactly {\"DEL\", key} -- no third "
+                               "field, unlike PEXPIREAT/RESTORE's extra args above";
     EXPECT_EQ(e[0], "DEL");
     EXPECT_EQ(e[1], "k19");
     EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
   }
 
   // DELEX key IFEQ v, predicate holds (deletes) -> DEL, kMultiKeySelfGuarded (Delex's own
-  // conditional cb hand-journals the RESULT, not the recipe).
+  // conditional cb hand-journals the RESULT, not the recipe). Also pins the required ORDER: the
+  // delete must commit before the journal entry, so by the time this entry exists the key already
+  // carries a real (non-zero-authority) tombstone stamp, not the zero-authority placeholder
+  // PerformDeletionAtomic's ArmTombstone leaves behind mid-delete.
   {
     Run({"set", "k20", "match"});
+    auto before_dropped = TotalUnstampedWrites();
     auto e = run1({"delex", "k20", "IFEQ", "match"});
-    ASSERT_GE(e.size(), 2u);
+    ASSERT_EQ(e.size(), 2u) << "DEL's own journal args are exactly {\"DEL\", key}";
     EXPECT_EQ(e[0], "DEL");
     EXPECT_EQ(e[1], "k20");
     EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+    auto tomb = StampOf("k20");
+    ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+    EXPECT_TRUE(tomb->IsTombstone());
+    EXPECT_NE(tomb->Mvcc(), 0u)
+        << "by the time RecordJournal's own Commit() ran, the key must already carry a REAL "
+           "author stamp, not the zero-authority placeholder ArmTombstone leaves mid-delete -- "
+           "proving RecordJournal ran AFTER DelMutable, not before it";
+    EXPECT_EQ(TotalUnstampedWrites(), before_dropped)
+        << "the delete must be committed by this same RecordJournal call, never left armed";
   }
 
   // DELEX key IFEQ v, predicate fails (no delete) -> journals nothing at all: NO_AUTOJOURNAL, and

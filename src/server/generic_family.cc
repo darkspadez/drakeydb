@@ -1514,11 +1514,16 @@ void GenericFamily::Delex(facade::CmdArgParser parser, CommandContext* cmd_cntx)
 
       // drakeydb: P4-4 Task A11b -- DELEX is CO::NO_AUTOJOURNAL, so nothing journals this delete
       // unless we do it here. Journaling the RESULT ("DEL key"), not the recipe ("DELEX key IFEQ
-      // v"), mirrors OpDelV2's own "Del then RecordJournal" order (this Op function's own
-      // tombstone commits above, so the entry below is for an already-committed delete) and
-      // means a receiver applies a guarded DEL against its OWN value instead of re-evaluating this
-      // predicate against a value that may already differ -- the same SETNX->SET precedent Task
-      // A9 established for SETNX. A failed predicate (should_delete == false, below) journals
+      // v"), mirrors OpDelV2's own "Del then RecordJournal" order for a reason, not just style:
+      // DelMutable above only ARMS a zero-authority tombstone placeholder (PerformDeletionAtomic's
+      // SetTombstone+ArmTombstone, db_slice.cc) -- it is THIS RecordJournal call's Commit()
+      // (journal.cc) that stamps the real author stamp into that slot. Journaling first would run
+      // Commit() before the arm exists, so DelMutable's later arm is never revisited by this
+      // callback: EndOfWriteEpoch's rollback erases the orphaned placeholder (the tombstone
+      // vanishes) and counts it as an unstamped write. Journaling the RESULT also means a receiver
+      // applies a guarded DEL against its OWN value instead of re-evaluating this predicate
+      // against a value that may already differ -- the same SETNX->SET precedent Task A9
+      // established for SETNX. A failed predicate (should_delete == false, below) journals
       // nothing at all: NO_AUTOJOURNAL plus no explicit RecordJournal call is exactly "nothing".
       auto op_args = tx->GetOpArgs(es);
       if (op_args.shard->journal())
@@ -3202,7 +3207,7 @@ void GenericFamily::Register(CommandRegistry* registry) {
       // generic single-key veto only classifies kSingleKey names, never DELEX) -- a double journal
       // that, on a guarded receiver, forwarded a delete OpDelV2's own per-key guard had just
       // dropped. The conditional forms (IFEQ/IFNE/IFDEQ/IFDNE) now hand-journal their own result
-      // (see Delex below) instead of relying on auto-journal to forward the recipe verbatim.
+      // (see Delex above) instead of relying on auto-journal to forward the recipe verbatim.
       << CI{"DELEX", CO::JOURNALED | CO::NO_AUTOJOURNAL | CO::FAST, -2, 1, 1, acl::kDel}.HFUNC(
              Delex)
       /* Redis compatibility:
