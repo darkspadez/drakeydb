@@ -110,6 +110,12 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
   entry.mvcc = mvcc;
   entry.entry_flags = entry_flags;
 
+  // drakeydb: P4-4 Task A5 -- "applied" per the task's own resolution of ambiguity: the CALLER
+  // supplied a non-zero mvcc, BEFORE the mint below ever runs. A local mint (mvcc == 0 here) is
+  // never floored -- only a caller-supplied author stamp (an applied write's, guarded or not, on
+  // a peer link or a plain replica) can legitimately be older than the key's own stored stamp.
+  const bool applied = mvcc != 0;
+
   // drakeydb: Phase 4 -- mint AFTER entry.mvcc = mvcc above (an assignment from the possibly-zero
   // caller-supplied parameter, which would otherwise clobber a mint placed earlier straight back
   // to 0) and BEFORE AddLogRecord below, so the wire carries this exact value. HopStamp takes
@@ -139,8 +145,22 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     MvccStamper::tlocal()->Commit(
         entry.mvcc, stamp_origin_idx.value_or(entry.origin_idx),
-        [&db_slice](DbIndex db, std::string_view key, const MvccStamp& st) {
-          db_slice.SetExistingMvcc(db, key, st);
+        [&db_slice, applied](DbIndex db, std::string_view key, const MvccStamp& st,
+                             const MvccStamp& prev_stamp) {
+          if (!applied) {
+            db_slice.SetExistingMvcc(db, key, st);
+            return;
+          }
+          // drakeydb: P4-4 Task A5 -- floor an applied write's stamp against this key's own
+          // stored stamp `S`. A tombstone arm's slot has ALREADY been overwritten by
+          // PerformDeletionAtomic's placeholder by this point (db_slice.cc), so `S` for it is
+          // the arm's own captured prev_stamp, not a live lookup; a plain arm's slot still holds
+          // its true pre-mutation value (PostUpdate/EnsureMvcc never touch it), so `S` for it IS
+          // that live lookup. st.IsTombstone() reliably tells the two cases apart: Commit() only
+          // ever sets that bit for a tombstone arm (mvcc.cc), never a plain one.
+          const MvccStamp stored =
+              st.IsTombstone() ? prev_stamp : db_slice.GetMvcc(db, key).value_or(MvccStamp{});
+          db_slice.SetExistingMvcc(db, key, FloorAppliedStamp(stored, st));
         });
   }
 }

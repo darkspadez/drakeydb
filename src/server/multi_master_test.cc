@@ -860,8 +860,9 @@ class MvccStoreTest : public BaseFamilyTest {
   // peer_replication_test.cc).
   //
   // The origin_idx -> origin_hash registration is done manually here via
-  // shard_set->pool()->AwaitBrief, the same shape AppliedWriteKeepsAuthorStampVerbatim above
-  // uses -- NOT via DflyShardReplica's constructor. An earlier version of this helper relied on
+  // shard_set->pool()->AwaitBrief, the same shape
+  // AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim above uses -- NOT via DflyShardReplica's
+  // constructor. An earlier version of this helper relied on
   // the constructor to do that registration (mirroring what was, at the time, production
   // behavior); that production behavior was reverted after it crashed the server (SIGSEGV,
   // reproduced 5/10 runs of test_active_replica_single_peer_replaces) -- see
@@ -874,8 +875,8 @@ class MvccStoreTest : public BaseFamilyTest {
   // property now lives in InitiateDflySync, a private Replica method with no no-socket
   // construction path); what it still genuinely proves is multi-shard correctness of the
   // CONSUMING side -- ExecuteTx's real, per-shard application of an author's mvcc/origin_hash --
-  // which AppliedWriteKeepsAuthorStampVerbatim above does not cover, since that test only ever
-  // touches one key/shard.
+  // which AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim above does not cover, since that test
+  // only ever touches one key/shard.
   //
   // Construction AND every ExecuteTx call run inside one pp_->at(0)->LaunchFiber(...).Join(),
   // matching ApplyReplicatedCommand above: Execute() calls into Service::DispatchCommand, which
@@ -946,11 +947,11 @@ class MvccStoreTest : public BaseFamilyTest {
   }
 
   // drakeydb: P4-4 Task A3 -- registers `origin_idx` -> `origin_hash` on EVERY shard thread, the
-  // same shape AppliedWriteKeepsAuthorStampVerbatim (above) and ApplyOnePeerWriteToEveryShard
-  // (above) both use directly: MvccStamper::tlocal() is per-thread, and ShouldDropForLww's own
-  // IncomingStamp call (transaction.cc) runs on whichever shard thread owns the guarded key, so
-  // registering on only one thread would DCHECK-fail (or silently fail open in release) the
-  // moment a test's key lands on a different shard.
+  // same shape AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim (above) and
+  // ApplyOnePeerWriteToEveryShard (above) both use directly: MvccStamper::tlocal() is per-thread,
+  // and ShouldDropForLww's own IncomingStamp call (transaction.cc) runs on whichever shard thread
+  // owns the guarded key, so registering on only one thread would DCHECK-fail (or silently fail
+  // open in release) the moment a test's key lands on a different shard.
   void RegisterPeerOriginHash(uint32_t origin_idx, uint64_t origin_hash) {
     shard_set->pool()->AwaitBrief([origin_idx, origin_hash](unsigned, auto*) {
       MvccStamper::tlocal()->RegisterOriginHash(origin_idx, origin_hash);
@@ -1503,10 +1504,13 @@ TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) 
     db_slice.SetMvcc(0, std::string_view{"loaded-key"}, kPersistedStamp);
     loaded->post_updater.RunWithoutMvccArm();
 
-    MvccStamper::tlocal()->Commit(kPendingMvcc, 0,
-                                  [&](DbIndex db, std::string_view key, const MvccStamp& stamp) {
-                                    db_slice.SetExistingMvcc(db, key, stamp);
-                                  });
+    MvccStamper::tlocal()->Commit(
+        kPendingMvcc, 0,
+        // drakeydb: P4-4 Task A5 -- CommitFn's 4th argument (the arm's captured prev_stamp) is
+        // unused here; this test is about arm/commit isolation, not the floor.
+        [&](DbIndex db, std::string_view key, const MvccStamp& stamp, const MvccStamp&) {
+          db_slice.SetExistingMvcc(db, key, stamp);
+        });
     pending_stamp = db_slice.GetMvcc(0, "pending-key");
     loaded_stamp = db_slice.GetMvcc(0, "loaded-key");
   });
@@ -2529,7 +2533,18 @@ TEST_F(MvccStoreTest, ZunionstoreStampsTheDestinationAcrossTwoJournalEntries) {
 // JournalExecutor's ConnectionContext::repl_mvcc at its 0 default, so RecordEntry's
 // `entry.mvcc == 0` test (journal.cc) is true and it mints a fresh HopStamp instead of storing
 // kAuthorMvcc, failing the first EXPECT_EQ below.
-TEST_F(MvccStoreTest, AppliedWriteKeepsAuthorStampVerbatim) {
+//
+// drakeydb: P4-4 Task A5 -- renamed from AppliedWriteKeepsAuthorStampVerbatim: "verbatim" is no
+// longer the WHOLE story for an applied write's LOCAL stored stamp -- FloorAppliedStamp (mvcc.h)
+// floors it instead whenever the author's stamp is older than the key's own current one. "k"
+// here is a BRAND NEW key, so its stored stamp `S` is a fresh {0,0} slot -- exactly
+// FloorAppliedStamp's own "nothing to floor against" case -- so this test's assertion is
+// unchanged; see UnguardedAppliedRmwWithOlderAuthorMvccFloorsInsteadOfRewindingTheStamp (below)
+// for the floored case this task adds. The journal ENTRY this applier's own downstream peers see
+// still carries kAuthorMvcc verbatim regardless -- RecordEntry writes entry.mvcc onto the wire
+// entry BEFORE Commit() (and any floor) ever runs (journal.cc) -- only the LOCAL stored stamp is
+// ever floored, never what gets propagated.
+TEST_F(MvccStoreTest, AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim) {
   constexpr uint64_t kAuthorMvcc = 0x1234'5678'9ABCULL;
   constexpr uint32_t kPeerIdx = 3;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-0000-4000-8000-00000000000b");
@@ -2675,9 +2690,9 @@ TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp) {
 
 // drakeydb: Phase 4 Task 9, fix round (F1v2) -- proves ExecuteTx applies an author's mvcc AND
 // origin_hash correctly regardless of which shard a replicated write's key lands on, which
-// AppliedWriteKeepsAuthorStampVerbatim above cannot: that test touches exactly one key/shard, so
-// it cannot distinguish "correct on every shard" from "correct on whichever shard this key
-// happened to hash to." This test constructs a real DflyShardReplica -- exactly as
+// AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim above cannot: that test touches exactly one
+// key/shard, so it cannot distinguish "correct on every shard" from "correct on whichever shard
+// this key happened to hash to." This test constructs a real DflyShardReplica -- exactly as
 // Replica::InitiateDflySync does -- and applies through one key per shard (not just one key
 // total), asserting the resulting stamp on each.
 //
@@ -2692,16 +2707,16 @@ TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp) {
 // private Replica method with no no-socket construction path this file can reach the way
 // DflyShardReplicaOriginTest reaches DflyShardReplica's public constructor -- so
 // ApplyOnePeerWriteToEveryShard registers the origin hash manually (shard_set->pool()->AwaitBrief,
-// the same shape AppliedWriteKeepsAuthorStampVerbatim already uses) rather than relying on
-// construction to do it. See ApplyOnePeerWriteToEveryShard's own comment for the full account,
-// including why construction and every apply run on thread 0 specifically (ServerState::tlocal()
-// must resolve on the calling thread).
+// the same shape AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim already uses) rather than
+// relying on construction to do it. See ApplyOnePeerWriteToEveryShard's own comment for the full
+// account, including why construction and every apply run on thread 0 specifically
+// (ServerState::tlocal() must resolve on the calling thread).
 //
 // Falsifying (see task-9-report.md for the verbatim run): no-op'ing the body of
 // JournalExecutor::SetApplyMvcc (executor.h) -- the same mutation that falsifies
-// AppliedWriteKeepsAuthorStampVerbatim -- makes every shard's Mvcc() EXPECT below fail with a
-// freshly-minted HopStamp instead of kAuthorMvcc, since ExecuteTx's non-global path calls that
-// same method before every Execute().
+// AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim -- makes every shard's Mvcc() EXPECT below fail
+// with a freshly-minted HopStamp instead of kAuthorMvcc, since ExecuteTx's non-global path calls
+// that same method before every Execute().
 TEST_F(MvccStoreTest, AppliedWriteAppliesCorrectlyOnEveryShard) {
   const unsigned num_shards = shard_set->size();
   ASSERT_GT(num_shards, 1u) << "this test's entire point is proving correctness on shards OTHER "
@@ -2758,8 +2773,8 @@ class MvccCapturingConsumer : public journal::JournalConsumerInterface {
 // itself derived from applying a peer's replicated command. Two peers independently applying the
 // same replicated HDEL (each emptying their own copy of the hash) would then diverge onto two
 // different, locally-minted stamps for the same logical delete instead of converging on the
-// author's one stamp, exactly like AppliedWriteKeepsAuthorStampVerbatim above proves for ordinary
-// (non-derived) applied writes.
+// author's one stamp, exactly like AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim above proves
+// for ordinary (non-derived) applied writes.
 //
 // The emptied key itself can't be used to observe this (StampOf would read nullopt either way --
 // the key is gone), so this test instead reads the derived DEL's own journal entry (mvcc travels
@@ -2841,9 +2856,18 @@ TEST_F(MvccStoreTest, StalePeerSetDroppedUnderLwwGuard) {
 }
 
 // drakeydb: P4-4 Task A3 -- the guard's sibling/control for the test above: the IDENTICAL stale
-// SET, with the link's guard bit off, must apply exactly as arrival-order replication always
-// has -- proving the drop above is caused by the guard, not some unrelated side effect of
-// ApplyReplicatedCommand or of a stale mvcc by itself.
+// SET, with the link's guard bit off, must still apply its VALUE exactly as arrival-order
+// replication always has -- proving the drop above is caused by the guard, not some unrelated
+// side effect of ApplyReplicatedCommand or of a stale mvcc by itself.
+//
+// drakeydb: P4-4 Task A5 -- this test's STAMP assertions changed from its pre-A5 version: SET is
+// one of the commands ClassifyJournaledCommand (multimaster_lww.h) guards by NAME, but with the
+// link's guard bit off here A3's veto never engages -- exactly the "unguarded command" case
+// FloorAppliedStamp (mvcc.h) exists for. "k"
+// already carries a real local stamp `S` by the time this stale peer SET commits, so the applied
+// write's stamp is floored to just-below `S`, never kStaleMvcc verbatim -- committing verbatim
+// would rewind the key's stamp, letting some later, even-older write wrongly win a future
+// comparison against it.
 TEST_F(MvccStoreTest, StalePeerSetAppliesWithoutLwwGuard) {
   constexpr uint32_t kPeerIdx = 21;
   constexpr uint64_t kStaleMvcc = 0x1000ULL;
@@ -2851,6 +2875,11 @@ TEST_F(MvccStoreTest, StalePeerSetAppliesWithoutLwwGuard) {
   RegisterPeerOriginHash(kPeerIdx, peer_hash);
 
   ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  ASSERT_GT(before_stamp->Mvcc(), kStaleMvcc)
+      << "sanity: the local stamp must actually be newer than the peer's for the floor below to "
+         "be a meaningful check";
 
   facade::DispatchResult res =
       ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, kStaleMvcc, /*lww_guard=*/false);
@@ -2861,8 +2890,11 @@ TEST_F(MvccStoreTest, StalePeerSetAppliesWithoutLwwGuard) {
          "regardless of its (older) mvcc";
   auto st = StampOf("k");
   ASSERT_TRUE(st.has_value());
-  EXPECT_EQ(st->Mvcc(), kStaleMvcc);
-  EXPECT_EQ(st->origin_hash, peer_hash);
+  EXPECT_EQ(st->Mvcc(), before_stamp->Mvcc())
+      << "FloorAppliedStamp keeps the Mvcc() field at S's own -- only origin_hash regresses";
+  EXPECT_EQ(st->origin_hash, before_stamp->origin_hash - 1)
+      << "an applied write's author stamp is never committed verbatim once a real prior stamp "
+         "exists and the author's is older -- floored one origin_hash below it instead (mvcc.h)";
 }
 
 // drakeydb: P4-4 Task A3 -- F1 (multimaster_lww.h): a zero incoming mvcc must NEVER be guarded,
@@ -3189,6 +3221,14 @@ TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyC
 // tasks A7/A8, not this one) -- GetShardArgs on MSET yields keys AND values in one contiguous
 // range, which is exactly why this generic single-key helper must never touch it. All three must
 // still apply a stale peer write, and none may ever be counted as an LWW drop by this task.
+//
+// drakeydb: P4-4 Task A5 -- every stamp assertion below changed from this test's pre-A5 version:
+// each of these three keys already carries a real local stamp `S` (from its own `Run({"set"/
+// "incr", ...})` setup below) that is newer than kStaleMvcc, so this is precisely the "unguarded
+// applied write with an author stamp older than S" case FloorAppliedStamp (mvcc.h) exists for --
+// none of these three commands is vetoed (that is this test's whole point), but their COMMITTED
+// stamp is still floored to just-below `S`, never kStaleMvcc verbatim, or a later, even-older
+// write could wrongly win a comparison against the rewound stamp.
 TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
   constexpr uint32_t kPeerIdx = 27;
   constexpr uint64_t kStaleMvcc = 0x1000ULL;
@@ -3200,6 +3240,7 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
     ASSERT_EQ(Run({"incr", "sj_incr"}).GetInt(), 1);
     auto before = StampOf("sj_incr");
     ASSERT_TRUE(before.has_value());
+    ASSERT_GT(before->Mvcc(), kStaleMvcc) << "sanity: S must be newer than the stale author mvcc";
     const uint64_t pre_dropped = TotalLwwDropped();
     auto res = ApplyReplicatedCommand({"incr", "sj_incr"}, kPeerIdx, kStaleMvcc, true);
     EXPECT_EQ(res, facade::DispatchResult::OK);
@@ -3207,10 +3248,11 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
         << "INCR is unguarded -- a stale mvcc must never veto it";
     auto after = StampOf("sj_incr");
     ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->Mvcc(), kStaleMvcc)
-        << "the incoming author's stamp is committed verbatim -- proof the write actually ran, "
-           "not merely that the value happened to look right";
-    EXPECT_EQ(after->origin_hash, peer_hash);
+    EXPECT_EQ(after->Mvcc(), before->Mvcc())
+        << "the INCR itself actually ran (the value changed above), but FloorAppliedStamp keeps "
+           "the Mvcc() field at S's own, never the stale kStaleMvcc verbatim";
+    EXPECT_EQ(after->origin_hash, before->origin_hash - 1)
+        << "floored one origin_hash below S -- never the peer's own origin_hash verbatim";
     EXPECT_NE(*after, *before) << "sanity: the stamp must have actually advanced";
     EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "INCR must never count as an LWW drop";
   }
@@ -3218,7 +3260,9 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
   {  // DEL -- kMultiKeySelfGuarded; A8's own guard does not exist yet.
     SCOPED_TRACE("DEL");
     ASSERT_EQ(Run({"set", "sj_del", "local"}), "OK");
-    ASSERT_TRUE(StampOf("sj_del").has_value());
+    auto before = StampOf("sj_del");
+    ASSERT_TRUE(before.has_value());
+    ASSERT_GT(before->Mvcc(), kStaleMvcc) << "sanity: S must be newer than the stale author mvcc";
     const uint64_t pre_dropped = TotalLwwDropped();
     auto res = ApplyReplicatedCommand({"del", "sj_del"}, kPeerIdx, kStaleMvcc, true);
     EXPECT_EQ(res, facade::DispatchResult::OK);
@@ -3227,10 +3271,10 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
     auto tomb = StampOf("sj_del");
     ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
     EXPECT_TRUE(tomb->IsTombstone());
-    EXPECT_EQ(tomb->Mvcc(), kStaleMvcc)
-        << "the applied DEL's own tombstone carries the incoming author's stamp verbatim -- "
-           "proof it actually applied rather than being silently vetoed";
-    EXPECT_EQ(tomb->origin_hash, peer_hash);
+    EXPECT_EQ(tomb->Mvcc(), before->Mvcc())
+        << "the applied DEL actually ran (the key is gone above), but its tombstone's stamp is "
+           "floored to just-below S -- never the incoming author's stale mvcc verbatim";
+    EXPECT_EQ(tomb->origin_hash, before->origin_hash - 1);
     EXPECT_EQ(TotalLwwDropped(), pre_dropped)
         << "this generic single-key veto must never classify or count DEL";
   }
@@ -3239,6 +3283,12 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
     SCOPED_TRACE("MSET");
     ASSERT_EQ(Run({"set", "sj_msk1", "local1"}), "OK");
     ASSERT_EQ(Run({"set", "sj_msk2", "local2"}), "OK");
+    auto before1 = StampOf("sj_msk1");
+    auto before2 = StampOf("sj_msk2");
+    ASSERT_TRUE(before1.has_value());
+    ASSERT_TRUE(before2.has_value());
+    ASSERT_GT(before1->Mvcc(), kStaleMvcc);
+    ASSERT_GT(before2->Mvcc(), kStaleMvcc);
     const uint64_t pre_dropped = TotalLwwDropped();
     auto res = ApplyReplicatedCommand({"mset", "sj_msk1", "peer1", "sj_msk2", "peer2"}, kPeerIdx,
                                       kStaleMvcc, true);
@@ -3250,15 +3300,116 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
     auto st2 = StampOf("sj_msk2");
     ASSERT_TRUE(st1.has_value());
     ASSERT_TRUE(st2.has_value());
-    EXPECT_EQ(st1->Mvcc(), kStaleMvcc)
-        << "MSET's own commit stamps every key with the incoming author's stamp verbatim -- "
-           "proof it actually applied rather than being silently vetoed";
-    EXPECT_EQ(st1->origin_hash, peer_hash);
-    EXPECT_EQ(st2->Mvcc(), kStaleMvcc);
-    EXPECT_EQ(st2->origin_hash, peer_hash);
+    EXPECT_EQ(st1->Mvcc(), before1->Mvcc())
+        << "MSET's own commit floors each key's stamp to just-below ITS OWN prior stamp -- "
+           "never the incoming author's stale mvcc verbatim";
+    EXPECT_EQ(st1->origin_hash, before1->origin_hash - 1);
+    EXPECT_EQ(st2->Mvcc(), before2->Mvcc());
+    EXPECT_EQ(st2->origin_hash, before2->origin_hash - 1);
     EXPECT_EQ(TotalLwwDropped(), pre_dropped)
         << "this generic single-key veto must never classify or count MSET";
   }
+}
+
+// ---------------------------------------------------------------------------
+// P4-4 Task A5: FloorAppliedStamp's end-to-end proof. See mvcc.h's declaration for the pure-
+// function why; mvcc_test.cc's FloorAppliedStampTest suite covers the function in isolation.
+// ---------------------------------------------------------------------------
+
+// drakeydb: P4-4 Task A5 -- the headline case the floor exists for: an UNGUARDED applied RMW
+// (APPEND is not one of the names ClassifyJournaledCommand, multimaster_lww.h, guards, so A3's
+// veto never even classifies it) whose author authored it before it ever saw this key's local
+// stamp `S`. Item (i): the write still applies (its value change is real, not silently dropped),
+// but its COMMITTED stamp floors to just-below `S` instead of the author's own (older) mvcc
+// verbatim.
+// Item (ii): with the floor in place, a stale GUARDED SET whose mvcc sits strictly between the
+// APPEND's stale author mvcc and the ORIGINAL `S` must still be dropped -- proving the floor kept
+// the key's stamp high enough to reject it, exactly as it would have rejected anything below `S`
+// itself. See UnguardedAppliedDeleteWithOlderAuthorMvccFloorsTheTombstone (below) for the
+// tombstone-arm sibling of this test, and rdb_test.cc's
+// MergeLwwOnFullSyncHealsRmwDivergenceLeftByAnAppliedFloor for item (iii), the heal.
+TEST_F(MvccStoreTest, UnguardedAppliedRmwWithOlderAuthorMvccFloorsInsteadOfRewindingTheStamp) {
+  constexpr uint32_t kPeerIdx = 30;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a5a5-4000-8000-000000000030");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "v1"}), "OK");
+  auto stored = StampOf("k");
+  ASSERT_TRUE(stored.has_value());
+  constexpr uint64_t kAuthorMvcc = 0x1000ULL;  // strictly older than any real HopStamp
+  ASSERT_GT(stored->Mvcc(), kAuthorMvcc) << "sanity: S must be newer than the author's mvcc";
+
+  // (i) APPEND is unguarded and its author mvcc is older than S -- the write applies, but its
+  // stamp floors to just-below S rather than the author's stale mvcc verbatim.
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"append", "k", "x"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "k"}), "v1x") << "APPEND's own delta must still apply to the value";
+
+  auto floored = StampOf("k");
+  ASSERT_TRUE(floored.has_value());
+  EXPECT_EQ(floored->Mvcc(), stored->Mvcc())
+      << "FloorAppliedStamp keeps the Mvcc() field at S's own";
+  EXPECT_EQ(floored->origin_hash, stored->origin_hash - 1)
+      << "and lands exactly one origin_hash below S -- never the author's peer origin_hash "
+         "verbatim, or a rewound stamp would let a later stale guarded write wrongly win";
+
+  // (ii) a stale GUARDED SET with mvcc strictly between the APPEND's kAuthorMvcc and the
+  // ORIGINAL S must still be dropped: the floor kept the key's live stamp high enough to reject
+  // it, so the dirty "v1x" value survives untouched.
+  const uint64_t before_dropped = TotalLwwDropped();
+  const uint64_t mid_mvcc = kAuthorMvcc + (stored->Mvcc() - kAuthorMvcc) / 2;
+  ASSERT_GT(mid_mvcc, kAuthorMvcc);
+  ASSERT_LT(mid_mvcc, stored->Mvcc());
+  res = ApplyReplicatedCommand({"set", "k", "stale"}, kPeerIdx, mid_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK)
+      << "a dropped write must still report success -- see StalePeerSetDroppedUnderLwwGuard above";
+  EXPECT_EQ(Run({"get", "k"}), "v1x")
+      << "the stale guarded SET must still be dropped after the floor -- the dirty RMW value "
+         "must survive";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  auto after_veto = StampOf("k");
+  ASSERT_TRUE(after_veto.has_value());
+  EXPECT_EQ(*after_veto, *floored) << "the veto must not disturb the floored stamp either";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u) << "a drop must never arm-then-abandon the key";
+}
+
+// drakeydb: P4-4 Task A5 -- the tombstone-arm sibling of the RMW test above. DEL is
+// kMultiKeySelfGuarded (its own per-key guard is a later task, not this one), so with the link's
+// guard bit off here it is simply an unguarded applied delete -- PerformDeletionAtomic's own
+// captured prev_stamp (db_slice.cc) is what lets the floor apply here at all, since by the time
+// journal::RecordEntry's Commit() runs, the slot no longer holds `S` itself (only the delete's own
+// zero-authority placeholder does). This is exactly the "derived DEL from an applied RMW that
+// empties a container, or a plain DEL applied with the guard OFF" case the brief calls out.
+TEST_F(MvccStoreTest, UnguardedAppliedDeleteWithOlderAuthorMvccFloorsTheTombstone) {
+  constexpr uint32_t kPeerIdx = 31;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a5a5-4000-8000-000000000031");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "v1"}), "OK");
+  auto stored = StampOf("k");
+  ASSERT_TRUE(stored.has_value());
+  constexpr uint64_t kAuthorMvcc = 0x1000ULL;
+  ASSERT_GT(stored->Mvcc(), kAuthorMvcc) << "sanity: S must be newer than the author's mvcc";
+
+  const size_t tombstones_before = GetMetrics().db_stats[0].mvcc_tombstones;
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"del", "k"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0) << "the applied DEL must actually remove the key";
+
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(tomb->Mvcc(), stored->Mvcc())
+      << "the tombstone's Mvcc() floors to S's own, not the author's stale mvcc verbatim";
+  EXPECT_EQ(tomb->origin_hash, stored->origin_hash - 1)
+      << "and lands one origin_hash below S -- PerformDeletionAtomic's captured prev_stamp is "
+         "what makes S available here, since the placeholder has already overwritten the slot "
+         "by the time this commits";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, tombstones_before + 1)
+      << "mvcc_tombstones must advance by exactly one for the floored tombstone -- "
+         "SetExistingMvcc keys its accounting off the NEW stamp's bit, which is still set";
 }
 
 TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {

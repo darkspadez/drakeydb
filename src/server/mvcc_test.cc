@@ -166,6 +166,96 @@ TEST(MvccStamp, ATombstoneComparesByItsStampNotItsBit) {
   EXPECT_EQ(tomb.DeadlineMs(600'000), kTombMs + 600'000);
 }
 
+// ---------------------------------------------------------------------------
+// FloorAppliedStamp (P4-4 Task A5): the "just-below" floor for an applied write whose author
+// stamp is older than the key's own stored stamp. See mvcc.h's declaration for the full why.
+// ---------------------------------------------------------------------------
+
+TEST(FloorAppliedStampTest, IncomingNewerThanStoredCommitsVerbatim) {
+  const MvccStamp stored{0x2000, 0xAAAA};
+  const MvccStamp incoming{0x3000, 0xBBBB};
+  EXPECT_EQ(FloorAppliedStamp(stored, incoming), incoming);
+}
+
+TEST(FloorAppliedStampTest, ExactTieCommitsVerbatim) {
+  const MvccStamp stored{0x2000, 0xAAAA};
+  const MvccStamp incoming{0x2000, 0xAAAA};
+  EXPECT_EQ(FloorAppliedStamp(stored, incoming), incoming)
+      << "FloorAppliedStamp's own contract is 'incoming >= stored commits verbatim' -- a tie "
+         "is unchanged, not floored, and idempotent (re-committing the same stamp is a no-op)";
+}
+
+TEST(FloorAppliedStampTest, IncomingOlderFloorsToOneOriginBelowStored) {
+  const MvccStamp stored{0x5000, 0xAAAA};
+  const MvccStamp incoming{0x1000, 0xFFFF};  // Mvcc() strictly less -> older, regardless of origin
+  const MvccStamp got = FloorAppliedStamp(stored, incoming);
+  EXPECT_EQ(got.Mvcc(), stored.Mvcc());
+  EXPECT_EQ(got.origin_hash, stored.origin_hash - 1);
+  EXPECT_FALSE(got.IsTombstone());
+}
+
+TEST(FloorAppliedStampTest, StoredOriginZeroFloorsToOneMvccTickBelowStored) {
+  const MvccStamp stored{0x5000, /*origin_hash=*/0};
+  const MvccStamp incoming{0x1000, 0xFFFF};
+  const MvccStamp got = FloorAppliedStamp(stored, incoming);
+  EXPECT_EQ(got.Mvcc(), stored.Mvcc() - 1);
+  EXPECT_EQ(got.origin_hash, UINT64_MAX);
+  EXPECT_FALSE(got.IsTombstone());
+}
+
+TEST(FloorAppliedStampTest, FreshStoredSlotCommitsIncomingVerbatim) {
+  const MvccStamp incoming{0x1000, 0xABCD};
+  EXPECT_EQ(FloorAppliedStamp(MvccStamp{}, incoming), incoming)
+      << "a fresh {0,0} slot has no real prior stamp to floor against";
+}
+
+TEST(FloorAppliedStampTest, UncommittedPlaceholderStoredCommitsIncomingVerbatim) {
+  // PerformDeletionAtomic's own synchronous tombstone placeholder (db_slice.cc).
+  const MvccStamp placeholder{MvccClock::kTombstoneBit, 0};
+  const MvccStamp incoming{0x1000, 0xABCD};
+  EXPECT_EQ(FloorAppliedStamp(placeholder, incoming), incoming)
+      << "Mvcc() masks bit 63 -- the placeholder's Mvcc() is 0, same as a genuinely fresh slot";
+}
+
+TEST(FloorAppliedStampTest, StoredTombstoneLiveIncomingOlderFloorsWithoutTombstoneBit) {
+  const MvccStamp stored = MvccStamp{0x5000, 0xAAAA}.AsTombstone();
+  const MvccStamp incoming{0x1000, 0xFFFF};  // live, not a tombstone
+  const MvccStamp got = FloorAppliedStamp(stored, incoming);
+  EXPECT_FALSE(got.IsTombstone())
+      << "the floor must never inherit stored's own tombstone bit -- only the NEW operation's";
+  EXPECT_EQ(got.Mvcc(), stored.Mvcc());
+  EXPECT_EQ(got.origin_hash, stored.origin_hash - 1);
+}
+
+TEST(FloorAppliedStampTest, LiveStoredTombstoneIncomingOlderFloorsWithTombstoneBit) {
+  const MvccStamp stored{0x5000, 0xAAAA};                              // live
+  const MvccStamp incoming = MvccStamp{0x1000, 0xFFFF}.AsTombstone();  // older, but a delete
+  const MvccStamp got = FloorAppliedStamp(stored, incoming);
+  EXPECT_TRUE(got.IsTombstone()) << "the NEW operation's tombstone bit must survive the floor";
+  EXPECT_EQ(got.Mvcc(), stored.Mvcc());
+  EXPECT_EQ(got.origin_hash, stored.origin_hash - 1);
+}
+
+TEST(FloorAppliedStampTest, FlooredStampOrdersBetweenStoredAndEveryPreviouslyRejectedStamp) {
+  const MvccStamp stored{0x5000, 100};
+  const MvccStamp incoming{0x1000, 7};
+  const MvccStamp floored = FloorAppliedStamp(stored, incoming);
+
+  EXPECT_TRUE(floored < stored) << "a clean copy stamped exactly S must still beat the floor on "
+                                   "the next merge, or RMW divergence never heals";
+
+  // Every stamp {stored.Mvcc(), o} with o < floored.origin_hash was ALREADY rejected against
+  // `stored` before this write landed (equal Mvcc(), lower origin loses) -- the floor must still
+  // beat every one of them, or a previously-dropped stale write starts winning once this RMW's
+  // floor replaces `stored` as the key's live stamp.
+  const MvccStamp already_rejected{stored.Mvcc(), floored.origin_hash - 1};
+  EXPECT_TRUE(already_rejected < floored);
+
+  // Every stamp with a strictly smaller Mvcc() must also lose to the floor.
+  const MvccStamp older_ms{stored.Mvcc() - 1, UINT64_MAX};
+  EXPECT_TRUE(older_ms < floored);
+}
+
 TEST(NodeUuidHashTest, StableAndDistinct) {
   const string a = "6f1c4c3e-0000-4000-8000-000000000001";
   const string b = "6f1c4c3e-0000-4000-8000-000000000002";
@@ -199,7 +289,9 @@ struct Recorder {
   std::vector<Write> writes;
 
   MvccStamper::CommitFn Fn() {
-    return [this](DbIndex db, std::string_view key, const MvccStamp& st) {
+    // drakeydb: P4-4 Task A5 -- CommitFn grew a 4th argument (the arm's captured prev_stamp);
+    // unused by every test that only cares about the committed stamp itself.
+    return [this](DbIndex db, std::string_view key, const MvccStamp& st, const MvccStamp&) {
       writes.push_back(Write{db, std::string(key), st});
     };
   }
@@ -254,8 +346,9 @@ TEST(MvccStamperTest, CommitMarksOnlyTombstoneArms) {
   s->Arm(0, "live");
   s->ArmTombstone(0, "dead");
   std::map<std::string, MvccStamp> got;
-  s->Commit(0x5000, 0,
-            [&](DbIndex, std::string_view k, const MvccStamp& st) { got[std::string(k)] = st; });
+  s->Commit(0x5000, 0, [&](DbIndex, std::string_view k, const MvccStamp& st, const MvccStamp&) {
+    got[std::string(k)] = st;
+  });
   ASSERT_EQ(got.size(), 2u);
   EXPECT_FALSE(got["live"].IsTombstone());
   EXPECT_TRUE(got["dead"].IsTombstone());
@@ -536,9 +629,11 @@ TEST(MvccStamperTest, CommitOwnTombstoneIsScopedToTheDbIndex) {
 TEST(MvccStamperTest, CommitDepthRecoversAfterCommitFnThrows) {
   MvccStamper* s = FreshStamper();
   s->Arm(0, "k");
-  EXPECT_THROW(
-      s->Commit(1, 0, [](DbIndex, std::string_view, const MvccStamp&) { throw std::bad_alloc{}; }),
-      std::bad_alloc);
+  EXPECT_THROW(s->Commit(1, 0,
+                         [](DbIndex, std::string_view, const MvccStamp&, const MvccStamp&) {
+                           throw std::bad_alloc{};
+                         }),
+               std::bad_alloc);
 
   // If commit_depth_ had leaked at 1 above, this would DCHECK-abort the whole test binary in a
   // debug build -- there is no way to observe a leaked guard other than the process not dying.
@@ -684,21 +779,24 @@ TEST(MultimasterLwwDeathTest, IncomingStampUnregisteredOriginDies) {
 TEST(MvccStamperDeathTest, ReentrantCommitDies) {
   MvccStamper* s = FreshStamper();
   s->Arm(0, "k");
-  EXPECT_DEBUG_DEATH(s->Commit(1, 0,
-                               [s](DbIndex, std::string_view, const MvccStamp&) {
-                                 s->Commit(2, 0,
-                                           [](DbIndex, std::string_view, const MvccStamp&) {});
-                               }),
-                     "re-entrantly");
+  EXPECT_DEBUG_DEATH(
+      s->Commit(1, 0,
+                [s](DbIndex, std::string_view, const MvccStamp&, const MvccStamp&) {
+                  s->Commit(2, 0,
+                            [](DbIndex, std::string_view, const MvccStamp&, const MvccStamp&) {});
+                }),
+      "re-entrantly");
 }
 
 // The hazard Commit()'s own doc comment names first: "fn must not call Arm()".
 TEST(MvccStamperDeathTest, ArmFromCommitFnDies) {
   MvccStamper* s = FreshStamper();
   s->Arm(0, "k");
-  EXPECT_DEBUG_DEATH(
-      s->Commit(1, 0, [s](DbIndex, std::string_view, const MvccStamp&) { s->Arm(0, "reentrant"); }),
-      "mid-iteration");
+  EXPECT_DEBUG_DEATH(s->Commit(1, 0,
+                               [s](DbIndex, std::string_view, const MvccStamp&, const MvccStamp&) {
+                                 s->Arm(0, "reentrant");
+                               }),
+                     "mid-iteration");
 }
 #endif  // NDEBUG
 

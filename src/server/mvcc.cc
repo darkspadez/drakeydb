@@ -20,6 +20,22 @@ uint64_t NodeUuidHash(std::string_view uuid) {
   return XXH64(uuid.data(), uuid.size(), kOriginHashSeed);
 }
 
+// drakeydb: P4-4 Task A5 -- see the declaration (mvcc.h) for the full why. `stored.Mvcc() == 0`
+// covers both a genuinely fresh {0,0} slot and an uncommitted placeholder (Mvcc() masks bit 63,
+// so PerformDeletionAtomic's {kTombstoneBit, 0} lands here too): neither carries a real prior
+// stamp to floor against. `!(incoming < stored)` covers both "incoming is strictly newer" and an
+// exact tie -- both commit verbatim, unchanged from before this task.
+MvccStamp FloorAppliedStamp(const MvccStamp& stored, const MvccStamp& incoming) {
+  if (stored.Mvcc() == 0 || !(incoming < stored))
+    return incoming;
+  // incoming < stored: land one tick below `stored` instead of rewinding to `incoming` verbatim.
+  // Never inherit stored's own tombstone bit -- only the NEW operation's (incoming's).
+  const uint64_t tomb_bit = incoming.IsTombstone() ? MvccClock::kTombstoneBit : 0;
+  if (stored.origin_hash == 0)
+    return MvccStamp{(stored.Mvcc() - 1) | tomb_bit, UINT64_MAX};
+  return MvccStamp{stored.Mvcc() | tomb_bit, stored.origin_hash - 1};
+}
+
 MvccStamper* MvccStamper::tlocal() {
   static thread_local MvccStamper stamper;
   return &stamper;
@@ -66,13 +82,15 @@ void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
 // with a default) so every existing Arm() call site -- and its "arms a LIVE key" reading -- stays
 // unambiguous at the call site, matching ArmTombstone's own single caller being the one place that
 // actually means "arm a deletion".
-void MvccStamper::ArmTombstone(DbIndex db_index, std::string_view key) {
+void MvccStamper::ArmTombstone(DbIndex db_index, std::string_view key,
+                               const MvccStamp& prev_stamp) {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn armed a tombstone -- Commit() is mid-iteration over "
                                  "armed_/arena_, both of which this call can reallocate, "
                                  "corrupting that iteration";
   const uint32_t off = static_cast<uint32_t>(arena_.size());
   arena_.append(key);
-  armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/true});
+  armed_.push_back(
+      Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/true, prev_stamp});
 }
 
 // drakeydb: Phase 4, review wave 2 (F1, CRITICAL) -- erases EVERY arm matching (db_index, key),
@@ -146,7 +164,7 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
     arena_.clear();  // keeps capacity
   };
   for (const Armed& a : armed_)
-    fn(a.db_index, ArmedKey(a), a.tombstone ? tomb_stamp : stamp);
+    fn(a.db_index, ArmedKey(a), a.tombstone ? tomb_stamp : stamp, a.prev_stamp);
 }
 
 // drakeydb: P4-3 Task 11, review ruling I2 -- see the declaration (mvcc.h) for the contract.
@@ -173,7 +191,10 @@ bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uin
         --commit_depth_;
         armed_.erase(it);
       };
-      fn(db_index, ArmedKey(*it), stamp);
+      // drakeydb: P4-4 Task A5 -- passes the arm's own prev_stamp through, matching Commit()'s own
+      // call above; harmless here since this stamp is always a fresh self-mint (never an applied
+      // write), so RecordExpiryBlocking's fn (tx_base.cc) ignores this argument entirely.
+      fn(db_index, ArmedKey(*it), stamp, it->prev_stamp);
       return true;
     }
   }

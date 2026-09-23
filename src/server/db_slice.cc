@@ -3262,8 +3262,16 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
       // be -- this is a bookkeeping marker, exactly as MvccStamp{} is for EnsureMvcc's plain-write
       // placeholder, not a delete stamp. If the real commit never arrives, EndOfWriteEpoch's
       // rollback (review fix I3) erases this placeholder instead, generically.
+      //
+      // drakeydb: P4-4 Task A5 -- capture this key's PRE-delete stamp (`S`) BEFORE the placeholder
+      // write below overwrites the slot: journal::RecordEntry's Commit() call floors an applied
+      // (replicated) delete's author stamp against `S` if that author's stamp is older, and by
+      // the time that Commit() runs the slot no longer holds `S` -- only this placeholder does.
+      // GetMvcc always finds a slot here: the dense invariant guarantees a live prime key (the
+      // only kind PerformDeletionAtomic ever deletes) already owns one.
+      const MvccStamp prev_stamp = GetMvcc(table->index, del_it.key()).value_or(MvccStamp{});
       SetTombstone(table->index, del_it.key(), MvccStamp{MvccClock::kTombstoneBit, 0});
-      MvccStamper::tlocal()->ArmTombstone(table->index, del_it.key());
+      MvccStamper::tlocal()->ArmTombstone(table->index, del_it.key(), prev_stamp);
     } else {
       if (earns_tombstone)
         ++table->stats.mvcc_tombstones_dropped;  // at the cap: degrade to erase, visibly

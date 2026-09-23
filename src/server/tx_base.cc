@@ -141,7 +141,10 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
   // for the two cases' regression coverage.
   MvccStamper::tlocal()->CommitOwnTombstone(
       db_cntx.db_index, key, db_cntx.time_now_ms,
-      [](DbIndex db, string_view k, const MvccStamp& st) {
+      // drakeydb: P4-4 Task A5 -- CommitFn's 4th argument (the arm's captured pre-delete stamp)
+      // is intentionally unused here: an expiry's tombstone is always a freshly minted self
+      // stamp (D-10, see the comment above), never floored against anything.
+      [](DbIndex db, string_view k, const MvccStamp& st, const MvccStamp&) {
         namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
       });
 
