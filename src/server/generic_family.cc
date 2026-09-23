@@ -38,6 +38,7 @@ extern "C" {
 #include "server/family_utils.h"
 #include "server/hset_family.h"
 #include "server/journal/journal.h"
+#include "server/multimaster_lww.h"
 #include "server/namespaces.h"
 #include "server/rdb_extensions.h"
 #include "server/rdb_load.h"
@@ -1313,10 +1314,29 @@ OpResult<uint32_t> OpDelV2(const OpArgs& op_args, const ShardArgs& keys, bool as
   bool journal_enabled = op_args.shard->journal();
   auto& db_slice = op_args.GetDbSlice();
 
+  // drakeydb: P4-4 -- DEL is classified kMultiKeySelfGuarded (multimaster_lww.h), same reason as
+  // MSET (OpMSet, string_family.cc): GetShardArgs hands this Op function a bare list of keys, so
+  // the generic single-key veto (Transaction::ShouldDropForLww) deliberately never classifies it,
+  // and the per-key compare has to happen right here, under this shard's own key locks.
+  const DbContext& db_cntx = op_args.db_cntx;
+  const bool guarded = LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc);
+  const std::optional<MvccStamp> incoming =
+      guarded ? IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx) : std::nullopt;
+  const bool split = guarded && incoming.has_value();
+
   uint32_t deleted_cnt = 0;
   absl::InlinedVector<std::string_view, 5> journal_args;
 
   for (string_view key : keys) {
+    // drakeydb: P4-4 -- the skip must precede FindMutable: FindMutable can lazily expire a stale
+    // key (arming its post_updater) or otherwise touch a slot this replicated DEL has no right to
+    // touch once its own author stamp has lost the LWW compare against what's stored (or
+    // tombstoned) for `key`.
+    if (split && LwwShouldDropKey(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
+      NoteLwwDrop("DEL", key);
+      continue;
+    }
+
     auto it = db_slice.FindMutable(op_args.db_cntx, key);
     it.post_updater.Run();  // Run before Del
 

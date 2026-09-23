@@ -3309,7 +3309,8 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
     EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "INCR must never count as an LWW drop";
   }
 
-  {  // DEL -- kMultiKeySelfGuarded; A8's own guard does not exist yet.
+  {  // DEL -- kMultiKeySelfGuarded; its own per-key guard (Task A8) now drops a stale key entirely
+     // instead of applying-and-flooring it.
     SCOPED_TRACE("DEL");
     ASSERT_EQ(Run({"set", "sj_del", "local"}), "OK");
     auto before = StampOf("sj_del");
@@ -3318,17 +3319,18 @@ TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByThisTask) {
     const uint64_t pre_dropped = TotalLwwDropped();
     auto res = ApplyReplicatedCommand({"del", "sj_del"}, kPeerIdx, kStaleMvcc, true);
     EXPECT_EQ(res, facade::DispatchResult::OK);
-    EXPECT_EQ(Run({"exists", "sj_del"}).GetInt(), 0)
-        << "before A8 adds DEL's own per-key guard, a stale peer DEL must still apply";
-    auto tomb = StampOf("sj_del");
-    ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
-    EXPECT_TRUE(tomb->IsTombstone());
-    EXPECT_EQ(tomb->Mvcc(), before->Mvcc())
-        << "the applied DEL actually ran (the key is gone above), but its tombstone's stamp is "
-           "floored to just-below S -- never the incoming author's stale mvcc verbatim";
-    EXPECT_EQ(tomb->origin_hash, before->origin_hash - 1);
-    EXPECT_EQ(TotalLwwDropped(), pre_dropped)
-        << "this generic single-key veto must never classify or count DEL";
+    EXPECT_EQ(Run({"exists", "sj_del"}).GetInt(), 1)
+        << "DEL's own per-key guard must drop a key whose incoming stamp is older than that key's "
+           "own stored stamp -- this generic single-key veto never even classifies DEL as a "
+           "candidate, so this drop can only be A8's own logic inside OpDelV2";
+    EXPECT_EQ(Run({"get", "sj_del"}), "local");
+    auto after = StampOf("sj_del");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(*after, *before) << "a dropped key is never armed, so its stamp is untouched -- "
+                                  "unlike an applied delete, it is not even floored";
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1)
+        << "the key is stale against its own stored stamp and must be counted exactly once";
+    EXPECT_EQ(TotalUnstampedWrites(), 0u);
   }
 
   {  // MSET -- kMultiKeySelfGuarded; its own per-pair guard (Task A7) now drops a stale pair
@@ -3803,6 +3805,334 @@ TEST_F(MvccStoreTest, MsetUnstampedIncomingAppliesAllPairsEvenWithGuardOn) {
          "prior stamp, never a no-op and never the incoming (nonexistent) mvcc verbatim";
   EXPECT_EQ(k2_after->origin_hash, peer_hash)
       << "the freshly-minted stamp is attributed to the LINK's peer origin, not this node's own";
+}
+
+// ---------------------------------------------------------------------------
+// P4-4 Task A8: OpDelV2's own per-key LWW guard (generic_family.cc). DEL is classified
+// kMultiKeySelfGuarded (multimaster_lww.h) for the same reason MSET is (Task A7, above): its Op
+// function receives a bare list of keys, so the generic single-key veto (Task A3) never classifies
+// it -- the per-key compare has to live inside OpDelV2 itself, under the shard's own key locks,
+// skipping a stale key BEFORE FindMutable ever touches it.
+// ---------------------------------------------------------------------------
+
+// drakeydb: P4-4 Task A8 -- the headline partial-apply case: k1's own stored stamp is OLDER than
+// the incoming DEL's author stamp (so it survives, and its tombstone commits the author's stamp
+// VERBATIM -- the guard already guarantees incoming > stored for anything that gets this far, so
+// FloorAppliedStamp's floor case, which only fires when incoming < stored, never applies), while
+// k2's own stored stamp is NEWER than incoming (so it is dropped, and stays completely untouched --
+// never even looked up mutably). Exactly one key must survive, and the journal must carry only its
+// own name, never a two-key DEL.
+//
+// Falsified by moving the LwwShouldDropKey skip to AFTER FindMutable/post_updater.Run() (the exact
+// shape this task's brief warns against): verbatim output captured below.
+TEST_F(MvccStoreTest, DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesTheSurvivor) {
+  constexpr uint32_t kPeerIdx = 70;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000070");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("del_lww_partial_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("del_lww_partial_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid) << "both keys must land on the SAME shard, or this test "
+                                           "proves nothing about a single shard's own journal";
+
+  // k1 gets an OLD stamp, planted directly via a replicated apply so its exact value is under this
+  // test's own control rather than tied to the local wall clock.
+  constexpr uint64_t kOldMvcc = 0x1000ULL;
+  auto plant = ApplyReplicatedCommand({"set", k1, "v1"}, kPeerIdx, kOldMvcc, /*lww_guard=*/false);
+  ASSERT_EQ(plant, facade::DispatchResult::OK);
+  auto k1_before = StampOf(k1);
+  ASSERT_TRUE(k1_before.has_value());
+  ASSERT_EQ(*k1_before, (MvccStamp{kOldMvcc, peer_hash}))
+      << "sanity: a fresh key's applied stamp commits verbatim";
+
+  // k2 gets a real, freshly-minted LOCAL stamp -- far newer than kOldMvcc and, by construction
+  // below, also newer than the DEL's own incoming mvcc.
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+  const uint64_t incoming_mvcc = kOldMvcc + 1;
+  ASSERT_GT(k2_before->Mvcc(), incoming_mvcc)
+      << "sanity: k2's own stamp must be strictly newer than the DEL's incoming mvcc";
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", k1, k2}, kPeerIdx, incoming_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", k1}).GetInt(), 0) << "k1's own stamp is older than the incoming DEL";
+  auto k1_tomb = StampOf(k1);
+  ASSERT_TRUE(k1_tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+  EXPECT_TRUE(k1_tomb->IsTombstone());
+  EXPECT_EQ(*k1_tomb, (MvccStamp{incoming_mvcc, peer_hash}).AsTombstone())
+      << "the guard already guarantees incoming > stored for anything that survives it, so the "
+         "committed tombstone is the author's stamp VERBATIM, never floored";
+
+  EXPECT_EQ(Run({"exists", k2}).GetInt(), 1) << "k2's own stamp is newer than the incoming DEL";
+  EXPECT_EQ(Run({"get", k2}), "local2");
+  auto k2_after = StampOf(k2);
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_EQ(*k2_after, *k2_before)
+      << "a dropped key is never armed -- its stamp must stay exactly what it was, not merely "
+         "floored";
+
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1) << "exactly one journal entry for this DEL";
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 2u);
+  EXPECT_EQ(args[0], "DEL");
+  EXPECT_EQ(args[1], k1);
+}
+
+// drakeydb: P4-4 Task A8 -- every key stale: nothing may change, nothing may journal, and F5 (a
+// dropped write must never advance the wire's LSN) must hold -- same invariant, same two witnesses
+// (LSN + a live recording consumer), as MsetAllPairsStaleJournalsNothingAndLeavesLsnUnchanged (A7,
+// above) proves for MSET; OpDelV2's trailing journal block already cannot call
+// journal::ClearBuffer() here (a fully-dropped key never increments deleted_cnt, so deleted_cnt
+// stays 0 alongside the empty journal_args), and this test is the proof that stays true.
+TEST_F(MvccStoreTest, DelLwwAllKeysStaleJournalsNothingAndLeavesLsnUnchanged) {
+  constexpr uint32_t kPeerIdx = 71;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000071");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("del_lww_all_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("del_lww_all_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k1, "local1"}), "OK");
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+  auto k1_before = StampOf(k1);
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k1_before.has_value());
+  ASSERT_TRUE(k2_before.has_value());
+  const uint64_t min_mvcc = std::min(k1_before->Mvcc(), k2_before->Mvcc());
+  ASSERT_GT(min_mvcc, 1u);
+  const uint64_t incoming_mvcc = min_mvcc - 1;  // strictly older than BOTH stored stamps.
+
+  LSN lsn_before = 0;
+  shard_set->Await(sid, [&] { lsn_before = journal::GetLsn(); });
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", k1, k2}, kPeerIdx, incoming_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", k1}).GetInt(), 1);
+  EXPECT_EQ(Run({"exists", k2}).GetInt(), 1);
+  EXPECT_EQ(StampOf(k1), k1_before);
+  EXPECT_EQ(StampOf(k2), k2_before);
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 2) << "both keys are individually stale";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  LSN lsn_after = 0;
+  shard_set->Await(sid, [&] { lsn_after = journal::GetLsn(); });
+  EXPECT_EQ(lsn_after, lsn_before)
+      << "an entirely-dropped DEL must never advance the journal's LSN -- it deleted nothing, so "
+         "nothing may be recorded, not even an empty marker";
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), pre_entries)
+      << "no COMMAND journal entry -- empty or otherwise -- may be delivered to a live consumer "
+         "for a fully-dropped DEL";
+}
+
+// drakeydb: P4-4 Task A8 -- the guard bit itself gates the split: with lww_guard=false, OpDelV2
+// must take the byte-identical unguarded path regardless of how stale the incoming mvcc is --
+// arrival order wins, exactly as it did before this task existed. Same shape as A7's
+// MsetGuardOffAppliesArrivalOrderRegardlessOfStamps for MSET.
+TEST_F(MvccStoreTest, DelLwwGuardOffAppliesArrivalOrderRegardlessOfStamps) {
+  constexpr uint32_t kPeerIdx = 72;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000072");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("del_lww_off_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("del_lww_off_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k1, "local1"}), "OK");
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+  auto k1_before = StampOf(k1);
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k1_before.has_value());
+  ASSERT_TRUE(k2_before.has_value());
+  const uint64_t min_mvcc = std::min(k1_before->Mvcc(), k2_before->Mvcc());
+  ASSERT_GT(min_mvcc, 1u);
+  const uint64_t stale_mvcc = min_mvcc - 1;  // would drop both if the guard were active.
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", k1, k2}, kPeerIdx, stale_mvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", k1}).GetInt(), 0)
+      << "guard off means arrival order wins regardless of stamps";
+  EXPECT_EQ(Run({"exists", k2}).GetInt(), 0);
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped)
+      << "no per-key compare may run at all with the guard off";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1);
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 3u) << "byte-identical unguarded path: the full verbatim command";
+  EXPECT_EQ(args[0], "DEL");
+  EXPECT_EQ(args[1], k1);
+  EXPECT_EQ(args[2], k2);
+}
+
+// drakeydb: P4-4 Task A8 -- F1 (multimaster_lww.h): mvcc == 0 must never be guarded, even with the
+// guard bit itself on -- a classic Redis/KeyDB link never carries mvcc at all. LwwGuardActive's own
+// mvcc != 0 requirement already makes `guarded` false before OpDelV2 ever calls IncomingStamp, so
+// the per-key compare cannot run regardless of what is (or isn't) stored for either key. Same shape
+// as A7's MsetUnstampedIncomingAppliesAllPairsEvenWithGuardOn for MSET.
+TEST_F(MvccStoreTest, DelLwwUnstampedIncomingAppliesAllKeysEvenWithGuardOn) {
+  constexpr uint32_t kPeerIdx = 73;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000073");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("del_lww_zero_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("del_lww_zero_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k1, "local1"}), "OK");
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", k1, k2}, kPeerIdx, /*mvcc=*/0, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", k1}).GetInt(), 0)
+      << "mvcc == 0 must fail open even with the guard bit on";
+  EXPECT_EQ(Run({"exists", k2}).GetInt(), 0);
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "an unstamped apply must never count as a drop";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 Task A8 -- an absent key can still carry a TOMBSTONE in the mvcc side table
+// (DbSlice::GetMvcc looks it up directly, independent of the prime table -- db_slice.cc): a
+// replicated DEL of that same key must still be LWW-compared against the tombstone, exactly as it
+// would be against a live value, never treated as "nothing to compare against" just because
+// FindMutable would find it absent either way.
+TEST_F(MvccStoreTest, DelLwwDropsAgainstAnAbsentKeysNewerTombstone) {
+  const std::string key = FindKeyOnShard("del_lww_tomb_new_", 0, shard_set->size());
+  ASSERT_EQ(Run({"set", key, "v"}), "OK");
+  ASSERT_EQ(Run({"del", key}).GetInt(), 1);
+  auto tomb = StampOf(key);
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone()) << "sanity: key must be a tombstone, not fully erased";
+
+  constexpr uint32_t kPeerIdx = 74;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000074");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  ASSERT_GT(tomb->Mvcc(), kStaleMvcc) << "sanity: T must be newer than the stale incoming mvcc";
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", key}, kPeerIdx, kStaleMvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", key}).GetInt(), 0);
+  auto tomb_after = StampOf(key);
+  ASSERT_TRUE(tomb_after.has_value());
+  EXPECT_EQ(*tomb_after, *tomb)
+      << "a dropped key's existing tombstone must stay exactly what it was -- the guard skips it "
+         "before FindMutable ever touches it";
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 Task A8 -- the not-dropped sibling of the test above: an incoming DEL strictly
+// NEWER than the key's own existing tombstone must not be classified as a drop at all -- and
+// whatever the pre-existing (pre-A8) path already does for a DEL of an absent key is unchanged:
+// FindMutable finds nothing, so it is still a silent no-op, never journaled, never counted.
+TEST_F(MvccStoreTest, DelLwwAppliesAgainstAnAbsentKeysOlderTombstone) {
+  const std::string key = FindKeyOnShard("del_lww_tomb_old_", 0, shard_set->size());
+  ASSERT_EQ(Run({"set", key, "v"}), "OK");
+  ASSERT_EQ(Run({"del", key}).GetInt(), 1);
+  auto tomb = StampOf(key);
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone());
+
+  constexpr uint32_t kPeerIdx = 75;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000075");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+  const uint64_t incoming_mvcc = tomb->Mvcc() + 1;  // strictly newer than the tombstone.
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", key}, kPeerIdx, incoming_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK)
+      << "not dropped: incoming is strictly newer than the stored tombstone";
+
+  EXPECT_EQ(Run({"exists", key}).GetInt(), 0)
+      << "the key was already absent -- a not-dropped DEL of an absent key is still a no-op, "
+         "exactly as it always has been (FindMutable finds nothing to delete)";
+  auto tomb_after = StampOf(key);
+  ASSERT_TRUE(tomb_after.has_value());
+  EXPECT_EQ(*tomb_after, *tomb)
+      << "nothing was armed -- the pre-existing tombstone is untouched, the same as any other DEL "
+         "of a nonexistent key";
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped)
+      << "this key must never be counted as a drop -- the guard let it through";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
 }
 
 // ---------------------------------------------------------------------------
