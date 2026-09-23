@@ -5364,7 +5364,7 @@ namespace {
 constexpr std::string_view kKnownUnguardedAutoJournaled[] = {
     "APPEND",
     "BF.ADD",
-    "BF.LOADCHUNK",  // concern: cursor==1 overwrites an existing key wholesale -- see report
+    "BF.LOADCHUNK",  // concern: cursor==1 overwrites an existing key wholesale
     "BF.MADD",
     "BF.RESERVE",
     "BITFIELD",
@@ -5379,7 +5379,7 @@ constexpr std::string_view kKnownUnguardedAutoJournaled[] = {
     "CMS.INCRBY",
     "CMS.INITBYDIM",
     "CMS.INITBYPROB",
-    "CMS.MERGE",  // concern: resets dest then writes the weighted sum of sources -- see report
+    "CMS.MERGE",  // concern: resets dest then writes the weighted sum of sources
     "DECR",
     "DECRBY",
     "DELEX",  // SETNX-class trap: predicate compares the STORED VALUE (IFEQ/IFNE/IFDEQ/IFDNE)
@@ -5413,7 +5413,7 @@ constexpr std::string_view kKnownUnguardedAutoJournaled[] = {
     "JSON.MERGE",
     "JSON.NUMINCRBY",
     "JSON.NUMMULTBY",
-    "JSON.SET",  // concern: a "$" (root) path replaces the whole document -- see report
+    "JSON.SET",  // concern: a "$" (root) path replaces the whole document
     "JSON.STRAPPEND",
     "JSON.TOGGLE",
     "LINSERT",
