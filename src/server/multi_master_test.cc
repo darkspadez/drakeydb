@@ -3448,12 +3448,13 @@ class MsetLwwJournalConsumer : public journal::JournalConsumerInterface {
 // Metrics aggregation path entirely.
 //
 // Falsifying: commenting out server_state.cc's `ADD(multimaster_lww_dropped);` line (so
-// Stats::Add no longer sums this field across threads) makes the parsed INFO value come back
-// short of expect_total (0, since this test's own baseline is a delta from a fresh drop count, and
-// a freshly-added field with no ADD line is simply left as whichever thread's Stats object the
-// aggregation happened to seed `result` from) while `TotalLwwDropped()` -- which reads every
-// thread directly -- still correctly reports pre_dropped + 2, isolating the break to the
-// aggregation path rather than the guard itself.
+// Stats::Add no longer sums this field across threads) makes the parsed INFO value come back as
+// exactly 0, not merely short of expect_total: with no ADD line, every partial's own
+// coordinator_stats.multimaster_lww_dropped stays at its default-constructed 0 (InitFromThread's
+// own coordinator_stats.Add(ss->stats) call never copies the per-thread value in either), so
+// EVERY thread contributes 0 to the merge, not just one. `TotalLwwDropped()` -- which reads every
+// thread directly, bypassing Stats::Add entirely -- still correctly reports pre_dropped + 2,
+// isolating the break to the aggregation path rather than the guard itself.
 TEST_F(MvccStoreTest, InfoReplicationShowsLwwDroppedSummedAcrossShards) {
   const unsigned num_shards = shard_set->size();
   ASSERT_GT(num_shards, 1u) << "this test's entire point is proving cross-THREAD aggregation -- "

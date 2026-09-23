@@ -384,8 +384,9 @@ class Transaction {
   // instead inherit it directly from their parent (see the parent/shard_id/slot_id constructor)
   // since they never go through PrepareTransaction.
   // drakeydb: P4-4 -- `lww_guard` (the connection's repl_lww_guard) has no default: every caller
-  // must decide explicitly rather than silently defaulting to unguarded or guarded. Behaviour-
-  // free until task A3 reads IsLwwGuarded() below.
+  // must decide explicitly rather than silently defaulting to unguarded or guarded. Read back by
+  // IsLwwGuarded() below, which ShouldDropForLww (transaction.cc) consults for every guarded
+  // single-key command's veto.
   void SetReplOrigin(uint32_t origin_idx, uint64_t mvcc, bool lww_guard) {
     repl_origin_idx_ = origin_idx;
     repl_mvcc_ = mvcc;
@@ -393,9 +394,9 @@ class Transaction {
   }
 
   // drakeydb: P4-4 -- true only on a guarded peer link (repl_lww_guard_) AND a non-zero author
-  // stamp (F1: a zero mvcc -- classic Redis/KeyDB link, or a DFLY link to a non-active node --
-  // is never guarded). Delegates to A1's single predicate (multimaster_lww.h) rather than
-  // re-implementing the rule; nothing calls this yet (the veto is task A3).
+  // stamp (a zero mvcc -- classic Redis/KeyDB link, or a DFLY link to a non-active node -- is
+  // never guarded). Delegates to multimaster_lww.h's single predicate rather than re-implementing
+  // the rule; consulted by ShouldDropForLww (transaction.cc, below) for every kSingleKey command.
   bool IsLwwGuarded() const {
     return LwwGuardActive(repl_lww_guard_, repl_mvcc_);
   }

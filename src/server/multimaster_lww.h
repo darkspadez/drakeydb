@@ -27,9 +27,11 @@ ABSL_DECLARE_FLAG(bool, multi_master_stream_lww);
 namespace dfly {
 
 // drakeydb: P4-4 -- the streaming LWW guard's pure decision module. FLAGS_multi_master_stream_lww
-// is read once per peer link, at flow setup, by DflyShardReplica's constructor (replica.cc);
-// LwwGuardActive backs Transaction::IsLwwGuarded() (transaction.h). Nothing yet acts on the
-// result -- the veto is task A3.
+// is read once per peer link, at flow setup, by DflyShardReplica's constructor (replica.cc).
+// LwwGuardActive has two callers: it backs Transaction::IsLwwGuarded() (transaction.h), which
+// Transaction::ShouldDropForLww (transaction.cc) consults for every kSingleKey command's veto;
+// and OpMSet/OpDelV2 (string_family.cc/generic_family.cc) call it directly for their own
+// self-guarded per-key veto (kMultiKeySelfGuarded, below).
 
 // A journaled command's guard classification. kUnguarded commands are never LWW-compared; a
 // kSingleKey command's OWN journaled write is compared under the key's lock; a
