@@ -136,8 +136,10 @@ wasteful, steady state, not a fault that should force a resync.
 `MSET`/`DEL` (multi-key, self-guarded — see the per-key split below). Every other journaled name is
 unguarded; an unrecognized name fails open, never closed. The master already normalizes several
 client-facing commands onto one of those names before journaling — `SETEX`/`SET ... EX` → `SET`,
-`UNLINK` → `DEL`, the `EXPIRE` family → `PEXPIREAT`/`DEL` (it only ever sets or clears a TTL, never
-removes one, so it never journals `PERSIST`), `MSETNX` → `MSET`, and `GETEX`'s own expiry path and
+`UNLINK` → `DEL`, the `EXPIRE` family → `PEXPIREAT`/`DEL` (it sets a TTL, or deletes the key
+outright when the given expiry is already in the past — it never just removes a TTL while leaving
+the key alive; that is `PERSIST`'s own separate top-level command, which the `EXPIRE` family never
+journals under), `MSETNX` → `MSET`, and `GETEX`'s own expiry path and
 `GAT` (a separate call site, picking the same three names independently) → `PEXPIREAT`/`DEL`/
 `PERSIST` — so those inherit the guard through whichever guarded name they land on. State-carrying
 RMW results that journal under a guarded name are
@@ -154,14 +156,18 @@ always goes through the RESTORE-journaling path, never the verbatim-recipe one) 
 order, guard on or off: dropping a delta permanently loses it rather than merely reordering it, and
 there is no full "result" to journal instead.
 
-**A non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE` or `ZUNIONSTORE`/`ZINTERSTORE`/
-`ZDIFFSTORE`/`ZRANGESTORE` result over an EXISTING destination is a known gap, not yet fixed.**
-Unlike `SORT ... STORE`'s own destination write, these commands' overwrite path journals `DEL`
-(guarded) and `SADD`/`ZADD` (delta-journaled, unguarded) as two SEPARATE entries — so a guarded
+**A non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/
+`ZDIFFSTORE`/`ZRANGESTORE`, or `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST` result is a
+known gap, not yet fixed.** Unlike `SORT ... STORE`'s own destination write, every one of these
+commands' `Op` functions is called with `overwrite`/`override` hardcoded `true` — unconditionally,
+whether or not the destination previously existed — so a non-empty result always journals `DEL`
+(guarded) and `SADD`/`ZADD` (delta-journaled, unguarded) as two SEPARATE entries. A guarded
 receiver whose own destination is newer correctly drops the `DEL`, but then blindly applies the
 unguarded add on top of its own untouched, newer value anyway, producing a third state neither
-node ever actually held. Their own EMPTY-result case (destination becomes/stays absent) does not
-have this problem — it journals a bare, guarded `DEL` with no add to follow. See
+node ever actually held. Their EMPTY-result case is not the same shape both ways: a destination
+that *becomes* absent (it held a value, now deleted) journals a bare, guarded `DEL`; a destination
+that *stays* absent (nothing was there to delete) journals nothing at all — neither has this
+problem, since there is never an add to follow either way. See
 [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md) (D-21).
 
 **A same-shard `RENAME`/`RENAMENX`, a same-shard `SORT ... STORE`, an exact (non-approximate,
@@ -210,36 +216,50 @@ drops anything, because every entry it carries fails the guard's own per-entry d
 instead.** These are two different mechanisms, not one.
 
 `Replica::ConsumeRedisStream` (`replica.cc`) never touches `JournalExecutor` at all: it builds its
-own bare `ConnectionContext`, sets only `repl_origin_idx` on it, and never calls
-`SetApplyLwwGuard`, so `repl_lww_guard` stays at its default `false` for the whole classic link's
-lifetime — a structural property of the link, fixed before a single command ever dispatches
-(independently, this protocol also never carries a per-key `mvcc` at all, so `LwwGuardActive`
-would exclude it a second way even if the bit were somehow true). The stream's batching does not
-change any of that. `Service::DispatchSquashedBatch` (`main_service.cc`) collects a run of
-commands, stopping at the first one it cannot batch at all (an unknown command, `MULTI`/`EXEC`,
-`EVAL`, a blocking command, an admin command, a connection-state command, or a subscribe-family
-one) and returns how many it consumed; `ConsumeRedisStream`'s own loop dispatches whatever it
-stopped on through an ordinary `DispatchCommand` call before retrying the batch from there.
-Whatever it *did* collect gets handed, once per batch, to one **non-atomic**
-`MultiCommandSquasher` — built over a `Transaction` started with
-`StartMultiNonAtomic(Transaction::DEFAULT)`, never atomic, since this is a replication stream, not
-a client `MULTI`/`EXEC`. Inside it, `TrySquash` rejects any command that is
-not transactional, is `CO::BLOCKING`, is `CO::GLOBAL_TRANS`, or spans more than one shard's keys;
-those run through `ExecuteStandalone`, directly on that same non-atomic `Transaction`. Everything
-`TrySquash` *does* accept is grouped per shard and later dispatched by `SquashedHopCb`, which — in
-non-atomic mode — runs directly on each shard's own thread against a per-shard `Transaction` built
-with `StartMultiNonAtomic(Transaction::SHARD_LOCAL)`.
+own bare `ConnectionContext` and sets `is_replicating`, `journal_emulated`, `skip_acl_validation`,
+`ns`, and `repl_origin_idx` on it directly — but never calls `SetApplyLwwGuard`, so `repl_lww_guard`
+stays at its default `false` for the whole classic link's lifetime regardless. That is a structural
+property of the link, fixed before a single command ever dispatches (independently, this protocol
+also never carries a per-key `mvcc` at all, so `LwwGuardActive` would exclude it a second way even
+if the bit were somehow true). A non-transactional command with no keys at all (`SELECT`, `PING`)
+never even reaches a `Transaction`'s own callback machinery in the first place, so it is trivially
+"never guarded" too — there is no callback for a veto to skip.
 
-Neither of those two transactions is ever a `SQUASHED_STUB`: that role — and the
-`RunSquashedMultiCb` path it triggers inside `Transaction::Execute` — is produced only by the
-*other* stub constructor (`Transaction(parent, shard_id, ...)`), which only *atomic* squashing (a
-client's own `MULTI`/`EXEC` being squashed) ever uses. So every command from a classic link,
-squashed or not, dispatches through the ordinary `Transaction::Execute` → `RunCallback` →
-`ShouldDropForLww` path instead, with `repl_lww_guard_` copied from the connection's own
-(always-`false`) bit either way (both `MultiCommandSquasher`'s non-atomic per-shard construction
-and `Service::DispatchSquashedBatch`'s own batch-level `Transaction` call `SetReplOrigin` with it).
-`RunSquashedMultiCb`'s own `LOG(DFATAL)` tripwire guards the atomic-squash path only; the classic
-link never reaches that function at all.
+The stream's own batching does not change any of that, even though the batching itself is not
+specific to replication at all: `Service::DispatchSquashedBatch` (`main_service.cc`) is the SAME
+pipeline-squashing mechanism an ordinary client connection's own pipelined command burst uses too
+(`facade::Connection`'s own dispatch loop calls it directly) — `ConsumeRedisStream` is just one of
+its callers, not the reason it builds a non-atomic transaction. It collects a run of commands,
+stopping at the first one it cannot batch at all (an unknown command, `MULTI`/`EXEC`, `EVAL`, a
+blocking command, an admin command, a connection-state command, or a subscribe-family one) and
+returns how many it consumed; `ConsumeRedisStream`'s own loop dispatches whatever it stopped on
+through an ordinary `DispatchCommand` call before retrying the batch from there. Whatever it *did*
+collect gets handed, once per batch, to one **non-atomic** `MultiCommandSquasher` — built over a
+`Transaction` started with `StartMultiNonAtomic(Transaction::DEFAULT)`, which is what
+`DispatchSquashedBatch` always builds, for any caller. Inside it, `TrySquash` rejects any command
+that is not transactional, is `CO::BLOCKING`, is `CO::GLOBAL_TRANS`, or spans more than one shard's
+keys; those run through `ExecuteStandalone`, directly on that same non-atomic `Transaction`.
+Everything `TrySquash` *does* accept is grouped per shard and later dispatched by `SquashedHopCb`,
+which — in non-atomic mode — runs directly on each shard's own thread against a per-shard
+`Transaction` built with `StartMultiNonAtomic(Transaction::SHARD_LOCAL)`.
+
+Neither of *those* two transactions is ever a `SQUASHED_STUB`, so neither reaches
+`RunSquashedMultiCb` directly — but the classic link CAN reach that function by a different route.
+`EVAL`/`EVALSHA` is in `DispatchSquashedBatch`'s own break list above, so it falls straight to
+`ConsumeRedisStream`'s ordinary `DispatchCommand` fallback and takes the normal Lua-eval path. When
+a script's declared keys all hash to one shard, `CanRunSingleShardMulti` builds its own stub with
+`new Transaction{tx, real_sid, ...}` — the *other* stub constructor, the one that unconditionally
+sets `SQUASHED_STUB` no matter what mode its parent `tx` (the script's own outer transaction) is
+in — so the script's inner commands DO run through `RunSquashedMultiCb`. (The same constructor
+also backs two other `SQUASHED_STUB` producers, for completeness: `DEBUG POPULATE`'s own stub,
+built directly over an explicitly non-atomic `SHARD_LOCAL` parent — proof by construction that this
+role is not atomic-only — and the atomic squasher's own asynchronous `EVAL` command flush.) None of
+this actually changes anything observable on the classic link, though: that constructor also
+copies `repl_lww_guard_` straight from its own parent `tx`, and `tx` itself got that bit from the
+SAME always-`false` connection, the ordinary way any transaction on this link does. So
+`RunSquashedMultiCb`'s `LOG(DFATAL)` tripwire still never fires here — not because the classic link
+cannot reach the function, but because `IsLwwGuarded()` reads `false` there exactly as it does
+everywhere else on this link.
 
 A DFLY-protocol peer link to a peer that is itself non-active is a genuinely different case. The
 guard *bit* is set exactly the way it would be for any other peer link — `peer_mode_ &&
@@ -483,10 +503,11 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
   accepted here while a peer that saw the `DEL` against a still-live value holds a newer
   tombstone — a divergence a subsequent full sync from that peer repairs while its tombstone is
   still live, but not otherwise. Owned by P4-5 (tombstone lifecycle).
-- **D-21** — a non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`/`ZUNIONSTORE`/`ZINTERSTORE`/
-  `ZDIFFSTORE`/`ZRANGESTORE` result over an existing destination journals `DEL` (guarded) then
-  `SADD`/`ZADD` (delta, unguarded) as two entries; a guarded receiver with a newer destination
-  drops the `DEL` but still applies the add, merging a stale result into its own newer value.
-  Owner: open.
+- **D-21** — a non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/
+  `ZDIFFSTORE`/`ZRANGESTORE`, or `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST` result always
+  journals `DEL` (guarded) then `SADD`/`ZADD` (delta, unguarded) as two entries; a guarded receiver
+  with a newer destination drops the `DEL` but still applies the add, merging a stale result into
+  its own newer value. A later full sync from a node still holding the clean, correctly-stamped
+  value repairs it; nothing in steady-state streaming does. Owner: open.
 
 See that document for the full list, upstream-bug cross-references, and each entry's owning phase.

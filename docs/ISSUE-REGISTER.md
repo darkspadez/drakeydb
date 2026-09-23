@@ -548,13 +548,18 @@ tombstone-lifecycle work.
 
 ### D-21. `*STORE`'s `DEL` + add split can merge a stale result into a newer destination
 
-**Where:** `SetFamily::OpAdd` (`src/server/set_family.cc:520-636`) — `SINTERSTORE`/`SUNIONSTORE`/
-`SDIFFSTORE`'s destination write, when the destination already existed (`overwrite`), journals
-`DEL key` followed unconditionally by `SADD key <members...>` as two SEPARATE entries.
+**Where:** `SetFamily::OpAdd` (`src/server/set_family.cc:520-636`) is called with `overwrite=true`
+UNCONDITIONALLY — regardless of whether the destination previously existed — by
+`SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`'s destination write (`set_family.cc:1384,1487,1577`); its
+non-empty-result branch journals `DEL key` (guarded, since `overwrite` is always true for these
+callers) followed unconditionally by `SADD key <members...>` (unguarded) as two SEPARATE entries.
 `ZSetFamily::OpAdd` (`src/server/zset_family.cc`, its `zparams.override` branch, ~line 2054) does
-the identical thing for `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`/`ZRANGESTORE`'s destination write:
-`DEL key` then unconditionally `ZADD key <score member>...`. `DEL` is in the guarded table;
-`SADD`/`ZADD` are delta-journaled RMW and are not.
+the identical thing for `ZUNIONSTORE`/`ZINTERSTORE` (`zset_family.cc:1619`), `ZRANGESTORE`
+(`:1769`), and `ZDIFFSTORE` (`:2361`) — all three call sites also pass `override=true`
+unconditionally. `GeoFamily`'s `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST` modes
+(`geo_family.cc:651-657`) route through the SAME `ZSetFamily::OpAdd`, also with
+`override=true, journal_update=true` unconditionally, and get the identical split. `DEL` is in the
+guarded table; `SADD`/`ZADD` are delta-journaled RMW and are not.
 
 On a guarded receiver whose own `key` is newer than the incoming author stamp, the `DEL` entry is
 correctly dropped (it is stale) — but the `SADD`/`ZADD` entry that follows it in the SAME applied
@@ -562,16 +567,26 @@ command is unguarded and applies unconditionally, blindly adding the author's fr
 members into whatever this receiver's own, untouched, newer destination value already was. The
 result is neither the author's fresh set/zset (which the receiver's newer value should have kept)
 nor a value either node ever actually held — a third, merged state manufactured by the split
-itself, and one no future `MergeAccepts` compare can undo, since nothing records that this ever
-happened as a single logical write.
+itself. This is not permanent, though: the `SADD`/`ZADD` is an applied write whose own author
+stamp is OLDER than the receiver's stored stamp `S`, so `FloorAppliedStamp` (`mvcc.h`) commits the
+merged value one tick BELOW `S` (`{S.mvcc, S.origin_hash - 1}`), never at `S` itself or above. A
+later full sync from any node still holding the clean value stamped exactly `S` therefore wins the
+next merge compare and overwrites the corrupted merge. Nothing in steady-state streaming repairs
+it on its own (an ordinary streamed write only ever compares against whatever is *currently*
+stored, never specifically targets undoing this) — only a subsequent full sync from a clean-`S`
+holder does.
 
-**How established:** static reading of both `OpAdd` implementations' journaling branches; not
-reproduced with a live two-node divergence. Same shape as the `*STORE`-family empty-result case
-already guarded (`DEL` alone, when the result is empty) and as cross-shard `SORT ... STORE`'s own
-`RESTORE ... REPLACE` result-journaling (D-13's sibling, already guarded) — this is the
-non-empty-result case those two commands' own set/zset equivalents never received the same
-treatment for.
+**How established:** static reading of `SetFamily::OpAdd`/`ZSetFamily::OpAdd`'s journaling
+branches, every call site that passes `overwrite`/`override`, and the applied-write stamp floor
+(`FloorAppliedStamp`, `mvcc.h`) that governs the merged value's eventual repair; not reproduced with
+a live two-node divergence. Same shape as the `*STORE`-family empty-result case already guarded (a
+destination that *becomes* absent journals a bare, guarded `DEL`) and as cross-shard
+`SORT ... STORE`'s own `RESTORE ... REPLACE` result-journaling (D-13's sibling, already guarded) —
+this is the non-empty-result case those two commands' own set/zset/geo equivalents never received
+the same treatment for.
 
 **Owner:** open. Fix path if wanted: journal the destination's result as state
 (`RESTORE ... REPLACE`, one entry, guarded — the same treatment cross-shard `SORT ... STORE`
-already gets) instead of a `DEL` + delta-add pair, for all six affected commands. **From:** P4-4.
+already gets) instead of a `DEL` + delta-add pair, for all nine affected commands
+(`SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`/`ZRANGESTORE`,
+`GEORADIUS`/`GEORADIUSBYMEMBER`). **From:** P4-4.
