@@ -471,13 +471,21 @@ recipes, the same way the cross-shard forms already do. **From:** P4-4.
 ### D-19. Duplicate plain re-arms of a re-created key in one applied entry commit verbatim
 
 **Where:** `MvccStamper::Arm` (`src/server/mvcc.cc`) inherits a pending arm's real previous stamp
-only when the NEW arm's own `prev_stamp` is tombstone-shaped with `Mvcc() == 0` (a fresh,
-just-created placeholder) — the shape `DbSlice::EnsureMvcc` (`db_slice.cc`) returns the FIRST time
-it clears an existing tombstone for a key. A SECOND `EnsureMvcc` call for the SAME key later in the
-same callback (the slot having already been reset to a plain `MvccStamp{}` by the first call) sees
-an ordinary, non-tombstone, zero placeholder — `IsTombstone()` false — so `Arm`'s inheritance scan
-never triggers for it, even though `armed_` already holds an earlier arm for this exact key
-carrying the real prior tombstone.
+only when the NEW arm's own `prev_stamp` is tombstone-shaped with `Mvcc() == 0` — the shape
+`PerformDeletionAtomic`'s synchronous tombstone arm writes as an UNCOMMITTED, same-callback
+placeholder (`SetTombstone`+`ArmTombstone`, before that delete's own journal commit ever runs), and
+which `DbSlice::EnsureMvcc` (`db_slice.cc`) returns verbatim if that SAME placeholder is cleared
+again later in the same callback (a delete-then-recreate sequence). For a genuinely COMMITTED,
+pre-existing tombstone, `EnsureMvcc`'s clearing branch instead returns the real stamp
+(`Mvcc() != 0`) verbatim — never the placeholder shape. Two `EnsureMvcc` calls for the same key,
+both against an already-committed tombstone (e.g. `MSET k a k b` over a previously-tombstoned
+`k`), therefore never trip the inheritance gate either time: the first call clears the real
+tombstone and returns it verbatim (`Mvcc() != 0` — correctly not the placeholder shape, since
+there is nothing to inherit yet); the second call finds the slot already cleared to a plain,
+non-tombstone `MvccStamp{}` and falls through to `EnsureMvcc`'s "already live, unchanged" branch,
+returning `{0, 0}` — not tombstone-shaped at all, so the gate never even looks for anything to
+inherit. `armed_` still holds the first arm's real prior stamp one slot away, but nothing ever
+asks it.
 
 With the streaming guard OFF (the flag false, or a plain replica mirroring such a master), an
 applied `MSET k a k b` over a previously-tombstoned `k` reaches exactly this shape: the first pair
@@ -515,18 +523,25 @@ committing any stamp for that key at all. `T1` is left exactly as it was — the
 
 A peer that instead held a *live* value for that same key at the time would accept this same `DEL`
 and install a fresh tombstone at (approximately) the `DEL`'s own stamp — call it `T2`, with
-`T1 < T2`. If a third write arrives later stamped strictly between `T1` and `T2`, this node compares
-it only against `T1` (the only thing it has) and accepts it, installing a live value; the peer
-holding `T2` rejects the identical write as stale. The two nodes now disagree — one live, one
-tombstoned — for a write that both should have treated identically, and no further `MergeAccepts`
-compare between them repairs it: this node's live value has no stamp older than `T2` for the peer's
-tombstone to lose against, and `MergeAccepts`' tie-favors-stored rule was never designed to notice a
-tombstone that was silently never advanced.
+`T1 < T2`. If a third write `W` arrives later stamped strictly between `T1` and `T2`, this node
+compares it only against `T1` (the only thing it has) and accepts it, installing a live value; the
+peer holding `T2` rejects the identical write as stale. The two nodes now disagree — one live
+(this node, holding `W`), one tombstoned (the peer, holding `T2`) — for a write both should have
+treated identically. **Nothing repairs this in steady-state streaming**: this node's own stream of
+ordinary replicated writes never re-sends `T2`. The *next full sync* from the peer holding `T2`
+does repair it, and by the ordinary mechanism, not a special case: `RdbLoader::
+ApplyMergeTombstoneOnShard` runs `MergeAccepts(stored=W, incoming=T2)` for the incoming opcode-225
+tombstone record, `T2` is strictly newer than `W`, so it wins and installs the tombstone here too —
+both nodes converge to absent. The repair is contingent on timing, though: if the peer's own
+`TombstoneGcStep` reaps `T2` (its TTL elapsed) before that full sync ever happens, the peer no
+longer sends anything for this key at all (no live value, no tombstone), and this node's `W` stands
+permanently — the delete is lost, not merely delayed.
 
-**How established:** static reading of `OpDelV2`'s per-key skip-before-`FindMutable` ordering; not
-reproduced with a live three-node scenario. Pre-existing in the tombstone mechanism since P4-3 (the
-per-key LWW skip itself is new in P4-4, but the underlying "a DEL of an absent key touches no
-tombstone" behavior is not); newly documented here rather than fixed, since a real fix belongs with
-the rest of the tombstone-lifecycle work.
+**How established:** static reading of `OpDelV2`'s per-key skip-before-`FindMutable` ordering and
+of `ApplyMergeTombstoneOnShard`'s own `MergeAccepts` call; not reproduced with a live three-node
+scenario. Pre-existing in the tombstone mechanism since P4-3 (the per-key LWW skip itself is new in
+P4-4, but the underlying "a DEL of an absent key touches no tombstone" behavior is not); newly
+documented here rather than fixed, since a real fix belongs with the rest of the
+tombstone-lifecycle work.
 
 **Owner:** P4-5 (tombstone lifecycle). **From:** P4-4.

@@ -39,9 +39,11 @@ higher stamp (e.g. merged in earlier from a peer with a fast clock) still mints 
 one tick higher, so that overwrite is not silently doomed to lose the *next* full-sync merge
 against a third node. It is computed per journal entry, not a per-shard ratchet: an unrelated key's
 mint in the same epoch is unaffected. The floor is capped at the stamp's own bit-mask; at that cap
-the local write *ties* the stored stamp rather than beating it — reachable only with a corrupt,
-hostile, or (at this encoding's millisecond granularity) roughly year-2248 stamp. An expiry's own
-tombstone mint follows the identical rule, floored against the value it deletes.
+only the `mvcc` portion *ties* the stored stamp's — `origin_hash` still decides which one actually
+wins the next compare (`MergeAccepts`' own tie-break), so a local write does not automatically lose
+just because it hit the cap. The cap itself is reachable only with a corrupt, hostile, or (at this
+encoding's millisecond granularity) roughly year-2248 stamp. An expiry's own tombstone mint follows
+the identical rule, floored against the value it deletes.
 
 **An already-expired incoming key is the peer's DELETE.** A full sync can ship a key whose
 whole-key TTL has already elapsed — the normal state of an expiring key on a loaded server, whose
@@ -134,23 +136,41 @@ wasteful, steady state, not a fault that should force a resync.
 `MSET`/`DEL` (multi-key, self-guarded — see the per-key split below). Every other journaled name is
 unguarded; an unrecognized name fails open, never closed. The master already normalizes several
 client-facing commands onto one of those names before journaling — `SETEX`/`SET ... EX` → `SET`,
-`UNLINK` → `DEL`, the `EXPIRE` family and `GETEX`'s own expiry path → `PEXPIREAT`/`DEL`, `MSETNX` →
-`MSET`, `GAT` → `PEXPIREAT`/`DEL`/`PERSIST` — so those inherit the guard through whichever guarded
-name they land on. State-carrying RMW results that journal under a guarded name are deliberately
-guarded too, because a journaled `SET`/`DEL` is a blind full-state write on the receiver exactly
-like any other: `PFMERGE` → `SET` (`hll_family.cc`), `BITOP` → `SET`/`DEL` (`bitops_family.cc`), a
-`*STORE`-family command's empty-result delete (e.g. a cross-shard `SORT ... STORE`) → `DEL`, and a
-cross-shard `RENAME`'s `DEL` src + `RESTORE ... REPLACE` dest. **Delta-journaled RMW is
-deliberately never guarded** — `INCR`, `APPEND`, `LPUSH`, `HSET`-style commands, `PFADD`, and
-similar always resolve by plain arrival order, guard on or off: dropping a delta permanently loses
-it rather than merely reordering it, and there is no full "result" to journal instead.
+`UNLINK` → `DEL`, the `EXPIRE` family and `GETEX`'s own expiry path → `PEXPIREAT`/`DEL`/`PERSIST`,
+`MSETNX` → `MSET`, `GAT` → `PEXPIREAT`/`DEL`/`PERSIST` (a separate call site from `GETEX`'s own,
+which independently picks the same three names) — so those inherit the guard through whichever
+guarded name they land on. State-carrying RMW results that journal under a guarded name are
+deliberately guarded too, because a journaled `SET`/`DEL`/`RESTORE` is a blind full-state write on
+the receiver exactly like any other: `PFMERGE` → `SET` (`hll_family.cc`), `BITOP` → `SET`/`DEL`
+(`bitops_family.cc`), a `*STORE`-family command's empty-result delete (e.g. a cross-shard
+`SORT ... STORE`) → `DEL`, that same command's non-empty result → `RESTORE ... REPLACE`, `COPY`
+(same-shard or cross-shard — it always goes through the RESTORE-journaling path, never the
+verbatim-recipe one) → `RESTORE ... REPLACE`, and a cross-shard `RENAME`'s `DEL` src +
+`RESTORE ... REPLACE` dest. **Delta-journaled RMW is deliberately never guarded** — `INCR`,
+`APPEND`, `LPUSH`, `HSET`-style commands, `PFADD`, and similar always resolve by plain arrival
+order, guard on or off: dropping a delta permanently loses it rather than merely reordering it, and
+there is no full "result" to journal instead.
 
-**Two commands are rewritten on the receiver before dispatch, unconditionally, so their journaled
-form reproduces the author's *result* rather than the author's *command*:** `SETNX` (conditional on
-non-existence — applying it verbatim on a receiver that already holds the key would be a silent
-no-op even once the guard has already let it through) becomes a plain `SET`; `RESTORE` without
-`REPLACE` errors on an existing key, and that reply-level error is reported back by
-`DispatchCommand` as an applied `OK` — so `REPLACE` is injected. Both rewrites
+**A same-shard `RENAME`/`RENAMENX`, a same-shard `SORT ... STORE`, an exact (non-approximate,
+non-`MAXLEN`) `XTRIM`, and a handful of name-ambiguous commands are unguarded by design, not by
+oversight.** The first three revive auto-journal at runtime (`Transaction::ReviveAutoJournal`) and
+journal the client's own command verbatim under its own name — none of `RENAME`/`RENAMENX`/`SORT`/
+`XTRIM` is in the guarded table, so all four resolve by plain arrival order on a guarded link (the
+*cross-shard* form of `RENAME`/`RENAMENX`/`SORT ... STORE` takes the RESTORE-journaling path above
+instead, and is guarded). Separately, `JSON.SET`/`JSON.MERGE`/`JSON.DEL`/`JSON.FORGET`/
+`JSON.CLEAR` at the root (`"$"`) path are full-value writes under a name that cannot tell that path
+from an ordinary partial one, so guarding the name would also guard-and-drop their everyday partial
+uses — left unguarded, resolving by arrival order like any other unguarded command. See
+[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md) (D-18) for the full account.
+
+**Two commands are rewritten on the receiver before dispatch, so their journaled form reproduces
+the author's *result* rather than the author's *command*, but only when the link is actually
+guarded for that entry** (`LwwGuardActive(repl_lww_guard, repl_mvcc)` — the flag off, a plain
+replica, or an unstamped entry all skip the rewrite and apply verbatim, same as before P4-4):
+`SETNX` (conditional on non-existence — applying it verbatim on a receiver that already holds the
+key would be a silent no-op even once the guard has already let it through) becomes a plain `SET`;
+`RESTORE` without `REPLACE` errors on an existing key, and that reply-level error is reported back
+by `DispatchCommand` as an applied `OK` — so `REPLACE` is injected. Once triggered, both rewrites
 (`ApplyLwwRewrites`, `multimaster_lww.h`) are unconditional name/arg edits with no lock hazard, so
 they run pre-dispatch; the stamp *compare* itself still runs inside the transaction, under the
 key's lock, exactly like every other guarded command.
@@ -167,26 +187,45 @@ was never atomic across shards under replication even before this guard existed 
 flow with no cross-shard barrier — the per-key split only adds the possibility of a *single
 shard's* own partial application, on top of an atomicity gap that already existed one level up.
 
-**Classic (non-DFLY-protocol) links bypass the guard structurally, not by a runtime check on the
-data.** A classic Redis/KeyDB master's batch replays through `MultiCommandSquasher`, whose
-per-command stub runs `Transaction::RunSquashedMultiCb` instead of the ordinary `RunCallback` — and
-that stub's `repl_mvcc_` is set once for the whole batch, never refreshed per command, so it could
-never be safely compared per key. `RunSquashedMultiCb` never calls `ShouldDropForLww`; it carries
-only a `LOG(DFATAL)` tripwire for the case where `IsLwwGuarded()` somehow reads true there anyway,
-and even then still runs the command unguarded rather than dropping it. In practice the tripwire is
-just a backstop: a classic link's entries always carry `mvcc == 0`, which `LwwGuardActive` already
-excludes on its own, with no need for this second check to ever fire.
+**Classic (non-DFLY-protocol) links, and a DFLY link to a non-active peer, are never guarded — by
+construction, not by a runtime check on the data.** `Replica::ConsumeRedisStream` (`replica.cc`)
+never touches `JournalExecutor` at all: it builds its own bare `ConnectionContext` directly and
+sets `repl_origin_idx` on it, but never calls `SetApplyLwwGuard`, so `repl_lww_guard` stays at its
+default `false` for every command this stream ever dispatches — regardless of which of its two
+dispatch paths a given command takes. `MultiCommandSquasher::TrySquash` rejects a non-transactional
+command, a `CO::BLOCKING` one, a `CO::GLOBAL_TRANS` one (multi-shard commands and similar), and a
+few others outright; for those, `DispatchSquashedBatch` returns having processed nothing, and
+`ConsumeRedisStream`'s own fallback dispatches that one command through the ordinary
+`DispatchCommand` → `Transaction::RunCallback` → `ShouldDropForLww` path instead — same
+`ConnectionContext`, so `IsLwwGuarded()` still reads false there. Everything else in the batch runs
+through the squasher's own per-command stub, `Transaction::RunSquashedMultiCb`, instead of
+`RunCallback`; that stub never calls `ShouldDropForLww` at all (its `repl_mvcc_` is set once for
+the whole squashed batch, never refreshed per command, so it could not be safely compared per key
+even if the guard bit were somehow set) — it carries only a `LOG(DFATAL)` tripwire for the case
+where `IsLwwGuarded()` reads true there anyway, and even then still runs the command unguarded
+rather than dropping it. That tripwire is a backstop for the single-shard-squashed-command case
+specifically; it is not what makes the *other* commands on this link — multi-shard, blocking, and
+anything else the squasher rejects — unguarded, since those never reach the squasher's stub at all.
+Separately, and independently of any of this: a classic link's entries carry `mvcc == 0` regardless
+(no per-key write time to send at all), and so does a DFLY-protocol peer link to a peer that is
+itself non-active (`--active_replica=false` there means nothing on that peer's own side was ever
+stamped, so anything it forwards is unstamped too) — `LwwGuardActive` (`multimaster_lww.h`)
+excludes both on that basis alone, so even a hypothetical bug that set `repl_lww_guard` true on one
+of these links would still fail open.
 
 **`DEBUG MVCC`'s `origin:` field can end up naming no real node in the mesh.** The applied-write
 stamp floor (`FloorAppliedStamp`, `mvcc.h`) that protects an *unguarded* applied write (arrival
 order — guard off, a delta-RMW command, or a plain replica) whose author stamp is older than the
 key's stored stamp `S` commits `{S.mvcc, S.origin_hash - 1}` instead of that older stamp verbatim —
 one tick below `S`, keeping the key's stamp monotone for practical purposes, so a later, clean full
-sync from a peer holding `S` still wins the next merge compare and the two copies re-converge. The
-cost is that `S.origin_hash - 1` is an arbitrary derived number, not any node's own registered
-hash, so `DEBUG MVCC <key>`'s `origin:` line can show a value that matches no peer in the mesh once
-this has happened even once. Extend the "do not diff `DEBUG MVCC` across peers" rule (see
-Observability, below) to cover this case too, alongside an expiry tombstone's own per-node stamp.
+sync from a peer holding `S` still wins the next merge compare and the two copies re-converge.
+(Edge case: if `S.origin_hash` is itself `0` — a placeholder shape, not a real registered origin —
+the floor instead lands at `{S.mvcc - 1, UINT64_MAX}`, dropping the `mvcc` field by one tick rather
+than decrementing a hash of `0`.) The cost is that the resulting `origin_hash` is an arbitrary
+derived number, not any node's own registered hash, so `DEBUG MVCC <key>`'s `origin:` line can show
+a value that matches no peer in the mesh once this has happened even once. Extend the "do not diff
+`DEBUG MVCC` across peers" rule (see Observability, below) to cover this case too, alongside an
+expiry tombstone's own per-node stamp.
 
 ## Tombstones
 
@@ -312,11 +351,13 @@ reminder of this split, not because the combination is unsupported.
 
 - `INFO memory`: `mvcc_table_bytes`, `mvcc_entries`, `mvcc_tombstones`, `mvcc_tombstones_dropped`
   (all gated on `--active_replica`; absent, not zero, on a non-active node).
-- `INFO replication`: `multimaster_lww_dropped` — replicated writes the streaming LWW guard has
-  dropped on this node's peer links, summed across every shard/proactor thread (`ServerState::
-  Stats::multimaster_lww_dropped`, `multimaster_lww.h`'s `NoteLwwDrop`). Same gate as the other
-  `mvcc_*` replication fields: gated on `--active_replica`, absent (not zero) otherwise. Also
-  exported as the Prometheus counter `dragonfly_multimaster_lww_dropped_total`, same gate.
+- `INFO replication`: `multimaster_lww_dropped` — counts one per dropped *key*, not per replicated
+  command (a guarded `MSET`/`DEL` naming several keys can contribute more than one to a single
+  applied entry), on this node's peer links, summed across every shard/proactor thread
+  (`ServerState::Stats::multimaster_lww_dropped`, `multimaster_lww.h`'s `NoteLwwDrop`). Same gate
+  as the other `mvcc_*` replication fields: gated on `--active_replica`, absent (not zero)
+  otherwise. Also exported as the Prometheus counter `dragonfly_multimaster_lww_dropped_total`,
+  same gate.
 - `DEBUG MVCC <key>`: prints `state:value|tombstone|absent`, and for `value`/`tombstone` the raw
   `mvcc:`, `ms:`, `counter:` (value only), and `origin:` fields for that key on its own shard.
 - `DEBUG MVCC` (no key): per-shard aggregate — `shard<N>_entries`, `shard<N>_tombstones`,
@@ -391,5 +432,14 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
   a `BY`/`GET` pattern key is not a transaction key, so a peer can legitimately compute a different
   destination value under an identical MVCC stamp, and the tie-favors-stored rule then never
   repairs the divergence.
+- **D-18** — the runtime-revived recipes (same-shard `RENAME`/`RENAMENX`/`SORT ... STORE`, exact
+  `XTRIM`) and the name-ambiguous full-value writes (`JSON.SET`/`MERGE`/`DEL`/`FORGET`/`CLEAR` at
+  the root path, `CMS.MERGE`, `BF.LOADCHUNK`'s init chunk) described above, all unguarded by
+  design.
+- **D-20** — a guarded `DEL` newer than an absent key's older tombstone leaves that tombstone
+  untouched (nothing to delete, nothing armed); a later write stamped between the two is then
+  accepted here while a peer that saw the `DEL` against a still-live value holds a newer
+  tombstone — a divergence a subsequent full sync from that peer repairs while its tombstone is
+  still live, but not otherwise. Owned by P4-5 (tombstone lifecycle).
 
 See that document for the full list, upstream-bug cross-references, and each entry's owning phase.
