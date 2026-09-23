@@ -3433,7 +3433,7 @@ class MsetLwwJournalConsumer : public journal::JournalConsumerInterface {
 // applies), and the dropped pair's stamp must stay completely untouched (never armed, so not even
 // floored).
 //
-// Falsified both ways (see task report for the exact captured output):
+// Falsified both ways:
 //  (a) "all-or-nothing" -- pre-scanning every pair and skipping the ENTIRE apply if any one pair
 //      would drop -- makes k1 come back missing (GET k1 empty) even though it had every right to
 //      apply on its own.
@@ -3513,7 +3513,9 @@ TEST_F(MvccStoreTest, MsetPartialApplyKeepsOnlyNonStaleKeysInOneJournalEntry) {
 //
 // Falsified by reverting the guarded journal branch to the pre-existing prefix-truncation shape
 // (`store_args.resize(stored * 2)` against the ORIGINAL args, `stored` counting only the pairs
-// actually Set()) -- see task report for the exact captured wrong output.
+// actually Set()): the captured args come back as [k1, "a", k2, "b"] -- the dropped middle pair
+// is wrongly RE-INCLUDED (its stale value would propagate to every downstream peer) while k3,
+// which was actually written locally, is silently missing from the journal entirely.
 TEST_F(MvccStoreTest, MsetSkipsOnlyTheStaleMiddleKeyNotAPrefixTruncation) {
   constexpr uint32_t kPeerIdx = 41;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000041");
@@ -3578,8 +3580,9 @@ TEST_F(MvccStoreTest, MsetSkipsOnlyTheStaleMiddleKeyNotAPrefixTruncation) {
 // must hold -- read directly on the owning shard's own thread, matching journal::GetLsn()'s own
 // contract ("must be called in the context of the owning shard", journal.h).
 //
-// Falsified by adding a journal::ClearBuffer() call on the all-dropped (empty survivors) path --
-// see task report for the exact captured LSN delta.
+// Falsified by adding a journal::ClearBuffer() call on the all-dropped (empty survivors) path:
+// the LSN observably advances by one across the apply (e.g. 3 -> 4) even though nothing was
+// written or journaled.
 TEST_F(MvccStoreTest, MsetAllPairsStaleJournalsNothingAndLeavesLsnUnchanged) {
   constexpr uint32_t kPeerIdx = 42;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000042");
@@ -3628,10 +3631,12 @@ TEST_F(MvccStoreTest, MsetAllPairsStaleJournalsNothingAndLeavesLsnUnchanged) {
 // must take the byte-identical unguarded path regardless of how stale the incoming mvcc is --
 // arrival order wins, exactly as it did before this task existed.
 //
-// Falsified by hardcoding OpMSet's `guarded` local to `db_cntx.repl_lww_guard` alone (dropping
-// LwwGuardActive's mvcc requirement, which is moot here since mvcc is real) -- see task report;
-// concretely, this is the same shape as forcing `guarded = true` outright, since this test's own
-// incoming mvcc is non-zero.
+// Falsified by computing OpMSet's `guarded` from `db_cntx.repl_mvcc != 0` alone, ignoring
+// `repl_lww_guard` entirely (this test's own incoming mvcc is non-zero, so this is the same shape
+// as forcing `guarded = true` outright here): GET k2 then comes back "b" instead of "local", the
+// per-pair compare runs and counts a drop even though the link is unguarded
+// (TotalLwwDropped() advances by 1 instead of staying flat), and the journal entry shrinks to
+// just the surviving pair instead of staying the full, byte-identical command.
 TEST_F(MvccStoreTest, MsetGuardOffAppliesArrivalOrderRegardlessOfStamps) {
   constexpr uint32_t kPeerIdx = 43;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000043");
@@ -3693,11 +3698,13 @@ TEST_F(MvccStoreTest, MsetGuardOffAppliesArrivalOrderRegardlessOfStamps) {
 // makes `guarded` false before OpMSet ever calls IncomingStamp, so the per-pair compare cannot
 // run regardless of what is (or isn't) stored for k2.
 //
-// Falsified by disabling BOTH independent fail-open layers at once (OpMSet's own `guarded`
-// computation AND IncomingStamp's `mvcc == 0` check in multimaster_lww.cc) -- disabling only one
-// of the two does not reproduce a visible failure here, the same redundancy
-// UnstampedIncomingNeverGuarded (above) already documents for the single-key veto; see task
-// report for the exact captured output.
+// Falsified by disabling BOTH independent fail-open layers at once: OpMSet's own `guarded`
+// computed from `repl_lww_guard` alone (dropping the mvcc requirement) AND IncomingStamp's own
+// `mvcc == 0` early return (multimaster_lww.cc). Disabling only OpMSet's layer does not reproduce
+// a visible failure here -- IncomingStamp(0, ...) still independently returns nullopt, so `split`
+// still ends up false -- the same redundancy UnstampedIncomingNeverGuarded (above) already
+// documents for the single-key veto. Disabling both at once does: GET k2 comes back "b" instead
+// of "local", and TotalLwwDropped() advances by 1 instead of staying flat.
 TEST_F(MvccStoreTest, MsetUnstampedIncomingAppliesAllPairsEvenWithGuardOn) {
   constexpr uint32_t kPeerIdx = 44;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000044");
