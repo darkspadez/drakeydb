@@ -649,6 +649,45 @@ TEST(MvccStamperTest, CommitDepthRecoversAfterCommitFnThrows) {
   EXPECT_EQ(rec.writes[0].key, "k2");
 }
 
+// drakeydb: P4-4 Task A5b fix round 1 -- a corrupt or hostile peer stamp with Mvcc() exactly
+// MvccClock::kStampMask (the maximum representable non-tombstone value: every bit but bit 63)
+// must not let LocalMintFloor overflow prev+1 into precisely kTombstoneBit -- journal.cc's mint
+// would then commit that value verbatim for a PLAIN arm, silently marking a live write's stamp as
+// a tombstone (IsTombstone() true) whose own Mvcc() masks right back down to 0.
+//
+// Falsifying: removing the `std::min(prev_mvcc + 1, MvccClock::kStampMask)` cap (mvcc.cc) back to
+// a bare `prev_mvcc + 1` reproduces this: LocalMintFloor() comes back one above kStampMask (i.e.
+// exactly kTombstoneBit) instead of capped at kStampMask itself.
+TEST(MvccStamperTest, LocalMintFloorCapsAtStampMaskNeverOverflowingIntoTheTombstoneBit) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k", MvccStamp{MvccClock::kStampMask, 111});
+  EXPECT_EQ(s->LocalMintFloor(), MvccClock::kStampMask)
+      << "must cap at kStampMask, never overflow prev_mvcc + 1 into exactly kTombstoneBit";
+}
+
+// drakeydb: P4-4 Task A5b fix round 1 -- CommitOwnTombstone's own floor (mvcc.cc) needs the
+// identical cap: uncapped, prev_mvcc == kStampMask overflows prev_mvcc + 1 into kTombstoneBit,
+// which the subsequent `| kTombstoneBit` is then a no-op on -- so the committed tombstone's own
+// Mvcc() masks right back down to 0, losing every bit of the "strictly newer" guarantee this floor
+// exists to give it (a regression distinct from, but the same shape as, the plain-arm one above).
+//
+// Falsifying: removing CommitOwnTombstone's own `std::min(prev_mvcc + 1, MvccClock::kStampMask)`
+// cap (mvcc.cc) back to a bare `prev_mvcc + 1` reproduces this: the committed tombstone's Mvcc()
+// comes back 0 instead of kStampMask.
+TEST(MvccStamperTest, CommitOwnTombstoneCapsAtStampMaskNeverOverflowingTheMaskedMvccToZero) {
+  MvccStamper* s = FreshStamper();
+  s->ArmTombstone(0, "k", MvccStamp{MvccClock::kStampMask, 111});
+  Recorder rec;
+  // Deliberately tiny: HopStamp(1) is far below kStampMask, so the floor -- not HopStamp -- is
+  // what determines the result below.
+  EXPECT_TRUE(s->CommitOwnTombstone(0, "k", /*now_ms=*/1, rec.Fn()));
+  ASSERT_EQ(rec.writes.size(), 1u);
+  EXPECT_TRUE(rec.writes[0].stamp.IsTombstone());
+  EXPECT_EQ(rec.writes[0].stamp.Mvcc(), MvccClock::kStampMask)
+      << "must cap at kStampMask, never overflow prev_mvcc + 1 into exactly kTombstoneBit -- which "
+         "the tombstone bit already being OR'd in then masks straight back down to a Mvcc() of 0";
+}
+
 // ---------------------------------------------------------------------------
 // multimaster_lww.h: the streaming LWW guard's pure decision module (P4-4 Task A1). These tests
 // exercise the module in isolation; see peer_replication_test.cc for its callers

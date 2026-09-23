@@ -3591,7 +3591,7 @@ TEST_F(MvccStoreTest, RenameOntoExistingDestAppliedUnguardedFloorsOnceAgainstDes
 // drakeydb: P4-4 Task A5b -- spec D3: a LOCAL mint must land strictly above the key's own stored
 // stamp, not just above this node's wall clock -- a node whose clock trails a peer's
 // already-observed stamp for a key otherwise stamps a causally-LATER local write BELOW that
-// stamp: the client sees OK, and every peer running the streaming LWW guard (PR-A) silently drops
+// stamp: the client sees OK, and every peer running the streaming LWW guard silently drops
 // the write as stale, then a later full sync reverts the writer too. future_mvcc simulates
 // exactly that skew: a peer 10s ahead of this node's own (frozen, fixture) clock -- comfortably
 // outside kMaxEpochMs (50ms) and any realistic NTP slop, so nothing here depends on timing
@@ -3642,6 +3642,7 @@ TEST_F(MvccStoreTest, BackwardSkewedLocalWriteRaisesAboveObservedFuturePeerStamp
       << "the guarded re-delivery of the peer's own (already-beaten) write must be dropped -- if "
          "it instead won, the local write's stamp never actually rose above the peer's";
   EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u) << "a drop must never arm-then-abandon the key";
 }
 
 // drakeydb: P4-4 Task A5b -- D3's tombstone half: a LOCAL delete's own tombstone must also land
@@ -3715,8 +3716,9 @@ TEST_F(MvccStoreTest, BackwardSkewedLocalWriteAfterFuturePeerDeleteRaisesAboveTo
 // MultiKeySameShardCommandSharesOneStamp above, which relies on the identical fact.
 //
 // Falsifying: same revert; k1_after->Mvcc() comes back below k2_before->Mvcc() (a bare HopStamp,
-// unrelated to k2's stored future value) instead of strictly greater, and typically no longer
-// equal to k2_after->Mvcc() either.
+// unrelated to k2's stored future value) instead of strictly greater. k1_after and k2_after stay
+// EQUAL either way -- one Commit() call, one entry.mvcc, regardless of whether that mvcc was
+// floored -- so this test's other EXPECT_EQ is not itself falsified by this revert.
 TEST_F(MvccStoreTest, BackwardSkewedMultiKeyLocalMsetRaisesBothKeysToTheSameStamp) {
   constexpr uint32_t kPeerIdx = 53;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000053");
@@ -3780,18 +3782,23 @@ TEST_F(MvccStoreTest, BackwardSkewedExpiryTombstoneRaisesAboveFuturePeerValueSta
 
 // drakeydb: P4-4 Task A5b -- D3 is explicitly NOT a per-shard HLC ratchet (design doc D3: "not a
 // per-shard HLC ratchet -- that lets one fast-clock peer poison a whole shard's clock
-// permanently"). The raise above must never leak into MvccClock/hop_stamp_: an UNRELATED later
-// local write, on the SAME shard, must still get a plain clock stamp -- strictly below the raise
-// a sibling write needed moments earlier for a completely different key.
+// permanently"). The raise above must never leak into MvccClock: an UNRELATED local write, on the
+// SAME shard, in a LATER epoch, must still get a plain clock stamp -- strictly below the raise a
+// sibling write needed moments earlier for a completely different key. "Later epoch" specifically,
+// not "later in the same epoch": each Run() call below is its own top-level command, hence its own
+// write epoch, and Transaction::RunCallback's trailing EndOfWriteEpoch resets hop_stamp_ (but not
+// MvccClock itself, which is never reset except by TEST_Reset) in between them -- so this test
+// exercises whether MvccClock survives poisoned, never whether hop_stamp_ does (it structurally
+// cannot: it is already gone by the time "other" is written).
 //
 // "k" and "other" are forced onto the same shard deliberately: proving this on two DIFFERENT
 // shards would only show that MvccClock is per-shard (already known), never that THIS shard's own
 // clock stayed unratcheted by k's own raise.
 //
-// Falsifying: making journal::RecordEntry's mint ratchet the clock instead of computing a
-// per-entry max (e.g. `stamper->HopStamp(GetCurrentTimeMs() + 10'000'000)`, standing in for
-// "write the raised floor back into hop_stamp_/clock_") reproduces: other_stamp->Mvcc() comes
-// back >= k_stamp->Mvcc() instead of strictly below it.
+// Falsifying: making LocalMintFloor (mvcc.cc) write its own return value back into clock_ (e.g.
+// `clock_.TEST_Set(std::max(clock_.last(), floor));` before `return floor;`) reproduces: k_stamp's
+// own sanity ASSERT still holds (k is raised, same as ever), but other_stamp->Mvcc() then comes
+// back >= k_stamp->Mvcc() instead of strictly below it, at the EXPECT_LT below.
 TEST_F(MvccStoreTest, LocalMintRaiseDoesNotRatchetTheSharedClock) {
   constexpr uint32_t kPeerIdx = 55;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000055");

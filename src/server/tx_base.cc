@@ -142,9 +142,12 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
   MvccStamper::tlocal()->CommitOwnTombstone(
       db_cntx.db_index, key, db_cntx.time_now_ms,
       // drakeydb: P4-4 Task A5 fix round 1 -- CommitFn's 4th (tombstone) and 5th (the arm's
-      // captured pre-delete stamp) arguments are both intentionally unused here: an expiry's
+      // captured pre-delete stamp) arguments are both intentionally unused HERE: an expiry's
       // tombstone is always a freshly minted self stamp (D-10, see the comment above), never
-      // floored against anything.
+      // db_cntx.repl_mvcc/repl_origin_idx. It is not floor-free, though (P4-4 Task A5b) --
+      // CommitOwnTombstone (mvcc.cc) already floors `st` (this lambda's 3rd argument) against that
+      // same arm's own prev_stamp internally, before this lambda ever runs, which is exactly why
+      // this lambda itself has no further use for the raw 5th argument.
       [](DbIndex db, string_view k, const MvccStamp& st, bool, const MvccStamp&) {
         namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
       });

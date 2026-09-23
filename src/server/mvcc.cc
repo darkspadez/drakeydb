@@ -88,17 +88,25 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
 
 // drakeydb: P4-4 Task A5b -- see the declaration (mvcc.h) for the full why. A pure read over
 // armed_ -- no allocation, no mutation of clock_/hop_stamp_/armed_ -- so calling this from
-// journal::RecordEntry right before its own HopStamp/AddLogRecord costs nothing extra beyond the
-// scan itself (armed_ is per-epoch and small, the same bound Arm()'s own fix-round-2 scan relies
-// on). `prev_stamp.Mvcc() == 0` excludes both a genuinely fresh {0,0} slot and an uncommitted
+// journal::RecordEntry, alongside its own HopStamp call, costs nothing extra beyond the scan
+// itself (armed_ is per-epoch and small, the same bound Arm()'s own fix-round-2 scan relies on).
+// `prev_stamp.Mvcc() == 0` excludes both a genuinely fresh {0,0} slot and an uncommitted
 // placeholder (Mvcc() masks bit 63, so PerformDeletionAtomic's {kTombstoneBit, 0} lands here too)
 // -- neither carries a real prior stamp to floor a local mint against.
 uint64_t MvccStamper::LocalMintFloor() const {
   uint64_t floor = 0;
   for (const Armed& a : armed_) {
-    if (a.prev_stamp.Mvcc() == 0)
+    const uint64_t prev_mvcc = a.prev_stamp.Mvcc();
+    if (prev_mvcc == 0)
       continue;
-    floor = std::max(floor, a.prev_stamp.Mvcc() + 1);
+    // drakeydb: P4-4 Task A5b fix round 1 -- capped at kStampMask: prev_mvcc == kStampMask (the
+    // max representable non-tombstone value -- all bits but bit 63) would otherwise overflow
+    // prev_mvcc + 1 into EXACTLY kTombstoneBit, which a plain (non-tombstone) arm's Commit() call
+    // would then commit verbatim as this key's live stamp -- silently marking a LIVE write as a
+    // tombstone (IsTombstone() true) whose Mvcc() masks right back down to 0. A corrupt or
+    // hostile peer stamp at exactly that value must not be able to do that; see
+    // LocalMintFloorCapsAtStampMaskNeverOverflowingIntoTheTombstoneBit (mvcc_test.cc).
+    floor = std::max(floor, std::min(prev_mvcc + 1, MvccClock::kStampMask));
   }
   return floor;
 }
@@ -235,8 +243,16 @@ bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uin
       // HopStamp alone land below `it->prev_stamp`, the value this exact arm is replacing).
       // Floored against THIS arm's own prev only -- never armed_ as a whole -- since this call
       // commits exactly one arm, unlike Commit()'s sweep of every currently-armed key.
+      //
+      // drakeydb: P4-4 Task A5b fix round 1 -- capped at kStampMask, mirroring LocalMintFloor's
+      // own cap (see its comment, mvcc.cc, for the full why): prev_mvcc == kStampMask would
+      // otherwise overflow prev_mvcc + 1 into EXACTLY kTombstoneBit, which the `| kTombstoneBit`
+      // below is then a no-op on -- the committed tombstone's own Mvcc() would mask right back
+      // down to 0, losing every bit of the "strictly newer" guarantee this floor exists to give
+      // it. See CommitOwnTombstoneCapsAtStampMaskNeverOverflowingTheMaskedMvccToZero
+      // (mvcc_test.cc).
       const uint64_t prev_mvcc = it->prev_stamp.Mvcc();
-      const uint64_t floor = prev_mvcc == 0 ? 0 : prev_mvcc + 1;
+      const uint64_t floor = prev_mvcc == 0 ? 0 : std::min(prev_mvcc + 1, MvccClock::kStampMask);
       const MvccStamp stamp{std::max(HopStamp(now_ms), floor) | MvccClock::kTombstoneBit,
                             OriginHash(0)};
       ++commit_depth_;

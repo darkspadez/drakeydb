@@ -252,16 +252,22 @@ class MvccStamper {
   // node whose wall clock trails a peer's already-observed stamp for a key otherwise mints a
   // causally-LATER local write BELOW that stamp -- the client sees OK, and every peer running the
   // streaming LWW guard silently drops the write as stale. This is a pure read of the arms already
-  // pending at mint time (Arm()/ArmTombstone() ran first; journal::RecordEntry, journal.cc, calls
-  // this before its own HopStamp/AddLogRecord), never a per-shard clock ratchet -- MvccClock
-  // itself is untouched. Deliberately NOT folded into MvccClock::Next: ratcheting the shared clock
-  // would let one fast/skewed peer's write poison every LATER, unrelated local mint on this shard
-  // too, which the spec explicitly rejects.
+  // pending at mint time: Arm()/ArmTombstone() ran first, so every arm THIS entry itself placed is
+  // already in armed_ by the time journal::RecordEntry (journal.cc) calls this, ahead of that same
+  // statement's own AddLogRecord call. (Its order relative to that statement's own HopStamp() call
+  // is unspecified by C++ -- both are arguments to one std::max -- but harmless: this has no side
+  // effects, so calling it before or after HopStamp's memo update changes nothing observable.)
+  // Never a per-shard clock ratchet -- MvccClock itself is untouched. Deliberately NOT folded into
+  // MvccClock::Next: ratcheting the shared clock would let one fast/skewed peer's write poison
+  // every LATER, unrelated local mint on this shard too, which the spec explicitly rejects.
   //
   // Returns the highest (prev_stamp.Mvcc() + 1) among currently-armed keys that carry a real
   // prior stamp (Mvcc() != 0 -- a fresh {0,0} slot or an uncommitted placeholder has none to floor
   // against, same check as FloorAppliedStamp's), or 0 if none does -- a no-op floor, so
   // std::max(HopStamp(now), LocalMintFloor()) degrades to a bare HopStamp exactly as before D3.
+  // Capped at MvccClock::kStampMask (P4-4 Task A5b fix round 1): a corrupt or hostile peer stamp
+  // with Mvcc() exactly kStampMask would otherwise overflow prev+1 into precisely kTombstoneBit,
+  // silently marking a LIVE write's stamp as a tombstone (Mvcc() masks bit 63 back to 0).
   uint64_t LocalMintFloor() const;
 
   // May be called more than once for the same (db_index, key) within one callback -- a command
@@ -360,7 +366,9 @@ class MvccStamper {
   // that generic sweep runs, this key's arm (if any) has already been removed and stamped here,
   // and cannot be double-stamped with the wrong value.
   //
-  // Mints HopStamp(now_ms) and looks up this node's own (kSelfIdx) origin hash internally, but
+  // Mints HopStamp(now_ms), floors it against this exact arm's own prev_stamp (spec D3, P4-4 Task
+  // A5b -- same rule LocalMintFloor applies to a plain arm, capped the same way at
+  // MvccClock::kStampMask), and looks up this node's own (kSelfIdx) origin hash internally, but
   // ONLY if a matching tombstone arm is found -- avoids advancing the shared per-thread clock (or
   // doing the origin lookup) on every expiry when nothing is armed (TombstonesEnabled() is false,
   // the delete was outside the default namespace, or PerformDeletionAtomic degraded to a plain
