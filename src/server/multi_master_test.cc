@@ -4167,6 +4167,225 @@ TEST_F(MvccStoreTest, DelLwwIsNotDroppedAgainstAnOlderTombstone) {
 }
 
 // ---------------------------------------------------------------------------
+// P4-4 Task A9: the pre-dispatch SETNX->SET / RESTORE->+REPLACE rewrite (ApplyLwwRewrites,
+// multimaster_lww.h), wired into JournalExecutor::Execute (executor.cc) end to end. See
+// mvcc_test.cc's MultimasterLwwTest.ApplyLwwRewrites* suite for the rewrite function in
+// isolation.
+// ---------------------------------------------------------------------------
+
+// drakeydb: P4-4 Task A9 -- the headline case the rewrite exists for: SETNX is conditional on
+// non-existence, so applying it VERBATIM against a receiver that already holds "k" would always
+// SKIP, no matter how much newer the author's write is -- a silent, permanent divergence. Once
+// rewritten to a plain SET, the ordinary single-key veto compares stamps instead of existence,
+// and a genuinely newer author wins.
+//
+// Falsifying: removing the `ApplyLwwRewrites` call in JournalExecutor::Execute (executor.cc)
+// makes the literal "setnx" dispatch unchanged -- SetCmd::Set's own SET_IF_NOTEXIST precondition
+// then finds "k" already live and returns SKIPPED, so `GET k` below observes "local" instead of
+// "peer".
+TEST_F(MvccStoreTest, SetnxRewrittenToSetAppliesOverOlderLocalValue) {
+  constexpr uint32_t kPeerIdx = 80;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000080");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const uint64_t newer_mvcc = before_stamp->Mvcc() + 1;
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"setnx", "k", "peer"}, kPeerIdx, newer_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer")
+      << "a newer-author guarded SETNX on an EXISTING key must still apply -- rewritten to SET, "
+         "the veto compares stamps instead of SETNX's own (always-false, here) existence check";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(after_stamp->Mvcc(), newer_mvcc);
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_FALSE(consumer.entries.empty());
+  EXPECT_EQ(consumer.entries.back().args[0], "SET")
+      << "the journaled name must be SET, never SETNX verbatim -- proving the rewrite, not some "
+         "other path, is what let this apply";
+}
+
+// drakeydb: P4-4 Task A9 -- the drop-side sibling of the test above: a STALE guarded SETNX (also
+// rewritten to SET before dispatch) must be vetoed exactly like any other guarded SET, leaving
+// the newer local value in place and counting one drop. SETNX was already classified kSingleKey
+// before this task (see ClassifyJournaledCommandMatchesEveryTableRow, mvcc_test.cc), and the
+// generic single-key veto runs before the SET/SETNX distinction ever reaches SetCmd -- so a
+// literal, unrewritten SETNX would already be vetoed here too (SETNX's own existence check also
+// no-ops for a stale write against an existing key). What this test actually pins is that the
+// rewrite does not disturb the veto's ability to drop a stale write once it arrives as SET.
+//
+// Falsifying: making the single-key veto (ShouldDropForLww, transaction.cc) always `return
+// false` makes `GET k` below observe "peer" instead of "local".
+TEST_F(MvccStoreTest, SetnxRewrittenToSetIsDroppedWhenStale) {
+  constexpr uint32_t kPeerIdx = 81;
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000081");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  ASSERT_GT(before_stamp->Mvcc(), kStaleMvcc)
+      << "sanity: the local stamp must actually be newer than the peer's for this to be a "
+         "meaningful drop";
+
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"setnx", "k", "peer"}, kPeerIdx, kStaleMvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "local");
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, *before_stamp);
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 Task A9 -- the rewrite's own central hazard: an unstamped (mvcc 0) apply must
+// NEVER be rewritten, even with the link's guard bit on. LwwGuardActive(link_guard, 0) is false,
+// so gating the rewrite on `conn_context_.repl_lww_guard` alone (ignoring mvcc) would turn this
+// into a BLIND, UNGUARDED SET -- IsLwwGuarded() at the Transaction level independently also reads
+// false for mvcc 0, so the rewritten SET would apply with no veto at all and clobber "k".
+//
+// Falsifying: changing executor.cc's gate from `LwwGuardActive(conn_context_.repl_lww_guard,
+// conn_context_.repl_mvcc)` to `conn_context_.repl_lww_guard` alone makes `GET k` below observe
+// "peer" instead of "local".
+TEST_F(MvccStoreTest, UnstampedGuardedSetnxIsNotRewritten) {
+  constexpr uint32_t kPeerIdx = 82;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000082");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"setnx", "k", "peer"}, kPeerIdx, /*mvcc=*/0, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "local")
+      << "mvcc 0 must never be rewritten -- SETNX's own existence check must still see 'k' live "
+         "and no-op, exactly as an unrewritten SETNX always has";
+  EXPECT_EQ(StampOf("k"), before_stamp) << "an untouched key's stamp must not move either";
+}
+
+// drakeydb: P4-4 Task A9 -- the guard-off control: a plain (non-peer) replication link must see
+// KeyDB parity -- a client-issued SETNX on an existing key always no-ops, and this link's SETNX
+// must too, completely untouched by the rewrite. Uses a real non-zero mvcc (unlike the test
+// above) specifically so this test cannot pass merely because LwwGuardActive's mvcc-0 half caught
+// it -- only the link_guard half is doing the work here.
+//
+// Falsifying: gating the rewrite on `conn_context_.repl_mvcc != 0` alone (dropping the
+// link_guard half of LwwGuardActive) makes `GET k` below observe "peer" instead of "local".
+TEST_F(MvccStoreTest, GuardOffSetnxOnExistingKeyIsUntouched) {
+  constexpr uint32_t kPeerIdx = 83;
+  constexpr uint64_t kSomeMvcc = 0x9999ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000083");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"setnx", "k", "peer"}, kPeerIdx, kSomeMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "local");
+  EXPECT_EQ(StampOf("k"), before_stamp);
+}
+
+// drakeydb: P4-4 Task A9 -- RESTORE's own divergence: without REPLACE, RESTORE onto an existing
+// key errors, and DispatchCommand reports that reply-level error as DispatchResult::OK (only an
+// uncaught exception or OOM changes that result) -- so an unrewritten guarded RESTORE would leave
+// the receiver on the OLD value with no visible apply failure and no LWW-drop metric either. A9
+// injects REPLACE so the ordinary single-key veto decides instead.
+//
+// Falsifying: removing the `ApplyLwwRewrites` call in JournalExecutor::Execute (executor.cc)
+// makes `GET k` below observe "local" (RESTORE errors with BUSYKEY, silently, still returning
+// DispatchResult::OK) instead of "donorval".
+TEST_F(MvccStoreTest, RestoreGainsReplaceAndAppliesOverOlderExistingKey) {
+  constexpr uint32_t kPeerIdx = 84;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000084");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "donor", "donorval"}), "OK");
+  std::string dump = Run({"dump", "donor"}).GetString();
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const uint64_t newer_mvcc = before_stamp->Mvcc() + 1;
+
+  // No REPLACE token -- A9 must inject it pre-dispatch.
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"restore", "k", "0", dump}, kPeerIdx, newer_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK)
+      << "a reply-level RESTORE error is still reported as OK -- this alone proves nothing about "
+         "whether REPLACE was actually injected, see the GET below for that";
+
+  EXPECT_EQ(Run({"get", "k"}), "donorval")
+      << "REPLACE must have been injected so the veto, not RESTORE's own existence check, "
+         "decided -- a newer author must win";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(after_stamp->Mvcc(), newer_mvcc);
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash);
+}
+
+// drakeydb: P4-4 Task A9 -- the premise the SETNX rewrite depends on, pinned directly: a
+// client-issued SETNX that does NOT set (the key already exists) must reach the journal ZERO
+// times. SetCmd::Set's own SET_IF_NOTEXIST branch (string_family.cc) returns OpStatus::SKIPPED
+// before ever calling PostEdit/RecordJournal, and Transaction::LogAutoJournalOnShard's `if
+// (result.status != OpStatus::OK) return;` gate (transaction.cc) independently suppresses the
+// auto-journal for that SKIPPED result too. If either were wrong, rewriting a replicated SETNX to
+// SET would be reproducing a phantom write the author itself never made.
+TEST_F(MvccStoreTest, AuthorSideNoopSetnxJournalsNothing) {
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  ASSERT_EQ(Run({"set", "k", "v1"}), "OK");
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  EXPECT_EQ(Run({"setnx", "k", "v2"}).GetInt(), 0) << "sanity: the key already exists";
+  EXPECT_EQ(Run({"get", "k"}), "v1") << "sanity: the no-op SETNX must not have changed the value";
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), pre_entries) << "a no-op SETNX must never reach the journal";
+}
+
+// ---------------------------------------------------------------------------
 // P4-4 Task A5: FloorAppliedStamp's end-to-end proof. See mvcc.h's declaration for the pure-
 // function why; mvcc_test.cc's FloorAppliedStampTest suite covers the function in isolation.
 // ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@
 #include <optional>
 #include <string_view>
 
+#include "common/backed_args.h"
 #include "server/mvcc.h"
 
 // drakeydb: P4-4 -- absl flags live at global scope (matching multi_master.h's own
@@ -51,6 +52,19 @@ LwwClass ClassifyJournaledCommand(std::string_view journaled_name);
 constexpr bool LwwGuardActive(bool link_guard, uint64_t incoming_mvcc) {
   return link_guard && incoming_mvcc != 0;
 }
+
+// drakeydb: P4-4 -- pre-dispatch rewrite for the two guarded single-key commands whose journaled
+// form reproduces the author's COMMAND rather than the author's RESULT: SETNX (conditional on
+// non-existence -- applying it verbatim is a silent no-op on a receiver that already holds the
+// key) becomes a plain SET, and RESTORE (errors on an existing key without REPLACE, and
+// DispatchCommand reports that reply-level error as an applied OK) gets REPLACE injected. Both
+// are unconditional name/arg edits with no TOCTOU hazard, so callers run this PRE-dispatch; the
+// stamp COMPARE itself still happens inside the transaction, under the key's lock
+// (Transaction::ShouldDropForLww). Callers must gate this call on EXACTLY
+// LwwGuardActive(link_guard, incoming_mvcc) -- never on the link bit alone, or an unstamped
+// (mvcc 0) SETNX would be rewritten into an UNGUARDED blind SET that clobbers the key. Returns
+// whether it changed anything.
+bool ApplyLwwRewrites(cmn::BackedArguments* args);
 
 // The author's stamp for an incoming replicated write, or nullopt when it cannot be formed
 // (origin not registered: MvccStamper::OriginHash returns 0 for an unknown index) -- callers then

@@ -5,10 +5,12 @@
 
 #include <absl/flags/flag.h>
 #include <absl/strings/ascii.h>
+#include <absl/strings/match.h>
 
 #include <algorithm>
 #include <iterator>
 #include <string>
+#include <vector>
 
 #include "base/logging.h"
 #include "server/server_state.h"
@@ -58,6 +60,43 @@ LwwClass ClassifyJournaledCommand(std::string_view journaled_name) {
   if (it != std::end(kJournaledClasses) && it->name == upper)
     return it->klass;
   return LwwClass::kUnguarded;
+}
+
+bool ApplyLwwRewrites(cmn::BackedArguments* args) {
+  if (args->empty())
+    return false;
+
+  const std::string_view name = args->Front();
+
+  if (absl::EqualsIgnoreCase(name, "SETNX")) {
+    // drakeydb: P4-4 -- exactly 3 args (SETNX key value) or leave untouched; a malformed SETNX
+    // is dispatch's problem, not this rewrite's.
+    if (args->size() != 3)
+      return false;
+    const std::vector<std::string> rewritten{"SET", std::string(args->at(1)),
+                                             std::string(args->at(2))};
+    // BackedArguments has no in-place rename -- Assign rebuilds storage_/offsets_ from scratch.
+    args->Assign(rewritten.begin(), rewritten.end(), rewritten.size());
+    return true;
+  }
+
+  if (absl::EqualsIgnoreCase(name, "RESTORE")) {
+    // RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency].
+    // A short/malformed RESTORE (arity < 4) is dispatch's problem, same as SETNX above.
+    if (args->size() < 4)
+      return false;
+    for (size_t i = 4; i < args->size(); ++i) {
+      const std::string_view opt = args->at(i);
+      if (absl::EqualsIgnoreCase(opt, "REPLACE"))
+        return false;  // already present, anywhere, in any case -- nothing to do
+      if (absl::EqualsIgnoreCase(opt, "IDLETIME") || absl::EqualsIgnoreCase(opt, "FREQ"))
+        ++i;  // the next token is that option's VALUE, not another option name -- skip it
+    }
+    args->PushArg("REPLACE");
+    return true;
+  }
+
+  return false;
 }
 
 std::optional<MvccStamp> IncomingStamp(uint64_t mvcc, uint32_t origin_idx) {

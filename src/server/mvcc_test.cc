@@ -9,8 +9,12 @@
 
 #include <map>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "base/gtest.h"
+#include "common/backed_args.h"
 #include "server/multimaster_lww.h"
 #include "server/table.h"
 
@@ -801,6 +805,102 @@ TEST(MultimasterLwwDeathTest, IncomingStampUnregisteredOriginDies) {
   EXPECT_DEBUG_DEATH(IncomingStamp(/*mvcc=*/1, /*origin_idx=*/99), "no registered hash");
 }
 #endif  // NDEBUG
+
+// ---------------------------------------------------------------------------
+// ApplyLwwRewrites (P4-4 Task A9): the pre-dispatch SETNX->SET / RESTORE->+REPLACE rewrite. See
+// executor.cc for where this is actually called, gated on LwwGuardActive.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Builds a BackedArguments the same shape JournalExecutor::Execute receives off the wire.
+cmn::BackedArguments MakeArgs(const std::vector<std::string_view>& parts) {
+  cmn::BackedArguments args;
+  args.Assign(parts.begin(), parts.end(), parts.size());
+  return args;
+}
+
+// Reads every argument back as a comparable vector<string>, so assertions can equal-compare
+// against a literal expected list instead of poking at BackedArguments one index at a time.
+std::vector<std::string> ArgsToVec(const cmn::BackedArguments& args) {
+  std::vector<std::string> out;
+  out.reserve(args.size());
+  for (size_t i = 0; i < args.size(); ++i)
+    out.emplace_back(args.at(i));
+  return out;
+}
+
+}  // namespace
+
+TEST(MultimasterLwwTest, ApplyLwwRewritesSetnxBecomesSetArgsPreserved) {
+  cmn::BackedArguments args = MakeArgs({"SETNX", "k", "v"});
+  EXPECT_TRUE(ApplyLwwRewrites(&args));
+  EXPECT_THAT(ArgsToVec(args), ::testing::ElementsAre("SET", "k", "v"));
+}
+
+TEST(MultimasterLwwTest, ApplyLwwRewritesSetnxIsCaseInsensitive) {
+  cmn::BackedArguments args = MakeArgs({"setnx", "k", "v"});
+  EXPECT_TRUE(ApplyLwwRewrites(&args));
+  EXPECT_THAT(ArgsToVec(args), ::testing::ElementsAre("SET", "k", "v"));
+}
+
+// A SETNX with the wrong arity is dispatch's problem, not this rewrite's -- left untouched so
+// dispatch still reports its own arity error, same as an unrewritten SETNX would today.
+TEST(MultimasterLwwTest, ApplyLwwRewritesSetnxWrongArityUntouched) {
+  for (const std::vector<std::string_view>& parts :
+       {std::vector<std::string_view>{"SETNX", "k"},
+        std::vector<std::string_view>{"SETNX", "k", "v", "extra"}}) {
+    cmn::BackedArguments args = MakeArgs(parts);
+    const std::vector<std::string> before = ArgsToVec(args);
+    EXPECT_FALSE(ApplyLwwRewrites(&args));
+    EXPECT_EQ(ArgsToVec(args), before);
+  }
+}
+
+TEST(MultimasterLwwTest, ApplyLwwRewritesRestoreGainsReplace) {
+  cmn::BackedArguments args = MakeArgs({"RESTORE", "k", "0", "payload"});
+  EXPECT_TRUE(ApplyLwwRewrites(&args));
+  EXPECT_THAT(ArgsToVec(args), ::testing::ElementsAre("RESTORE", "k", "0", "payload", "REPLACE"));
+}
+
+// REPLACE, in any case and at any valid position (including after ABSTTL, or after an
+// IDLETIME/FREQ value), must be recognized as already present -- appending a second one would
+// hand RESTORE's own arg parser a stray extra token.
+TEST(MultimasterLwwTest, ApplyLwwRewritesRestoreAlreadyCarryingReplaceUnchanged) {
+  const std::vector<std::vector<std::string_view>> cases = {
+      {"RESTORE", "k", "0", "payload", "REPLACE"},
+      {"RESTORE", "k", "0", "payload", "replace"},
+      {"RESTORE", "k", "0", "payload", "ABSTTL", "Replace"},
+      {"RESTORE", "k", "0", "payload", "IDLETIME", "5", "REPLACE"},
+      {"RESTORE", "k", "0", "payload", "FREQ", "7", "REPLACE"},
+  };
+  for (const auto& parts : cases) {
+    cmn::BackedArguments args = MakeArgs(parts);
+    const std::vector<std::string> before = ArgsToVec(args);
+    EXPECT_FALSE(ApplyLwwRewrites(&args)) << before.back();
+    EXPECT_EQ(ArgsToVec(args), before);
+  }
+}
+
+// The token right after IDLETIME is that option's VALUE, not another option name -- even when it
+// happens to spell "replace", it must stay opaque, and a REAL REPLACE still gets appended.
+TEST(MultimasterLwwTest, ApplyLwwRewritesRestoreIdletimeValueLiterallyReplaceStillAppends) {
+  cmn::BackedArguments args = MakeArgs({"RESTORE", "k", "0", "payload", "IDLETIME", "replace"});
+  EXPECT_TRUE(ApplyLwwRewrites(&args));
+  EXPECT_THAT(ArgsToVec(args), ::testing::ElementsAre("RESTORE", "k", "0", "payload", "IDLETIME",
+                                                      "replace", "REPLACE"));
+}
+
+TEST(MultimasterLwwTest, ApplyLwwRewritesOtherNamesUntouched) {
+  const std::vector<std::vector<std::string_view>> cases = {
+      {"SET", "k", "v"}, {"GET", "k"}, {"DEL", "k"}, {"MSET", "k1", "v1"}, {"PERSIST", "k"}, {},
+  };
+  for (const auto& parts : cases) {
+    cmn::BackedArguments args = MakeArgs(parts);
+    const std::vector<std::string> before = ArgsToVec(args);
+    EXPECT_FALSE(ApplyLwwRewrites(&args));
+    EXPECT_EQ(ArgsToVec(args), before);
+  }
+}
 
 #ifndef NDEBUG
 // Hole 1(b): a CommitFn that called Commit() again used to clear armed_/arena_ out from under the
