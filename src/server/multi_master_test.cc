@@ -6397,11 +6397,12 @@ TEST_F(OriginJournalFamilyTest, GuardedSquashedStubTripwireFiresInDebug) {
 #endif  // NDEBUG
 }
 
-// drakeydb: P4-4 Task A4 -- the tripwire's control that isolates repl_lww_guard_: guard=false
-// with a non-zero mvcc must not trip IsLwwGuarded() (LwwGuardActive, multimaster_lww.h, requires
-// the guard bit set), so the squashed stub applies normally -- like today's only production
-// caller (a classic Redis/KeyDB link via DispatchSquashedBatch, which never sets
-// repl_lww_guard). A misfiring tripwire on this case would abort the whole process in a debug
+// drakeydb: P4-4 -- the tripwire's control that isolates repl_lww_guard_: guard=false with a
+// non-zero mvcc must not trip IsLwwGuarded() (LwwGuardActive, multimaster_lww.h, requires the
+// guard bit set), so the squashed stub applies normally -- the same outcome a classic Redis/KeyDB
+// link's own single-shard EVAL script gets today (CanRunSingleShardMulti, main_service.cc, builds
+// a SQUASHED_STUB regardless of mode; that stub inherits repl_lww_guard_ from its parent, always
+// false on that link). A misfiring tripwire on this case would abort the whole process in a debug
 // build (LOG(DFATAL) is LOG(FATAL) there), not merely fail an assertion, so this test passing is
 // itself real evidence, not a vacuous one.
 TEST_F(OriginJournalFamilyTest, NonGuardedSquashedStubNeverTripsTripwire) {

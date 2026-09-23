@@ -1622,20 +1622,21 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
   DCHECK_EQ(unique_shard_cnt_, 1u);
 
   // drakeydb: P4-4 -- fail-open tripwire, not a guard: skips RunCallback's ShouldDropForLww veto.
-  // Reachable with a replicated-apply (repl_*) context only via ATOMIC squashing: SQUASHED_STUB
-  // (and thus this function, via Transaction::Execute's own role check) is only ever produced by
-  // the parent+shard_id stub constructor, which only the atomic path uses. The classic Redis/
-  // KeyDB link's own batching (replica.cc's ConsumeRedisStream -> DispatchSquashedBatch ->
-  // MultiCommandSquasher) never reaches here at all: it stays non-atomic end to end, so its
-  // per-shard local_tx is a SHARD_LOCAL transaction, not a SQUASHED_STUB one, and every command
-  // in it dispatches through ordinary RunCallback -- where ShouldDropForLww DOES run -- instead.
-  // That non-atomic path's own repl_mvcc_ is set once per shard for the WHOLE batch
-  // (MultiCommandSquasher::PrepareShardInfo's SetReplOrigin call), never refreshed per command;
-  // harmless today only because the classic link's repl_lww_guard_ is always false
-  // (ConsumeRedisStream never calls SetApplyLwwGuard) and its entries always carry mvcc 0
-  // regardless. A future link that streamed a real per-key stamp through that same non-atomic
-  // batching would need to refresh repl_mvcc_ per command before RunCallback's own veto there
-  // could be trusted.
+  // SQUASHED_STUB (and thus this function, via Transaction::Execute's own role check) is produced
+  // by the parent+shard_id stub constructor -- NOT atomic-squashing-only: DEBUG POPULATE builds
+  // one directly over an explicitly non-atomic SHARD_LOCAL parent (debugcmd.cc), and a classic
+  // Redis/KeyDB link's own single-shard EVAL script reaches here too (CanRunSingleShardMulti,
+  // main_service.cc, builds this same stub constructor over the script's own outer transaction,
+  // whatever mode that happens to be in). The classic link's OWN batching (replica.cc's
+  // ConsumeRedisStream -> DispatchSquashedBatch -> MultiCommandSquasher) does NOT reach here --
+  // it stays non-atomic end to end, building SHARD_LOCAL (not SQUASHED_STUB) per-shard
+  // transactions, so every command it squashes dispatches through ordinary RunCallback, where
+  // ShouldDropForLww DOES run -- but a classic link's EVAL is a second, independent way to reach
+  // this function, and it does. The tripwire below still never fires either way: the stub
+  // constructor copies repl_lww_guard_ from its own parent, and every transaction on the classic
+  // link -- squashed EVAL stub included -- traces back to the same connection whose
+  // repl_lww_guard is always false, so IsLwwGuarded() reads false here regardless of which route
+  // got a command to this function.
   if (IsLwwGuarded()) {
     LOG(DFATAL) << "multi-master LWW guard reached RunSquashedMultiCb: repl_mvcc_ is "
                    "batch-level here, not per-command, and cannot be safely compared -- "
@@ -1682,9 +1683,9 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
   }
   db_slice.OnCbFinishBlocking();
 
-  // drakeydb: P4-4 -- always false here: the squashed-multi LWW tripwire is task A4's job, not
-  // this task's. RunSquashedMultiCb always actually runs `cb` above (no veto exists on this path
-  // yet), so its own auto-journal must never be suppressed.
+  // drakeydb: P4-4 -- always false here: RunSquashedMultiCb never consults ShouldDropForLww at
+  // all (see this function's own top comment) -- it always actually runs `cb` above -- so nothing
+  // on this path ever drops, and its own auto-journal must never be suppressed.
   LogAutoJournalOnShard(shard, result, /*lww_dropped=*/false);
   MaybeInvokeTrackingCb();
 

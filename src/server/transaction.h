@@ -620,12 +620,11 @@ class Transaction {
   void LogAutoJournalOnShard(EngineShard* shard, RunnableResult shard_result, bool lww_dropped);
 
   // drakeydb: P4-4 -- the generic single-key LWW veto RunCallback consults for its own drop
-  // decision. True iff
-  // this shard's own callback for the current command must be skipped because a strictly newer
-  // (or tied, favoring stored) local stamp already exists for its one key. Only classifies
-  // kSingleKey journaled names (SET, SETNX, GETSET, GETDEL, PEXPIREAT, PERSIST, RESTORE);
-  // kMultiKeySelfGuarded (MSET, DEL) and kUnguarded names always return false here -- MSET/DEL
-  // guard themselves per-key inside their own Op functions (A7/A8) because GetShardArgs on MSET
+  // decision. True iff this shard's own callback for the current command must be skipped because
+  // a strictly newer (or tied, favoring stored) local stamp already exists for its one key. Only
+  // classifies kSingleKey journaled names (SET, SETNX, GETSET, GETDEL, PEXPIREAT, PERSIST,
+  // RESTORE); kMultiKeySelfGuarded (MSET, DEL) and kUnguarded names always return false here --
+  // MSET/DEL guard themselves per-key inside their own Op functions because GetShardArgs on MSET
   // yields keys AND values in one contiguous range, which this generic helper cannot tell apart.
   //
   // The compare runs HERE, inside RunCallback, under this key's shard-thread execution (which
