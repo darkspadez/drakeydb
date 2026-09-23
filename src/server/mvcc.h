@@ -248,6 +248,22 @@ class MvccStamper {
   // journal.cc) pass it explicitly.
   uint64_t HopStamp(uint64_t now_ms);
 
+  // drakeydb: P4-4 Task A5b -- spec D3: "Local stamp = max(clock_tick(), stored.mvcc + 1)". A
+  // node whose wall clock trails a peer's already-observed stamp for a key otherwise mints a
+  // causally-LATER local write BELOW that stamp -- the client sees OK, and every peer running the
+  // streaming LWW guard silently drops the write as stale. This is a pure read of the arms already
+  // pending at mint time (Arm()/ArmTombstone() ran first; journal::RecordEntry, journal.cc, calls
+  // this before its own HopStamp/AddLogRecord), never a per-shard clock ratchet -- MvccClock
+  // itself is untouched. Deliberately NOT folded into MvccClock::Next: ratcheting the shared clock
+  // would let one fast/skewed peer's write poison every LATER, unrelated local mint on this shard
+  // too, which the spec explicitly rejects.
+  //
+  // Returns the highest (prev_stamp.Mvcc() + 1) among currently-armed keys that carry a real
+  // prior stamp (Mvcc() != 0 -- a fresh {0,0} slot or an uncommitted placeholder has none to floor
+  // against, same check as FloorAppliedStamp's), or 0 if none does -- a no-op floor, so
+  // std::max(HopStamp(now), LocalMintFloor()) degrades to a bare HopStamp exactly as before D3.
+  uint64_t LocalMintFloor() const;
+
   // May be called more than once for the same (db_index, key) within one callback -- a command
   // can take a second, independent FindMutable/AutoUpdater on a key it is about to delete (e.g.
   // DeleteHw, DelMutable's other callers). Duplicates are harmless for an ORDINARY plain arm:

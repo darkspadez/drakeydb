@@ -4,6 +4,8 @@
 
 #include "server/journal/journal.h"
 
+#include <algorithm>  // std::max
+
 #include "base/logging.h"
 #include "server/common.h"
 #include "server/db_slice.h"
@@ -122,8 +124,19 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
   // now_ms explicitly (Task 4, design point 3): mvcc.cc itself never calls GetCurrentTimeMs(), so
   // the caller -- here, already deep in EngineShard territory -- does. entry.mvcc == 0 is a safe
   // "caller supplied no stamp" test: 0 is unreachable for a real stamp (ms << 20, ms ~ 1.77e12).
-  if (MvccEnabled() && opcode == Op::COMMAND && entry.mvcc == 0)
-    entry.mvcc = MvccStamper::tlocal()->HopStamp(GetCurrentTimeMs());
+  //
+  // drakeydb: P4-4 Task A5b -- spec D3: a LOCAL mint must land strictly above the stored stamp of
+  // every key this entry is about to commit, not just above the wall clock -- LocalMintFloor
+  // (mvcc.h) reads the arms Arm()/ArmTombstone() already placed for THIS entry (PostUpdate/
+  // PerformDeletionAtomic both run before RecordEntry) and returns the highest prev+1 among them,
+  // or 0 (a no-op) if none carries a real prior stamp. Deliberately max()'d with HopStamp rather
+  // than folded into MvccClock itself: the clock (and hop_stamp_'s memo) stay untouched, so a
+  // LATER, unrelated local mint in the same epoch still gets a plain clock tick -- one skewed peer
+  // must never be able to poison this whole shard's clock for every other key too.
+  if (MvccEnabled() && opcode == Op::COMMAND && entry.mvcc == 0) {
+    MvccStamper* stamper = MvccStamper::tlocal();
+    entry.mvcc = std::max(stamper->HopStamp(GetCurrentTimeMs()), stamper->LocalMintFloor());
+  }
 
   journal_slice.AddLogRecord(entry);
 

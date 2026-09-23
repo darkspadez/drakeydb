@@ -3588,6 +3588,245 @@ TEST_F(MvccStoreTest, RenameOntoExistingDestAppliedUnguardedFloorsOnceAgainstDes
          "rule -- src was never re-armed live in this same entry, so it needs no inheritance";
 }
 
+// drakeydb: P4-4 Task A5b -- spec D3: a LOCAL mint must land strictly above the key's own stored
+// stamp, not just above this node's wall clock -- a node whose clock trails a peer's
+// already-observed stamp for a key otherwise stamps a causally-LATER local write BELOW that
+// stamp: the client sees OK, and every peer running the streaming LWW guard (PR-A) silently drops
+// the write as stale, then a later full sync reverts the writer too. future_mvcc simulates
+// exactly that skew: a peer 10s ahead of this node's own (frozen, fixture) clock -- comfortably
+// outside kMaxEpochMs (50ms) and any realistic NTP slop, so nothing here depends on timing
+// precision.
+//
+// Falsifying: reverting journal::RecordEntry's local mint (journal.cc) from
+// `std::max(stamper->HopStamp(now), stamper->LocalMintFloor())` back to a bare
+// `stamper->HopStamp(now)` reproduces this: local_stamp's Mvcc() comes back below peer_stamp's
+// instead of strictly above it, and the guarded re-delivery below then wins (GET returns "peer"
+// instead of "local").
+TEST_F(MvccStoreTest, BackwardSkewedLocalWriteRaisesAboveObservedFuturePeerStamp) {
+  constexpr uint32_t kPeerIdx = 50;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000050");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, future_mvcc, /*lww_guard=*/false),
+      facade::DispatchResult::OK);
+  auto peer_stamp = StampOf("k");
+  ASSERT_TRUE(peer_stamp.has_value());
+  ASSERT_EQ(peer_stamp->Mvcc(), future_mvcc) << "sanity: k's stored stamp really is the future one";
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  EXPECT_EQ(Run({"get", "k"}), "local") << "the client's local write must win, not be lost";
+
+  auto local_stamp = StampOf("k");
+  ASSERT_TRUE(local_stamp.has_value());
+  EXPECT_GT(local_stamp->Mvcc(), peer_stamp->Mvcc())
+      << "D3: a local mint must land strictly above the key's own stored (peer, future) stamp, "
+         "not just above this node's own (comparatively behind) wall clock";
+  uint64_t self_origin_hash = 0;
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { self_origin_hash = MvccStamper::tlocal()->OriginHash(0); });
+  EXPECT_EQ(local_stamp->origin_hash, self_origin_hash)
+      << "a local mint is never floored/decremented the way an APPLIED write's stamp can be (A5) "
+         "-- it is attributed to this node's own origin hash verbatim";
+
+  // The write above must have raised "k" high enough that a guarded re-delivery of the SAME
+  // (now-stale) peer write is dropped, not re-applied -- i.e. the local write would actually reach
+  // the peer and win there too.
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult redelivery =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, future_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(redelivery, facade::DispatchResult::OK)
+      << "a dropped write must still report success -- see StalePeerSetDroppedUnderLwwGuard above";
+  EXPECT_EQ(Run({"get", "k"}), "local")
+      << "the guarded re-delivery of the peer's own (already-beaten) write must be dropped -- if "
+         "it instead won, the local write's stamp never actually rose above the peer's";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+}
+
+// drakeydb: P4-4 Task A5b -- D3's tombstone half: a LOCAL delete's own tombstone must also land
+// strictly above a future-skewed peer's stored stamp. PerformDeletionAtomic (db_slice.cc)
+// captures that stamp as the tombstone arm's own prev_stamp (A5), and LocalMintFloor (mvcc.h)
+// reads it back at mint time exactly as it does for a plain arm.
+//
+// Falsifying: same revert as above; tomb->Mvcc() comes back <= peer_stamp->Mvcc() instead of
+// strictly greater.
+TEST_F(MvccStoreTest, BackwardSkewedLocalDeleteRaisesTombstoneAboveObservedFuturePeerStamp) {
+  constexpr uint32_t kPeerIdx = 51;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000051");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, future_mvcc, /*lww_guard=*/false),
+      facade::DispatchResult::OK);
+  auto peer_stamp = StampOf("k");
+  ASSERT_TRUE(peer_stamp.has_value());
+  ASSERT_EQ(peer_stamp->Mvcc(), future_mvcc);
+
+  ASSERT_EQ(Run({"del", "k"}).GetInt(), 1);
+
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_GT(tomb->Mvcc(), peer_stamp->Mvcc())
+      << "D3: the local delete's own tombstone must land strictly above the value it replaces, "
+         "even when that value's stamp is a future-skewed peer's";
+}
+
+// drakeydb: P4-4 Task A5b -- the write-after-delete half: a LOCAL write recreating a key that a
+// future-skewed peer already deleted must also land strictly above that tombstone's own stamp.
+// DbSlice::EnsureMvcc's tombstone-clearing branch (A5) is what makes the tombstone's stamp
+// available to the recreating plain arm's prev_stamp here.
+//
+// Falsifying: same revert; after->Mvcc() comes back <= tomb->Mvcc() instead of strictly greater.
+TEST_F(MvccStoreTest, BackwardSkewedLocalWriteAfterFuturePeerDeleteRaisesAboveTombstone) {
+  constexpr uint32_t kPeerIdx = 52;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000052");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "v0"}), "OK");
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(ApplyReplicatedCommand({"del", "k"}, kPeerIdx, future_mvcc, /*lww_guard=*/false),
+            facade::DispatchResult::OK);
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone());
+  ASSERT_EQ(tomb->Mvcc(), future_mvcc) << "sanity: T really is the future peer's tombstone stamp";
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  EXPECT_EQ(Run({"get", "k"}), "local");
+
+  auto after = StampOf("k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_FALSE(after->IsTombstone()) << "the recreated key must be live, not still look deleted";
+  EXPECT_GT(after->Mvcc(), tomb->Mvcc())
+      << "D3: the local recreate must land strictly above T's stamp, even though T is a "
+         "future-skewed peer's tombstone";
+}
+
+// drakeydb: P4-4 Task A5b -- D3's multi-key half: a same-shard local MSET where only ONE of two
+// keys has a future-skewed stored stamp must still raise BOTH keys to the SAME stamp, above that
+// one key's stored value -- MvccStamper::Commit stamps every currently-armed key with the same
+// entry.mvcc (mvcc.cc), and LocalMintFloor (mvcc.h) is a max over every arm pending at mint time,
+// not merely the key that itself needed the raise.
+//
+// "k1"/"k2" hash to the same shard in this fixture -- verified empirically by
+// MultiKeySameShardCommandSharesOneStamp above, which relies on the identical fact.
+//
+// Falsifying: same revert; k1_after->Mvcc() comes back below k2_before->Mvcc() (a bare HopStamp,
+// unrelated to k2's stored future value) instead of strictly greater, and typically no longer
+// equal to k2_after->Mvcc() either.
+TEST_F(MvccStoreTest, BackwardSkewedMultiKeyLocalMsetRaisesBothKeysToTheSameStamp) {
+  constexpr uint32_t kPeerIdx = 53;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000053");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "k2", "peer"}, kPeerIdx, future_mvcc, /*lww_guard=*/false),
+      facade::DispatchResult::OK);
+  auto k2_before = StampOf("k2");
+  ASSERT_TRUE(k2_before.has_value());
+  ASSERT_EQ(k2_before->Mvcc(), future_mvcc);
+  ASSERT_FALSE(StampOf("k1").has_value())
+      << "sanity: k1 starts absent -- its own arm must contribute no floor of its own";
+
+  ASSERT_EQ(Run({"mset", "k1", "v1", "k2", "v2"}), "OK");
+
+  auto k1_after = StampOf("k1");
+  auto k2_after = StampOf("k2");
+  ASSERT_TRUE(k1_after.has_value());
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_EQ(k1_after->Mvcc(), k2_after->Mvcc())
+      << "one shard callback, one entry.mvcc -- both keys committed by the same Commit() call";
+  EXPECT_GT(k1_after->Mvcc(), k2_before->Mvcc())
+      << "D3: raised strictly above k2's future-skewed stored stamp, even though k1 itself never "
+         "had a stored stamp to floor against on its own";
+}
+
+// drakeydb: P4-4 Task A5b -- D3 applies to an expiry's own tombstone too (CommitOwnTombstone,
+// mvcc.cc): a key a future-skewed peer wrote with a short TTL, expired LOCALLY, must get an
+// expiry tombstone strictly above that peer's value stamp -- never a bare HopStamp that could
+// land below it under clock skew, which would let a peer's still-live copy resurrect it forever.
+//
+// Falsifying: reverting CommitOwnTombstone's floor (mvcc.cc) back to a bare
+// `HopStamp(now_ms) | MvccClock::kTombstoneBit` reproduces: tomb->Mvcc() comes back <=
+// before->Mvcc() (this node's frozen fixture clock is far behind the peer's future stamp)
+// instead of strictly greater.
+TEST_F(MvccStoreTest, BackwardSkewedExpiryTombstoneRaisesAboveFuturePeerValueStamp) {
+  constexpr uint32_t kPeerIdx = 54;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000054");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "j", "v", "px", "10"}, kPeerIdx, future_mvcc,
+                                   /*lww_guard=*/false),
+            facade::DispatchResult::OK);
+  auto before = StampOf("j");
+  ASSERT_TRUE(before.has_value());
+  ASSERT_EQ(before->Mvcc(), future_mvcc) << "sanity: j's stored stamp really is the future one";
+
+  AdvanceTime(50);
+  Run({"get", "j"});  // triggers lazy expiry (DbSlice::ExpireIfNeeded, the read path)
+
+  auto tomb = StampOf("j");
+  ASSERT_TRUE(tomb.has_value()) << "a lazily-expired key must keep its slot, as a tombstone";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_GT(tomb->Mvcc(), before->Mvcc())
+      << "D3: the expiry's own tombstone must land strictly above the value it replaces, even "
+         "though that value's stamp is a future-skewed peer's";
+}
+
+// drakeydb: P4-4 Task A5b -- D3 is explicitly NOT a per-shard HLC ratchet (design doc D3: "not a
+// per-shard HLC ratchet -- that lets one fast-clock peer poison a whole shard's clock
+// permanently"). The raise above must never leak into MvccClock/hop_stamp_: an UNRELATED later
+// local write, on the SAME shard, must still get a plain clock stamp -- strictly below the raise
+// a sibling write needed moments earlier for a completely different key.
+//
+// "k" and "other" are forced onto the same shard deliberately: proving this on two DIFFERENT
+// shards would only show that MvccClock is per-shard (already known), never that THIS shard's own
+// clock stayed unratcheted by k's own raise.
+//
+// Falsifying: making journal::RecordEntry's mint ratchet the clock instead of computing a
+// per-entry max (e.g. `stamper->HopStamp(GetCurrentTimeMs() + 10'000'000)`, standing in for
+// "write the raised floor back into hop_stamp_/clock_") reproduces: other_stamp->Mvcc() comes
+// back >= k_stamp->Mvcc() instead of strictly below it.
+TEST_F(MvccStoreTest, LocalMintRaiseDoesNotRatchetTheSharedClock) {
+  constexpr uint32_t kPeerIdx = 55;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000055");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const unsigned num_shards = shard_set->size();
+  const std::string kKey = "k";
+  std::string other;
+  for (int i = 0; other.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find a key on the same shard as \"k\"";
+    std::string cand = absl::StrCat("other", i);
+    if (Shard(cand, num_shards) == Shard(kKey, num_shards))
+      other = cand;
+  }
+
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", kKey, "peer"}, kPeerIdx, future_mvcc, /*lww_guard=*/false),
+      facade::DispatchResult::OK);
+
+  ASSERT_EQ(Run({"set", kKey, "local"}), "OK");
+  auto k_stamp = StampOf(kKey);
+  ASSERT_TRUE(k_stamp.has_value());
+  ASSERT_GT(k_stamp->Mvcc(), future_mvcc)
+      << "sanity: k's local write really was raised -- see the backward-skew test above for the "
+         "same shape";
+
+  ASSERT_EQ(Run({"set", other, "x"}), "OK");
+  auto other_stamp = StampOf(other);
+  ASSERT_TRUE(other_stamp.has_value());
+  EXPECT_LT(other_stamp->Mvcc(), k_stamp->Mvcc())
+      << "D3 is per-entry only: an unrelated key's local mint must get a plain clock stamp, never "
+         "inherit a sibling write's raise -- a per-shard ratchet would ALSO raise this one";
+}
+
 TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
   for (int i = 0; i < 200; ++i) {
     Run({"set", absl::StrCat("k", i), "v"});

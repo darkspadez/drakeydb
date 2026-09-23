@@ -6,6 +6,8 @@
 #include <absl/cleanup/cleanup.h>
 #include <xxhash.h>
 
+#include <algorithm>  // std::max
+
 #include "base/logging.h"  // DCHECK
 
 namespace dfly {
@@ -82,6 +84,23 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
     hop_started_ms_ = now_ms;
   }
   return hop_stamp_;
+}
+
+// drakeydb: P4-4 Task A5b -- see the declaration (mvcc.h) for the full why. A pure read over
+// armed_ -- no allocation, no mutation of clock_/hop_stamp_/armed_ -- so calling this from
+// journal::RecordEntry right before its own HopStamp/AddLogRecord costs nothing extra beyond the
+// scan itself (armed_ is per-epoch and small, the same bound Arm()'s own fix-round-2 scan relies
+// on). `prev_stamp.Mvcc() == 0` excludes both a genuinely fresh {0,0} slot and an uncommitted
+// placeholder (Mvcc() masks bit 63, so PerformDeletionAtomic's {kTombstoneBit, 0} lands here too)
+// -- neither carries a real prior stamp to floor a local mint against.
+uint64_t MvccStamper::LocalMintFloor() const {
+  uint64_t floor = 0;
+  for (const Armed& a : armed_) {
+    if (a.prev_stamp.Mvcc() == 0)
+      continue;
+    floor = std::max(floor, a.prev_stamp.Mvcc() + 1);
+  }
+  return floor;
 }
 
 void MvccStamper::Arm(DbIndex db_index, std::string_view key, const MvccStamp& prev_stamp) {
@@ -211,7 +230,15 @@ bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uin
                                  "iteration over the same container";
   for (auto it = armed_.begin(); it != armed_.end(); ++it) {
     if (it->db_index == db_index && it->tombstone && ArmedKey(*it) == key) {
-      const MvccStamp stamp{HopStamp(now_ms) | MvccClock::kTombstoneBit, OriginHash(0)};
+      // drakeydb: P4-4 Task A5b -- spec D3 applies to an expiry's own tombstone too: it must not
+      // stamp below the value it deletes (clock skew can otherwise make the freshly-minted
+      // HopStamp alone land below `it->prev_stamp`, the value this exact arm is replacing).
+      // Floored against THIS arm's own prev only -- never armed_ as a whole -- since this call
+      // commits exactly one arm, unlike Commit()'s sweep of every currently-armed key.
+      const uint64_t prev_mvcc = it->prev_stamp.Mvcc();
+      const uint64_t floor = prev_mvcc == 0 ? 0 : prev_mvcc + 1;
+      const MvccStamp stamp{std::max(HopStamp(now_ms), floor) | MvccClock::kTombstoneBit,
+                            OriginHash(0)};
       ++commit_depth_;
       // RAII, matching Commit()'s own exception-safety contract (fn may throw): erase this one
       // arm and restore commit_depth_ whether or not fn throws. Does not touch arena_ -- same as
