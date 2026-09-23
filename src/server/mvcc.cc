@@ -26,14 +26,21 @@ uint64_t NodeUuidHash(std::string_view uuid) {
 // stamp to floor against. `!(incoming < stored)` covers both "incoming is strictly newer" and an
 // exact tie -- both commit verbatim, unchanged from before this task.
 //
-// drakeydb: P4-4 Task A5 fix round 1 -- the `stored.Mvcc() == 0` check is redundant given this
-// function's only real caller's own precondition (journal::RecordEntry only floors an APPLIED
-// write, whose `incoming` is a non-zero author mvcc by definition -- see RecordEntry's `applied`
-// check -- so `incoming < stored` is already false whenever `stored.Mvcc() == 0`). Kept anyway:
-// this is a general pure function, exercised directly in mvcc_test.cc without going through that
-// caller, and a `stored.Mvcc() == 0` slot has no real prior stamp regardless of what `incoming`
-// happens to be, so relying on an undocumented caller invariant to get the right answer here would
-// make the function's own correctness depend on something this file cannot see or enforce.
+// drakeydb: P4-4 Task A5 fix round 1 (correction in fix round 3) -- the `stored.Mvcc() == 0`
+// check is NOT strictly redundant, despite this function's only real caller gating on
+// journal::RecordEntry's `applied` flag (`mvcc != 0` on the caller-supplied RAW wire value):
+// `applied` only guarantees the raw wire mvcc is nonzero, not that its MASKED Mvcc() is -- a
+// wire value of EXACTLY `MvccClock::kTombstoneBit` (bit 63 set, every other bit clear) is
+// `applied` (nonzero as a raw integer) yet has `incoming.Mvcc() == 0`. If `stored` ALSO has
+// `Mvcc() == 0` but a nonzero `origin_hash` (a malformed or placeholder-shaped value that is not
+// exactly {0,0}), `incoming < stored` can still be true by origin_hash alone, and without this
+// check the function would wrongly take the floor branch and return a corrupted result --
+// `stored.Mvcc() | tomb_bit` collapses to just the tombstone bit (or 0), discarding `incoming`'s
+// own value entirely -- instead of recognizing there is no real prior stamp to floor against.
+// This is a general pure function regardless, exercised directly in mvcc_test.cc without going
+// through that caller, so relying on ANY caller invariant here -- even one that turned out to
+// hold -- would make the function's own correctness depend on something this file cannot see or
+// enforce.
 MvccStamp FloorAppliedStamp(const MvccStamp& stored, const MvccStamp& incoming) {
   if (stored.Mvcc() == 0 || !(incoming < stored))
     return incoming;

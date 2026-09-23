@@ -250,8 +250,16 @@ class MvccStamper {
 
   // May be called more than once for the same (db_index, key) within one callback -- a command
   // can take a second, independent FindMutable/AutoUpdater on a key it is about to delete (e.g.
-  // DeleteHw, DelMutable's other callers). Duplicates are harmless: Commit() below just calls its
-  // CommitFn once per arm with the same stamp.
+  // DeleteHw, DelMutable's other callers). Duplicates are harmless for an ORDINARY plain arm:
+  // Commit() below just calls its CommitFn once per arm with the same stamp.
+  //
+  // KNOWN RESIDUAL, deliberately parked, not fixed: for a key deleted then recreated within this
+  // SAME callback (see fix round 2's comment below), only the FIRST plain re-arm inherits the
+  // tombstone arm's true prior stamp. By the time a SECOND plain Arm() call for that same key
+  // runs, the table has already been reset to a genuine {0,0} by the first re-arm's own
+  // EnsureMvcc call -- indistinguishable from a genuinely fresh key -- so it floors (verbatim)
+  // against THAT instead, and Commit() processing arms in order means this second, wrong commit
+  // silently overwrites the first re-arm's correct floor.
   //
   // drakeydb: P4-4 Task A5 fix round 1 -- `prev_stamp` is this key's stamp from BEFORE this
   // write, mandatory (no default -- a caller that skipped capturing it would silently commit the
@@ -374,17 +382,22 @@ class MvccStamper {
     uint32_t off;
     uint32_t len;
     // drakeydb: P4-3 Task 2 -- true for an ArmTombstone()'d entry; Commit() ORs kTombstoneBit
-    // into the stamp it hands this arm's CommitFn call, and only this arm's. Defaulted so every
-    // existing Armed{db_index, off, len} aggregate-init (Arm(), mvcc.cc) keeps compiling unchanged.
+    // into the stamp it hands this arm's CommitFn call, and only this arm's. `= false`, not a
+    // bare declaration -- purely defensive today (both Arm() and ArmTombstone(), mvcc.cc, already
+    // fully specify all 5 fields of every Armed{} they construct; see prev_stamp's own comment
+    // below for the identical reasoning).
     bool tombstone = false;
-    // drakeydb: P4-4 Task A5 -- ArmTombstone's captured pre-delete stamp (see its own comment
-    // above); fresh {0,0} for a plain Arm() and for any ArmTombstone call that supplies none.
-    // Handed to Commit()'s CommitFn verbatim as that call's 4th argument -- see CommitFn's own
-    // comment for why only a tombstone arm's caller ever reads it. `{}`, not a bare declaration:
-    // an explicit default member initializer here (matching `tombstone`'s own `= false` above)
-    // is what keeps every existing Armed{db_index, off, len} aggregate-init (Arm(), mvcc.cc)
-    // compiling WITHOUT -Wmissing-field-initializers, not merely MvccStamp's own defaulted
-    // members -- GCC warns per-field-of-the-enclosing-aggregate, not per-field-of-the-nested-type.
+    // drakeydb: P4-4 Task A5 -- this arm's captured pre-mutation stamp: ArmTombstone's own 3rd
+    // argument for a tombstone arm (PerformDeletionAtomic's pre-delete capture, db_slice.cc), or
+    // Arm()'s own 3rd argument for a plain arm (DbSlice::EnsureMvcc's return, PostUpdate --
+    // possibly itself replaced by an inherited tombstone arm's own prev_stamp, fix round 2, see
+    // Arm()'s own comment). Handed to Commit()'s CommitFn verbatim as that call's 5TH argument;
+    // the journal.cc lambda reads it for BOTH arm kinds, never a live table lookup (fix round 1).
+    // `{}`, not a bare declaration, matching `tombstone`'s own `= false` above -- purely
+    // defensive today: both current callers (Arm(), ArmTombstone(), mvcc.cc) already fully
+    // specify all 5 fields of every Armed{} they construct, so nothing relies on this default,
+    // but a FUTURE partial aggregate-init would otherwise silently default to "nothing to floor
+    // against" instead, with no -Wmissing-field-initializers warning to flag the omission.
     MvccStamp prev_stamp{};
   };
 

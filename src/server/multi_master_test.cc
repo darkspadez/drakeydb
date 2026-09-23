@@ -2578,15 +2578,18 @@ TEST_F(MvccStoreTest, AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim) {
 //
 // drakeydb: P4-4 Task A5 fix round 1 -- k2's own assertions below changed: k2's LIVE recreate
 // (OpMSet's own Set() call for it, right after its lazy expiry) now floors against that expiry's
-// OWN self-minted tombstone stamp -- DbSlice::EnsureMvcc (db_slice.cc) captures whatever the slot
-// held before this write, including a tombstone it itself just cleared, and PostUpdate carries
-// that on k2's arm for exactly this purpose. That tombstone's mvcc is a real, freshly minted
-// HopStamp from the live (mocked, advanced) wall clock -- always far larger than the literal
-// kAuthorMvcc below -- so k2's committed stamp floors to just-below it, never kAuthorMvcc
-// verbatim. The exact value is not independently observable from this test without either
-// minting it a second time (impossible -- HopStamp is one-shot per epoch) or expiring k2 in a
-// separate, earlier step, which would remove the mid-MSET lazy-expiry race this test exists to
-// exercise -- so the assertions below pin the FLOORED shape, not the floor's exact value.
+// OWN self-minted tombstone stamp E -- DbSlice::EnsureMvcc (db_slice.cc) captures whatever the
+// slot held before this write, including a tombstone it itself just cleared, and PostUpdate
+// carries that on k2's arm for exactly this purpose. E's mvcc is a real, freshly minted HopStamp
+// from the live (mocked, advanced) wall clock, so it is not independently predictable from this
+// test without either minting it a second time (impossible -- HopStamp is one-shot per epoch) or
+// expiring k2 in a separate, earlier step, which would remove the mid-MSET lazy-expiry race this
+// test exists to exercise. The assertions below still pin the floor EXACTLY, though: E.Mvcc() is
+// whatever k2's own committed stamp's Mvcc() turns out to be (the floor preserves that field
+// unchanged, so reading it back off the result and using it to build the expected comparison
+// stamp is not circular), and origin_hash/bit 63 are independently known regardless (one below
+// this node's own registered self hash, never a tombstone) -- fix round 3 tightened this from a
+// looser shape check to a single whole-stamp comparison.
 TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   constexpr uint32_t kPeerIdx = 6;
   constexpr uint64_t kAuthorMvcc = 0x7777'0000'2222ULL;
@@ -2627,15 +2630,19 @@ TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
 
   auto st2 = StampOf(k2);
   ASSERT_TRUE(st2.has_value());
-  EXPECT_FALSE(st2->IsTombstone()) << "k2's recreate is a live write, not a delete -- the floor "
-                                      "must never leave it looking like a tombstone";
-  EXPECT_GT(st2->Mvcc(), kAuthorMvcc)
-      << "k2 itself IS stamped by MSET's own trailing commit (not left as the expiry's own "
-         "tombstone, and not silently dropped) -- but floored against that expiry's real, "
-         "wall-clock-minted stamp, strictly greater than the literal kAuthorMvcc, never "
-         "kAuthorMvcc verbatim";
-  EXPECT_NE(st2->origin_hash, peer_hash)
-      << "the floor lands one origin_hash below the expiry's SELF stamp -- never the peer's own";
+  ASSERT_GT(st2->Mvcc(), kAuthorMvcc)
+      << "sanity: k2 must be stamped by MSET's own trailing commit (not left as the expiry's own "
+         "tombstone, and not silently dropped), floored against that expiry's real, wall-clock-"
+         "minted stamp E -- strictly greater than the literal kAuthorMvcc, never kAuthorMvcc "
+         "verbatim";
+  uint64_t self_origin_hash = 0;
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { self_origin_hash = MvccStamper::tlocal()->OriginHash(0); });
+  // Whole-stamp equality: st2->Mvcc() IS E.Mvcc() (the floor preserves the mvcc field
+  // unchanged), so this pins origin_hash at EXACTLY self_origin_hash - 1 -- one below E's own
+  // self-mint, never the peer's -- and bit 63 at EXACTLY 0 -- a live write, never left looking
+  // like a tombstone -- in one comparison, rather than three separate, weaker checks.
+  EXPECT_EQ(*st2, (MvccStamp{st2->Mvcc(), self_origin_hash - 1}));
 }
 
 // drakeydb: P4-3 Task 11, review ruling I2 -- a lazy expiry firing while applying a peer's
@@ -3490,56 +3497,79 @@ TEST_F(MvccStoreTest, UnguardedAppliedRmwOverATombstonedSlotFloorsAgainstTheTomb
 
 // drakeydb: P4-4 Task A5 fix round 2 -- the "DEL + re-create in one entry" case fix round 1
 // found but did not close: RENAME onto an EXISTING dest, applied unguarded, is Renamer::
-// DeserializeDest's own delete-then-recreate dance (generic_family.cc): DelMutable(dest) ->
-// ArmTombstone (captures dest's true prior stamp S) -> loader.Add(dest) + post_updater.Run() ->
-// EnsureMvcc (sees PerformDeletionAtomic's own placeholder, NOT S) -> Arm(). Without the fix,
-// dest's live (recreate) arm floors against that placeholder (Mvcc()==0, "nothing to floor
-// against") and commits its author stamp VERBATIM -- confirmed empirically in fix round 1's
-// exploration, removed rather than asserted as a false pass. MvccStamper::Arm now recognizes the
-// placeholder shape and inherits the still-pending tombstone arm's own prev_stamp (S) instead
-// (mvcc.h/.cc), so dest's live arm floors against S directly: a SINGLE floor, never verbatim and
-// never floored twice (once via the tombstone arm's own commit, again via the live arm's).
-// "{h}a"/"{h}b" share a lock tag so they land on the same shard (KeySlot/LockTagOptions::Tag,
-// cluster_support.cc/common.cc), matching the real single-shard DeserializeDest path this test
-// exercises -- an arbitrary cross-shard pair would not reproduce the one-callback, two-arm shape.
+// DeserializeDest's own delete-then-recreate dance (generic_family.cc) -- but ONLY when src and
+// dest land on DIFFERENT shards. RenameGeneric (generic_family.cc:1229-1236) routes a
+// single-shard rename (src and dest already on the SAME shard, tx->GetUniqueShardCnt() == 1)
+// straight to OpRen instead, which overwrites dest IN PLACE (FindMutable + post_updater.Run) and
+// never deletes it at all -- no placeholder, no tombstone arm, nothing to inherit. This test
+// therefore picks src_key/dest_key explicitly on DIFFERENT shards (asserted below, not left to
+// chance), forcing the CROSS-shard path: DelMutable(dest) -> ArmTombstone (captures dest's true
+// prior stamp S) -> loader.Add(dest) + post_updater.Run() -> EnsureMvcc (sees
+// PerformDeletionAtomic's own placeholder, NOT S) -> Arm(). Without the round-2 fix, dest's live
+// (recreate) arm floors against that placeholder (Mvcc()==0, "nothing to floor against") and
+// commits its author stamp VERBATIM. MvccStamper::Arm now recognizes the placeholder shape and
+// inherits the still-pending tombstone arm's own prev_stamp (S) instead (mvcc.h/.cc), so dest's
+// live arm floors against S directly: a SINGLE floor, never verbatim and never floored twice
+// (once via the tombstone arm's own commit, again via the live arm's).
 TEST_F(MvccStoreTest, RenameOntoExistingDestAppliedUnguardedFloorsOnceAgainstDestStamp) {
   constexpr uint32_t kPeerIdx = 41;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a5a5-4000-8000-000000000041");
   RegisterPeerOriginHash(kPeerIdx, peer_hash);
 
-  ASSERT_EQ(Run({"set", "{h}a", "v1"}), "OK");
-  ASSERT_EQ(Run({"set", "{h}b", "v0"}), "OK");
-  auto a_before = StampOf("{h}a");
-  auto b_before = StampOf("{h}b");
-  ASSERT_TRUE(a_before.has_value());
-  ASSERT_TRUE(b_before.has_value());
-  constexpr uint64_t kAuthorMvcc = 0x1000ULL;  // strictly older than any real HopStamp
-  ASSERT_GT(b_before->Mvcc(), kAuthorMvcc) << "sanity: dest's S must be newer than the author's";
+  // Same shard-search idiom ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc (above) uses for
+  // the opposite requirement: here src_key and dest_key must land on DIFFERENT shards, or RENAME
+  // takes the single-shard OpRen path instead of the cross-shard Renamer::DeserializeDest one
+  // this test exists to exercise.
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "this test's entire point is exercising the CROSS-shard "
+                               "Renamer::DeserializeDest path, which needs at least 2 shards";
+  std::string src_key, dest_key;
+  for (int i = 0; dest_key.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find a key on a different shard from src_key";
+    std::string cand = absl::StrCat("rn", i);
+    if (src_key.empty()) {
+      src_key = cand;
+    } else if (Shard(cand, num_shards) != Shard(src_key, num_shards)) {
+      dest_key = cand;
+    }
+  }
+  ASSERT_NE(Shard(src_key, num_shards), Shard(dest_key, num_shards))
+      << "sanity: src_key and dest_key must land on different shards, or this test silently "
+         "degrades to exercising OpRen instead of Renamer::DeserializeDest";
 
-  facade::DispatchResult res = ApplyReplicatedCommand({"rename", "{h}a", "{h}b"}, kPeerIdx,
+  ASSERT_EQ(Run({"set", src_key, "v1"}), "OK");
+  ASSERT_EQ(Run({"set", dest_key, "v0"}), "OK");
+  auto src_before = StampOf(src_key);
+  auto dest_before = StampOf(dest_key);
+  ASSERT_TRUE(src_before.has_value());
+  ASSERT_TRUE(dest_before.has_value());
+  constexpr uint64_t kAuthorMvcc = 0x1000ULL;  // strictly older than any real HopStamp
+  ASSERT_GT(dest_before->Mvcc(), kAuthorMvcc) << "sanity: dest's S must be newer than the author's";
+
+  facade::DispatchResult res = ApplyReplicatedCommand({"rename", src_key, dest_key}, kPeerIdx,
                                                       kAuthorMvcc, /*lww_guard=*/false);
   EXPECT_EQ(res, facade::DispatchResult::OK);
-  EXPECT_EQ(Run({"get", "{h}b"}), "v1") << "the rename's value must still apply";
-  EXPECT_EQ(Run({"exists", "{h}a"}).GetInt(), 0);
+  EXPECT_EQ(Run({"get", dest_key}), "v1") << "the rename's value must still apply";
+  EXPECT_EQ(Run({"exists", src_key}).GetInt(), 0);
 
-  auto dest = StampOf("{h}b");
+  auto dest = StampOf(dest_key);
   ASSERT_TRUE(dest.has_value());
   EXPECT_FALSE(dest->IsTombstone())
       << "the destination still ends up live, self-correcting exactly as "
          "RenameOntoAnExistingDestSelfCorrectsToALiveStamp proves for a LOCAL rename";
   // Whole-stamp equality: pins bit 63 at exactly 0, and Mvcc()/origin_hash exactly -- a SINGLE
   // floor against dest's own true prior stamp, not verbatim (kAuthorMvcc) and not floored twice
-  // (b_before.origin_hash - 2, which double-flooring through the placeholder-then-real chain
+  // (dest_before.origin_hash - 2, which double-flooring through the placeholder-then-real chain
   // would produce).
-  EXPECT_EQ(*dest, (MvccStamp{b_before->Mvcc(), b_before->origin_hash - 1}))
+  EXPECT_EQ(*dest, (MvccStamp{dest_before->Mvcc(), dest_before->origin_hash - 1}))
       << "dest's live (recreate) arm must inherit the tombstone arm's captured S, floor against "
          "it directly -- never PerformDeletionAtomic's own placeholder, and never S already "
          "floored once by the tombstone arm's own commit";
 
-  auto src_tomb = StampOf("{h}a");
+  auto src_tomb = StampOf(src_key);
   ASSERT_TRUE(src_tomb.has_value());
   EXPECT_TRUE(src_tomb->IsTombstone());
-  EXPECT_EQ(*src_tomb, (MvccStamp{a_before->Mvcc(), a_before->origin_hash - 1}.AsTombstone()))
+  EXPECT_EQ(*src_tomb, (MvccStamp{src_before->Mvcc(), src_before->origin_hash - 1}.AsTombstone()))
       << "src's own tombstone floors against ITS OWN prior stamp, per the ordinary single-arm "
          "rule -- src was never re-armed live in this same entry, so it needs no inheritance";
 }
