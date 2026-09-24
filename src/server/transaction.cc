@@ -748,8 +748,8 @@ void Transaction::RunCallback(EngineShard* shard) {
   try {
     // drakeydb: P4-4 -- a dropped write's callback never runs at all: nothing is written, and
     // (via LogAutoJournalOnShard's own lww_dropped parameter below) nothing is journaled either,
-    // including the auto-journal that SETNX/GETDEL/PERSIST/RESTORE/GETSET would otherwise still
-    // emit verbatim -- an auto-journaled drop would otherwise still reach sub-replicas even though
+    // including the auto-journal that SETNX/GETDEL/RESTORE/GETSET would otherwise still emit
+    // verbatim -- an auto-journaled drop would otherwise still reach sub-replicas even though
     // this node never actually wrote it. OpStatus::OK (never a non-OK status) so a fully dropped
     // entry counts as successfully applied: signaling the drop any other way would either
     // CHECK-fail the multi-shard path below or force a full resync on every LWW conflict.
@@ -1785,8 +1785,8 @@ void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult resul
     return;
 
   // drakeydb: P4-4 -- a dropped write journals NOTHING, including the auto-journal: SETNX,
-  // GETDEL, PERSIST, RESTORE and GETSET are auto-journaled verbatim (no explicit RecordJournal of
-  // their own), so without this early return a drop would still forward the client's original
+  // GETDEL, RESTORE and GETSET are auto-journaled verbatim (no explicit RecordJournal of their
+  // own), so without this early return a drop would still forward the client's original
   // command to sub-replicas even though this node's own copy was never touched -- the exact
   // divergence the veto exists to prevent. Checked before the SQUASHER/IsJournaled/journal()
   // gates below only because it is cheapest; those gates are also correct for a dropped entry

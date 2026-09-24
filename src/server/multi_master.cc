@@ -135,9 +135,9 @@ bool ValidateMultiMasterFlags() {
   }
   // drakeydb: P4-4 -- this warning used to say every stable-sync apply stayed arrival-order
   // "until P4-4", with no flag to change that. P4-4 added --multi_master_stream_lww (default
-  // true): a guarded command's own replicated write (SET, SETNX, GETSET, GETDEL, PEXPIREAT,
-  // PERSIST, RESTORE, and MSET/DEL's own per-key split -- see docs/multi-master.md for the full
-  // table) is now LWW-compared against the local stamp on stream, the same rule full-sync merge
+  // true): a guarded command's own replicated write (SET, SETNX, GETSET, GETDEL, RESTORE, and
+  // MSET/DEL's own per-key split -- see docs/multi-master.md for the full table) is now
+  // LWW-compared against the local stamp on stream, the same rule full-sync merge
   // already used (ties favor the stored side). Only turning that flag off brings back the old
   // arrival-order behavior for those commands; full-sync merge LWW (MergeAccepts, mvcc.h) is
   // unconditional either way and does not read this flag.
