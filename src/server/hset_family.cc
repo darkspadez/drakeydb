@@ -1702,7 +1702,7 @@ bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std:
             db_cntx.db_index, key,
             [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
                          const MvccStamp&) {
-              // drakeydb: P4-4 Task FW-A1 -- has_prior_stamp false means the hash's own
+              // drakeydb: P4-4 -- has_prior_stamp false means the hash's own
               // pre-delete stamp was never real (see CommitOwnTombstone's own comment, mvcc.h):
               // erase the slot rather than install an unsafe Mvcc()==0 tombstone.
               if (has_prior_stamp) {

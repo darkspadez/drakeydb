@@ -1747,8 +1747,9 @@ DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext m
   // drakeydb: P4-4 Task A2 -- the streaming LWW guard's per-link bit (see
   // ConnectionContext::repl_lww_guard, JournalExecutor::SetApplyLwwGuard,
   // Transaction::IsLwwGuarded). Read ONCE here, at flow setup, matching SetApplyOrigin above --
-  // never per entry (journal.cc:26-32 documents an uncached absl::GetFlag on a hot path as a
-  // known defect class in this codebase). A plain replica (peer_mode == false) is never guarded
+  // never per entry (journal.cc's own MvccEnabled() helper documents an uncached absl::GetFlag on
+  // a hot path as a known defect class in this codebase). A plain replica (peer_mode == false) is
+  // never guarded
   // regardless of the flag or IsActiveReplica(); this constructor does not yield (see the long
   // comment below), and reading a flag does not yield either.
   executor_->SetApplyLwwGuard(peer_mode && IsActiveReplica() &&

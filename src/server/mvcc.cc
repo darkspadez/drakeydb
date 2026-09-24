@@ -89,7 +89,7 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
 // drakeydb: P4-4 Task A5b -- see the declaration (mvcc.h) for the full why. A pure read over
 // armed_ -- no allocation, no mutation of clock_/hop_stamp_/armed_ -- so calling this from
 // journal::RecordEntry, alongside its own HopStamp call, costs nothing extra beyond the scan
-// itself (armed_ is per-epoch and small, the same bound Arm()'s own fix-round-2 scan relies on).
+// itself (armed_ is per-epoch and small, the same bound Arm()'s own scan already relies on).
 // `prev_stamp.Mvcc() == 0` excludes both a genuinely fresh {0,0} slot and an uncommitted
 // placeholder (Mvcc() masks bit 63, so PerformDeletionAtomic's {kTombstoneBit, 0} lands here too)
 // -- neither carries a real prior stamp to floor a local mint against.
@@ -254,11 +254,14 @@ bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, con
       // rather than a genuine committed tombstone -- TombstoneGcStep would then skip it forever
       // (immortal, never reaped) and the RDB load path would refuse to reinstall it after a
       // save/load round-trip. `has_prior_stamp` false instead signals the caller (below) to erase
-      // the slot outright: the same ordering semantics a real tombstone would give (nothing beats
-      // nothing -- an absent slot loses to every future write, local or peer, exactly as a fresh
-      // {0,0} slot already does), without the immortality hazard, and the same "erase, don't
-      // tombstone" precedent PerformDeletionAtomic's own kEvicted/kSlotFlush deletes already use
-      // (ArmTombstone's comment, mvcc.h).
+      // the slot outright. This is NOT the same ordering semantics a real tombstone would give:
+      // MergeAccepts(nullopt, x) -- what an erased/absent slot compares as -- accepts EVERY
+      // incoming x unconditionally, even one that itself carries no real authority (an incoming
+      // {0,0}); a genuine {*, 1} tombstone would have correctly rejected that same incoming {0,0}
+      // instead (ties favor stored). Erasing avoids the immortality hazard -- see D-29,
+      // ISSUE-REGISTER.md, for the resurrection residual this trades it for -- and matches the
+      // same "erase, don't tombstone" precedent PerformDeletionAtomic's own kEvicted/kSlotFlush
+      // deletes already use (ArmTombstone's comment, mvcc.h).
       const uint64_t prev_mvcc = it->prev_stamp.Mvcc();
       const bool has_prior_stamp = prev_mvcc != 0;
       const MvccStamp stamp = has_prior_stamp ? ExpiryTombstoneFor(it->prev_stamp) : MvccStamp{};

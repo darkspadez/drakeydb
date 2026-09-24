@@ -681,7 +681,7 @@ class DflyShardReplicaOriginTest : public BaseFamilyTest {
   // drakeydb: P4-4 Task A10 -- same journal-blob technique as RunGuardedJournalBlobLoad above, but
   // exercises the REAL production forwarding call (DflyShardReplica::ApplyPeerFullSyncLwwGuard,
   // replica.cc) instead of setting rdb_loader_'s guard directly: constructs a flow with the given
-  // `peer_mode` (the constructor alone decides executor_'s guard bit -- see A2's
+  // `peer_mode` (the constructor alone decides executor_'s guard bit -- see
   // ConstructorThreadsLwwGuardIntoExecutor; the caller sets FLAGS_active_replica/
   // FLAGS_multi_master_stream_lww beforehand), then calls the real flow.ApplyPeerFullSyncLwwGuard()
   // to thread that bit onto rdb_loader_ exactly as FullSyncDflyFb's peer_mode_ block does in
@@ -826,9 +826,9 @@ TEST_F(DflyShardReplicaOriginTest, FullSyncJournalBlobAppliesAndReJournalsWithFl
 // compare (Transaction::ShouldDropForLww/MergeAccepts, untouched by A10) and both the value and
 // its stamp survive untouched, and multimaster_lww_dropped advances by exactly one; unguarded,
 // the same stale write applies unconditionally (plain arrival order -- the GUARD's compare is
-// never run, though Task A5's own floor compare, see below, still runs on every applied write
+// never run, though FloorAppliedStamp's own compare, see below, still runs on every applied write
 // regardless of guard state). Its committed stamp is NOT the peer's raw 0x1000 verbatim, though:
-// Task A5's FloorAppliedStamp (mvcc.cc, unrelated to A10's own guard -- it fires for ANY applied
+// FloorAppliedStamp (mvcc.cc, unrelated to the LWW guard's own compare -- it fires for ANY applied
 // write, guarded or not, whose author mvcc is older than the key's own) floors it to one tick
 // below the stored stamp instead, so an applied write can never rewind a key's stamp. With
 // stored.origin_hash != 0, that floor is exactly {stored.Mvcc(), stored.origin_hash - 1}
@@ -902,8 +902,8 @@ TEST_F(DflyShardReplicaLwwGuardTest, PeerFullSyncJournalBlobHonorsLwwGuard) {
         << "unguarded: the stale peer write must still apply (plain arrival order)";
     std::optional<MvccStamp> stamp = stamp_of(key);
     ASSERT_TRUE(stamp.has_value());
-    // A5's FloorAppliedStamp, not A10's guard: kLocalStamp.origin_hash != 0, so the floor is
-    // {stored.Mvcc(), stored.origin_hash - 1} -- see this test's own top comment.
+    // FloorAppliedStamp, not the LWW guard's own compare: kLocalStamp.origin_hash != 0, so the
+    // floor is {stored.Mvcc(), stored.origin_hash - 1} -- see this test's own top comment.
     EXPECT_EQ(*stamp, (MvccStamp{kLocalStamp.Mvcc(), kLocalStamp.origin_hash - 1}))
         << "unguarded: an applied write's stamp is floored one tick below the stored stamp, "
            "never rewound to the peer's older mvcc verbatim";
@@ -923,12 +923,13 @@ TEST_F(DflyShardReplicaLwwGuardTest, PeerFullSyncJournalBlobHonorsLwwGuard) {
 //
 // active_replica is held fixed at true throughout (this fixture's own constructor -- required for
 // the mvcc side table these tests' stamp assertions read via db_slice.SetMvcc/GetMvcc); it is NOT
-// varied here, so this is NOT A2's full three-gate matrix. What IS covered, over
-// (peer_mode x FLAGS_multi_master_stream_lww): peer_mode=true + flag=true -> guarded (the
-// method's normal use); peer_mode=false (flag on) -> never guarded, matching A2's own framing for
-// executor_ -- the most important case (not separately re-run with the flag off here:
-// ApplyPeerFullSyncLwwGuard has no peer_mode-dependent branch of its own, only a verbatim read of
-// executor_'s bit, and A2's ConstructorThreadsLwwGuardIntoExecutor already covers executor_ under
+// varied here, so this is NOT ConstructorThreadsLwwGuardIntoExecutor's full three-gate matrix.
+// What IS covered, over (peer_mode x FLAGS_multi_master_stream_lww): peer_mode=true + flag=true
+// -> guarded (the method's normal use); peer_mode=false (flag on) -> never guarded, matching
+// ConstructorThreadsLwwGuardIntoExecutor's own framing for executor_ -- the most important case
+// (not separately re-run with the flag off here: ApplyPeerFullSyncLwwGuard has no
+// peer_mode-dependent branch of its own, only a verbatim read of executor_'s bit, and
+// ConstructorThreadsLwwGuardIntoExecutor already covers executor_ under
 // peer_mode=false with the flag on -- the flag-off sub-case is not separately re-run for
 // peer_mode=false in either test, since a plain replica is unguarded either way and the flag's
 // only observable effect is on the peer_mode=true branch, which IS covered below with flag=OFF);
@@ -971,7 +972,7 @@ TEST_F(DflyShardReplicaLwwGuardTest, ApplyPeerFullSyncLwwGuardMirrorsExecutorGua
 
   {
     // Peer link, active node, flag on: rdb_loader_ must end up guarded, exactly like executor_
-    // (A2's ConstructorThreadsLwwGuardIntoExecutor).
+    // (see ConstructorThreadsLwwGuardIntoExecutor).
     const std::string key = Shard0Key("a10-flow-guarded-");
     ASSERT_EQ(Run({"SET", key, "local"}), "OK");
     shard_set->Await(0, [&] {
@@ -988,7 +989,8 @@ TEST_F(DflyShardReplicaLwwGuardTest, ApplyPeerFullSyncLwwGuardMirrorsExecutorGua
 
   {
     // Plain (non-peer) replica: rdb_loader_ must NEVER be guarded, regardless of the other gates
-    // -- the most important case, matching A2's own framing for executor_.
+    // -- the most important case, matching ConstructorThreadsLwwGuardIntoExecutor's own framing
+    // for executor_.
     const std::string key = Shard0Key("a10-flow-unguarded-");
     ASSERT_EQ(Run({"SET", key, "local"}), "OK");
     shard_set->Await(0, [&] {

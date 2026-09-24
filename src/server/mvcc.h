@@ -456,11 +456,15 @@ class MvccStamper {
   // own synchronous, mid-epoch placeholder, never a genuine committed one, so installing one here
   // would make it immortal (never reaped, never reinstalled across a save/load round-trip). `fn`
   // is instead called with `tombstone=false` and an empty (`Mvcc()==0`, `origin_hash==0`) stamp in
-  // that case, signalling the caller to erase the slot outright rather than commit a value to it --
-  // the same ordering semantics a real tombstone would have (nothing beats nothing: an absent slot
-  // loses to every future write, local or peer, same as a fresh {0,0} slot already does) without
-  // the immortality hazard, and the same "erase, don't tombstone" precedent PerformDeletionAtomic's
-  // own kEvicted/kSlotFlush deletes already use (ArmTombstone's comment, above). Returns true if it
+  // that case, signalling the caller to erase the slot outright rather than commit a value to it.
+  // This is NOT the same ordering semantics a real tombstone would have: MergeAccepts(nullopt, x)
+  // -- what an erased/absent slot compares as -- accepts EVERY incoming x unconditionally, even
+  // one that itself carries no real authority (an incoming {0,0}); a genuine {*, 1} tombstone (one
+  // origin_hash tick above the {0,0} the value itself carried) would have correctly rejected that
+  // same incoming {0,0} instead (ties favor stored, and {0,1} is not a tie). Erasing avoids the
+  // immortality hazard -- see D-29, ISSUE-REGISTER.md, for the resurrection residual this trades
+  // it for -- and matches the same "erase, don't tombstone" precedent PerformDeletionAtomic's own
+  // kEvicted/kSlotFlush deletes already use (ArmTombstone's comment, above). Returns true if it
   // found and processed (removing) that arm either way; false only if no matching arm was armed at
   // all (TombstonesEnabled() is false, the delete was outside the default namespace, or
   // PerformDeletionAtomic degraded to a plain erase at the tombstone cap) -- every caller branches

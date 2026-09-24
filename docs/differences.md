@@ -33,8 +33,9 @@ This is a **one-way door for incompatible consumers**: a snapshot written by an 
 only be loaded by a drakeydb binary (the read side understands opcode 221 unconditionally, active
 or not) — never by a stock Dragonfly. Negotiated drakeydb full sync deliberately carries the same
 snapshot stream, including opcode 221. Peer admission requires the current fork protocol version
-(`kDrakeydbReplVersion`, `node_identity.h` — **`67`** as of P4-3; opcode 221 alone first required
-`66`, bumped again when P4-3 added opcode 225, see `docs/multi-master.md`) before a single byte is
+(`kDrakeydbReplVersion`, `node_identity.h` — **`68`** as of P4-4; opcode 221 alone first required
+`66`, bumped to `67` when P4-3 added opcode 225, bumped again to `68` for P4-4's streaming LWW
+guard and applied-write stamp floor, see `docs/multi-master.md`) before a single byte is
 sent, so an older drakeydb, stock Dragonfly, or plain Redis consumer can never receive it from an
 active node. The compatibility cliff therefore
 appears when an active snapshot **file** is copied by hand onto a stock Dragonfly's `--dir` (or

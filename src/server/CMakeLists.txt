@@ -48,8 +48,15 @@ add_library(dfly_transaction db_slice.cc blocking_controller.cc
             server_state.cc table.cc  transaction.cc tx_base.cc
             serializer_commons.cc
             # drakeydb: P4-4 -- moved from dragonfly_lib below. Its callers (server_state.h/.cc's
-            # egress_throttler_ member, snapshot.*, and journal/streamer.cc) all live in or below
-            # dfly_transaction, which dragonfly_lib depends on, not the reverse; leaving it in
+            # egress_throttler_ member, and journal/streamer.cc) both live IN dfly_transaction
+            # itself (server_state.cc above, journal/streamer.cc via DF_JOURNAL_SRCS above), which
+            # dragonfly_lib depends on, not the reverse -- snapshot.cc lives in dragonfly_lib
+            # (below in this file), not dfly_transaction, but was never at risk of the hazard this
+            # comment describes: dragonfly_lib always links dfly_transaction transitively (see
+            # cxx_link(dragonfly_lib dfly_transaction ...) below), so a single dragonfly_lib
+            # target's own object files never hit the cross-archive resolution gap the next
+            # paragraph names -- only a target that pulls dfly_transaction's server_state.cc.o
+            # WITHOUT dragonfly_lib does. Leaving it in
             # dragonfly_lib left a static archive whose only symbol-resolution route back to
             # dfly_transaction's server_state.cc.o was never exercised by a test that pulls in
             # server_state.cc.o without ALSO already needing dragonfly_lib first (mvcc_test is the

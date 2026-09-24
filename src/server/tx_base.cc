@@ -145,10 +145,16 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
       db_cntx.db_index, key,
       [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
                    const MvccStamp&) {
-        // drakeydb: P4-4 Task FW-A1 -- has_prior_stamp false means the expired value never had
-        // a real stamp of its own (see CommitOwnTombstone's own comment, mvcc.h): erase the slot
-        // rather than install an unsafe Mvcc()==0 tombstone. `committed` stays default (Empty()),
-        // which the wire-entry mvcc below already treats the same as "nothing was committed".
+        // drakeydb: P4-4 -- has_prior_stamp false means the expired value never had a real stamp
+        // of its own (see CommitOwnTombstone's own comment, mvcc.h): erase the slot -- no
+        // tombstone survives locally for this key -- rather than install an unsafe Mvcc()==0
+        // tombstone. `committed` stays default (Empty()), so the wire-entry mvcc below sends the
+        // LITERAL value 0 (`committed.Mvcc()`) on this branch -- NOT the same as the separate
+        // "CommitOwnTombstone found no arm at all" case a few lines below, which instead forwards
+        // db_cntx.repl_mvcc verbatim (possibly non-zero, e.g. while applying a peer's command).
+        // journal::RecordEntry's own Commit() then mints a fresh LOCAL stamp for this entry,
+        // since it treats an incoming mvcc of exactly 0 as self-originated -- the same as any
+        // other unstamped local write, never a peer's own authority.
         if (has_prior_stamp) {
           committed = st;
           namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
@@ -163,10 +169,13 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
   // drakeydb: P4-4 -- the wire mvcc is the just-committed tombstone's own masked magnitude
   // (Mvcc() -- never the tombstone bit itself: every other entry's wire mvcc is a bare magnitude
   // too, and each receiver decides locally, from its own arm's ground truth, whether the
-  // committed stamp gets the tombstone bit). A plain (non-active-mesh) replica applies this DEL
-  // as an ordinary command with that value as its author stamp, so its own floor lands on or
-  // under the SAME value this node just committed, rather than minting one of its own. When no
-  // tombstone was actually committed above (TombstonesEnabled() is false, or
+  // committed stamp gets the tombstone bit). A plain (non-`--active_replica`) replica has no mvcc
+  // side table to floor anything against at all (MvccEnabled == IsActiveReplica(), db_slice.cc,
+  // and a plain replica is never --active_replica -- ServerFamily::ReplicaOfInternal
+  // unconditionally routes an --active_replica node's own REPLICAOF through the peer-mode path,
+  // so the two can never coincide): it applies this DEL as an ordinary command and this wire mvcc
+  // field simply goes unused there. When no tombstone was actually committed above
+  // (TombstonesEnabled() is false, or
   // PerformDeletionAtomic degraded to a plain erase at the tombstone cap) there is no such value
   // to reuse, so this falls back to forwarding db_cntx.repl_mvcc verbatim, exactly as every DEL
   // derived from an applied write already does (RecordDelete/RecordDerivedDelete above) --
