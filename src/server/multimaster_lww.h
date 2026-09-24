@@ -83,23 +83,27 @@ LwwClass ClassifyJournaledCommand(std::string_view journaled_name);
 // non-active node) must NEVER be guarded -- MergeAccepts(stored, {0, h}) is false for every
 // stamped key, so guarding it would silently discard the whole stream. This single predicate has
 // three direct callers -- Transaction::IsLwwGuarded(), OpMSet/OpDelV2's own per-key veto, and
-// JournalExecutor::Execute's gate on the pre-dispatch SETNX/RESTORE rewrite (see this header's
-// own top comment) -- and must be the only definition of the rule.
+// JournalExecutor::Execute's gate on the pre-dispatch SETNX/GETSET/GETDEL/RESTORE rewrite (see
+// this header's own top comment) -- and must be the only definition of the rule.
 constexpr bool LwwGuardActive(bool link_guard, uint64_t incoming_mvcc) {
   return link_guard && incoming_mvcc != 0;
 }
 
-// drakeydb: P4-4 -- pre-dispatch rewrite for the two guarded single-key commands whose journaled
-// form reproduces the author's COMMAND rather than the author's RESULT: SETNX (conditional on
+// drakeydb: P4-4 -- pre-dispatch rewrite for the guarded single-key commands whose journaled form
+// reproduces the author's COMMAND rather than the author's RESULT: SETNX (conditional on
 // non-existence -- applying it verbatim is a silent no-op on a receiver that already holds the
-// key) becomes a plain SET, and RESTORE (errors on an existing key without REPLACE, and
-// DispatchCommand reports that reply-level error as an applied OK) gets REPLACE injected. Both
-// are unconditional name/arg edits with no TOCTOU hazard, so callers run this PRE-dispatch; the
-// stamp COMPARE itself still happens inside the transaction, under the key's lock
-// (Transaction::ShouldDropForLww). Callers must gate this call on EXACTLY
-// LwwGuardActive(link_guard, incoming_mvcc) -- never on the link bit alone, or an unstamped
-// (mvcc 0) SETNX would be rewritten into an UNGUARDED blind SET that clobbers the key. Returns
-// whether it changed anything.
+// key) becomes a plain SET; GETSET and GETDEL (each a type-checked read-modify-write -- applying
+// either verbatim against a receiver holding a DIFFERENT type for this key WRONGTYPEs and applies
+// nothing, even when the author's write must win) become a plain SET and a plain DEL,
+// respectively; and RESTORE (errors on an existing key without REPLACE, and DispatchCommand
+// reports that reply-level error as an applied OK) gets REPLACE injected. All four are
+// unconditional name/arg edits with no TOCTOU hazard, so callers run this PRE-dispatch; the stamp
+// COMPARE itself still happens inside the transaction, under the key's lock
+// (Transaction::ShouldDropForLww for SET/GETSET/RESTORE's now-SET-shaped applies; OpDelV2's own
+// per-key veto for GETDEL's now-DEL-shaped apply, since DEL is kMultiKeySelfGuarded). Callers must
+// gate this call on EXACTLY LwwGuardActive(link_guard, incoming_mvcc) -- never on the link bit
+// alone, or an unstamped (mvcc 0) SETNX would be rewritten into an UNGUARDED blind SET that
+// clobbers the key. Returns whether it changed anything.
 bool ApplyLwwRewrites(cmn::BackedArguments* args);
 
 // The author's stamp for an incoming replicated write, or nullopt when it cannot be formed

@@ -2680,6 +2680,61 @@ async def test_stream_lww_newer_local_write_survives_stale_peer_write(
     assert unstamped == 0, f"unstamped writes leaked: {unstamped}"
 
 
+async def test_stream_lww_dropped_counter_renders_as_prometheus_metric(
+    df_factory: DflyInstanceFactory, proxy_factory
+):
+    """Review #2: dragonfly_multimaster_lww_dropped_total must actually render on /metrics, not
+    only in INFO replication -- docs/multi-master.md used to claim no test in this codebase
+    exercised the Prometheus text output at all. Reuses
+    test_stream_lww_newer_local_write_survives_stale_peer_write's own forced-drop setup (B is a
+    peer of A through a paused proxy; A's stale write reaches B strictly after B's own fresher
+    write, so B's guard drops it) to make the counter advance on an ACTIVE node, then checks:
+      - the metric is present on B and its value equals INFO replication's own count;
+      - the metric is entirely ABSENT -- never printed as 0 -- on a plain, non-active node.
+
+    Falsifying: dropping metrics.cc's `if (IsActiveReplica())` gate around this metric's
+    AppendMetricWithoutLabels call makes the non-active assertion below fail (the key would be
+    present, at 0, instead of absent entirely).
+    """
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    proxy = await proxy_factory(a.port)
+    await attach(c_b, proxy)
+    await wait_for_peers(c_b, 1)
+
+    await _pause_and_settle(proxy, c_a, "settle-marker-prom")
+    await c_a.set("k", "stale")
+    await asyncio.sleep(0.1)  # real wall-clock gap -- see the sibling test's own comment above
+    await c_b.set("k", "fresh")
+    proxy.resume()
+
+    await _wait_drained(c_a, c_b, "drain-marker-prom")
+    assert await c_b.get("k") == "fresh"
+
+    info_dropped = int((await c_b.info("replication"))["multimaster_lww_dropped"])
+    assert info_dropped > 0, "sanity: the forced drop above must have advanced the counter"
+
+    metrics_b = await b.metrics()
+    assert (
+        "dragonfly_multimaster_lww_dropped" in metrics_b
+    ), "dragonfly_multimaster_lww_dropped_total must render on /metrics on an active node"
+    samples = metrics_b["dragonfly_multimaster_lww_dropped"].samples
+    assert len(samples) == 1, samples
+    assert (
+        samples[0].value == info_dropped
+    ), f"/metrics ({samples[0].value}) must agree with INFO replication ({info_dropped})"
+
+    plain = df_factory.create(proactor_threads=2)
+    plain.start()
+    metrics_plain = await plain.metrics()
+    assert (
+        "dragonfly_multimaster_lww_dropped" not in metrics_plain
+    ), "the counter must be entirely absent -- not printed as 0 -- on a non-active node"
+
+
 async def test_stream_lww_bidirectional_conflict_converges_on_newer_origin(
     df_factory: DflyInstanceFactory, proxy_factory
 ):

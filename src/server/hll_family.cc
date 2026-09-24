@@ -332,7 +332,12 @@ OpResult<int> PFMergeInternal(string_view key, Transaction* tx, SinkReplyBuilder
     // BITOP's own dest_shard filter (bitops_family.cc). A non-active node has no per-key stamp to
     // protect and must see upstream's own (phantom-writing) shape exactly, so this filter is
     // active-only.
-    if (IsActiveReplica() && shard->shard_id() != dest_shard) {
+    //
+    // drakeydb: P4-4 -- shard->shard_id() != dest_shard first: this callback runs on every shard
+    // PFMERGE touches, and IsActiveReplica() is an uncached absl::GetFlag (multi_master.cc, see
+    // journal.cc's MvccEnabled() comment for this defect class); the shard-id compare is cheap
+    // and already computed, so it comes first.
+    if (shard->shard_id() != dest_shard && IsActiveReplica()) {
       return OpStatus::OK;
     }
 

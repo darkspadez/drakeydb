@@ -996,8 +996,24 @@ OpStatus SetCmd::Set(const SetParams& params, string_view key, string_view value
     auto find_res = db_slice.FindMutable(op_args_.db_cntx, key);
     if (auto status = CachePrevIfNeeded(params, find_res.it); status != OpStatus::OK)
       return status;
-    if (!IsValid(find_res.it))
+    if (!IsValid(find_res.it)) {
+      // drakeydb: P4-4 -- a guarded applied write whose absolute TTL has already elapsed, against
+      // a key this node does not hold, still carries the author's authority: install it as a
+      // tombstone so a strictly OLDER write for this key, racing in from a third peer, is
+      // rejected exactly as it would be everywhere else this key's expiry is already known.
+      // Without this, this node silently forgets the write ever happened and a stale peer write
+      // can resurrect the key with no TTL. Reuses the same install
+      // RdbLoader::ApplyMergeTombstoneOnShard (rdb_load.cc) applies for the identical shape
+      // reached via a full sync (DbSlice::InstallAbsentKeyTombstone, db_slice.cc/.h).
+      const DbContext& db_cntx = op_args_.db_cntx;
+      if (LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)) {
+        if (auto incoming = IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx);
+            incoming && MergeAccepts(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
+          db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming));
+        }
+      }
       return OpStatus::OK;
+    }
     return DeleteExpiredKey(key, &find_res);
   }
 
@@ -1138,7 +1154,11 @@ void SetCmd::RecordJournal(const SetParams& params, string_view key, string_view
   // pk/pv are this write's own resulting key state either way, so the shared builder reads the
   // right thing regardless of which path got here. A non-active node has no per-key stamp to
   // protect and must see the exact upstream KEEPTTL shape, so it skips this branch entirely.
-  if (IsActiveReplica() && (params.flags & SET_KEEP_EXPIRE)) {
+  // drakeydb: P4-4 -- operand order matters: this branch runs on every journaled SET, and
+  // IsActiveReplica() is an uncached absl::GetFlag (multi_master.cc) -- journal.cc's own
+  // MvccEnabled() comment names this exact defect class. SET_KEEP_EXPIRE first means the flag
+  // read only happens for the (rare) KEEPTTL case, not on every call.
+  if ((params.flags & SET_KEEP_EXPIRE) && IsActiveReplica()) {
     JournalFullStateSet(op_args_, key, pk, pv);
     return;
   }

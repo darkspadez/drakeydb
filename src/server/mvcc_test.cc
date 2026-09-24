@@ -936,8 +936,10 @@ TEST(MultimasterLwwDeathTest, IncomingStampUnregisteredOriginDies) {
 #endif  // NDEBUG
 
 // ---------------------------------------------------------------------------
-// ApplyLwwRewrites (P4-4 Task A9): the pre-dispatch SETNX->SET / RESTORE->+REPLACE rewrite. See
-// executor.cc for where this is actually called, gated on LwwGuardActive.
+// ApplyLwwRewrites (P4-4 Task A9 for SETNX->SET / RESTORE->+REPLACE, extended below for
+// GETSET->SET / GETDEL->DEL): the pre-dispatch rewrite for every guarded single-key command whose
+// journaled form reproduces the author's COMMAND rather than the author's RESULT. See executor.cc
+// for where this is actually called, gated on LwwGuardActive.
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -978,6 +980,52 @@ TEST(MultimasterLwwTest, ApplyLwwRewritesSetnxWrongArityUntouched) {
   for (const std::vector<std::string_view>& parts :
        {std::vector<std::string_view>{"SETNX", "k"},
         std::vector<std::string_view>{"SETNX", "k", "v", "extra"}}) {
+    cmn::BackedArguments args = MakeArgs(parts);
+    const std::vector<std::string> before = ArgsToVec(args);
+    EXPECT_FALSE(ApplyLwwRewrites(&args));
+    EXPECT_EQ(ArgsToVec(args), before);
+  }
+}
+
+TEST(MultimasterLwwTest, ApplyLwwRewritesGetsetBecomesSetArgsPreserved) {
+  cmn::BackedArguments args = MakeArgs({"GETSET", "k", "v"});
+  EXPECT_TRUE(ApplyLwwRewrites(&args));
+  EXPECT_THAT(ArgsToVec(args), ::testing::ElementsAre("SET", "k", "v"));
+}
+
+TEST(MultimasterLwwTest, ApplyLwwRewritesGetsetIsCaseInsensitive) {
+  cmn::BackedArguments args = MakeArgs({"getset", "k", "v"});
+  EXPECT_TRUE(ApplyLwwRewrites(&args));
+  EXPECT_THAT(ArgsToVec(args), ::testing::ElementsAre("SET", "k", "v"));
+}
+
+TEST(MultimasterLwwTest, ApplyLwwRewritesGetsetWrongArityUntouched) {
+  for (const std::vector<std::string_view>& parts :
+       {std::vector<std::string_view>{"GETSET", "k"},
+        std::vector<std::string_view>{"GETSET", "k", "v", "extra"}}) {
+    cmn::BackedArguments args = MakeArgs(parts);
+    const std::vector<std::string> before = ArgsToVec(args);
+    EXPECT_FALSE(ApplyLwwRewrites(&args));
+    EXPECT_EQ(ArgsToVec(args), before);
+  }
+}
+
+TEST(MultimasterLwwTest, ApplyLwwRewritesGetdelBecomesDelArgsPreserved) {
+  cmn::BackedArguments args = MakeArgs({"GETDEL", "k"});
+  EXPECT_TRUE(ApplyLwwRewrites(&args));
+  EXPECT_THAT(ArgsToVec(args), ::testing::ElementsAre("DEL", "k"));
+}
+
+TEST(MultimasterLwwTest, ApplyLwwRewritesGetdelIsCaseInsensitive) {
+  cmn::BackedArguments args = MakeArgs({"getdel", "k"});
+  EXPECT_TRUE(ApplyLwwRewrites(&args));
+  EXPECT_THAT(ArgsToVec(args), ::testing::ElementsAre("DEL", "k"));
+}
+
+TEST(MultimasterLwwTest, ApplyLwwRewritesGetdelWrongArityUntouched) {
+  for (const std::vector<std::string_view>& parts :
+       {std::vector<std::string_view>{"GETDEL"},
+        std::vector<std::string_view>{"GETDEL", "k", "extra"}}) {
     cmn::BackedArguments args = MakeArgs(parts);
     const std::vector<std::string> before = ArgsToVec(args);
     EXPECT_FALSE(ApplyLwwRewrites(&args));

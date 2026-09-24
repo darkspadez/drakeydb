@@ -1673,6 +1673,23 @@ void DbSlice::SetTombstone(DbIndex db_ind, string_view key, const MvccStamp& sta
     ++db.stats.mvcc_tombstones;
 }
 
+// drakeydb: P4-4 -- see the declaration (db_slice.h) for the full contract. `would_grow` mirrors
+// SetTombstone's own `was_tombstone` guard: SetTombstone does not increment mvcc_tombstones when
+// the slot it overwrites is already a tombstone, so refusing that case at the cap would be a
+// spurious, miscounted drop that also strands the older (losing) stamp already in place.
+void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
+  if (!TombstonesEnabled())
+    return;
+  auto& db = *db_arr_[db_ind];
+  const std::optional<MvccStamp> existing = GetMvcc(db_ind, key);
+  const bool would_grow = !existing.has_value() || !existing->IsTombstone();
+  if (!would_grow || db.stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
+    SetTombstone(db_ind, key, stamp);
+  } else {
+    ++db.stats.mvcc_tombstones_dropped;  // at the cap: degrade to no-op, visibly
+  }
+}
+
 // drakeydb: P4-3 Task 2 review fix (I3) -- see the declaration (db_slice.h) for the full contract.
 // The IsTombstone() guard is load-bearing, not defensive filler: a key re-created within the same
 // epoch (EnsureMvcc's tombstone-clearing branch above) already turned this slot back into a live
@@ -2595,7 +2612,7 @@ void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterat
         cntx.db_index, key_owned,
         [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
                      const MvccStamp&) {
-          // drakeydb: P4-4 Task FW-A1 -- has_prior_stamp false means the reaped container's
+          // drakeydb: P4-4 -- has_prior_stamp false means the reaped container's
           // pre-delete stamp was never real (see CommitOwnTombstone's own comment, mvcc.h):
           // erase the slot rather than install an unsafe Mvcc()==0 tombstone.
           if (has_prior_stamp) {

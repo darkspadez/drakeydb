@@ -1038,7 +1038,7 @@ OpStatus OpPop(const OpArgs& op_args, string_view key, unsigned count, cmn::Back
         all_expired ? DbSlice::DeleteReason::kExpired : DbSlice::DeleteReason::kExplicit);
 
     if (all_expired) {
-      // drakeydb: P4-4 Task FW-A2 -- SPOP is NO_AUTOJOURNAL (its result is non-deterministic), so
+      // drakeydb: P4-4 -- SPOP is NO_AUTOJOURNAL (its result is non-deterministic), so
       // nothing else ever journals this delete. Before this fix, the tombstone arm
       // DelMutable(kExpired) above just placed (PerformDeletionAtomic's own ArmTombstone) rolled
       // back uncommitted at this transaction's own epoch end -- an mvcc_unstamped_writes leak --
@@ -1048,8 +1048,10 @@ OpStatus OpPop(const OpArgs& op_args, string_view key, unsigned count, cmn::Back
       // DeleteSetIfEmpty exactly. Non-active nodes must stay byte-identical to upstream, which
       // never journals this branch at all (SPOP's all-expired case is silent there too) -- gated
       // on IsActiveReplica(), like every other active-only journaling change (PFMERGE, BITOP,
-      // the TTL-carrying commands' full-state journaling).
-      if (IsActiveReplica() && op_args.shard->journal()) {
+      // the TTL-carrying commands' full-state journaling). op_args.shard->journal() checked first:
+      // a cheap pointer check, ahead of IsActiveReplica()'s uncached absl::GetFlag
+      // (multi_master.cc; see journal.cc's MvccEnabled() comment for this defect class).
+      if (op_args.shard->journal() && IsActiveReplica()) {
         MvccStamp committed;
         const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
             op_args.db_cntx.db_index, key,
@@ -1749,7 +1751,7 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
             db_cntx.db_index, key,
             [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
                          const MvccStamp&) {
-              // drakeydb: P4-4 Task FW-A1 -- has_prior_stamp false means the set's own
+              // drakeydb: P4-4 -- has_prior_stamp false means the set's own
               // pre-delete stamp was never real (see CommitOwnTombstone's own comment, mvcc.h):
               // erase the slot rather than install an unsafe Mvcc()==0 tombstone.
               if (has_prior_stamp) {

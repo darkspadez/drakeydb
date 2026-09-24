@@ -49,11 +49,11 @@ facade::DispatchResult JournalExecutor::Execute(DbIndex dbid, journal::ParsedEnt
   CommandContext cntx_cmd;
   cntx_cmd.Init(reply_builder_.get(), &conn_context_);
 
-  // drakeydb: P4-4 Task A9 -- SETNX->SET / RESTORE->+REPLACE, see ApplyLwwRewrites'
-  // (multimaster_lww.h) own comment for why. Gated on EXACTLY LwwGuardActive -- the same
-  // predicate Transaction::IsLwwGuarded() uses -- never on repl_lww_guard alone: an unstamped
-  // (mvcc 0) SETNX rewritten to SET would become an UNGUARDED blind SET that clobbers the key.
-  // Must run before SwapArgs below: the rewrite mutates `cmd`, not `cntx_cmd`.
+  // drakeydb: P4-4 Task A9 -- SETNX->SET / GETSET->SET / GETDEL->DEL / RESTORE->+REPLACE, see
+  // ApplyLwwRewrites' (multimaster_lww.h) own comment for why. Gated on EXACTLY LwwGuardActive --
+  // the same predicate Transaction::IsLwwGuarded() uses -- never on repl_lww_guard alone: an
+  // unstamped (mvcc 0) SETNX rewritten to SET would become an UNGUARDED blind SET that clobbers
+  // the key. Must run before SwapArgs below: the rewrite mutates `cmd`, not `cntx_cmd`.
   if (LwwGuardActive(conn_context_.repl_lww_guard, conn_context_.repl_mvcc))
     ApplyLwwRewrites(&cmd);
 

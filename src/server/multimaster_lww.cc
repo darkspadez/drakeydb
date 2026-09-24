@@ -80,6 +80,34 @@ bool ApplyLwwRewrites(cmn::BackedArguments* args) {
     return true;
   }
 
+  if (absl::EqualsIgnoreCase(name, "GETSET")) {
+    // drakeydb: P4-4 -- GETSET key value always replicates as GETSET's own verbatim command
+    // (auto-journaled: GETSET is CO::JOURNALED, not NO_AUTOJOURNAL). Replaying it verbatim on a
+    // receiver re-runs GETSET's OWN read-modify-write, which requires the existing key (if any) to
+    // already be a string -- a receiver holding a DIFFERENT type for this key gets WRONGTYPE and
+    // applies nothing, even though the per-key veto already decided this write should win. Rewrite
+    // to a plain SET, exactly like SETNX->SET above: a blind full-state write, same as every other
+    // guarded single-key command's applied form.
+    if (args->size() != 3)
+      return false;
+    const std::vector<std::string> rewritten{"SET", std::string(args->at(1)),
+                                             std::string(args->at(2))};
+    args->Assign(rewritten.begin(), rewritten.end(), rewritten.size());
+    return true;
+  }
+
+  if (absl::EqualsIgnoreCase(name, "GETDEL")) {
+    // drakeydb: P4-4 -- same reasoning as GETSET above: GETDEL key auto-journals verbatim
+    // (CO::JOURNALED), and replaying it re-runs GETDEL's own type-checked read-then-delete, which
+    // WRONGTYPEs (and deletes nothing) against a receiver holding a different type. Rewrite to a
+    // plain DEL, exactly the write GETDEL's own author-side effect already was.
+    if (args->size() != 2)
+      return false;
+    const std::vector<std::string> rewritten{"DEL", std::string(args->at(1))};
+    args->Assign(rewritten.begin(), rewritten.end(), rewritten.size());
+    return true;
+  }
+
   if (absl::EqualsIgnoreCase(name, "RESTORE")) {
     // RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency].
     // A short/malformed RESTORE (arity < 4) is dispatch's problem, same as SETNX above.

@@ -579,6 +579,25 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
       RecordJournal(op_args, "DEL"sv, ArgSlice{dest_key_}, 2);
     }
 
+    // drakeydb: P4-4 -- same fix as OpRestore/SetCmd::Set (this file / string_family.cc), for
+    // symmetry: Renamer::DeserializeDest is only ever reached from a live client's own
+    // RENAME/RENAMENX/COPY dispatch (never a replicated apply -- a peer's own cross-shard rename
+    // replays as plain DEL src + RESTORE dst through the ordinary command path instead), so
+    // op_args.db_cntx.repl_lww_guard is always false here today and this branch never fires. Kept
+    // for the same defensive reason every other guarded branch in this PR checks the predicate
+    // explicitly rather than assuming its caller's shape. Scoped to !dest_found_, matching
+    // OpRestore: a found destination was already deleted (and tombstoned) above.
+    if (!dest_found_) {
+      const DbContext& dctx = op_args.db_cntx;
+      if (LwwGuardActive(dctx.repl_lww_guard, dctx.repl_mvcc)) {
+        if (auto incoming = IncomingStamp(dctx.repl_mvcc, dctx.repl_origin_idx);
+            incoming && MergeAccepts(db_slice.GetMvcc(dctx.db_index, dest_key_), *incoming)) {
+          db_slice.InstallAbsentKeyTombstone(dctx.db_index, dest_key_,
+                                             ExpiryTombstoneFor(*incoming));
+        }
+      }
+    }
+
     return OpStatus::OK;
   }
 
@@ -662,7 +681,10 @@ OpStatus OpPersist(const OpArgs& op_args, string_view key) {
   }
 
   res.post_updater.Run();
-  if (IsActiveReplica() && op_args.shard->journal()) {
+  // drakeydb: P4-4 -- op_args.shard->journal() first: this runs on every PERSIST that actually
+  // clears a TTL, and IsActiveReplica() is an uncached absl::GetFlag (multi_master.cc) -- see
+  // journal.cc's MvccEnabled() comment for this defect class. journal() is a cheap pointer check.
+  if (op_args.shard->journal() && IsActiveReplica()) {
     RecordFullStateJournal(op_args, key, res.it->first, res.it->second);
   }
   return OpStatus::OK;
@@ -706,6 +728,29 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
 
   if (restore_args.Expired()) {
     VLOG(1) << "the new key '" << key << "' already expired, will not save the value";
+    if (!found_prev) {
+      // drakeydb: P4-4 -- mirrors SetCmd::Set's identical fix (string_family.cc) for a guarded
+      // applied write whose absolute TTL has already elapsed, against a key this node does not
+      // hold: install it as a tombstone so a strictly OLDER write for this key, racing in from a
+      // third peer, is rejected exactly as it would be everywhere else this key's expiry is
+      // already known.
+      const DbContext& db_cntx = op_args.db_cntx;
+      if (LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)) {
+        if (auto incoming = IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx);
+            incoming && MergeAccepts(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
+          db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming));
+        }
+      }
+    } else if (op_args.shard->journal() && IsActiveReplica()) {
+      // drakeydb: P4-4 -- the Replace() branch above already deleted the old key through the
+      // ordinary PerformDeletionAtomic path, which ARMED a tombstone placeholder expecting a
+      // journal commit to stamp it. RESTORE is now CO::NO_AUTOJOURNAL, so nothing else journals
+      // this delete -- without this explicit call the arm would sit uncommitted until an
+      // unrelated later write's epoch end rolled it back, an mvcc_unstamped_writes leak. Mirrors
+      // Renamer::DeserializeDest's identical "old dest key deleted, new value never created" DEL
+      // journal, above in this file.
+      RecordJournal(op_args, "DEL"sv, ArgSlice{key});
+    }
     return OpStatus::OK;
   }
 
@@ -716,7 +761,35 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
       << " override: " << restore_args.Replace()
       << ", type: " << ObjTypeToString(add_res->it->second.ObjType());
 
-  return add_res.status();
+  if (!add_res)
+    return add_res.status();
+
+  // drakeydb: P4-4 -- arm before journaling (the established P4-1 Task 8 rule; mirrors
+  // Renamer::DeserializeDest's identical comment, above in this file): add_res->post_updater is
+  // an AutoUpdater that would not otherwise run until this function returns, AFTER the explicit
+  // RecordJournal below -- and RecordJournal's Commit() runs synchronously, against whatever is
+  // armed at that instant.
+  add_res->post_updater.Run();
+
+  if (op_args.shard->journal() && IsActiveReplica()) {
+    // drakeydb: P4-4 -- ship an ABSOLUTE ttl, not the client's own (possibly relative) one: each
+    // receiver would otherwise compute its own deadline from ITS OWN arrival time, drifting with
+    // replication lag. restore_args.UpdateExpiration (this function's own first line) already
+    // normalized expiration.value to an absolute ms deadline (or 0, meaning none) against THIS
+    // node's own clock -- exactly the authority JournalFullStateSet's callers ship for every
+    // other TTL-carrying command. REPLACE/STICK carry the client's own flags through; IDLETIME/
+    // FREQ do not (matching Renamer::DeserializeDest's own RESTORE journal, above in this file --
+    // one-time load-time eviction hints, not part of this key's converged state).
+    const std::string expire_str = absl::StrCat(restore_args.ExpirationTime());
+    absl::InlinedVector<std::string_view, 6> args({key, expire_str, payload, "ABSTTL"sv});
+    if (restore_args.Replace())
+      args.push_back("REPLACE"sv);
+    if (restore_args.Sticky())
+      args.push_back("STICK"sv);
+    RecordJournal(op_args, "RESTORE"sv, args);
+  }
+
+  return OpStatus::OK;
 }
 
 bool ScanCb(const OpArgs& op_args, PrimeIterator prime_it, const ScanOpts& opts, StringVec* res) {
@@ -1600,10 +1673,14 @@ void GenericFamily::Delex(facade::CmdArgParser parser, CommandContext* cmd_cntx)
       // Delex's top-of-function comment): that forwards the client's ORIGINAL recipe verbatim,
       // unconditionally, matching upstream -- so this explicit call must not also fire, or a
       // non-active downstream link would see this delete journaled twice.
-      if (IsActiveReplica()) {
-        auto op_args = tx->GetOpArgs(es);
-        if (op_args.shard->journal())
-          RecordJournal(op_args, "DEL"sv, ArgSlice{key});
+      //
+      // drakeydb: P4-4 -- op_args.shard->journal() first: IsActiveReplica() is an uncached
+      // absl::GetFlag (multi_master.cc, see journal.cc's MvccEnabled() comment for this defect
+      // class); op_args is a cheap struct build and journal() a cheap pointer check, so both come
+      // before the flag read.
+      auto op_args = tx->GetOpArgs(es);
+      if (op_args.shard->journal() && IsActiveReplica()) {
+        RecordJournal(op_args, "DEL"sv, ArgSlice{key});
       }
       return 1;
     }
@@ -2787,6 +2864,14 @@ void GenericFamily::Restore(facade::CmdArgParser parser, CommandContext* cmd_cnt
     return cmd_cntx->SendError(status);
   }
 
+  // drakeydb: P4-4 -- RESTORE is CO::NO_AUTOJOURNAL now (OpRestore journals explicitly, with an
+  // ABSOLUTE ttl, on an active node -- see OpRestore's own comment for why a relative ttl
+  // auto-journaled verbatim is wrong). A non-active node has no per-key stamp to protect and must
+  // see the exact upstream shape, so it revives the verbatim auto-journal here, in command setup,
+  // before the Execute hop -- the same contract RENAME/SORT/DELEX/PERSIST already follow.
+  if (!IsActiveReplica())
+    cmd_cntx->tx()->ReviveAutoJournal();
+
   auto cb = [&](Transaction* t, EngineShard* shard) {
     return OpRestore(t->GetOpArgs(shard), restore_args.key, restore_args.serialized_value,
                      restore_args, rdb_version.value());
@@ -3355,7 +3440,10 @@ void GenericFamily::Register(CommandRegistry* registry) {
       << CI{"SORT_RO", CO::READONLY, -2, 1, 1, acl::kSortRO}.HFUNC(Sort_RO)
       << CI{"MOVE", CO::JOURNALED | CO::GLOBAL_TRANS | CO::NO_AUTOJOURNAL, 3, 1, 1, acl::kMove}
              .HFUNC(Move)
-      << CI{"RESTORE", CO::JOURNALED, -4, 1, 1, acl::kRestore}.HFUNC(Restore)
+      // drakeydb: P4-4 -- CO::NO_AUTOJOURNAL added: a relative-ttl RESTORE auto-journaled verbatim
+      // has each receiver compute its own deadline from ITS OWN arrival time (see OpRestore's own
+      // comment on its explicit, ABSOLUTE-ttl journal call, this file).
+      << CI{"RESTORE", CO::JOURNALED | CO::NO_AUTOJOURNAL, -4, 1, 1, acl::kRestore}.HFUNC(Restore)
       << CI{"RANDOMKEY", CO::READONLY, 1, 0, 0, 0}.HFUNC(RandomKey)
       << CI{"EXPIRETIME", CO::READONLY | CO::FAST, 2, 1, 1, acl::kExpireTime}.HFUNC(ExpireTime)
       << CI{"PEXPIRETIME", CO::READONLY | CO::FAST, 2, 1, 1, acl::kPExpireTime}.HFUNC(PExpireTime);
