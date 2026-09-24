@@ -450,6 +450,13 @@ class DbSlice {
   // identical shape via a full sync, rather than copied a third time there; and by SetCmd::Set's
   // already-expired absent-key branch, OpRestore, and Renamer::DeserializeDest (string_family.cc
   // / generic_family.cc).
+  //
+  // NOTE: the same write landing on a PRESENT live key (stored S < incoming X) never reaches this
+  // call -- SetCmd::DeleteExpiredKey / OpRestore's found_prev branch deletes it through the
+  // ordinary path instead, committing FloorAppliedStamp(S, X) = X|tombstone, one origin_hash tick
+  // below this call's own ExpiryTombstoneFor(X) for the identical write against an absent key. Not
+  // a divergence -- no real stamp falls between the two (floored stamps never go on the wire), and
+  // a merge-load raises the lower one. This present-key path predates this call.
   void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);

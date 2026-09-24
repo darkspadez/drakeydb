@@ -1193,6 +1193,13 @@ tombstone, no trace this write was ever authored. A strictly OLDER write for the
 afterward from a third peer, is then wrongly accepted, with no tombstone here to reject it.
 Registered, not fixed, same as the `found_prev` case above.
 
+**A related asymmetry, not a divergence.** The same write landing on a PRESENT live key instead
+never reaches `InstallAbsentKeyTombstone`: `found_prev`'s delete above (`SetCmd::DeleteExpiredKey`'s
+identical shape, `string_family.cc`) commits `FloorAppliedStamp(S, X)` = `X|tombstone`, one
+origin_hash tick below this call's own `ExpiryTombstoneFor(X)` for the same write against an absent
+key. No real stamp falls between the two (floored stamps never go on the wire), and a merge-load
+raises the lower one to match — this present-key path predates `InstallAbsentKeyTombstone`.
+
 **How established:** static reading of `OpRestore`'s control flow (the `DelMutable`-before-`Add`
 ordering, both `Add` failure returns, the early, journal-call-free `return add_res.status();`, and
 the absence of any tombstone-install call reachable from that same early return) composed with

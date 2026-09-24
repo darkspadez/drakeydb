@@ -591,10 +591,15 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
     // DIFFERENT shards even though the author's commit was same-shard, routing THIS receiver's own
     // replay of that entry through the cross-shard path -- and Renamer::DeserializeDest
     // specifically -- fully guarded (LwwGuardActive sees the link's real bit and the entry's real
-    // mvcc). The behaviour converges correctly there too: whichever path a given receiver's own
-    // shard topology happens to route an already-expired dest key through, it installs the
-    // identically-derived tombstone. Scoped to !dest_found_, matching OpRestore: a found
-    // destination was already deleted (and tombstoned) above.
+    // mvcc). That shard-count mismatch only decides which path runs; it does not by itself make
+    // Expired() true below. SerializeSrc's own FindReadOnly (the earlier hop) already lazily reaps
+    // an expired source under this same transaction's fixed clock (time_now_ms_, set once in
+    // Transaction::InitTxTime), so an ordinarily-expired src key never survives to be serialized.
+    // Expired() can only fire here when that earlier hop ran with expiry disallowed (CLIENT PAUSE,
+    // Transaction::Guard, or takeover catch-up) and so skipped the reap. When it does fire, the
+    // result still matches the author: its own destination, stamped X, reaps to
+    // ExpiryTombstoneFor(X) too -- the same value installed below. Scoped to !dest_found_, matching
+    // OpRestore: a found destination was already deleted (and tombstoned) above.
     if (!dest_found_) {
       const DbContext& dctx = op_args.db_cntx;
       if (LwwGuardActive(dctx.repl_lww_guard, dctx.repl_mvcc)) {
