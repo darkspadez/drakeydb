@@ -579,14 +579,22 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
       RecordJournal(op_args, "DEL"sv, ArgSlice{dest_key_}, 2);
     }
 
-    // drakeydb: P4-4 -- same fix as OpRestore/SetCmd::Set (this file / string_family.cc), for
-    // symmetry: Renamer::DeserializeDest is only ever reached from a live client's own
-    // RENAME/RENAMENX/COPY dispatch (never a replicated apply -- a peer's own cross-shard rename
-    // replays as plain DEL src + RESTORE dst through the ordinary command path instead), so
-    // op_args.db_cntx.repl_lww_guard is always false here today and this branch never fires. Kept
-    // for the same defensive reason every other guarded branch in this PR checks the predicate
-    // explicitly rather than assuming its caller's shape. Scoped to !dest_found_, matching
-    // OpRestore: a found destination was already deleted (and tombstoned) above.
+    // drakeydb: P4-4 -- same fix as OpRestore/SetCmd::Set (this file / string_family.cc), for the
+    // identical shape reached a less obvious way: Renamer::DeserializeDest is the CROSS-SHARD
+    // rename/copy destination path. A live client's own cross-shard RENAME/RENAMENX/COPY dispatch
+    // never reaches here guarded (a fresh client command's own db_cntx.repl_lww_guard/repl_mvcc
+    // default to false/0) -- but a REPLICATED apply of a SAME-shard RENAME can: the author commits
+    // that via the runtime-revived verbatim auto-journal (RenameGeneric, kUnguarded per
+    // ClassifyJournaledCommand), and a self-originated auto-journal entry still gets a real,
+    // freshly minted author mvcc on the wire regardless of the command's own guard classification.
+    // A receiving peer whose OWN shard count differs from the author's can hash src/dst to
+    // DIFFERENT shards even though the author's commit was same-shard, routing THIS receiver's own
+    // replay of that entry through the cross-shard path -- and Renamer::DeserializeDest
+    // specifically -- fully guarded (LwwGuardActive sees the link's real bit and the entry's real
+    // mvcc). The behaviour converges correctly there too: whichever path a given receiver's own
+    // shard topology happens to route an already-expired dest key through, it installs the
+    // identically-derived tombstone. Scoped to !dest_found_, matching OpRestore: a found
+    // destination was already deleted (and tombstoned) above.
     if (!dest_found_) {
       const DbContext& dctx = op_args.db_cntx;
       if (LwwGuardActive(dctx.repl_lww_guard, dctx.repl_mvcc)) {
@@ -745,10 +753,11 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
       // drakeydb: P4-4 -- the Replace() branch above already deleted the old key through the
       // ordinary PerformDeletionAtomic path, which ARMED a tombstone placeholder expecting a
       // journal commit to stamp it. RESTORE is now CO::NO_AUTOJOURNAL, so nothing else journals
-      // this delete -- without this explicit call the arm would sit uncommitted until an
-      // unrelated later write's epoch end rolled it back, an mvcc_unstamped_writes leak. Mirrors
-      // Renamer::DeserializeDest's identical "old dest key deleted, new value never created" DEL
-      // journal, above in this file.
+      // this delete -- without this explicit call the arm would sit uncommitted until THIS
+      // transaction's OWN epoch end (the `epoch_end` Cleanup at the top of RunCallback,
+      // transaction.cc, which runs on scope exit from processing this exact command) rolled it
+      // back, an mvcc_unstamped_writes leak. Mirrors Renamer::DeserializeDest's identical "old
+      // dest key deleted, new value never created" DEL journal, above in this file.
       RecordJournal(op_args, "DEL"sv, ArgSlice{key});
     }
     return OpStatus::OK;

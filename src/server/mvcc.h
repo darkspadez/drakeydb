@@ -208,9 +208,10 @@ inline MvccStamp ExpiryTombstoneFor(const MvccStamp& value) {
 
 // drakeydb: P4-4 Task A5 -- the "just-below" stamp floor for an APPLIED write (a caller-supplied,
 // non-zero author mvcc committed by journal::RecordEntry, never a local mint) whose `incoming`
-// stamp is OLDER than the key's own current stamp `stored`. Guarded writes (Task A3) only ever
-// apply when incoming > stored, so verbatim is correct for them -- this floor only matters for an
-// UNGUARDED applied write (a delta RMW like INCR/APPEND, or any apply on a plain, non-active-peer
+// stamp is OLDER than the key's own current stamp `stored`. Guarded writes (the streaming LWW
+// veto) only ever apply when incoming > stored, so verbatim is correct for them -- this floor
+// only matters for an UNGUARDED applied write (a delta RMW like INCR/APPEND, or any apply on a
+// plain, non-active-peer
 // replica), which can legitimately carry an author stamp older than what this node already has,
 // because that author authored it before it ever saw `stored`.
 //

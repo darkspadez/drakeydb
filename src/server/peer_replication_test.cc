@@ -817,14 +817,15 @@ TEST_F(DflyShardReplicaOriginTest, FullSyncJournalBlobAppliesAndReJournalsWithFl
   EXPECT_EQ(Run({"GET", self_key}), "replayed-value");
 }
 
-// drakeydb: P4-4 Task A10 -- there are THREE applier paths, not two: besides executor_ (stable
-// sync, A3/A7/A8/A9) and the RDB key-stream merge (merge_lww_, P4-3), a peer full sync also
-// replays its embedded CONCURRENT journal blob via rdb_loader_ (RdbLoaderBase::HandleJournalBlob),
-// which builds its own journal_executor_. Proves that loader-level applier honors its OWN
-// SetApplyLwwGuard(bool) exactly like the stable-sync path: guarded, a stale peer write (mvcc
-// 0x1000, strictly less than a resident local value's mvcc 0x2000) loses the LWW guard's own
-// compare (Transaction::ShouldDropForLww/MergeAccepts, untouched by A10) and both the value and
-// its stamp survive untouched, and multimaster_lww_dropped advances by exactly one; unguarded,
+// drakeydb: P4-4 Task A10 -- there are THREE applier paths, not two: besides executor_ (the
+// ordinary stable-sync guard/rewrite path) and the RDB key-stream merge (merge_lww_, P4-3), a peer
+// full sync also replays its embedded CONCURRENT journal blob via rdb_loader_
+// (RdbLoaderBase::HandleJournalBlob), which builds its own journal_executor_. Proves that
+// loader-level applier honors its OWN SetApplyLwwGuard(bool) exactly like the stable-sync path:
+// guarded, a stale peer write (mvcc 0x1000, strictly less than a resident local value's mvcc
+// 0x2000) loses the LWW guard's own compare (Transaction::ShouldDropForLww/MergeAccepts, unchanged
+// by this loader-level wiring) and both the value and its stamp survive untouched, and
+// multimaster_lww_dropped advances by exactly one; unguarded,
 // the same stale write applies unconditionally (plain arrival order -- the GUARD's compare is
 // never run, though FloorAppliedStamp's own compare, see below, still runs on every applied write
 // regardless of guard state). Its committed stamp is NOT the peer's raw 0x1000 verbatim, though:

@@ -152,9 +152,13 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
         // LITERAL value 0 (`committed.Mvcc()`) on this branch -- NOT the same as the separate
         // "CommitOwnTombstone found no arm at all" case a few lines below, which instead forwards
         // db_cntx.repl_mvcc verbatim (possibly non-zero, e.g. while applying a peer's command).
-        // journal::RecordEntry's own Commit() then mints a fresh LOCAL stamp for this entry,
-        // since it treats an incoming mvcc of exactly 0 as self-originated -- the same as any
-        // other unstamped local write, never a peer's own authority.
+        // journal::RecordEntry (journal.cc) itself mints a fresh LOCAL stamp for this entry's own
+        // wire mvcc -- its own inline mint, BEFORE AddLogRecord, treating an incoming mvcc of
+        // exactly 0 as self-originated the same as any other unstamped local write, never a
+        // peer's own authority. `Commit()` is a SEPARATE step, and does not run at all for this
+        // entry: RecordEntry's own call to it is gated on `!(entry_flags & kEntryFlagExpired)`,
+        // which this entry sets -- this key's arm is already gone, consumed by CommitOwnTombstone
+        // just above, so there is nothing left for a generic Commit() sweep to do here anyway.
         if (has_prior_stamp) {
           committed = st;
           namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);

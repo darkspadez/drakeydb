@@ -747,10 +747,14 @@ void Transaction::RunCallback(EngineShard* shard) {
   RunnableResult result;
   try {
     // drakeydb: P4-4 -- a dropped write's callback never runs at all: nothing is written, and
-    // (via LogAutoJournalOnShard's own lww_dropped parameter below) nothing is journaled either,
-    // including the auto-journal that SETNX/GETDEL/RESTORE/GETSET would otherwise still emit
-    // verbatim -- an auto-journaled drop would otherwise still reach sub-replicas even though
-    // this node never actually wrote it. OpStatus::OK (never a non-OK status) so a fully dropped
+    // (via LogAutoJournalOnShard's own lww_dropped parameter below) nothing is journaled either --
+    // every guarded kSingleKey name that would otherwise still auto-journal verbatim is either
+    // pre-dispatch rewritten by ApplyLwwRewrites (multimaster_lww.cc) to a name that isn't, or is
+    // CO::NO_AUTOJOURNAL itself; this early return is defense-in-depth against that invariant ever
+    // breaking, not dead code -- see GenericVetoSuppressesUnrewrittenAutoJournal
+    // (multi_master_test.cc) for a test that reaches it directly, bypassing the rewrite. An
+    // auto-journaled drop would otherwise still reach sub-replicas even though this node never
+    // actually wrote it. OpStatus::OK (never a non-OK status) so a fully dropped
     // entry counts as successfully applied: signaling the drop any other way would either
     // CHECK-fail the multi-shard path below or force a full resync on every LWW conflict.
     result = lww_dropped ? RunnableResult{OpStatus::OK} : (*cb_ptr_)(this, shard);
@@ -1784,11 +1788,15 @@ void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult resul
   if (shard == nullptr)
     return;
 
-  // drakeydb: P4-4 -- a dropped write journals NOTHING, including the auto-journal: SETNX,
-  // GETDEL, RESTORE and GETSET are auto-journaled verbatim (no explicit RecordJournal of their
-  // own), so without this early return a drop would still forward the client's original
-  // command to sub-replicas even though this node's own copy was never touched -- the exact
-  // divergence the veto exists to prevent. Checked before the SQUASHER/IsJournaled/journal()
+  // drakeydb: P4-4 -- a dropped write journals NOTHING, including the auto-journal. No guarded
+  // kSingleKey name reaches here still auto-journaling verbatim today (ApplyLwwRewrites,
+  // multimaster_lww.cc, rewrites SETNX/GETSET/GETDEL pre-dispatch, and RESTORE is
+  // CO::NO_AUTOJOURNAL now too, generic_family.cc) -- this early return is defense-in-depth
+  // against that invariant ever breaking; GenericVetoSuppressesUnrewrittenAutoJournal
+  // (multi_master_test.cc) reaches it directly, bypassing the rewrite, to prove it still works.
+  // Without it, a drop would still forward the client's original command to sub-replicas even
+  // though this node's own copy was never touched -- the exact divergence the veto exists to
+  // prevent. Checked before the SQUASHER/IsJournaled/journal()
   // gates below only because it is cheapest; those gates are also correct for a dropped entry
   // (result.status is OpStatus::OK, so they would not catch this on their own).
   if (lww_dropped)
