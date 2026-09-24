@@ -238,23 +238,17 @@ bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uin
                                  "iteration over the same container";
   for (auto it = armed_.begin(); it != armed_.end(); ++it) {
     if (it->db_index == db_index && it->tombstone && ArmedKey(*it) == key) {
-      // drakeydb: P4-4 -- order-equivalent to the value this tombstone replaces: same mvcc AND
-      // origin_hash as `it->prev_stamp` (this exact arm's own captured pre-delete stamp),
-      // tombstone bit set. No floor and no fresh mint here -- this compares the tombstone against
-      // the very value it deletes, on this same node, so there is nothing for a floor to protect
-      // against (see AsTombstone()'s own comment, mvcc.h, for why reusing the value's stamp
-      // verbatim is safe for exactly this shape of call, unlike an ordinary delete's fresh-minted
-      // tombstone). `prev_mvcc == 0` means this arm carries no real prior stamp at all (a
-      // genuinely fresh key, or a slot the caller's own GetMvcc lookup found nothing for) -- there
-      // is then no value to be order-equivalent WITH, so this falls back to a freshly minted self
-      // stamp instead, with no floor term of its own to add: LocalMintFloor's identical `prev_mvcc
-      // == 0` check (above in this file) already reduces to a no-op floor in that same shape, so
-      // a bare HopStamp here matches what a local mint would already do with nothing to floor
-      // against.
+      // drakeydb: P4-4 -- `ExpiryTombstoneFor` (mvcc.h) applied to `it->prev_stamp` (this exact
+      // arm's own captured pre-delete stamp): one origin_hash tick above the value this tombstone
+      // replaces, tombstone bit set -- never that value's own stamp reused verbatim, and never a
+      // freshly minted, wall-clock-derived one either. `prev_mvcc == 0` means this arm carries no
+      // real prior stamp at all (a value that never received a stamp, or a slot the caller's own
+      // GetMvcc lookup found nothing for) -- there is then nothing for `ExpiryTombstoneFor` to
+      // advance, so this falls back to a freshly minted self stamp instead.
       const uint64_t prev_mvcc = it->prev_stamp.Mvcc();
       const MvccStamp stamp =
           prev_mvcc == 0 ? MvccStamp{HopStamp(now_ms) | MvccClock::kTombstoneBit, OriginHash(0)}
-                         : it->prev_stamp.AsTombstone();
+                         : ExpiryTombstoneFor(it->prev_stamp);
       ++commit_depth_;
       // RAII, matching Commit()'s own exception-safety contract (fn may throw): erase this one
       // arm and restore commit_depth_ whether or not fn throws. Does not touch arena_ -- same as

@@ -2579,8 +2579,33 @@ void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterat
   // unchanged. See ExpireIfNeeded's own comment above for the read-path argument, which does not
   // apply here (this function is never reached from the read path).
   Del(cntx, it, db_arr_[cntx.db_index].get(), false, DeleteReason::kExpired);
-  if (owner_->journal() && journal_deletion)
-    RecordDerivedDelete(cntx, key_owned);
+  if (owner_->journal() && journal_deletion) {
+    // drakeydb: P4-4 -- this container's own removal has no causing client command of its own --
+    // its members simply timed out, discovered by the heartbeat, not by a read or write -- the
+    // same shape a whole-key TTL expiry has. Its tombstone must therefore follow the identical
+    // rule RecordExpiryBlocking's own whole-key expiry uses (tx_base.cc): `ExpiryTombstoneFor`
+    // (mvcc.h) applied to this arm's own captured pre-delete stamp, never a freshly minted,
+    // wall-clock-derived one. CommitOwnTombstone (mvcc.cc) does the actual work; the committed
+    // stamp's masked magnitude is threaded through a patched copy of `cntx` so
+    // RecordDerivedDelete's own journal entry (unchanged below) carries it on the wire, the same
+    // way RecordExpiryBlocking forwards its own committed tombstone's Mvcc(). When no tombstone
+    // was actually committed (TombstonesEnabled() is false, or the tombstone cap was hit),
+    // `cntx.repl_mvcc`/`repl_origin_idx` are forwarded unpatched, exactly as before this change.
+    MvccStamp committed;
+    const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
+        cntx.db_index, key_owned, cntx.time_now_ms,
+        [&committed](DbIndex db, string_view k, const MvccStamp& st, bool, const MvccStamp&) {
+          committed = st;
+          namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+        });
+    if (found_tombstone) {
+      Context patched_cntx = cntx;
+      patched_cntx.repl_mvcc = committed.Mvcc();
+      RecordDerivedDelete(patched_cntx, key_owned);
+    } else {
+      RecordDerivedDelete(cntx, key_owned);
+    }
+  }
 }
 
 int32_t DbSlice::GetNextSegmentForEviction(int32_t segment_id, DbIndex db_ind) const {

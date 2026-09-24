@@ -394,10 +394,11 @@ can sit between two nodes' stamps. Concretely — the reasoning that motivated T
 correctly losing against the newer stamp, could wrongly win against a stale one left behind". That
 argument has never been run. The same applies to an expiry tombstone, whether it comes from a
 merge load's synthetic tombstone for an already-expired incoming key (`ApplyMergeTombstoneOnShard`,
-`rdb_load.cc`) or from a live reap on this node (`CommitOwnTombstone`, `mvcc.cc`): both now carry
-the incoming or expired *value's own* stamp, so both are order-equivalent to that value on a third
-peer that still holds it live — ties favor the stored side, which is why this is believed safe, but
-that too is reasoned rather than measured, not composed across three peers.
+`rdb_load.cc`) or from a live reap on this node (`CommitOwnTombstone`, `mvcc.cc`): both now derive
+their stamp from the incoming or expired *value's own* stamp, one origin_hash tick above it
+(`ExpiryTombstoneFor`, `mvcc.h`), so both order strictly newer than that value on a third peer that
+still holds it live — believed safe by the same one-tick-above argument `ExpiryTombstoneFor`'s own
+doc comment makes, but that too is reasoned rather than measured, not composed across three peers.
 
 **How established:** coverage audit during P4-3's final whole-branch review. No failure is known;
 this is an untested risk, not a reproduced defect.
@@ -408,14 +409,16 @@ this is an untested risk, not a reproduced defect.
 ### D-16. An expiry tombstone can be born GC-eligible
 
 **Where:** originally `src/server/rdb_load.cc`'s merge-load path for an incoming key whose TTL has
-already elapsed (`ApplyMergeTombstoneOnShard`); as of the change that made a LIVE expiry's own
-tombstone order-equivalent to the value it replaces too (`RecordExpiryBlocking`/
-`CommitOwnTombstone`, `tx_base.cc`/`mvcc.cc`), this now applies to most `kExpired` tombstones,
-not only the merge-load one. `DbSlice::TombstoneGcStep` reaps when `DeadlineMs(ttl) <= now`, and
-`DeadlineMs` is `MsPart() + ttl` (`src/server/mvcc.h`).
+already elapsed (`ApplyMergeTombstoneOnShard`); as of the change that put every `kExpired`
+tombstone (local lazy/active expiry, the member-expiry reaper, and this merge-load path) through
+one shared rule (`ExpiryTombstoneFor`, `src/server/mvcc.h`), this applies to essentially every
+`kExpired` tombstone, not only the merge-load one. `DbSlice::TombstoneGcStep` reaps when
+`DeadlineMs(ttl) <= now`, and `DeadlineMs` is `MsPart() + ttl` (`src/server/mvcc.h`).
 
-Both paths reuse the value's *write-time* stamp (bit 63 set) so the tombstone compares exactly as
-that value's own authority would. Its GC deadline is therefore `write_time + tombstone_ttl`, not
+Every path derives its tombstone from the value's *write-time* stamp, one origin_hash tick above
+it (bit 63 set) — the one-tick advance almost always lands in `origin_hash`, essentially never in
+`mvcc` (see `ExpiryTombstoneFor`'s own doc comment for the rare carry case) — so the tombstone's
+`mvcc` field, and therefore its GC deadline, is still `write_time + tombstone_ttl`, not
 `reap_time + tombstone_ttl`. For any key whose own TTL exceeds `--multi_master_tombstone_ttl`
 (default 600 s — e.g. `SET k v EX 3600`), the resulting tombstone is born already past its
 deadline, or close to it, and is reaped on the next idle GC pass (or soon after), then excluded
@@ -437,19 +440,20 @@ are strictly better than erasing with no tombstone at all, which is what happens
 deadline passes regardless.
 
 Why not mint a fresh stamp instead, sized to give the tombstone its full protection window: that
-would fabricate authority the value's own write never carried (or, for the live-reap case, is
-exactly the design this change reverses -- a fresh reap-time mint that outranks writes it has no
-business outranking; see the surrounding review's findings for why that is worse, not better). The
-honest alternatives are a separate reap-deadline field (rejected for the 16-byte per-key layout) or
+would fabricate authority the value's own write never carried, and (for the live-reap case) is
+exactly the reap-time-mint design this rule replaces -- a fresh mint outranks writes it has no
+business outranking, which is worse than a short protection window, not better. The honest
+alternatives are a separate reap-deadline field (rejected for the 16-byte per-key layout) or
 clamping the deadline to `max(write_time, receive_time_or_reap_time) + ttl` at install -- a design
 choice left open here.
 
 **How established:** static analysis in the scoped re-review that added the merge-load path; the
-three-peer scenario is unmeasured (see D-15). The live-reap path's identical exposure was
-identified when that path was changed to reuse the value's own stamp too.
+three-peer scenario is unmeasured (see D-15). The live-reap and member-expiry-reaper paths'
+identical exposure was identified when those paths were changed to derive their stamp from the
+value's own too.
 
 **Status:** open. **Owner:** unassigned (tombstone lifecycle). **From:** the merge-load synthetic
-tombstone's own introduction; widened when the live-reap path adopted the same stamp-reuse rule.
+tombstone's own introduction; widened when the local-reap paths adopted the same rule.
 
 ### D-18. Runtime-revived recipes and name-level full-value writes are unguarded
 
@@ -559,12 +563,34 @@ both nodes converge to absent. The repair is contingent on timing, though: if th
 longer sends anything for this key at all (no live value, no tombstone), and this node's `W` stands
 permanently — the delete is lost, not merely delayed.
 
+**A second cause, not just an absent key's skip.** An applied, guarded `DEL`/`GETDEL` of a key
+whose TTL has already elapsed but which this node has not yet reaped hits the same symptom from a
+different angle. The guard's own veto compares the author's stamp `X` against the key's LIVE,
+still-unreaped stamp `S` (a pure side-table read that never itself triggers expiry) and passes it
+(`X` is newer than `S`); only INSIDE the callback does `FindMutable` (`OpDelV2`/`OpGetDel`'s own
+lookup) lazily reap the key, installing `ExpiryTombstoneFor(S)` — one origin_hash tick above `S`,
+`src/server/mvcc.h` — as its tombstone (`ExpireIfNeeded` → `RecordExpiryBlocking` →
+`CommitOwnTombstone`). Because the key is then already gone, `OpDelV2`'s own `IsValid` check skips
+it exactly as the absent-key case above does: it is never added to `journal_args`, so the author's
+own stamp `X` is never committed here at all — the stored tombstone is `ExpiryTombstoneFor(S)`,
+not `X`. Since `X` can be arbitrarily larger than `ExpiryTombstoneFor(S)`, a third peer's write `W`
+stamped strictly between them applies HERE (it beats the low tombstone) while it is correctly
+dropped AT THE AUTHOR (whose own copy of the key was still live, non-expired, at command time, so
+its local `DEL` committed the real `X` directly, no expiry involved) — diverging exactly as the
+absent-key case does, repaired the same way by the author's next full sync, and lost the same way
+if that tombstone is GC'd first.
+
 **How established:** static reading of `OpDelV2`'s per-key skip-before-`FindMutable` ordering and
 of `ApplyMergeTombstoneOnShard`'s own `MergeAccepts` call; not reproduced with a live three-node
 scenario. Pre-existing in the tombstone mechanism since P4-3 (the per-key LWW skip itself is new in
 P4-4, but the underlying "a DEL of an absent key touches no tombstone" behavior is not); newly
 documented here rather than fixed, since a real fix belongs with the rest of the
-tombstone-lifecycle work.
+tombstone-lifecycle work. The second cause was identified alongside the change that made every
+`kExpired` tombstone derive from the expired value's own stamp (`ExpiryTombstoneFor`, `mvcc.h`);
+it exists regardless of that change (an applied delete's own stamp was always at risk of being
+silently discarded by a mid-command lazy expiry this way), but that change is what makes the
+resulting gap between the discarded `X` and the installed tombstone precisely `X -
+ExpiryTombstoneFor(S)` rather than something already partly closed by a reap-time mint.
 
 **Owner:** P4-5 (tombstone lifecycle). **From:** P4-4.
 

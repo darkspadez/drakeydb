@@ -3,6 +3,7 @@
 //
 #pragma once
 
+#include <algorithm>  // std::min
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -87,22 +88,20 @@ struct MvccStamp {
   // a second call site by necessity (Commit mints/forwards the stamp, this method does not), not
   // a duplication of this logic.
   //
-  // PRECONDITION for an ordinary (non-expiry) delete's own commit-time bit-set inside
-  // MvccStamper::Commit: `this` must already be strictly greater than the stamp of the value
-  // being deleted, never that value's own stamp reused verbatim -- operator< masks bit 63 (see
-  // the INVARIANT comment below), so a reused stamp is order-equivalent to the value it replaces,
+  // PRECONDITION: `this` must already be strictly greater than the stamp of the value being
+  // deleted, never that value's own stamp reused verbatim -- operator< masks bit 63 (see the
+  // INVARIANT comment below), so a reused stamp is order-equivalent to the value it replaces,
   // MergeAccepts ties on it, and ties favor the stored side: the delete then silently never
-  // applies on a peer that still holds the live value. Commit must mint delete stamps strictly
-  // greater than the value's there, never call this on the value's own stamp unmodified.
-  //
-  // Two call sites deliberately do exactly that anyway, and are safe: a merge load's synthetic
-  // tombstone for an incoming key whose TTL has already elapsed (RdbLoader::
-  // ApplyMergeTombstoneOnShard, rdb_load.cc, on `incoming`'s own stamp) and a live expiry's own
-  // tombstone (MvccStamper::CommitOwnTombstone below, on the expired value's own captured
-  // prev_stamp). Both compare the tombstone against the very value it replaces, on the SAME node,
-  // so there is no other write present to lose a tie against; order-equivalence with a THIRD
-  // peer's still-live copy of that same value is exactly the intended outcome (ties favor the
-  // stored side, so neither side resurrects or deletes the other's identical copy).
+  // applies on a peer that still holds the live value, and (worse) a receiver that later
+  // re-creates the exact same key at the exact same {mvcc, origin_hash} pair -- reachable via a
+  // delta RMW applied on a node that already reaped the key -- ties against this tombstone
+  // forever, permanently unrepairable once it is GC'd. Every caller mints or advances a stamp
+  // strictly greater than the value's before calling this: MvccStamper::Commit's own commit-time
+  // bit-set for an ordinary (non-expiry) delete, and ExpiryTombstoneFor (below) for every expiry
+  // tombstone -- local (MvccStamper::CommitOwnTombstone), the member-expiry reaper
+  // (DbSlice::DeleteReapedContainer, db_slice.cc), and a merge load's synthetic tombstone for an
+  // already-expired incoming key (RdbLoader::ApplyMergeTombstoneOnShard's caller, rdb_load.cc)
+  // alike. Never call this directly on a stamp unmodified from the value it replaces.
   MvccStamp AsTombstone() const {
     return MvccStamp{packed | MvccClock::kTombstoneBit, origin_hash};
   }
@@ -111,14 +110,19 @@ struct MvccStamp {
   uint64_t DeadlineMs(uint64_t ttl_ms) const {
     return MsPart() + ttl_ms;
   }
-  // INVARIANT: a tombstone's mvcc MUST be freshly minted via MvccClock::Next -- it must never
-  // reuse the mvcc of the value it deletes. operator< masks bit 63 below precisely because a
-  // fresh mvcc is assumed to make (mvcc, origin_hash) unique per write; if a tombstone instead
-  // sets bit 63 on the value's existing packed, it becomes order-equivalent to that value (see
+  // INVARIANT: a tombstone must be strictly greater, in the (mvcc, origin_hash) lexicographic
+  // order operator< implements below, than the value it replaces -- landing EXACTLY on that value
+  // (advancing neither field) makes the tombstone order-equivalent to it (see
   // MvccStampTest.EqualityDistinguishesTombstoneAtEqualMvcc), and merge code written as
-  // `if (local < incoming) adopt;` silently drops the delete. operator== below is deliberately
-  // NOT tombstone-masked (it compares raw packed), so equality still distinguishes a tombstone
-  // from the value at the same mvcc even though ordering does not.
+  // `if (local < incoming) adopt;` silently drops the delete. Two DIFFERENT, both sanctioned, ways
+  // satisfy this: an ordinary (non-expiry) delete's own commit-time bit-set mints a genuinely
+  // fresh mvcc via MvccClock::Next, never reusing the value's own; an expiry's own tombstone
+  // (`ExpiryTombstoneFor`, below) instead reuses the value's mvcc UNCHANGED and advances
+  // origin_hash by exactly one tick -- still strictly greater by the SAME lexicographic order,
+  // just moving the other coordinate. Which field moved is not what merge code compares; only
+  // "strictly greater" is. operator== below is deliberately NOT tombstone-masked (it compares raw
+  // packed), so equality still distinguishes a tombstone from the value at the same mvcc even
+  // though ordering does not.
   friend bool operator<(const MvccStamp& a, const MvccStamp& b) {
     // std::tie needs lvalues; Mvcc() returns by value, so make_tuple (which copies) is used
     // instead. Semantics are identical: lexicographic comparison on (Mvcc(), origin_hash).
@@ -147,6 +151,46 @@ static_assert(alignof(MvccStamp) == 8,
 // correctly against each other here, while still being distinguishable elsewhere by equality.
 inline bool MergeAccepts(const std::optional<MvccStamp>& stored, const MvccStamp& incoming) {
   return !stored.has_value() || *stored < incoming;
+}
+
+// drakeydb: P4-4 -- the "just-above" tombstone for a value an expiry replaces, never a value's
+// own stamp reused verbatim (AsTombstone's own precondition, above) and never a freshly minted,
+// wall-clock-derived one either. One shared rule for every expiry tombstone in the phase: local
+// lazy/active expiry (MvccStamper::CommitOwnTombstone, below), the member-expiry reaper
+// (DbSlice::DeleteReapedContainer, db_slice.cc), and a merge load's synthetic tombstone for an
+// already-expired incoming key (RdbLoader::ApplyMergeTombstoneOnShard's caller, rdb_load.cc) all
+// call this, so the three can never drift onto different tombstone stamps for what is logically
+// the same kind of event.
+//
+// `{value.Mvcc(), value.origin_hash + 1}`, tombstone bit set -- one origin_hash tick above
+// `value`, mirroring FloorAppliedStamp's one-tick-BELOW landing above for the opposite direction.
+// Strictly greater than `value` (satisfies AsTombstone's own precondition: this is genuinely new
+// authority, not `value`'s own stamp reused), yet the smallest such stamp, so it costs nothing
+// against a later write with real authority of its own (a guarded apply, or a later local write):
+// nothing with legitimate authority over this key can land strictly between `value` and this
+// tombstone, since no author ever mints (or is floored/advanced to) a stamp that exactly
+// reproduces a stamp that already exists here.
+//
+// Landing exactly ON `value` instead (order-equivalent to it, reusing `value`'s own stamp
+// verbatim) was tried and rejected: MergeAccepts ties favor the stored side, so a receiver that
+// re-creates this exact key at this exact {mvcc, origin_hash} pair -- reachable via a delta RMW
+// (INCR/APPEND/...) applied on a node that already reaped the key, which stamps its own re-create
+// verbatim at the author's stamp with no floor of its own to raise it -- would tie against this
+// tombstone forever, permanently unrepairable once the tombstone itself is GC'd. One tick above
+// forecloses that tie entirely, at essentially no cost: the only stamp this excludes that
+// order-equivalence would have included is `value` itself, which nothing legitimately re-mints.
+//
+// `value.origin_hash == UINT64_MAX` carries into Mvcc() instead of overflowing origin_hash to 0
+// (which would REGRESS the ordering, not advance it) -- capped at kStampMask, mirroring
+// LocalMintFloor's own cap (mvcc.cc) for the identical overflow-into-kTombstoneBit hazard: see
+// ExpiryTombstoneForCarriesIntoMvccAtOriginHashMax and
+// ExpiryTombstoneForCapsAtStampMaskOnDoubleOverflow (mvcc_test.cc).
+inline MvccStamp ExpiryTombstoneFor(const MvccStamp& value) {
+  if (value.origin_hash == UINT64_MAX) {
+    return MvccStamp{std::min(value.Mvcc() + 1, MvccClock::kStampMask) | MvccClock::kTombstoneBit,
+                     0};
+  }
+  return MvccStamp{value.Mvcc() | MvccClock::kTombstoneBit, value.origin_hash + 1};
 }
 
 // drakeydb: P4-4 Task A5 -- the "just-below" stamp floor for an APPLIED write (a caller-supplied,
@@ -367,21 +411,21 @@ class MvccStamper {
 
   // drakeydb: P4-4 -- commits ONLY the tombstone arm for (db_index, key), if one is currently
   // armed, independently of whatever the epoch's ordinary Commit() call above would otherwise
-  // apply to EVERY armed key. An expiry is always a local decision: its own tombstone carries the
-  // EXPIRED VALUE'S OWN pre-deletion stamp, order-equivalent to it (AsTombstone() on that arm's
-  // own captured prev_stamp -- same mvcc AND origin_hash, tombstone bit set) -- never an applied
-  // peer command's mvcc/origin, and never a freshly minted one, even when a sibling key armed
-  // earlier in the SAME epoch (e.g. a replicated multi-key command's other pair) correctly must
-  // retain that peer's stamp -- which happens via the enclosing command's own, LATER journal
-  // entry and its own Commit() call, never this one: RecordExpiryBlocking (tx_base.cc) is the only
-  // caller, and calls this BEFORE its own journal::RecordEntry, so this key's arm (if any) has
-  // already been removed and stamped here by the time that entry's own commit logic runs, and a
-  // sibling's arm is left untouched by this call for that later entry to pick up.
+  // apply to EVERY armed key. An expiry is always a local decision: its own tombstone is
+  // `ExpiryTombstoneFor` (above) applied to that arm's own captured prev_stamp -- one tick above
+  // the expired value's own pre-deletion stamp -- never an applied peer command's mvcc/origin, and
+  // never a freshly minted, wall-clock-derived one, even when a sibling key armed earlier in the
+  // SAME epoch (e.g. a replicated multi-key command's other pair) correctly must retain that
+  // peer's stamp -- which happens via the enclosing command's own, LATER journal entry and its own
+  // Commit() call, never this one: RecordExpiryBlocking (tx_base.cc) is the only caller, and calls
+  // this BEFORE its own journal::RecordEntry, so this key's arm (if any) has already been removed
+  // and stamped here by the time that entry's own commit logic runs, and a sibling's arm is left
+  // untouched by this call for that later entry to pick up.
   //
-  // Falls back to a freshly minted self stamp (HopStamp(now_ms), no floor needed -- see the
-  // fallback's own comment in the .cc for why) only when that arm's own prev_stamp carries no
-  // real authority (Mvcc() == 0: a genuinely fresh key, or a slot PerformDeletionAtomic's own
-  // GetMvcc call found nothing for). Looks up this node's own (kSelfIdx) origin hash only in that
+  // Falls back to a freshly minted self stamp (HopStamp(now_ms)) only when that arm's own
+  // prev_stamp carries no real authority (Mvcc() == 0: a value that never received a stamp, or a
+  // slot PerformDeletionAtomic's own GetMvcc call found nothing for) -- `ExpiryTombstoneFor` has
+  // nothing to advance in that case. Looks up this node's own (kSelfIdx) origin hash only in that
   // fallback, and only if a matching tombstone arm is found at all -- avoids the lookup (and, in
   // the fallback branch, advancing the shared per-thread clock) on every expiry when nothing is
   // armed (TombstonesEnabled() is false, the delete was outside the default namespace, or

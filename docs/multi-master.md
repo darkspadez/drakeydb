@@ -42,25 +42,29 @@ mint in the same epoch is unaffected. The floor is capped at the stamp's own bit
 only the `mvcc` portion *ties* the stored stamp's — `origin_hash` still decides which one actually
 wins the next compare (`MergeAccepts`' own tie-break), so a local write does not automatically lose
 just because it hit the cap. The cap itself is reachable only with a corrupt, hostile, or (at this
-encoding's millisecond granularity) roughly year-2248 stamp. An expiry's own tombstone mint follows
-the identical rule, floored against the value it deletes.
+encoding's millisecond granularity) roughly year-2248 stamp. An expiry's own tombstone does not
+mint or floor anything against the value it deletes -- it is a pure, deterministic function of
+that value's own stamp (`ExpiryTombstoneFor`, `mvcc.h`; see "Tombstones" below).
 
 **An already-expired incoming key is the peer's DELETE.** A full sync can ship a key whose
 whole-key TTL has already elapsed — the normal state of an expiring key on a loaded server, whose
 active-expire sweep runs behind. On a *merge* load such a key is not silently dropped: it is
-applied as a delete for that key, carrying the incoming key's own stamp with the tombstone bit
-set, through exactly the same `MergeAccepts` compare and tombstone-install path an opcode-225
-tombstone record takes. If this node's own value for that key is newer, it wins and nothing
-changes; if it is older, it is deleted and the peer's stamp is recorded as a tombstone. That
-tombstone carries the peer's *write-time* stamp, so its GC deadline is `write time +
---multi_master_tombstone_ttl`: for a key whose TTL was longer than the tombstone TTL it is born
-already reapable and gives this node almost no resurrection-protection window (the delete itself
-still stands). Without
+applied as a delete for that key, carrying a tombstone one origin_hash tick above the incoming
+key's own stamp (`ExpiryTombstoneFor`, `mvcc.h`), through exactly the same `MergeAccepts` compare
+and tombstone-install path an opcode-225 tombstone record takes. If this node's own value for that
+key is newer, it wins and nothing changes; if it is older, it is deleted and the peer's stamp
+(advanced by that one tick) is recorded as a tombstone. That tombstone's `mvcc` field is still the
+peer's own *write-time* value (the one-tick advance almost always lands in `origin_hash`, not
+`mvcc` -- see `ExpiryTombstoneFor`'s own doc comment for the rare carry case), so its GC deadline is
+`write time + --multi_master_tombstone_ttl`: for a key whose TTL was longer than the tombstone TTL
+it is born already reapable and gives this node almost no resurrection-protection window (the
+delete itself still stands). Without
 this, a peer's `SET k v2 PX 1000` issued during a partition would leave this node holding the
 older `v1` forever — the peer's tombstone is not in the snapshot's prologue-emitted opcode-225
 section (the key had not expired yet when that ran) and its expiry `DEL` never crosses a peer
-link (see "An expiry's tombstone stamp is per-node" below). A **non-merge** load — a local RDB
-file, `DEBUG LOAD`, a plain Dragonfly replica's full sync — keeps dropping an already-expired key
+link (see "An expiry's tombstone stamp is one origin_hash tick above the value it replaces" below).
+A **non-merge** load — a local RDB file, `DEBUG LOAD`, a plain Dragonfly replica's full sync — keeps
+dropping an already-expired key
 verbatim, exactly as upstream does.
 
 **What it does not do:** merge-LWW only ever compares against *this node's own resident stamp*
@@ -286,8 +290,7 @@ non-zero-`mvcc` stamp whose hash field happens to be exactly `0`; the floor then
 `0`.) The cost is that the resulting `origin_hash` is an arbitrary
 derived number, not any node's own registered hash, so `DEBUG MVCC <key>`'s `origin:` line can show
 a value that matches no peer in the mesh once this has happened even once. Extend the "do not diff
-`DEBUG MVCC` across peers" rule (see Observability, below) to cover this case too, alongside an
-expiry tombstone's own per-node stamp.
+`DEBUG MVCC` across peers" rule (see Observability, below) to cover this case too.
 
 ## Tombstones
 
@@ -304,43 +307,58 @@ as before this phase. This is intentional: eviction is a local capacity decision
 fact about the dataset, and the peer's copy is treated as authoritative for that key. See the
 `--cache_mode` section below for the operational consequence.
 
-**An expiry's tombstone stamp is order-equivalent to the value it replaces.** A `kExpired`
-tombstone carries the expired value's OWN pre-deletion stamp — the same `mvcc` AND the same
-`origin`, with the tombstone bit set (`RecordExpiryBlocking`/`CommitOwnTombstone`,
-`tx_base.cc`/`mvcc.cc`) — never a freshly minted one, unless the value carried no real stamp at
-all (a genuinely fresh key), in which case a fresh self stamp is minted instead, exactly as before.
-This is the same rule a merge load already applies to an incoming key whose TTL has already
-elapsed (`ApplyMergeTombstoneOnShard`, `rdb_load.cc`): reusing the value's own stamp keeps the
-tombstone comparing exactly as the value it replaces would have, so a peer's write with a stamp
-strictly newer than the expired value still wins the next `MergeAccepts` compare, and a peer's
-write with an OLDER stamp still loses — a freshly minted reap-time stamp, by contrast, would
-outrank every write between the value's own stamp and the moment of reaping, including ones that
-should have won.
+**An expiry's tombstone stamp is one origin_hash tick above the value it replaces.** A `kExpired`
+tombstone is `ExpiryTombstoneFor(value)` (`mvcc.h`) applied to the expired value's own
+pre-deletion stamp — the same `mvcc`, `origin_hash + 1`, tombstone bit set
+(`RecordExpiryBlocking`/`CommitOwnTombstone`, `tx_base.cc`/`mvcc.cc`; the same function backs the
+member-expiry reaper, `DbSlice::DeleteReapedContainer`, `db_slice.cc`, and a merge load's
+synthetic tombstone for an already-expired incoming key, `rdb_load.cc`) — never a freshly minted
+one, and never the value's own stamp reused verbatim either, unless the value carried no real
+stamp at all (one that never received a stamp), in which case a fresh self stamp is minted
+instead, exactly as before. Landing exactly on the value (verbatim reuse) was tried and rejected:
+a receiver that re-creates this exact key at this exact stamp — reachable via a delta RMW
+(INCR/APPEND/...) applied on a node that already reaped the key — would tie against such a
+tombstone forever, permanently unrepairable once it is GC'd; one tick above forecloses that tie
+while still costing nothing against any later write with real authority of its own (see
+`ExpiryTombstoneFor`'s own doc comment, `mvcc.h`, for the full argument). This is the same rule a
+merge load already applies to an incoming key whose TTL has already elapsed
+(`ApplyMergeTombstoneOnShard`'s caller, `rdb_load.cc`): a peer's write with a stamp strictly newer
+than the expired value still wins the next `MergeAccepts` compare, and a peer's write with an
+OLDER stamp still loses — a freshly minted reap-time stamp, by contrast, would outrank every write
+between the value's own stamp and the moment of reaping, including ones that should have won.
 
 An expiry `DEL` is still deliberately **not** forwarded on a peer link: `journal::
 PassesPeerEchoFilter` (`journal/types.cc`) drops every entry carrying `kEntryFlagExpired`, and
 `SliceSnapshot::ConsumeJournalChange` applies the same filter to a full sync's concurrent journal
-blob. This remains intentional even though the tombstone's stamp is now order-equivalent to the
-value: an expiry is still each node's own local decision about when to reap, and forwarding it as
-a foreign delete would apply one node's reap timing to another node's copy of the key.
+blob. This remains intentional even though the tombstone's stamp is now a deterministic function
+of the value: an expiry is still each node's own local decision about when to reap, and
+forwarding it as a foreign delete would apply one node's reap timing to another node's copy of
+the key.
 
 The consequence: when the same TTL fires on two peers (the normal case, since the TTL itself
-replicates), both nodes reap the SAME logical value and install the SAME `{mvcc, origin}`
-tombstone for that key — `DEBUG MVCC <key>` on the two nodes now **agrees**. What can still differ
-is the tombstone's own age relative to `--multi_master_tombstone_ttl`: because the stamp is the
-value's write-time, not the reap-time, its GC deadline (`DeadlineMs`, `mvcc.h`) is `write_time +
-tombstone_ttl`, not `reap_time + tombstone_ttl` — see "Sizing the TTL" below for the operational
-consequence. (A tombstone reaped on exactly one node still propagates verbatim to peers via the
-opcode-225 section of that node's next full sync, exactly as before.)
+replicates), both nodes reap the SAME logical value and install the SAME tombstone for that key —
+`DEBUG MVCC <key>` on the two nodes now **agrees**. What can still differ is the tombstone's own
+age relative to `--multi_master_tombstone_ttl`: because its `mvcc` field is (almost always) still
+the value's write-time, not the reap-time (`ExpiryTombstoneFor`'s one-tick advance almost always
+lands in `origin_hash`, not `mvcc` — see its own doc comment for the rare carry case), its GC
+deadline (`DeadlineMs`, `mvcc.h`) is `write_time + tombstone_ttl`, not `reap_time + tombstone_ttl`
+— see "Sizing the TTL" below for the operational consequence. (A tombstone reaped on exactly one
+node still propagates verbatim to peers via the opcode-225 section of that node's next full sync,
+exactly as before.)
 
 On a PLAIN (non-active-mesh) replica specifically, this expiry `DEL` still arrives — only a peer
-link filters it — and carries the tombstone's own masked `mvcc` on the wire, so that replica's own
-floor lands on or under the SAME value the source node just committed, rather than minting one of
-its own. Its recorded `origin`, though, can differ from the source's: the replicated command's
-origin is resolved from this link's own registered author (the source node itself, from the
-replica's point of view), never from the expired value's original `origin_hash`, which does not
-travel on the wire at all. A plain replica already needs a full resync before it can join the mesh
-as a peer, so this divergence is accepted rather than fixed here.
+link filters it — and carries `ExpiryTombstoneFor(value)`'s own masked `mvcc` on the wire: the
+value's own magnitude in the near-universal case, one tick above it only on the rare carry (see
+above). That replica applies the `DEL` as an ordinary command with that value as its author stamp,
+so its own stored stamp for the key lands at, or (on that same rare carry) one tick above, the
+value — never far above it the way a wall-clock-derived reap-time mint could. Its recorded
+`origin`, though, is not the source node's: a plain `REPLICAOF` flow's `peer_origin_idx_` stays
+`kSelfIdx` (0) (`replica.cc`), and this node never remaps index 0 to the source's own hash for such
+a link (that remapping is a DFLY-mesh peer link's own mechanism) — so index 0 keeps resolving to
+THIS replica's own self-registered hash. This replica therefore stamps the tombstone with its own
+self hash, never the source node's and never the expired value's original `origin_hash` either,
+which does not travel on the wire at all. A plain replica already needs a full resync before it
+can join the mesh as a peer, so this divergence is accepted rather than fixed here.
 
 **Tombstones are default-namespace-only.** `PerformDeletionAtomic`'s tombstone-earning check
 (`db_slice.cc`) is gated on `ns_ == &namespaces->GetDefaultNamespace()`. A delete in an ACL
@@ -394,7 +412,8 @@ universal answer. There is no cost to setting it much higher other than the tomb
 the risk of hitting `--multi_master_max_tombstones` sooner on a delete-heavy shard.
 
 An expiry tombstone's GC deadline is measured from the expired value's OWN write time, not from
-when it was actually reaped (see "order-equivalent to the value it replaces" above) — so for a key
+when it was actually reaped (see "one origin_hash tick above the value it replaces" above) — so for
+a key
 whose own TTL is close to, or exceeds, `--multi_master_tombstone_ttl` (e.g. `SET k v EX 3600` under
 the 600s default), the tombstone can be born already past its deadline, or close to it, and get
 reclaimed by the very next idle GC pass — losing the resurrection-protection window for that key
@@ -471,13 +490,17 @@ actually written; when the predicate/condition then skips the write, nothing jou
 conditional delete or a `SET NX` in a loop (e.g. `DELEX lock IFEQ <token>`) will visibly raise this
 counter without indicating any real problem.
 
-**Do not diff `DEBUG MVCC <key>` across peers.** Two nodes that each expired the same key hold
-different `{mvcc, origin}` tombstones for it, by design — see "An expiry's tombstone stamp is
-per-node" above. Both will report `state:tombstone` (or `absent`, once the tombstone is GC'd) and
-both will return nil; only the stamps differ. For a `DEL`, and for an expiry reaped on exactly one
-node, the stamps do match across peers. The applied-write stamp floor (see "Streaming LWW" above)
-is the same kind of case: a floored stamp's `origin:` is a number derived from, not equal to, a
-real registered origin hash, so it is not comparable to any peer's own reporting either.
+**Do not diff `DEBUG MVCC <key>` across peers.** Two mesh peers that each expire the same key
+independently now install the SAME tombstone (see "An expiry's tombstone stamp is one
+origin_hash tick above the value it replaces" above) — as do a `DEL`'s stamp and an expiry reaped
+on exactly one node and propagated to the rest. What still legitimately differs: the
+applied-write stamp floor (see "Streaming LWW" above) produces a floored stamp whose `origin:` is
+a number derived from, not equal to, a real registered origin hash, so it is not comparable to any
+peer's own reporting; and a PLAIN (non-active-mesh) replica's own copy of an expiry tombstone
+carries its own self hash in `origin:`, never the source node's (see "An expiry's tombstone stamp
+is one origin_hash tick above the value it replaces" above) — a `DEBUG MVCC` comparison between a
+mesh peer and a plain replica downstream of it should expect that divergence, even though two
+mesh peers comparing directly should not.
 
 ## Compatibility: the RDB one-way doors
 

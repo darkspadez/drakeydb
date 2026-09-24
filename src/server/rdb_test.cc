@@ -3978,9 +3978,11 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsReplica) {
     mismatches = db_slice.TEST_VerifyMvccTable(0);
   });
   ASSERT_TRUE(got.has_value()) << "the synthetic tombstone must be installed";
-  EXPECT_EQ(*got, kIncomingStamp.AsTombstone())
-      << "the tombstone carries the peer's OWN stamp with bit 63 set -- never our stale one, and "
-         "never a locally minted one";
+  // Independently constructed, not by calling ExpiryTombstoneFor: one origin_hash tick above the
+  // peer's own incoming stamp (mvcc.h), never our stale one, and never a locally minted one.
+  EXPECT_EQ(*got, (MvccStamp{kIncomingStamp.packed | MvccClock::kTombstoneBit, kPeerHash + 1}))
+      << "the tombstone must derive from the peer's OWN stamp -- one origin_hash tick above it -- "
+         "never our stale one, and never a locally minted one";
   EXPECT_TRUE(got->IsTombstone());
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after the delete";
 }
@@ -4036,7 +4038,9 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsMaster) {
     mismatches = db_slice.TEST_VerifyMvccTable(0);
   });
   ASSERT_TRUE(got.has_value()) << "the synthetic tombstone must be installed";
-  EXPECT_EQ(*got, kIncomingStamp.AsTombstone());
+  // Independently constructed, not by calling ExpiryTombstoneFor: one origin_hash tick above the
+  // peer's own incoming stamp (mvcc.h).
+  EXPECT_EQ(*got, (MvccStamp{kIncomingStamp.packed | MvccClock::kTombstoneBit, kPeerHash + 1}));
   EXPECT_TRUE(got->IsTombstone());
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after the delete";
 }

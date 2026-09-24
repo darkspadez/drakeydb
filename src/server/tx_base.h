@@ -281,9 +281,13 @@ void RecordDerivedDelete(const DbContext& db_cntx, std::string_view key);
 // (tx_base.cc) rather than inline here because it needs journal::kEntryFlagExpired and can no
 // longer just forward to RecordDelete(DbIndex, ...), which must stay flag-free.
 //
-// drakeydb: Phase 4, review wave 2 (F4) -- takes a DbContext (not a bare DbIndex) so it can pass
-// db_cntx.repl_mvcc to journal::RecordEntry instead of always minting a fresh local stamp; see
-// the .cc for why origin_idx deliberately does NOT get the same treatment.
+// drakeydb: Phase 4 -- takes a DbContext (not a bare DbIndex) for db_cntx.time_now_ms/db_index
+// (needed to look up and commit this key's own tombstone arm, mvcc.h's CommitOwnTombstone) and,
+// in the narrow case that arm carries no real prior stamp, as a fallback source for
+// journal::RecordEntry's own mvcc (db_cntx.repl_mvcc) instead of minting a fresh local one. In
+// the ordinary case -- a real prior stamp exists -- the wire mvcc instead comes from that
+// committed tombstone's own masked magnitude, never db_cntx.repl_mvcc; see the .cc for the full
+// account, and for why origin_idx deliberately does NOT get any equivalent treatment.
 void RecordExpiryBlocking(const DbContext& db_cntx, std::string_view key);
 
 }  // namespace dfly

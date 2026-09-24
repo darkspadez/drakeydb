@@ -193,15 +193,21 @@ def _comparable(entry, stamp_free):
     Normally: everything -- value AND the full `{mvcc, origin}` stamp (see this module's
     docstring on why a value-only assertion is structurally blind).
 
-    `stamp_free` is for keys whose winning write was an **expiry** (P4-3 final fix wave, F-2).
-    An expiry tombstone's stamp is minted LOCALLY, by the node that reaped the key
-    (`CommitOwnTombstone`/`RecordExpiryBlocking`, `tx_base.cc`), and expiry DELs are deliberately
+    `stamp_free` is for keys whose winning write was an **expiry**. An expiry tombstone's stamp
+    is `ExpiryTombstoneFor(value)` (`mvcc.h`) applied to whichever value the reaping node ITSELF
+    is holding at that moment (`CommitOwnTombstone`/`RecordExpiryBlocking`, `tx_base.cc`) -- a
+    deterministic function of that value, identical on any node that reaps the SAME resident
+    value, not a per-node wall-clock mint. A straddling key is exactly the shape whose resident
+    value can still legitimately differ between the two peers at their own, independent reap
+    moments (ordinary replication lag, not a stamp-minting difference): each peer reaps whatever
+    IT is holding, so if that differs, the resulting tombstone differs too, even though the
+    function computing it is now identical on both sides. Expiry DELs are also still deliberately
     dropped from every peer link (`kEntryFlagExpired` in `journal::PassesPeerEchoFilter`,
-    `journal/types.cc`, applied to the full-sync journal blob too, `snapshot.cc`). So when the
-    same TTL fires on two peers -- which is the normal outcome whenever the TTL itself
-    replicated, i.e. every straddling key in phase (a) above -- each node legitimately holds a
-    DIFFERENT `{mvcc, origin}` for the same key, and `DEBUG MVCC` legitimately differs between
-    them. What must still converge is existence and value: absent on both.
+    `journal/types.cc`, applied to the full-sync journal blob too, `snapshot.cc`), so neither side
+    ever learns the other's tombstone directly either. So when the same TTL fires on two peers --
+    the normal outcome whenever the TTL itself replicated, i.e. every straddling key in phase (a)
+    above -- `DEBUG MVCC` can still legitimately differ between them if their resident values
+    did. What must still converge is existence and value: absent on both.
 
     Exact tombstone-stamp propagation for an expiry that was reaped on ONE node only is still
     pinned, with a full `{mvcc, origin}` equality assertion, by
@@ -314,11 +320,13 @@ async def _arm_straddling_expiries(rng, c_a, c_b, straddling, round_idx, model):
     cross the reattach boundary either still-live or expired-but-unreaped.
 
     The model entry uses the SET's own read-back stamp as its `real` ordering key. That is not
-    the stamp of the eventual tombstone (an expiry tombstone is minted locally at reap time, and
-    is therefore strictly newer) -- it is only used to decide WHICH write wins this key, and
-    since these ops are issued last in the round, the value's stamp already out-ranks every other
-    write on that key this round. The winning entry's `kind` is "expire", which is what makes the
-    final assertion drop to existence+value (see `_comparable`).
+    the stamp of the eventual tombstone (an expiry tombstone is `ExpiryTombstoneFor(value)`,
+    `mvcc.h` -- one origin_hash tick above whichever value is actually reaped, which is not
+    necessarily this exact read-back value if the two peers' copies have since diverged) -- it is
+    only used to decide WHICH write wins this key, and since these ops are issued last in the
+    round, the value's stamp already out-ranks every other write on that key this round. The
+    winning entry's `kind` is "expire", which is what makes the final assertion drop to
+    existence+value (see `_comparable`).
 
     Returns the maximum TTL armed, in seconds (0.0 if nothing was armed).
     """
@@ -401,8 +409,11 @@ async def _run_fuzzer(df_factory, seed, rounds, ops_per_round, extra_a=None, ext
                 await c_a.get(key)
                 await c_b.get(key)
 
-        # F-2: an expiry's tombstone stamp is per-node by design, so expiry winners are compared
-        # on existence + value only. SET/DEL winners keep full {mvcc, origin} equality.
+        # An expiry's tombstone stamp is a deterministic function of the value each peer itself
+        # reaps (ExpiryTombstoneFor, mvcc.h) -- not a per-node mint -- but the two peers' own
+        # resident values can still legitimately differ for a straddling key (ordinary
+        # replication lag), so expiry winners are compared on existence + value only. SET/DEL
+        # winners keep full {mvcc, origin} equality.
         stamp_free = {k for k, exp in model.expected.items() if exp["kind"] == "expire"}
         got_a, got_b = await _wait_converged(
             c_a, c_b, keys, f"seed={seed} round={round_idx}", stamp_free_keys=stamp_free
@@ -436,10 +447,13 @@ async def _run_fuzzer(df_factory, seed, rounds, ops_per_round, extra_a=None, ext
                     f"seed={seed} round={round_idx} key={key}: winner stamp mismatch -- model "
                     f"expected {exp}, got {got['stamp']}"
                 )
-            # `free` (an expiry winner): F-2 -- the surviving tombstone stamp is whichever node
-            # reaped the key, so it is not predictable and not required to match across nodes.
-            # The `got["value"] == exp["value"]` assertion above (exp["value"] is None for every
-            # expiry) is what catches a resurrection, and it is what F-1 fails on.
+            # `free` (an expiry winner): the surviving tombstone stamp is a deterministic function
+            # of whichever value the reaping node itself was actually holding (ExpiryTombstoneFor,
+            # mvcc.h), which this model's own read-back `real` value does not necessarily still
+            # match (ordinary replication lag on a straddling key) -- so it is not predictable by
+            # this model, and not required to match across nodes. The `got["value"] ==
+            # exp["value"]` assertion above (exp["value"] is None for every expiry) is what catches
+            # a resurrection, and it is what an unbounded-tombstone-GC-deadline regression fails on.
             # else: the model's winning write left no discoverable stamp on its own author (e.g.
             # --multi_master_tombstone_ttl=0 erasing a delete's tombstone) -- the value check
             # above is what catches a resurrection in that case; there is no real stamp left
