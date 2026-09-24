@@ -7,6 +7,7 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <absl/strings/ascii.h>
+#include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -32,6 +33,7 @@
 #include "server/journal/serializer.h"
 #include "server/journal/tx_executor.h"
 #include "server/journal/types.h"
+#include "server/multimaster_lww.h"
 #include "server/node_identity.h"
 #include "server/rdb_load.h"
 #include "server/replica.h"
@@ -69,11 +71,11 @@ bool WriteStringToFileForTest(const std::string& path, std::string_view content)
 }  // namespace
 
 TEST(NodeIdentity, VersionConstant) {
-  // drakeydb: P4-3 Task 5 review fix (M2) -- bumped 66 -> 67 alongside kDrakeydbReplVersion
-  // itself (node_identity.h): P4-3's snapshot stream adds opcode 225, so a P4-2-era peer
-  // advertising the old 66 must be refused before full sync, not admitted and hard-failed on an
-  // opcode it cannot parse.
-  EXPECT_EQ(67u, kDrakeydbReplVersion);
+  // drakeydb: P4-4 -- bumped 67 -> 68 alongside kDrakeydbReplVersion itself (node_identity.h):
+  // P4-4 adds the streaming LWW guard plus an applied-write stamp floor change to apply
+  // semantics, so a mixed 67/68 mesh must be refused at handshake, not admitted and left to
+  // silently diverge.
+  EXPECT_EQ(68u, kDrakeydbReplVersion);
 }
 
 TEST(NodeUuid, GenerateIsValidV4) {
@@ -510,8 +512,7 @@ class NodeIdentityFiberTest : public ::testing::Test {
 // that does not match the identity this boot ran with.
 //
 // Falsifying: reverting PersistUuid to mkstemp+rename (no link()/EEXIST/adopt path) makes this
-// test fail with racer uuids that diverge from each other and/or from the file on disk --
-// observed failure text captured in task-9-report.md.
+// test fail with racer uuids that diverge from each other and/or from the file on disk.
 TEST_F(NodeIdentityFiberTest, ConcurrentBootConvergesOnSameUuid) {
   std::string dir = base::GetTestTempPath("nid_race");
   std::filesystem::remove_all(dir);
@@ -744,6 +745,11 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
   EXPECT_EQ(std::string::npos, info.find("active_replica:"));
   EXPECT_EQ(std::string::npos, info.find("connected_masters:"));
+  // drakeydb: P4-4 Task A12 -- multimaster_lww_dropped joins mvcc_unstamped_writes/
+  // mvcc_clock_ahead_ms/mvcc_stale_epoch under the exact same `if (IsActiveReplica())` gate
+  // (server_family.cc) those three already sit behind, just below them -- absent, not printed as
+  // 0, on a non-active node, since the streaming LWW guard can never engage there at all.
+  EXPECT_EQ(std::string::npos, info.find("multimaster_lww_dropped:"));
 
   // drakeydb: review wave 2 (F5, MINOR) -- server_family.cc used to append mvcc_table_bytes/
   // mvcc_entries/mvcc_tombstones to INFO memory unconditionally; a non-active node emitted all
@@ -759,6 +765,26 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones:"));
   // drakeydb: P4-3 Task 8 -- mvcc_tombstones_dropped must be gated identically to its siblings.
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones_dropped:"));
+}
+
+// drakeydb: P4-4 Task A1 -- NoteLwwDrop touches ServerState::tlocal(), which only resolves on a
+// pool proactor thread (see this file's own ApplyReplicatedCommand/
+// ApplyOnePeerWriteToEveryShard comments above for the SIGSEGV this fixture already learned that
+// lesson from); mvcc_test.cc's plain TESTs run on the gtest main thread instead, so this one test
+// lives here rather than beside ClassifyJournaledCommand/LwwGuardActive/LwwShouldDropKey/
+// IncomingStamp in mvcc_test.cc. Three calls, not one, so a bug that sets the counter to a fixed
+// value (e.g. `= 1` instead of `+= 1`) would still be caught.
+TEST_F(MultiMasterFamilyTest, NoteLwwDropIncrementsCounterByExactlyOnePerCall) {
+  auto& shard_set_ref = *shard_set;
+  uint64_t before = 0, after = 0;
+  shard_set_ref.Await(0, [&] { before = ServerState::tlocal()->stats.multimaster_lww_dropped; });
+
+  shard_set_ref.Await(0, [&] { NoteLwwDrop("SET", "k1"); });
+  shard_set_ref.Await(0, [&] { NoteLwwDrop("MSET", "k2"); });
+  shard_set_ref.Await(0, [&] { NoteLwwDrop("DEL", "k3"); });
+
+  shard_set_ref.Await(0, [&] { after = ServerState::tlocal()->stats.multimaster_lww_dropped; });
+  EXPECT_EQ(after - before, 3u);
 }
 
 // drakeydb: P4-1 Task 5 -- the side table on DbTable. Storage only; nothing writes to it outside
@@ -805,14 +831,20 @@ class MvccStoreTest : public BaseFamilyTest {
   // calling thread, and shard_set->Await would run this directly on shard 0's own
   // TxQueue-processing fiber, self-deadlocking the moment a dispatched command needs that same
   // queue to schedule a hop.
+  // drakeydb: P4-4 Task A3 -- extended with `lww_guard`, forwarded verbatim to
+  // JournalExecutor::SetApplyLwwGuard (a per-link setting, so it is set once here alongside
+  // SetApplyOrigin/SetApplyMvcc rather than per entry -- see that method's own comment,
+  // executor.h). Every pre-existing caller now passes false, preserving its prior meaning
+  // (unguarded apply); tests of the streaming LWW veto pass true instead, to exercise it.
   facade::DispatchResult ApplyReplicatedCommand(std::vector<std::string> args, uint32_t origin_idx,
-                                                uint64_t mvcc) {
+                                                uint64_t mvcc, bool lww_guard) {
     facade::DispatchResult dispatch_result = facade::DispatchResult::ERROR;
     pp_->at(0)
         ->LaunchFiber([&] {
           JournalExecutor executor(service_.get());
           executor.SetApplyOrigin(origin_idx);
           executor.SetApplyMvcc(mvcc);
+          executor.SetApplyLwwGuard(lww_guard);
 
           journal::ParsedEntry::CmdData cmd_data;
           cmd_data.Assign(args.begin(), args.end(), args.size());
@@ -833,8 +865,9 @@ class MvccStoreTest : public BaseFamilyTest {
   // peer_replication_test.cc).
   //
   // The origin_idx -> origin_hash registration is done manually here via
-  // shard_set->pool()->AwaitBrief, the same shape AppliedWriteKeepsAuthorStampVerbatim above
-  // uses -- NOT via DflyShardReplica's constructor. An earlier version of this helper relied on
+  // shard_set->pool()->AwaitBrief, the same shape
+  // AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim above uses -- NOT via DflyShardReplica's
+  // constructor. An earlier version of this helper relied on
   // the constructor to do that registration (mirroring what was, at the time, production
   // behavior); that production behavior was reverted after it crashed the server (SIGSEGV,
   // reproduced 5/10 runs of test_active_replica_single_peer_replaces) -- see
@@ -847,16 +880,15 @@ class MvccStoreTest : public BaseFamilyTest {
   // property now lives in InitiateDflySync, a private Replica method with no no-socket
   // construction path); what it still genuinely proves is multi-shard correctness of the
   // CONSUMING side -- ExecuteTx's real, per-shard application of an author's mvcc/origin_hash --
-  // which AppliedWriteKeepsAuthorStampVerbatim above does not cover, since that test only ever
-  // touches one key/shard.
+  // which AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim above does not cover, since that test
+  // only ever touches one key/shard.
   //
   // Construction AND every ExecuteTx call run inside one pp_->at(0)->LaunchFiber(...).Join(),
   // matching ApplyReplicatedCommand above: Execute() calls into Service::DispatchCommand, which
   // needs ServerState::tlocal() to resolve on the calling thread, and that's only ever
   // initialized on the pool's own proactor threads -- confirmed the hard way, by first writing
-  // this without the wrapper and hitting a SIGSEGV in dfly::ServerState::gstate() (see
-  // task-9-report.md for the verbatim crash -- a different crash from the constructor one above,
-  // hit and fixed earlier in the same investigation).
+  // this without the wrapper and hitting a SIGSEGV in dfly::ServerState::gstate() -- a different
+  // crash from the constructor one above, hit and fixed earlier in the same investigation.
   //
   // Assertions on the applied stamps are deliberately NOT inside the LaunchFiber lambda below:
   // gtest's ASSERT_* macros expand to a bare `return`, which only unwinds the immediately
@@ -916,6 +948,39 @@ class MvccStoreTest : public BaseFamilyTest {
                                              << "' (target shard " << target_shard << ")";
     }
     return keys;
+  }
+
+  // drakeydb: P4-4 Task A3 -- registers `origin_idx` -> `origin_hash` on EVERY shard thread, the
+  // same shape AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim (above) and
+  // ApplyOnePeerWriteToEveryShard (above) both use directly: MvccStamper::tlocal() is per-thread,
+  // and ShouldDropForLww's own IncomingStamp call (transaction.cc) runs on whichever shard thread
+  // owns the guarded key, so registering on only one thread would DCHECK-fail (or silently fail
+  // open in release) the moment a test's key lands on a different shard.
+  void RegisterPeerOriginHash(uint32_t origin_idx, uint64_t origin_hash) {
+    shard_set->pool()->AwaitBrief([origin_idx, origin_hash](unsigned, auto*) {
+      MvccStamper::tlocal()->RegisterOriginHash(origin_idx, origin_hash);
+    });
+  }
+
+  // drakeydb: P4-4 Task A3 -- ServerState::Stats::multimaster_lww_dropped is thread-local (one
+  // ServerState per shard/proactor thread), same shape as unstamped_writes
+  // (PureWriteWorkloadLeavesNoUnstampedWrites, above) -- summed across every shard rather than
+  // read off shard 0, since a guarded test's key can land on any of them.
+  uint64_t TotalLwwDropped() {
+    std::atomic<uint64_t> total{0};
+    shard_set->pool()->AwaitBrief(
+        [&](unsigned, auto*) { total += ServerState::tlocal()->stats.multimaster_lww_dropped; });
+    return total.load();
+  }
+
+  // drakeydb: P4-4 Task A3 -- see TotalLwwDropped above; every drop test also asserts this did NOT
+  // advance, proving the veto took the "return OpStatus::OK without ever arming the key" path
+  // rather than arming and then abandoning it.
+  uint64_t TotalUnstampedWrites() {
+    std::atomic<uint64_t> total{0};
+    shard_set->pool()->AwaitBrief(
+        [&](unsigned, auto*) { total += MvccStamper::tlocal()->stats().unstamped_writes; });
+    return total.load();
   }
 };
 
@@ -1290,7 +1355,11 @@ TEST_F(MvccStoreTest, MultiKeySameShardCommandSharesOneStamp) {
   EXPECT_EQ(a->Mvcc(), b->Mvcc()) << "one shard callback mints one stamp";
 }
 
-// The over-stamp cases. Each must leave the stamp untouched and bump the counter.
+// The over-stamp case: a read that still runs an AutoUpdater must leave the stamp untouched, but
+// still bumps mvcc_unstamped_writes at epoch end (armed, never committed). GETEX with no expiry
+// option is the one instance of this left -- EXPIRE's own NX/XX/GT/LT skip used to be a second
+// one; see SkippedExpireDoesNotArmOrStampKey below, now fixed to never arm at all, since (unlike a
+// read) nothing here is ever going to journal.
 TEST_F(MvccStoreTest, ReadOnlyGetExDoesNotStampKey) {
   Run({"set", "k", "v"});
   auto before_stamp = StampOf("k");
@@ -1304,15 +1373,89 @@ TEST_F(MvccStoreTest, ReadOnlyGetExDoesNotStampKey) {
          "silently rejects peer writes that should have won";
 }
 
-TEST_F(MvccStoreTest, SkippedExpireDoesNotStampKey) {
-  Run({"set", "k", "v"});
+// drakeydb: P4-4 -- EXPIRE ... NX/XX/GT/LT whose condition is not satisfied, or whose deadline is
+// out of range, must never arm this key's mvcc slot (OpExpire's own WouldExpireBeNoop pre-check,
+// generic_family.cc/db_slice.h, mirroring OpPersist's identical no-op handling above). Unlike
+// GETEX above, this was never an accepted over-stamp cost: nothing ever journals a no-op EXPIRE,
+// so arming and then abandoning it was a pure, avoidable mvcc_unstamped_writes leak -- on exactly
+// the `EXPIRE k ttl NX` pattern D-27's own operator mitigation (docs/ISSUE-REGISTER.md)
+// recommends running after every INCR. UpdateExpire (db_slice.cc) itself is always called
+// regardless of what WouldExpireBeNoop predicts -- that predicate is a hint for this arm choice
+// only, never a behavioral gate; see its own declaration (db_slice.h) for why.
+//
+// Falsifying: reverting OpExpire's WouldExpireBeNoop pre-check (generic_family.cc) back to an
+// unconditional `find_res.post_updater.Run()` before UpdateExpire makes each
+// `EXPECT_EQ(TotalUnstampedWrites(), before_unstamped)` below observe `before_unstamped + 1`
+// instead, one at a time, for NX, XX, GT, LT and PEXPIREAT-out-of-range.
+TEST_F(MvccStoreTest, SkippedExpireDoesNotArmOrStampKey) {
+  ASSERT_EQ(Run({"set", "k", "v"}), "OK");
   auto before_stamp = StampOf("k");
   ASSERT_TRUE(before_stamp.has_value());
   const MvccStamp before = *before_stamp;
-  EXPECT_EQ(0, CheckedInt({"expire", "k", "100", "XX"}));  // no TTL set -> predicate fails
-  auto after_stamp = StampOf("k");
-  ASSERT_TRUE(after_stamp.has_value());
-  EXPECT_EQ(*after_stamp, before);
+
+  {
+    SCOPED_TRACE("XX against a key with no TTL");
+    const uint64_t before_unstamped = TotalUnstampedWrites();
+    EXPECT_EQ(0, CheckedInt({"expire", "k", "100", "XX"}));  // no TTL set -> predicate fails
+    EXPECT_EQ(StampOf("k"), before);
+    EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+  }
+  {
+    SCOPED_TRACE("GT against a key with no TTL");
+    const uint64_t before_unstamped = TotalUnstampedWrites();
+    // current_cmp is "infinity" with no TTL set -- no finite deadline is ever greater -> fails.
+    EXPECT_EQ(0, CheckedInt({"expire", "k", "100", "GT"}));
+    EXPECT_EQ(CheckedInt({"pttl", "k"}), -1) << "sanity: still genuinely no TTL";
+    EXPECT_EQ(StampOf("k"), before);
+    EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+  }
+
+  MvccStamp with_ttl;
+  {
+    // A real, non-skipped EXPIRE, so NX/GT/LT/OUT_OF_RANGE below all have a TTL to find. This one
+    // DOES arm and commit normally -- it must not itself perturb the baseline the next sub-blocks
+    // read.
+    SCOPED_TRACE("sanity: bare EXPIRE actually sets a TTL");
+    ASSERT_EQ(1, CheckedInt({"expire", "k", "100"}));
+    auto stamp = StampOf("k");
+    ASSERT_TRUE(stamp.has_value());
+    with_ttl = *stamp;
+  }
+  {
+    SCOPED_TRACE("NX against a key that already has a TTL");
+    const uint64_t before_unstamped = TotalUnstampedWrites();
+    EXPECT_EQ(0, CheckedInt({"expire", "k", "200", "NX"}));  // already has one -> predicate fails
+    EXPECT_EQ(StampOf("k"), with_ttl);
+    EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+  }
+  {
+    SCOPED_TRACE("GT against a strictly SHORTER new deadline");
+    const uint64_t before_unstamped = TotalUnstampedWrites();
+    // 50s < the 100s set above -> the new deadline is not greater -> predicate fails.
+    EXPECT_EQ(0, CheckedInt({"expire", "k", "50", "GT"}));
+    EXPECT_EQ(StampOf("k"), with_ttl);
+    EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+  }
+  {
+    SCOPED_TRACE("LT against a strictly LONGER new deadline");
+    const uint64_t before_unstamped = TotalUnstampedWrites();
+    // 500s > the 100s still in effect (the GT above was itself skipped) -> not less -> fails.
+    EXPECT_EQ(0, CheckedInt({"expire", "k", "500", "LT"}));
+    EXPECT_EQ(StampOf("k"), with_ttl);
+    EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+  }
+  {
+    // The leak the round-2 re-review found: PEXPIREAT with an absolute deadline overflowing
+    // kMaxExpireDeadlineMs returns OUT_OF_RANGE -- also a pure no-op, on `main` too, not specific
+    // to this fix -- and used to arm the key regardless, exactly like a failed NX/XX/GT/LT.
+    SCOPED_TRACE("PEXPIREAT out of range");
+    const uint64_t before_unstamped = TotalUnstampedWrites();
+    auto res = Run({"pexpireat", "k", absl::StrCat(INT64_MAX)});
+    EXPECT_THAT(res, ArgType(RespExpr::ERROR));
+    EXPECT_EQ(Run({"get", "k"}), "v") << "the key's own value must be untouched";
+    EXPECT_EQ(StampOf("k"), with_ttl);
+    EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+  }
 }
 
 // drakeydb: P4-1 Task 7, Step 6 -- IsOmittableWrite's redundant-write optimisation arms but never
@@ -1443,10 +1586,14 @@ TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) 
     db_slice.SetMvcc(0, std::string_view{"loaded-key"}, kPersistedStamp);
     loaded->post_updater.RunWithoutMvccArm();
 
-    MvccStamper::tlocal()->Commit(kPendingMvcc, 0,
-                                  [&](DbIndex db, std::string_view key, const MvccStamp& stamp) {
-                                    db_slice.SetExistingMvcc(db, key, stamp);
-                                  });
+    MvccStamper::tlocal()->Commit(
+        kPendingMvcc, 0,
+        // drakeydb: P4-4 Task A5 -- CommitFn's 4th (tombstone) and 5th (the arm's
+        // captured prev_stamp) arguments are both unused here; this test is about arm/commit
+        // isolation, not the floor.
+        [&](DbIndex db, std::string_view key, const MvccStamp& stamp, bool, const MvccStamp&) {
+          db_slice.SetExistingMvcc(db, key, stamp);
+        });
     pending_stamp = db_slice.GetMvcc(0, "pending-key");
     loaded_stamp = db_slice.GetMvcc(0, "loaded-key");
   });
@@ -2156,20 +2303,22 @@ std::string InvalidRestorePayloadWithValidFooter() {
   return payload;
 }
 
-// drakeydb: second-round review fix (Important #1) -- I3's PRODUCTION half
-// (DbSlice::RollbackUncommittedTombstone, db_slice.cc) had no coverage: the only committed I3
-// test (mvcc_test.cc) drives MvccStamper::EndOfWriteEpoch directly with a mock EraseFn, so
-// neither RollbackUncommittedTombstone itself nor any of the eight real call-site wirings
-// (transaction.cc x2, db_slice.cc x6) was exercised -- gutting RollbackUncommittedTombstone to a
-// no-op left mvcc_test 30/30 and multi_master_test green. This drives a real, unmocked
-// never-commits path end to end: RESTORE key 0 <payload> REPLACE on an existing key runs
-// OpRestore (generic_family.cc), which DelMutable's the existing value (default reason
-// kExplicit, so it ArmTombstones under this task's own gate) BEFORE attempting
+// drakeydb: P4-4 -- I3's PRODUCTION half (DbSlice::RollbackUncommittedTombstone, db_slice.cc) had
+// no coverage: the only committed I3 test (mvcc_test.cc) drives MvccStamper::EndOfWriteEpoch
+// directly with a mock EraseFn, so neither RollbackUncommittedTombstone itself nor any of the
+// eight real call-site wirings (transaction.cc x2, db_slice.cc x6) was exercised -- gutting
+// RollbackUncommittedTombstone to a no-op left mvcc_test 30/30 and multi_master_test green. This
+// drives a real, unmocked never-commits path end to end: RESTORE key 0 <payload> REPLACE on an
+// existing key runs OpRestore (generic_family.cc), which DelMutable's the existing value (default
+// reason kExplicit, so it ArmTombstones under this task's own gate) BEFORE attempting
 // RdbRestoreValue::Add on the caller-supplied payload -- when that Add fails, OpRestore returns
-// the error status directly, RESTORE being CO::JOURNALED (auto-journal, not NO_AUTOJOURNAL) means
-// Transaction::LogAutoJournalOnShard's `if (result.status != OpStatus::OK) return;`
-// (transaction.cc) skips journaling entirely, so no Commit() ever consumes the tombstone arm --
-// exactly the "auto-journaled command returning non-OK" class of orphaning path I3 exists for.
+// the error status directly. RESTORE's own registration is CO::JOURNALED | CO::NO_AUTOJOURNAL
+// (generic_family.cc), and an active node (this fixture's own default) never revives it for
+// RESTORE, so IsAutoJournalSuppressed() (transaction.cc) would suppress the generic auto-journal
+// here regardless -- but Transaction::LogAutoJournalOnShard's own `if (result.status !=
+// OpStatus::OK) return;` gate, checked earlier in that same function, already fires first for this
+// non-OK status either way, so no Commit() ever consumes the tombstone arm -- exactly the
+// "auto-journaled command returning non-OK" class of orphaning path I3 exists for.
 TEST_F(MvccStoreTest, RestoreReplaceFailureRollsBackTheOrphanedTombstone) {
   Run({"set", "k", "v1"});
   ASSERT_TRUE(StampOf("k").has_value());
@@ -2236,12 +2385,15 @@ TEST_F(MvccStoreTest, RecreateAfterContainerEmptiedByCommandClearsTheTombstone) 
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-3 Task 2 review fix (C1, Critical) -- the single-command variant: OpRestore
-// (generic_family.cc) deletes an existing key itself (DelMutable, default reason kExplicit, so it
-// tombstones) then re-adds the restored value, all inside ONE auto-journaled RESTORE command
-// (CO::JOURNALED, not NO_AUTOJOURNAL) -- so the eventual commit is deferred past
-// OnCbFinishBlocking's check exactly like a deferred/auto-journaled write, unlike DEL's own
-// explicit, synchronous RecordJournal.
+// drakeydb: P4-4 -- the single-command variant: OpRestore (generic_family.cc) deletes an existing
+// key itself (DelMutable, default reason kExplicit, so it tombstones) then re-adds the restored
+// value, all inside ONE RESTORE command. RESTORE is CO::JOURNALED | CO::NO_AUTOJOURNAL now: a
+// non-active node revives the verbatim auto-journal (deferred past OnCbFinishBlocking's check,
+// like any auto-journaled write), while an active node (this fixture's own default) journals
+// explicitly instead, from inside OpRestore's own callback body (synchronous, not deferred). What
+// actually clears the stale tombstone bit here, either way, is EnsureMvcc's own synchronous branch
+// (PostUpdate, db_slice.cc), which runs at the moment the new value is created -- independent of
+// when the journal entry itself eventually commits.
 TEST_F(MvccStoreTest, RestoreReplaceRecreatesClearingTheTombstone) {
   Run({"set", "k", "v1"});
   std::string dump = Run({"dump", "k"}).GetString();
@@ -2336,13 +2488,13 @@ TEST_F(MvccStoreTest, CopyStampsTheDestinationRegardlessOfShardPlacement) {
 // comment, db_slice.h). DbSlice::ExpireIfNeeded now calls Del()/PerformDeletionAtomic BEFORE
 // RecordExpiryBlocking, so the tombstone arm PerformDeletionAtomic places for this kExpired
 // delete is consumed by this DEL's own Commit(), exactly the way an explicit DEL's arm is.
-// Supersedes ExpiryErasesTheStamp, which pinned the pre-Task-11 erase behavior for the same
-// scenario -- this test is its replacement, not an addition.
+// Supersedes ExpiryErasesTheStamp, which pinned the plain-erase behavior this same scenario had
+// before that reorder -- this test is its replacement, not an addition.
 //
 // Falsifying: reverting the ExpireIfNeeded reorder (db_slice.cc) so RecordExpiryBlocking runs
-// before Del() again reproduces the orphaned-arm symptom: EndOfWriteEpoch's rollback (Task 2's
-// I3) erases the synchronous zero-authority placeholder before any Commit() lands a real stamp
-// on it, so StampOf comes back nullopt instead of a tombstone. Verbatim run in task-11-report.md.
+// before Del() again reproduces the orphaned-arm symptom: EndOfWriteEpoch's rollback erases the
+// synchronous zero-authority placeholder before any Commit() lands a real stamp on it, so
+// StampOf comes back nullopt instead of a tombstone.
 TEST_F(MvccStoreTest, LazyExpiryEarnsATombstoneWithSelfOrigin) {
   // An ordinary self-authored write, purely so this test can compare its origin_hash against the
   // expiry tombstone's below without hardcoding this node's uuid hash.
@@ -2361,12 +2513,17 @@ TEST_F(MvccStoreTest, LazyExpiryEarnsATombstoneWithSelfOrigin) {
       << "a lazily-expired key must keep its slot, as a tombstone -- not an absent slot";
   EXPECT_TRUE(tomb->IsTombstone());
   EXPECT_NE(tomb->Mvcc(), 0u)
-      << "must carry the expiry DEL's own real, minted stamp -- not the zero-authority "
-         "{kTombstoneBit, 0} placeholder PerformDeletionAtomic writes synchronously, which "
-         "EndOfWriteEpoch rolls back if nothing ever commits over it";
-  EXPECT_EQ(tomb->origin_hash, self_origin_hash)
+      << "must carry the expiry DEL's own real stamp -- not the zero-authority {kTombstoneBit, 0} "
+         "placeholder PerformDeletionAtomic writes synchronously, which EndOfWriteEpoch rolls "
+         "back if nothing ever commits over it";
+  // One origin_hash tick above self_origin_hash, not equal to it: k's own pre-expiry stamp is
+  // itself self-authored, and ExpiryTombstoneFor (mvcc.h) advances origin_hash by exactly one
+  // tick, never reusing it verbatim -- see that function's own doc comment for why (a tie would
+  // let a same-stamp re-create tie against this tombstone forever).
+  EXPECT_EQ(tomb->origin_hash, self_origin_hash + 1)
       << "an expiry is always a local decision (RecordExpiryBlocking pins origin_idx to "
-         "kSelfIdx) -- it must never be attributed to a peer";
+         "kSelfIdx) -- it must derive from this node's own prior stamp, never be attributed to a "
+         "peer";
 }
 
 // drakeydb: P4-1 Task 8; updated P4-3 Task 2 -- a multi-key DEL is still kExplicit for every key
@@ -2462,21 +2619,32 @@ TEST_F(MvccStoreTest, ZunionstoreStampsTheDestinationAcrossTwoJournalEntries) {
                                    "newer stamp for dest via its two-entry DEL+ZADD path";
 }
 
-// drakeydb: Phase 4 Task 9 -- the phase's acceptance criterion: an applied write carries the
-// author's stamp verbatim, not a freshly-minted local one, and records the AUTHOR's origin hash,
-// not the applier's own. Falsifying (see task-9-report.md for the verbatim run): removing the
+// drakeydb: Phase 4 Task 9 -- an applied write must carry the
+// author's stamp verbatim, not a freshly-minted local one, and record the AUTHOR's origin hash,
+// not the applier's own. Falsifying: removing the
 // executor_->SetApplyMvcc(tx_data.mvcc) call in DflyShardReplica::ExecuteTx (replica.cc) leaves
 // JournalExecutor's ConnectionContext::repl_mvcc at its 0 default, so RecordEntry's
 // `entry.mvcc == 0` test (journal.cc) is true and it mints a fresh HopStamp instead of storing
 // kAuthorMvcc, failing the first EXPECT_EQ below.
-TEST_F(MvccStoreTest, AppliedWriteKeepsAuthorStampVerbatim) {
+//
+// drakeydb: P4-4 Task A5 -- renamed from AppliedWriteKeepsAuthorStampVerbatim: "verbatim" is no
+// longer the WHOLE story for an applied write's LOCAL stored stamp -- FloorAppliedStamp (mvcc.h)
+// floors it instead whenever the author's stamp is older than the key's own current one. "k"
+// here is a BRAND NEW key, so its stored stamp `S` is a fresh {0,0} slot -- exactly
+// FloorAppliedStamp's own "nothing to floor against" case -- so this test's assertion is
+// unchanged; see UnguardedAppliedRmwWithOlderAuthorMvccFloorsInsteadOfRewindingTheStamp (below)
+// for the floored case. The journal ENTRY this applier's own downstream peers see
+// still carries kAuthorMvcc verbatim regardless -- RecordEntry writes entry.mvcc onto the wire
+// entry BEFORE Commit() (and any floor) ever runs (journal.cc) -- only the LOCAL stored stamp is
+// ever floored, never what gets propagated.
+TEST_F(MvccStoreTest, AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim) {
   constexpr uint64_t kAuthorMvcc = 0x1234'5678'9ABCULL;
   constexpr uint32_t kPeerIdx = 3;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-0000-4000-8000-00000000000b");
 
   shard_set->pool()->AwaitBrief(
       [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
-  ApplyReplicatedCommand({"set", "k", "v"}, kPeerIdx, kAuthorMvcc);
+  ApplyReplicatedCommand({"set", "k", "v"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
 
   auto st = StampOf("k");
   ASSERT_TRUE(st.has_value());
@@ -2485,20 +2653,36 @@ TEST_F(MvccStoreTest, AppliedWriteKeepsAuthorStampVerbatim) {
   EXPECT_EQ(st->origin_hash, peer_hash) << "and must record the AUTHOR, not itself";
 }
 
-// drakeydb: review wave 2 (F4, IMPORTANT) -- MvccStamper::Commit stamps EVERY currently-armed key
-// with the entry it is given, not just the key its own payload names (mvcc.h). MSET arms
-// key-by-key (OpMSet, string_family.cc: one Set() call per pair, one post_updater.Run() each) and
-// only journals once at the very end -- so if a LATER key in the same MSET already has an expired
-// whole-key TTL, AddOrFind -> FindInternal -> ExpireIfNeeded (db_slice.cc) fires
-// RecordExpiryBlocking (tx_base.cc) for it MID-CALLBACK, and that call's own Commit() sweeps up
-// every key armed so far -- including k1 here, armed by its own Set() one iteration earlier --
-// before MSET's own trailing RecordJournal ever gets a chance to stamp it. Before this fix, k1
-// came out stamped with a freshly-minted LOCAL HopStamp (RecordExpiryBlocking's hardcoded mvcc=0)
-// instead of the replicated MSET's real author stamp.
+// drakeydb: P4-4 -- MvccStamper::Commit stamps EVERY currently-armed key with the entry it is
+// given, not just the key its own payload names (mvcc.h). MSET arms key-by-key (OpMSet,
+// string_family.cc: one Set() call per pair, one post_updater.Run() each) and only journals once
+// at the very end -- so if a LATER key in the same MSET already has an expired whole-key TTL,
+// AddOrFind -> FindInternal -> ExpireIfNeeded (db_slice.cc) fires RecordExpiryBlocking (tx_base.cc)
+// for it MID-CALLBACK. That call's own journal entry no longer sweeps anything but k2's own
+// tombstone arm (RecordExpiryBlocking/journal::RecordEntry), so k1 -- armed by its own Set() one
+// iteration earlier -- stays armed until MSET's own trailing RecordJournal commits it, with the
+// replicated MSET's real author stamp, exactly as if k2 had never expired at all.
 //
-// Falsifying: reverting RecordExpiryBlocking's `db_cntx.repl_mvcc` argument (tx_base.cc) back to
-// a hardcoded 0 makes k1's EXPECT_EQ below fail -- st->Mvcc() comes back larger than kAuthorMvcc
-// (a real HopStamp minted from the live wall clock, not this literal).
+// Falsifying k1's own assertion: reintroducing the removed sibling sweep (the unconditional
+// Commit() call inside journal::RecordEntry, gated here on `!(entry_flags & kEntryFlagExpired)`,
+// journal.cc) makes k1's EXPECT_EQ below fail -- st1->Mvcc() comes back equal to whatever
+// RecordExpiryBlocking's own entry carried for k2 (see below) instead of kAuthorMvcc.
+//
+// k2 itself is RECREATED by this same MSET (its own Set() call writes "v2" right after the
+// expiry), so its FINAL stamp is not the transient tombstone at all -- it is that recreate's own
+// applied-write floor (FloorAppliedStamp, mvcc.h), computed against whatever prev_stamp the
+// recreate's arm captured. That prev_stamp is now the expiry's own committed tombstone --
+// `ExpiryTombstoneFor(P)` (mvcc.h: one origin_hash tick above the value's pre-expiry stamp `P`,
+// captured below as `p_before_expiry`) -- never a freshly minted, wall-clock-scale one.
+// kAuthorMvcc below is a small, fixed constant, strictly OLDER than P's own wall-clock-derived
+// Mvcc(), so FloorAppliedStamp takes its "incoming is older" branch and floors one origin_hash
+// tick below `ExpiryTombstoneFor(P)` -- which lands EXACTLY back on P itself (advancing one tick
+// up, then flooring one tick back down): never below P's own Mvcc(), and never above it either,
+// the way flooring against a fresh, larger reap-time mint used to.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// unconditionally makes k2's EXPECT_EQ below fail -- st2 comes back floored one origin_hash tick
+// below a freshly-minted (larger) Mvcc(), not equal to P itself.
 TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   constexpr uint32_t kPeerIdx = 6;
   constexpr uint64_t kAuthorMvcc = 0x7777'0000'2222ULL;
@@ -2525,69 +2709,70 @@ TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   // (above in this file) uses for the analogous member-TTL case. AdvanceTime (mocked clock, no
   // real sleep) keeps this deterministic.
   Run({"set", k2, "old", "px", "10"});
+  auto p_before_expiry = StampOf(k2);  // P: k2's own live stamp, captured BEFORE it expires
+  ASSERT_TRUE(p_before_expiry.has_value());
   AdvanceTime(50);
 
-  ApplyReplicatedCommand({"mset", k1, "v1", k2, "v2"}, kPeerIdx, kAuthorMvcc);
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+  ApplyReplicatedCommand({"mset", k1, "v1", k2, "v2"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
 
   auto st1 = StampOf(k1);
   ASSERT_TRUE(st1.has_value());
   EXPECT_EQ(st1->Mvcc(), kAuthorMvcc)
-      << "k1 was armed by its own Set() before k2's lazy expiry swept it into that entry's "
-         "Commit() call -- it must still end up stamped with the MSET's real author mvcc";
-  EXPECT_EQ(st1->origin_hash, peer_hash)
-      << "k1 was swept into the expiry commit and must retain the MSET author's origin hash";
+      << "k1 was armed by its own Set() before k2's lazy expiry, and must stay armed through it "
+         "-- it must end up stamped with the MSET's real author mvcc, from MSET's OWN trailing "
+         "journal entry, never k2's expiry entry";
+  EXPECT_EQ(st1->origin_hash, peer_hash) << "k1 must retain the MSET author's origin hash";
 
   auto st2 = StampOf(k2);
   ASSERT_TRUE(st2.has_value());
-  EXPECT_EQ(st2->Mvcc(), kAuthorMvcc) << "k2 itself is stamped by MSET's own trailing commit, "
-                                         "unaffected by this bug -- guards against a vacuous pass";
-  EXPECT_EQ(st2->origin_hash, peer_hash);
+  EXPECT_FALSE(st2->IsTombstone()) << "k2 is recreated within this same MSET, so it ends up live";
+  // Derived independently from FloorAppliedStamp's own documented formula (mvcc.h), not by
+  // calling it: kAuthorMvcc is strictly older than P.Mvcc() here (a small fixed constant against
+  // a wall-clock-scale value), and ExpiryTombstoneFor(P)'s own origin_hash (P's own, plus one) is
+  // real and non-zero, so the "incoming is older, origin_hash != 0" branch applies exactly, and
+  // its own "-1" cancels ExpiryTombstoneFor's own "+1" exactly, landing back on P itself.
+  EXPECT_EQ(*st2, *p_before_expiry)
+      << "k2's re-created value must floor against ExpiryTombstoneFor(P) -- landing exactly back "
+         "on P itself -- never against a fresh, wall-clock-scale reap-time mint";
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped)
+      << "k1 staying armed across k2's expiry must not leak it as an unstamped write";
 }
 
-// drakeydb: P4-3 Task 11, review ruling I2 -- a lazy expiry firing while applying a peer's
-// command must mint its OWN fresh self stamp for its tombstone, never inherit that peer
-// command's mvcc/origin (db_cntx.repl_mvcc/repl_origin_idx) -- an expiry is always a local
-// decision (D-10), regardless of whose command happened to trigger it. Before this fix,
-// RecordExpiryBlocking (tx_base.cc) forwarded db_cntx.repl_mvcc/repl_origin_idx unconditionally
-// (review wave 2, F4) so a sibling key swept into the SAME Commit() call mid a replicated
-// multi-key command would correctly retain the author's stamp (see
-// ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc above) -- but that same forwarding also
-// reached the EXPIRING key's own tombstone arm, with no way to tell the two apart. If the
-// peer's forwarded stamp predates the expired key's own prior stamp (clock skew, or simply an
-// old command applied late, as here), the resulting tombstone is OLDER than the value it
-// replaces and a peer's still-live copy of the same key would resurrect it forever.
+// drakeydb: P4-4 -- a lazy expiry firing while applying a peer's command must keep its tombstone
+// derived from the value it replaces -- one origin_hash tick above the value's OWN pre-deletion
+// stamp (ExpiryTombstoneFor, mvcc.h) -- never inherit that peer command's mvcc/origin
+// (db_cntx.repl_mvcc/repl_origin_idx), and never mint a fresh, wall-clock-derived one either: an
+// expiry is always a local decision about WHEN to reap, regardless of whose command happened to
+// trigger it, but the tombstone it leaves is a deterministic function of the exact value that was
+// reaped, not a new, independent event with its own timestamp. If the tombstone instead inherited
+// the peer's forwarded stamp verbatim, and that stamp predates the expired key's own prior stamp
+// (clock skew, or simply an old command applied late, as here), the resulting tombstone would be
+// OLDER than the value it replaces and a peer's still-live copy of the same key would resurrect it
+// forever; if it instead minted a fresh reap-time stamp, it would outrank every write between the
+// value's own stamp and the moment of reaping, including ones that should have won.
 //
 // The simplest repro needs no multi-key command at all: replaying a peer's plain DEL of a key
-// that is ALREADY (lazily, not yet swept) expired routes through DbSlice::FindMutable ->
+// that is ALREADY (lazily, not yet reaped) expired routes through DbSlice::FindMutable ->
 // FindInternal -> ExpireIfNeeded BEFORE GenericFamily::OpDelV2 ever gets a valid iterator for it
 // (IsValid(it.it) is false, so OpDelV2 just skips it and journals nothing of its own, per its
 // journal_args/deleted_cnt bookkeeping) -- the ONLY journal entry this command produces is the
 // expiry's own RecordExpiryBlocking call, so whatever it stamps "j" with is exactly, and only,
-// what this test observes; nothing else can overwrite it afterward the way k2's resurrection
-// masks the same transient stamp in the sibling test above.
+// what this test observes.
 //
 // kOldPeerMvcc is deliberately tiny (far smaller than any real HopStamp, which is derived from
 // wall-clock ms) so a stamp that wrongly inherited it would be strictly OLDER than "j"'s own
-// prior live stamp -- exactly the resurrection hazard the ruling describes.
+// prior live stamp -- exactly the resurrection hazard this test guards against.
 //
-// Falsifying: removing the MvccStamper::tlocal()->CommitOwnTombstone(...) call at the top of
-// RecordExpiryBlocking (tx_base.cc) reproduces this -- see task-11-report.md's fix report for
-// the verbatim failure (tomb->Mvcc() comes back equal to kOldPeerMvcc, tomb->origin_hash equal
-// to peer_hash, instead of a fresh self stamp).
-TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp) {
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// unconditionally makes the EXPECT_EQ below fail -- tomb comes back self-originated with a
+// freshly-minted (larger) Mvcc(), not one origin_hash tick above `before`.
+TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandKeepsExpiredValuesOwnStamp) {
   constexpr uint32_t kPeerIdx = 11;
   constexpr uint64_t kOldPeerMvcc = 0x1000ULL;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-0000-4000-8000-0000000000ee");
   shard_set->pool()->AwaitBrief(
       [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
-
-  // An ordinary self-authored write, purely so this test can compare its origin_hash against the
-  // expiry tombstone's below without hardcoding this node's uuid hash (same technique as
-  // LazyExpiryEarnsATombstoneWithSelfOrigin above).
-  Run({"set", "control", "v"});
-  auto control_stamp = StampOf("control");
-  ASSERT_TRUE(control_stamp.has_value());
-  const uint64_t self_origin_hash = control_stamp->origin_hash;
 
   Run({"set", "j", "v", "px", "10"});
   auto before_stamp = StampOf("j");
@@ -2597,51 +2782,357 @@ TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp) {
 
   // Apply a peer's DEL of "j" as if replicated. "j" is already lazily expired but not yet
   // physically removed, so this command's own FindMutable lookup discovers and expires it.
-  ApplyReplicatedCommand({"del", "j"}, kPeerIdx, kOldPeerMvcc);
+  ApplyReplicatedCommand({"del", "j"}, kPeerIdx, kOldPeerMvcc, /*lww_guard=*/false);
 
   auto tomb = StampOf("j");
   ASSERT_TRUE(tomb.has_value())
       << "the applied peer DEL's own lazy expiry of j must still leave a tombstone";
   EXPECT_TRUE(tomb->IsTombstone());
-  EXPECT_GT(tomb->Mvcc(), before.Mvcc())
-      << "must be a freshly minted self stamp, strictly newer than the value it replaces -- not "
-         "the peer's old mvcc, or a peer's still-live copy of j would resurrect it";
+  // Independently constructed, not by calling ExpiryTombstoneFor: one origin_hash tick above
+  // `before`, tombstone bit set, mvcc unchanged.
+  EXPECT_EQ(*tomb, (MvccStamp{before.packed | MvccClock::kTombstoneBit, before.origin_hash + 1}))
+      << "must be derived from the value it replaced -- one origin_hash tick above `before`'s own "
+         "mvcc AND origin_hash -- never the peer's old mvcc/origin and never a freshly minted "
+         "self stamp";
   EXPECT_NE(tomb->Mvcc(), kOldPeerMvcc);
-  EXPECT_EQ(tomb->origin_hash, self_origin_hash)
-      << "an expiry is always a local decision -- it must be self-originated even while applying "
-         "a peer's command, never attributed to that peer";
-  EXPECT_NE(tomb->origin_hash, peer_hash);
+  EXPECT_NE(tomb->origin_hash, peer_hash)
+      << "an expiry is always a local decision -- it must never be attributed to the peer whose "
+         "command happened to trigger it";
+}
+
+// drakeydb: P4-4 -- a guarded applied write can legitimately arrive for a key whose TTL has
+// already elapsed but which this node has not yet reaped: the guard's own veto compares the
+// incoming author stamp against the key's LIVE, still-unreaped stamp S (a pure side-table read,
+// GetMvcc, that never itself triggers expiry), so a stamp X strictly greater than S passes the
+// veto and the callback runs. Only INSIDE that callback does the write's own key lookup
+// (FindMutable /AddOrFind) lazily expire the key -- and that expiry's own tombstone must derive
+// from S, one origin_hash tick above it (ExpiryTombstoneFor, mvcc.h; never a fresh, wall-clock-
+// derived mint that would land far above X for no reason related to X at all), or the resulting
+// stamp would wrongly outrank every future write between S and that mint, including this one and
+// any later one whose author stamp sits in that same range.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// unconditionally makes the SECOND ApplyReplicatedCommand below get dropped (Run({"get","k"})
+// stays "v1", not "v2") -- the expiry's own fresh mint outranks Y, even though the peer never saw
+// that mint and never lost to it.
+TEST_F(MvccStoreTest, GuardedApplyAgainstAnUnreapedExpiredKeyAppliesWithTheAuthorsStampExactly) {
+  constexpr uint32_t kPeerIdx = 60;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-c1c1-4000-8000-000000000060");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "old", "px", "10"}), "OK");
+  auto s_stamp = StampOf("k");  // S: k's own pre-expiry stamp
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(50);  // k's TTL has now elapsed, but nothing has read/reaped it yet
+
+  // X: a peer's write, strictly newer than S, but nowhere near this node's own (much later, after
+  // AdvanceTime) wall clock -- exactly the shape a freshly-minted reap-time stamp would wrongly
+  // outrank.
+  const uint64_t stamp_x = s_stamp->Mvcc() + 1;
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "v1"}, kPeerIdx, stamp_x, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "v1");
+  auto after_x = StampOf("k");
+  ASSERT_TRUE(after_x.has_value());
+  EXPECT_FALSE(after_x->IsTombstone());
+  EXPECT_EQ(*after_x, (MvccStamp{stamp_x, peer_hash}))
+      << "must apply with the author's stamp EXACTLY -- not floored above X by the key's own "
+         "lazy expiry, which fires mid-callback while this SET is looking up 'k' to write it";
+
+  // Y: a second peer write, strictly newer than X, still far below this node's current wall
+  // clock -- must also apply; it would be wrongly dropped if the expiry above had floored the
+  // stored stamp above X.
+  const uint64_t stamp_y = stamp_x + 1;
+  ASSERT_LT(stamp_y, GetCurrentTimeMs() << MvccClock::kCounterBits)
+      << "sanity: Y is nowhere near this node's own wall clock";
+  const uint64_t before_dropped = TotalLwwDropped();
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "v2"}, kPeerIdx, stamp_y, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "k"}), "v2")
+      << "a write strictly newer than X must still apply, not be wrongly dropped against a stamp "
+         "an earlier reap-time mint would have raised above it";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped);
+}
+
+// drakeydb: P4-4 -- the mirror-image case: this node reaps an expired key ON ITS OWN (no peer
+// command involved), and only LATER does a peer's legitimate write for that same key arrive.
+// Because the tombstone this node installed derives from the value it replaced (S, one
+// origin_hash tick above it -- ExpiryTombstoneFor, mvcc.h -- not a fresh reap-time mint), a peer
+// write authored strictly after S still applies, even though this node's own reap happened long
+// before -- on its own clock -- and even though the peer's write carries a stamp nowhere near
+// this node's wall clock at reap time.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// unconditionally makes the ApplyReplicatedCommand below get dropped (Run({"get","k"}) stays nil,
+// not "peer_v") -- this node's own fresh reap-time mint outranks a peer write it never even saw.
+// The sanity check just below is deliberately EXPECT, not ASSERT: under that same falsification
+// it also fails, and the test continues on into the real assertion instead of stopping early --
+// both failures are captured in one run.
+TEST_F(MvccStoreTest, GuardedApplyAfterThisNodeAlreadyReapedTheKeyStillApplies) {
+  constexpr uint32_t kPeerIdx = 61;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000061");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "old", "px", "10"}), "OK");
+  auto s_stamp = StampOf("k");
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(50);
+
+  // This node reaps k itself, well before any peer write arrives.
+  Run({"get", "k"});
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone());
+  // Independently constructed, not by calling ExpiryTombstoneFor. EXPECT, not ASSERT -- see this
+  // test's own header comment for why.
+  EXPECT_EQ(*tomb,
+            (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
+      << "sanity: this node's own reap must derive from S, not mint a fresh stamp";
+
+  // I: a peer's write authored strictly after the TTL deadline (the key's PX was 10ms; this lands
+  // 5ms past it) -- a genuine wall-clock-scale advance past the deadline, not merely one raw mvcc
+  // tick above S -- yet still nowhere near this node's own wall clock at reap time (AdvanceTime(50)
+  // above).
+  const uint64_t stamp_i = (s_stamp->MsPart() + 15) << MvccClock::kCounterBits;
+  ASSERT_GT(stamp_i, s_stamp->Mvcc()) << "sanity: I is strictly after S";
+  ASSERT_LT(stamp_i, GetCurrentTimeMs() << MvccClock::kCounterBits)
+      << "sanity: I is nowhere near this node's own wall clock";
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "peer_v"}, kPeerIdx, stamp_i, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer_v")
+      << "a peer write authored strictly after the value's own stamp must apply, even against a "
+         "tombstone this node reaped long before the peer's write ever arrived";
+  auto after = StampOf("k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_FALSE(after->IsTombstone());
+  EXPECT_EQ(*after, (MvccStamp{stamp_i, peer_hash}));
+}
+
+// drakeydb: P4-4 -- both a lazy (read-triggered) and an active (heartbeat/DeleteExpiredStep)
+// whole-key expiry must install a tombstone one origin_hash tick above the value they replace
+// (ExpiryTombstoneFor, mvcc.h), checked both via the side table directly (StampOf) and via the
+// operator-facing DEBUG MVCC command (DebugCmd::Mvcc, debugcmd.cc), which reports the identical
+// stamp from the same side table.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// unconditionally makes both EXPECT_EQ below fail (tomb comes back self-originated, not one tick
+// above `before`), and DEBUG MVCC's own `mvcc:<N>` substring no longer matches either `before`
+// stamp's Mvcc().
+TEST_F(MvccStoreTest, LazyAndActiveExpiryTombstonesCarryTheExpiredValuesOwnStamp) {
+  // Lazy (read-triggered) half.
+  ASSERT_EQ(Run({"set", "lazykey", "v", "px", "10"}), "OK");
+  auto lazy_before = StampOf("lazykey");
+  ASSERT_TRUE(lazy_before.has_value());
+  AdvanceTime(50);
+  Run({"get", "lazykey"});  // triggers lazy expiry (DbSlice::ExpireIfNeeded, the read path)
+
+  auto lazy_tomb = StampOf("lazykey");
+  ASSERT_TRUE(lazy_tomb.has_value());
+  EXPECT_TRUE(lazy_tomb->IsTombstone());
+  // Independently constructed, not by calling ExpiryTombstoneFor.
+  EXPECT_EQ(*lazy_tomb, (MvccStamp{lazy_before->packed | MvccClock::kTombstoneBit,
+                                   lazy_before->origin_hash + 1}));
+
+  {
+    const std::string body = Run({"debug", "mvcc", "lazykey"}).GetString();
+    EXPECT_THAT(body, testing::HasSubstr("state:tombstone"));
+    EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("mvcc:", lazy_tomb->Mvcc())));
+    EXPECT_THAT(body, testing::HasSubstr(absl::StrCat(
+                          "origin:", absl::Hex(lazy_tomb->origin_hash, absl::kZeroPad16))));
+  }
+
+  // Active (heartbeat) half: DbSlice::DeleteExpiredStep, not a client read.
+  ASSERT_EQ(Run({"set", "activekey", "v", "px", "10"}), "OK");
+  auto active_before = StampOf("activekey");
+  ASSERT_TRUE(active_before.has_value());
+  AdvanceTime(50);
+
+  const unsigned sid = Shard("activekey", shard_set->size());
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+    db_slice.DeleteExpiredStep(db_cntx, 100000);
+  });
+
+  ASSERT_EQ(Run({"exists", "activekey"}).GetInt(), 0) << "guard against a vacuous pass";
+  auto active_tomb = StampOf("activekey");
+  ASSERT_TRUE(active_tomb.has_value());
+  EXPECT_TRUE(active_tomb->IsTombstone());
+  EXPECT_EQ(*active_tomb, (MvccStamp{active_before->packed | MvccClock::kTombstoneBit,
+                                     active_before->origin_hash + 1}));
+
+  {
+    const std::string body = Run({"debug", "mvcc", "activekey"}).GetString();
+    EXPECT_THAT(body, testing::HasSubstr("state:tombstone"));
+    EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("mvcc:", active_tomb->Mvcc())));
+    EXPECT_THAT(body, testing::HasSubstr(absl::StrCat(
+                          "origin:", absl::Hex(active_tomb->origin_hash, absl::kZeroPad16))));
+  }
+}
+
+// drakeydb: P4-4 -- a genuinely UNSTAMPED value (Mvcc() == 0: this node's own mvcc
+// side table never armed one for it -- e.g. a key this node never itself wrote, restored from a
+// pre-multi-master snapshot, or otherwise missing its slot) that expires must not mint a
+// reap-time self stamp for its tombstone: a reap-time mint outranks a peer's write authored
+// before this node happened to reap, dropping it on arrival (the same hazard
+// ExpiryTombstoneFor itself exists to close), and installing ExpiryTombstoneFor's own
+// {0,1}|tombstone result would be no better -- its Mvcc() is 0 too, which TombstoneGcStep/
+// rdb_load both treat as an abandoned mid-epoch placeholder rather than a genuine committed
+// tombstone (immortal, never reaped). CommitOwnTombstone (mvcc.cc) instead erases the slot
+// outright: nothing beats nothing, so any later write -- local or peer, any stamp -- always wins,
+// exactly as it would against a fresh, never-written key. EraseMvcc below simulates "this node's
+// mvcc table never armed a stamp for this key" directly (mirroring PerformDeletionAtomic's own
+// "GetMvcc found nothing" case CommitOwnTombstone's own comment, mvcc.h, names) rather than
+// constructing a real cross-node merge-load, since that is the documented, load-bearing meaning
+// of prev_stamp.Mvcc() == 0 and needs no lower-level plumbing to exercise correctly.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// for the has_prior_stamp==false branch AND unconditionally passing `/*tombstone=*/true` to `fn`
+// (both changes together -- reverting the stamp value alone while still passing
+// has_prior_stamp's false through to `fn` leaves the caller erasing anyway, and only the
+// EXPECT_FALSE(StampOf(...).has_value()) assertions below fail, not the GET ones) makes all four
+// assertions below fail: StampOf comes back stamped (not erased), AND both
+// ApplyReplicatedCommand calls' peer writes get dropped (Run({"get",...}) stays nil, not the
+// peer's value) -- the reap-time mint outranks a peer write authored long before this node's own
+// wall clock at reap time.
+TEST_F(MvccStoreTest, UnstampedKeyExpiryErasesInsteadOfMintingAndAcceptsAnOlderPeerWrite) {
+  constexpr uint32_t kPeerIdx = 62;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b4b4-4000-8000-000000000062");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+
+  // Lazy (read-triggered) half.
+  ASSERT_EQ(Run({"set", "lazykey", "old", "px", "10"}), "OK");
+  {
+    const unsigned sid = Shard("lazykey", shard_set->size());
+    shard_set->Await(sid, [&] {
+      namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(0, "lazykey");
+    });
+  }
+  ASSERT_FALSE(StampOf("lazykey").has_value()) << "sanity: lazykey must now be genuinely unstamped";
+  AdvanceTime(50);
+  Run({"get", "lazykey"});  // triggers lazy expiry (DbSlice::ExpireIfNeeded, the read path)
+
+  ASSERT_EQ(Run({"exists", "lazykey"}).GetInt(), 0) << "guard against a vacuous pass";
+  EXPECT_FALSE(StampOf("lazykey").has_value())
+      << "an unstamped value's own expiry must erase the slot outright, never install a "
+         "Mvcc()==0 tombstone (TombstoneGcStep/rdb_load would treat it as immortal)";
+
+  // A peer write authored well before this node's own wall clock at reap time must still apply --
+  // dropped by the old reap-time-mint fallback, applies cleanly once erased instead.
+  constexpr uint64_t kOldPeerMvcc = 0x1000ULL;
+  ASSERT_LT(kOldPeerMvcc, GetCurrentTimeMs() << MvccClock::kCounterBits)
+      << "sanity: the peer's stamp is nowhere near this node's own wall clock";
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "lazykey", "peer_v"}, kPeerIdx, kOldPeerMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "lazykey"}), "peer_v")
+      << "a peer write stamped before this node's reap time must be applied, not dropped against "
+         "a leftover reap-time-inflated stamp";
+
+  // Active (heartbeat) half: DbSlice::DeleteExpiredStep, not a client read.
+  ASSERT_EQ(Run({"set", "activekey", "old", "px", "10"}), "OK");
+  const unsigned active_sid = Shard("activekey", shard_set->size());
+  shard_set->Await(active_sid, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(0, "activekey");
+  });
+  ASSERT_FALSE(StampOf("activekey").has_value())
+      << "sanity: activekey must now be genuinely unstamped";
+  AdvanceTime(50);
+  shard_set->Await(active_sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+    db_slice.DeleteExpiredStep(db_cntx, 100000);
+  });
+
+  ASSERT_EQ(Run({"exists", "activekey"}).GetInt(), 0) << "guard against a vacuous pass";
+  EXPECT_FALSE(StampOf("activekey").has_value())
+      << "an unstamped value's own ACTIVE expiry must erase the slot outright too";
+
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "activekey", "peer_v"}, kPeerIdx, kOldPeerMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "activekey"}), "peer_v")
+      << "same for an actively (heartbeat) reaped unstamped key";
+
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped)
+      << "erasing on the fallback path must still disarm the tombstone arm -- a leftover arm "
+         "would inflate this counter at the next EndOfWriteEpoch";
+}
+
+// drakeydb: P4-4 -- SPOP of a set whose members have ALL expired (count >= size, but
+// every member lazily expired during iteration, leaving `dest` empty) must earn the identical
+// ExpiryTombstoneFor(S) tombstone every other member-expiry emptiness gets
+// (SetFamily::DeleteSetIfEmpty's own derived branch), not silently erase with no tombstone and
+// leak an uncommitted arm into mvcc_unstamped_writes. SPOP is NO_AUTOJOURNAL, so nothing else
+// ever journals this delete -- before this fix, the tombstone arm DelMutable's own
+// PerformDeletionAtomic call placed simply rolled back uncommitted at this transaction's own
+// epoch end.
+//
+// Falsifying: reverting set_family.cc's SPOP fix (OpPop's count>=size branch, the `all_expired`
+// gate) back to an unconditional `db_slice.DelMutable(op_args.db_cntx, std::move(*find_res))`
+// with no CommitOwnTombstone call leaves the generic kExplicit tombstone arm DelMutable's own
+// PerformDeletionAtomic still places uncommitted (SPOP is NO_AUTOJOURNAL, so nothing ever
+// journals it) -- it rolls back at this transaction's own epoch end, ERASING the placeholder
+// (RollbackUncommittedTombstone). `ASSERT_TRUE(tomb.has_value())` below then fails and aborts the
+// test immediately: `StampOf` comes back nullopt, so neither the `EXPECT_TRUE(tomb->IsTombstone())`
+// nor the `EXPECT_EQ` stamp check nor the final `TotalUnstampedWrites()` check ever runs.
+TEST_F(MvccStoreTest, SpopAllMembersExpiredEarnsExpiryTombstoneAndStaysStamped) {
+  ASSERT_EQ(Run({"sadd", "key", "member"}), 1);
+  ASSERT_EQ(Run({"saddex", "key", "1", "member"}), 0) << "SADDEX sets member TTL, not membership";
+  auto s_stamp = StampOf("key");  // S: the set's own pre-expiry stamp
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(2000);
+
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+  auto resp = Run({"spop", "key"});
+  EXPECT_THAT(resp, ArgType(RespExpr::NIL));
+  ASSERT_EQ(Run({"exists", "key"}).GetInt(), 0) << "guard against a vacuous pass";
+
+  auto tomb = StampOf("key");
+  ASSERT_TRUE(tomb.has_value())
+      << "an all-expired SPOP must still earn a real tombstone, not erase silently";
+  EXPECT_TRUE(tomb->IsTombstone());
+  // Independently constructed, not by calling ExpiryTombstoneFor: one origin_hash tick above S's
+  // own mvcc AND origin_hash.
+  EXPECT_EQ(*tomb,
+            (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
+      << "must derive from the set's own pre-expiry stamp, never a freshly minted self stamp";
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped)
+      << "the tombstone arm must be committed, not left to roll back uncommitted at epoch end";
 }
 
 // drakeydb: Phase 4 Task 9, fix round (F1v2) -- proves ExecuteTx applies an author's mvcc AND
 // origin_hash correctly regardless of which shard a replicated write's key lands on, which
-// AppliedWriteKeepsAuthorStampVerbatim above cannot: that test touches exactly one key/shard, so
-// it cannot distinguish "correct on every shard" from "correct on whichever shard this key
-// happened to hash to." This test constructs a real DflyShardReplica -- exactly as
+// AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim above cannot: that test touches exactly one
+// key/shard, so it cannot distinguish "correct on every shard" from "correct on whichever shard
+// this key happened to hash to." This test constructs a real DflyShardReplica -- exactly as
 // Replica::InitiateDflySync does -- and applies through one key per shard (not just one key
 // total), asserting the resulting stamp on each.
 //
 // This does NOT pin the origin-hash registration broadcast itself (InitiateDflySync's shard_cb,
 // replica.cc) the way an earlier version of this test did: that version relied on
 // DflyShardReplica's own constructor performing the registration, matching what was, at the
-// time, production behavior. That behavior was reverted -- see the constructor's own comment and
-// task-9-report.md -- after it crashed the server (SIGSEGV, reproduced 5/10 runs of
+// time, production behavior. That behavior was reverted -- see the constructor's own comment --
+// after it crashed the server (SIGSEGV, reproduced 5/10 runs of
 // test_active_replica_single_peer_replaces in multimaster_test.py) by introducing the
 // constructor's first-ever fiber yield point inside InitiateDflySync's tight per-flow
 // construction loop. The registration now lives in InitiateDflySync's shard_cb instead, a
 // private Replica method with no no-socket construction path this file can reach the way
 // DflyShardReplicaOriginTest reaches DflyShardReplica's public constructor -- so
 // ApplyOnePeerWriteToEveryShard registers the origin hash manually (shard_set->pool()->AwaitBrief,
-// the same shape AppliedWriteKeepsAuthorStampVerbatim already uses) rather than relying on
-// construction to do it. See ApplyOnePeerWriteToEveryShard's own comment for the full account,
-// including why construction and every apply run on thread 0 specifically (ServerState::tlocal()
-// must resolve on the calling thread).
+// the same shape AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim already uses) rather than
+// relying on construction to do it. See ApplyOnePeerWriteToEveryShard's own comment for the full
+// account, including why construction and every apply run on thread 0 specifically
+// (ServerState::tlocal() must resolve on the calling thread).
 //
-// Falsifying (see task-9-report.md for the verbatim run): no-op'ing the body of
+// Falsifying: no-op'ing the body of
 // JournalExecutor::SetApplyMvcc (executor.h) -- the same mutation that falsifies
-// AppliedWriteKeepsAuthorStampVerbatim -- makes every shard's Mvcc() EXPECT below fail with a
-// freshly-minted HopStamp instead of kAuthorMvcc, since ExecuteTx's non-global path calls that
-// same method before every Execute().
+// AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim -- makes every shard's Mvcc() EXPECT below fail
+// with a freshly-minted HopStamp instead of kAuthorMvcc, since ExecuteTx's non-global path calls
+// that same method before every Execute().
 TEST_F(MvccStoreTest, AppliedWriteAppliesCorrectlyOnEveryShard) {
   const unsigned num_shards = shard_set->size();
   ASSERT_GT(num_shards, 1u) << "this test's entire point is proving correctness on shards OTHER "
@@ -2698,8 +3189,8 @@ class MvccCapturingConsumer : public journal::JournalConsumerInterface {
 // itself derived from applying a peer's replicated command. Two peers independently applying the
 // same replicated HDEL (each emptying their own copy of the hash) would then diverge onto two
 // different, locally-minted stamps for the same logical delete instead of converging on the
-// author's one stamp, exactly like AppliedWriteKeepsAuthorStampVerbatim above proves for ordinary
-// (non-derived) applied writes.
+// author's one stamp, exactly like AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim above proves
+// for ordinary (non-derived) applied writes.
 //
 // The emptied key itself can't be used to observe this (StampOf would read nullopt either way --
 // the key is gone), so this test instead reads the derived DEL's own journal entry (mvcc travels
@@ -2724,7 +3215,7 @@ TEST_F(MvccStoreTest, DerivedDeleteFromAppliedWriteKeepsAuthorStamp) {
 
   Run({"hset", "h", "f", "v"});  // local write; its own entry is irrelevant to this test
 
-  ApplyReplicatedCommand({"hdel", "h", "f"}, kPeerIdx, kAuthorMvcc);
+  ApplyReplicatedCommand({"hdel", "h", "f"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
 
   shard_set->RunBriefInParallel(
       [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
@@ -2743,6 +3234,2843 @@ TEST_F(MvccStoreTest, DerivedDeleteFromAppliedWriteKeepsAuthorStamp) {
   EXPECT_EQ(del->origin_idx, kPeerIdx);
 }
 
+// drakeydb: P4-4 -- a LOCAL multi-key DEL where ONE key (k2) lazily expires mid-command must not
+// let that expiry's own journal entry sweep up the OTHER key (k1), still armed from earlier in
+// the SAME command, with the expiry entry's own stamp: k1 must stay armed until the DEL command's
+// own trailing journal entry commits it, so k1's stored stamp equals EXACTLY what that entry
+// carries onto the wire -- never a different value left over from k2's own, earlier entry. k1
+// already carries a peer stamp P ahead of this node's own local clock, so the DEL's own D3 local
+// mint must floor above P, not merely above whatever the wall clock alone would give.
+//
+// Falsifying: reintroducing the removed sibling sweep (the unconditional Commit() call inside
+// journal::RecordEntry, gated here on `!(entry_flags & kEntryFlagExpired)`, journal.cc) sweeps k1
+// into k2's own expiry entry's Commit() call while k1 is still an APPLIED, tombstoned arm: since
+// k2's own committed stamp there is far OLDER than P (k2's value is wall-clock-scale, P is offset
+// 100M ms into the future), FloorAppliedStamp floors k1 one origin_hash tick BELOW P instead of
+// letting it stay armed for the DEL command's own, later, much larger local mint --
+// k1_after->Mvcc() comes back equal to P's own Mvcc() exactly (not `del->mvcc`), and the
+// EXPECT_GT below fails too (P.Mvcc() is not strictly greater than itself).
+TEST_F(MvccStoreTest, LocalDelWithMidCommandLazyExpiryStampsSiblingWithItsOwnWireMvcc) {
+  constexpr uint32_t kPeerIdx = 62;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-1010-4000-8000-000000000062");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  // Two distinct keys that hash to the same shard, so OpDelV2 processes both within one shard
+  // callback (one MvccStamper::armed_ list) -- see
+  // ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc above for why this matters and how the
+  // search below finds such a pair.
+  const unsigned num_shards = shard_set->size();
+  std::string k1, k2;
+  for (int i = 0; k2.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find two keys hashing to the same shard";
+    std::string cand = absl::StrCat("i1_", i);
+    if (Shard(cand, num_shards) == 0) {
+      (k1.empty() ? k1 : k2) = cand;
+    }
+  }
+
+  // P: k1's own prior stamp, a peer's write far ahead of this node's local clock.
+  const uint64_t stamp_p = (GetCurrentTimeMs() + 100'000'000ULL) << MvccClock::kCounterBits;
+  ASSERT_EQ(ApplyReplicatedCommand({"set", k1, "v0"}, kPeerIdx, stamp_p, /*lww_guard=*/false),
+            facade::DispatchResult::OK);
+  auto p_stamp = StampOf(k1);
+  ASSERT_TRUE(p_stamp.has_value());
+  ASSERT_EQ(p_stamp->Mvcc(), stamp_p);
+
+  // k2 has a whole-key TTL that has already elapsed by the time the DEL below re-probes it.
+  ASSERT_EQ(Run({"set", k2, "old", "px", "10"}), "OK");
+  AdvanceTime(50);
+
+  MvccCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  shard_set->Await(0, [&] { consumer_id = journal::RegisterConsumer(&consumer); });
+
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+  ASSERT_EQ(Run({"del", k1, k2}).GetInt(), 1)
+      << "only k1 is really deleted by this command -- k2 is already gone via lazy expiry";
+
+  shard_set->Await(0, [&] { journal::UnregisterConsumer(consumer_id); });
+
+  const MvccCapturedEntry* del = nullptr;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    for (auto it = consumer.entries.rbegin(); it != consumer.entries.rend(); ++it) {
+      if (it->cmd == "DEL") {
+        del = &*it;  // the LAST "DEL" entry is the command's own, recorded after k2's own
+                     // synthetic expiry entry.
+        break;
+      }
+    }
+    ASSERT_NE(nullptr, del) << "the DEL command must still journal its own entry for k1";
+  }
+
+  auto k1_after = StampOf(k1);
+  ASSERT_TRUE(k1_after.has_value());
+  EXPECT_TRUE(k1_after->IsTombstone()) << "k1 was really deleted (kExplicit) by this command";
+  EXPECT_EQ(k1_after->Mvcc(), del->mvcc)
+      << "k1's committed stamp must equal the exact stamp the command's own DEL entry carries on "
+         "the wire, not a different value left over from k2's own expiry entry";
+  EXPECT_GT(k1_after->Mvcc(), p_stamp->Mvcc())
+      << "the local DEL's own D3 mint must land strictly above k1's own prior stamp P";
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped)
+      << "k1 staying armed across k2's expiry must not leak it as an unstamped write";
+}
+
+// drakeydb: P4-4 -- SetFamily::DeleteSetIfEmpty's `derived` (default true) branch must earn the
+// SAME kind of tombstone the member-expiry reaper and RecordExpiryBlocking's own whole-key expiry
+// do: `ExpiryTombstoneFor` (mvcc.h) applied to the set's own prior stamp, never a freshly minted
+// local one. This DEL is peer-suppressed (kEntryFlagDerived, RecordDerivedDelete) exactly like the
+// reaper's own, so a fresh mint here is the identical reap-time-stamp defect: it would outrank
+// every write between the value's own stamp and the moment of reaping, including a guarded peer
+// write with real authority that this node has not seen yet -- just reached through a command
+// (SISMEMBER) discovering the member-TTL expiry lazily instead of
+// the heartbeat discovering a whole-key one. SISMEMBER (not FIELDEXPIRE) is the trigger
+// deliberately: FIELDEXPIRE's own emptying uses the `derived=false` carve-out (RecordDelete, the
+// causing command's own stamp, correctly unaffected by this change -- see
+// FieldExpireEmptyingSetEarnsATombstone, above in this file, which already covers that path and
+// needed no change here), so this test exercises the OTHER, default branch instead.
+//
+// Falsifying: reverting the `derived` branch's own CommitOwnTombstone call (set_family.cc) back to
+// an unconditional `RecordDerivedDelete(db_cntx, key)` reproduces the old behavior: the first
+// EXPECT_EQ below fails (tomb comes back self-originated with a freshly-minted Mvcc(), not one
+// tick above S), and the guarded peer write below gets wrongly dropped (Run({"get",...}) stays
+// nil, not "peer_v") -- the fresh mint outranks a peer write it never even saw.
+TEST_F(MvccStoreTest, MemberTtlEmptiedSetByCommandEarnsExpiryTombstoneAndAppliesLaterPeerWrite) {
+  constexpr uint32_t kPeerIdx = 63;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-1313-4000-8000-000000000063");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"sadd", "mset", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "mset", "1", "m"});
+  auto s_stamp = StampOf("mset");  // S: the set's own stamp after arming the member TTL
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(1100);  // past the 1s member TTL
+
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+  // SISMEMBER queries the expired member specifically: IsInSet's own time-aware lookup
+  // (StringSetWrapper::Contains) lazily reaps it, and SetFamily::DeleteSetIfEmpty (default
+  // derived=true) then removes the now-empty set.
+  EXPECT_EQ(Run({"sismember", "mset", "m"}).GetInt(), 0);
+  ASSERT_EQ(Run({"exists", "mset"}).GetInt(), 0) << "guard against a vacuous pass";
+
+  auto tomb = StampOf("mset");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  // Independently constructed, not by calling ExpiryTombstoneFor.
+  EXPECT_EQ(*tomb,
+            (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
+      << "must be one origin_hash tick above S, never a freshly minted self stamp";
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+
+  // A guarded peer write stamped strictly between S and this node's own (much later, after
+  // AdvanceTime) wall clock must still apply -- it would be wrongly dropped against a reap-time
+  // mint, which would land near "now", not near S.
+  const uint64_t stamp_i = (s_stamp->MsPart() + 500) << MvccClock::kCounterBits;
+  ASSERT_GT(stamp_i, s_stamp->Mvcc()) << "sanity: I is strictly after S";
+  ASSERT_LT(stamp_i, GetCurrentTimeMs() << MvccClock::kCounterBits)
+      << "sanity: I is nowhere near this node's own wall clock";
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "mset", "peer_v"}, kPeerIdx, stamp_i, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "mset"}), "peer_v")
+      << "a write strictly newer than S must still apply, not be wrongly dropped against a "
+         "reap-time mint that landed near this node's wall clock instead of near S";
+}
+
+// drakeydb: P4-4 -- the HSetFamily::DeleteIfEmpty analogue of the test directly above: its own
+// `derived` (default true) branch must earn the identical kind of tombstone, for the identical
+// reason (this DEL is peer-suppressed too). HTTL (not FIELDEXPIRE) is the trigger deliberately, for
+// the same reason SISMEMBER is above: FIELDEXPIRE's own emptying uses the `derived=false` carve-out
+// (see FieldExpireEmptyingHashEarnsATombstone, above in this file, unaffected by this change);
+// HTTL's own lazy field-expiry discovery (HSetFamily::FieldExpireTime) reaches the OTHER, default
+// branch instead.
+//
+// Falsifying: reverting the `derived` branch's own CommitOwnTombstone call (hset_family.cc) back to
+// an unconditional `RecordDerivedDelete(db_cntx, key)` reproduces the old behavior: the first
+// EXPECT_EQ below fails, and the guarded peer write below gets wrongly dropped.
+TEST_F(MvccStoreTest, MemberTtlEmptiedHashByCommandEarnsExpiryTombstoneAndAppliesLaterPeerWrite) {
+  constexpr uint32_t kPeerIdx = 64;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-1414-4000-8000-000000000064");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"hset", "mhash", "f", "v"}).GetInt(), 1);
+  Run({"fieldexpire", "mhash", "1", "f"});
+  auto s_stamp = StampOf("mhash");
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(1100);
+
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+  // HTTL triggers HSetFamily::FieldExpireTime's own lazy field-expiry check, then
+  // HSetFamily::DeleteIfEmpty (default derived=true) removes the now-empty hash.
+  Run({"httl", "mhash", "fields", "1", "f"});
+  ASSERT_EQ(Run({"exists", "mhash"}).GetInt(), 0) << "guard against a vacuous pass";
+
+  auto tomb = StampOf("mhash");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(*tomb,
+            (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
+      << "must be one origin_hash tick above S, never a freshly minted self stamp";
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+
+  const uint64_t stamp_i = (s_stamp->MsPart() + 500) << MvccClock::kCounterBits;
+  ASSERT_GT(stamp_i, s_stamp->Mvcc()) << "sanity: I is strictly after S";
+  ASSERT_LT(stamp_i, GetCurrentTimeMs() << MvccClock::kCounterBits)
+      << "sanity: I is nowhere near this node's own wall clock";
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "mhash", "peer_v"}, kPeerIdx, stamp_i, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "mhash"}), "peer_v")
+      << "a write strictly newer than S must still apply, not be wrongly dropped against a "
+         "reap-time mint that landed near this node's wall clock instead of near S";
+}
+
+// drakeydb: P4-4 -- a READ-ONLY hash command's own emptying (ExecuteRO, hset_family.cc) is a
+// third, distinct route to HSetFamily::DeleteIfEmpty, alongside HTTL's above and HRANDFIELD's: a
+// read-only callback can never itself remove a field, so ExecuteRO's own `hw.Length() == 0` check
+// can only fire from lazy field-TTL expiry, discovered here by HGET's own HMapWrap::Find call.
+// Before this test's own fix, ExecuteRO instead called DeleteHw (further up this file) with its
+// default suppress_peer=true, minting a fresh reap-time stamp for this exact case -- the identical
+// defect DeleteSetIfEmpty/DeleteIfEmpty were already fixed for via other callers, just unreached by
+// those fixes because ExecuteRO's own call site had not been switched over yet.
+//
+// Falsifying: reverting ExecuteRO's own call (hset_family.cc) from
+// `HSetFamily::DeleteIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, pv)` back to
+// `DeleteHw(hw, op_args, key)` reproduces the old behavior: the first EXPECT_EQ below fails (tomb
+// comes back self-originated with a freshly-minted Mvcc(), not one tick above S), and the guarded
+// peer write below gets wrongly dropped (Run({"get",...}) stays nil, not "peer_v").
+TEST_F(MvccStoreTest,
+       MemberTtlEmptiedHashByReadCommandEarnsExpiryTombstoneAndAppliesLaterPeerWrite) {
+  constexpr uint32_t kPeerIdx = 65;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-1515-4000-8000-000000000065");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"hset", "mhash2", "f", "v"}).GetInt(), 1);
+  Run({"fieldexpire", "mhash2", "1", "f"});
+  auto s_stamp = StampOf("mhash2");
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(1100);
+
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+  // HGET's own HMapWrap::Find call lazily expires "f", then ExecuteRO's own emptiness check
+  // (default derived=true via HSetFamily::DeleteIfEmpty) removes the now-empty hash.
+  EXPECT_THAT(Run({"hget", "mhash2", "f"}), ArgType(RespExpr::NIL));
+  ASSERT_EQ(Run({"exists", "mhash2"}).GetInt(), 0) << "guard against a vacuous pass";
+
+  auto tomb = StampOf("mhash2");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(*tomb,
+            (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
+      << "must be one origin_hash tick above S, never a freshly minted self stamp";
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+
+  const uint64_t stamp_i = (s_stamp->MsPart() + 500) << MvccClock::kCounterBits;
+  ASSERT_GT(stamp_i, s_stamp->Mvcc()) << "sanity: I is strictly after S";
+  ASSERT_LT(stamp_i, GetCurrentTimeMs() << MvccClock::kCounterBits)
+      << "sanity: I is nowhere near this node's own wall clock";
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "mhash2", "peer_v"}, kPeerIdx, stamp_i, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "mhash2"}), "peer_v")
+      << "a write strictly newer than S must still apply, not be wrongly dropped against a "
+         "reap-time mint that landed near this node's wall clock instead of near S";
+}
+
+// drakeydb: P4-4 Task A3 -- the generic single-key LWW veto's core case: a guarded peer link must
+// drop a replicated SET whose author stamp is not strictly newer than the key's own stored stamp,
+// leaving the local value AND its stamp completely untouched while still reporting the hop as
+// successfully applied (never forcing a resync), and recording exactly one drop with no
+// unstamped write left behind.
+//
+// Falsifying: removing ShouldDropForLww's veto (transaction.cc), i.e. making it always
+// `return false`, makes the first EXPECT_EQ below observe "peer" instead of "local".
+TEST_F(MvccStoreTest, StalePeerSetDroppedUnderLwwGuard) {
+  constexpr uint32_t kPeerIdx = 20;
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;  // far smaller than any real HopStamp
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000020");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  ASSERT_GT(before_stamp->Mvcc(), kStaleMvcc)
+      << "sanity: the local stamp must actually be newer than the peer's for this to be a "
+         "meaningful drop";
+
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, kStaleMvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK)
+      << "a dropped write must still report success -- signaling it any other way would force a "
+         "full resync on every LWW conflict";
+
+  EXPECT_EQ(Run({"get", "k"}), "local")
+      << "the stale peer SET must never overwrite the newer local value";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, *before_stamp) << "a dropped write must not disturb the stamp either";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u) << "a drop must never arm-then-abandon the key";
+}
+
+// drakeydb: P4-4 Task A3 -- the guard's sibling/control for the test above: the IDENTICAL stale
+// SET, with the link's guard bit off, must still apply its VALUE exactly as arrival-order
+// replication always has -- proving the drop above is caused by the guard, not some unrelated
+// side effect of ApplyReplicatedCommand or of a stale mvcc by itself.
+//
+// drakeydb: P4-4 Task A5 -- SET is one of the commands ClassifyJournaledCommand (multimaster_lww.h)
+// guards by NAME, but with the link's guard bit off here the single-key veto never engages --
+// exactly the "unguarded command" case FloorAppliedStamp (mvcc.h) exists for. "k" already carries
+// a real local stamp `S` by the time this stale peer SET commits, so the applied write's stamp is
+// floored to just-below `S`, never
+// kStaleMvcc verbatim -- committing verbatim would rewind the key's stamp, letting a LATER write
+// whose stamp sits strictly between kStaleMvcc and `S` (older than `S`, but newer than this
+// write's own stale mvcc) wrongly win a future comparison against it.
+TEST_F(MvccStoreTest, StalePeerSetAppliesWithoutLwwGuard) {
+  constexpr uint32_t kPeerIdx = 21;
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000021");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  ASSERT_GT(before_stamp->Mvcc(), kStaleMvcc)
+      << "sanity: the local stamp must actually be newer than the peer's for the floor below to "
+         "be a meaningful check";
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, kStaleMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer")
+      << "without the guard, replication is plain arrival order -- the peer's write applies "
+         "regardless of its (older) mvcc";
+  auto st = StampOf("k");
+  ASSERT_TRUE(st.has_value());
+  EXPECT_EQ(st->Mvcc(), before_stamp->Mvcc())
+      << "FloorAppliedStamp keeps the Mvcc() field at S's own -- only origin_hash regresses";
+  EXPECT_EQ(st->origin_hash, before_stamp->origin_hash - 1)
+      << "an applied write's author stamp is never committed verbatim once a real prior stamp "
+         "exists and the author's is older -- floored one origin_hash below it instead (mvcc.h)";
+}
+
+// drakeydb: P4-4 Task A3 -- a zero incoming mvcc must NEVER be guarded (multimaster_lww.h), even
+// on a real peer link whose guard bit is on -- the "DFLY link to a non-active node" shape (a
+// classic Redis/KeyDB link CAN also run peer_mode_ -- a KeyDB active-replica master's classic
+// PSYNC connection is peer-mode too, replica.cc's IsPeerMode() branch -- so its guard bit staying
+// off in production is not from peer_mode_ itself; JournalExecutor::SetApplyLwwGuard is only ever
+// called from DflyShardReplica's constructor, the DFLY-protocol flow, never from the
+// classic-protocol path, so a classic link's repl_lww_guard is always false regardless of
+// peer_mode_. This test isolates the mvcc==0 rule itself, on a registered PEER origin, rather
+// than reproducing the classic-link shape literally -- exercising it via kSelfIdx would not hit
+// the guarded ShouldDropForLww path at all, since IsLwwGuarded() only ever reads true here on a
+// registered peer origin). Two independent layers enforce the rule: IsLwwGuarded()
+// itself requires repl_mvcc_ != 0 (LwwGuardActive), which short-circuits ShouldDropForLww before
+// IncomingStamp is ever called; IncomingStamp(0, ...) also independently returns nullopt on its
+// own (its own fail-open contract, documented in multimaster_lww.h). Either one alone already
+// prevents this specific entry from being vetoed -- removing only one of the two does not
+// reproduce a visible failure here. Disabling BOTH (dropping the mvcc half of IsLwwGuarded AND
+// IncomingStamp's own `mvcc == 0` check) does: the GET below then observes "local" instead of
+// "peer", and BOTH surviving-stamp checks below observe the pre-apply stamp unchanged instead of
+// a freshly-minted stamp under the peer's origin.
+TEST_F(MvccStoreTest, UnstampedIncomingNeverGuarded) {
+  constexpr uint32_t kPeerIdx = 22;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000022");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, /*mvcc=*/0, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer") << "mvcc == 0 must fail open even with the guard bit on";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  // journal::RecordEntry (journal.cc) mints a fresh local HopStamp whenever entry.mvcc == 0, and
+  // MvccStamper::Commit (mvcc.cc) attributes that mint to entry.origin_idx verbatim --
+  // the LINK's peer index, not this node's own -- so the resulting stamp carries the peer's
+  // origin_hash even though the entry itself carried no author mvcc.
+  EXPECT_GT(after_stamp->Mvcc(), before_stamp->Mvcc())
+      << "an mvcc==0 apply still mints a fresh HopStamp on commit -- strictly newer than whatever "
+         "was there before, never a no-op and never the incoming (nonexistent) mvcc verbatim";
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash)
+      << "the freshly-minted stamp is attributed to the LINK's peer origin, not this node's own";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped) << "an unstamped apply must never count as a drop";
+}
+
+// drakeydb: P4-4 Task A3 -- a genuinely newer peer write must apply with the incoming author's
+// stamp EXACTLY -- not max(local, incoming), and not a freshly-minted local stamp -- proving the
+// guard only vetoes strictly-older writes, never interferes with a legitimate one.
+TEST_F(MvccStoreTest, NewerPeerSetAppliesWithExactIncomingStamp) {
+  constexpr uint32_t kPeerIdx = 23;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000023");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const uint64_t newer_mvcc = before_stamp->Mvcc() + 1;
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, newer_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer");
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(after_stamp->Mvcc(), newer_mvcc)
+      << "the applied stamp must be the incoming author's stamp EXACTLY -- not a max() with the "
+         "local stamp, and not a freshly-minted local one";
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash)
+      << "must record the AUTHOR's origin hash, never this node's own";
+}
+
+// drakeydb: P4-4 Task A3 -- exact-tie half (a): incoming mvcc == stored mvcc, with the peer's
+// origin_hash GREATER than self's. MergeAccepts orders lexicographically on (Mvcc(), origin_hash)
+// (mvcc.h), so a tie must be broken by origin_hash alone, and the greater one must win/apply.
+// self_hash is read off a throwaway control write rather than hardcoded, since it depends on this
+// process's randomly-generated boot uuid (same technique as
+// LazyExpiryEarnsATombstoneWithSelfOrigin, above).
+TEST_F(MvccStoreTest, ExactTieAppliesWhenIncomingOriginHashIsGreater) {
+  constexpr uint32_t kPeerIdx = 24;
+
+  ASSERT_EQ(Run({"set", "control", "v"}), "OK");
+  auto control_stamp = StampOf("control");
+  ASSERT_TRUE(control_stamp.has_value());
+  const uint64_t self_hash = control_stamp->origin_hash;
+  const uint64_t peer_hash = self_hash + 1;  // deterministically greater than self's
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  ASSERT_EQ(before_stamp->origin_hash, self_hash);
+
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult res = ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx,
+                                                      before_stamp->Mvcc(), /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer")
+      << "an exact mvcc tie with a GREATER incoming origin_hash must apply";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(after_stamp->Mvcc(), before_stamp->Mvcc());
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash);
+  EXPECT_EQ(TotalLwwDropped(), before_dropped);
+}
+
+// drakeydb: P4-4 Task A3 -- exact-tie half (b): same setup as above, but the peer's origin_hash is
+// SMALLER than self's -- owner decision 2026-08-30 (mvcc.h): ties favor the STORED side, so this
+// must drop.
+TEST_F(MvccStoreTest, ExactTieDroppedWhenIncomingOriginHashIsSmaller) {
+  constexpr uint32_t kPeerIdx = 25;
+
+  ASSERT_EQ(Run({"set", "control", "v"}), "OK");
+  auto control_stamp = StampOf("control");
+  ASSERT_TRUE(control_stamp.has_value());
+  const uint64_t self_hash = control_stamp->origin_hash;
+  ASSERT_GT(self_hash, 0u) << "sanity: need room below self_hash for a strictly smaller peer hash";
+  const uint64_t peer_hash = self_hash - 1;  // deterministically smaller than self's
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult res = ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx,
+                                                      before_stamp->Mvcc(), /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "local")
+      << "an exact mvcc tie with a SMALLER incoming origin_hash must drop -- ties favor the "
+         "stored side";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, *before_stamp);
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 -- a dropped write must never journal anything, whether the command journals via
+// auto-journal or an explicit call of its own. This test pins that outcome for every guarded
+// single-key name, but by NOW (RESTORE having also become CO::NO_AUTOJOURNAL, generic_family.cc)
+// none of them actually reach Transaction::LogAutoJournalOnShard's own `if (lww_dropped) return;`
+// early return (transaction.cc) at all -- see GenericVetoSuppressesUnrewrittenAutoJournal, below
+// in this file, for a test that reaches that specific line, and its own header comment for why no
+// production path does anymore. What each block below actually exercises:
+// SET, SETNX (rewritten to SET pre-dispatch by ApplyLwwRewrites, multimaster_lww.h), GETSET
+// (also rewritten to SET), and RESTORE (also CO::NO_AUTOJOURNAL now) all share ONE mechanism --
+// RunCallback's own callback-skip (`result = lww_dropped ? RunnableResult{OpStatus::OK} :
+// (*cb_ptr_)(this, shard)`, transaction.cc): the callback that would otherwise call
+// SetCmd::RecordJournal/OpRestore's own explicit post-write journal call simply never runs.
+// GETDEL (rewritten to DEL) exercises a DIFFERENT mechanism: DEL is kMultiKeySelfGuarded, so
+// OpDelV2's own per-key veto (generic_family.cc) skips the key before ever calling Del(), leaving
+// journal_args empty and deleted_cnt at 0, so OpDelV2's own journal-emitting `if` block (neither
+// its RecordJournal nor its journal::ClearBuffer() branch) never runs at all.
+//
+// PERSIST and PEXPIREAT are deliberately absent from this test: both are now
+// removed from the guarded table entirely -- an active node never journals either name any more
+// (OpPersist/OpExpire ship the key's full state under SET/RESTORE/DEL instead), and a non-active
+// sender's PERSIST/PEXPIREAT entries carry mvcc 0, which is never guarded regardless. Injecting a
+// literal "persist"/"pexpireat" command with a real stamp via ApplyReplicatedCommand -- as this
+// test used to -- no longer exercises the generic single-key veto at all, since
+// ClassifyJournaledCommand now returns kUnguarded for both; keeping those blocks here would
+// silently start asserting on an UNGUARDED, arrival-order apply instead of a dropped one.
+//
+// Falsifying: making RunCallback's own callback-skip unconditional-false (i.e. always run
+// `(*cb_ptr_)(this, shard)` regardless of `lww_dropped`) makes the SET/SETNX/GETSET/RESTORE blocks
+// fail: `EXPECT_EQ(consumer.commands.load(), pre)` observes one more entry than expected, and each
+// block's own follow-up read observes the write actually landed -- `Run({"get", ...})` returns the
+// peer's value for SET/GETSET/RESTORE, and `Run({"exists", ...}).GetInt()` returns 1 for SETNX
+// (the key it must NOT have created) -- their shared callback-skip mechanism is gone, so each
+// one's own explicit/auto journal call now runs and its value change actually lands. The GETDEL
+// block stays GREEN under this exact revert: its drop is
+// OpDelV2's own per-key veto (the SEPARATE mechanism this test's own first paragraph, above,
+// already names), which independently re-derives that the key is stale and skips it before Del()
+// ever runs -- completely unaffected by whether RunCallback's callback-skip itself ran, since
+// GETDEL never depended on that mechanism to begin with. Falsifying `LogAutoJournalOnShard`'s own
+// `if (lww_dropped) return;` early return instead leaves every block in THIS test green -- see
+// GenericVetoSuppressesUnrewrittenAutoJournal for the one that actually catches that specific
+// line.
+TEST_F(MvccStoreTest, DroppedApplySuppressesAutoJournalForEveryGuardedSingleKeyCommand) {
+  constexpr uint32_t kPeerIdx = 26;
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000026");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  class CountingJournalConsumer final : public journal::JournalConsumerInterface {
+   public:
+    void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+      if (item.journal_item.opcode == journal::Op::COMMAND)
+        ++commands;
+    }
+    void ThrottleIfNeeded() override {
+    }
+    std::atomic<size_t> commands{0};
+  } consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  {  // SET -- manually journaled (SetCmd::RecordJournal).
+    SCOPED_TRACE("SET");
+    ASSERT_EQ(Run({"set", "sj_set", "local"}), "OK");
+    auto before = StampOf("sj_set");
+    ASSERT_TRUE(before.has_value());
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"set", "sj_set", "peer"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"get", "sj_set"}), "local");
+    EXPECT_EQ(StampOf("sj_set"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  {  // SETNX -- rewritten to SET pre-dispatch (ApplyLwwRewrites, multimaster_lww.h), so this
+     // exercises SET's own callback-skip path, not SETNX's auto-journal suppression (see this
+     // test's own header comment). sj_setnx is deleted (tombstoned), not merely left absent or
+     // live: on a LIVE pre-existing key, SETNX's own IF_NOTEXIST precondition makes an
+     // actually-applied write indistinguishable from a dropped one -- SetCmd::Set returns
+     // SKIPPED either way, leaving value/stamp/journal count identically untouched, which would
+     // make the value/stamp/journal-count checks below pass regardless of whether the veto ever
+     // fired (the drop counter would still distinguish them, but a single surviving assertion is
+     // a thin foundation for this block's whole point). A tombstoned key still carries a real
+     // MVCC stamp for ShouldDropForLww to compare against (DbSlice::GetMvcc returns it regardless
+     // of liveness), but SETNX's own precondition IS satisfied on it (the key does not exist), so
+     // an actually-applied SETNX would create it with "peer" -- giving this block a real,
+     // observable difference between applied and dropped.
+    SCOPED_TRACE("SETNX");
+    ASSERT_EQ(Run({"set", "sj_setnx", "local"}), "OK");
+    ASSERT_EQ(Run({"del", "sj_setnx"}).GetInt(), 1);
+    auto before = StampOf("sj_setnx");
+    ASSERT_TRUE(before.has_value());
+    ASSERT_TRUE(before->IsTombstone());
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"setnx", "sj_setnx", "peer"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"exists", "sj_setnx"}).GetInt(), 0)
+        << "a dropped SETNX on a tombstoned key must NOT create it -- an applied one would";
+    EXPECT_EQ(StampOf("sj_setnx"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  {  // GETSET -- rewritten to SET pre-dispatch (ApplyLwwRewrites, multimaster_lww.h), so this
+     // exercises SET's own callback-skip path, not GETSET's own auto-journal suppression (see
+     // this test's own header comment).
+    SCOPED_TRACE("GETSET");
+    ASSERT_EQ(Run({"set", "sj_getset", "local"}), "OK");
+    auto before = StampOf("sj_getset");
+    ASSERT_TRUE(before.has_value());
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"getset", "sj_getset", "peer"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"get", "sj_getset"}), "local");
+    EXPECT_EQ(StampOf("sj_getset"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  {  // GETDEL -- rewritten to DEL pre-dispatch (ApplyLwwRewrites, multimaster_lww.h); this
+     // exercises DEL's own self-guarded per-key veto (OpDelV2), not GETDEL's own auto-journal
+     // suppression (see this test's own header comment). Also proves the key is not deleted.
+    SCOPED_TRACE("GETDEL");
+    ASSERT_EQ(Run({"set", "sj_getdel", "local"}), "OK");
+    auto before = StampOf("sj_getdel");
+    ASSERT_TRUE(before.has_value());
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"getdel", "sj_getdel"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"exists", "sj_getdel"}).GetInt(), 1) << "the key must NOT be deleted";
+    EXPECT_EQ(Run({"get", "sj_getdel"}), "local");
+    EXPECT_EQ(StampOf("sj_getdel"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  {  // RESTORE -- CO::NO_AUTOJOURNAL now (see this test's own header comment); exercises the same
+     // callback-skip path SET does, not LogAutoJournalOnShard's own suppression. The dump is of a
+     // DIFFERENT key's value than sj_restore's own current one, so an incorrectly-applied
+     // RESTORE...REPLACE is actually observable: restoring the key's own unchanged dump verbatim
+     // would leave the value identical either way and prove nothing about whether the callback
+     // ran.
+    SCOPED_TRACE("RESTORE");
+    ASSERT_EQ(Run({"set", "sj_restore", "local"}), "OK");
+    ASSERT_EQ(Run({"set", "sj_restore_donor", "peer_would_win"}), "OK");
+    std::string dump = Run({"dump", "sj_restore_donor"}).GetString();
+    auto before = StampOf("sj_restore");
+    ASSERT_TRUE(before.has_value());
+    const size_t pre = consumer.commands.load();
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"restore", "sj_restore", "0", dump, "REPLACE"}, kPeerIdx,
+                                      kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(consumer.commands.load(), pre);
+    EXPECT_EQ(Run({"get", "sj_restore"}), "local")
+        << "a dropped RESTORE must not replace the key with the donor's different value";
+    EXPECT_EQ(StampOf("sj_restore"), before);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  }
+
+  std::move(unregister_consumer).Invoke();
+  EXPECT_EQ(TotalUnstampedWrites(), 0u) << "none of the drops above may arm-then-abandon a key";
+}
+
+// drakeydb: P4-4 -- Transaction::LogAutoJournalOnShard's own `if (lww_dropped) return;` early
+// return (transaction.cc) is unreached by any production path today: every guarded kSingleKey
+// name that still auto-journals verbatim when dispatched unrewritten (SETNX, GETSET, GETDEL,
+// RESTORE) is either pre-dispatch rewritten by ApplyLwwRewrites (multimaster_lww.cc) to a name
+// that is CO::NO_AUTOJOURNAL (SETNX/GETSET->SET, GETDEL->DEL), or is CO::NO_AUTOJOURNAL itself
+// now (RESTORE, generic_family.cc) -- and ApplyLwwRewrites lives exclusively inside
+// JournalExecutor::Execute, the only production caller of RunCallback with `repl_lww_guard` ever
+// set. This test constructs the shape production can no longer reach: BaseFamilyTest::
+// RunWithReplContext (test_utils.h/.cc) dispatches through the ordinary client path
+// (service_->DispatchCommand), setting a connection's repl_lww_guard/repl_mvcc/repl_origin_idx
+// directly and never touching JournalExecutor::Execute -- so a literal, UNREWRITTEN "SETNX" (still
+// CO::JOURNALED, not NO_AUTOJOURNAL, in string_family.cc's own registration) reaches
+// RunCallback/ShouldDropForLww exactly as it would have before the pre-dispatch SETNX->SET
+// rewrite existed. Proves the
+// early return is still doing real work as defense-in-depth, not dead code kept only for its own
+// sake.
+//
+// Falsifying: removing LogAutoJournalOnShard's `if (lww_dropped) return;` early return
+// (transaction.cc) makes `EXPECT_EQ(consumer.commands.load(), 0u)` below observe 1 instead
+// (RunCallback's own callback-skip still leaves `k` untouched -- SETNX has no explicit journal
+// call of its own to skip -- but nothing stops the verbatim auto-journal from firing for the
+// forced OpStatus::OK result once this early return is gone).
+TEST_F(MvccStoreTest, GenericVetoSuppressesUnrewrittenAutoJournal) {
+  constexpr uint32_t kPeerIdx = 94;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000094");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before = StampOf("k");
+  ASSERT_TRUE(before.has_value());
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  ASSERT_GT(before->Mvcc(), kStaleMvcc) << "sanity: the local stamp must be newer than the peer's";
+  const uint64_t before_dropped = TotalLwwDropped();
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+
+  class CountingJournalConsumer final : public journal::JournalConsumerInterface {
+   public:
+    void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+      if (item.journal_item.opcode == journal::Op::COMMAND)
+        ++commands;
+    }
+    void ThrottleIfNeeded() override {
+    }
+    std::atomic<size_t> commands{0};
+  } consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  // A literal, unrewritten SETNX: only reachable this way, since JournalExecutor::Execute always
+  // rewrites it to SET first under the identical guard.
+  RunWithReplContext("generic_veto_probe", {"setnx", "k", "peer"}, kPeerIdx, kStaleMvcc,
+                     /*repl_lww_guard=*/true);
+
+  EXPECT_EQ(Run({"get", "k"}), "local") << "the stale SETNX must still be dropped";
+  EXPECT_EQ(StampOf("k"), before);
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped)
+      << "the drop must never arm-then-abandon the key";
+
+  std::move(unregister_consumer).Invoke();
+  EXPECT_EQ(consumer.commands.load(), 0u)
+      << "a dropped write's auto-journal must never fire, even for an unrewritten guarded name";
+}
+
+// drakeydb: P4-4 Task A3 -- out-of-scope classes must be left completely alone by the generic
+// veto: INCR is kUnguarded (delta-journaled RMW -- dropping a delta would permanently
+// lose it, not just reorder it), and DEL/MSET are kMultiKeySelfGuarded -- GetShardArgs on MSET
+// yields keys AND values in one contiguous range, which is exactly why this generic single-key
+// helper must never touch it (ShouldDropForLww, transaction.cc, returns false for both by
+// classification alone, before ever reaching a per-key compare). Neither DEL nor MSET is ever
+// counted as an LWW drop BY THIS GENERIC SINGLE-KEY VETO -- regardless of what a
+// self-guarded command's OWN per-key logic later decides to do with the same write.
+//
+// drakeydb: P4-4 Tasks A7/A8 -- MSET and DEL now each have their own per-key guard (OpMSet,
+// string_family.cc; OpDelV2, generic_family.cc), so unlike INCR below neither merely floors a
+// stale write anymore: each drops its stale unit (pair or key) entirely, never arming it. sj_del
+// and both of sj_msk1/sj_msk2 already carry a stamp newer than kStaleMvcc, so all three are
+// dropped -- consistent with OpMSet/OpDelV2's own per-key guards, not this generic veto (which
+// never classifies either command as a candidate at all), being what left sj_del/sj_msk1/sj_msk2
+// alone.
+//
+// drakeydb: P4-4 Task A5 -- INCR's own stamp assertion below relies on FloorAppliedStamp
+// (mvcc.h): sj_incr already carries a real local stamp `S` (from its own `Run({"incr", ...})`
+// setup below) that is newer than kStaleMvcc, so this is precisely the "unguarded applied write
+// with an author stamp older than S" case FloorAppliedStamp exists for -- INCR is never vetoed
+// (it is kUnguarded), but its COMMITTED stamp is still floored to just-below `S`, never
+// kStaleMvcc verbatim -- verbatim would rewind the key's stamp, letting a LATER write whose stamp
+// sits strictly between kStaleMvcc and `S` (older than `S`, but newer than this write's own stale
+// mvcc) wrongly win a future comparison. DEL and MSET's dropped units are never armed at all (see
+// the per-pair/per-key guard paragraph above), so they are not floored either -- their stamps
+// stay exactly `before`/`before1`/`before2`, not just-below them.
+TEST_F(MvccStoreTest, UnguardedAndSelfGuardedClassesAreNotVetoedByTheGenericSingleKeyCheck) {
+  constexpr uint32_t kPeerIdx = 27;
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000027");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  {  // INCR -- kUnguarded.
+    SCOPED_TRACE("INCR");
+    ASSERT_EQ(Run({"incr", "sj_incr"}).GetInt(), 1);
+    auto before = StampOf("sj_incr");
+    ASSERT_TRUE(before.has_value());
+    ASSERT_GT(before->Mvcc(), kStaleMvcc) << "sanity: S must be newer than the stale author mvcc";
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"incr", "sj_incr"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(Run({"get", "sj_incr"}), "2")
+        << "INCR is unguarded -- a stale mvcc must never veto it";
+    auto after = StampOf("sj_incr");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->Mvcc(), before->Mvcc())
+        << "the INCR itself actually ran (the value changed above), but FloorAppliedStamp keeps "
+           "the Mvcc() field at S's own, never the stale kStaleMvcc verbatim";
+    EXPECT_EQ(after->origin_hash, before->origin_hash - 1)
+        << "floored one origin_hash below S -- never the peer's own origin_hash verbatim";
+    EXPECT_NE(*after, *before) << "sanity: the stamp must have actually changed -- the floor "
+                                  "lands BELOW before, not above it";
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "INCR must never count as an LWW drop";
+  }
+
+  {  // DEL -- kMultiKeySelfGuarded; its own per-key guard now drops a stale key entirely
+     // instead of applying-and-flooring it.
+    SCOPED_TRACE("DEL");
+    ASSERT_EQ(Run({"set", "sj_del", "local"}), "OK");
+    auto before = StampOf("sj_del");
+    ASSERT_TRUE(before.has_value());
+    ASSERT_GT(before->Mvcc(), kStaleMvcc) << "sanity: S must be newer than the stale author mvcc";
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"del", "sj_del"}, kPeerIdx, kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(Run({"exists", "sj_del"}).GetInt(), 1)
+        << "DEL's own per-key guard must drop a key whose incoming stamp is older than that key's "
+           "own stored stamp. This single-key sub-block alone can't distinguish that drop from a "
+           "hypothetical misclassification (DEL wrongly routed through the generic single-key "
+           "veto instead, with the same observable effect here) -- what actually pins DEL as "
+           "kMultiKeySelfGuarded is ClassifyJournaledCommandMatchesEveryTableRow (mvcc_test.cc), "
+           "and what proves the drop is a per-key compare inside OpDelV2 itself, not a "
+           "whole-command veto, is DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesTheSurvivor "
+           "(two keys, only the stale one dropped)";
+    EXPECT_EQ(Run({"get", "sj_del"}), "local");
+    auto after = StampOf("sj_del");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(*after, *before) << "a dropped key is never armed, so its stamp is untouched -- "
+                                  "unlike an applied delete, it is not even floored";
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1)
+        << "the key is stale against its own stored stamp and must be counted exactly once";
+    EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  }
+
+  {  // MSET -- kMultiKeySelfGuarded; its own per-pair guard now drops a stale pair
+     // entirely instead of applying-and-flooring it.
+    SCOPED_TRACE("MSET");
+    ASSERT_EQ(Run({"set", "sj_msk1", "local1"}), "OK");
+    ASSERT_EQ(Run({"set", "sj_msk2", "local2"}), "OK");
+    auto before1 = StampOf("sj_msk1");
+    auto before2 = StampOf("sj_msk2");
+    ASSERT_TRUE(before1.has_value());
+    ASSERT_TRUE(before2.has_value());
+    ASSERT_GT(before1->Mvcc(), kStaleMvcc);
+    ASSERT_GT(before2->Mvcc(), kStaleMvcc);
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"mset", "sj_msk1", "peer1", "sj_msk2", "peer2"}, kPeerIdx,
+                                      kStaleMvcc, true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+    EXPECT_EQ(Run({"get", "sj_msk1"}), "local1")
+        << "MSET's own per-pair guard must drop a pair whose incoming stamp is older than that "
+           "key's own stored stamp -- this generic single-key veto never even classifies MSET as "
+           "a candidate, so this drop is consistent with OpMSet's own per-pair logic, not this "
+           "test's own generic veto";
+    EXPECT_EQ(Run({"get", "sj_msk2"}), "local2");
+    auto st1 = StampOf("sj_msk1");
+    auto st2 = StampOf("sj_msk2");
+    ASSERT_TRUE(st1.has_value());
+    ASSERT_TRUE(st2.has_value());
+    EXPECT_EQ(*st1, *before1) << "a dropped pair is never armed, so its stamp is untouched -- "
+                                 "unlike an applied write, it is not even floored";
+    EXPECT_EQ(*st2, *before2);
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 2)
+        << "both pairs are individually stale against their own stored stamps and must each be "
+           "counted once";
+    EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// drakeydb: P4-4 Task A7 -- OpMSet's own per-pair LWW guard (string_family.cc). MSET is classified
+// kMultiKeySelfGuarded (multimaster_lww.h) precisely because GetShardArgs hands it keys AND
+// values in one contiguous range, so the generic single-key veto above never inspects it at all --
+// the per-pair compare has to live inside OpMSet itself, under the shard's own key
+// locks, and a guarded apply must journal exactly the pairs it actually wrote, in one journal
+// entry, never one-entry-per-key.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// drakeydb: P4-4 Task A7 -- this fixture (MvccStoreTest, via BaseFamilyTest) enables neither
+// lock_on_hashtags nor cluster mode, so a `{tag}`-style hashtag does not co-locate keys here.
+// Same-shard placement has to be found empirically and then asserted directly -- the same linear
+// probe MvccStoreTest::ApplyOnePeerWriteToEveryShard (above) already uses to find one key per
+// DIFFERENT shard, aimed here at one target shard instead.
+std::string FindKeyOnShard(std::string_view prefix, ShardId target_sid, size_t num_shards) {
+  for (int i = 0;; ++i) {
+    std::string candidate = absl::StrCat(prefix, i);
+    if (Shard(candidate, num_shards) == target_sid)
+      return candidate;
+    CHECK_LT(i, 10000) << "could not find a '" << prefix << "' key hashing to shard " << target_sid;
+  }
+}
+
+// drakeydb: P4-4 Task A7 -- captures each COMMAND journal entry's full argument list (command
+// name first), decoded with a real JournalReader exactly like this file's own
+// DecodingEntryCapturingConsumer (below, Task 7's SORT diagnosis). A bare command COUNT (this
+// file's CountingJournalConsumer) cannot show WHICH pairs a guarded MSET actually journaled, which
+// is the entire question these tests turn on.
+struct MsetLwwJournalEntry {
+  std::vector<std::string> args;  // args[0] is the command name, upper-case.
+  uint64_t mvcc{0};               // the wire entry's own mvcc, for stamp==wire pins.
+};
+
+class MsetLwwJournalConsumer : public journal::JournalConsumerInterface {
+ public:
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    if (item.journal_item.opcode != journal::Op::COMMAND)
+      return;
+    io::BytesSource source{item.journal_item.data};
+    JournalReader reader{&source, 0};
+    journal::ParsedEntry parsed;
+    CHECK(!reader.ReadEntry(&parsed));
+
+    std::vector<std::string> args;
+    for (std::string_view sv : parsed.cmd.view())
+      args.emplace_back(sv);
+
+    util::fb2::LockGuard lk(mu_);
+    entries.push_back({std::move(args), parsed.mvcc});
+  }
+  void ThrottleIfNeeded() override {
+  }
+
+  util::fb2::Mutex mu_;
+  std::vector<MsetLwwJournalEntry> entries;  // guarded by mu_
+};
+
+}  // namespace
+
+// drakeydb: P4-4 Task A12 -- proves the INFO field is really the cross-THREAD sum
+// (ServerState::Stats::Add, server_state.cc; folded into Metrics::coordinator_stats by
+// Metrics::InitFromThread/Merge, metrics.cc) rather than one shard's own counter: forces a drop on
+// shard 0's own key and a SECOND, independent drop on shard 1's key, so a bug that only reads (or
+// only aggregates) one thread's counter would under-report by exactly one against the
+// TotalLwwDropped() cross-check below, which reads every thread directly and bypasses the
+// Metrics aggregation path entirely.
+//
+// Falsifying: commenting out server_state.cc's `ADD(multimaster_lww_dropped);` line (so
+// Stats::Add no longer sums this field across threads) makes the parsed INFO value come back as
+// exactly 0, not merely short of expect_total: with no ADD line, every partial's own
+// coordinator_stats.multimaster_lww_dropped stays at its default-constructed 0 (InitFromThread's
+// own coordinator_stats.Add(ss->stats) call never copies the per-thread value in either), so
+// EVERY thread contributes 0 to the merge, not just one. `TotalLwwDropped()` -- which reads every
+// thread directly, bypassing Stats::Add entirely -- still correctly reports pre_dropped + 2,
+// isolating the break to the aggregation path rather than the guard itself.
+TEST_F(MvccStoreTest, InfoReplicationShowsLwwDroppedSummedAcrossShards) {
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "this test's entire point is proving cross-THREAD aggregation -- "
+                               "with only one shard there is only one thread's counter to sum";
+
+  constexpr uint32_t kPeerIdx = 60;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000060");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const std::string k1 = FindKeyOnShard("info_lww_dropped_k1_", 0, num_shards);
+  const std::string k2 = FindKeyOnShard("info_lww_dropped_k2_", 1, num_shards);
+
+  ASSERT_EQ(Run({"set", k1, "local1"}), "OK");
+  auto k1_before = StampOf(k1);
+  ASSERT_TRUE(k1_before.has_value());
+  ASSERT_GT(k1_before->Mvcc(), 1u) << "sanity: room for a strictly older incoming mvcc below";
+  const uint64_t k1_stale_mvcc = k1_before->Mvcc() - 1;
+
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+  ASSERT_GT(k2_before->Mvcc(), 1u) << "sanity: room for a strictly older incoming mvcc below";
+  const uint64_t k2_stale_mvcc = k2_before->Mvcc() - 1;
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+
+  EXPECT_EQ(
+      ApplyReplicatedCommand({"set", k1, "peer"}, kPeerIdx, k1_stale_mvcc, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(
+      ApplyReplicatedCommand({"set", k2, "peer"}, kPeerIdx, k2_stale_mvcc, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "local1") << "shard 0's stale peer SET must be dropped";
+  EXPECT_EQ(Run({"get", k2}), "local2") << "shard 1's stale peer SET must be dropped";
+
+  const uint64_t expect_total = pre_dropped + 2;
+  ASSERT_EQ(TotalLwwDropped(), expect_total)
+      << "sanity: exactly one drop expected on each of two different shard threads";
+
+  const std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
+  const size_t pos = info.find("\nmultimaster_lww_dropped:");
+  ASSERT_NE(std::string::npos, pos) << "field must be present on an --active_replica node";
+  const size_t value_start = pos + std::string("\nmultimaster_lww_dropped:").size();
+  const size_t value_end = info.find("\r\n", value_start);
+  ASSERT_NE(std::string::npos, value_end);
+  uint64_t parsed = 0;
+  ASSERT_TRUE(absl::SimpleAtoi(info.substr(value_start, value_end - value_start), &parsed));
+  EXPECT_EQ(parsed, expect_total)
+      << "INFO must report the SUM across every shard thread, not just one";
+}
+
+// drakeydb: P4-4 Task A7 -- the headline partial-apply case: k1 is fresh (no stored stamp, so
+// MergeAccepts(nullopt, incoming) is always true -- it can never be dropped) while k2 already
+// carries a local stamp strictly newer than the incoming mvcc. Exactly one pair must survive, it
+// must commit the AUTHOR's stamp verbatim (not floored -- incoming > stored, here "stored" is
+// nullopt, so FloorAppliedStamp's floor case, which only fires when incoming < stored, never
+// applies), and the dropped pair's stamp must stay completely untouched (never armed, so not even
+// floored).
+//
+// Falsified both ways:
+//  (a) "all-or-nothing" -- pre-scanning every pair and skipping the ENTIRE apply if any one pair
+//      would drop -- makes k1 come back missing (GET k1 empty) even though it had every right to
+//      apply on its own.
+//  (b) "always-apply" -- dropping the per-pair compare entirely -- clobbers k2's VALUE with "b"
+//      (never applied by the correct code, since k2 is genuinely stale), and its stamp is not
+//      left untouched either: FloorAppliedStamp still floors the applied (older-author)
+//      write to just below k2's own prior stamp -- {k2.Mvcc(), k2.origin_hash - 1} -- rather than
+//      leaving it exactly as it was, exactly the divergence the guard exists to prevent.
+TEST_F(MvccStoreTest, MsetPartialApplyKeepsOnlyNonStaleKeysInOneJournalEntry) {
+  constexpr uint32_t kPeerIdx = 40;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000040");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("mset_lww_partial_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("mset_lww_partial_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid) << "both keys must land on the SAME shard, or this test "
+                                           "proves nothing about a single shard's own journal";
+
+  ASSERT_EQ(Run({"set", k2, "local"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+  ASSERT_GT(k2_before->Mvcc(), 1u) << "sanity: room for a strictly older incoming mvcc below";
+  const uint64_t incoming_mvcc = k2_before->Mvcc() - 1;
+  ASSERT_FALSE(StampOf(k1).has_value()) << "sanity: k1 must be fresh -- no stored stamp";
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"mset", k1, "a", k2, "b"}, kPeerIdx, incoming_mvcc,
+                                    /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "a") << "a fresh key has no stored stamp to be dropped against";
+  auto k1_after = StampOf(k1);
+  ASSERT_TRUE(k1_after.has_value());
+  EXPECT_EQ(k1_after->Mvcc(), incoming_mvcc)
+      << "a surviving pair commits the incoming author's stamp EXACTLY, verbatim";
+  EXPECT_EQ(k1_after->origin_hash, peer_hash);
+
+  EXPECT_EQ(Run({"get", k2}), "local") << "k2's own stored stamp is newer than the incoming one";
+  auto k2_after = StampOf(k2);
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_EQ(*k2_after, *k2_before)
+      << "a dropped pair is never armed -- its stamp must stay exactly what it was, not merely "
+         "floored";
+
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1) << "exactly one journal entry for this MSET";
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 3u);
+  EXPECT_EQ(args[0], "MSET");
+  EXPECT_EQ(args[1], k1);
+  EXPECT_EQ(args[2], "a");
+}
+
+// drakeydb: P4-4 Task A7 -- a stale pair in the MIDDLE of the argument list must be skipped
+// without disturbing either neighbor: k1 and k3 are both fresh (never dropped), k2 alone carries
+// a stored stamp newer than the incoming mvcc. The journaled args must be exactly the surviving
+// PAIRS, in their original relative order, never a prefix of the original argument list.
+//
+// Falsified by reverting the guarded journal branch to the pre-existing prefix-truncation shape
+// (`store_args.resize(stored * 2)` against the ORIGINAL args, `stored` counting only the pairs
+// actually Set()): the captured args come back as [k1, "a", k2, "b"] -- the dropped middle pair
+// is wrongly RE-INCLUDED (its stale value would propagate to every downstream peer) while k3,
+// which was actually written locally, is silently missing from the journal entirely.
+TEST_F(MvccStoreTest, MsetSkipsOnlyTheStaleMiddleKeyNotAPrefixTruncation) {
+  constexpr uint32_t kPeerIdx = 41;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000041");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("mset_lww_mid_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("mset_lww_mid_k2_", sid, num_shards);
+  const std::string k3 = FindKeyOnShard("mset_lww_mid_k3_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+  ASSERT_EQ(Shard(k3, num_shards), sid) << "all three keys must land on the SAME shard";
+
+  ASSERT_EQ(Run({"set", k2, "local"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+  ASSERT_GT(k2_before->Mvcc(), 1u);
+  const uint64_t incoming_mvcc = k2_before->Mvcc() - 1;
+  ASSERT_FALSE(StampOf(k1).has_value());
+  ASSERT_FALSE(StampOf(k3).has_value());
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"mset", k1, "a", k2, "b", k3, "c"}, kPeerIdx, incoming_mvcc,
+                                    /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "a");
+  EXPECT_EQ(Run({"get", k2}), "local") << "the middle pair must be dropped";
+  EXPECT_EQ(Run({"get", k3}), "c") << "k3 must still apply -- it is not a prefix of the pairs "
+                                      "that survived, it is the LAST one";
+
+  auto k1_after = StampOf(k1);
+  ASSERT_TRUE(k1_after.has_value());
+  EXPECT_EQ(*k1_after, (MvccStamp{incoming_mvcc, peer_hash}))
+      << "k1 is fresh -- no prior stamp to floor against -- so it commits the author's stamp "
+         "verbatim";
+  auto k3_after = StampOf(k3);
+  ASSERT_TRUE(k3_after.has_value());
+  EXPECT_EQ(*k3_after, (MvccStamp{incoming_mvcc, peer_hash}))
+      << "k3 is also fresh and commits the author's stamp verbatim, exactly like k1 -- its "
+         "position AFTER the dropped middle pair changes nothing";
+  auto k2_after = StampOf(k2);
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_EQ(*k2_after, *k2_before)
+      << "the dropped middle pair is never armed -- its stamp must stay exactly what it was, not "
+         "merely floored";
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1)
+      << "exactly one pair (k2) is dropped -- k1 and k3 are fresh keys and can never be";
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1);
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 5u);
+  EXPECT_EQ(args[0], "MSET");
+  EXPECT_EQ(args[1], k1);
+  EXPECT_EQ(args[2], "a");
+  EXPECT_EQ(args[3], k3);
+  EXPECT_EQ(args[4], "c");
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 Task A7 -- every pair stale: nothing may change, nothing may journal, and the
+// invariant that a dropped write never advances the wire's LSN (not even to mark an empty gap)
+// must hold -- read directly on the owning shard's own thread, matching journal::GetLsn()'s own
+// contract ("must be called in the context of the owning shard", journal.h).
+//
+// Falsified by adding a journal::ClearBuffer() call on the all-dropped (empty survivors) path:
+// the LSN observably advances by one across the apply (e.g. 3 -> 4) even though nothing was
+// written or journaled. The recording consumer below is a second, independent witness of the
+// same "nothing journaled" fact -- LSN not advancing proves no entry was appended to the wire,
+// while the consumer proves no COMMAND entry was ever delivered to a live subscriber either.
+TEST_F(MvccStoreTest, MsetAllPairsStaleJournalsNothingAndLeavesLsnUnchanged) {
+  constexpr uint32_t kPeerIdx = 42;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000042");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("mset_lww_all_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("mset_lww_all_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k1, "local1"}), "OK");
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+  auto k1_before = StampOf(k1);
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k1_before.has_value());
+  ASSERT_TRUE(k2_before.has_value());
+  const uint64_t min_mvcc = std::min(k1_before->Mvcc(), k2_before->Mvcc());
+  ASSERT_GT(min_mvcc, 1u);
+  const uint64_t incoming_mvcc = min_mvcc - 1;  // strictly older than BOTH stored stamps.
+
+  LSN lsn_before = 0;
+  shard_set->Await(sid, [&] { lsn_before = journal::GetLsn(); });
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"mset", k1, "peer1", k2, "peer2"}, kPeerIdx, incoming_mvcc,
+                                    /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "local1");
+  EXPECT_EQ(Run({"get", k2}), "local2");
+  EXPECT_EQ(StampOf(k1), k1_before);
+  EXPECT_EQ(StampOf(k2), k2_before);
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 2) << "both pairs are individually stale";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  LSN lsn_after = 0;
+  shard_set->Await(sid, [&] { lsn_after = journal::GetLsn(); });
+  EXPECT_EQ(lsn_after, lsn_before)
+      << "an entirely-dropped MSET must never advance the journal's LSN -- it wrote nothing, so "
+         "nothing may be recorded, not even an empty marker";
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), pre_entries)
+      << "no COMMAND journal entry -- empty or otherwise -- may be delivered to a live consumer "
+         "for a fully-dropped MSET";
+}
+
+// drakeydb: P4-4 Task A7 -- the guard bit itself gates the split: with lww_guard=false, OpMSet
+// must take the byte-identical unguarded path regardless of how stale the incoming mvcc is --
+// arrival order wins, exactly as it does on a non-active node or a classic link.
+//
+// Falsified by computing OpMSet's `guarded` from `db_cntx.repl_mvcc != 0` alone, ignoring
+// `repl_lww_guard` entirely (this test's own incoming mvcc is non-zero, so this is the same shape
+// as forcing `guarded = true` outright here): the per-pair compare wrongly runs and DROPS k2 (its
+// own local stamp beats stale_mvcc), so GET k2 then comes back "local" instead of "b", and
+// TotalLwwDropped() advances by 1 instead of staying flat -- and the journal entry shrinks to
+// just the surviving pair (k1) instead of staying the full, byte-identical command.
+TEST_F(MvccStoreTest, MsetGuardOffAppliesArrivalOrderRegardlessOfStamps) {
+  constexpr uint32_t kPeerIdx = 43;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000043");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("mset_lww_off_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("mset_lww_off_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k2, "local"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+  ASSERT_GT(k2_before->Mvcc(), 1u);
+  const uint64_t stale_mvcc = k2_before->Mvcc() - 1;  // would be dropped if the guard were active.
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"mset", k1, "a", k2, "b"}, kPeerIdx, stale_mvcc,
+                                    /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "a");
+  EXPECT_EQ(Run({"get", k2}), "b") << "guard off means arrival order wins regardless of stamps";
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "no per-pair compare may run at all with the guard "
+                                               "off";
+
+  auto k2_after = StampOf(k2);
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_EQ(*k2_after, (MvccStamp{k2_before->Mvcc(), k2_before->origin_hash - 1}))
+      << "the unguarded path still applies FloorAppliedStamp: an applied write whose author stamp "
+         "is "
+         "older than the key's own prior stamp commits just below that prior stamp, never the "
+         "peer's raw (older) incoming mvcc verbatim -- this is what proves k2 went through the "
+         "generic unguarded apply path (the same one an unguarded delta RMW uses), not merely "
+         "arrival-order overwrite with no floor at all";
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1);
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 5u) << "byte-identical unguarded path: the full verbatim command";
+  EXPECT_EQ(args[0], "MSET");
+  EXPECT_EQ(args[1], k1);
+  EXPECT_EQ(args[2], "a");
+  EXPECT_EQ(args[3], k2);
+  EXPECT_EQ(args[4], "b");
+}
+
+// drakeydb: P4-4 Task A7 -- mvcc == 0 must never be guarded (multimaster_lww.h), even with
+// the guard bit itself on -- a classic Redis/KeyDB link never carries mvcc at all, and guarding
+// it would silently discard the whole stream. LwwGuardActive's own mvcc != 0 requirement already
+// makes `guarded` false before OpMSet ever calls IncomingStamp, so the per-pair compare cannot
+// run regardless of what is (or isn't) stored for k2.
+//
+// Falsified by disabling BOTH independent fail-open layers at once: OpMSet's own `guarded`
+// computed from `repl_lww_guard` alone (dropping the mvcc requirement) AND IncomingStamp's own
+// `mvcc == 0` early return (multimaster_lww.cc). Disabling only OpMSet's layer does not reproduce
+// a visible failure here -- IncomingStamp(0, ...) still independently returns nullopt, so `split`
+// still ends up false -- the same redundancy UnstampedIncomingNeverGuarded (above) already
+// documents for the single-key veto. Disabling both at once does: the per-pair compare now
+// genuinely runs against a real (mvcc=0) incoming stamp, and since k2's own stored stamp is newer
+// than {0, peer_hash}, k2 is wrongly dropped -- the GET below then observes "local" instead of
+// "b", and TotalLwwDropped() advances by 1 instead of staying flat.
+TEST_F(MvccStoreTest, MsetUnstampedIncomingAppliesAllPairsEvenWithGuardOn) {
+  constexpr uint32_t kPeerIdx = 44;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a7a7-4000-8000-000000000044");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("mset_lww_zero_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("mset_lww_zero_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k2, "local"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"mset", k1, "a", k2, "b"}, kPeerIdx, /*mvcc=*/0,
+                                    /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", k1}), "a") << "mvcc == 0 must fail open even with the guard bit on";
+  EXPECT_EQ(Run({"get", k2}), "b");
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "an unstamped apply must never count as a drop";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  // drakeydb: P4-4 -- journal::RecordEntry mints a fresh local HopStamp whenever entry.mvcc == 0,
+  // and MvccStamper::Commit attributes that mint to entry.origin_idx verbatim (the LINK's peer
+  // index, not this node's own) -- see UnstampedIncomingNeverGuarded's identical single-key
+  // reasoning (above). Expectations below are derived independently of the values under test: the
+  // origin is the peer_hash registered at the top of this test, and k2's mint must be strictly
+  // newer than k2_before, captured before the apply ever ran.
+  auto k1_after = StampOf(k1);
+  ASSERT_TRUE(k1_after.has_value());
+  EXPECT_EQ(k1_after->origin_hash, peer_hash)
+      << "a fresh key's mvcc==0 mint is still attributed to the LINK's peer origin";
+  auto k2_after = StampOf(k2);
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_GT(k2_after->Mvcc(), k2_before->Mvcc())
+      << "an mvcc==0 apply still mints a fresh HopStamp on commit -- strictly newer than k2's own "
+         "prior stamp, never a no-op and never the incoming (nonexistent) mvcc verbatim";
+  EXPECT_EQ(k2_after->origin_hash, peer_hash)
+      << "the freshly-minted stamp is attributed to the LINK's peer origin, not this node's own";
+}
+
+// ---------------------------------------------------------------------------
+// drakeydb: P4-4 Task A8 -- OpDelV2's own per-key LWW guard (generic_family.cc). DEL is classified
+// kMultiKeySelfGuarded (multimaster_lww.h) for the same reason MSET is (its own per-pair guard,
+// above): its Op function receives a bare list of keys, so the generic single-key veto never
+// classifies it -- the per-key compare has to live inside OpDelV2 itself, under the shard's own
+// key locks, skipping a stale key BEFORE FindMutable ever touches it.
+// ---------------------------------------------------------------------------
+
+// drakeydb: P4-4 Task A8 -- the headline partial-apply case: k1's own stored stamp is OLDER than
+// the incoming DEL's author stamp (so it survives, and its tombstone commits the author's stamp
+// VERBATIM -- the guard already guarantees incoming > stored for anything that gets this far, so
+// FloorAppliedStamp's floor case, which only fires when incoming < stored, never applies), while
+// k2's own stored stamp is NEWER than incoming (so it is dropped, and stays completely untouched --
+// never even looked up mutably). Exactly one key must survive, and the journal must carry only its
+// own name, never a two-key DEL.
+//
+// Falsified by moving the LwwShouldDropKey skip to AFTER FindMutable/post_updater.Run(): that
+// still arms the live, stale k2 even though the skip continues before Del() ever runs on it, and
+// k1's own surviving journal commit then floors k2's stamp too -- one origin_hash below its own
+// prior value, byte-for-byte, even though k2's existence and GET value are untouched.
+TEST_F(MvccStoreTest, DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesTheSurvivor) {
+  constexpr uint32_t kPeerIdx = 70;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000070");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("del_lww_partial_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("del_lww_partial_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid) << "both keys must land on the SAME shard, or this test "
+                                           "proves nothing about a single shard's own journal";
+
+  // k1 gets an OLD stamp, planted directly via a replicated apply so its exact value is under this
+  // test's own control rather than tied to the local wall clock.
+  constexpr uint64_t kOldMvcc = 0x1000ULL;
+  auto plant = ApplyReplicatedCommand({"set", k1, "v1"}, kPeerIdx, kOldMvcc, /*lww_guard=*/false);
+  ASSERT_EQ(plant, facade::DispatchResult::OK);
+  auto k1_before = StampOf(k1);
+  ASSERT_TRUE(k1_before.has_value());
+  ASSERT_EQ(*k1_before, (MvccStamp{kOldMvcc, peer_hash}))
+      << "sanity: a fresh key's applied stamp commits verbatim";
+
+  // k2 gets a real, freshly-minted LOCAL stamp -- far newer than kOldMvcc and, by construction
+  // below, also newer than the DEL's own incoming mvcc.
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k2_before.has_value());
+  const uint64_t incoming_mvcc = kOldMvcc + 1;
+  ASSERT_GT(k2_before->Mvcc(), incoming_mvcc)
+      << "sanity: k2's own stamp must be strictly newer than the DEL's incoming mvcc";
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", k1, k2}, kPeerIdx, incoming_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", k1}).GetInt(), 0) << "k1's own stamp is older than the incoming DEL";
+  auto k1_tomb = StampOf(k1);
+  ASSERT_TRUE(k1_tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+  EXPECT_TRUE(k1_tomb->IsTombstone());
+  EXPECT_EQ(*k1_tomb, (MvccStamp{incoming_mvcc, peer_hash}).AsTombstone())
+      << "the guard already guarantees incoming > stored for anything that survives it, so the "
+         "committed tombstone is the author's stamp VERBATIM, never floored";
+
+  EXPECT_EQ(Run({"exists", k2}).GetInt(), 1) << "k2's own stamp is newer than the incoming DEL";
+  EXPECT_EQ(Run({"get", k2}), "local2");
+  auto k2_after = StampOf(k2);
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_EQ(*k2_after, *k2_before)
+      << "a dropped key is never armed -- its stamp must stay exactly what it was, not merely "
+         "floored";
+
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1) << "exactly one journal entry for this DEL";
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 2u);
+  EXPECT_EQ(args[0], "DEL");
+  EXPECT_EQ(args[1], k1);
+}
+
+// drakeydb: P4-4 Task A8 -- every key stale: nothing may change, nothing may journal, and the
+// invariant that a dropped write must never advance the wire's LSN must hold -- same two witnesses
+// (LSN + a live recording consumer), as MsetAllPairsStaleJournalsNothingAndLeavesLsnUnchanged
+// (above) proves for MSET; OpDelV2's trailing journal block already cannot call
+// journal::ClearBuffer() here (a fully-dropped key never increments deleted_cnt, so deleted_cnt
+// stays 0 alongside the empty journal_args), and this test is the proof that stays true.
+TEST_F(MvccStoreTest, DelLwwAllKeysStaleJournalsNothingAndLeavesLsnUnchanged) {
+  constexpr uint32_t kPeerIdx = 71;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000071");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("del_lww_all_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("del_lww_all_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k1, "local1"}), "OK");
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+  auto k1_before = StampOf(k1);
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k1_before.has_value());
+  ASSERT_TRUE(k2_before.has_value());
+  const uint64_t min_mvcc = std::min(k1_before->Mvcc(), k2_before->Mvcc());
+  ASSERT_GT(min_mvcc, 1u);
+  const uint64_t incoming_mvcc = min_mvcc - 1;  // strictly older than BOTH stored stamps.
+
+  LSN lsn_before = 0;
+  shard_set->Await(sid, [&] { lsn_before = journal::GetLsn(); });
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", k1, k2}, kPeerIdx, incoming_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", k1}).GetInt(), 1);
+  EXPECT_EQ(Run({"exists", k2}).GetInt(), 1);
+  EXPECT_EQ(StampOf(k1), k1_before);
+  EXPECT_EQ(StampOf(k2), k2_before);
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 2) << "both keys are individually stale";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  LSN lsn_after = 0;
+  shard_set->Await(sid, [&] { lsn_after = journal::GetLsn(); });
+  EXPECT_EQ(lsn_after, lsn_before)
+      << "an entirely-dropped DEL must never advance the journal's LSN -- it deleted nothing, so "
+         "nothing may be recorded, not even an empty marker";
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), pre_entries)
+      << "no COMMAND journal entry -- empty or otherwise -- may be delivered to a live consumer "
+         "for a fully-dropped DEL";
+}
+
+// drakeydb: P4-4 Task A8 -- the guard bit itself gates the split: with lww_guard=false, OpDelV2
+// must take the byte-identical unguarded path regardless of how stale the incoming mvcc is --
+// arrival order wins. Same shape as MsetGuardOffAppliesArrivalOrderRegardlessOfStamps for
+// MSET.
+TEST_F(MvccStoreTest, DelLwwGuardOffAppliesArrivalOrderRegardlessOfStamps) {
+  constexpr uint32_t kPeerIdx = 72;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000072");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("del_lww_off_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("del_lww_off_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k1, "local1"}), "OK");
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+  auto k1_before = StampOf(k1);
+  auto k2_before = StampOf(k2);
+  ASSERT_TRUE(k1_before.has_value());
+  ASSERT_TRUE(k2_before.has_value());
+  const uint64_t min_mvcc = std::min(k1_before->Mvcc(), k2_before->Mvcc());
+  ASSERT_GT(min_mvcc, 1u);
+  const uint64_t stale_mvcc = min_mvcc - 1;  // would drop both if the guard were active.
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", k1, k2}, kPeerIdx, stale_mvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", k1}).GetInt(), 0)
+      << "guard off means arrival order wins regardless of stamps";
+  EXPECT_EQ(Run({"exists", k2}).GetInt(), 0);
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped)
+      << "no per-key compare may run at all with the guard off";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1);
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 3u) << "byte-identical unguarded path: the full verbatim command";
+  EXPECT_EQ(args[0], "DEL");
+  EXPECT_EQ(args[1], k1);
+  EXPECT_EQ(args[2], k2);
+}
+
+// drakeydb: P4-4 Task A8 -- mvcc == 0 must never be guarded (multimaster_lww.h), even with the
+// guard bit itself on -- a classic Redis/KeyDB link never carries mvcc at all. LwwGuardActive's own
+// mvcc != 0 requirement already makes `guarded` false before OpDelV2 ever calls IncomingStamp, so
+// the per-key compare cannot run regardless of what is (or isn't) stored for either key. Same shape
+// as MsetUnstampedIncomingAppliesAllPairsEvenWithGuardOn for MSET.
+TEST_F(MvccStoreTest, DelLwwUnstampedIncomingAppliesAllKeysEvenWithGuardOn) {
+  constexpr uint32_t kPeerIdx = 73;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000073");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const size_t num_shards = shard_set->size();
+  const std::string k1 = FindKeyOnShard("del_lww_zero_k1_", 0, num_shards);
+  const ShardId sid = Shard(k1, num_shards);
+  const std::string k2 = FindKeyOnShard("del_lww_zero_k2_", sid, num_shards);
+  ASSERT_EQ(Shard(k1, num_shards), sid);
+  ASSERT_EQ(Shard(k2, num_shards), sid);
+
+  ASSERT_EQ(Run({"set", k1, "local1"}), "OK");
+  ASSERT_EQ(Run({"set", k2, "local2"}), "OK");
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", k1, k2}, kPeerIdx, /*mvcc=*/0, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", k1}).GetInt(), 0)
+      << "mvcc == 0 must fail open even with the guard bit on";
+  EXPECT_EQ(Run({"exists", k2}).GetInt(), 0);
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped) << "an unstamped apply must never count as a drop";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 Task A8 -- an absent key can still carry a TOMBSTONE in the mvcc side table
+// (DbSlice::GetMvcc looks it up directly, independent of the prime table -- db_slice.cc): a
+// replicated DEL of that same key must still be LWW-compared against the tombstone, exactly as it
+// would be against a live value, never treated as "nothing to compare against" just because
+// FindMutable would find it absent either way.
+TEST_F(MvccStoreTest, DelLwwDropsAgainstAnAbsentKeysNewerTombstone) {
+  const std::string key = FindKeyOnShard("del_lww_tomb_new_", 0, shard_set->size());
+  ASSERT_EQ(Run({"set", key, "v"}), "OK");
+  ASSERT_EQ(Run({"del", key}).GetInt(), 1);
+  auto tomb = StampOf(key);
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone()) << "sanity: key must be a tombstone, not fully erased";
+
+  constexpr uint32_t kPeerIdx = 74;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000074");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  ASSERT_GT(tomb->Mvcc(), kStaleMvcc) << "sanity: T must be newer than the stale incoming mvcc";
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", key}, kPeerIdx, kStaleMvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", key}).GetInt(), 0);
+  auto tomb_after = StampOf(key);
+  ASSERT_TRUE(tomb_after.has_value());
+  EXPECT_EQ(*tomb_after, *tomb)
+      << "a dropped key's existing tombstone must stay exactly what it was -- the guard skips it "
+         "before FindMutable ever touches it";
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 Task A8 -- the not-dropped sibling of the test above: an incoming DEL strictly
+// NEWER than the key's own existing tombstone must not be classified as a drop at all -- and
+// the ordinary DEL-of-an-absent-key path is unchanged: FindMutable finds nothing, so it is still
+// a silent no-op, never journaled, never counted. Note
+// this DEL still returns OK either way -- a dropped write also returns OK and counts as applied
+// -- so `TotalLwwDropped()` below, not the dispatch result, is what actually proves not-dropped.
+TEST_F(MvccStoreTest, DelLwwIsNotDroppedAgainstAnOlderTombstone) {
+  const std::string key = FindKeyOnShard("del_lww_tomb_old_", 0, shard_set->size());
+  ASSERT_EQ(Run({"set", key, "v"}), "OK");
+  ASSERT_EQ(Run({"del", key}).GetInt(), 1);
+  auto tomb = StampOf(key);
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone());
+
+  constexpr uint32_t kPeerIdx = 75;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000075");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+  const uint64_t incoming_mvcc = tomb->Mvcc() + 1;  // strictly newer than the tombstone.
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res = ApplyReplicatedCommand({"del", key}, kPeerIdx, incoming_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped)
+      << "not dropped: a dropped write also returns OK and counts as applied, so this counter -- "
+         "not the dispatch result above -- is what actually proves the guard let this DEL through";
+
+  EXPECT_EQ(Run({"exists", key}).GetInt(), 0)
+      << "the key was already absent -- a not-dropped DEL of an absent key is still a no-op, "
+         "exactly as it always has been (FindMutable finds nothing to delete)";
+  auto tomb_after = StampOf(key);
+  ASSERT_TRUE(tomb_after.has_value());
+  EXPECT_EQ(*tomb_after, *tomb)
+      << "nothing was armed -- the pre-existing tombstone is untouched, the same as any other DEL "
+         "of a nonexistent key";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), pre_entries)
+      << "a DEL of an absent key journals nothing, guarded or not -- FindMutable finds nothing to "
+         "delete, so journal_args stays empty and RecordJournal is never called for it";
+}
+
+// ---------------------------------------------------------------------------
+// drakeydb: P4-4 Task A11b -- DELEX journals its RESULT (DEL), never its own name
+// (generic_family.cc). A bare `DELEX key` delegates to CmdDel/OpDelV2, which already has its own
+// per-key guard -- the defect this fixes was purely in the AUTO-JOURNAL epilogue re-forwarding
+// "DELEX key"
+// verbatim regardless of what OpDelV2 decided, since the generic single-key veto never classifies
+// DELEX (same reason it never classifies DEL/MSET -- see UnguardedAndSelfGuardedClassesAreNot-
+// VetoedByTheGenericSingleKeyCheck, above). The conditional forms now hand-journal "DEL key"
+// themselves; see this file's EmittedNamePinsMatchClassifiedGuardedNames (below) for proof of
+// the exact shape emitted, and DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesTheSurvivor /
+// DelLwwAllKeysStaleJournalsNothingAndLeavesLsnUnchanged (above) for OpDelV2's own guard on the
+// "DEL key" this conditional path now emits.
+// ---------------------------------------------------------------------------
+
+// drakeydb: P4-4 Task A11b -- the receiver-side regression this fixes: a guarded, STALE bare
+// `DELEX key` from a peer must be dropped by OpDelV2's own per-key guard (exactly like a stale
+// DEL) AND must forward nothing downstream. Before this fix, DELEX's own auto-journal epilogue
+// forwarded "DELEX key" verbatim regardless of the drop -- a plain (never-guarded) replica further
+// downstream would apply that forwarded DELEX and diverge from its master -- a dropped write must
+// journal nothing, full stop.
+//
+// Falsified: reverting the CO::NO_AUTOJOURNAL added to DELEX's registration (generic_family.cc)
+// while keeping everything else made this test's live consumer see a "DELEX delex_leak_k" entry
+// (pre_entries + 1, not + 0).
+TEST_F(MvccStoreTest, DelexBareStaleAuthorLeakClosedByNoAutoJournal) {
+  constexpr uint32_t kPeerIdx = 76;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a11b-4000-8000-000000000076");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "delex_leak_k", "local"}), "OK");
+  auto before = StampOf("delex_leak_k");
+  ASSERT_TRUE(before.has_value());
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  ASSERT_GT(before->Mvcc(), kStaleMvcc) << "sanity: S must be newer than the stale author mvcc";
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalLwwDropped();
+  auto res =
+      ApplyReplicatedCommand({"delex", "delex_leak_k"}, kPeerIdx, kStaleMvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", "delex_leak_k"}).GetInt(), 1)
+      << "a stale bare DELEX must be dropped by OpDelV2's own per-key guard, same as a stale DEL";
+  EXPECT_EQ(Run({"get", "delex_leak_k"}), "local");
+  auto after = StampOf("delex_leak_k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(*after, *before) << "a dropped key is never armed, so its stamp is untouched";
+  EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), pre_entries)
+      << "DELEX is CO::NO_AUTOJOURNAL: a dropped bare DELEX must forward nothing downstream -- no "
+         "COMMAND journal entry, of any name, may reach a live consumer for it";
+}
+
+// drakeydb: P4-4 Task A11b -- the conditional forms' own result-journal (Delex's conditional cb,
+// generic_family.cc) hands a receiver plain "DEL key" -- exactly the shape a live capture pins in
+// EmittedNamePinsMatchClassifiedGuardedNames (below). That shape is a fixed constant
+// ("DEL" plus the key, never anything else), so this test applies it directly rather than
+// capturing and replaying a live conditional DELEX invocation -- doing so would exercise the same
+// fixed constant a second time, not add coverage. What this test actually checks is OpDelV2's
+// existing per-key guard against that shape: an incoming stamp NEWER than the stored stamp
+// deletes and tombstones with the author's stamp verbatim; OLDER is dropped, stamp untouched --
+// both already covered in full by DelLwwPartialApplyDropsOnlyTheStaleKeyAndTombstonesTheSurvivor
+// (above), so this is a targeted interaction check (does the shape DELEX now emits land
+// on that guard correctly), not new guard coverage.
+TEST_F(MvccStoreTest, DelexConditionalResultDelNewerDeletesOlderDropped) {
+  constexpr uint32_t kPeerIdx = 77;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a11b-4000-8000-000000000077");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  {  // NEWER than the local stamp: deletes, tombstone = author stamp verbatim.
+    SCOPED_TRACE("newer");
+    ASSERT_EQ(Run({"set", "delex_res_new", "local"}), "OK");
+    auto before = StampOf("delex_res_new");
+    ASSERT_TRUE(before.has_value());
+    const uint64_t newer_mvcc = before->Mvcc() + 1;
+
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"del", "delex_res_new"}, kPeerIdx, newer_mvcc,
+                                      /*lww_guard=*/true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+
+    EXPECT_EQ(Run({"exists", "delex_res_new"}).GetInt(), 0);
+    auto tomb = StampOf("delex_res_new");
+    ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+    EXPECT_TRUE(tomb->IsTombstone());
+    EXPECT_EQ(*tomb, (MvccStamp{newer_mvcc, peer_hash}).AsTombstone())
+        << "the guard already guarantees incoming > stored for anything that survives it, so the "
+           "committed tombstone is the author's stamp verbatim, never floored";
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped);
+  }
+
+  {  // OLDER than the local stamp: dropped, stamp untouched.
+    SCOPED_TRACE("older");
+    ASSERT_EQ(Run({"set", "delex_res_old", "local"}), "OK");
+    auto before = StampOf("delex_res_old");
+    ASSERT_TRUE(before.has_value());
+    ASSERT_GT(before->Mvcc(), 1u) << "sanity: needs room below to construct an older mvcc";
+    const uint64_t older_mvcc = before->Mvcc() - 1;
+
+    const uint64_t pre_dropped = TotalLwwDropped();
+    auto res = ApplyReplicatedCommand({"del", "delex_res_old"}, kPeerIdx, older_mvcc,
+                                      /*lww_guard=*/true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+
+    EXPECT_EQ(Run({"exists", "delex_res_old"}).GetInt(), 1)
+        << "DEL's own per-key guard must drop a key whose incoming stamp is older than that key's "
+           "own stored stamp";
+    EXPECT_EQ(Run({"get", "delex_res_old"}), "local");
+    auto after = StampOf("delex_res_old");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(*after, *before) << "a dropped key is never armed, so its stamp is untouched";
+    EXPECT_EQ(TotalLwwDropped(), pre_dropped + 1);
+    EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// drakeydb: P4-4 Task A9 -- the pre-dispatch SETNX->SET / RESTORE->+REPLACE rewrite
+// (ApplyLwwRewrites, multimaster_lww.h), wired into JournalExecutor::Execute (executor.cc) end to
+// end. See mvcc_test.cc's MultimasterLwwTest.ApplyLwwRewrites* suite for the rewrite function in
+// isolation.
+// ---------------------------------------------------------------------------
+
+// drakeydb: P4-4 Task A9 -- the headline case the rewrite exists for: SETNX is conditional on
+// non-existence, so applying it VERBATIM against a receiver that already holds "k" would always
+// SKIP, no matter how much newer the author's write is -- a silent, permanent divergence. Once
+// rewritten to a plain SET, the ordinary single-key veto compares stamps instead of existence,
+// and a genuinely newer author wins.
+//
+// Falsifying: removing the `ApplyLwwRewrites` call in JournalExecutor::Execute (executor.cc)
+// makes the literal "setnx" dispatch unchanged -- SetCmd::Set's own SET_IF_NOTEXIST precondition
+// then finds "k" already live and returns SKIPPED, so `GET k` below observes "local" instead of
+// "peer".
+TEST_F(MvccStoreTest, SetnxRewrittenToSetAppliesOverOlderLocalValue) {
+  constexpr uint32_t kPeerIdx = 80;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000080");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const uint64_t newer_mvcc = before_stamp->Mvcc() + 1;
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"setnx", "k", "peer"}, kPeerIdx, newer_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer")
+      << "a newer-author guarded SETNX on an EXISTING key must still apply -- rewritten to SET, "
+         "the veto compares stamps instead of SETNX's own (always-false, here) existence check";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(after_stamp->Mvcc(), newer_mvcc);
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_FALSE(consumer.entries.empty());
+  EXPECT_EQ(consumer.entries.back().args[0], "SET")
+      << "the journaled name must be SET, never SETNX verbatim -- proving the rewrite, not some "
+         "other path, is what let this apply";
+}
+
+// drakeydb: P4-4 Task A9 -- the drop-side sibling of the test above: a STALE guarded SETNX (also
+// rewritten to SET before dispatch) must be vetoed exactly like any other guarded SET, leaving
+// the newer local value in place and counting one drop. SETNX is classified kSingleKey
+// (see ClassifyJournaledCommandMatchesEveryTableRow, mvcc_test.cc) independent of the SETNX->SET
+// rewrite below, and the
+// generic single-key veto runs before the SET/SETNX distinction ever reaches SetCmd -- so a
+// literal, unrewritten SETNX would already be vetoed here too (SETNX's own existence check also
+// no-ops for a stale write against an existing key). What this test actually pins is that the
+// rewrite does not disturb the veto's ability to drop a stale write once it arrives as SET.
+//
+// Falsifying: making the single-key veto (ShouldDropForLww, transaction.cc) always `return
+// false` makes `GET k` below observe "peer" instead of "local".
+TEST_F(MvccStoreTest, SetnxRewrittenToSetIsDroppedWhenStale) {
+  constexpr uint32_t kPeerIdx = 81;
+  constexpr uint64_t kStaleMvcc = 0x1000ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000081");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  ASSERT_GT(before_stamp->Mvcc(), kStaleMvcc)
+      << "sanity: the local stamp must actually be newer than the peer's for this to be a "
+         "meaningful drop";
+
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"setnx", "k", "peer"}, kPeerIdx, kStaleMvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "local");
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(*after_stamp, *before_stamp);
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 Task A9 -- the rewrite's own central hazard: an unstamped (mvcc 0) apply must
+// NEVER be rewritten, even with the link's guard bit on. LwwGuardActive(link_guard, 0) is false,
+// so gating the rewrite on `conn_context_.repl_lww_guard` alone (ignoring mvcc) would turn this
+// into a BLIND, UNGUARDED SET -- IsLwwGuarded() at the Transaction level independently also reads
+// false for mvcc 0, so the rewritten SET would apply with no veto at all and clobber "k".
+//
+// Falsifying: changing executor.cc's gate from `LwwGuardActive(conn_context_.repl_lww_guard,
+// conn_context_.repl_mvcc)` to `conn_context_.repl_lww_guard` alone makes `GET k` below observe
+// "peer" instead of "local".
+TEST_F(MvccStoreTest, UnstampedGuardedSetnxIsNotRewritten) {
+  constexpr uint32_t kPeerIdx = 82;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000082");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"setnx", "k", "peer"}, kPeerIdx, /*mvcc=*/0, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "local")
+      << "mvcc 0 must never be rewritten -- SETNX's own existence check must still see 'k' live "
+         "and no-op, exactly as an unrewritten SETNX always has";
+  EXPECT_EQ(StampOf("k"), before_stamp) << "an untouched key's stamp must not move either";
+}
+
+// drakeydb: P4-4 Task A9 -- the guard-off control: a plain (non-peer) replication link must see
+// KeyDB parity -- a client-issued SETNX on an existing key always no-ops, and this link's SETNX
+// must too, completely untouched by the rewrite. Uses a real non-zero mvcc (unlike the test
+// above) specifically so this test cannot pass merely because LwwGuardActive's mvcc-0 half caught
+// it -- only the link_guard half is doing the work here.
+//
+// Falsifying: gating the rewrite on `conn_context_.repl_mvcc != 0` alone (dropping the
+// link_guard half of LwwGuardActive) makes `GET k` below observe "peer" instead of "local".
+TEST_F(MvccStoreTest, GuardOffSetnxOnExistingKeyIsUntouched) {
+  constexpr uint32_t kPeerIdx = 83;
+  constexpr uint64_t kSomeMvcc = 0x9999ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000083");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"setnx", "k", "peer"}, kPeerIdx, kSomeMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "local");
+  EXPECT_EQ(StampOf("k"), before_stamp);
+}
+
+// drakeydb: P4-4 Task A9 -- RESTORE's own divergence: without REPLACE, RESTORE onto an existing
+// key errors, and DispatchCommand reports that reply-level error as DispatchResult::OK (only an
+// uncaught exception or OOM changes that result) -- so an unrewritten guarded RESTORE would leave
+// the receiver on the OLD value with no visible apply failure and no LWW-drop metric either.
+// The pre-dispatch rewrite injects REPLACE so the ordinary single-key veto decides instead.
+//
+// Falsifying: removing the `ApplyLwwRewrites` call in JournalExecutor::Execute (executor.cc)
+// makes `GET k` below observe "local" (RESTORE errors with BUSYKEY, silently, still returning
+// DispatchResult::OK) instead of "donorval".
+TEST_F(MvccStoreTest, RestoreGainsReplaceAndAppliesOverOlderExistingKey) {
+  constexpr uint32_t kPeerIdx = 84;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000084");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "donor", "donorval"}), "OK");
+  std::string dump = Run({"dump", "donor"}).GetString();
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const uint64_t newer_mvcc = before_stamp->Mvcc() + 1;
+
+  // No REPLACE token -- the pre-dispatch rewrite must inject it.
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"restore", "k", "0", dump}, kPeerIdx, newer_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK)
+      << "a reply-level RESTORE error is still reported as OK -- this alone proves nothing about "
+         "whether REPLACE was actually injected, see the GET below for that";
+
+  EXPECT_EQ(Run({"get", "k"}), "donorval")
+      << "REPLACE must have been injected so the veto, not RESTORE's own existence check, "
+         "decided -- a newer author must win";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(after_stamp->Mvcc(), newer_mvcc);
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash);
+}
+
+// drakeydb: P4-4 -- a client-issued RESTORE with a RELATIVE ttl must journal an ABSOLUTE one on
+// an active node: each receiver would otherwise compute its own deadline from ITS OWN arrival
+// time, drifting with replication lag (the same class of bug PXAT/JournalFullStateSet already
+// close for every other TTL-carrying command). RESTORE is CO::NO_AUTOJOURNAL on an active node
+// now, so OpRestore's own explicit, post-write journal call (generic_family.cc) is the only path
+// to the wire.
+//
+// Falsifying: journaling `restore_args.expiration.value` BEFORE UpdateExpiration runs (i.e. the
+// client's own, still-relative ttl) instead of AFTER makes the EXPECT_EQ on `journaled_ttl` below
+// observe the bare relative ttl (100000) instead of an absolute deadline.
+TEST_F(MvccStoreTest, RestoreActiveNodeJournalsAbsoluteTtlNotRelative) {
+  ASSERT_EQ(Run({"set", "restore_abs_donor", "donorval"}), "OK");
+  std::string dump = Run({"dump", "restore_abs_donor"}).GetString();
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  constexpr int64_t kRelativeTtlMs = 100000;
+  const uint64_t before_ms = TEST_current_time_ms;
+  ASSERT_EQ(Run({"restore", "restore_abs_k", absl::StrCat(kRelativeTtlMs), dump}), "OK");
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), 1u) << "RESTORE is CO::NO_AUTOJOURNAL now -- exactly one "
+                                            "entry, this function's own explicit journal, must "
+                                            "reach the wire";
+  const auto& args = consumer.entries[0].args;
+  ASSERT_GE(args.size(), 4u) << "RESTORE key abs_ttl dump ABSTTL";
+  EXPECT_EQ(args[0], "RESTORE");
+  EXPECT_EQ(args[1], "restore_abs_k");
+  int64_t journaled_ttl = 0;
+  ASSERT_TRUE(absl::SimpleAtoi(args[2], &journaled_ttl));
+  EXPECT_EQ(journaled_ttl, static_cast<int64_t>(before_ms) + kRelativeTtlMs)
+      << "the journaled ttl must be an ABSOLUTE deadline (before_ms + the relative ttl), never "
+         "the bare relative ttl (100000) itself";
+  EXPECT_EQ(args[3], dump);
+  EXPECT_THAT(args, ::testing::Contains("ABSTTL"))
+      << "an absolute ttl with no ABSTTL token would be silently re-interpreted as relative by "
+         "the very next hop";
+
+  EXPECT_EQ(Run({"get", "restore_abs_k"}), "donorval");
+}
+
+// drakeydb: P4-4 -- the found_prev + Expired() shape: RESTORE ... REPLACE deletes the OLD key
+// through the ordinary PerformDeletionAtomic path (which ARMS a tombstone placeholder expecting a
+// journal commit), then discovers the NEW ttl already elapsed and never creates a replacement.
+// RESTORE is CO::NO_AUTOJOURNAL on an active node, so without OpRestore's own explicit "DEL key"
+// journal call (generic_family.cc) that arm would sit uncommitted until THIS transaction's own
+// epoch end rolls it back -- caught here by TotalUnstampedWrites() staying 0, not merely by the
+// journal entry showing up. The entry-count
+// check is an EXPECT_, not an ASSERT_, specifically so a failure there does not abort the test
+// before the TotalUnstampedWrites() check at the end ever runs -- both halves must be observed
+// independently.
+//
+// Falsifying: deleting OpRestore's `RecordJournal(op_args, "DEL"sv, ArgSlice{key})` call in its
+// found_prev branch (generic_family.cc) makes `EXPECT_EQ(consumer.entries.size(), 1u)` below
+// observe 0 instead of 1, AND `EXPECT_EQ(TotalUnstampedWrites(), 0u)` at the end observe 1
+// instead of 0 -- both are actually observed, not just the first one to run.
+TEST_F(MvccStoreTest, RestoreActiveNodeExpiredReplaceJournalsDelAndCommitsTheArm) {
+  ASSERT_EQ(Run({"set", "restore_exp_donor", "donorval"}), "OK");
+  std::string dump = Run({"dump", "restore_exp_donor"}).GetString();
+  ASSERT_EQ(Run({"set", "restore_exp_k", "old"}), "OK");
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  // ABSTTL "1" (1ms since the epoch) is already elapsed relative to any real now -- Expired()
+  // will be true.
+  ASSERT_EQ(Run({"restore", "restore_exp_k", "1", dump, "REPLACE", "ABSTTL"}), "OK");
+  EXPECT_EQ(Run({"exists", "restore_exp_k"}).GetInt(), 0);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), 1u);
+  if (!consumer.entries.empty()) {
+    const auto& args = consumer.entries[0].args;
+    ASSERT_EQ(args.size(), 2u);
+    EXPECT_EQ(args[0], "DEL");
+    EXPECT_EQ(args[1], "restore_exp_k");
+  }
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 -- SetCmd::Set's own absent-key sibling of the RESTORE fix above: a guarded
+// applied SET whose absolute TTL has already elapsed, against a key this node does not hold,
+// must still install a tombstone -- otherwise this node silently forgets the write ever
+// happened, and a strictly OLDER write for the same key, arriving afterwards from a third peer,
+// is wrongly accepted instead of rejected.
+//
+// Falsifying: reverting the `if (!IsValid(find_res.it))` branch in SetCmd::Set
+// (string_family.cc) to a bare `return OpStatus::OK;` (no tombstone install) makes
+// `EXPECT_TRUE(after_x.has_value())` below fail (StampOf comes back nullopt instead of a
+// tombstone) AND the final `EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0)` observe 1 instead (the
+// older write W, with no tombstone left to reject it, is wrongly accepted against the still-absent
+// slot) -- both halves are actually observed: the first check is an EXPECT_, not an ASSERT_,
+// specifically so a failure there does not abort the test before the second one runs.
+TEST_F(MvccStoreTest, SetActiveNodeExpiredAbsentKeyInstallsTombstoneRejectingOlderWrite) {
+  constexpr uint32_t kPeerIdx = 87;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000087");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
+
+  // X: a guarded SET with an ABSOLUTE deadline already in the past (PXAT 1 -- 1ms since the
+  // epoch). The key is absent, so the veto's own MergeAccepts(nullopt, X) accepts it and lets it
+  // reach SetCmd::Set's own expire_in_past branch.
+  constexpr uint64_t kXMvcc = 0x5000ULL;
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "x_val", "PXAT", "1"}, kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0) << "the already-expired write must create nothing";
+
+  auto after_x = StampOf("k");
+  EXPECT_TRUE(after_x.has_value())
+      << "an already-expired guarded write against an absent key must still install a tombstone";
+  if (after_x.has_value()) {
+    EXPECT_TRUE(after_x->IsTombstone());
+    const MvccStamp x_stamp{kXMvcc, peer_hash};
+    EXPECT_EQ(*after_x,
+              (MvccStamp{x_stamp.packed | MvccClock::kTombstoneBit, x_stamp.origin_hash + 1}))
+        << "must derive from X's own stamp (ExpiryTombstoneFor), never a freshly minted one";
+  }
+
+  // W: an OLDER write (mvcc strictly below X) for the same key, reaching this node afterwards
+  // from a third peer. It must be dropped -- the tombstone this node just installed for X is
+  // strictly newer than W, exactly as it would be on every other node that saw X applied while
+  // the key was still live.
+  constexpr uint32_t kPeerIdx2 = 88;
+  const uint64_t peer_hash2 = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000088");
+  RegisterPeerOriginHash(kPeerIdx2, peer_hash2);
+  constexpr uint64_t kWMvcc = 0x1000ULL;
+  ASSERT_LT(kWMvcc, kXMvcc) << "sanity: W must be strictly older than X";
+  const uint64_t before_dropped = TotalLwwDropped();
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "w_val"}, kPeerIdx2, kWMvcc, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0)
+      << "W must be dropped -- it is older than the tombstone X installed";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(StampOf("k"), after_x) << "the tombstone must survive W's drop untouched";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 -- OpRestore's own !found_prev sibling of the SET test above: a guarded RESTORE
+// against a key this node does not hold, carrying an ABSOLUTE ttl already in the past, must also
+// install a tombstone -- the common shape for a non-string RESTORE whose TTL has already elapsed
+// (SetCmd::Set's own fix above only ever covers a string value). Without it, this node forgets
+// the write happened at all, and a strictly OLDER write for the same key, arriving afterwards
+// from a third peer, is wrongly accepted instead of rejected.
+//
+// Falsifying: commenting out the `db_slice.InstallAbsentKeyTombstone(...)` call inside OpRestore's
+// `!found_prev` branch (generic_family.cc) makes `EXPECT_TRUE(after_x.has_value())` below fail
+// (StampOf comes back nullopt) AND the final `EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0)` observe
+// 1 instead (the older write W, with no tombstone left to reject it, is wrongly accepted) -- both
+// halves are actually observed: the first check is an EXPECT_, not an ASSERT_, specifically so a
+// failure there does not abort the test before the second one runs.
+TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeyInstallsTombstoneRejectingOlderWrite) {
+  constexpr uint32_t kPeerIdx = 89;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000089");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "restore_absent_donor", "donorval"}), "OK");
+  std::string dump = Run({"dump", "restore_absent_donor"}).GetString();
+
+  ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
+
+  // X: a guarded RESTORE with an ABSOLUTE deadline already in the past (ABSTTL "1" -- 1ms since
+  // the epoch). The key is absent, so the veto's own MergeAccepts(nullopt, X) accepts it and lets
+  // it reach OpRestore's own Expired() + !found_prev branch.
+  constexpr uint64_t kXMvcc = 0x5000ULL;
+  ASSERT_EQ(ApplyReplicatedCommand({"restore", "k", "1", dump, "ABSTTL"}, kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0) << "the already-expired write must create nothing";
+
+  auto after_x = StampOf("k");
+  EXPECT_TRUE(after_x.has_value())
+      << "an already-expired guarded RESTORE against an absent key must still install a tombstone";
+  if (after_x.has_value()) {
+    EXPECT_TRUE(after_x->IsTombstone());
+    const MvccStamp x_stamp{kXMvcc, peer_hash};
+    EXPECT_EQ(*after_x,
+              (MvccStamp{x_stamp.packed | MvccClock::kTombstoneBit, x_stamp.origin_hash + 1}))
+        << "must derive from X's own stamp (ExpiryTombstoneFor), never a freshly minted one";
+  }
+
+  // W: an OLDER write (mvcc strictly below X) for the same key, reaching this node afterwards
+  // from a third peer. It must be dropped -- the tombstone this node just installed for X is
+  // strictly newer than W, exactly as it would be on every other node that saw X applied while
+  // the key was still live.
+  constexpr uint32_t kPeerIdx2 = 90;
+  const uint64_t peer_hash2 = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000090");
+  RegisterPeerOriginHash(kPeerIdx2, peer_hash2);
+  constexpr uint64_t kWMvcc = 0x1000ULL;
+  ASSERT_LT(kWMvcc, kXMvcc) << "sanity: W must be strictly older than X";
+  const uint64_t before_dropped = TotalLwwDropped();
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "w_val"}, kPeerIdx2, kWMvcc, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0)
+      << "W must be dropped -- it is older than the tombstone X installed";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(StampOf("k"), after_x) << "the tombstone must survive W's drop untouched";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-4 Task A9 -- the premise the SETNX rewrite depends on, pinned directly: a
+// client-issued SETNX that does NOT set (the key already exists) must reach the journal ZERO
+// times. SETNX has no CO::NO_AUTOJOURNAL (string_family.cc), so its only journal path is ever
+// the transaction's generic auto-journal, and that path is driven by one status value:
+// SetCmd::Set's own SET_IF_NOTEXIST branch returns OpStatus::SKIPPED for an existing key before
+// ever calling PostEdit (so RecordJournal is simply never reached), and that same SKIPPED status
+// is exactly what Transaction::LogAutoJournalOnShard's `if (result.status != OpStatus::OK)
+// return;` gate (transaction.cc) reads to suppress the auto-journal. If SET_IF_NOTEXIST ever
+// returned OK instead of SKIPPED here, rewriting a replicated SETNX to SET would be reproducing a
+// phantom write the author itself never made.
+TEST_F(MvccStoreTest, AuthorSideNoopSetnxJournalsNothing) {
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  ASSERT_EQ(Run({"set", "k", "v1"}), "OK");
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  EXPECT_EQ(Run({"setnx", "k", "v2"}).GetInt(), 0) << "sanity: the key already exists";
+  EXPECT_EQ(Run({"get", "k"}), "v1") << "sanity: the no-op SETNX must not have changed the value";
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), pre_entries) << "a no-op SETNX must never reach the journal";
+}
+
+// drakeydb: P4-4 -- the pre-dispatch GETSET->SET rewrite (ApplyLwwRewrites, multimaster_lww.h):
+// GETSET replicates verbatim (auto-journaled, CO::JOURNALED), and GETSET's own read-modify-write
+// requires the existing key, if any, to already be a string -- applying it verbatim against a
+// receiver holding a DIFFERENT type WRONGTYPEs and applies nothing, even though a newer author
+// must win. Rewritten to a plain SET, the ordinary single-key veto compares stamps instead of
+// GETSET's own type check, and the value converges to the author's regardless of what type this
+// node held.
+//
+// Falsifying: removing the GETSET branch from ApplyLwwRewrites (multimaster_lww.cc) makes the
+// literal "getset" dispatch unchanged -- GETSET's own type check then WRONGTYPEs against the
+// resident hash and applies nothing, so `GET k` below observes the hash still live instead of
+// the peer's string.
+TEST_F(MvccStoreTest, GetsetRewrittenToSetAppliesOverMismatchedType) {
+  constexpr uint32_t kPeerIdx = 85;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000085");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"hset", "k", "field", "val"}).GetInt(), 1);
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const uint64_t newer_mvcc = before_stamp->Mvcc() + 1;
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"getset", "k", "peer"}, kPeerIdx, newer_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer")
+      << "a newer-author guarded GETSET against a hash must still apply -- rewritten to SET, the "
+         "veto compares stamps instead of GETSET's own (WRONGTYPE, here) type check";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_EQ(after_stamp->Mvcc(), newer_mvcc);
+  EXPECT_EQ(after_stamp->origin_hash, peer_hash);
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_FALSE(consumer.entries.empty());
+  EXPECT_EQ(consumer.entries.back().args[0], "SET")
+      << "the journaled name must be SET, never GETSET verbatim -- proving the rewrite, not some "
+         "other path, is what let this apply";
+}
+
+// drakeydb: P4-4 -- the pre-dispatch GETDEL->DEL rewrite (ApplyLwwRewrites, multimaster_lww.h):
+// same reasoning as GETSET above. GETDEL's own read-then-delete also requires the existing key to
+// already be a string; applying it verbatim against a receiver holding a different type
+// WRONGTYPEs and deletes nothing, even though a newer author's delete must still win.
+//
+// Falsifying: removing the GETDEL branch from ApplyLwwRewrites (multimaster_lww.cc) makes the
+// literal "getdel" dispatch unchanged -- GETDEL's own type check then WRONGTYPEs against the
+// resident hash and deletes nothing, so `EXISTS k` below observes 1 instead of 0.
+TEST_F(MvccStoreTest, GetdelRewrittenToDelAppliesOverMismatchedType) {
+  constexpr uint32_t kPeerIdx = 86;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000086");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"hset", "k", "field", "val"}).GetInt(), 1);
+  auto before_stamp = StampOf("k");
+  ASSERT_TRUE(before_stamp.has_value());
+  const uint64_t newer_mvcc = before_stamp->Mvcc() + 1;
+
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"getdel", "k"}, kPeerIdx, newer_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0)
+      << "a newer-author guarded GETDEL against a hash must still delete the key -- rewritten to "
+         "DEL, the veto compares stamps instead of GETDEL's own (WRONGTYPE, here) type check";
+  auto after_stamp = StampOf("k");
+  ASSERT_TRUE(after_stamp.has_value());
+  EXPECT_TRUE(after_stamp->IsTombstone());
+}
+
+// ---------------------------------------------------------------------------
+// drakeydb: P4-4 Task A5 -- FloorAppliedStamp's end-to-end proof. See mvcc.h's declaration for why
+// it is a pure function; mvcc_test.cc's FloorAppliedStampTest suite covers the function in
+// isolation.
+// ---------------------------------------------------------------------------
+
+// drakeydb: P4-4 Task A5 -- the headline case the floor exists for: an UNGUARDED applied RMW
+// (APPEND is not one of the names ClassifyJournaledCommand, multimaster_lww.h, guards, so the
+// single-key veto never even classifies it) whose author authored it before it ever saw this key's
+// local stamp `S`. Item (i): the write still applies (its value change is real, not silently
+// dropped), but its COMMITTED stamp floors to just-below `S` instead of the author's own (older)
+// mvcc verbatim. Item (ii): with the floor in place, a stale GUARDED SET whose mvcc sits strictly
+// between the APPEND's stale author mvcc and the ORIGINAL `S` must still be dropped -- proving the
+// floor kept the key's stamp high enough to reject it, exactly as it would have rejected anything
+// below `S` itself. See UnguardedAppliedDeleteWithOlderAuthorMvccFloorsTheTombstone (below) for the
+// tombstone-arm sibling of this test, and rdb_test.cc's
+// MergeLwwOnFullSyncHealsRmwDivergenceLeftByAnAppliedFloor for item (iii), the heal.
+TEST_F(MvccStoreTest, UnguardedAppliedRmwWithOlderAuthorMvccFloorsInsteadOfRewindingTheStamp) {
+  constexpr uint32_t kPeerIdx = 30;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a5a5-4000-8000-000000000030");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "v1"}), "OK");
+  auto stored = StampOf("k");
+  ASSERT_TRUE(stored.has_value());
+  constexpr uint64_t kAuthorMvcc = 0x1000ULL;  // strictly older than any real HopStamp
+  ASSERT_GT(stored->Mvcc(), kAuthorMvcc) << "sanity: S must be newer than the author's mvcc";
+
+  // (i) APPEND is unguarded and its author mvcc is older than S -- the write applies, but its
+  // stamp floors to just-below S rather than the author's stale mvcc verbatim.
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"append", "k", "x"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "k"}), "v1x") << "APPEND's own delta must still apply to the value";
+
+  auto floored = StampOf("k");
+  ASSERT_TRUE(floored.has_value());
+  EXPECT_EQ(floored->Mvcc(), stored->Mvcc())
+      << "FloorAppliedStamp keeps the Mvcc() field at S's own";
+  EXPECT_EQ(floored->origin_hash, stored->origin_hash - 1)
+      << "and lands exactly one origin_hash below S -- never the author's peer origin_hash "
+         "verbatim, or a rewound stamp would let a later stale guarded write wrongly win";
+
+  // (ii) a stale GUARDED SET with mvcc strictly between the APPEND's kAuthorMvcc and the
+  // ORIGINAL S must still be dropped: the floor kept the key's live stamp high enough to reject
+  // it, so the dirty "v1x" value survives untouched.
+  const uint64_t before_dropped = TotalLwwDropped();
+  const uint64_t mid_mvcc = kAuthorMvcc + (stored->Mvcc() - kAuthorMvcc) / 2;
+  ASSERT_GT(mid_mvcc, kAuthorMvcc);
+  ASSERT_LT(mid_mvcc, stored->Mvcc());
+  res = ApplyReplicatedCommand({"set", "k", "stale"}, kPeerIdx, mid_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK)
+      << "a dropped write must still report success -- see StalePeerSetDroppedUnderLwwGuard above";
+  EXPECT_EQ(Run({"get", "k"}), "v1x")
+      << "the stale guarded SET must still be dropped after the floor -- the dirty RMW value "
+         "must survive";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  auto after_veto = StampOf("k");
+  ASSERT_TRUE(after_veto.has_value());
+  EXPECT_EQ(*after_veto, *floored) << "the veto must not disturb the floored stamp either";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u) << "a drop must never arm-then-abandon the key";
+}
+
+// drakeydb: P4-4 Task A5 -- the tombstone-arm sibling of the RMW test above. DEL is
+// kMultiKeySelfGuarded (OpDelV2's own per-key guard), but with the link's guard bit off
+// here it takes the same unguarded applied-delete path regardless -- PerformDeletionAtomic's own
+// captured prev_stamp (db_slice.cc) is what lets the floor apply here at all, since by the time
+// journal::RecordEntry's Commit() runs, the slot no longer holds `S` itself (only the delete's own
+// zero-authority placeholder does). This covers any unguarded applied delete whose author stamp
+// is older than the key's own -- a derived DEL from an applied RMW that empties a container, a
+// plain DEL applied with the guard OFF, or (as here) a directly-applied DEL on an unguarded link.
+TEST_F(MvccStoreTest, UnguardedAppliedDeleteWithOlderAuthorMvccFloorsTheTombstone) {
+  constexpr uint32_t kPeerIdx = 31;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a5a5-4000-8000-000000000031");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "v1"}), "OK");
+  auto stored = StampOf("k");
+  ASSERT_TRUE(stored.has_value());
+  constexpr uint64_t kAuthorMvcc = 0x1000ULL;
+  ASSERT_GT(stored->Mvcc(), kAuthorMvcc) << "sanity: S must be newer than the author's mvcc";
+
+  const size_t tombstones_before = GetMetrics().db_stats[0].mvcc_tombstones;
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"del", "k"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0) << "the applied DEL must actually remove the key";
+
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(tomb->Mvcc(), stored->Mvcc())
+      << "the tombstone's Mvcc() floors to S's own, not the author's stale mvcc verbatim";
+  EXPECT_EQ(tomb->origin_hash, stored->origin_hash - 1)
+      << "and lands one origin_hash below S -- PerformDeletionAtomic's captured prev_stamp is "
+         "what makes S available here, since the placeholder has already overwritten the slot "
+         "by the time this commits";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, tombstones_before + 1)
+      << "mvcc_tombstones must advance by exactly one for the floored tombstone -- "
+         "SetExistingMvcc keys its accounting off the NEW stamp's bit, which is still set";
+}
+
+// drakeydb: P4-4 Task A5 -- a LIVE applied write over a TOMBSTONED slot. Before this
+// fix, DbSlice::PostUpdate called EnsureMvcc (which resets a tombstone slot to {0,0} and returns
+// void) BEFORE Arm(), so by the time journal::RecordEntry's Commit() ran, a live lookup of this
+// key's slot saw {0,0} (fresh), never the tombstone T -- the applied write committed its stale
+// author mvcc verbatim instead of flooring against T. EnsureMvcc now returns the stamp it found
+// (T, here) and PostUpdate carries it on the plain arm itself, so the floor reads THAT, never a
+// live lookup.
+TEST_F(MvccStoreTest, UnguardedAppliedRmwOverATombstonedSlotFloorsAgainstTheTombstone) {
+  constexpr uint32_t kPeerIdx = 32;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a5a5-4000-8000-000000000032");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "v"}), "OK");
+  ASSERT_EQ(Run({"del", "k"}).GetInt(), 1);
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone()) << "sanity: k must actually be a tombstone (T), not erased";
+  constexpr uint64_t kAuthorMvcc = 0x1000ULL;  // strictly older than any real HopStamp
+  ASSERT_GT(tomb->Mvcc(), kAuthorMvcc) << "sanity: T must be newer than the author's mvcc";
+
+  const size_t tombstones_before = GetMetrics().db_stats[0].mvcc_tombstones;
+  facade::DispatchResult res =
+      ApplyReplicatedCommand({"append", "k", "x"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "k"}), "x") << "APPEND over an absent (tombstoned) key creates it fresh";
+
+  auto floored = StampOf("k");
+  ASSERT_TRUE(floored.has_value());
+  EXPECT_FALSE(floored->IsTombstone()) << "the recreated key is LIVE -- the floor must never "
+                                          "leave a live write looking like a tombstone";
+  // Whole-stamp equality: pins bit 63 at exactly 0 too, not merely IsTombstone() being falsy.
+  EXPECT_EQ(*floored, (MvccStamp{tomb->Mvcc(), tomb->origin_hash - 1}))
+      << "the plain (live) arm's own captured prev_stamp -- DbSlice::EnsureMvcc's return, carried "
+         "by PostUpdate -- is T itself, captured by EnsureMvcc's tombstone-clearing branch BEFORE "
+         "it reset the slot; the write floors against T, never the {0,0} the table would show by "
+         "the time journal::RecordEntry's Commit() actually runs, and never kAuthorMvcc verbatim";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, tombstones_before - 1)
+      << "the tombstone credit is released exactly once, by EnsureMvcc's own clear -- this plain "
+         "arm's commit must not re-tombstone it (a.tombstone is false for this arm)";
+
+  // A stale guarded SET with mvcc strictly between the APPEND's kAuthorMvcc and the ORIGINAL T
+  // must still be dropped: the floor kept the key's live stamp high enough to reject it.
+  const uint64_t before_dropped = TotalLwwDropped();
+  const uint64_t mid_mvcc = kAuthorMvcc + (tomb->Mvcc() - kAuthorMvcc) / 2;
+  ASSERT_GT(mid_mvcc, kAuthorMvcc);
+  ASSERT_LT(mid_mvcc, tomb->Mvcc());
+  res = ApplyReplicatedCommand({"set", "k", "stale"}, kPeerIdx, mid_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "k"}), "x") << "the stale guarded SET must still be dropped after the "
+                                       "floor -- the recreated value must survive";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u) << "a drop must never arm-then-abandon the key";
+}
+
+// drakeydb: P4-4 Task A5 -- the "DEL + re-create in one entry" case not closed by the floor
+// alone: RENAME onto an EXISTING dest, applied unguarded, is Renamer::
+// DeserializeDest's own delete-then-recreate dance (generic_family.cc) -- but ONLY when src and
+// dest land on DIFFERENT shards. RenameGeneric (generic_family.cc:1229-1236) routes a
+// single-shard rename (src and dest already on the SAME shard, tx->GetUniqueShardCnt() == 1)
+// straight to OpRen instead, which overwrites dest IN PLACE (FindMutable + post_updater.Run) and
+// never deletes it at all -- no placeholder, no tombstone arm, nothing to inherit. This test
+// therefore picks src_key/dest_key explicitly on DIFFERENT shards (asserted below, not left to
+// chance), forcing the CROSS-shard path: DelMutable(dest) -> ArmTombstone (captures dest's true
+// prior stamp S) -> loader.Add(dest) + post_updater.Run() -> EnsureMvcc (sees
+// PerformDeletionAtomic's own placeholder, NOT S) -> Arm(). Without the round-2 fix, dest's live
+// (recreate) arm floors against that placeholder (Mvcc()==0, "nothing to floor against") and
+// commits its author stamp VERBATIM. MvccStamper::Arm now recognizes the placeholder shape and
+// inherits the still-pending tombstone arm's own prev_stamp (S) instead (mvcc.h/.cc), so dest's
+// live arm floors against S directly: a SINGLE floor, never verbatim and never floored twice
+// (once via the tombstone arm's own commit, again via the live arm's).
+TEST_F(MvccStoreTest, RenameOntoExistingDestAppliedUnguardedFloorsOnceAgainstDestStamp) {
+  constexpr uint32_t kPeerIdx = 41;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a5a5-4000-8000-000000000041");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  // Same shard-search idiom ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc (above) uses for
+  // the opposite requirement: here src_key and dest_key must land on DIFFERENT shards, or RENAME
+  // takes the single-shard OpRen path instead of the cross-shard Renamer::DeserializeDest one
+  // this test exists to exercise.
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "this test's entire point is exercising the CROSS-shard "
+                               "Renamer::DeserializeDest path, which needs at least 2 shards";
+  std::string src_key, dest_key;
+  for (int i = 0; dest_key.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find a key on a different shard from src_key";
+    std::string cand = absl::StrCat("rn", i);
+    if (src_key.empty()) {
+      src_key = cand;
+    } else if (Shard(cand, num_shards) != Shard(src_key, num_shards)) {
+      dest_key = cand;
+    }
+  }
+  ASSERT_NE(Shard(src_key, num_shards), Shard(dest_key, num_shards))
+      << "sanity: src_key and dest_key must land on different shards, or this test silently "
+         "degrades to exercising OpRen instead of Renamer::DeserializeDest";
+
+  ASSERT_EQ(Run({"set", src_key, "v1"}), "OK");
+  ASSERT_EQ(Run({"set", dest_key, "v0"}), "OK");
+  auto src_before = StampOf(src_key);
+  auto dest_before = StampOf(dest_key);
+  ASSERT_TRUE(src_before.has_value());
+  ASSERT_TRUE(dest_before.has_value());
+  constexpr uint64_t kAuthorMvcc = 0x1000ULL;  // strictly older than any real HopStamp
+  ASSERT_GT(dest_before->Mvcc(), kAuthorMvcc) << "sanity: dest's S must be newer than the author's";
+
+  facade::DispatchResult res = ApplyReplicatedCommand({"rename", src_key, dest_key}, kPeerIdx,
+                                                      kAuthorMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", dest_key}), "v1") << "the rename's value must still apply";
+  EXPECT_EQ(Run({"exists", src_key}).GetInt(), 0);
+
+  auto dest = StampOf(dest_key);
+  ASSERT_TRUE(dest.has_value());
+  EXPECT_FALSE(dest->IsTombstone())
+      << "the destination still ends up live, self-correcting exactly as "
+         "RenameOntoAnExistingDestSelfCorrectsToALiveStamp proves for a LOCAL rename";
+  // Whole-stamp equality: pins bit 63 at exactly 0, and Mvcc()/origin_hash exactly -- a SINGLE
+  // floor against dest's own true prior stamp, not verbatim (kAuthorMvcc) and not floored twice
+  // (dest_before.origin_hash - 2, which double-flooring through the placeholder-then-real chain
+  // would produce).
+  EXPECT_EQ(*dest, (MvccStamp{dest_before->Mvcc(), dest_before->origin_hash - 1}))
+      << "dest's live (recreate) arm must inherit the tombstone arm's captured S, floor against "
+         "it directly -- never PerformDeletionAtomic's own placeholder, and never S already "
+         "floored once by the tombstone arm's own commit";
+
+  auto src_tomb = StampOf(src_key);
+  ASSERT_TRUE(src_tomb.has_value());
+  EXPECT_TRUE(src_tomb->IsTombstone());
+  EXPECT_EQ(*src_tomb, (MvccStamp{src_before->Mvcc(), src_before->origin_hash - 1}.AsTombstone()))
+      << "src's own tombstone floors against ITS OWN prior stamp, per the ordinary single-arm "
+         "rule -- src was never re-armed live in this same entry, so it needs no inheritance";
+}
+
+// drakeydb: P4-4 Task A5b -- spec D3: a LOCAL mint must land strictly above the key's own stored
+// stamp, not just above this node's wall clock -- a node whose clock trails a peer's
+// already-observed stamp for a key otherwise stamps a causally-LATER local write BELOW that
+// stamp: the client sees OK, and every peer running the streaming LWW guard silently drops
+// the write as stale, then a later full sync reverts the writer too. future_mvcc simulates
+// exactly that skew: a peer 10s ahead of this node's own (frozen, fixture) clock -- comfortably
+// outside kMaxEpochMs (50ms) and any realistic NTP slop, so nothing here depends on timing
+// precision.
+//
+// Falsifying: reverting journal::RecordEntry's local mint (journal.cc) from
+// `std::max(stamper->HopStamp(now), stamper->LocalMintFloor())` back to a bare
+// `stamper->HopStamp(now)` reproduces this: local_stamp's Mvcc() comes back below peer_stamp's
+// instead of strictly above it, and the guarded re-delivery below then wins (GET returns "peer"
+// instead of "local").
+TEST_F(MvccStoreTest, BackwardSkewedLocalWriteRaisesAboveObservedFuturePeerStamp) {
+  constexpr uint32_t kPeerIdx = 50;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000050");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, future_mvcc, /*lww_guard=*/false),
+      facade::DispatchResult::OK);
+  auto peer_stamp = StampOf("k");
+  ASSERT_TRUE(peer_stamp.has_value());
+  ASSERT_EQ(peer_stamp->Mvcc(), future_mvcc) << "sanity: k's stored stamp really is the future one";
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  EXPECT_EQ(Run({"get", "k"}), "local") << "the client's local write must win, not be lost";
+
+  auto local_stamp = StampOf("k");
+  ASSERT_TRUE(local_stamp.has_value());
+  EXPECT_GT(local_stamp->Mvcc(), peer_stamp->Mvcc())
+      << "D3: a local mint must land strictly above the key's own stored (peer, future) stamp, "
+         "not just above this node's own (comparatively behind) wall clock";
+  uint64_t self_origin_hash = 0;
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { self_origin_hash = MvccStamper::tlocal()->OriginHash(0); });
+  EXPECT_EQ(local_stamp->origin_hash, self_origin_hash)
+      << "a local mint is never floored/decremented the way an APPLIED write's stamp can be "
+         "-- it is attributed to this node's own origin hash verbatim";
+
+  // The write above must have raised "k" high enough that a guarded re-delivery of the SAME
+  // (now-stale) peer write is dropped, not re-applied -- i.e. the local write would actually reach
+  // the peer and win there too.
+  const uint64_t before_dropped = TotalLwwDropped();
+  facade::DispatchResult redelivery =
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, future_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(redelivery, facade::DispatchResult::OK)
+      << "a dropped write must still report success -- see StalePeerSetDroppedUnderLwwGuard above";
+  EXPECT_EQ(Run({"get", "k"}), "local")
+      << "the guarded re-delivery of the peer's own (already-beaten) write must be dropped -- if "
+         "it instead won, the local write's stamp never actually rose above the peer's";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u) << "a drop must never arm-then-abandon the key";
+}
+
+// drakeydb: P4-4 Task A5b -- D3's tombstone half: a LOCAL delete's own tombstone must also land
+// strictly above a future-skewed peer's stored stamp. PerformDeletionAtomic (db_slice.cc)
+// captures that stamp as the tombstone arm's own prev_stamp, and LocalMintFloor (mvcc.h)
+// reads it back at mint time exactly as it does for a plain arm.
+//
+// Falsifying: same revert as above; tomb->Mvcc() comes back <= peer_stamp->Mvcc() instead of
+// strictly greater.
+TEST_F(MvccStoreTest, BackwardSkewedLocalDeleteRaisesTombstoneAboveObservedFuturePeerStamp) {
+  constexpr uint32_t kPeerIdx = 51;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000051");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "k", "peer"}, kPeerIdx, future_mvcc, /*lww_guard=*/false),
+      facade::DispatchResult::OK);
+  auto peer_stamp = StampOf("k");
+  ASSERT_TRUE(peer_stamp.has_value());
+  ASSERT_EQ(peer_stamp->Mvcc(), future_mvcc);
+
+  ASSERT_EQ(Run({"del", "k"}).GetInt(), 1);
+
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_GT(tomb->Mvcc(), peer_stamp->Mvcc())
+      << "D3: the local delete's own tombstone must land strictly above the value it replaces, "
+         "even when that value's stamp is a future-skewed peer's";
+}
+
+// drakeydb: P4-4 Task A5b -- the write-after-delete half: a LOCAL write recreating a key that a
+// future-skewed peer already deleted must also land strictly above that tombstone's own stamp.
+// DbSlice::EnsureMvcc's tombstone-clearing branch is what makes the tombstone's stamp
+// available to the recreating plain arm's prev_stamp here.
+//
+// Falsifying: same revert; after->Mvcc() comes back <= tomb->Mvcc() instead of strictly greater.
+TEST_F(MvccStoreTest, BackwardSkewedLocalWriteAfterFuturePeerDeleteRaisesAboveTombstone) {
+  constexpr uint32_t kPeerIdx = 52;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000052");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "v0"}), "OK");
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(ApplyReplicatedCommand({"del", "k"}, kPeerIdx, future_mvcc, /*lww_guard=*/false),
+            facade::DispatchResult::OK);
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone());
+  ASSERT_EQ(tomb->Mvcc(), future_mvcc) << "sanity: T really is the future peer's tombstone stamp";
+
+  ASSERT_EQ(Run({"set", "k", "local"}), "OK");
+  EXPECT_EQ(Run({"get", "k"}), "local");
+
+  auto after = StampOf("k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_FALSE(after->IsTombstone()) << "the recreated key must be live, not still look deleted";
+  EXPECT_GT(after->Mvcc(), tomb->Mvcc())
+      << "D3: the local recreate must land strictly above T's stamp, even though T is a "
+         "future-skewed peer's tombstone";
+}
+
+// drakeydb: P4-4 Task A5b -- D3's multi-key half: a same-shard local MSET where only ONE of two
+// keys has a future-skewed stored stamp must still raise BOTH keys to the SAME stamp, above that
+// one key's stored value -- MvccStamper::Commit stamps every currently-armed key with the same
+// entry.mvcc (mvcc.cc), and LocalMintFloor (mvcc.h) is a max over every arm pending at mint time,
+// not merely the key that itself needed the raise.
+//
+// "k1"/"k2" hash to the same shard in this fixture -- verified empirically by
+// MultiKeySameShardCommandSharesOneStamp above, which relies on the identical fact.
+//
+// Falsifying: same revert; k1_after->Mvcc() comes back below k2_before->Mvcc() (a bare HopStamp,
+// unrelated to k2's stored future value) instead of strictly greater. k1_after and k2_after stay
+// EQUAL either way -- one Commit() call, one entry.mvcc, regardless of whether that mvcc was
+// floored -- so this test's other EXPECT_EQ is not itself falsified by this revert.
+TEST_F(MvccStoreTest, BackwardSkewedMultiKeyLocalMsetRaisesBothKeysToTheSameStamp) {
+  constexpr uint32_t kPeerIdx = 53;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000053");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "k2", "peer"}, kPeerIdx, future_mvcc, /*lww_guard=*/false),
+      facade::DispatchResult::OK);
+  auto k2_before = StampOf("k2");
+  ASSERT_TRUE(k2_before.has_value());
+  ASSERT_EQ(k2_before->Mvcc(), future_mvcc);
+  ASSERT_FALSE(StampOf("k1").has_value())
+      << "sanity: k1 starts absent -- its own arm must contribute no floor of its own";
+
+  ASSERT_EQ(Run({"mset", "k1", "v1", "k2", "v2"}), "OK");
+
+  auto k1_after = StampOf("k1");
+  auto k2_after = StampOf("k2");
+  ASSERT_TRUE(k1_after.has_value());
+  ASSERT_TRUE(k2_after.has_value());
+  EXPECT_EQ(k1_after->Mvcc(), k2_after->Mvcc())
+      << "one shard callback, one entry.mvcc -- both keys committed by the same Commit() call";
+  EXPECT_GT(k1_after->Mvcc(), k2_before->Mvcc())
+      << "D3: raised strictly above k2's future-skewed stored stamp, even though k1 itself never "
+         "had a stored stamp to floor against on its own";
+}
+
+// drakeydb: P4-4 -- an expiry's own tombstone (CommitOwnTombstone, mvcc.cc) is `ExpiryTombstoneFor`
+// (mvcc.h) applied to the value it replaces -- one origin_hash tick above it, mvcc UNCHANGED --
+// EVEN when that value's stamp is a future-skewed peer's. This is deliberately NOT a
+// wall-clock-scale raise: minting a fresh reap-time stamp above a future-skewed value would
+// outrank every write between that value's own stamp and the moment of reaping, including a
+// legitimate one this node has not seen yet -- exactly the hazard advancing the value's own stamp
+// by the smallest possible amount avoids (see ExpiryTombstoneFor's own doc comment, mvcc.h, for
+// the full argument).
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`,
+// floored above `before`'s own stamp, reproduces the OLD behavior this replaces: tomb's Mvcc()
+// comes back far larger than `before`'s own instead of unchanged.
+TEST_F(MvccStoreTest, ExpiryTombstoneAgainstAFutureSkewedPeerValueAdvancesOneOriginHashTick) {
+  constexpr uint32_t kPeerIdx = 54;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000054");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "j", "v", "px", "10"}, kPeerIdx, future_mvcc,
+                                   /*lww_guard=*/false),
+            facade::DispatchResult::OK);
+  auto before = StampOf("j");
+  ASSERT_TRUE(before.has_value());
+  ASSERT_EQ(before->Mvcc(), future_mvcc) << "sanity: j's stored stamp really is the future one";
+
+  AdvanceTime(50);
+  Run({"get", "j"});  // triggers lazy expiry (DbSlice::ExpireIfNeeded, the read path)
+
+  auto tomb = StampOf("j");
+  ASSERT_TRUE(tomb.has_value()) << "a lazily-expired key must keep its slot, as a tombstone";
+  EXPECT_TRUE(tomb->IsTombstone());
+  // Independently constructed, not by calling ExpiryTombstoneFor.
+  EXPECT_EQ(*tomb, (MvccStamp{before->packed | MvccClock::kTombstoneBit, before->origin_hash + 1}))
+      << "the expiry's own tombstone must be one origin_hash tick above the value it replaced -- "
+         "mvcc unchanged -- even though that value's stamp is a future-skewed peer's";
+}
+
+// drakeydb: P4-4 Task A5b -- D3 is explicitly NOT a per-shard HLC ratchet (design doc D3: "not a
+// per-shard HLC ratchet -- that lets one fast-clock peer poison a whole shard's clock
+// permanently"). The raise above must never leak into MvccClock: an UNRELATED local write, on the
+// SAME shard, in a LATER epoch, must still get a plain clock stamp -- strictly below the raise a
+// sibling write needed moments earlier for a completely different key. "Later epoch" specifically,
+// not "later in the same epoch": each Run() call below is its own top-level command, hence its own
+// write epoch, and Transaction::RunCallback's trailing EndOfWriteEpoch resets hop_stamp_ (but not
+// MvccClock itself, which is never reset except by TEST_Reset) in between them -- so this test
+// exercises whether MvccClock survives poisoned, never whether hop_stamp_ does (it structurally
+// cannot: it is already gone by the time "other" is written).
+//
+// "k" and "other" are forced onto the same shard deliberately: proving this on two DIFFERENT
+// shards would only show that MvccClock is per-shard (already known), never that THIS shard's own
+// clock stayed unratcheted by k's own raise.
+//
+// Falsifying: making LocalMintFloor (mvcc.cc) write its own return value back into clock_ (e.g.
+// `clock_.TEST_Set(std::max(clock_.last(), floor));` before `return floor;`) reproduces: k_stamp's
+// own sanity ASSERT still holds (k is raised, same as ever), but other_stamp->Mvcc() then comes
+// back >= k_stamp->Mvcc() instead of strictly below it, at the EXPECT_LT below.
+TEST_F(MvccStoreTest, LocalMintRaiseDoesNotRatchetTheSharedClock) {
+  constexpr uint32_t kPeerIdx = 55;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000055");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const unsigned num_shards = shard_set->size();
+  const std::string kKey = "k";
+  std::string other;
+  for (int i = 0; other.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find a key on the same shard as \"k\"";
+    std::string cand = absl::StrCat("other", i);
+    if (Shard(cand, num_shards) == Shard(kKey, num_shards))
+      other = cand;
+  }
+
+  const uint64_t future_mvcc = (GetCurrentTimeMs() + 10'000) << MvccClock::kCounterBits;
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", kKey, "peer"}, kPeerIdx, future_mvcc, /*lww_guard=*/false),
+      facade::DispatchResult::OK);
+
+  ASSERT_EQ(Run({"set", kKey, "local"}), "OK");
+  auto k_stamp = StampOf(kKey);
+  ASSERT_TRUE(k_stamp.has_value());
+  ASSERT_GT(k_stamp->Mvcc(), future_mvcc)
+      << "sanity: k's local write really was raised -- see the backward-skew test above for the "
+         "same shape";
+
+  ASSERT_EQ(Run({"set", other, "x"}), "OK");
+  auto other_stamp = StampOf(other);
+  ASSERT_TRUE(other_stamp.has_value());
+  EXPECT_LT(other_stamp->Mvcc(), k_stamp->Mvcc())
+      << "D3 is per-entry only: an unrelated key's local mint must get a plain clock stamp, never "
+         "inherit a sibling write's raise -- a per-shard ratchet would ALSO raise this one";
+}
+
 TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
   for (int i = 0; i < 200; ++i) {
     Run({"set", absl::StrCat("k", i), "v"});
@@ -2759,22 +6087,20 @@ TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
       << "every live key needs exactly one stamp, and vice versa";
 }
 
-// drakeydb: review wave 2 (F1, CRITICAL) -- HDEL emptying a hash arms the key TWICE: ExecuteW's
+// drakeydb: HDEL emptying a hash arms the key TWICE: ExecuteW's
 // own it_res->post_updater.Run() (hset_family.cc) arms it once, then -- because the hash is now
 // empty -- DeleteHw takes a SECOND, independent FindMutable/AutoUpdater on the same still-present
 // key and arms it again via its own post_updater.Run(), before finally deleting it.
-// MvccStamper::Disarm (mvcc.cc) used to erase only the first matching arm and `return`, leaving
-// one arm behind for a key PerformDeletionAtomic had just erased from `prime`; the derived DEL's
-// own journal::RecordEntry->Commit then reinserted a side-table stamp for that now-nonexistent
-// key. This is the literal repro from the phase's review brief: under --active_replica,
-// `HSET h f v` then `HDEL h f` aborted the whole process with
+// MvccStamper::Disarm (mvcc.cc) erases EVERY matching arm, not just the first: a single-match
+// version that erases only the first and `return`s would leave one arm behind for a key
+// PerformDeletionAtomic had just erased from `prime`, and the derived DEL's own
+// journal::RecordEntry->Commit would then reinsert a side-table stamp for that now-nonexistent
+// key -- `HSET h f v` then `HDEL h f` would abort the whole process with
 // `Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (1 vs. 0)`
-// at db_slice.cc's OnCbFinishBlocking -- reproduced verbatim before this fix; see
-// final-fix-report.md.
+// at db_slice.cc's OnCbFinishBlocking.
 //
 // Falsifying: restoring Disarm's early `return` after the first erase (mvcc.cc) reproduces that
-// exact DCHECK abort inside this test's own HDEL call -- see final-fix-report.md for the verbatim
-// output.
+// exact DCHECK abort inside this test's own HDEL call.
 //
 // drakeydb: P4-3 Task 2 -- HDEL emptying a hash reaches PerformDeletionAtomic via DeleteHw's
 // default DeleteReason::kExplicit (hset_family.cc), same as a plain DEL, so since Task 2 "h"
@@ -2793,7 +6119,7 @@ TEST_F(MvccStoreTest, HdelEmptyingHashDoesNotResurrectAStamp) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: review wave 2 (F1, CRITICAL) -- the same double-arm shape as
+// drakeydb: the same double-arm shape as
 // HdelEmptyingHashDoesNotResurrectAStamp above, via a different pair of call sites:
 // OpFieldExpire's own auto_updater.Run() (generic_family.cc) arms the key once, then --
 // discovering the named field already lazily expired while trying to re-arm it, and the hash now
@@ -2805,7 +6131,7 @@ TEST_F(MvccStoreTest, HdelEmptyingHashDoesNotResurrectAStamp) {
 // what keeps this deterministic instead of racing the ~100ms member-expiry reaper heartbeat.
 //
 // Falsifying: restoring Disarm's early `return` (mvcc.cc) reproduces the same
-// mvcc->size()/prime->size() DCHECK abort as the HDEL test above -- see final-fix-report.md.
+// mvcc->size()/prime->size() DCHECK abort as the HDEL test above.
 //
 // drakeydb: P4-3 Task 11 -- renamed from FieldExpireEmptyingHashDoesNotResurrectAStamp and
 // flipped its final assertion. HSetFamily::DeleteIfEmpty's derived DEL is DeleteReason::kExpired
@@ -2814,8 +6140,9 @@ TEST_F(MvccStoreTest, HdelEmptyingHashDoesNotResurrectAStamp) {
 // branch (db_slice.cc) cannot distinguish which kExpired call site it came from: now that kExpired
 // joins kExplicit there, this delete earns a tombstone too, exactly like HdelEmptyingHashDoes
 // NotResurrectAStamp above. What this test still pins is unchanged: the double-arm shape must not
-// desync mvcc_entries/mvcc_tombstones (SumMvccMismatchesAcrossShards), whether the result is an
-// erase (pre-Task-11) or a tombstone (post-Task-11).
+// desync mvcc_entries/mvcc_tombstones (SumMvccMismatchesAcrossShards), whether the result is a
+// plain erase (the old behavior) or a tombstone (the current one, earned via the `earns_tombstone`
+// branch above).
 TEST_F(MvccStoreTest, FieldExpireEmptyingHashEarnsATombstone) {
   ASSERT_EQ(Run({"hset", "feh", "f", "v"}).GetInt(), 1);
   Run({"fieldexpire", "feh", "1", "f"});
@@ -2831,12 +6158,13 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingHashEarnsATombstone) {
   EXPECT_TRUE(tomb->IsTombstone());
   EXPECT_NE(tomb->Mvcc(), 0u)
       << "must carry the derived DEL's own real, minted stamp -- not a stuck zero-authority "
-         "{kTombstoneBit, 0} placeholder (review M3: this test's own has_value()+IsTombstone() "
-         "checks above would both pass for a stuck placeholder too)";
+         "{kTombstoneBit, 0} placeholder (this test's own has_value()+IsTombstone() checks above "
+         "would both pass for a stuck placeholder too, so Mvcc() != 0 is the one assertion that "
+         "actually distinguishes a real stamp from that placeholder)";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: review wave 2 (F1, CRITICAL) -- the SET counterpart of
+// drakeydb: the SET counterpart of
 // FieldExpireEmptyingHashEarnsATombstone above: OpFieldExpire's is_set branch calls
 // SetFamily::DeleteSetIfEmpty (set_family.cc) instead of HSetFamily::DeleteIfEmpty, but takes the
 // identical second-FindMutable/second-arm shape. Same recipe as
@@ -2844,7 +6172,7 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingHashEarnsATombstone) {
 // scenario's journal-flag behavior; this test pins the mvcc side-table invariant instead.
 //
 // Falsifying: restoring Disarm's early `return` (mvcc.cc) reproduces the same
-// mvcc->size()/prime->size() DCHECK abort as the two tests above -- see final-fix-report.md.
+// mvcc->size()/prime->size() DCHECK abort as the two tests above.
 //
 // drakeydb: P4-3 Task 11 -- renamed from FieldExpireEmptyingSetDoesNotResurrectAStamp; see
 // FieldExpireEmptyingHashEarnsATombstone's comment above for why this now tombstones instead of
@@ -2865,8 +6193,9 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingSetEarnsATombstone) {
   EXPECT_TRUE(tomb->IsTombstone());
   EXPECT_NE(tomb->Mvcc(), 0u)
       << "must carry the derived DEL's own real, minted stamp -- not a stuck zero-authority "
-         "{kTombstoneBit, 0} placeholder (review M3: this test's own has_value()+IsTombstone() "
-         "checks above would both pass for a stuck placeholder too)";
+         "{kTombstoneBit, 0} placeholder (this test's own has_value()+IsTombstone() checks above "
+         "would both pass for a stuck placeholder too, so Mvcc() != 0 is the one assertion that "
+         "actually distinguishes a real stamp from that placeholder)";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
@@ -2876,7 +6205,7 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingSetEarnsATombstone) {
 // EngineShard::CompactTable) and would exercise none of the mirror loop this test targets -- using
 // it here would pass vacuously, never reaching DefragTableSegments at all.
 //
-// Falsifying: see task-10-report.md for the verbatim run. Commenting out the EraseMvcc call in
+// Falsifying: commenting out the EraseMvcc call in
 // PerformDeletionAtomic reproduces the same "stamp with no live key" failure here as in
 // TableMatchesPrimeAfterMixedWorkload above, since this test's setup also deletes half its keys.
 TEST_F(MvccStoreTest, DefragRelocationPreservesStamps) {
@@ -2897,11 +6226,11 @@ TEST_F(MvccStoreTest, DefragRelocationPreservesStamps) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: fix round 1 (F1, CRITICAL) -- DefragRelocationPreservesStamps above cannot, by
+// drakeydb: DefragRelocationPreservesStamps above cannot, by
 // construction, distinguish a present mirror loop from a deleted one: TryRelocateSegment is a
 // content-preserving move local to whichever DashTable instance it is called on, invisible to
 // StampOf/TEST_VerifyMvccTable, both of which resolve by hash lookup, never by segment position
-// (recorded, with that test's own falsification proving it, in task-10-report.md). This test
+// (see that test's own falsification comment). This test
 // follows the template DefragDflyEngineTest.SegmentsRelocated (dragonfly_test.cc) already uses to
 // prove the identical property for `prime`: force every segment to be reported "under-utilized"
 // (PageUsage::SetForceReallocate(true) -- an unconditional-true override of the virtual
@@ -2909,7 +6238,7 @@ TEST_F(MvccStoreTest, DefragRelocationPreservesStamps) {
 // collect every segment's address before and after one DefragTableSegments call, and assert every
 // address changed. Applied to db->mvcc here, not db->prime.
 //
-// Falsifying: see task-10-report.md fix round 1. Replacing the mvcc mirror loop in
+// Falsifying: replacing the mvcc mirror loop in
 // DefragTableSegments (db_slice.cc) with `return;` immediately after the prime loop -- the exact
 // mutation DefragRelocationPreservesStamps's own comment already tried and documented as
 // undetectable by that test -- makes this test fail: every mvcc segment address is unchanged
@@ -2965,7 +6294,8 @@ TEST_F(MvccStoreTest, DefragActuallyRelocatesMvccSegments) {
 // drakeydb: Phase 4, P4-1 Task 10 -- rdb_load.cc's CreateObjectOnShard inserts every loaded key
 // via DbSlice::AddOrUpdate. Its ItAndUpdater's AutoUpdater DOES eventually call PostUpdate (on
 // destruction, or explicitly beside a tiered-storage stash -- db_slice.cc), so a loaded key does
-// get armed; fix round 1 (F2) covers the separate bug that arm exposed (nothing in the load path
+// get armed -- ReloadDoesNotLeaveArmsForALaterWriteToClobber (below) covers the separate bug that
+// arm exposed (nothing in the load path
 // ever committed or discarded it, so a later, unrelated write's Commit() could clobber this
 // test's stamp -- {0,0} at the time this was written, now (P4-2 Task 2) whatever was actually
 // persisted -- with local authority no peer ever saw -- see
@@ -2981,11 +6311,11 @@ TEST_F(MvccStoreTest, DefragActuallyRelocatesMvccSegments) {
 // to "" globally) -- that exact vacuous-test trap was caught on P4-0. Unique per pid, matching
 // ReaperJournalFamilyTest's two RDB round-trip tests above (this file), the working precedent this
 // follows: SetTestFlag alone is sufficient here (no ResetService/InitWithDbFilename needed)
-// because DoSave reads the flag live. absl::FlagSaver (fix round 1, Minor) restores it on scope
+// because DoSave reads the flag live. absl::FlagSaver restores it on scope
 // exit, matching MultiMasterFamilyTest's saver_ -- without it, dbfilename leaked globally into
 // every later test in this binary that also reads or sets it.
 //
-// drakeydb: Task 11 fix round 1 (F2) -- --dir also pointed at a private GetTestTempPath, matching
+// drakeydb: --dir also points at a private GetTestTempPath, matching
 // MultiMasterFamilyTest's constructor (:509, this file): dbfilename alone has no directory
 // component (ValidateFilename, save_stages_controller.cc, rejects one outright), so without this
 // the save/reload below wrote its .dfs files into whatever the process's cwd happened to be --
@@ -3001,20 +6331,19 @@ TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
   ASSERT_EQ(Run({"debug", "reload"}), "OK");
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 100u)
       << "a reload that leaves keys unstamped trips the dense invariant on the next write";
-  // EXISTS, not DBSIZE: verified empirically, not assumed (see task-10-report.md) -- DBSIZE
+  // EXISTS, not DBSIZE: verified empirically, not assumed -- DBSIZE
   // (ServerFamily::DbSize, server_family.cc) dispatches via a bare shard_set->RunBriefInParallel
   // call and never goes through Transaction::RunCallback/OnCbFinishBlocking at all. A write would
   // also prepare its own zero-authority slot before reaching the invariant, adding unnecessary
   // mutation to this probe. GenericFamily::Exists
   // (generic_family.cc) drives a real Transaction, the same shape as the HLEN calls that already
-  // caught this bug's Section 5 instances (task-10-report.md) -- confirmed here by disabling
+  // caught this class of bug -- confirmed here by disabling
   // Step 3b's stamp and observing EXISTS reach and trip the DCHECK where DBSIZE had not.
   Run({"exists", "k0"});  // must not DCHECK -- a debug build aborts the whole test binary, not
                           // just this one test, if the invariant is violated here.
 }
 
-// drakeydb: fix round 1 (F2, IMPORTANT) -- regression test for the coordinator's finding, verified
-// before being fixed (see task-10-report.md): rdb_load.cc's CreateObjectOnShard arms every loaded
+// drakeydb: regression test: rdb_load.cc's CreateObjectOnShard arms every loaded
 // key (AddOrUpdate's AutoUpdater, see the comment above) but this file never journals a load, so
 // nothing ever calls MvccStamper::Commit() for those arms. Without an EndOfWriteEpoch() call
 // somewhere in the load path, those arms sat in armed_ until the next unrelated journaled write on
@@ -3037,10 +6366,10 @@ TEST_F(MvccStoreTest, ReloadedKeysAreStampedSoTheInvariantHolds) {
 // thread-local), so a bug here only clobbers reload keys sharing a shard with the trigger write --
 // a single trigger key would leave every other shard's reloaded keys looking correct regardless of
 // whether the fix is present, the same "passes only because the fixture happens to hash everything
-// onto one shard" trap this phase has hit before.
+// onto one shard" trap tests in this file must avoid.
 TEST_F(MvccStoreTest, ReloadDoesNotLeaveArmsForALaterWriteToClobber) {
   absl::FlagSaver flag_saver;
-  // drakeydb: Task 11 fix round 1 (F2) -- see ReloadedKeysAreStampedSoTheInvariantHolds's comment
+  // drakeydb: see ReloadedKeysAreStampedSoTheInvariantHolds's comment
   // above for why --dir is set here too, not just --dbfilename.
   absl::SetFlag(&FLAGS_dir, base::GetTestTempPath("mvcc_reload_arm_leak_test"));
   BaseFamilyTest::SetTestFlag("dbfilename", absl::StrCat("mvcc_reload_arm_leak_test_", getpid()));
@@ -3115,11 +6444,11 @@ TEST_F(MvccStoreTest, DebugMvccReportsValueState) {
 // drakeydb: P4-3 Task 2 -- the "state:tombstone" branch (debugcmd.cc) was wired in ahead of
 // anything setting kTombstoneBit; a kExplicit DEL is now the first live path that reaches it.
 //
-// drakeydb: P4-3 Task 8 -- strengthened beyond substring presence: the task-8 brief asks this
-// test to "assert the tombstone state + stamp", so this parses the printed `mvcc:<N>` value back
-// out and cross-checks it against DbSlice::GetMvcc's own stamp for the same key (StampOf), the
-// same side-table read production code (and DEBUG MVCC itself) uses. Catches a regression where
-// the reply says "state:tombstone" but prints a stale, zero, or otherwise wrong stamp.
+// drakeydb: P4-3 Task 8 -- strengthened beyond substring presence: asserts the tombstone state
+// AND its stamp together, so this parses the printed `mvcc:<N>` value back out and cross-checks
+// it against DbSlice::GetMvcc's own stamp for the same key (StampOf), the same side-table read
+// production code (and DEBUG MVCC itself) uses. Catches a regression where the reply says
+// "state:tombstone" but prints a stale, zero, or otherwise wrong stamp.
 TEST_F(MvccStoreTest, DebugMvccReportsTombstoneState) {
   Run({"set", "k", "v"});
   Run({"del", "k"});
@@ -3146,9 +6475,9 @@ TEST_F(MvccStoreTest, DebugMvccVerifyReportsZeroMismatches) {
   EXPECT_THAT(Run({"debug", "mvcc", "verify"}).GetString(), testing::HasSubstr("mismatches:0"));
 }
 
-// Not part of D9's acceptance test, but the third produced interface (alongside <key> and
-// VERIFY above) -- covered here so a crash or empty-reply regression in the aggregate path
-// doesn't first surface in production INFO/ops usage.
+// The third `DEBUG MVCC` interface shape (alongside <key> and VERIFY above) -- covered here so a
+// crash or empty-reply regression in the aggregate path doesn't first surface in production
+// INFO/ops usage.
 TEST_F(MvccStoreTest, DebugMvccWithNoKeyReportsPerShardAggregates) {
   Run({"set", "k", "v"});
   auto resp = Run({"debug", "mvcc"});
@@ -3157,7 +6486,7 @@ TEST_F(MvccStoreTest, DebugMvccWithNoKeyReportsPerShardAggregates) {
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_unstamped_writes:"));
 }
 
-// drakeydb: P4-3 Task 8 -- task-2-report.md flagged this as a minor gap: INFO memory got
+// drakeydb: P4-3 Task 8 -- INFO memory got
 // mvcc_tombstones_dropped, but the DEBUG MVCC no-key aggregate (this command) did not, leaving an
 // operator staring at DEBUG MVCC with no way to see a shard degrading to resurrection. Drives a
 // real cap-triggered drop (same shape as MvccStoreTest.DeleteAtTombstoneCapDegradesToEraseAndCounts
@@ -3187,6 +6516,1929 @@ TEST_F(MvccStoreTest, DebugMvccAggregateReportsTombstonesDropped) {
   EXPECT_THAT(resp.GetString(),
               testing::HasSubstr(absl::StrCat("shard", sid, "_tombstones_dropped:1")))
       << resp.GetString();
+}
+
+namespace {
+
+// drakeydb: P4-4 Task A11 -- every command name that is CO::JOURNALED and NOT CO::NO_AUTOJOURNAL
+// (it auto-journals its own client-facing args verbatim, the same mechanism SET/RESTORE/etc. use)
+// and is deliberately ABSENT from kJournaledClasses (multimaster_lww.cc), so the streaming LWW
+// guard never compares it. Built by enumerating the live command registry (RegistryClosure
+// below) and reviewed one family at a time:
+//
+//  - numeric/string delta RMW (APPEND, BITFIELD, CL.THROTTLE, DECR, DECRBY, INCR, INCRBY,
+//    INCRBYFLOAT, PREPEND, SETBIT, SETRANGE): reads whatever is currently stored and composes the
+//    client's own args onto it -- a stale replay re-applies the SAME delta, never a blind clobber
+//    of unrelated newer content.
+//  - container element delta RMW, touching one member/field/path/entry and leaving the rest of
+//    the key's value untouched (BF.ADD, BF.MADD, CF.ADD, CF.COMPACT, CF.DEL, CF.INSERT,
+//    CMS.INCRBY, FIELDEXPIRE, GEOADD, HDEL, HEXPIRE, HGETEX, HINCRBY, HINCRBYFLOAT, HMSET, HSET,
+//    HSETEX, JSON.ARRAPPEND, JSON.ARRINSERT, JSON.ARRPOP, JSON.ARRTRIM, JSON.NUMINCRBY,
+//    JSON.NUMMULTBY, JSON.STRAPPEND, JSON.TOGGLE, LINSERT, LPOP, LPUSH, LPUSHX, LREM, LSET, LTRIM,
+//    PFADD, RPOP, RPUSH, RPUSHX, SADD, SADDEX, SREM, TOPK.ADD, TOPK.INCRBY, XACK, XAUTOCLAIM,
+//    XCLAIM, XDEL, XGROUP, ZADD, ZINCRBY, ZPOPMAX, ZPOPMIN, ZREM, ZREMRANGEBYLEX,
+//    ZREMRANGEBYRANK, ZREMRANGEBYSCORE): CF.COMPACT reorganizes internal storage
+//    deterministically, changing no logical content.
+//  - name-level: the classifier sees only the JOURNALED NAME, never the runtime path or patch
+//    argument, so a command whose behavior depends on those to decide "whole key" vs. "one part"
+//    stays unguarded by design rather than guessing (JSON.CLEAR, JSON.DEL, JSON.FORGET,
+//    JSON.MERGE). At the root/default path, JSON.DEL/JSON.FORGET delete the whole key (OpDel,
+//    json_family.cc) and JSON.CLEAR empties the whole root value (OpClear); JSON.MERGE with a
+//    non-object patch replaces the whole document (RFC 7396 merge-patch semantics, verified: a
+//    scalar patch at "$" onto an existing object overwrites it), and against an absent key it
+//    falls back to OpSet at root (creating the whole document) regardless of patch shape. Same
+//    class of ambiguity as JSON.SET's path="$" case, flagged below.
+//  - "create if absent" recipes, erroring/no-op if the key (or, for HSETNX/CF.ADDNX/CF.INSERTNX,
+//    the member) already exists (BF.RESERVE, CF.ADDNX, CF.INSERTNX, CF.RESERVE, CMS.INITBYDIM,
+//    CMS.INITBYPROB, HSETNX, TOPK.RESERVE): a stale replay against a receiver that already has the
+//    key/member is a no-op, the same SETNX shape.
+//  - keyless/global (CO::GLOBAL_TRANS): DetermineKeys (transaction.cc) returns an EMPTY KeyIndex
+//    for these, so even a hypothetical guarded classification would have nothing to compare
+//    (FLUSHALL, FLUSHDB, FT.ALTER, FT.CREATE, FT.DROPINDEX, FT.SYNUPDATE -- the FT.* four exist in
+//    the registry only when built WITH_SEARCH, see the #ifdef below). MOVE is the same story but
+//    is CO::NO_AUTOJOURNAL, so it never reaches this table at all.
+//  - metadata-only, touching no value bytes (SHRINK reclaims already-expired capacity and
+//    otherwise leaves content untouched; STICK flips a bookkeeping bit on the key's metadata;
+//    XSETID rewrites the stream's internal ID counters, not its entries).
+//
+// DELEX is absent from this table entirely: it is CO::NO_AUTOJOURNAL, and both its
+// bare form (delegates to CmdDel/OpDelV2, which journals "DEL key" itself) and its conditional
+// forms (IFEQ/IFNE/IFDEQ/IFDNE; Delex's own conditional cb, generic_family.cc, hand-journals "DEL
+// key" only when the predicate actually deletes) now journal their RESULT under DEL's own name --
+// so DELEX never reaches this table's forward loop at all (CO::NO_AUTOJOURNAL commands are
+// skipped there before the guarded/known-unguarded check runs).
+//
+// Four entries are open concerns, deliberately not reclassified here: BF.LOADCHUNK's cursor==1
+// init phase overwrites any existing key wholesale (OpLoadChunk, bloom_family.cc); CMS.MERGE
+// resets the destination sketch, then writes the weighted sum of the sources (CmdMerge,
+// cms_family.cc) -- the same blind, state-carrying full-value recompute PFMERGE's SET result is
+// guarded for, but journaled under CMS.MERGE's own name instead; JSON.SET's path can be "$" (the
+// whole document), a full-value replace at that path; JSON.MERGE is the same class as JSON.SET
+// (see the name-level bullet above for why).
+constexpr std::string_view kKnownUnguardedAutoJournaled[] = {
+    "APPEND",
+    "BF.ADD",
+    "BF.LOADCHUNK",  // concern: cursor==1 overwrites an existing key wholesale
+    "BF.MADD",
+    "BF.RESERVE",
+    "BITFIELD",
+    "CF.ADD",
+    "CF.ADDNX",
+    "CF.COMPACT",
+    "CF.DEL",
+    "CF.INSERT",
+    "CF.INSERTNX",
+    "CF.RESERVE",
+    "CL.THROTTLE",
+    "CMS.INCRBY",
+    "CMS.INITBYDIM",
+    "CMS.INITBYPROB",
+    "CMS.MERGE",  // concern: resets dest then writes the weighted sum of sources
+    "DECR",
+    "DECRBY",
+    "FIELDEXPIRE",
+    "FLUSHALL",
+    "FLUSHDB",
+#ifdef WITH_SEARCH
+    // drakeydb: P4-4 Task A11 -- the search family (and these four commands with it) is only
+    // registered when built WITH_SEARCH (main_service.cc); without the ifdef, a non-search build
+    // would fail RegistryClosure's reverse check (these entries would no longer exist).
+    "FT.ALTER",
+    "FT.CREATE",
+    "FT.DROPINDEX",
+    "FT.SYNUPDATE",
+#endif
+    "GEOADD",
+    "HDEL",
+    "HEXPIRE",
+    "HGETEX",
+    "HINCRBY",
+    "HINCRBYFLOAT",
+    "HMSET",
+    "HSET",
+    "HSETEX",
+    "HSETNX",
+    "INCR",
+    "INCRBY",
+    "INCRBYFLOAT",
+    "JSON.ARRAPPEND",
+    "JSON.ARRINSERT",
+    "JSON.ARRPOP",
+    "JSON.ARRTRIM",
+    "JSON.CLEAR",
+    "JSON.DEL",
+    "JSON.FORGET",
+    "JSON.MERGE",  // concern: a non-object patch (or absent key) at "$" replaces the whole
+                   // document, same class as JSON.SET
+    "JSON.NUMINCRBY",
+    "JSON.NUMMULTBY",
+    "JSON.SET",  // concern: a "$" (root) path replaces the whole document
+    "JSON.STRAPPEND",
+    "JSON.TOGGLE",
+    "LINSERT",
+    "LPOP",
+    "LPUSH",
+    "LPUSHX",
+    "LREM",
+    "LSET",
+    "LTRIM",
+    "PFADD",
+    "PREPEND",
+    "RPOP",
+    "RPUSH",
+    "RPUSHX",
+    "SADD",
+    "SADDEX",
+    "SETBIT",
+    "SETRANGE",
+    "SHRINK",
+    "SREM",
+    "STICK",
+    "TOPK.ADD",
+    "TOPK.INCRBY",
+    "TOPK.RESERVE",
+    "XACK",
+    "XAUTOCLAIM",
+    "XCLAIM",
+    "XDEL",
+    "XGROUP",
+    "XSETID",
+    "ZADD",
+    "ZINCRBY",
+    "ZPOPMAX",
+    "ZPOPMIN",
+    "ZREM",
+    "ZREMRANGEBYLEX",
+    "ZREMRANGEBYRANK",
+    "ZREMRANGEBYSCORE",
+};
+
+constexpr bool KnownUnguardedTableIsSorted() {
+  for (std::size_t i = 1; i < std::size(kKnownUnguardedAutoJournaled); ++i) {
+    if (!(kKnownUnguardedAutoJournaled[i - 1] < kKnownUnguardedAutoJournaled[i]))
+      return false;
+  }
+  return true;
+}
+static_assert(KnownUnguardedTableIsSorted(),
+              "kKnownUnguardedAutoJournaled must stay sorted for binary_search");
+
+}  // namespace
+
+// drakeydb: P4-4 Task A11 -- registry closure: every JOURNALED command that auto-journals its own
+// args verbatim (not CO::NO_AUTOJOURNAL) must be accounted for -- either guarded
+// (ClassifyJournaledCommand != kUnguarded) or explicitly reviewed in kKnownUnguardedAutoJournaled
+// above. An upstream rename/re-normalization that drops a state-carrying write into neither bucket
+// fails here, naming the command.
+//
+// Falsifying: dropping "GETSET" from kJournaledClasses (multimaster_lww.cc) makes the forward loop
+// below fail with "GETSET is CO::JOURNALED, auto-journals verbatim, and is neither in the guarded
+// table nor in kKnownUnguardedAutoJournaled...". Dropping "SHRINK" from
+// kKnownUnguardedAutoJournaled above reproduces the same failure naming SHRINK instead.
+TEST_F(MvccStoreTest, RegistryClosureEveryAutoJournaledNameIsGuardedOrKnown) {
+  service_->mutable_registry()->Traverse([&](std::string_view name, const CommandId& cid) {
+    if (!(cid.opt_mask() & CO::JOURNALED) || (cid.opt_mask() & CO::NO_AUTOJOURNAL))
+      return;
+
+    const std::string upper = absl::AsciiStrToUpper(name);
+    const bool guarded = ClassifyJournaledCommand(upper) != LwwClass::kUnguarded;
+    const bool known_unguarded =
+        std::binary_search(std::begin(kKnownUnguardedAutoJournaled),
+                           std::end(kKnownUnguardedAutoJournaled), std::string_view(upper));
+
+    EXPECT_TRUE(guarded || known_unguarded)
+        << upper << " is CO::JOURNALED, auto-journals verbatim, and is neither in the guarded "
+        << "table nor in kKnownUnguardedAutoJournaled -- classify it: add it to the guarded table "
+        << "in multimaster_lww.cc or to kKnownUnguardedAutoJournaled with a reason.";
+    EXPECT_FALSE(guarded && known_unguarded)
+        << upper << " is in BOTH the guarded table (multimaster_lww.cc) and "
+        << "kKnownUnguardedAutoJournaled -- remove it from one.";
+  });
+
+  // Reverse checks: a stale kKnownUnguardedAutoJournaled entry -- upstream renamed/removed the
+  // command, or gave it CO::NO_AUTOJOURNAL, or (wrongly) added it to the guarded table too -- must
+  // fail loudly here, not silently keep vouching for a name nothing (or something guarded) emits.
+  for (std::string_view name : kKnownUnguardedAutoJournaled) {
+    const CommandId* cid = service_->mutable_registry()->Find(name);
+    ASSERT_NE(cid, nullptr) << name << " is in kKnownUnguardedAutoJournaled but no longer exists "
+                            << "in the command registry -- remove the stale entry";
+    EXPECT_TRUE(cid->opt_mask() & CO::JOURNALED)
+        << name << " is in kKnownUnguardedAutoJournaled but is no longer CO::JOURNALED";
+    EXPECT_FALSE(cid->opt_mask() & CO::NO_AUTOJOURNAL)
+        << name << " is in kKnownUnguardedAutoJournaled but is now CO::NO_AUTOJOURNAL -- it no "
+        << "longer auto-journals verbatim, so this table no longer applies to it";
+    EXPECT_EQ(ClassifyJournaledCommand(name), LwwClass::kUnguarded)
+        << name << " is in kKnownUnguardedAutoJournaled but is ALSO in the guarded table";
+  }
+}
+
+// drakeydb: P4-4 Task A11 -- emitted-name pin: for each of a set of representative CLIENT
+// commands, pins the journaled name the tree ACTUALLY emits (verified against a running build,
+// not assumed) and its ClassifyJournaledCommand classification, so a future normalization change
+// that silently moves a command onto an unguarded name fails here by name.
+//
+// Four commands revive auto-journal at runtime (Transaction::ReviveAutoJournal) instead of
+// journaling a normalized name, and this test pins all four: a SAME-SHARD RENAME or RENAMENX
+// (RenameGeneric, generic_family.cc, when GetUniqueShardCnt()==1 -- "safe to use RENAME with
+// single shard"), a same-shard SORT ... STORE (SortGeneric, same file, same shard-count gate),
+// and an exact (non-approximate, non-MAXLEN) XTRIM (CmdXTrim, stream_family.cc). Each journals
+// the client's own command verbatim under ITS OWN name, and none of RENAME/RENAMENX/SORT/XTRIM
+// are in kJournaledClasses, so all four classify kUnguarded. (A CROSS-shard RENAME/RENAMENX goes
+// through a different path, Renamer::DelSrc/DeserializeDest, which does journal DEL src +
+// RESTORE dst -- not exercised by the same-shard rows below.)
+//
+// Falsifying: removing "GETSET" from kJournaledClasses (multimaster_lww.cc) makes this test's own
+// GETSET block's ClassifyJournaledCommand EXPECT_EQ fail (kUnguarded instead of kSingleKey).
+// Changing the RENAME block's expected name from "RENAME" to "DEL" makes that EXPECT_EQ fail,
+// proving the tree really does journal RENAME verbatim rather than decomposing it.
+TEST_F(MvccStoreTest, EmittedNamePinsMatchClassifiedGuardedNames) {
+  // drakeydb: P4-4 Task A11 -- runs one dispatch step (never a peer apply) and returns the args of
+  // every resulting COMMAND journal entry, in arrival order (args[0] is each entry's journaled
+  // name, upper-case in practice). Reuses MsetLwwJournalConsumer (above) purely for its
+  // decoding. Takes an arbitrary dispatch callable rather than a fixed command vector so both a
+  // plain Run() (the common case, wrapped by run1 below) and GAT's memcache-only GetMC() call can
+  // share the same registration/capture/unregistration boilerplate. A local lambda, not a free
+  // function: Run() is a protected BaseFamilyTest member, so this can only be called from within a
+  // member function (or a closure captured inside one) of a class derived from it -- exactly what
+  // a TEST_F body is.
+  auto capture_all = [&](auto&& dispatch) -> std::vector<std::vector<std::string>> {
+    MsetLwwJournalConsumer consumer;
+    std::vector<uint32_t> consumer_ids(shard_set->size());
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+    });
+    dispatch();
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+    util::fb2::LockGuard lk(consumer.mu_);
+    std::vector<std::vector<std::string>> out;
+    out.reserve(consumer.entries.size());
+    for (auto& e : consumer.entries)
+      out.push_back(e.args);
+    return out;
+  };
+  auto capture_cmd = [&](std::vector<std::string> cmd) { return capture_all([&] { Run(cmd); }); };
+  auto run1 = [&](std::vector<std::string> cmd) {
+    auto entries = capture_cmd(cmd);
+    EXPECT_EQ(entries.size(), 1u) << "expected exactly one journal entry";
+    return entries.empty() ? std::vector<std::string>{} : entries.front();
+  };
+
+  // SETEX / PSETEX / SET ... EX / SET ... NX (when it sets) -> SET, kSingleKey.
+  {
+    auto e = run1({"setex", "k1", "100", "v"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k1");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+  {
+    auto e = run1({"psetex", "k2", "100000", "v"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k2");
+  }
+  {
+    auto e = run1({"set", "k3", "v", "EX", "100"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k3");
+  }
+  {
+    Run({"del", "k4"});
+    auto e = run1({"set", "k4", "v", "NX"});
+    ASSERT_GE(e.size(), 3u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k4");
+    EXPECT_EQ(e[2], "v");
+  }
+
+  // GETEX k EX 100 -> on an active node (this fixture), the tree ships the key's FULL STATE
+  // under SET instead of a bare PEXPIREAT delta: a receiver applying a bare TTL delta against
+  // its own, possibly different, value would end up with a pairing neither peer actually held.
+  // Still kSingleKey (SET was already guarded).
+  {
+    Run({"set", "k5", "v"});
+    auto e = run1({"getex", "k5", "EX", "100"});
+    ASSERT_EQ(e.size(), 5u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k5");
+    EXPECT_EQ(e[2], "v");
+    EXPECT_EQ(e[3], "PXAT");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+
+  // GAT (memcache-only; registered, CO::NO_AUTOJOURNAL) -- on an active node, the tree also ships
+  // full state under SET, from a DIFFERENT call site than GETEX: CmdGetEx (string_family.cc)
+  // journals from its own inline callback, while GAT goes through
+  // MGetGeneric -> OpMGet -> FindKeyAndSetExpiry (same file), which independently picks the same
+  // shape. Not reachable via plain RESP Run() (CmdGAT aborts with "GAT is a memcache-only
+  // command" outside an mc_command() context), so driven via GetMC instead.
+  {
+    using MP = MemcacheParser;
+    Run({"set", "k18", "v"});
+    auto entries = capture_all([&] {
+      GetMC(MP::GAT, {absl::StrCat(TEST_current_time_ms / 1000 + 100), "k18"});
+    });
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 5u);
+    EXPECT_EQ(entries[0][0], "SET");
+    EXPECT_EQ(entries[0][1], "k18");
+    EXPECT_EQ(entries[0][2], "v");
+    EXPECT_EQ(entries[0][3], "PXAT");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kSingleKey);
+  }
+
+  // GETSET k v -> auto-journaled verbatim as GETSET, kSingleKey (guarded).
+  {
+    Run({"set", "k6", "old"});
+    auto e = run1({"getset", "k6", "v"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "GETSET");
+    EXPECT_EQ(e[1], "k6");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+
+  // UNLINK -> DEL, kMultiKeySelfGuarded.
+  {
+    Run({"set", "k7", "v"});
+    auto e = run1({"unlink", "k7"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "DEL");
+    EXPECT_EQ(e[1], "k7");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  // EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT -> on an active node, full state under SET (P4-4),
+  // never a bare PEXPIREAT delta. Still kSingleKey.
+  {
+    Run({"set", "k8", "v"});
+    auto e = run1({"expire", "k8", "100"});
+    ASSERT_EQ(e.size(), 5u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k8");
+    EXPECT_EQ(e[2], "v");
+    EXPECT_EQ(e[3], "PXAT");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+  {
+    Run({"set", "k9", "v"});
+    auto e = run1({"pexpire", "k9", "100000"});
+    ASSERT_EQ(e.size(), 5u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k9");
+  }
+  {
+    Run({"set", "k10", "v"});
+    auto e = run1({"expireat", "k10", absl::StrCat(TEST_current_time_ms / 1000 + 100)});
+    ASSERT_EQ(e.size(), 5u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k10");
+  }
+  {
+    Run({"set", "k11", "v"});
+    auto e = run1({"pexpireat", "k11", absl::StrCat(TEST_current_time_ms + 100000)});
+    ASSERT_EQ(e.size(), 5u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k11");
+  }
+
+  // EXPIRE k -1 (existing key) -> DEL, kMultiKeySelfGuarded.
+  {
+    Run({"set", "k12", "v"});
+    auto e = run1({"expire", "k12", "-1"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "DEL");
+    EXPECT_EQ(e[1], "k12");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  const size_t n = shard_set->size();
+
+  // MSETNX a 1 b 2 (single shard) -> MSET, kMultiKeySelfGuarded.
+  {
+    std::string a = FindKeyOnShard("a11_ms_", 0, n);
+    std::string b = FindKeyOnShard("a11_ms2_", 0, n);
+    Run({"del", a, b});
+    auto e = run1({"msetnx", a, "1", b, "2"});
+    ASSERT_GE(e.size(), 3u);
+    EXPECT_EQ(e[0], "MSET");
+    EXPECT_EQ(e[1], a);
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  // RENAME src dst (same shard) -> the tree emits a single verbatim "RENAME src dst" entry, NOT
+  // "DEL src" + "RESTORE dst ... REPLACE ABSTTL" (see this test's own top comment for why).
+  // kUnguarded: RENAME is absent from kJournaledClasses. Deliberately not reclassified here.
+  {
+    std::string src = FindKeyOnShard("a11_rn_src_", 0, n);
+    std::string dst = FindKeyOnShard("a11_rn_dst_", 0, n);
+    Run({"set", src, "v"});
+    Run({"del", dst});
+    auto entries = capture_cmd({"rename", src, dst});
+    ASSERT_EQ(entries.size(), 1u) << "same-shard RENAME must journal exactly one entry";
+    ASSERT_GE(entries[0].size(), 3u);
+    EXPECT_EQ(entries[0][0], "RENAME");
+    EXPECT_EQ(entries[0][1], src);
+    EXPECT_EQ(entries[0][2], dst);
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kUnguarded);
+  }
+
+  // RENAMENX src dst (same shard, dst absent so it succeeds) -> a single verbatim
+  // "RENAMENX src dst" entry (RenameGeneric also revives auto-journal for RENAMENX -- it is the
+  // same function as RENAME, just called with destination_should_not_exist=true). kUnguarded:
+  // RENAMENX is absent from kJournaledClasses. Deliberately not reclassified here.
+  {
+    std::string src = FindKeyOnShard("a11_rnx_src_", 0, n);
+    std::string dst = FindKeyOnShard("a11_rnx_dst_", 0, n);
+    Run({"set", src, "v"});
+    Run({"del", dst});
+    auto entries = capture_cmd({"renamenx", src, dst});
+    ASSERT_EQ(entries.size(), 1u) << "same-shard RENAMENX must journal exactly one entry";
+    ASSERT_GE(entries[0].size(), 3u);
+    EXPECT_EQ(entries[0][0], "RENAMENX");
+    EXPECT_EQ(entries[0][1], src);
+    EXPECT_EQ(entries[0][2], dst);
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kUnguarded);
+  }
+
+  // SORT src STORE dst (same shard) -> a single verbatim "SORT src STORE dst" entry
+  // (SortGeneric revives auto-journal whenever the whole transaction -- source key plus STORE
+  // destination -- collapses to one shard). kUnguarded: SORT is absent from kJournaledClasses.
+  // Deliberately not reclassified here.
+  {
+    std::string src = FindKeyOnShard("a11_sort_src_", 0, n);
+    std::string dst = FindKeyOnShard("a11_sort_dst_", 0, n);
+    Run({"del", src, dst});
+    Run({"rpush", src, "3", "1", "2"});
+    auto entries = capture_cmd({"sort", src, "STORE", dst});
+    ASSERT_EQ(entries.size(), 1u) << "same-shard SORT ... STORE must journal exactly one entry";
+    ASSERT_GE(entries[0].size(), 4u);
+    EXPECT_EQ(entries[0][0], "SORT");
+    EXPECT_EQ(entries[0][1], src);
+    EXPECT_EQ(entries[0][2], "STORE");
+    EXPECT_EQ(entries[0][3], dst);
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kUnguarded);
+  }
+
+  // XTRIM key MINID <id> (exact -- no "~", and MINID rather than MAXLEN) -> a single verbatim
+  // "XTRIM key MINID <id>" entry (CmdXTrim revives auto-journal only for this exact-MINID case;
+  // an approximate or MAXLEN trim instead journals via its own RecordJournal call, never
+  // revival -- an explicitly recomputed MINID <s->first_id> when the trim leaves the stream
+  // non-empty, or MAXLEN 0 when it empties the stream entirely, OpTrim/stream_family.cc).
+  // kUnguarded: XTRIM is absent from kJournaledClasses. Deliberately not reclassified here.
+  //
+  // `<id>` is deliberately "1-2" -- between the two XADD'd entries, matching NEITHER -- not the
+  // surviving entry's own real id ("2-1"): trimming with MINID "2-1" would leave "2-1" as the
+  // stream's own first_id too, so a bug that ran the recompute path instead of reviving the
+  // client's verbatim command would journal the SAME "MINID 2-1" either way, and this test could
+  // not tell revival from recompute. With "1-2", revival journals "1-2" verbatim; the recompute
+  // path would instead journal the surviving entry's real id, "2-1" -- distinguishable.
+  {
+    std::string key = FindKeyOnShard("a11_xtrim_", 0, n);
+    Run({"del", key});
+    Run({"xadd", key, "1-1", "f", "v"});
+    Run({"xadd", key, "2-1", "f", "v"});
+    auto entries = capture_cmd({"xtrim", key, "MINID", "1-2"});
+    ASSERT_EQ(entries.size(), 1u) << "exact XTRIM MINID must journal exactly one entry";
+    ASSERT_GE(entries[0].size(), 4u);
+    EXPECT_EQ(entries[0][0], "XTRIM");
+    EXPECT_EQ(entries[0][1], key);
+    EXPECT_EQ(entries[0][2], "MINID");
+    EXPECT_EQ(entries[0][3], "1-2")
+        << "must journal the client's own verbatim MINID (revival), not the surviving entry's "
+           "real id (which a mistaken recompute path would produce instead)";
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kUnguarded);
+  }
+
+  // MOVE key db -> a single verbatim "MOVE key target_db" entry (GenericFamily::Move,
+  // hand-journaled unconditionally, never decomposed into guarded state -- D-18,
+  // ISSUE-REGISTER.md). kUnguarded: MOVE is absent from kJournaledClasses, and it is
+  // CO::NO_AUTOJOURNAL, so RegistryClosureEveryAutoJournaledNameIsGuardedOrKnown's own forward
+  // loop (above) cannot see it at all -- this is the only pin covering MOVE's classification.
+  {
+    std::string key = FindKeyOnShard("a11_move_", 0, n);
+    Run({"select", "1"});
+    Run({"del", key});
+    Run({"select", "0"});
+    Run({"set", key, "v"});
+    auto entries = capture_cmd({"move", key, "1"});
+    ASSERT_EQ(entries.size(), 1u) << "MOVE must journal exactly one entry";
+    ASSERT_EQ(entries[0].size(), 3u);
+    EXPECT_EQ(entries[0][0], "MOVE");
+    EXPECT_EQ(entries[0][1], key);
+    EXPECT_EQ(entries[0][2], "1");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kUnguarded);
+  }
+
+  // PFMERGE dst src -> SET (guarded -- a state-carrying RMW result), kSingleKey.
+  {
+    std::string dst = FindKeyOnShard("a11_pf_dst_", 0, n);
+    std::string src1 = FindKeyOnShard("a11_pf_src1_", 0, n);
+    std::string src2 = FindKeyOnShard("a11_pf_src2_", 0, n);
+    Run({"pfadd", src1, "a", "b"});
+    Run({"pfadd", src2, "c", "d"});
+    auto e = run1({"pfmerge", dst, src1, src2});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], dst);
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+
+  // BITOP AND dst a b (non-empty result) -> SET; with an empty result -> DEL (both guarded,
+  // kSingleKey / kMultiKeySelfGuarded respectively).
+  {
+    Run({"set", "pbit_a", std::string(1, '\xff')});
+    Run({"set", "pbit_b", std::string(1, '\xff')});
+    auto e = run1({"bitop", "AND", "pbdst1", "pbit_a", "pbit_b"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "pbdst1");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+  {
+    // BITOP's "empty result" is a ZERO-LENGTH result, only reachable when every source key is
+    // absent -- an AND of a present nonzero byte against a present zero byte is still a
+    // (nonempty, all-zero-bits) 1-byte result, not this case. The destination must already exist
+    // for the empty-result DEL branch to fire at all (operation.IsNewEntry() otherwise skips it).
+    Run({"del", "pbit_missing1", "pbit_missing2"});
+    Run({"set", "pbdst2", "preexisting"});
+    auto e = run1({"bitop", "AND", "pbdst2", "pbit_missing1", "pbit_missing2"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "DEL");
+    EXPECT_EQ(e[1], "pbdst2");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  // SETNX k v (sets) -> SETNX verbatim (the pre-dispatch SETNX->SET rewrite happens on the
+  // RECEIVER, not the author), kSingleKey.
+  {
+    Run({"del", "k13"});
+    auto e = run1({"setnx", "k13", "v"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "SETNX");
+    EXPECT_EQ(e[1], "k13");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+
+  // GETDEL / RESTORE -> same name, kSingleKey.
+  {
+    Run({"set", "k14", "v"});
+    auto e = run1({"getdel", "k14"});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "GETDEL");
+    EXPECT_EQ(e[1], "k14");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+  // PERSIST on a key WITH a TTL -> on an active node, full state under SET, no PXAT (P4-4): the
+  // TTL is gone, and a plain "SET key value" already says that.
+  {
+    Run({"set", "k15", "v", "EX", "1000"});
+    auto e = run1({"persist", "k15"});
+    ASSERT_EQ(e.size(), 3u);
+    EXPECT_EQ(e[0], "SET");
+    EXPECT_EQ(e[1], "k15");
+    EXPECT_EQ(e[2], "v");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+  // PERSIST on a key WITHOUT a TTL -> a genuine no-op: journals NOTHING at all on an active
+  // node, not even a no-op PERSIST. Unlike the GETEX/GAT persist-no-op pins below, this one
+  // cannot distinguish full-state journaling from a bare-delta PERSIST: PERSIST auto-journaled
+  // verbatim only when OpPersist returned OpStatus::OK (a TTL actually removed); on a no-op it
+  // already returned SKIPPED, and the auto-journal epilogue already gated on
+  // `result.status == OpStatus::OK`, so nothing reaches the wire either way. Kept as a live pin
+  // of that property, not as evidence of full-state journaling specifically.
+  {
+    Run({"set", "k15b", "v"});
+    ASSERT_EQ(Run({"ttl", "k15b"}).GetInt(), -1) << "sanity: no TTL to begin with";
+    auto entries = capture_cmd({"persist", "k15b"});
+    EXPECT_EQ(entries.size(), 0u) << "a PERSIST that changes nothing must journal nothing";
+  }
+  {
+    Run({"set", "k16", "v"});
+    std::string dump_blob = Run({"dump", "k16"}).GetString();
+    Run({"del", "k17"});
+    auto e = run1({"restore", "k17", "0", dump_blob});
+    ASSERT_GE(e.size(), 2u);
+    EXPECT_EQ(e[0], "RESTORE");
+    EXPECT_EQ(e[1], "k17");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kSingleKey);
+  }
+
+  // drakeydb: P4-4 Task A11b -- DELEX is now CO::NO_AUTOJOURNAL and hand-journals its RESULT, so
+  // it is pinned here like every other result-journaled command above rather than living in
+  // kKnownUnguardedAutoJournaled (it no longer auto-journals at all, verbatim or otherwise).
+
+  // Bare DELEX key -> DEL, kMultiKeySelfGuarded (via CmdDel/OpDelV2's own explicit RecordJournal;
+  // DELEX's own auto-journal epilogue is suppressed, so this is the only entry).
+  {
+    Run({"set", "k19", "v"});
+    auto e = run1({"delex", "k19"});
+    ASSERT_EQ(e.size(), 2u) << "DEL's own journal args are exactly {\"DEL\", key} -- no third "
+                               "field, unlike SET/RESTORE's extra args above";
+    EXPECT_EQ(e[0], "DEL");
+    EXPECT_EQ(e[1], "k19");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+  }
+
+  // DELEX key IFEQ v, predicate holds (deletes) -> DEL, kMultiKeySelfGuarded (Delex's own
+  // conditional cb hand-journals the RESULT, not the recipe). Also pins the required ORDER: the
+  // delete must commit before the journal entry, so by the time this entry exists the key already
+  // carries a real (non-zero-authority) tombstone stamp, not the zero-authority placeholder
+  // PerformDeletionAtomic's ArmTombstone leaves behind mid-delete.
+  {
+    Run({"set", "k20", "match"});
+    auto before_unstamped = TotalUnstampedWrites();
+    auto e = run1({"delex", "k20", "IFEQ", "match"});
+    ASSERT_EQ(e.size(), 2u) << "DEL's own journal args are exactly {\"DEL\", key}";
+    EXPECT_EQ(e[0], "DEL");
+    EXPECT_EQ(e[1], "k20");
+    EXPECT_EQ(ClassifyJournaledCommand(e[0]), LwwClass::kMultiKeySelfGuarded);
+    auto tomb = StampOf("k20");
+    ASSERT_TRUE(tomb.has_value()) << "an explicit DEL must leave a tombstone, not erase the slot";
+    EXPECT_TRUE(tomb->IsTombstone());
+    EXPECT_NE(tomb->Mvcc(), 0u)
+        << "by the time RecordJournal's own Commit() ran, the key must already carry a REAL "
+           "author stamp, not the zero-authority placeholder ArmTombstone leaves mid-delete -- "
+           "proving RecordJournal ran AFTER DelMutable, not before it";
+    EXPECT_EQ(TotalUnstampedWrites(), before_unstamped)
+        << "the delete must be committed by this same RecordJournal call, never left armed";
+  }
+
+  // DELEX key IFEQ v, predicate fails (no delete) -> journals nothing at all: NO_AUTOJOURNAL, and
+  // the conditional cb's explicit RecordJournal call never runs on this path.
+  {
+    Run({"set", "k21", "nomatch"});
+    auto entries = capture_cmd({"delex", "k21", "IFNE", "nomatch"});
+    EXPECT_EQ(entries.size(), 0u) << "a predicate that does not hold must journal nothing";
+    EXPECT_EQ(Run({"exists", "k21"}).GetInt(), 1) << "the key must survive an unmet predicate";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P4-4: TTL-carrying writes journal the key's FULL STATE on active nodes -- the removal of
+// PEXPIREAT/PERSIST from the guarded table; convergence regressions for value-vs-TTL races and
+// tombstone recreation; and the non-active byte-identity invariant for the sites this touches
+// (EXPIRE family, PERSIST, GETEX, GAT, SET ... KEEPTTL, and DELEX's own gate).
+// ---------------------------------------------------------------------------
+
+// The classifier-level pin for this removal (ClassifyJournaledCommand("PEXPIREAT"/"PERSIST") ==
+// kUnguarded) lives in mvcc_test.cc, alongside the rest of the table's direct unit tests
+// (ClassifyJournaledCommandNoLongerGuardsPexpireatOrPersist) -- not duplicated here.
+
+// drakeydb: P4-4 -- non-string emission pin: EXPIRE (PEXPIREAT client-side) on a hash key ships
+// the key's full state as RESTORE ... REPLACE ABSTTL, with a dump byte-identical to the value's
+// own DUMP (the value itself is untouched by an EXPIRE -- only the TTL changes), never a bare
+// PEXPIREAT delta.
+//
+// Falsifying: reverting OpExpire's `else if (IsActiveReplica())` branch (generic_family.cc) back
+// to the unconditional `RecordJournal(op_args, "PEXPIREAT"sv, ArgSlice{key, time})` makes the
+// captured entry come back as {"PEXPIREAT", "hexp_k", <ts>} (size 3, name PEXPIREAT) instead of
+// the expected 6-element RESTORE shape, failing the ASSERT_EQ(args.size(), 6u) below.
+TEST_F(MvccStoreTest, ExpireOnHashKeyShipsFullStateRestore) {
+  Run({"del", "hexp_k"});
+  ASSERT_EQ(Run({"hset", "hexp_k", "f1", "v1", "f2", "v2"}).GetInt(), 2);
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const std::string abs_ttl = absl::StrCat(TEST_current_time_ms + 100'000);
+  ASSERT_EQ(Run({"pexpireat", "hexp_k", abs_ttl}).GetInt(), 1);
+  const std::string dump_after = Run({"dump", "hexp_k"}).GetString();
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1)
+      << "exactly one journal entry for this EXPIRE";
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 6u) << "RESTORE key ttl dump REPLACE ABSTTL, no STICK here";
+  EXPECT_EQ(args[0], "RESTORE");
+  EXPECT_EQ(args[1], "hexp_k");
+  EXPECT_EQ(args[2], abs_ttl);
+  EXPECT_EQ(args[3], dump_after)
+      << "the journaled dump must be byte-identical to the value's own DUMP -- EXPIRE never "
+         "touches the value itself";
+  EXPECT_EQ(args[4], "REPLACE");
+  EXPECT_EQ(args[5], "ABSTTL");
+}
+
+// drakeydb: P4-4 -- non-string emission pin, TTL-removed case: PERSIST on a hash key with a real
+// TTL ships RESTORE ... REPLACE ABSTTL with the `0` sentinel (no TTL survives), never a bare
+// PERSIST delta.
+//
+// Falsifying: removing OpPersist's active-node branch (the
+// `if (IsActiveReplica() && op_args.shard->journal())` call to RecordFullStateJournal,
+// generic_family.cc) makes this test's own capture come back with ZERO entries instead of one --
+// PERSIST is CO::NO_AUTOJOURNAL now, so with no explicit journal call left on the active path,
+// nothing reaches the wire at all -- failing ASSERT_EQ(consumer.entries.size(), pre_entries + 1)
+// below.
+TEST_F(MvccStoreTest, PersistOnHashKeyShipsFullStateRestoreWithZeroTtl) {
+  Run({"del", "hpersist_k"});
+  ASSERT_EQ(Run({"hset", "hpersist_k", "f1", "v1"}).GetInt(), 1);
+  ASSERT_EQ(Run({"pexpireat", "hpersist_k", absl::StrCat(TEST_current_time_ms + 100'000)}).GetInt(),
+            1);
+  ASSERT_GT(Run({"pttl", "hpersist_k"}).GetInt(), 0) << "sanity: must actually have a TTL";
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  ASSERT_EQ(Run({"persist", "hpersist_k"}).GetInt(), 1);
+  const std::string dump_after = Run({"dump", "hpersist_k"}).GetString();
+
+  std::move(unregister_consumer).Invoke();
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), pre_entries + 1);
+  const auto& args = consumer.entries[pre_entries].args;
+  ASSERT_EQ(args.size(), 6u);
+  EXPECT_EQ(args[0], "RESTORE");
+  EXPECT_EQ(args[1], "hpersist_k");
+  EXPECT_EQ(args[2], "0") << "no TTL survives this write -- ttl arg is the 0 sentinel";
+  EXPECT_EQ(args[3], dump_after);
+  EXPECT_EQ(args[4], "REPLACE");
+  EXPECT_EQ(args[5], "ABSTTL");
+}
+
+// drakeydb: P4-4 -- convergence regression, both sides, the RECEIVER half driven from the entry
+// the AUTHOR side actually recorded (captured live, then re-targeted), not hand-typed: a
+// hand-typed receiver half can't fail when the author-side gate regresses, since it never reads
+// what the author actually emitted. AUTHOR side: a local PERSIST on k journals a full-state SET
+// carrying the value (not a bare PERSIST delta) -- so a peer holding a DIFFERENT value for this
+// key would converge on the author's value, not merely lose its TTL. RECEIVER side: a receiver
+// holding its OWN value (vB, stamp SB) applies that exact captured entry, re-targeted to its own
+// key, with a strictly newer stamp SP, and must converge on v0 -- the value a bare
+// PEXPIREAT/PERSIST delta could never have carried.
+//
+// Falsifying: removing OpPersist's active-node full-state journal call (generic_family.cc)
+// without also reverting PERSIST's registration off `CO::NO_AUTOJOURNAL` back to plain
+// auto-journal leaves PERSIST journaling NOTHING at all (no manual call, and auto-journal still
+// disabled) -- the actual observed failure is `ASSERT_EQ(author_consumer.entries.size(), 1u)`
+// observing 0u, before this test ever reaches the `author_args` checks or the receiver half. A
+// true revert to the pre-full-state shape (a bare, unconditional "PERSIST key" auto-journaled
+// entry) needs both the branch AND the `CO::NO_AUTOJOURNAL` flag reverted together.
+TEST_F(MvccStoreTest, PersistFullStateLetsReceiverConvergeOnAuthorsValueNotItsOwn) {
+  constexpr uint32_t kPeerIdx = 90;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a14a-4000-8000-000000000090");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  // AUTHOR side.
+  ASSERT_EQ(Run({"set", "r1_author_k", "v0", "PX", "100000"}), "OK");
+  std::vector<std::string> author_args;
+  {
+    MsetLwwJournalConsumer author_consumer;
+    std::vector<uint32_t> author_ids(shard_set->size());
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      author_ids[shard->shard_id()] = journal::RegisterConsumer(&author_consumer);
+    });
+    ASSERT_EQ(Run({"persist", "r1_author_k"}).GetInt(), 1);
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(author_ids[shard->shard_id()]); });
+
+    util::fb2::LockGuard alk(author_consumer.mu_);
+    ASSERT_EQ(author_consumer.entries.size(), 1u);
+    author_args = author_consumer.entries[0].args;
+    ASSERT_EQ(author_args.size(), 3u);
+    EXPECT_EQ(author_args[0], "SET");
+    EXPECT_EQ(author_args[1], "r1_author_k");
+    EXPECT_EQ(author_args[2], "v0")
+        << "a peer holding a DIFFERENT value for this key would converge on v0, not merely lose "
+           "its TTL -- a bare PERSIST delta could never carry that";
+  }
+
+  // RECEIVER side: this node holds its OWN value (vB) for a DIFFERENT key, stamp SB; the exact
+  // entry captured above, re-targeted to r1_recv_k, arrives with a strictly newer stamp SP --
+  // the receiver must end up with v0, not vB.
+  ASSERT_EQ(Run({"set", "r1_recv_k", "vB"}), "OK");
+  auto sb = StampOf("r1_recv_k");
+  ASSERT_TRUE(sb.has_value());
+  const uint64_t sp = sb->Mvcc() + 1;
+
+  author_args[1] = "r1_recv_k";
+  auto res = ApplyReplicatedCommand(author_args, kPeerIdx, sp, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "r1_recv_k"}), "v0")
+      << "the author's PERSIST-derived full state must win -- not this receiver's own vB";
+  auto after = StampOf("r1_recv_k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(after->Mvcc(), sp);
+  EXPECT_EQ(after->origin_hash, peer_hash);
+}
+
+// drakeydb: P4-4 -- convergence regression, the RECEIVER half driven from the entry the AUTHOR
+// side actually recorded (captured live, then re-targeted), not hand-typed. SET ... KEEPTTL on
+// an active node ships the SURVIVING absolute TTL as PXAT, not a bare KEEPTTL token -- a receiver
+// applying that exact captured entry, with a DIFFERENT existing TTL for this key, must end up
+// with THIS write's TTL, not its own.
+//
+// Falsifying: reverting SetCmd::RecordJournal's active-node branch (string_family.cc) so it falls
+// through to the generic path (still unconditionally journaled, just with the bare `KEEPTTL`
+// token) makes the very first size assertion after the capture fail:
+// `ASSERT_EQ(author_args.size(), 5u)` observes 4u (author_args comes back as
+// {"SET", "r4_author_k", "v1", "KEEPTTL"}), before this test ever reaches the receiver half.
+TEST_F(MvccStoreTest, SetKeepttlShipsAbsoluteTtlSoReceiverConvergesOnAuthorsTtl) {
+  constexpr uint32_t kPeerIdx = 91;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a14a-4000-8000-000000000091");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  // AUTHOR side.
+  const std::string abs_ttl = absl::StrCat(TEST_current_time_ms + 200'000);
+  ASSERT_EQ(Run({"set", "r4_author_k", "v0", "PXAT", abs_ttl}), "OK");
+  std::vector<std::string> author_args;
+  {
+    MsetLwwJournalConsumer consumer;
+    std::vector<uint32_t> ids(shard_set->size());
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+    ASSERT_EQ(Run({"set", "r4_author_k", "v1", "KEEPTTL"}), "OK");
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), 1u);
+    author_args = consumer.entries[0].args;
+    ASSERT_EQ(author_args.size(), 5u);
+    EXPECT_EQ(author_args[0], "SET");
+    EXPECT_EQ(author_args[1], "r4_author_k");
+    EXPECT_EQ(author_args[2], "v1");
+    EXPECT_EQ(author_args[3], "PXAT");
+    EXPECT_EQ(author_args[4], abs_ttl)
+        << "KEEPTTL ships the SURVIVING absolute TTL, not the bare token";
+  }
+
+  // RECEIVER side: this node's own r4_recv_k has a DIFFERENT TTL; applying the exact entry
+  // captured above, re-targeted to r4_recv_k, must leave it with the AUTHOR's TTL, not its own.
+  ASSERT_EQ(Run({"set", "r4_recv_k", "vB", "PX", "500000"}), "OK");
+  auto sb = StampOf("r4_recv_k");
+  ASSERT_TRUE(sb.has_value());
+  const uint64_t sp = sb->Mvcc() + 1;
+
+  author_args[1] = "r4_recv_k";
+  auto res = ApplyReplicatedCommand(author_args, kPeerIdx, sp, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "r4_recv_k"}), "v1");
+  EXPECT_EQ(Run({"pexpiretime", "r4_recv_k"}).GetInt(), std::stoll(abs_ttl))
+      << "the receiver must end up with the AUTHOR's TTL, not its own pre-existing one";
+}
+
+// drakeydb: P4-4 -- convergence regression: the exact shape an EXPIRE author ships today
+// (captured live, not hand-typed) applied newer than the receiver's own tombstone must re-create
+// the key with the author's value and TTL. A guarded PEXPIREAT/PERSIST newer than a receiver's
+// tombstone would silently no-op on the absent key (OpExpire/OpPersist return KEY_NOTFOUND); this
+// is closed not by teaching PEXPIREAT/PERSIST to create keys, but by retiring them from the
+// guarded vocabulary entirely -- an EXPIRE author now ships SET/RESTORE, which already recreates
+// correctly over a tombstone (the same path any other guarded SET uses).
+//
+// Falsifying: reverting OpExpire's active-node branch (generic_family.cc) makes the captured
+// entry's own sanity check fail first: `ASSERT_EQ(consumer.entries[0].args[0], "SET")` observes
+// "PEXPIREAT" instead, before this test ever reaches the tombstone-recreate assertions.
+TEST_F(MvccStoreTest, ExpireAuthoredFullStateAppliedNewerThanTombstoneRecreatesKey) {
+  constexpr uint32_t kPeerIdx = 92;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a14a-4000-8000-000000000092");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  // Capture the REAL shape an EXPIRE author ships today.
+  ASSERT_EQ(Run({"set", "r5_author_k", "v_from_expire"}), "OK");
+  const std::string abs_ttl = absl::StrCat(TEST_current_time_ms + 300'000);
+  std::vector<std::string> captured;
+  {
+    MsetLwwJournalConsumer consumer;
+    std::vector<uint32_t> ids(shard_set->size());
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+    ASSERT_EQ(Run({"pexpireat", "r5_author_k", abs_ttl}).GetInt(), 1);
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), 1u);
+    ASSERT_EQ(consumer.entries[0].args[0], "SET")
+        << "sanity: an EXPIRE author must ship full state, not a bare PEXPIREAT";
+    captured = consumer.entries[0].args;
+  }
+
+  // Apply that exact captured entry -- re-targeted to a key THIS node has already tombstoned --
+  // with a stamp strictly newer than the tombstone.
+  ASSERT_EQ(Run({"set", "r5_k", "local"}), "OK");
+  ASSERT_EQ(Run({"del", "r5_k"}).GetInt(), 1);
+  auto tomb = StampOf("r5_k");
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone());
+  const uint64_t newer_mvcc = tomb->Mvcc() + 1;
+
+  captured[1] = "r5_k";
+  auto res = ApplyReplicatedCommand(captured, kPeerIdx, newer_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "r5_k"}), "v_from_expire");
+  EXPECT_EQ(Run({"pexpiretime", "r5_k"}).GetInt(), std::stoll(abs_ttl));
+  auto after = StampOf("r5_k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_FALSE(after->IsTombstone());
+  EXPECT_EQ(after->Mvcc(), newer_mvcc);
+  EXPECT_EQ(after->origin_hash, peer_hash);
+}
+
+// drakeydb: P4-4 -- GETEX k PERSIST, on a key that HAS a real TTL to remove, ships a bare
+// "SET k v" -- no PXAT, since no TTL survives this write. GETEX with an already-past absolute
+// expiry still ships a bare "DEL k" -- already this key's full state, nothing further to add.
+TEST_F(MvccStoreTest, GetexPersistAndPastExpiryEmissionPins) {
+  auto capture_cmd = [&](std::vector<std::string> cmd) {
+    MsetLwwJournalConsumer consumer;
+    std::vector<uint32_t> ids(shard_set->size());
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+    Run(cmd);
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+    util::fb2::LockGuard lk(consumer.mu_);
+    std::vector<std::vector<std::string>> out;
+    for (auto& e : consumer.entries)
+      out.push_back(e.args);
+    return out;
+  };
+
+  {  // GETEX k PERSIST, k HAS a TTL -> bare SET k v.
+    Run({"set", "gx_persist_k", "v", "PX", "100000"});
+    auto entries = capture_cmd({"getex", "gx_persist_k", "PERSIST"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 3u);
+    EXPECT_EQ(entries[0][0], "SET");
+    EXPECT_EQ(entries[0][1], "gx_persist_k");
+    EXPECT_EQ(entries[0][2], "v");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kSingleKey);
+  }
+
+  {  // GETEX with an already-past absolute expiry -> DEL k.
+    Run({"set", "gx_past_k", "v"});
+    auto entries = capture_cmd({"getex", "gx_past_k", "EXAT", "1"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 2u);
+    EXPECT_EQ(entries[0][0], "DEL");
+    EXPECT_EQ(entries[0][1], "gx_past_k");
+    EXPECT_EQ(Run({"exists", "gx_past_k"}).GetInt(), 0);
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kMultiKeySelfGuarded);
+  }
+}
+
+// drakeydb: P4-4 -- same two emission pins as GetexPersistAndPastExpiryEmissionPins above, for
+// GAT's own, independent call site (FindKeyAndSetExpiry, string_family.cc) -- not reachable via
+// plain RESP Run() (memcache-only), so driven through GetMC.
+TEST_F(MvccStoreTest, GatPersistAndPastExpiryEmissionPins) {
+  using MP = MemcacheParser;
+  auto capture_all = [&](auto&& dispatch) {
+    MsetLwwJournalConsumer consumer;
+    std::vector<uint32_t> ids(shard_set->size());
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+    dispatch();
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+    util::fb2::LockGuard lk(consumer.mu_);
+    std::vector<std::vector<std::string>> out;
+    for (auto& e : consumer.entries)
+      out.push_back(e.args);
+    return out;
+  };
+
+  {  // GAT persist form (exptime 0), k HAS a TTL -> bare SET k v.
+    Run({"set", "gat_persist_k", "v", "PX", "100000"});
+    auto entries = capture_all([&] { GetMC(MP::GAT, {"0", "gat_persist_k"}); });
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 3u);
+    EXPECT_EQ(entries[0][0], "SET");
+    EXPECT_EQ(entries[0][1], "gat_persist_k");
+    EXPECT_EQ(entries[0][2], "v");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kSingleKey);
+  }
+
+  {  // GAT with an already-past absolute expiry -> DEL k.
+    Run({"set", "gat_past_k", "v"});
+    auto entries = capture_all([&] {
+      GetMC(MP::GAT, {absl::StrCat(TEST_current_time_ms / 1000 - 100), "gat_past_k"});
+    });
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 2u);
+    EXPECT_EQ(entries[0][0], "DEL");
+    EXPECT_EQ(entries[0][1], "gat_past_k");
+    EXPECT_EQ(Run({"exists", "gat_past_k"}).GetInt(), 0);
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kMultiKeySelfGuarded);
+  }
+}
+
+// drakeydb: P4-4 -- SET ... KEEPTTL where no TTL survives this write ships a bare "SET k v" --
+// the same shape as if KEEPTTL had never been requested -- whether k already existed without a
+// TTL (SetExisting) or is created fresh by this very command (AddNew reaches
+// SetCmd::RecordJournal with SET_KEEP_EXPIRE still set exactly the same way).
+TEST_F(MvccStoreTest, SetKeepttlOnNoTtlKeyEmissionPins) {
+  auto capture_cmd = [&](std::vector<std::string> cmd) {
+    MsetLwwJournalConsumer consumer;
+    std::vector<uint32_t> ids(shard_set->size());
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+    Run(cmd);
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+    util::fb2::LockGuard lk(consumer.mu_);
+    std::vector<std::vector<std::string>> out;
+    for (auto& e : consumer.entries)
+      out.push_back(e.args);
+    return out;
+  };
+
+  {  // k exists, but WITHOUT a TTL.
+    Run({"set", "kt_existing_k", "old"});
+    ASSERT_EQ(Run({"ttl", "kt_existing_k"}).GetInt(), -1) << "sanity: no TTL to begin with";
+    auto entries = capture_cmd({"set", "kt_existing_k", "v", "KEEPTTL"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 3u);
+    EXPECT_EQ(entries[0][0], "SET");
+    EXPECT_EQ(entries[0][1], "kt_existing_k");
+    EXPECT_EQ(entries[0][2], "v");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kSingleKey);
+  }
+
+  {  // k does NOT exist.
+    Run({"del", "kt_fresh_k"});
+    auto entries = capture_cmd({"set", "kt_fresh_k", "v", "KEEPTTL"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 3u);
+    EXPECT_EQ(entries[0][0], "SET");
+    EXPECT_EQ(entries[0][1], "kt_fresh_k");
+    EXPECT_EQ(entries[0][2], "v");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kSingleKey);
+  }
+}
+
+// drakeydb: P4-4 -- GETEX k PERSIST on a key WITHOUT a TTL is a genuine no-op: journals nothing
+// at all, never advances the key's stamp, and never inflates mvcc_unstamped_writes.
+//
+// Falsifying: removing the `noop_persist` guard in CmdGetEx (string_family.cc) -- i.e. calling
+// JournalFullStateSet unconditionally instead of only `else if (!noop_persist)` -- makes
+// `consumer.entries.size()` come back 1u instead of 0u, with a "SET gx_noop_k v" entry that
+// carries the author's mvcc onto a key that changed nothing.
+TEST_F(MvccStoreTest, GetexPersistNoopOnNoTtlKeyJournalsNothing) {
+  Run({"set", "gx_noop_k", "v"});
+  ASSERT_EQ(Run({"ttl", "gx_noop_k"}).GetInt(), -1) << "sanity: no TTL to begin with";
+  auto before = StampOf("gx_noop_k");
+  ASSERT_TRUE(before.has_value());
+  const uint64_t pre_unstamped = TotalUnstampedWrites();
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  Run({"getex", "gx_noop_k", "PERSIST"});
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), 0u) << "a persist that changes nothing must journal nothing";
+  auto after = StampOf("gx_noop_k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(*after, *before) << "a no-op must never advance this key's stamp";
+  EXPECT_EQ(TotalUnstampedWrites(), pre_unstamped)
+      << "a no-op must never arm-then-abandon this key either";
+}
+
+// drakeydb: P4-4 -- same no-op pin as GetexPersistNoopOnNoTtlKeyJournalsNothing above, for GAT's
+// own noop_persist guard in FindKeyAndSetExpiry (string_family.cc).
+//
+// Falsifying: removing that guard -- calling JournalFullStateSet unconditionally instead of only
+// `if (!noop_persist)` -- makes `consumer.entries.size()` come back 1u instead of 0u, with a
+// "SET gat_noop_k v" entry that carries the author's mvcc onto a key that changed nothing.
+TEST_F(MvccStoreTest, GatPersistNoopOnNoTtlKeyJournalsNothing) {
+  using MP = MemcacheParser;
+  Run({"set", "gat_noop_k", "v"});
+  ASSERT_EQ(Run({"ttl", "gat_noop_k"}).GetInt(), -1) << "sanity: no TTL to begin with";
+  auto before = StampOf("gat_noop_k");
+  ASSERT_TRUE(before.has_value());
+  const uint64_t pre_unstamped = TotalUnstampedWrites();
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  GetMC(MP::GAT, {"0", "gat_noop_k"});
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  EXPECT_EQ(consumer.entries.size(), 0u) << "a persist that changes nothing must journal nothing";
+  auto after = StampOf("gat_noop_k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(*after, *before) << "a no-op must never advance this key's stamp";
+  EXPECT_EQ(TotalUnstampedWrites(), pre_unstamped)
+      << "a no-op must never arm-then-abandon this key either";
+}
+
+// drakeydb: P4-4 -- for every TTL-changing full-state write, the LOCAL committed stamp must
+// equal the mvcc the wire entry itself carries: journal::RecordEntry mints a fresh HopStamp for a
+// self-originated write and commits that SAME value to every key armed for this entry
+// (journal.cc) -- if a call site armed the wrong key, forgot to arm at all, or armed via
+// RunWithoutMvccArm() when it should have used Run(), the wire entry would still carry a freshly
+// minted mvcc while the key's own committed stamp stayed whatever it was before.
+TEST_F(MvccStoreTest, FullStateWritesCommitTheSameMvccTheyJournal) {
+  auto capture_one = [&](std::vector<std::string> cmd) {
+    MvccCapturingConsumer consumer;
+    std::vector<uint32_t> ids(shard_set->size());
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+    Run(cmd);
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+    util::fb2::LockGuard lk(consumer.mu_);
+    return consumer.entries;
+  };
+
+  {  // EXPIRE on a string.
+    SCOPED_TRACE("EXPIRE string");
+    Run({"set", "sw_expire_str", "v"});
+    auto entries = capture_one({"expire", "sw_expire_str", "100"});
+    ASSERT_EQ(entries.size(), 1u);
+    auto st = StampOf("sw_expire_str");
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(st->Mvcc(), entries[0].mvcc);
+  }
+
+  {  // EXPIRE on a hash (non-string).
+    SCOPED_TRACE("EXPIRE hash");
+    Run({"del", "sw_expire_hash"});
+    Run({"hset", "sw_expire_hash", "f", "v"});
+    auto entries = capture_one({"expire", "sw_expire_hash", "100"});
+    ASSERT_EQ(entries.size(), 1u);
+    auto st = StampOf("sw_expire_hash");
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(st->Mvcc(), entries[0].mvcc);
+  }
+
+  {  // PERSIST.
+    SCOPED_TRACE("PERSIST");
+    Run({"set", "sw_persist", "v", "PX", "100000"});
+    auto entries = capture_one({"persist", "sw_persist"});
+    ASSERT_EQ(entries.size(), 1u);
+    auto st = StampOf("sw_persist");
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(st->Mvcc(), entries[0].mvcc);
+  }
+
+  {  // GETEX PERSIST.
+    SCOPED_TRACE("GETEX PERSIST");
+    Run({"set", "sw_getex", "v", "PX", "100000"});
+    auto entries = capture_one({"getex", "sw_getex", "PERSIST"});
+    ASSERT_EQ(entries.size(), 1u);
+    auto st = StampOf("sw_getex");
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(st->Mvcc(), entries[0].mvcc);
+  }
+
+  {  // SET ... KEEPTTL.
+    SCOPED_TRACE("SET KEEPTTL");
+    Run({"set", "sw_keepttl", "v0", "PX", "100000"});
+    auto entries = capture_one({"set", "sw_keepttl", "v1", "KEEPTTL"});
+    ASSERT_EQ(entries.size(), 1u);
+    auto st = StampOf("sw_keepttl");
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(st->Mvcc(), entries[0].mvcc);
+  }
+}
+
+// drakeydb: P4-4 -- PFMERGE into an EXISTING destination that already has a TTL overwrites the
+// VALUE in place (PrimeValue::SetString, hll_family.cc) without ever touching the key's own TTL
+// -- a bare "SET dest v" would silently drop it on the receiver, the same partial-state defect
+// SET ... KEEPTTL had. On an active node, PFMERGE ships the destination's full state instead.
+TEST_F(MvccStoreTest, PfmergeIntoTtlCarryingDestinationShipsFullState) {
+  // drakeydb: P4-4 -- both keys pinned to the SAME shard, deliberately: this keeps the test to a
+  // single write-phase shard so its own single-entry assertion is only about the TTL-preserving
+  // full-state fix. The CROSS-shard case (destination and source on different shards) is its own
+  // shape and is pinned separately by PfmergeAcrossShardsJournalsOnlyFromOwningShard below.
+  const size_t n = shard_set->size();
+  const std::string dst = FindKeyOnShard("pf_dst_", 0, n);
+  const std::string src = FindKeyOnShard("pf_src_", 0, n);
+  Run({"del", dst, src});
+  Run({"pfadd", dst, "x", "y"});
+  const std::string abs_ttl = absl::StrCat(TEST_current_time_ms + 200'000);
+  ASSERT_EQ(Run({"pexpireat", dst, abs_ttl}).GetInt(), 1);
+  Run({"pfadd", src, "a", "b", "c"});
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  ASSERT_EQ(Run({"pfmerge", dst, src}), "OK");
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), 1u);
+  const auto& args = consumer.entries[0].args;
+  ASSERT_EQ(args.size(), 5u) << "SET key value PXAT abs";
+  EXPECT_EQ(args[0], "SET");
+  EXPECT_EQ(args[1], dst);
+  EXPECT_EQ(args[2], Run({"get", dst}).GetString())
+      << "the journaled value must be the merged register, byte-identical to the destination's "
+         "own GET";
+  EXPECT_EQ(args[3], "PXAT");
+  EXPECT_EQ(args[4], abs_ttl) << "PFMERGE must not silently drop the destination's own TTL";
+  EXPECT_EQ(ClassifyJournaledCommand(args[0]), LwwClass::kSingleKey);
+  EXPECT_EQ(Run({"pexpiretime", dst}).GetInt(), std::stoll(abs_ttl))
+      << "sanity: PFMERGE itself must not have changed the local TTL either";
+}
+
+// drakeydb: P4-4 -- cross-shard PFMERGE (destination and source pinned to DIFFERENT shards):
+// PFMergeInternal's write phase (hll_family.cc) runs its `set_cb` on every shard the transaction
+// touches, not just the destination's own. Without a destination-shard filter, the shard that
+// does NOT own dest still runs AddOrFind(dest) in its OWN table, creating an independent phantom
+// copy there -- armed, stamped, and journaled separately from the owning shard's full-state
+// write. A guarded receiver applying both entries races them, and whichever lands second silently
+// clobbers whatever the first one carried (including the TTL). `set_cb` now skips every non-owning
+// shard on an active node (mirroring BITOP's own dest_shard filter), so a cross-shard PFMERGE
+// journals exactly once, from the shard that actually owns dest.
+//
+// Falsifying: dropping the `shard->shard_id() != dest_shard` filter in PFMergeInternal's `set_cb`
+// (hll_family.cc) makes `consumer.entries.size()` come back 2 instead of 1, and
+// `Run({"keys", dst}).GetVec().size()` come back 2 instead of 1 (the phantom copy on the
+// non-owning shard).
+TEST_F(MvccStoreTest, PfmergeAcrossShardsJournalsOnlyFromOwningShard) {
+  const size_t n = shard_set->size();
+  ASSERT_GT(n, 1u) << "sanity: this pin needs at least two shards to put dst and src on different "
+                      "ones";
+  const std::string dst = FindKeyOnShard("pf_xs_dst_", 0, n);
+  const std::string src = FindKeyOnShard("pf_xs_src_", 1, n);
+  Run({"del", dst, src});
+  Run({"pfadd", dst, "x", "y"});
+  const std::string abs_ttl = absl::StrCat(TEST_current_time_ms + 200'000);
+  ASSERT_EQ(Run({"pexpireat", dst, abs_ttl}).GetInt(), 1);
+  Run({"pfadd", src, "a", "b", "c"});
+
+  const int64_t dbsize_before = *Run({"dbsize"}).GetInt();
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  ASSERT_EQ(Run({"pfmerge", dst, src}), "OK");
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), 1u)
+      << "exactly one entry, from the shard that owns dest -- not one per participating shard";
+  const auto& e = consumer.entries[0];
+  ASSERT_EQ(e.args.size(), 5u) << "SET key value PXAT abs";
+  EXPECT_EQ(e.args[0], "SET");
+  EXPECT_EQ(e.args[1], dst);
+  EXPECT_EQ(e.args[2], Run({"get", dst}).GetString());
+  EXPECT_EQ(e.args[3], "PXAT");
+  EXPECT_EQ(e.args[4], abs_ttl) << "the owning shard's write must still carry dest's own TTL";
+  EXPECT_EQ(ClassifyJournaledCommand(e.args[0]), LwwClass::kSingleKey);
+
+  auto committed = StampOf(dst);
+  ASSERT_TRUE(committed.has_value());
+  EXPECT_EQ(committed->Mvcc(), e.mvcc)
+      << "the owning shard's committed stamp must equal the mvcc this same entry put on the wire";
+
+  EXPECT_EQ(Run({"keys", dst}).GetVec().size(), 1u)
+      << "no phantom copy of dest may exist in any non-owning shard's own table";
+  EXPECT_EQ(Run({"dbsize"}).GetInt(), dbsize_before)
+      << "PFMERGE overwrites dest's value in place; it must not create a new key anywhere";
+
+  // RECEIVER side: applying the exact entry the owning shard recorded must leave the receiver
+  // with dest's merged value AND its TTL -- the same capture-and-replay convergence technique
+  // this file's own SET ... KEEPTTL/EXPIRE full-state tests use, driven here from PFMERGE's own
+  // recorded shape.
+  constexpr uint32_t kPeerIdx = 93;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a14a-4000-8000-000000000093");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+  ASSERT_EQ(Run({"set", "pf_xs_recv_k", "vB", "PX", "500000"}), "OK");
+  auto sb = StampOf("pf_xs_recv_k");
+  ASSERT_TRUE(sb.has_value());
+  const uint64_t sp = sb->Mvcc() + 1;
+
+  std::vector<std::string> recv_args = e.args;
+  recv_args[1] = "pf_xs_recv_k";
+  auto res = ApplyReplicatedCommand(recv_args, kPeerIdx, sp, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "pf_xs_recv_k"}), e.args[2]);
+  EXPECT_EQ(Run({"pexpiretime", "pf_xs_recv_k"}).GetInt(), std::stoll(abs_ttl))
+      << "the receiver must end up with dest's own TTL, not its own pre-existing one";
+}
+
+// drakeydb: P4-4 -- on a non-active node, upstream's own phantom-writing shape for a cross-shard
+// PFMERGE is left completely alone: every participating shard still runs AddOrFind(dest) in its
+// own table and journals its own bare "SET dest v", exactly as upstream does. A non-active link
+// has no per-key stamp to protect and must stay byte-identical to upstream, phantom copies and
+// all -- see D-25, docs/ISSUE-REGISTER.md.
+TEST_F(BaseFamilyTest, NonActivePfmergeAcrossShardsKeepsUpstreamPhantomShape) {
+  ASSERT_FALSE(IsActiveReplica());
+  const size_t n = shard_set->size();
+  ASSERT_GT(n, 1u);
+  const std::string dst = FindKeyOnShard("na_pf_xs_dst_", 0, n);
+  const std::string src = FindKeyOnShard("na_pf_xs_src_", 1, n);
+  Run({"del", dst, src});
+  Run({"pfadd", dst, "x"});
+  Run({"pexpireat", dst, absl::StrCat(TEST_current_time_ms + 100'000)});
+  Run({"pfadd", src, "y"});
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+  };
+
+  Run({"pfmerge", dst, src});
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), 2u)
+      << "upstream's own shape: one bare SET per participating shard, phantom included";
+  EXPECT_EQ(Run({"keys", dst}).GetVec().size(), 2u)
+      << "upstream's own phantom copy on the non-owning shard, left untouched off the active path";
+}
+
+// drakeydb: P4-4 -- same defect and same fix as PFMERGE above, for BITOP's destination
+// (ElementAccess::Commit -> PrimeValue::SetString, bitops_family.cc): a blind in-place value
+// overwrite that keeps whatever TTL the destination already had.
+TEST_F(MvccStoreTest, BitopIntoTtlCarryingDestinationShipsFullState) {
+  Run({"del", "bop_dst", "bop_a", "bop_b"});
+  Run({"set", "bop_dst", std::string(1, '\x0f')});
+  const std::string abs_ttl = absl::StrCat(TEST_current_time_ms + 200'000);
+  ASSERT_EQ(Run({"pexpireat", "bop_dst", abs_ttl}).GetInt(), 1);
+  Run({"set", "bop_a", std::string(1, '\xff')});
+  Run({"set", "bop_b", std::string(1, '\xff')});
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  ASSERT_EQ(Run({"bitop", "AND", "bop_dst", "bop_a", "bop_b"}).GetInt(), 1);
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), 1u);
+  const auto& args = consumer.entries[0].args;
+  ASSERT_EQ(args.size(), 5u) << "SET key value PXAT abs";
+  EXPECT_EQ(args[0], "SET");
+  EXPECT_EQ(args[1], "bop_dst");
+  EXPECT_EQ(args[2], Run({"get", "bop_dst"}).GetString());
+  EXPECT_EQ(args[3], "PXAT");
+  EXPECT_EQ(args[4], abs_ttl) << "BITOP must not silently drop the destination's own TTL";
+  EXPECT_EQ(ClassifyJournaledCommand(args[0]), LwwClass::kSingleKey);
+  EXPECT_EQ(Run({"pexpiretime", "bop_dst"}).GetInt(), std::stoll(abs_ttl))
+      << "sanity: BITOP itself must not have changed the local TTL either";
+}
+
+// drakeydb: P4-4 -- convergence test: PFMERGE's result-journaled SET (a
+// state-carrying RMW result journaled under a guarded name) must converge with a peer's
+// independent, strictly newer SET on the same logical key, in BOTH directions -- applying each
+// side's own recorded entry to the other side's key must leave both on the newer value with the
+// SAME origin. Uses the capture-and-replay technique (see
+// PfmergeAcrossShardsJournalsOnlyFromOwningShard above): capture the author's own recorded
+// PFMERGE-SET entry, then apply it -- under the author's own stamp (origin_idx 0, this node's own
+// self hash: the author really is this process) -- to a receiver key that already holds an
+// independent, strictly newer SET.
+//
+// Falsifying: short-circuiting ClassifyJournaledCommand (multimaster_lww.cc) to return
+// LwwClass::kUnguarded for "SET" makes the first EXPECT_EQ below fail -- "pf_conv_recv" ends up
+// overwritten by the older PFMERGE-derived SET instead of staying on "peer_v2", and
+// TotalLwwDropped() does not advance.
+TEST_F(MvccStoreTest, PfmergeResultConvergesWithPeersNewerSetInBothDirections) {
+  constexpr uint32_t kPeerIdx = 94;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a14a-4000-8000-000000000094");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  // The author's (this node's) own PFMERGE, captured as a real journal entry.
+  Run({"del", "pf_conv_dst", "pf_conv_src"});
+  Run({"pfadd", "pf_conv_dst", "x", "y"});
+  Run({"pfadd", "pf_conv_src", "a", "b", "c"});
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  ASSERT_EQ(Run({"pfmerge", "pf_conv_dst", "pf_conv_src"}), "OK");
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  MsetLwwJournalEntry pfmerge_entry;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), 1u);
+    pfmerge_entry = consumer.entries[0];
+  }
+  ASSERT_EQ(pfmerge_entry.args[0], "SET");
+  EXPECT_EQ(ClassifyJournaledCommand(pfmerge_entry.args[0]), LwwClass::kSingleKey);
+  auto author_stamp = StampOf("pf_conv_dst");
+  ASSERT_TRUE(author_stamp.has_value());
+  ASSERT_EQ(author_stamp->Mvcc(), pfmerge_entry.mvcc);
+
+  // A peer's independent SET, strictly newer than the author's PFMERGE, standing in for the
+  // "receiver" side of this same logical key.
+  const uint64_t peer_stamp = pfmerge_entry.mvcc + 1;
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "pf_conv_recv", "peer_v2"}, kPeerIdx, peer_stamp,
+                                   /*lww_guard=*/false),
+            facade::DispatchResult::OK);
+
+  // Direction 1: the author's PFMERGE-SET applied to the receiver, which already holds the
+  // strictly newer peer write -- must be DROPPED; "pf_conv_recv" stays on "peer_v2".
+  std::vector<std::string> to_recv = pfmerge_entry.args;
+  to_recv[1] = "pf_conv_recv";
+  const uint64_t before_dropped = TotalLwwDropped();
+  ASSERT_EQ(
+      ApplyReplicatedCommand(to_recv, /*origin_idx=*/0, pfmerge_entry.mvcc, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "pf_conv_recv"}), "peer_v2")
+      << "the receiver's own strictly newer write must survive the author's older PFMERGE-SET";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+
+  // Direction 2: the peer's newer SET applied to the AUTHOR's own dest -- must overwrite it.
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "pf_conv_dst", "peer_v2"}, kPeerIdx, peer_stamp,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+
+  // Both sides now converge on the peer's value, with the peer's own origin.
+  EXPECT_EQ(Run({"get", "pf_conv_dst"}), "peer_v2");
+  EXPECT_EQ(Run({"get", "pf_conv_recv"}), "peer_v2");
+  auto dst_final = StampOf("pf_conv_dst");
+  auto recv_final = StampOf("pf_conv_recv");
+  ASSERT_TRUE(dst_final.has_value());
+  ASSERT_TRUE(recv_final.has_value());
+  EXPECT_EQ(*dst_final, (MvccStamp{peer_stamp, peer_hash}));
+  EXPECT_EQ(*recv_final, (MvccStamp{peer_stamp, peer_hash}))
+      << "both sides must converge on the SAME stamp/origin, the peer's";
+}
+
+// drakeydb: P4-4 -- convergence test: BITOP's empty-result DEL (also a
+// state-carrying RMW result) applied to a receiver holding a
+// strictly newer independent local write must be DROPPED -- the receiver's write survives and
+// TotalLwwDropped() advances by exactly one. DEL classifies kMultiKeySelfGuarded, not kSingleKey
+// (multimaster_lww.cc): the generic single-key veto (Transaction::ShouldDropForLww) never runs for
+// it at all; OpDelV2's own per-key guard (generic_family.cc) does the compare instead, driven
+// directly off LwwGuardActive/LwwShouldDropKey, independent of ClassifyJournaledCommand.
+//
+// Falsifying: short-circuiting OpDelV2's own `guarded` computation
+// (`LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)`, generic_family.cc) to always false
+// makes the EXPECT_EQ("get", "recv") below fail -- the receiver's
+// key is deleted instead of surviving, and TotalLwwDropped() does not advance.
+TEST_F(MvccStoreTest, BitopEmptyResultDelDropsAgainstReceiversNewerLocalWrite) {
+  constexpr uint32_t kPeerIdx = 95;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a14a-4000-8000-000000000095");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  // The author's own BITOP with an empty result (both src keys absent), captured as a real DEL
+  // journal entry.
+  Run({"del", "bd_dst", "bd_a", "bd_b"});
+  Run({"set", "bd_dst", "old"});
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  ASSERT_EQ(Run({"bitop", "AND", "bd_dst", "bd_a", "bd_b"}).GetInt(), 0);
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  MsetLwwJournalEntry bitop_entry;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), 1u);
+    bitop_entry = consumer.entries[0];
+  }
+  ASSERT_EQ(bitop_entry.args[0], "DEL");
+  ASSERT_EQ(bitop_entry.args[1], "bd_dst");
+  EXPECT_EQ(ClassifyJournaledCommand(bitop_entry.args[0]), LwwClass::kMultiKeySelfGuarded);
+  ASSERT_EQ(Run({"exists", "bd_dst"}).GetInt(), 0) << "sanity: BITOP really deleted its own dest";
+
+  // A newer local write on the "receiver": a key already holding an independent write strictly
+  // newer than the author's BITOP.
+  ASSERT_EQ(Run({"set", "bd_recv", "newer"}), "OK");
+  auto recv_stamp = StampOf("bd_recv");
+  ASSERT_TRUE(recv_stamp.has_value());
+  ASSERT_GT(recv_stamp->Mvcc(), bitop_entry.mvcc)
+      << "sanity: the receiver's own local write must really be newer than the author's BITOP";
+
+  std::vector<std::string> to_recv = bitop_entry.args;
+  to_recv[1] = "bd_recv";
+  const uint64_t before_dropped = TotalLwwDropped();
+  ASSERT_EQ(ApplyReplicatedCommand(to_recv, /*origin_idx=*/0, bitop_entry.mvcc, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "bd_recv"}), "newer")
+      << "the receiver's own strictly newer write must survive the author's older BITOP-DEL";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+}
+
+// drakeydb: P4-4 -- the shared builder's unification pin: SET ... KEEPTTL on a key that is
+// ALREADY sticky (from an earlier, separate SET ... STICK) and has a TTL must journal STICK.
+// Before collapsing
+// the three full-state-SET builders into one, KEEPTTL's own inline builder read STICK from THIS
+// command's own SET_STICK flag (never set on this particular SET), not from the key's actual
+// stored sticky bit -- silently dropping it, while EXPIRE on the very same key kept it (EXPIRE's
+// builder always read the key's own PrimeKey::IsSticky()).
+TEST_F(MvccStoreTest, SetKeepttlOnStickyKeyWithTtlJournalsStick) {
+  Run({"del", "kt_sticky_k"});
+  ASSERT_EQ(Run({"set", "kt_sticky_k", "v0", "PX", "100000", "STICK"}), "OK");
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  ASSERT_EQ(Run({"set", "kt_sticky_k", "v1", "KEEPTTL"}), "OK");
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), 1u);
+  const auto& args = consumer.entries[0].args;
+  ASSERT_EQ(args.size(), 6u) << "SET key value PXAT abs STICK";
+  EXPECT_EQ(args[0], "SET");
+  EXPECT_EQ(args[1], "kt_sticky_k");
+  EXPECT_EQ(args[2], "v1");
+  EXPECT_EQ(args[3], "PXAT");
+  EXPECT_EQ(args[5], "STICK")
+      << "the key's OWN sticky bit must be reflected, not this SET's own (absent) STICK flag";
+  EXPECT_EQ(ClassifyJournaledCommand(args[0]), LwwClass::kSingleKey);
+}
+
+// drakeydb: an ordinary (non-KEEPTTL) SET with memcache flags must journal the flags value
+// byte-correct: `SetCmd::RecordJournal`'s `_MCFLAGS` append used to push a `string_view` bound to
+// an `absl::StrCat` temporary directly into the InlinedVector -- the temporary is destroyed at
+// the end of that statement, so the pushed view dangled by the time RecordJournal read it a few
+// lines later. Named-local storage fixes the dangling reference without changing the wire bytes.
+// The dangling-view regression is only reliably detectable under ASAN (CI's sanitizer job runs
+// this binary); a plain debug build does not reproduce it, so this test stands as a wire-shape
+// pin rather than a regression reproducer.
+TEST_F(MvccStoreTest, SetWithMemcacheFlagsJournalsCorrectValue) {
+  Run({"del", "mc_flags_k"});
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  ASSERT_EQ(Run({"set", "mc_flags_k", "v", "_MCFLAGS", "42"}), "OK");
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), 1u);
+  const auto& args = consumer.entries[0].args;
+  ASSERT_EQ(args.size(), 5u) << "SET key value _MCFLAGS n";
+  EXPECT_EQ(args[0], "SET");
+  EXPECT_EQ(args[1], "mc_flags_k");
+  EXPECT_EQ(args[2], "v");
+  EXPECT_EQ(args[3], "_MCFLAGS");
+  EXPECT_EQ(args[4], "42") << "the journaled flags value must be exactly what was set";
+  EXPECT_EQ(ClassifyJournaledCommand(args[0]), LwwClass::kSingleKey);
+}
+
+// drakeydb: P4-4 -- "off means byte-identical to upstream" for every TTL-changing command: EXPIRE,
+// PERSIST, SET ... KEEPTTL, GETEX, and RESTORE must still journal upstream's own shape on a
+// non-active node -- a bare PEXPIREAT/PERSIST/KEEPTTL delta (or, for RESTORE, the client's own
+// RELATIVE ttl untouched), never the active node's own full-state SET/RESTORE (or, for RESTORE,
+// its own ABSOLUTE-ttl re-journal).
+//
+// Falsifying: swapping OpExpire's `else if (IsActiveReplica())` full-state branch
+// (generic_family.cc) to `else if (!IsActiveReplica())` makes this test's own EXPIRE block
+// observe a full-state SET instead of PEXPIREAT. Removing the
+// `if (!IsActiveReplica()) cmd_cntx->tx()->ReviveAutoJournal();` call at the top of
+// GenericFamily::Restore makes this test's own RESTORE block see zero entries instead of one
+// (RESTORE is CO::NO_AUTOJOURNAL, and nothing else journals on a non-active node).
+TEST_F(BaseFamilyTest, NonActiveTtlCommandsJournalUpstreamVerbatim) {
+  ASSERT_FALSE(IsActiveReplica());
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+  };
+
+  auto capture_cmd = [&](std::vector<std::string> cmd) {
+    size_t pre;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      pre = consumer.entries.size();
+    }
+    Run(cmd);
+    util::fb2::LockGuard lk(consumer.mu_);
+    std::vector<std::vector<std::string>> out;
+    for (size_t i = pre; i < consumer.entries.size(); ++i)
+      out.push_back(consumer.entries[i].args);
+    return out;
+  };
+
+  {  // EXPIRE -> bare PEXPIREAT (name, key, abs time), never the active node's full-state SET.
+    Run({"set", "na_expire_k", "v"});
+    auto entries = capture_cmd({"expire", "na_expire_k", "100"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 3u);
+    EXPECT_EQ(entries[0][0], "PEXPIREAT");
+    EXPECT_EQ(entries[0][1], "na_expire_k");
+  }
+
+  {  // PERSIST -> bare PERSIST, never a full-state SET, and never a double journal.
+    Run({"set", "na_persist_k", "v", "EX", "1000"});
+    auto entries = capture_cmd({"persist", "na_persist_k"});
+    ASSERT_EQ(entries.size(), 1u) << "PERSIST is CO::NO_AUTOJOURNAL now -- exactly one entry, "
+                                     "the revived verbatim auto-journal, must reach the wire";
+    ASSERT_EQ(entries[0].size(), 2u);
+    EXPECT_EQ(entries[0][0], "PERSIST");
+    EXPECT_EQ(entries[0][1], "na_persist_k");
+  }
+
+  {  // SET ... KEEPTTL -> the bare KEEPTTL token, never the surviving absolute TTL as PXAT.
+    Run({"set", "na_keepttl_k", "v0", "PX", "100000"});
+    auto entries = capture_cmd({"set", "na_keepttl_k", "v1", "KEEPTTL"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_GE(entries[0].size(), 4u);
+    EXPECT_EQ(entries[0][0], "SET");
+    EXPECT_EQ(entries[0][1], "na_keepttl_k");
+    EXPECT_EQ(entries[0][2], "v1");
+    EXPECT_EQ(entries[0][3], "KEEPTTL");
+  }
+
+  {  // GETEX ... EX -> bare PEXPIREAT (name, key, abs time).
+    Run({"set", "na_getex_k", "v"});
+    auto entries = capture_cmd({"getex", "na_getex_k", "EX", "100"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 3u);
+    EXPECT_EQ(entries[0][0], "PEXPIREAT");
+    EXPECT_EQ(entries[0][1], "na_getex_k");
+  }
+
+  // GETEX k PERSIST, k HAS a TTL to remove -> bare PERSIST -- upstream's own shape, not the
+  // active-node code above's full-state SET.
+  {
+    Run({"set", "na_getex_persist_k", "v", "PX", "100000"});
+    auto entries = capture_cmd({"getex", "na_getex_persist_k", "PERSIST"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 2u);
+    EXPECT_EQ(entries[0][0], "PERSIST");
+    EXPECT_EQ(entries[0][1], "na_getex_persist_k");
+  }
+
+  // GETEX k PERSIST, k has NO TTL to remove -> FindKeyAndSetExpiry (string_family.cc) is GETEX/
+  // GAT's own, hand-journaled call site (RecordJournal, not ReviveAutoJournal -- there is no
+  // auto-journal here to revive). Its non-active branch (`else if (params.expire_params.persist)`)
+  // is upstream's own unconditional shape: it journals "PERSIST key" verbatim even for a no-op
+  // removal, since only THAT SAME function's own active-node branch (`else if (IsActiveReplica())`,
+  // a few lines above -- a full-state SET, never PERSIST) checks `noop_persist` and skips
+  // journaling entirely; OpPersist (generic_family.cc), the plain PERSIST command's own separate
+  // function, is not involved in this GETEX/GAT path at all.
+  {
+    Run({"set", "na_getex_persist_noop_k", "v"});
+    ASSERT_EQ(Run({"ttl", "na_getex_persist_noop_k"}).GetInt(), -1)
+        << "sanity: no TTL to begin with";
+    auto entries = capture_cmd({"getex", "na_getex_persist_noop_k", "PERSIST"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 2u);
+    EXPECT_EQ(entries[0][0], "PERSIST");
+    EXPECT_EQ(entries[0][1], "na_getex_persist_noop_k");
+  }
+
+  // GAT persist form (exptime 0) -> bare PERSIST, its own independent call site
+  // (FindKeyAndSetExpiry), same upstream shape, same unconditional emission.
+  {
+    using MP = MemcacheParser;
+    Run({"set", "na_gat_persist_k", "v", "PX", "100000"});
+    size_t pre;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      pre = consumer.entries.size();
+    }
+    GetMC(MP::GAT, {"0", "na_gat_persist_k"});
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), pre + 1);
+    const auto& args = consumer.entries[pre].args;
+    ASSERT_EQ(args.size(), 2u);
+    EXPECT_EQ(args[0], "PERSIST");
+    EXPECT_EQ(args[1], "na_gat_persist_k");
+  }
+
+  // GAT with a future absolute expiry -> bare PEXPIREAT (name, key, abs time), never the
+  // active node's full-state SET.
+  {
+    using MP = MemcacheParser;
+    Run({"set", "na_gat_expire_k", "v"});
+    size_t pre;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      pre = consumer.entries.size();
+    }
+    GetMC(MP::GAT, {absl::StrCat(TEST_current_time_ms / 1000 + 100), "na_gat_expire_k"});
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), pre + 1);
+    const auto& args = consumer.entries[pre].args;
+    ASSERT_EQ(args.size(), 3u);
+    EXPECT_EQ(args[0], "PEXPIREAT");
+    EXPECT_EQ(args[1], "na_gat_expire_k");
+  }
+
+  // GAT with an already-past absolute expiry -> bare DEL, never a full-state SET/RESTORE.
+  {
+    using MP = MemcacheParser;
+    Run({"set", "na_gat_past_k", "v"});
+    size_t pre;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      pre = consumer.entries.size();
+    }
+    GetMC(MP::GAT, {absl::StrCat(TEST_current_time_ms / 1000 - 100), "na_gat_past_k"});
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), pre + 1);
+    const auto& args = consumer.entries[pre].args;
+    ASSERT_EQ(args.size(), 2u);
+    EXPECT_EQ(args[0], "DEL");
+    EXPECT_EQ(args[1], "na_gat_past_k");
+    EXPECT_EQ(Run({"exists", "na_gat_past_k"}).GetInt(), 0);
+  }
+
+  // RESTORE with a RELATIVE ttl -> the revived verbatim auto-journal, the client's own relative
+  // ttl untouched -- never the active node's own explicit, ABSOLUTE-ttl re-journal.
+  {
+    ASSERT_EQ(Run({"set", "na_restore_donor", "donorval"}), "OK");
+    std::string dump = Run({"dump", "na_restore_donor"}).GetString();
+    auto entries = capture_cmd({"restore", "na_restore_k", "100000", dump});
+    ASSERT_EQ(entries.size(), 1u) << "RESTORE is CO::NO_AUTOJOURNAL now -- exactly one entry, the "
+                                     "revived verbatim auto-journal, must reach the wire";
+    ASSERT_EQ(entries[0].size(), 4u) << "RESTORE key ttl dump, no ABSTTL token";
+    EXPECT_EQ(entries[0][0], "RESTORE");
+    EXPECT_EQ(entries[0][1], "na_restore_k");
+    EXPECT_EQ(entries[0][2], "100000") << "the relative ttl must reach the wire unchanged -- no "
+                                          "ABSTTL conversion on a non-active node";
+    EXPECT_EQ(entries[0][3], dump);
+    EXPECT_EQ(Run({"get", "na_restore_k"}), "donorval");
+  }
+}
+
+// drakeydb: P4-4 -- DELEX's own gate: on a NON-active node, DELEX must be byte-identical to
+// upstream, including its double-journal for a bare form (CmdDel/OpDelV2's own explicit
+// "DEL key" AND DELEX's own revived auto-journal "DELEX key") and its unconditional recipe
+// auto-journal for the conditional forms (upstream auto-journals even when the predicate never
+// deletes anything).
+//
+// Falsifying: removing the `if (!IsActiveReplica()) cmd_cntx->tx()->ReviveAutoJournal();` call at
+// the top of GenericFamily::Delex (generic_family.cc) -- while leaving the conditional cb's own
+// `if (IsActiveReplica())` guard on its hand-journal in place -- makes the bare-form block below
+// see only ONE entry ("DEL key") instead of two, and makes the conditional-no-match block below
+// see ZERO entries instead of one.
+TEST_F(BaseFamilyTest, NonActiveDelexJournalsUpstreamShapeVerbatim) {
+  ASSERT_FALSE(IsActiveReplica());
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+  };
+
+  auto capture_cmd = [&](std::vector<std::string> cmd) {
+    size_t pre;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      pre = consumer.entries.size();
+    }
+    Run(cmd);
+    util::fb2::LockGuard lk(consumer.mu_);
+    std::vector<std::vector<std::string>> out;
+    for (size_t i = pre; i < consumer.entries.size(); ++i)
+      out.push_back(consumer.entries[i].args);
+    return out;
+  };
+
+  {  // Bare DELEX -> upstream's own double journal: DEL (OpDelV2's own explicit journal) then
+     // DELEX (the revived, verbatim auto-journal).
+    Run({"set", "na_delex_bare", "v"});
+    auto entries = capture_cmd({"delex", "na_delex_bare"});
+    ASSERT_EQ(entries.size(), 2u)
+        << "upstream double-journals a bare DELEX -- DEL then DELEX -- this must not be closed "
+           "on a non-active node, which has no per-key stamp for that double journal to corrupt";
+    EXPECT_EQ(entries[0][0], "DEL");
+    EXPECT_EQ(entries[0][1], "na_delex_bare");
+    EXPECT_EQ(entries[1][0], "DELEX");
+    EXPECT_EQ(entries[1][1], "na_delex_bare");
+  }
+
+  {  // Conditional DELEX, predicate holds -> the recipe verbatim, never a hand-journaled DEL.
+    Run({"set", "na_delex_match", "v"});
+    auto entries = capture_cmd({"delex", "na_delex_match", "IFEQ", "v"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 4u);
+    EXPECT_EQ(entries[0][0], "DELEX");
+    EXPECT_EQ(entries[0][1], "na_delex_match");
+    EXPECT_EQ(entries[0][2], "IFEQ");
+    EXPECT_EQ(entries[0][3], "v");
+    EXPECT_EQ(Run({"exists", "na_delex_match"}).GetInt(), 0);
+  }
+
+  {  // Conditional DELEX, predicate does NOT hold -> upstream auto-journals the recipe verbatim
+     // EVEN THOUGH nothing is deleted (unlike the active-node hand-journal, which journals
+     // nothing on a failed predicate).
+    Run({"set", "na_delex_nomatch", "v"});
+    auto entries = capture_cmd({"delex", "na_delex_nomatch", "IFEQ", "nope"});
+    ASSERT_EQ(entries.size(), 1u)
+        << "upstream auto-journals the recipe even when the predicate never deletes anything";
+    EXPECT_EQ(entries[0][0], "DELEX");
+    EXPECT_EQ(entries[0][1], "na_delex_nomatch");
+    EXPECT_EQ(Run({"exists", "na_delex_nomatch"}).GetInt(), 1);
+  }
+}
+
+// drakeydb: P4-4 -- PFMERGE/BITOP into a TTL-carrying destination must still journal the exact
+// upstream shape on a non-active node -- a bare "SET dest v", the TTL silently dropped -- since a
+// non-active link has no per-key stamp to protect.
+TEST_F(BaseFamilyTest, NonActivePfmergeAndBitopJournalUpstreamShapeVerbatim) {
+  ASSERT_FALSE(IsActiveReplica());
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+  };
+
+  {  // PFMERGE. Both keys pinned to the SAME shard -- see
+     // PfmergeIntoTtlCarryingDestinationShipsFullState's own comment for why.
+    const size_t n = shard_set->size();
+    const std::string dst = FindKeyOnShard("na_pf_dst_", 0, n);
+    const std::string src = FindKeyOnShard("na_pf_src_", 0, n);
+    Run({"del", dst, src});
+    Run({"pfadd", dst, "x"});
+    Run({"pexpireat", dst, absl::StrCat(TEST_current_time_ms + 100'000)});
+    Run({"pfadd", src, "y"});
+    size_t pre;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      pre = consumer.entries.size();
+    }
+    Run({"pfmerge", dst, src});
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), pre + 1);
+    const auto& args = consumer.entries[pre].args;
+    ASSERT_EQ(args.size(), 3u);
+    EXPECT_EQ(args[0], "SET");
+    EXPECT_EQ(args[1], dst);
+  }
+
+  {  // BITOP.
+    Run({"del", "na_bop_dst", "na_bop_a", "na_bop_b"});
+    Run({"set", "na_bop_dst", std::string(1, '\x0f')});
+    Run({"pexpireat", "na_bop_dst", absl::StrCat(TEST_current_time_ms + 100'000)});
+    Run({"set", "na_bop_a", std::string(1, '\xff')});
+    Run({"set", "na_bop_b", std::string(1, '\xff')});
+    size_t pre;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      pre = consumer.entries.size();
+    }
+    Run({"bitop", "AND", "na_bop_dst", "na_bop_a", "na_bop_b"});
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), pre + 1);
+    const auto& args = consumer.entries[pre].args;
+    ASSERT_EQ(args.size(), 3u);
+    EXPECT_EQ(args[0], "SET");
+    EXPECT_EQ(args[1], "na_bop_dst");
+  }
 }
 
 // The "off means byte-identical to upstream" guard.
@@ -3230,6 +8482,47 @@ class OriginJournalFamilyTest : public MultiMasterFamilyTest {
   OriginJournalFamilyTest() {
     num_threads_ = 1;
     absl::SetFlag(&FLAGS_num_shards, 1);
+  }
+
+  // drakeydb: P4-4 Task A4 -- drives ONE command through a REAL MULTI/EXEC squash on a single
+  // JournalExecutor to reach a SQUASHED_STUB's RunSquashedMultiCb. MultiCommandSquasher::Execute
+  // has other callers too (Service::DispatchSquashedBatch's pipeline-batch path, and the
+  // EVAL-squash path in FlushEvalAsyncCmds, both main_service.cc); MULTI/EXEC is used here because
+  // it's the shape this fixture's own SquashedStubInheritsParentOrigin test (below) already uses,
+  // extended to also set repl_lww_guard_/repl_mvcc_ per link (SetApplyLwwGuard/SetApplyMvcc), the
+  // way a real peer flow would: EXEC's own PrepareTransaction call sets them on the outer
+  // transaction, and the squashed-stub ctor (transaction.cc) copies that same outer transaction's
+  // bits onto the per-shard SQUASHED_STUB -- MultiCommandSquasher::PrepareShardInfo's atomic
+  // branch (multi_command_squasher.cc) builds that stub with no SetReplOrigin call of its own.
+  // Unlike
+  // MvccStoreTest's ApplyReplicatedCommand (fresh JournalExecutor per call), MULTI's queued state
+  // lives on the executor's own ConnectionContext, so MULTI and EXEC here must share one instance.
+  facade::DispatchResult ExecSquashedGuardedCommand(std::vector<std::string> cmd_args,
+                                                    uint32_t origin_idx, uint64_t mvcc,
+                                                    bool lww_guard) {
+    facade::DispatchResult multi_res = facade::DispatchResult::ERROR;
+    facade::DispatchResult cmd_res = facade::DispatchResult::ERROR;
+    facade::DispatchResult exec_res = facade::DispatchResult::ERROR;
+    pp_->at(0)
+        ->LaunchFiber([&] {
+          JournalExecutor executor(service_.get());
+          executor.SetApplyOrigin(origin_idx);
+          executor.SetApplyMvcc(mvcc);
+          executor.SetApplyLwwGuard(lww_guard);
+
+          auto dispatch = [&](std::vector<std::string> parts) {
+            journal::ParsedEntry::CmdData cmd_data;
+            cmd_data.Assign(parts.begin(), parts.end(), parts.size());
+            return executor.Execute(0, cmd_data);
+          };
+          multi_res = dispatch({"MULTI"});
+          cmd_res = dispatch(cmd_args);
+          exec_res = dispatch({"EXEC"});
+        })
+        .Join();
+    EXPECT_EQ(facade::DispatchResult::OK, multi_res);
+    EXPECT_EQ(facade::DispatchResult::OK, cmd_res);
+    return exec_res;
   }
 };
 
@@ -3378,6 +8671,91 @@ TEST_F(OriginJournalFamilyTest, SquashedStubInheritsParentOrigin) {
   }
 
   pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
+}
+
+// drakeydb: P4-4 Task A4 -- acceptance case for the fail-open tripwire (transaction.cc,
+// RunSquashedMultiCb). RunSquashedMultiCb is a second run point that bypasses RunCallback (and
+// its ShouldDropForLww veto) entirely; in production it is reachable with a replicated-apply
+// context only from a classic Redis/KeyDB link, which never carries an mvcc, so IsLwwGuarded()
+// can never be true there today. This test forces that case anyway: a JournalExecutor whose link
+// is marked guarded (SetApplyLwwGuard(true)) with a non-zero author stamp
+// (SetApplyMvcc(kGuardedMvcc)), driving a real MULTI/SET/EXEC so MultiCommandSquasher builds a
+// SQUASHED_STUB for the atomic case (MultiCommandSquasher::PrepareShardInfo's IsAtomic() branch,
+// multi_command_squasher.cc: `new Transaction{cntx_->transaction, sid, nullopt}`, no SetReplOrigin
+// call of its own) whose repl_lww_guard_ instead comes from TWO copies stacked: the outer EXEC
+// transaction's own SetReplOrigin call (PrepareTransaction, main_service.cc, at EXEC's own
+// dispatch), then the squashed-stub constructor's direct `repl_lww_guard_ = parent->
+// repl_lww_guard_` (transaction.cc) copying that same bit onto the per-shard stub -- exactly the
+// seam the tripwire exists to catch.
+//
+// "threadsafe" death-test style avoids forking mid-flight of this fixture's own proactor/shard
+// threads -- the same workaround and rationale as
+// RdbMvccTest.RollbackFreshInsertRefusesNonFreshEntry (rdb_test.cc).
+//
+// NOT wrapped in #ifndef NDEBUG (unlike a plain DCHECK death test): absl's DFATAL pseudo-severity
+// is well-defined in both build types -- FATAL when NDEBUG is undefined, ERROR otherwise
+// (absl/log/log.h, absl/base/log_severity.h) -- so under NDEBUG, EXPECT_DEBUG_DEATH runs the
+// statement in this same process without expecting a crash, and the #ifdef NDEBUG block below
+// asserts the fail-open release behavior instead: the guarded write still applies, never silently
+// dropped.
+//
+// Falsification: with the `if (IsLwwGuarded())` block deleted from RunSquashedMultiCb, this test
+// fails with:
+//   Death test: ExecSquashedGuardedCommand({"SET", "guarded-squash-key", "v"}, kPeerOrigin,
+//   kGuardedMvcc, true)
+//       Result: failed to die.
+//    Error msg:
+//   [  DEATH   ]
+TEST_F(OriginJournalFamilyTest, GuardedSquashedStubTripwireFiresInDebug) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  constexpr uint32_t kPeerOrigin = 11;
+  constexpr uint64_t kGuardedMvcc = 42;
+
+  EXPECT_DEBUG_DEATH(
+      ExecSquashedGuardedCommand({"SET", "guarded-squash-key", "v"}, kPeerOrigin, kGuardedMvcc,
+                                 /*lww_guard=*/true),
+      "multi-master LWW guard reached RunSquashedMultiCb");
+
+#ifdef NDEBUG
+  // Under NDEBUG the statement above ran for real (no crash) -- confirm it actually failed open:
+  // the guarded write must still be visible, not dropped.
+  EXPECT_EQ("v", Run({"get", "guarded-squash-key"}));
+#endif  // NDEBUG
+}
+
+// drakeydb: P4-4 -- the tripwire's control that isolates repl_lww_guard_: guard=false with a
+// non-zero mvcc must not trip IsLwwGuarded() (LwwGuardActive, multimaster_lww.h, requires the
+// guard bit set), so the squashed stub applies normally -- the same outcome a classic Redis/KeyDB
+// link's own single-shard EVAL script gets today: CanRunSingleShardMulti (main_service.cc) is
+// itself mode-dependent (true only for `one_shard && multi_mode == LOCK_AHEAD`, or the
+// single-shard GLOBAL case), but once it passes, the SQUASHED_STUB it leads to gets built over
+// the script's own outer transaction regardless of that link being a peer or classic one; that
+// stub inherits repl_lww_guard_ from its parent, always false on a classic link. A misfiring
+// tripwire on this case would abort the whole process in a debug
+// build (LOG(DFATAL) is LOG(FATAL) there), not merely fail an assertion, so this test passing is
+// itself real evidence, not a vacuous one.
+TEST_F(OriginJournalFamilyTest, NonGuardedSquashedStubNeverTripsTripwire) {
+  constexpr uint32_t kPeerOrigin = 12;
+  constexpr uint64_t kAuthorMvcc = 42;
+
+  facade::DispatchResult exec_res = ExecSquashedGuardedCommand(
+      {"SET", "unguarded-squash-key", "v"}, kPeerOrigin, kAuthorMvcc, /*lww_guard=*/false);
+  EXPECT_EQ(facade::DispatchResult::OK, exec_res);
+  EXPECT_EQ("v", Run({"get", "unguarded-squash-key"}));
+}
+
+// drakeydb: P4-4 Task A4 -- the tripwire's control that isolates repl_mvcc_: the rule that mvcc
+// == 0 is never guarded (since a classic Redis/KeyDB link never carries one) holds even with
+// repl_lww_guard_ set -- LwwGuardActive (multimaster_lww.h) requires BOTH the guard bit and a
+// non-zero mvcc. As with the guard=false control above, a misfiring tripwire here would abort the
+// process in a debug build rather than let this test merely fail an assertion.
+TEST_F(OriginJournalFamilyTest, ZeroMvccSquashedStubNeverTripsTripwire) {
+  constexpr uint32_t kPeerOrigin = 13;
+
+  facade::DispatchResult exec_res = ExecSquashedGuardedCommand(
+      {"SET", "zero-mvcc-squash-key", "v"}, kPeerOrigin, /*mvcc=*/0, /*lww_guard=*/true);
+  EXPECT_EQ(facade::DispatchResult::OK, exec_res);
+  EXPECT_EQ("v", Run({"get", "zero-mvcc-squash-key"}));
 }
 
 namespace {
@@ -4329,8 +9707,8 @@ class ReaperJournalFamilyTest : public ActiveReplicaFamilyTest {
 
 // drakeydb: P4-0 Task 2b acceptance case. DbSlice::DeleteExpiredStep's member-expiry reaper must
 // derive its own DEL exactly like a read would -- through the three-arg Del()+RecordDerivedDelete
-// path (fix round 1's redesign; DeleteExpiredStep no longer touches SetFamily::DeleteSetIfEmpty
-// at all -- see task-2b-report.md section 14), which sets kEntryFlagDerived so
+// path (DeleteExpiredStep no longer touches SetFamily::DeleteSetIfEmpty
+// at all), which sets kEntryFlagDerived so
 // PassesPeerEchoFilter (types.cc; exhaustively pinned on the pure function by
 // PassesPeerEchoFilterTest in journal_test.cc) keeps it off mesh-peer links -- while
 // a plain consumer, standing in for a plain replica, still sees it: the peer filter is applied
@@ -4390,28 +9768,48 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteCarriesDerivedFlag) {
 // drakeydb: P4-3 Task 11 -- the DeleteReapedContainer equivalent of MvccStoreTest's
 // LazyExpiryEarnsATombstoneWithSelfOrigin above (multi_master_test.cc): DeleteReapedContainer now
 // calls Del()/PerformDeletionAtomic BEFORE RecordDerivedDelete too, so the derived DEL's own
-// Commit() lands the tombstone's real stamp instead of leaving PerformDeletionAtomic's
-// synchronous placeholder for EndOfWriteEpoch to roll back. Reads the stamp from inside the same
+// commit lands the tombstone's real stamp instead of leaving PerformDeletionAtomic's synchronous
+// placeholder for EndOfWriteEpoch to roll back. Reads the stamp from inside the same
 // shard_set->RunBriefInParallel callback that drives DeleteExpiredStep, on this fixture's single
 // shard/thread, so there is no yield between the reap and the read -- mirroring StampOf's own
 // same-shard-thread precondition in MvccStoreTest.
 //
+// drakeydb: P4-4 -- DeleteReapedContainer's own tombstone is now `ExpiryTombstoneFor` (mvcc.h)
+// applied to the set's own prior stamp -- one origin_hash tick above it, mirroring
+// RecordExpiryBlocking's own whole-key expiry -- not the set's self hash verbatim: `rs-tomb`'s
+// only prior write (`sadd`, above) is itself self-authored, so the tombstone's origin_hash is
+// `self_origin_hash + 1`, not `self_origin_hash`.
+//
 // Falsifying: reverting the DeleteReapedContainer reorder (db_slice.cc) reproduces the orphaned-
-// arm symptom -- `tomb` comes back nullopt (I3's rollback erases the uncommitted placeholder)
-// instead of a real tombstone. Verbatim run in task-11-report.md.
+// arm symptom -- `tomb` comes back nullopt (an epoch-end rollback erases the uncommitted
+// placeholder) instead of a real tombstone. Falsifying the origin_hash advance specifically:
+// reverting DeleteReapedContainer's own CommitOwnTombstone call (db_slice.cc) makes the final
+// EXPECT_EQ below fail -- tomb->origin_hash comes back equal to a freshly-minted local HopStamp's
+// self hash (still self_origin_hash, coincidentally, since both are self-originated) but
+// tomb->Mvcc() comes back far larger than the set's own prior stamp instead of unchanged.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteEarnsATombstone) {
   EXPECT_EQ(Run({"sadd", "rs-tomb", "m"}).GetInt(), 1);
   Run({"fieldexpire", "rs-tomb", "1", "m"});
+
+  // S: rs-tomb's own pre-reap stamp, captured before AdvanceTime so the reaper's tombstone can be
+  // checked against it exactly, the same way MvccStoreTest's own expiry tests check against
+  // `before`/`s_stamp`.
+  std::optional<MvccStamp> s_stamp;
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    s_stamp = db_slice.GetMvcc(0, "rs-tomb");
+  });
+  ASSERT_TRUE(s_stamp.has_value());
+  ASSERT_FALSE(s_stamp->IsTombstone());
+
   AdvanceTime(1100);
 
   std::optional<MvccStamp> tomb;
-  uint64_t self_origin_hash = 0;
   shard_set->RunBriefInParallel([&](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
     DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100);
     tomb = db_slice.GetMvcc(0, "rs-tomb");
-    self_origin_hash = MvccStamper::tlocal()->OriginHash(0);
   });
 
   // Guard against a vacuous pass: the container must have actually been reaped.
@@ -4419,13 +9817,12 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteEarnsATombstone) {
 
   ASSERT_TRUE(tomb.has_value())
       << "the reaper's derived DEL must earn a tombstone, not leave the slot absent";
-  EXPECT_TRUE(tomb->IsTombstone());
-  EXPECT_NE(tomb->Mvcc(), 0u)
-      << "must carry the derived DEL's own real, minted stamp -- not the zero-authority "
-         "{kTombstoneBit, 0} placeholder PerformDeletionAtomic writes synchronously";
-  EXPECT_EQ(tomb->origin_hash, self_origin_hash)
-      << "a reaper-derived delete is a local decision -- must be self-originated, never "
-         "attributed to a peer";
+  // Independently constructed from S, not by calling ExpiryTombstoneFor: one origin_hash tick
+  // above S, tombstone bit set, mvcc unchanged.
+  EXPECT_EQ(*tomb,
+            (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
+      << "must derive from the set's own prior stamp S -- one origin_hash tick above S's own mvcc "
+         "AND origin_hash -- never a freshly minted self stamp, and never S reused verbatim";
 }
 
 TEST_F(ReaperJournalFamilyTest, LocalOnlyReaperDoesNotJournalNamespaceBlindDelete) {
@@ -4511,9 +9908,9 @@ TEST_F(ReaperJournalFamilyTest, ReaperDeleteBypassesChangeCallbacks) {
 // intact for exactly that shape. A container with per-member TTLs that also has a key-level TTL
 // is the ordinary way to bound a session or cache hash (SADD+FIELDEXPIRE+EXPIRE), and EXPIRE can
 // be added to an existing HEXPIRE'd/FIELDEXPIRE'd key at any time -- silently removing it from
-// reaper coverage for the life of that TTL. See task-2b-report.md for the demonstrated escalation
-// to PERMANENT divergence (delete, recreate without a whole-key TTL, then a stale whole-key TTL
-// on the peer fires and gets suppressed right back).
+// reaper coverage for the life of that TTL, escalating to PERMANENT divergence (delete, recreate
+// without a whole-key TTL, then a stale whole-key TTL on the peer fires and gets suppressed right
+// back).
 //
 // This exercises the "whole-key TTL present but not yet due" arm specifically -- the one the bug
 // lived in. MemberExpiryReaperDeleteCarriesDerivedFlag above already covers the "no whole-key TTL
@@ -4521,7 +9918,7 @@ TEST_F(ReaperJournalFamilyTest, ReaperDeleteBypassesChangeCallbacks) {
 //
 // Falsifying: reverting the fix (member walk gated back to `if (!it->first.HasExpire())`) makes
 // EXPECT_EQ(Run({"exists", "s2"}), 0) fail -- "s2" is never walked, never reaped, and stays a set
-// with one dead member forever. Verbatim output recorded in task-2b-report.md.
+// with one dead member forever.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperCoversSetWithNotYetDueWholeKeyTtl) {
   ASSERT_EQ(Run({"sadd", "s2", "m1"}).GetInt(), 1);
   Run({"fieldexpire", "s2", "1", "m1"});
@@ -4613,7 +10010,7 @@ class BlockingSnapshotConsumer : public SliceSnapshot::SnapshotDataConsumerInter
 }  // namespace
 
 // drakeydb: P4-0 Task 2b redesign -- ORIGINAL regression test for the fiber-atomic-section
-// hazard the coordinator's review surfaced (task-2b-report.md): the reaper's delete used to
+// hazard this closes: the reaper's delete used to
 // route through SetFamily::DeleteSetIfEmpty/HSetFamily::DeleteIfEmpty -> DbSlice::FindMutable ->
 // PreUpdateBlocking -> CallChangeCallbacks -> SerializerBase::OnChange, which can synchronously
 // block on stream_mu_ whenever a concurrent BGSAVE/full-sync is mid-way through serializing a
@@ -4781,7 +10178,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
 //
 // Falsifying: reverting the HasRegisteredCallbacks() gate reintroduces the exact race this test
 // exercises -- verified by hand (temporarily removing the `!HasRegisteredCallbacks() &&` conjunct
-// and rebuilding) -- verbatim output recorded in task-2b-report.md.
+// and rebuilding).
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrentSnapshot) {
   BaseFamilyTest::SetTestFlag("serialization_tagged_chunks", "false");
   pp_->at(0)->LaunchFiber([&] { journal::StartInThread(); }).Join();
@@ -4902,7 +10299,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
 // unwinds the DB-wide byte counters it perturbed.
 //
 // Falsifying: commenting out the AccountObjectMemory block in DeleteExpiredStep's reaper branch
-// (verified by hand -- see task-2b-report.md) makes `after` come back equal to `before`, since
+// (verified by hand) makes `after` come back equal to `before`, since
 // nothing else in the reap path touches obj_memory_usage for a surviving container.
 //
 // drakeydb: P4-0 Task 2b, fix round 4 -- the `100000` passed to DeleteExpiredStep below is its
@@ -5045,7 +10442,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperRefreshesHashSearchIndex) {
 // client, not a write) must not see a spurious EXEC abort with no write having occurred.
 //
 // Falsifying: reverting the reaper's accounting call back to AutoUpdater::Run() (verified by
-// hand -- see task-2b-report.md) makes the EXEC below come back kExecFail instead of
+// hand) makes the EXEC below come back kExecFail instead of
 // kExecSuccess, purely from the reaper's own heartbeat-driven walk.
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotSpuriouslyAbortWatch) {
   const auto kExecSuccess = ArgType(RespExpr::ARRAY);
@@ -5083,7 +10480,7 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotSpuriouslyAbortWatch) {
 // clear.
 //
 // Falsifying: forcing ReaperClearMemberExpiration() to fire unconditionally instead of only on
-// complete_clean_pass (verified by hand -- see task-2b-report.md) does not break this specific
+// complete_clean_pass (verified by hand) does not break this specific
 // test (a genuinely clean pass looks the same either way) -- it's the companion test below,
 // MemberExpiryReaperUnclearedFlagPreservesTtlAcrossRdbRoundTrip, that catches an incorrect
 // clear; see that test's own falsification.

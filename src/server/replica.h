@@ -379,6 +379,12 @@ class DflyShardReplica : public ProtocolClient {
   void Pause(bool pause);
 
  private:
+  // drakeydb: P4-4 Task A10 -- threads executor_'s already-decided per-link LWW guard bit onto
+  // rdb_loader_'s own journal-blob applier; a no-op outside peer mode (executor_'s guard is
+  // already false there -- see the constructor). See the .cc definition for why this is its own
+  // method rather than inlined into FullSyncDflyFb's peer_mode_ block, its one call site.
+  void ApplyPeerFullSyncLwwGuard();
+
   // drakeydb: Phase 3 T6b -- adopts `master_lsn` (an incoming Op::LSN marker's payload) as
   // journal_rec_executed_'s new authoritative value; a no-op outside peer mode. See the .cc
   // definition for the full correctness argument (why this can never run the resume LSN ahead of

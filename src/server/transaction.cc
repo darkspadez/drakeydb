@@ -19,6 +19,7 @@
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/journal.h"
+#include "server/multimaster_lww.h"
 #include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/server_state.h"
@@ -174,8 +175,12 @@ Transaction::Transaction(const Transaction* parent, ShardId shard_id, std::optio
   // is the single construction point for every squashed-multi stub, incl. the general
   // multi_command_squasher.cc path) so a squashed MULTI/EXEC applied from a peer journals under
   // that peer's origin instead of echoing back to it as self-originated.
+  // drakeydb: P4-4 -- also inherit repl_lww_guard_ the same way: this ctor assigns members
+  // directly and bypasses SetReplOrigin (and thus PrepareTransaction), so a squashed stub built
+  // from a guarded parent would otherwise silently lose the bit.
   repl_origin_idx_ = parent->repl_origin_idx_;
   repl_mvcc_ = parent->repl_mvcc_;
+  repl_lww_guard_ = parent->repl_lww_guard_;
 }
 
 Transaction::~Transaction() {
@@ -732,9 +737,27 @@ void Transaction::RunCallback(EngineShard* shard) {
 
   shard->set_running_tx(this);
 
+  // drakeydb: P4-4 -- computed once, as a local, BEFORE the try block: RunCallback runs
+  // concurrently on several shard threads for one Transaction (one call per shard, each with its
+  // own EngineShard*), so the veto decision must never live on the Transaction itself -- doing so
+  // would race across shards for a multi-key command. See ShouldDropForLww's own comment
+  // (transaction.h) for why the compare runs here, under the key's lock, rather than pre-dispatch.
+  const bool lww_dropped = ShouldDropForLww(shard, db_slice);
+
   RunnableResult result;
   try {
-    result = (*cb_ptr_)(this, shard);
+    // drakeydb: P4-4 -- a dropped write's callback never runs at all: nothing is written, and
+    // (via LogAutoJournalOnShard's own lww_dropped parameter below) nothing is journaled either --
+    // every guarded kSingleKey name that would otherwise still auto-journal verbatim is either
+    // pre-dispatch rewritten by ApplyLwwRewrites (multimaster_lww.cc) to a name that isn't, or is
+    // CO::NO_AUTOJOURNAL itself; this early return is defense-in-depth against that invariant ever
+    // breaking, not dead code -- see GenericVetoSuppressesUnrewrittenAutoJournal
+    // (multi_master_test.cc) for a test that reaches it directly, bypassing the rewrite. An
+    // auto-journaled drop would otherwise still reach sub-replicas even though this node never
+    // actually wrote it. OpStatus::OK (never a non-OK status) so a fully dropped
+    // entry counts as successfully applied: signaling the drop any other way would either
+    // CHECK-fail the multi-shard path below or force a full resync on every LWW conflict.
+    result = lww_dropped ? RunnableResult{OpStatus::OK} : (*cb_ptr_)(this, shard);
 
     if (unique_shard_cnt_ == 1) {
       cb_ptr_.reset();  // We can do it because only a single thread runs the callback.
@@ -769,7 +792,7 @@ void Transaction::RunCallback(EngineShard* shard) {
 
   // Log to journal only once the command finished running
   if ((coordinator_state_ & COORD_CONCLUDING) || (multi_ && multi_->concluding)) {
-    LogAutoJournalOnShard(shard, result);
+    LogAutoJournalOnShard(shard, result, lww_dropped);
     MaybeInvokeTrackingCb();
   }
 
@@ -779,6 +802,43 @@ void Transaction::RunCallback(EngineShard* shard) {
   // epoch_end (declared at the top of this function) runs on scope exit, after every statement
   // above including this one -- not inside OnCbFinishBlocking, which runs before the journal
   // entry exists. See server/mvcc.h.
+}
+
+bool Transaction::ShouldDropForLww(EngineShard* shard, DbSlice& db_slice) const {
+  if (!IsLwwGuarded())
+    return false;
+
+  // drakeydb: P4-4 -- keyed on the JOURNALED name (cid_->name(), always upper-case in the command
+  // table), matching ClassifyJournaledCommand's own contract (multimaster_lww.h): a streamed
+  // apply's Transaction is built from the peer's already-journaled command name, so this IS that
+  // name, never the client-facing one the master may have normalized away.
+  if (ClassifyJournaledCommand(cid_->name()) != LwwClass::kSingleKey)
+    return false;
+
+  ShardArgs keys = GetShardArgs(shard->shard_id());
+  // drakeydb: P4-4 -- a kSingleKey command must, by construction, touch exactly one key on this
+  // shard. DCHECK makes a violation of that a hard failure in debug builds; a release build
+  // instead fails OPEN (never guesses which key to compare) and logs a throttled rollup, since
+  // guarding the wrong key would be worse than not guarding at all.
+  DCHECK_EQ(keys.Size(), 1u) << cid_->name();
+  if (keys.Size() != 1u) {
+    LOG_EVERY_T(ERROR, 60) << "multi-master LWW guard: " << cid_->name() << " touched "
+                           << keys.Size() << " keys on this shard, expected exactly 1 -- applying "
+                           << "unguarded rather than guessing which key to compare";
+    return false;
+  }
+
+  const std::optional<MvccStamp> incoming = IncomingStamp(repl_mvcc_, repl_origin_idx_);
+  if (!incoming)
+    return false;  // Unregistered origin; IncomingStamp already DCHECKed this should not happen.
+
+  const std::string_view key = keys.Front();
+  const std::optional<MvccStamp> stored = db_slice.GetMvcc(db_index_, key);
+  if (!LwwShouldDropKey(stored, *incoming))
+    return false;
+
+  NoteLwwDrop(cid_->name(), key);
+  return true;
 }
 
 // TODO: For multi-transactions we should be able to deduce mode() at run-time based
@@ -1565,6 +1625,28 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
   DCHECK(multi_ && multi_->role == SQUASHED_STUB);
   DCHECK_EQ(unique_shard_cnt_, 1u);
 
+  // drakeydb: P4-4 -- fail-open tripwire, not a guard: skips RunCallback's ShouldDropForLww veto.
+  // SQUASHED_STUB (and thus this function, via Transaction::Execute's own role check) is produced
+  // by the parent+shard_id stub constructor -- NOT atomic-squashing-only: DEBUG POPULATE builds
+  // one directly over an explicitly non-atomic SHARD_LOCAL parent (debugcmd.cc), and a classic
+  // Redis/KeyDB link's own single-shard EVAL script reaches here too (CanRunSingleShardMulti,
+  // main_service.cc, builds this same stub constructor over the script's own outer transaction,
+  // whatever mode that happens to be in). The classic link's OWN batching (replica.cc's
+  // ConsumeRedisStream -> DispatchSquashedBatch -> MultiCommandSquasher) does NOT reach here --
+  // it stays non-atomic end to end, building SHARD_LOCAL (not SQUASHED_STUB) per-shard
+  // transactions, so every command it squashes dispatches through ordinary RunCallback, where
+  // ShouldDropForLww DOES run -- but a classic link's EVAL is a second, independent way to reach
+  // this function, and it does. The tripwire below still never fires either way: the stub
+  // constructor copies repl_lww_guard_ from its own parent, and every transaction on the classic
+  // link -- squashed EVAL stub included -- traces back to the same connection whose
+  // repl_lww_guard is always false, so IsLwwGuarded() reads false here regardless of which route
+  // got a command to this function.
+  if (IsLwwGuarded()) {
+    LOG(DFATAL) << "multi-master LWW guard reached RunSquashedMultiCb: repl_mvcc_ is "
+                   "batch-level here, not per-command, and cannot be safely compared -- "
+                   "applying unguarded";
+  }
+
   auto* shard = EngineShard::tlocal();
   auto& db_slice = GetDbSlice(shard->shard_id());
 
@@ -1605,7 +1687,10 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
   }
   db_slice.OnCbFinishBlocking();
 
-  LogAutoJournalOnShard(shard, result);
+  // drakeydb: P4-4 -- always false here: RunSquashedMultiCb never consults ShouldDropForLww at
+  // all (see this function's own top comment) -- it always actually runs `cb` above -- so nothing
+  // on this path ever drops, and its own auto-journal must never be suppressed.
+  LogAutoJournalOnShard(shard, result, /*lww_dropped=*/false);
   MaybeInvokeTrackingCb();
 
   if (owns_running_tx)
@@ -1697,9 +1782,24 @@ optional<string_view> Transaction::GetWakeKey(ShardId sid) const {
   return full_args_[sd.wake_key_pos];
 }
 
-void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult result) {
+void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult result,
+                                        bool lww_dropped) {
   // TODO: For now, we ignore non shard coordination.
   if (shard == nullptr)
+    return;
+
+  // drakeydb: P4-4 -- a dropped write journals NOTHING, including the auto-journal. No guarded
+  // kSingleKey name reaches here still auto-journaling verbatim today (ApplyLwwRewrites,
+  // multimaster_lww.cc, rewrites SETNX/GETSET/GETDEL pre-dispatch, and RESTORE is
+  // CO::NO_AUTOJOURNAL now too, generic_family.cc) -- this early return is defense-in-depth
+  // against that invariant ever breaking; GenericVetoSuppressesUnrewrittenAutoJournal
+  // (multi_master_test.cc) reaches it directly, bypassing the rewrite, to prove it still works.
+  // Without it, a drop would still forward the client's original command to sub-replicas even
+  // though this node's own copy was never touched -- the exact divergence the veto exists to
+  // prevent. Checked before the SQUASHER/IsJournaled/journal() gates below only because it is
+  // cheapest; those gates are also correct for a dropped entry (result.status is OpStatus::OK, so
+  // they would not catch this on their own).
+  if (lww_dropped)
     return;
 
   // Ignore technical squasher hops.

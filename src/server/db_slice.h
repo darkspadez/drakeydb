@@ -372,6 +372,22 @@ class DbSlice {
   facade::OpResult<int64_t> UpdateExpire(const Context& cntx, Iterator prime_it,
                                          const ExpireParams& params);
 
+  // drakeydb: P4-4 -- read-only prediction of whether UpdateExpire, called with these exact
+  // params against this exact iterator's CURRENT expiry state, would be a pure no-op: the
+  // NX/XX/GT/LT condition unsatisfied (SKIPPED) or the deadline out of range (OUT_OF_RANGE) --
+  // either way, nothing gets mutated. A caller (OpExpire, generic_family.cc) that must decide
+  // whether to arm this key's mvcc slot BEFORE calling UpdateExpire needs this as a HINT for that
+  // decision only: UpdateExpire's own already-in-the-past branch calls Del(), which can invalidate
+  // `prime_it`, so the arm-or-not choice has to be made before any mutation is attempted, not
+  // after inspecting UpdateExpire's own return status. This predicate is never a behavioral gate --
+  // the caller must still call UpdateExpire unconditionally, on every node type, exactly as
+  // upstream does; if this prediction ever drifts from UpdateExpire's own logic, the worst case is
+  // a wrong arm choice (a benign extra arm, or a missed no-arm optimization), never a silently
+  // skipped EXPIRE. Returns false (never a no-op) for `persist` or an undefined params -- neither
+  // is a shape OpExpire's own callers produce, and persist's own no-op handling (OpPersist, above)
+  // is unrelated to this predicate.
+  bool WouldExpireBeNoop(Iterator prime_it, const ExpireParams& params, uint64_t now_ms) const;
+
   // Publishes the expired keyspace event; call AFTER the deletion has been journaled.
   void SendExpiredKeyEvent(const Context& cntx, std::string_view key) const;
 
@@ -393,9 +409,16 @@ class DbSlice {
   // Avoids the PrimeKey round-trip for callers that already have a string_view, notably the RDB
   // loader's explicit {0,0} fallback and tests. See db_slice.cc.
   void SetMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
-  // Ensures a zero-authority slot exists before the write enters the journal. Does not overwrite
-  // an existing stamp. This is the only allocation-capable half of journal-driven stamping.
-  void EnsureMvcc(DbIndex db_ind, std::string_view key);
+  // Ensures a zero-authority slot exists before the write enters the journal, and returns the
+  // stamp the slot held BEFORE this call -- a fresh {0,0} for a newly inserted slot, an existing
+  // live stamp left untouched, or a tombstone this call itself just cleared (see below). Callers
+  // that arm the key right after (PostUpdate, db_slice.cc) carry this on the arm as its
+  // pre-mutation stamp (drakeydb P4-4 Task A5): by the time journal::RecordEntry's
+  // Commit() runs, the slot may no longer hold it -- this call's own tombstone-clearing branch
+  // (below) can have already overwritten it, before any commit ever runs -- so the arm is the
+  // only place guaranteed to still have it. This is the only allocation-capable half of
+  // journal-driven stamping.
+  MvccStamp EnsureMvcc(DbIndex db_ind, std::string_view key);
   // Updates a slot prepared by EnsureMvcc. This is called only after AddLogRecord and therefore
   // must remain allocation-free; a missing slot is a fatal invariant violation -- CHECK-fails,
   // deliberately, even for a tombstone-flagged stamp (review fix I5: an earlier version of this
@@ -417,6 +440,24 @@ class DbSlice {
   // SetMvcc's insert-or-overwrite shape) rather than CHECK-failing -- unlike SetExistingMvcc
   // above, which no longer delegates here (review fix I5).
   void SetTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
+  // drakeydb: P4-4 -- installs `stamp` as an ABSENT key's tombstone: the caller has already
+  // established there is no live PrimeKey slot for `key` and that
+  // MergeAccepts(GetMvcc(db_ind, key), stamp) holds -- this call does not re-check either. Gated
+  // on TombstonesEnabled(), IsDbValid(db_ind), and capped at --multi_master_max_tombstones, the
+  // same would_grow/cap accounting PerformDeletionAtomic's own earns_tombstone branch
+  // (db_slice.cc) applies to a live delete's tombstone. Shared by RdbLoader::
+  // ApplyMergeTombstoneOnShard (rdb_load.cc), whose own no-resident-key install reaches the
+  // identical shape via a full sync, rather than copied a third time there; and by SetCmd::Set's
+  // already-expired absent-key branch, OpRestore, and Renamer::DeserializeDest (string_family.cc
+  // / generic_family.cc).
+  //
+  // NOTE: the same write landing on a PRESENT live key (stored S < incoming X) never reaches this
+  // call -- SetCmd::DeleteExpiredKey / OpRestore's found_prev branch deletes it through the
+  // ordinary path instead, committing FloorAppliedStamp(S, X) = X|tombstone, one origin_hash tick
+  // below this call's own ExpiryTombstoneFor(X) for the identical write against an absent key. Not
+  // a divergence -- no real stamp falls between the two (floored stamps never go on the wire), and
+  // a merge-load raises the lower one. This present-key path predates this call.
+  void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
   // drakeydb: Phase 4, P4-1 Task 8 -- same F4 split as SetMvcc above, for the same reason:

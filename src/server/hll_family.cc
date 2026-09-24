@@ -17,6 +17,8 @@ extern "C" {
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
+#include "server/multi_master.h"
+#include "server/multimaster_lww.h"
 #include "server/tiered_storage.h"
 #include "server/transaction.h"
 
@@ -317,7 +319,28 @@ OpResult<int> PFMergeInternal(string_view key, Transaction* tx, SinkReplyBuilder
   hll.resize(getDenseHllSize());
   createDenseHll(StringToHllPtr(hll));
   int result = pfmerge(ptrs.data(), ptrs.size(), StringToHllPtr(hll));
+  const ShardId dest_shard = Shard(key, shard_set->size());
   auto set_cb = [&](Transaction* t, EngineShard* shard) {
+    // drakeydb: P4-4 -- this callback runs on every shard the transaction touches (the
+    // destination plus every source key), not just the destination's own shard. Without this
+    // filter, each NON-owning shard's AddOrFind(key) below creates its own, independent, PHANTOM
+    // copy of the destination in that shard's own table (see D-25, docs/ISSUE-REGISTER.md) --
+    // upstream's own shape, mirrored here for a non-active node. On an active node that phantom
+    // gets its own arm and its own bare "SET key v" journal entry, racing the owning shard's
+    // full-state one: a guarded receiver applies both, and whichever lands second silently
+    // clobbers the TTL the first one carried. Filtered to the owning shard only, mirroring
+    // BITOP's own dest_shard filter (bitops_family.cc). A non-active node has no per-key stamp to
+    // protect and must see upstream's own (phantom-writing) shape exactly, so this filter is
+    // active-only.
+    //
+    // drakeydb: P4-4 -- shard->shard_id() != dest_shard first: this callback runs on every shard
+    // PFMERGE touches, and IsActiveReplica() is an uncached absl::GetFlag (multi_master.cc, see
+    // journal.cc's MvccEnabled() comment for this defect class); the shard-id compare is cheap
+    // and already computed, so it comes first.
+    if (shard->shard_id() != dest_shard && IsActiveReplica()) {
+      return OpStatus::OK;
+    }
+
     const OpArgs& op_args = t->GetOpArgs(shard);
     auto& db_slice = op_args.GetDbSlice();
     auto op_res = db_slice.AddOrFind(t->GetDbContext(), key, OBJ_STRING);
@@ -339,7 +362,17 @@ OpResult<int> PFMergeInternal(string_view key, Transaction* tx, SinkReplyBuilder
     res.post_updater.Run();
 
     if (op_args.shard->journal()) {
-      RecordJournal(op_args, "SET", ArgSlice{key, hll});
+      // drakeydb: P4-4 -- SetString above overwrites the VALUE in place, never touching the
+      // destination key's own TTL (TTL lives on the key, not the value) -- an existing,
+      // TTL-carrying destination keeps that TTL. A bare "SET key hll" would silently drop it on
+      // the receiver (the same partial-state defect SET ... KEEPTTL had), so an active node ships
+      // the destination's full state -- value, TTL, STICK, memcache flags -- through the shared
+      // builder instead; a non-active node keeps the exact upstream shape.
+      if (IsActiveReplica()) {
+        JournalFullStateSet(op_args, key, res.it->first, res.it->second);
+      } else {
+        RecordJournal(op_args, "SET", ArgSlice{key, hll});
+      }
     }
 
     return OpStatus::OK;

@@ -27,6 +27,8 @@ extern "C" {
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/family_utils.h"
+#include "server/mvcc.h"
+#include "server/namespaces.h"
 #include "server/search/doc_index.h"
 #include "server/tiered_storage.h"
 #include "server/tiering/decoders.h"
@@ -202,10 +204,16 @@ struct HMapWrap {
 
 // Delete if length is zero
 //
-// This is a third DEL-derivation path, distinct from DeleteIfEmpty below. Most callers can
-// suppress this local conclusion on mesh-peer links because the active-mode reaper guarantees
-// convergence in every namespace and DB. A condition whose replay can change under clock skew
-// must opt out so its peer sees the deletion before evaluating the condition.
+// Distinct from DeleteIfEmpty below: this path is for a WRITE that empties the hash as a direct
+// consequence of the fields it explicitly touched (ExecuteW's own call, below -- e.g. HDEL
+// removing the last field), so its derived DEL keeps that write's own freshly minted stamp --
+// every peer applying the same replicated write command reaches the identical empty-hash
+// conclusion on its own, so suppressing this DEL on mesh-peer links costs nothing. A READ-ONLY
+// emptying (ExecuteRO, below) can only be caused by lazy field-TTL expiry, never by a command this
+// function itself runs, and goes through DeleteIfEmpty instead, so its tombstone derives from the
+// hash's own prior stamp rather than minting fresh at read/reap time. A condition whose replay
+// can change under clock skew (CheckHSetExCondition's own call, further below) must opt out of
+// suppression altogether so its peer sees the deletion before evaluating the condition.
 void DeleteHw(HMapWrap& hw, const OpArgs& op_args, std::string_view key,
               bool suppress_peer = true) {
   auto& db_slice = op_args.GetDbSlice();
@@ -275,8 +283,15 @@ OpResult<T> ExecuteRO(Transaction* tx, F&& f) {
     HMapWrap hw{pv, op_args.db_cntx};
     auto res = f(hw);
 
-    if (hw.Length() == 0)  // Expirations might have emptied it
-      DeleteHw(hw, op_args, key);
+    // Expirations might have emptied it -- a read-only callback cannot itself explicitly remove
+    // a field, so this can only be lazy field-TTL expiry. Route through DeleteIfEmpty (not
+    // DeleteHw, below): its tombstone derives from the hash's own prior stamp (ExpiryTombstoneFor,
+    // mvcc.h), never a fresh mint at read time, matching every other lazy-field-expiry caller of
+    // DeleteIfEmpty (HTTL/HPEXPIRETIME, HRANDFIELD) -- a fresh mint here would carry no more real
+    // authority than the moment this read happened to run, and could wrongly outrank a peer write
+    // with real authority over this key that this node has not seen yet.
+    if (hw.Length() == 0)
+      HSetFamily::DeleteIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, pv);
 
     // Move result into variant or keep error status
     RETURN_ON_BAD_STATUS(res);
@@ -1669,8 +1684,45 @@ bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std:
       // unaffected. (SetFamily::DeleteSetIfEmpty, set_family.cc, has an analogous second
       // carve-out for SORT -- OBJ_HASH is not one of SORT's sortable types, so it never reaches
       // this helper.)
+      //
+      // drakeydb: P4-4 -- the `derived` branch's own tombstone must derive from the hash's own
+      // prior stamp (`ExpiryTombstoneFor`, mvcc.h -- one origin_hash tick above it), mirroring
+      // the member-expiry reaper (DbSlice::DeleteReapedContainer, db_slice.cc): this DEL is
+      // peer-suppressed (kEntryFlagDerived), exactly the shape RecordExpiryBlocking's own
+      // whole-key expiry has, so a freshly minted local stamp here is the identical reap-time-
+      // stamp defect. The `else` branch (OpFieldExpire's carve-out) is UNCHANGED: that DEL IS
+      // forwarded to peers (via the plain RecordDelete below, never suppressed), so it must keep
+      // carrying the causing command's own stamp (db_cntx.repl_mvcc, applied or local), never an
+      // expiry-style advance of the hash's OLD prior stamp -- a peer replaying this exact command
+      // needs to see the SAME stamp this node just committed, not a different one derived from
+      // data the peer never had.
       if (derived) {
-        RecordDerivedDelete(db_cntx, key);
+        MvccStamp committed;
+        const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
+            db_cntx.db_index, key,
+            [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
+                         const MvccStamp&) {
+              // drakeydb: P4-4 -- has_prior_stamp false means the hash's own
+              // pre-delete stamp was never real (see CommitOwnTombstone's own comment, mvcc.h):
+              // erase the slot rather than install an unsafe Mvcc()==0 tombstone.
+              if (has_prior_stamp) {
+                committed = st;
+                namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+              } else {
+                namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
+              }
+            });
+        if (found_tombstone) {
+          DCHECK_EQ(MvccStamper::tlocal()->ArmedCount(), 0u)
+              << "a sibling key was still armed when this derived DEL's own RecordEntry call was "
+                 "about to run its generic per-arm sweep -- that sweep would floor the sibling "
+                 "against this tombstone's own stamp instead of its real author stamp";
+          DbContext patched_cntx = db_cntx;
+          patched_cntx.repl_mvcc = committed.Mvcc();
+          RecordDerivedDelete(patched_cntx, key);
+        } else {
+          RecordDerivedDelete(db_cntx, key);
+        }
       } else {
         RecordDelete(db_cntx, key);
       }

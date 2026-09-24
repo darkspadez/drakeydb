@@ -21,6 +21,7 @@
 #include "server/cluster_support.h"
 #include "server/common.h"
 #include "server/journal/types.h"
+#include "server/multimaster_lww.h"
 #include "server/tx_base.h"
 #include "util/fibers/synchronization.h"
 
@@ -351,6 +352,9 @@ class Transaction {
     DbContext ctx{namespace_, db_index_, time_now_ms_};
     ctx.repl_origin_idx = repl_origin_idx_;
     ctx.repl_mvcc = repl_mvcc_;
+    // drakeydb: P4-4 -- mirrors repl_origin_idx_/repl_mvcc_ above; see DbContext::repl_lww_guard
+    // (tx_base.h).
+    ctx.repl_lww_guard = repl_lww_guard_;
     return ctx;
   }
 
@@ -379,9 +383,22 @@ class Transaction {
   // per dispatch in PrepareTransaction (main_service.cc); squashed-multi stub transactions
   // instead inherit it directly from their parent (see the parent/shard_id/slot_id constructor)
   // since they never go through PrepareTransaction.
-  void SetReplOrigin(uint32_t origin_idx, uint64_t mvcc) {
+  // drakeydb: P4-4 -- `lww_guard` (the connection's repl_lww_guard) has no default: every caller
+  // must decide explicitly rather than silently defaulting to unguarded or guarded. Read back by
+  // IsLwwGuarded() below, which ShouldDropForLww (transaction.cc) consults for every guarded
+  // single-key command's veto.
+  void SetReplOrigin(uint32_t origin_idx, uint64_t mvcc, bool lww_guard) {
     repl_origin_idx_ = origin_idx;
     repl_mvcc_ = mvcc;
+    repl_lww_guard_ = lww_guard;
+  }
+
+  // drakeydb: P4-4 -- true only on a guarded peer link (repl_lww_guard_) AND a non-zero author
+  // stamp (a zero mvcc -- classic Redis/KeyDB link, or a DFLY link to a non-active node -- is
+  // never guarded). Delegates to multimaster_lww.h's single predicate rather than re-implementing
+  // the rule; consulted by ShouldDropForLww (transaction.cc, below) for every kSingleKey command.
+  bool IsLwwGuarded() const {
+    return LwwGuardActive(repl_lww_guard_, repl_mvcc_);
   }
 
   // Re-enable auto journal for commands marked as NO_AUTOJOURNAL. Call during setup.
@@ -595,7 +612,29 @@ class Transaction {
 
   // Log command in shard's journal, if this is a write command with auto-journaling enabled.
   // Should be called immediately after the last hop.
-  void LogAutoJournalOnShard(EngineShard* shard, RunnableResult shard_result);
+  // drakeydb: P4-4 -- `lww_dropped` has no default: every caller must say explicitly whether the
+  // hop it is logging for actually ran its callback. RunCallback passes its own veto flag;
+  // RunSquashedMultiCb always passes false -- it never runs ShouldDropForLww at all, only a
+  // LOG(DFATAL) tripwire for the case where IsLwwGuarded() somehow reads true there anyway (see
+  // its own definition, transaction.cc).
+  void LogAutoJournalOnShard(EngineShard* shard, RunnableResult shard_result, bool lww_dropped);
+
+  // drakeydb: P4-4 -- the generic single-key LWW veto RunCallback consults for its own drop
+  // decision. True iff this shard's own callback for the current command must be skipped because
+  // a strictly newer (or tied, favoring stored) local stamp already exists for its one key. Only
+  // classifies kSingleKey journaled names (SET, SETNX, GETSET, GETDEL, RESTORE);
+  // kMultiKeySelfGuarded (MSET, DEL) and kUnguarded names always return false here --
+  // MSET/DEL guard themselves per-key inside their own Op functions because GetShardArgs on MSET
+  // yields keys AND values in one contiguous range, which this generic helper cannot tell apart.
+  //
+  // The compare runs HERE, inside RunCallback, under this key's shard-thread execution (which
+  // Dragonfly's intent-lock scheduling serializes against every other write to the same key) --
+  // never pre-dispatch. A pre-dispatch check reads the stamp before the key is actually locked
+  // for this hop; a local write could land in the window between that read and the apply, and the
+  // dropped peer write would then never be retried -- a permanent, silent divergence instead of a
+  // merely reordered one. `db_slice` is the caller's own GetDbSlice(shard->shard_id()) -- passed
+  // in rather than looked up again here.
+  bool ShouldDropForLww(EngineShard* shard, DbSlice& db_slice) const;
 
   // Whether the callback can be run directly on this fiber without dispatching on the shard queue.
   // It checks internally that there are no possible suspension points.
@@ -696,6 +735,11 @@ class Transaction {
   // that header into one of the most widely-included headers in the tree.
   uint32_t repl_origin_idx_{0};
   uint64_t repl_mvcc_{0};
+
+  // drakeydb: P4-4 -- the streaming LWW guard's per-link bit, mirroring repl_origin_idx_/
+  // repl_mvcc_ above (see SetReplOrigin/IsLwwGuarded). False for an ordinary client-issued
+  // transaction and for a non-guarded apply (plain replica, classic link, flag off).
+  bool repl_lww_guard_{false};
 
   std::atomic_uint32_t use_count_{0};  // transaction exists only as an intrusive_ptr
 

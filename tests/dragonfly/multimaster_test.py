@@ -1742,28 +1742,44 @@ async def test_three_node_mesh_converges_without_forwarding(df_factory: DflyInst
 async def test_three_node_mesh_reconverges_after_kill_and_restart(
     df_factory: DflyInstanceFactory, tmp_path, port_picker
 ):
-    """P3 T11 item 2: kills one node of a live 3-node mesh (SIGKILL, mid write-load -- not a
-    clean REPLICAOF REMOVE or graceful shutdown) and restarts it from its own on-disk snapshot,
-    re-attaching via --replicaof boot flags (test_fanin_restart_remerge's restart pattern,
-    extended here to a true reciprocal mesh instead of one-way fan-in into a single active node).
-    The two survivors' own REPLICAOF-to-C links are never torn down, so they auto-reconnect on
-    their own once C's port reopens (replica.cc's reconnect loop, FLAGS_master_reconnect_timeout_
-    ms) -- this test never re-issues REPLICAOF on A or B, only on the restarted C, and gates
-    purely on wait_for_peers to prove the auto-reconnect actually happens, not just that a fresh
-    REPLICAOF would work.
+    """Kills one node of a live 3-node mesh (SIGKILL, mid
+    write-load -- not a clean REPLICAOF REMOVE or graceful shutdown) and restarts it from its own
+    on-disk snapshot, re-attaching via --replicaof boot flags (test_fanin_restart_remerge's
+    restart pattern, extended here to a true reciprocal mesh instead of one-way fan-in into a
+    single active node). The two survivors' own REPLICAOF-to-C links are never torn down, so they
+    auto-reconnect on their own once C's port reopens (replica.cc's reconnect loop,
+    FLAGS_master_reconnect_timeout_ms) -- this test never re-issues REPLICAOF on A or B, only on
+    the restarted C, and gates purely on wait_for_peers to prove the auto-reconnect actually
+    happens, not just that a fresh REPLICAOF would work.
 
-    CRITICAL -- do not "fix" this: the assertions below check MUTUAL convergence, never that a
-    specific (e.g. newest) write survives. On restart, C loads its OWN on-disk snapshot BEFORE
-    the peer full syncs from A and B land on top of it, and every one of those three loads uses
-    plain AddOrUpdate, so whichever of {C's own snapshot, A's full sync, B's full sync} happens
-    to apply LAST for a given key wins -- regardless of which write is actually newer. This is
-    not a bug to fix here: SetOverrideExistingKeys(true), passed on every peer full-sync load, is
-    currently behaviourally INERT (rdb_load.cc only gates a LOG(WARNING) on it; AddOrUpdate
-    overwrites unconditionally either way) -- true last-write-wins needs MVCC timestamps, which
-    land in a later phase (see the task brief). This test manufactures exactly that conflict on
-    purpose (the "conflict-key" below: C writes it, then dies; A writes a DIFFERENT value for the
-    SAME key while C is down) and asserts only that all three nodes agree on ONE value afterward,
-    never which one -- so nobody "fixes" this test into asserting newest-wins before P6 lands.
+    Originally (P3, before merge-LWW) this test could only assert MUTUAL convergence, never which
+    value survived: on restart, C loads its OWN on-disk snapshot BEFORE the peer full syncs from A
+    and B land on top of it, and every one of those three loads used to be a plain, unconditional
+    AddOrUpdate, so whichever of {C's own snapshot, A's full sync, B's full sync} happened to apply
+    LAST for a given key won, regardless of which write was actually newer.
+
+    Merge-LWW (P4-3 Task 4) is what changed that: a peer-mode full sync also gets
+    SetMergeLww(true, ...) (replica.cc:800 for a classic-protocol peer, replica.cc:1479 for a
+    DFLY-protocol one -- gated on peer_mode_, replica.cc:1465), so CreateObjectOnShard
+    (rdb_load.cc) compares every incoming key against C's own resident stamp via MergeAccepts
+    BEFORE any mutation and returns early -- skipping the key outright -- when the resident side
+    wins (rdb_load.cc:3837, reconfirmed authoritatively at :3864 after the loader's own last
+    possible yield point). SetOverrideExistingKeys(true) -- passed on every DFLY-protocol full
+    sync, peer or plain (replica.cc:1457, unconditional), but only on a PEER-mode classic-protocol
+    one (replica.cc:787, inside its own IsPeerMode() branch -- a plain classic replica flushes
+    first instead, so there is nothing resident left to override) -- was never the gate this
+    docstring used to blame for "last-loaded-wins": it has exactly one reader (rdb_load.cc:3939),
+    and that reader only decides whether a duplicate
+    key logs a LOG(WARNING) -- it has never controlled whether an incoming value replaces a
+    resident one, on any full sync, peer or plain. What made "whichever load applies last wins"
+    true before P4-3 was simply that nothing compared stamps at all; merge_lww_'s own early-return
+    above is the new, separate gate that makes it false now, for peer links specifically.
+
+    The conflict this test manufactures on purpose -- C writes "conflict-key", then dies; A writes
+    a DIFFERENT value for the SAME key, strictly LATER in real time, while C is down -- therefore
+    now has a deterministic, checkable answer: A's post-kill write is the only one of the two with
+    a genuinely newer stamp, so it must be the value every node ends up with, carrying A's origin,
+    once C rejoins and its stale on-disk copy loses the merge compare.
 
     Falsifying (verified by hand; full transcript in task-11-report.md): same revert as
     test_three_node_mesh_converges_without_forwarding's docstring. Round 1 (before
@@ -1790,6 +1806,32 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
     reachable by driving it directly (a stub whose `info("persistence")` always reports
     `loading: 1`): `Failed: node still LOADING (INFO persistence) 0.3s after restart`, 0.42s
     total -- see task-11-report.md for the full transcript of both rounds.
+
+    The vector that could resurrect "c-before-kill" is NOT a partial resync replaying old journal
+    entries: master_replid_ is a fresh random hex minted once per process in ServerFamily's own
+    ctor (server_family.cc:1229), never persisted, so C2 (a brand-new process, even with the same
+    --dir/--dbfilename) boots with a different one than C had. A's and B's PRE-EXISTING links to
+    C notice the changed id in HandleCapaDflyResp (replica.cc:662) and, since
+    --break_replication_on_master_restart defaults false, reset last_journal_LSNs_ (replica.cc:670)
+    instead of aborting; InitiateDflySync then requests every flow with no LSN
+    (replica.cc:1000-1002) -- a fresh FULL sync of C2, not a resumed stream. C2's own two
+    --replicaof links (to A and B) are separately-new full syncs too. So "c-before-kill" would
+    reach A and B only by riding C2's just-loaded, verbatim on-disk snapshot through THEIR full
+    sync of C2, landing on the exact same CreateObjectOnShard merge compare described above --
+    never through anything on the streaming path.
+
+    Falsifying the STRENGTHENED (newest-wins) assertion below (verified by hand, one run):
+    narrowed to hit only that merge compare, not the streaming guard which also calls
+    MergeAccepts (via LwwShouldDropKey) -- temporarily forced both of rdb_load.cc's merge_lww_
+    gates (the fast-path check at :3837 and the authoritative recheck at :3858) to `false`,
+    leaving mvcc.h's MergeAccepts itself, and therefore every streaming-guard test in this file,
+    untouched. Rebuilt, ran this test once:
+
+        AssertionError: ('c-before-kill', 'c-before-kill', 'c-before-kill')
+
+    identical to the outcome the broader (MergeAccepts-wide) revert produced, confirming the
+    full-sync merge compare alone -- not the streaming guard -- is what this assertion depends on.
+    Reverted both lines before committing.
     """
     c_port = port_picker.get_available_port()
     a = df_factory.create(**active_args())
@@ -1825,8 +1867,13 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
         await task_c  # the kill above breaks c_c's connection; swallow whatever surfaces
 
     # A and B keep converging with each other while C is gone; overwrite the shared key so C's
-    # stale disk copy has something to (legitimately) clash with once it rejoins.
+    # stale disk copy has something to (legitimately) clash with once it rejoins. Captured right
+    # after the write, on the authoring node, per multimaster_merge_test.py's own ground-truth
+    # idiom: this is what "A's origin" below is checked against.
     await c_a.set("conflict-key", "a-while-c-down")
+    expected_origin = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "conflict-key"))[
+        "origin"
+    ]
     await wait_for_value(c_b, "conflict-key", "a-while-c-down")
 
     async with async_timeout.timeout(30):
@@ -1852,13 +1899,20 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
 
     await reconverged()
 
-    # Mutual convergence, NOT newest-wins -- see docstring. Either real write is an acceptable
-    # outcome; the only thing that must never happen is the three nodes disagreeing.
+    # NEWEST-STAMP-WINS (strengthened from the original mutual-convergence-only check -- see
+    # docstring): A's post-kill write is the only one of the two with a genuinely newer stamp,
+    # so it -- specifically, not "whichever value" -- must be what every node holds, with A's own
+    # origin, once C's stale on-disk copy has lost the merge compare on rejoin.
     val_a = await c_a.get("conflict-key")
     val_b = await c_b.get("conflict-key")
     val_c = await c_c2.get("conflict-key")
-    assert val_a == val_b == val_c
-    assert val_a in ("a-while-c-down", "c-before-kill")
+    assert val_a == val_b == val_c == "a-while-c-down", (val_a, val_b, val_c)
+    origin_a = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "conflict-key"))["origin"]
+    origin_b = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "conflict-key"))["origin"]
+    origin_c = _parse_mvcc(await c_c2.execute_command("debug", "mvcc", "conflict-key"))["origin"]
+    assert (
+        origin_a == origin_b == origin_c == expected_origin
+    ), f"expected A's origin {expected_origin}, got a={origin_a} b={origin_b} c={origin_c}"
 
     assert await c_a.dbsize() >= 500  # not vacuous -- real seeder load merged from both survivors
     assert await c_c2.set("after:restart", "ok")  # mesh still writable everywhere post-restart
@@ -2450,3 +2504,415 @@ async def test_stamps_survive_full_sync_and_restart(df_factory, tmp_path):
         assert (
             stamp_after["origin"] == stamps_before[key]["origin"]
         ), f"{key}: restart changed the origin: {stamp_after} != {stamps_before[key]}"
+
+
+# ---- Phase 4: streaming LWW guard (P4-4, Task A13) ----
+#
+# End-to-end, socket-level proof of the streaming (stable-sync) LWW guard: the per-link bit
+# `peer_mode_ && IsActiveReplica() && --multi_master_stream_lww`, read once at flow setup
+# (DflyShardReplica's constructor, replica.cc), and the per-write compare it gates
+# (Transaction::ShouldDropForLww / OpMSet's and OpDelV2's own self-guarded per-key loop,
+# multimaster_lww.h's LwwShouldDropKey). Every test below uses proxy.pause()/resume()
+# (tests/dragonfly/proxy.py) as the mechanism that forces a specific arrival order -- not an
+# eventually-consistent retry race manufacturing one by luck: DflyShardReplica's flow sockets
+# (main link and every shard flow) all dial the SAME address the top-level Replica was configured
+# with, so replacing a node's REPLICAOF target with a proxy address transparently intercepts every
+# socket for that link, including ones opened after the proxy was created. Two narrow, bounded
+# exceptions to "no sleeps" exist and are each documented at their own use: _pause_and_settle
+# (below) uses one fixed settle delay to work around a real TOCTOU in pause() itself, and a few
+# tests add a short explicit wall-clock gap between two writes to keep two independently-minted
+# MvccStamps from tying on their millisecond component (see test 1's own comment on that race).
+
+
+async def _own_origin(c, marker_key):
+    """Ground truth for `c`'s own author-origin hash: write a fresh, node-local key and read its
+    stamp back. MvccStamper::OriginHash(kSelfIdx) is a fixed, uuid-derived value for this node, so
+    any key `c` writes locally (and that no peer ever overwrites) reports that same origin -- the
+    same "read the stamp back on the authoring node" idiom multimaster_merge_test.py's _Model
+    uses for its own ground truth.
+    """
+    await c.set(marker_key, "own")
+    return _parse_mvcc(await c.execute_command("debug", "mvcc", marker_key))["origin"]
+
+
+async def _pause_and_settle(proxy, sender_c, marker_key):
+    """proxy.pause() (tests/dragonfly/proxy.py) clears an asyncio.Event that forward_requests/
+    forward_responses only re-check at the TOP of their loop, before blocking on the connection's
+    next `reader.read()` -- it cannot retroactively stop a read() call that was already pending
+    (past that same check) the instant pause() was called, which is true of an otherwise-idle
+    connection essentially always. So a fresh pause() can still let exactly ONE more chunk through
+    before it actually takes hold. Sending one disposable write here and letting it settle --
+    whether it leaks through or queues up, either outcome is fine -- consumes that one chunk, so
+    the NEXT write on the SAME flow -- the one carrying `marker_key`'s own shard, not necessarily
+    every other shard's flow on a multi-shard node, see _find_same_shard_keys -- is reliably held
+    until resume(). This also depends on the 0.3s sleep being long enough for `marker_key`'s write
+    to actually leave `sender_c`'s process and reach the paused proxy's stalled read() before this
+    returns: comfortably true on localhost, but a real timing bound, not an unconditional guarantee.
+    """
+    proxy.pause()
+    await sender_c.set(marker_key, "settle")
+    await asyncio.sleep(0.3)
+
+
+async def _wait_drained(sender_c, receiver_c, marker_key, marker_value="drained"):
+    """Prove every write already queued on this link has been applied (accepted or
+    guard-dropped) on the receiver, without racing a fixed sleep against the stream: a shard's
+    journal is strictly FIFO, so a fresh marker write issued now cannot land on the receiver
+    before anything queued on the same shard earlier. The marker is always a brand-new key, so
+    MergeAccepts(None, incoming) is unconditionally true (mvcc.h) regardless of the guard --
+    landing proves the stream drained, not that the marker itself survived a compare.
+    """
+    await sender_c.set(marker_key, marker_value)
+    await wait_for_value(receiver_c, marker_key, marker_value)
+
+
+async def _find_same_shard_keys(
+    df_factory: DflyInstanceFactory, proactor_threads, tmp_path, count=3
+):
+    """`count` key names that all land on the SAME shard, discovered the same way
+    _find_cross_shard_sort_keys (above) discovers two that land on DIFFERENT ones -- a throwaway
+    active-replica probe with the target proactor_threads, discarded before the real test's nodes
+    exist. MSET's own keys are not guaranteed to co-locate just because they share a `{tag}`:
+    sharding.cc's Shard() hashes each key independently unless the server also runs with
+    --lock_on_hashtags or cluster mode, neither of which this test uses -- probing real placement
+    sidesteps that rather than relying on hashtag syntax that would not actually be in effect.
+
+    A third (or later) key beyond the first two matters here specifically because with more than
+    one shard, a link's per-shard flow connections each race their OWN independent instance of the
+    _pause_and_settle TOCTOU (see that helper's own comment): settling with a key on the WRONG
+    shard leaves the tested shard's own flow connection un-settled, so a caller that pauses and
+    settles before writing to two same-shard keys needs its settle key confirmed on that SAME
+    shard too, not just any key.
+    """
+    probe = df_factory.create(
+        proactor_threads=proactor_threads,
+        active_replica="true",
+        dir=str(tmp_path / "same-shard-probe"),
+    )
+    probe.start()
+    try:
+        c = probe.client()
+        try:
+            src = "mset-k1"
+            src_shard = _parse_mvcc(await c.execute_command("debug", "mvcc", src))["shard"]
+            found = [src]
+            for i in range(64):
+                if len(found) >= count:
+                    break
+                dst = f"mset-k2-{i}"
+                dst_shard = _parse_mvcc(await c.execute_command("debug", "mvcc", dst))["shard"]
+                if dst_shard == src_shard:
+                    found.append(dst)
+            if len(found) < count:
+                raise AssertionError(
+                    f"could not find {count} keys hashing to the same shard, got {found}"
+                )
+            return found, src_shard
+        finally:
+            await c.aclose()
+    finally:
+        probe.stop()
+
+
+@pytest.mark.parametrize("stream_lww", [True, False], ids=["guarded", "unguarded"])
+async def test_stream_lww_newer_local_write_survives_stale_peer_write(
+    df_factory: DflyInstanceFactory, proxy_factory, stream_lww
+):
+    """B is a peer of A through a proxy. While the proxy is paused, A writes `k` (an
+    older stamp) and B writes its OWN, later `k` (a newer stamp, minted directly on B with no
+    compare at all -- a local write is never guarded). Only once both writes exist does the proxy
+    resume, so A's stale write reaches B's guarded receiving flow strictly after B's own fresher
+    value is already the one stored -- the guard bit is `peer_mode_ && IsActiveReplica() &&
+    --multi_master_stream_lww` (replica.cc), read once at flow setup, so it is this
+    parametrization on B's own flag that flips it.
+
+    With the guard on, B's flow LWW-compares A's incoming write against its own newer stamp
+    (LwwShouldDropKey -- exactly !MergeAccepts(stored, incoming), mvcc.h) and drops it: B keeps
+    "fresh", the surviving stamp's origin is B's own, and multimaster_lww_dropped advances. With
+    the guard off, B applies in plain arrival order and A's stale write clobbers B's fresher one.
+
+    Falsifying: this parametrization IS the falsification -- ids=["guarded", "unguarded"] runs
+    the identical body with only B's --multi_master_stream_lww flag flipped; "unguarded" reaches
+    the else-branch below (asserting the pre-guard arrival-order outcome, "stale") instead of the
+    if-branch's guarded assertions, so a body that only ever exercised one of the two branches
+    would fail the other parametrization outright.
+    """
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args(multi_master_stream_lww=str(stream_lww).lower()))
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    proxy = await proxy_factory(a.port)
+    await attach(c_b, proxy)
+    await wait_for_peers(c_b, 1)
+
+    baseline_dropped = int((await c_b.info("replication"))["multimaster_lww_dropped"])
+
+    await _pause_and_settle(proxy, c_a, "settle-marker-1")
+    await c_a.set("k", "stale")
+    await asyncio.sleep(0.1)  # real wall-clock gap: A and B mint stamps independently, and a
+    # sub-millisecond gap could tie on the ms component and fall to an origin-hash tie-break that
+    # does not respect real time (MvccStamp's Mvcc() packs ms << 20 | counter, mvcc.h).
+    await c_b.set("k", "fresh")
+    proxy.resume()
+
+    await _wait_drained(c_a, c_b, "drain-marker-1")
+
+    # _pause_and_settle only reliably settles the flow carrying the settle key's OWN shard (see
+    # its own docstring); assert "k" shares that shard so this test cannot silently start racing
+    # again if active_args()'s default proactor_threads (and therefore num_shards) ever changes.
+    assert (
+        _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))["shard"]
+        == _parse_mvcc(await c_b.execute_command("debug", "mvcc", "settle-marker-1"))["shard"]
+    )
+
+    if stream_lww:
+        assert await c_b.get("k") == "fresh"
+        stamp_k = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
+        own_origin_b = await _own_origin(c_b, "b-own-marker-1")
+        assert stamp_k["origin"] == own_origin_b, f"k's origin is not B's own: {stamp_k}"
+        dropped = int((await c_b.info("replication"))["multimaster_lww_dropped"])
+        assert dropped >= baseline_dropped + 1, f"dropped counter did not advance: {dropped}"
+    else:
+        assert await c_b.get("k") == "stale"
+
+    unstamped = int((await c_b.info("replication"))["mvcc_unstamped_writes"])
+    assert unstamped == 0, f"unstamped writes leaked: {unstamped}"
+
+
+async def test_stream_lww_dropped_counter_renders_as_prometheus_metric(
+    df_factory: DflyInstanceFactory, proxy_factory
+):
+    """dragonfly_multimaster_lww_dropped_total must actually render on /metrics, not
+    only in INFO replication. Reuses
+    test_stream_lww_newer_local_write_survives_stale_peer_write's own forced-drop setup (B is a
+    peer of A through a paused proxy; A's stale write reaches B strictly after B's own fresher
+    write, so B's guard drops it) to make the counter advance on an ACTIVE node, then checks:
+      - the metric is present on B and its value equals INFO replication's own count;
+      - the metric is entirely ABSENT -- never printed as 0 -- on a plain, non-active node.
+
+    Falsifying: dropping metrics.cc's `if (IsActiveReplica())` gate around this metric's
+    AppendMetricWithoutLabels call makes the non-active assertion below fail (the key would be
+    present, at 0, instead of absent entirely).
+    """
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    proxy = await proxy_factory(a.port)
+    await attach(c_b, proxy)
+    await wait_for_peers(c_b, 1)
+
+    await _pause_and_settle(proxy, c_a, "settle-marker-prom")
+    await c_a.set("k", "stale")
+    await asyncio.sleep(0.1)  # real wall-clock gap -- see the sibling test's own comment above
+    await c_b.set("k", "fresh")
+    proxy.resume()
+
+    await _wait_drained(c_a, c_b, "drain-marker-prom")
+    assert await c_b.get("k") == "fresh"
+
+    info_dropped = int((await c_b.info("replication"))["multimaster_lww_dropped"])
+    assert info_dropped > 0, "sanity: the forced drop above must have advanced the counter"
+
+    metrics_b = await b.metrics()
+    assert (
+        "dragonfly_multimaster_lww_dropped" in metrics_b
+    ), "dragonfly_multimaster_lww_dropped_total must render on /metrics on an active node"
+    samples = metrics_b["dragonfly_multimaster_lww_dropped"].samples
+    assert len(samples) == 1, samples
+    assert (
+        samples[0].value == info_dropped
+    ), f"/metrics ({samples[0].value}) must agree with INFO replication ({info_dropped})"
+
+    plain = df_factory.create(proactor_threads=2)
+    plain.start()
+    metrics_plain = await plain.metrics()
+    assert (
+        "dragonfly_multimaster_lww_dropped" not in metrics_plain
+    ), "the counter must be entirely absent -- not printed as 0 -- on a non-active node"
+
+
+async def test_stream_lww_bidirectional_conflict_converges_on_newer_origin(
+    df_factory: DflyInstanceFactory, proxy_factory
+):
+    """A and B are RECIPROCAL peers, each through its own proxy. Both proxies are
+    paused BEFORE either side writes `k`: A writes first, B strictly later (a real wall-clock gap,
+    well over the localhost clock-skew tolerance test_peer_clock_skew_reported measures, so B's
+    stamp is genuinely the newer one) -- with both directions frozen, neither side's write can
+    have been influenced by having already seen the other's. Resuming both then races A's stale
+    write into B (which must drop it) and B's fresh write into A (which must accept it).
+
+    Under plain arrival order (no guard), THIS EXACT schedule has a deterministic, and wrong,
+    outcome, not merely an unpredictable one: each side has exactly one entry queued for the
+    other, so on resume each side just adopts whatever it receives, unconditionally -- A adopts
+    B's queued "b-later", B adopts A's queued "a-first" -- and the two nodes' values SWAP (A ends
+    on "b-later", B ends on "a-first") and disagree with EACH OTHER, not merely with which value
+    "should" have won. Only both sides applying the same stamp-based rule explains BOTH nodes
+    converging on B's value AND reporting the SAME origin for it afterward.
+    """
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    proxy_to_a = await proxy_factory(a.port)  # B's link to A
+    proxy_to_b = await proxy_factory(b.port)  # A's link to B
+    await attach(c_b, proxy_to_a)
+    await wait_for_peers(c_b, 1)
+    await attach(c_a, proxy_to_b)
+    await wait_for_peers(c_a, 1)
+
+    # Ground truth for "B's own origin", established independently of the conflict below.
+    own_origin_b = await _own_origin(c_b, "origin-marker-b")
+    baseline_dropped_b = int((await c_b.info("replication"))["multimaster_lww_dropped"])
+
+    await _pause_and_settle(proxy_to_a, c_a, "settle-marker-2a")
+    await _pause_and_settle(proxy_to_b, c_b, "settle-marker-2b")
+    await c_a.set("k", "a-first")
+    await asyncio.sleep(0.5)  # real wall-clock gap, well over LOCALHOST_SKEW_TOLERANCE_MS (250ms)
+    await c_b.set("k", "b-later")
+    proxy_to_a.resume()
+    proxy_to_b.resume()
+
+    await _wait_drained(c_a, c_b, "drain-marker-2a")
+    await _wait_drained(c_b, c_a, "drain-marker-2b")
+
+    # Same one-line reason as test 1: each _pause_and_settle call above only reliably settles the
+    # flow carrying ITS OWN settle key's shard, so "k" must land on that same shard on each side.
+    assert (
+        _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))["shard"]
+        == _parse_mvcc(await c_b.execute_command("debug", "mvcc", "settle-marker-2a"))["shard"]
+    )
+    assert (
+        _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))["shard"]
+        == _parse_mvcc(await c_a.execute_command("debug", "mvcc", "settle-marker-2b"))["shard"]
+    )
+
+    assert await c_a.get("k") == "b-later"
+    assert await c_b.get("k") == "b-later"
+    stamp_a = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
+    stamp_b = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
+    assert stamp_a["origin"] == own_origin_b, f"A did not converge on B's origin: {stamp_a}"
+    assert stamp_b["origin"] == own_origin_b, f"B did not converge on its own origin: {stamp_b}"
+    assert stamp_a["mvcc"] == stamp_b["mvcc"], f"stamps disagree: {stamp_a} != {stamp_b}"
+
+    dropped_b = int((await c_b.info("replication"))["multimaster_lww_dropped"])
+    assert dropped_b >= baseline_dropped_b + 1, "B never dropped A's stale write"
+    for c in (c_a, c_b):
+        unstamped = int((await c.info("replication"))["mvcc_unstamped_writes"])
+        assert unstamped == 0, f"unstamped writes leaked: {unstamped}"
+
+    await assert_no_command_storm(c_a, c_b)
+
+
+async def test_stream_lww_mset_splits_per_key_on_same_shard(
+    df_factory: DflyInstanceFactory, proxy_factory, tmp_path
+):
+    """MSET's own per-key LWW veto (OpMSet's kMultiKeySelfGuarded loop,
+    string_family.cc) is a per-KEY decision, not a per-command or per-shard one: k1 (absent on B)
+    must be created from A's MSET while k2 (already resident on B with a newer stamp) must resist
+    the SAME MSET -- and both keys are forced onto the SAME shard (verified via DEBUG MVCC's own
+    `shard:` field below) precisely so a shard- or transaction-level veto could not produce this
+    split by accident.
+    """
+    (k1, k2, settle_key), shard1 = await _find_same_shard_keys(df_factory, 4, tmp_path)
+
+    a = df_factory.create(**active_args(proactor_threads=4))
+    b = df_factory.create(**active_args(proactor_threads=4))
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    proxy = await proxy_factory(a.port)
+    await attach(c_b, proxy)
+    await wait_for_peers(c_b, 1)
+
+    baseline_dropped = int((await c_b.info("replication"))["multimaster_lww_dropped"])
+
+    # settle_key was probed onto the SAME shard as k1/k2 -- see _pause_and_settle's own comment on
+    # why settling the wrong shard's flow connection would leave THIS shard's still racy.
+    await _pause_and_settle(proxy, c_a, settle_key)
+    await c_a.execute_command("mset", k1, "a", k2, "b")
+    await asyncio.sleep(0.1)  # real wall-clock gap -- see test 1's own comment on this same race.
+    await c_b.set(k2, "b-newer-on-b")
+    proxy.resume()
+
+    # A single-shard MSET is one journaled entry, applied atomically: k1 landing proves the whole
+    # entry (both keys) has already been decided, so no separate drain marker is needed here.
+    await wait_for_value(c_b, k1, "a")
+
+    assert await c_b.get(k2) == "b-newer-on-b"
+    stamp_k1 = _parse_mvcc(await c_b.execute_command("debug", "mvcc", k1))
+    stamp_k2 = _parse_mvcc(await c_b.execute_command("debug", "mvcc", k2))
+    assert (
+        stamp_k1["shard"] == shard1 and stamp_k2["shard"] == shard1
+    ), f"keys drifted off the probed shard: {stamp_k1} / {stamp_k2}"
+    own_origin_b = await _own_origin(c_b, "own-marker-3")
+    assert stamp_k2["origin"] == own_origin_b, f"k2's origin is not B's own: {stamp_k2}"
+
+    dropped = int((await c_b.info("replication"))["multimaster_lww_dropped"])
+    assert dropped >= baseline_dropped + 1, f"dropped counter did not advance: {dropped}"
+    unstamped = int((await c_b.info("replication"))["mvcc_unstamped_writes"])
+    assert unstamped == 0, f"unstamped writes leaked: {unstamped}"
+
+
+@pytest.mark.parametrize("stream_lww", [True, False], ids=["guarded", "unguarded"])
+async def test_stream_lww_restore_without_replace_pinned_by_flag(
+    df_factory: DflyInstanceFactory, proxy_factory, stream_lww
+):
+    """B already holds `k` (an older stamp). A performs RESTORE k (without REPLACE)
+    onto a key it never had itself, so the RESTORE succeeds locally on A and carries a genuinely
+    newer stamp than B's stored `k`. The receiver-side RESTORE->+REPLACE rewrite (ApplyLwwRewrites,
+    multimaster_lww.cc) and the LWW compare it enables are both gated on the SAME predicate,
+    LwwGuardActive(link_guard, incoming_mvcc) (multimaster_lww.h) -- so flipping B's
+    --multi_master_stream_lww flips both together, never just one:
+
+    - guard on: the rewrite injects REPLACE, the compare accepts A's genuinely newer write, and
+      OpRestore overwrites B's key -- A's restored value wins.
+    - guard off: the rewrite never runs either, so RESTORE reaches B's existing `k` without
+      REPLACE and fails outright (BUSYKEY); DispatchCommand reports that reply-level failure back
+      to the journal apply as an applied OK, so B silently keeps its own (older) value -- a real,
+      pinned (not "fixed") divergence for this one command on an unguarded link.
+    """
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args(multi_master_stream_lww=str(stream_lww).lower()))
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    proxy = await proxy_factory(a.port)
+    await attach(c_b, proxy)
+    await wait_for_peers(c_b, 1)
+
+    await c_b.set("k", "b-old")
+    await asyncio.sleep(0.1)  # real wall-clock gap -- see test 1's own comment on this same race.
+    await c_a.set("seed", "restored-value")
+    dump_val = await c_a.dump("seed")
+
+    await _pause_and_settle(proxy, c_a, "settle-marker-5")
+    assert await c_a.restore("k", 0, dump_val) == "OK"
+    proxy.resume()
+
+    await _wait_drained(c_a, c_b, "drain-marker-5")
+
+    # Same one-line reason as test 1: _pause_and_settle only reliably settles the flow carrying
+    # settle-marker-5's OWN shard, so "k" must land on that same shard for this test to hold.
+    assert (
+        _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))["shard"]
+        == _parse_mvcc(await c_b.execute_command("debug", "mvcc", "settle-marker-5"))["shard"]
+    )
+
+    if stream_lww:
+        assert await c_b.get("k") == "restored-value"
+        stamp_k = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
+        own_origin_a = await _own_origin(c_a, "own-marker-5")
+        assert stamp_k["origin"] == own_origin_a, f"k's origin is not A's: {stamp_k}"
+        unstamped = int((await c_b.info("replication"))["mvcc_unstamped_writes"])
+        assert unstamped == 0, f"unstamped writes leaked: {unstamped}"
+    else:
+        assert await c_b.get("k") == "b-old"
+        # mvcc_unstamped_writes not asserted here (fixture does not allow it): a RESTORE without
+        # REPLACE onto an existing key that fails with BUSYKEY leaks this counter from 0 to 1 on
+        # ANY active-replica node -- confirmed by hand with a single node, zero peers, issuing the
+        # same RESTORE directly, no guard or replication involved at all. Pre-existing (OpRestore's
+        # BUSYKEY early-return does not roll back PostUpdate's arm), independent of the guard.

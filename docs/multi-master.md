@@ -13,45 +13,76 @@ sync from a peer** — another drakeydb active node, or a classic Redis/KeyDB ma
 incoming key is compared against whatever this node currently has stored for that key, and only
 overwrites it if the incoming stamp is genuinely newer.
 
-**Merge-LWW is full-sync-only.** `MergeAccepts` (`src/server/mvcc.h`) has no caller outside the
-full-sync loader (`rdb_load.cc`); `merge_lww_` is set only by `replica.cc`'s two peer-mode call
-sites. This node's own restart-from-RDB (a local RDB file, `DEBUG LOAD`, `DEBUG RELOAD`, `RESTORE`)
-is **not** a merge source — it loads verbatim, exactly like pre-Phase-4 Dragonfly, overwriting
-whatever was resident with no comparison at all (pinned by
-`RdbMvccTest.WithoutMergeLwwStaleSnapshotStillOverwrites`, `src/server/rdb_test.cc`). And
-**steady-state (stable-sync) replicated writes are not merge-compared either**: once the initial
-full sync completes, ordinary commands streamed from a peer link apply in plain arrival order,
-with no stamp comparison against the local value — that guard is planned for P4-4, not yet built.
-Merge-LWW's protection is specifically, and only, the moment of a full sync.
+**Merge-LWW is full-sync-only; streaming (stable-sync) writes get their own, sibling compare.**
+`MergeAccepts` (`src/server/mvcc.h`) is the one comparison rule both use. The full-sync loader
+(`rdb_load.cc`; `merge_lww_` is set only by `replica.cc`'s two peer-mode call sites) calls it
+directly for a whole-key snapshot compare at full-sync time. Since P4-4, `multimaster_lww.h`'s
+`LwwShouldDropKey` calls the same function for a per-write compare on the streaming (stable-sync)
+path — see "Streaming LWW" below for that guard's own scope, gating, and vocabulary; the two
+compares are deliberately the same rule (ties favor the stored side either way) so a value can
+never look accepted on one path and rejected on the other. This node's own restart-from-RDB (a
+local RDB file, `DEBUG LOAD`, `DEBUG RELOAD`, `RESTORE`) is still **not** a merge source — it loads
+verbatim, exactly like pre-Phase-4 Dragonfly, overwriting whatever was resident with no comparison
+at all (pinned by `RdbMvccTest.WithoutMergeLwwStaleSnapshotStillOverwrites`, `src/server/
+rdb_test.cc`).
 
 **The comparison rule, in one sentence: ties are won by the stored side.** An incoming write is
 installed only when it is *strictly* newer than what is already there (`MergeAccepts`,
 `src/server/mvcc.h`); equal stamps never churn. This is a deliberate owner decision (2026-08-30),
 not an oversight — it is what makes a retried or duplicated apply idempotent.
 
+**A local write always mints a stamp strictly above whatever it is about to overwrite.** A
+locally-originated write's stamp is not simply a wall-clock tick (`MvccStamper::HopStamp`) — it is
+`max(clock tick, max over the entry's keys of stored.mvcc + 1)` (`LocalMintFloor`, `mvcc.h`, wired
+into `journal::RecordEntry`), so a local write that happens to overwrite a key already carrying a
+higher stamp (e.g. merged in earlier from a peer with a fast clock) still mints something at least
+one tick higher, so that overwrite is not silently doomed to lose the *next* full-sync merge
+against a third node. It is computed per journal entry, not a per-shard ratchet: an unrelated key's
+mint in the same epoch is unaffected. The floor is capped at the stamp's own bit-mask; at that cap
+only the `mvcc` portion *ties* the stored stamp's — `origin_hash` still decides which one actually
+wins the next compare (`MergeAccepts`' own tie-break), so a local write does not automatically lose
+just because it hit the cap. The cap itself is reachable only with a corrupt, hostile, or (at this
+encoding's millisecond granularity) roughly year-2248 stamp. An expiry's own tombstone does not
+mint or floor anything against the value it deletes -- it is a pure, deterministic function of
+that value's own stamp (`ExpiryTombstoneFor`, `mvcc.h`; see "Tombstones" below).
+
 **An already-expired incoming key is the peer's DELETE.** A full sync can ship a key whose
 whole-key TTL has already elapsed — the normal state of an expiring key on a loaded server, whose
 active-expire sweep runs behind. On a *merge* load such a key is not silently dropped: it is
-applied as a delete for that key, carrying the incoming key's own stamp with the tombstone bit
-set, through exactly the same `MergeAccepts` compare and tombstone-install path an opcode-225
-tombstone record takes. If this node's own value for that key is newer, it wins and nothing
-changes; if it is older, it is deleted and the peer's stamp is recorded as a tombstone. That
-tombstone carries the peer's *write-time* stamp, so its GC deadline is `write time +
---multi_master_tombstone_ttl`: for a key whose TTL was longer than the tombstone TTL it is born
-already reapable and gives this node almost no resurrection-protection window (the delete itself
-still stands). Without
+applied as a delete for that key, carrying a tombstone one origin_hash tick above the incoming
+key's own stamp (`ExpiryTombstoneFor`, `mvcc.h`), through exactly the same `MergeAccepts` compare
+and tombstone-install path an opcode-225 tombstone record takes. If this node's own value for that
+key is newer, it wins and nothing changes; if it is older, it is deleted and the peer's stamp
+(advanced by that one tick) is recorded as a tombstone. That tombstone's `mvcc` field is still the
+peer's own *write-time* value (the one-tick advance almost always lands in `origin_hash`, not
+`mvcc` -- see `ExpiryTombstoneFor`'s own doc comment for the rare carry case), so its GC deadline is
+`write time + --multi_master_tombstone_ttl`: for a key whose TTL was longer than the tombstone TTL
+it is born already reapable and gives this node almost no resurrection-protection window (the
+delete itself still stands). Without
 this, a peer's `SET k v2 PX 1000` issued during a partition would leave this node holding the
 older `v1` forever — the peer's tombstone is not in the snapshot's prologue-emitted opcode-225
 section (the key had not expired yet when that ran) and its expiry `DEL` never crosses a peer
-link (see "An expiry's tombstone stamp is per-node" below). A **non-merge** load — a local RDB
-file, `DEBUG LOAD`, a plain Dragonfly replica's full sync — keeps dropping an already-expired key
+link (see "An expiry's tombstone stamp is one origin_hash tick above the value it replaces" below).
+A **non-merge** load — a local RDB file, `DEBUG LOAD`, a plain Dragonfly replica's full sync — keeps
+dropping an already-expired key
 verbatim, exactly as upstream does.
+
+The identical rule applies on the **streaming** (stable-sync) path too, not only on a full-sync
+merge load: a guarded `SET`/`RESTORE` whose absolute ttl has already elapsed by the time it reaches
+this node, against a key this node does not currently hold live, installs that same
+`ExpiryTombstoneFor`-derived tombstone instead of silently recording nothing
+(`DbSlice::InstallAbsentKeyTombstone`, shared with the merge-load path above; `SetCmd::Set`'s own
+`expire_in_past` branch, `OpRestore`, `Renamer::DeserializeDest`). Without it, an already-expired
+guarded write against an absent key would leave no local record that it ever happened, letting a
+strictly older write for the same key — arriving afterwards from a third peer — be wrongly accepted
+instead of rejected.
 
 **What it does not do:** merge-LWW only ever compares against *this node's own resident stamp*
 for a key. It has no notion of a global "true" value, no quorum, and no read-repair outside a
 full sync. Two nodes can each accept different values for the same key from different partitions
-without either node knowing the other one exists; the next full sync between them is what
-resolves it (again by the tie rule above).
+without either node knowing the other one exists; the next full sync between them resolves it
+(again by the tie rule above), provided no later unguarded delta lands on that key first and
+re-opens an identical-stamp gap of its own (see D-23, [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md)).
 
 ### Stamped peers vs. unstamped peers
 
@@ -89,9 +120,289 @@ classic RDB stream as a merge source, not a bug to be fixed by more tuning. A DF
 between two drakeydb active nodes does not have this exposure — every key it carries has a real
 per-key stamp.
 
+## Streaming LWW (stable-sync compare)
+
+**Stable-sync (steady-state) replicated writes are LWW-compared too, per peer link.** Once the
+initial full sync completes, an active-replica node's *peer* links (never a plain replica — see
+below) run every subsequently streamed guarded write through the same tie-favors-the-stored-side
+rule merge uses, gated by `--multi_master_stream_lww` (default `true`). The compare
+(`LwwShouldDropKey`, `src/server/multimaster_lww.h`) runs *inside* the transaction, under the
+write's own key lock (`Transaction::ShouldDropForLww`, or the self-guarded per-key loop inside
+`OpMSet`/`OpDelV2` for `MSET`/`DEL` — see below), never before dispatch, so it always sees the
+value the lock is actually protecting. A dropped write writes nothing, journals nothing, and still
+reports success rather than an error — a stream of drops from a stale peer link is a normal, if
+wasteful, steady state, not a fault that should force a resync.
+
+**Only a guarded peer link, carrying a real stamp, is ever compared:**
+- A **plain replica** (a consumer that never sent `REPLCONF PEER`) is never guarded — the guard bit
+  is `peer_mode_ && IsActiveReplica() && --multi_master_stream_lww`, read exactly once per link, at
+  flow setup (`DflyShardReplica`'s constructor, `replica.cc`), never re-read per entry.
+- An entry whose incoming `mvcc` is `0` is never guarded, on any link (`LwwGuardActive`,
+  `multimaster_lww.h`): a classic Redis/KeyDB link never carries an `mvcc` at all, so guarding it
+  would silently drop its entire stream.
+- A full sync's own concurrent journal blob — writes that arrive *during* that same full sync,
+  applied by the RDB loader's own second applier (`RdbLoaderBase::HandleJournalBlob`) — shares the
+  identical guard bit with the flow's stable-sync executor (`ConnectionContext::repl_lww_guard`),
+  so the two appliers of one link can never disagree about whether it is guarded.
+
+**The guarded vocabulary is keyed on the JOURNALED command name**, not the client-facing one
+(`ClassifyJournaledCommand`, `multimaster_lww.h`): `SET`, `SETNX`, `GETSET`, `GETDEL`, `RESTORE`
+(single-key, compared generically before the Op function runs), and `MSET`/`DEL` (multi-key,
+self-guarded — see the per-key split below). Every other journaled name is unguarded; an
+unrecognized name fails open, never closed. The master already normalizes several client-facing
+commands onto one of those names before journaling — `SETEX`/`SET ... EX` → `SET`, `UNLINK` →
+`DEL`, and a cross-shard `RENAME` → `DEL` src + `RESTORE ... REPLACE` dest.
+
+**Every TTL-changing command ships this key's FULL STATE on an active node, not a delta.** The
+`EXPIRE` family, `PERSIST`, `GETEX`, `GAT`, and `SET ... KEEPTTL` used to journal a bare
+`PEXPIREAT`/`PERSIST`/`KEEPTTL` delta — "change this key's TTL", nothing about its value. On a
+plain (non-active) replica that is fine: there is only ever one copy of the key downstream of any
+given delta. On an active node, two peers can race on the SAME key — one writing a new value, the
+other only touching its TTL — and a delta can't tell a receiver anything about the value it should
+be paired with. A receiver applying `PEXPIREAT`/`PERSIST` against ITS OWN, independently-written
+value ends up holding a value/TTL pairing NEITHER peer ever actually wrote, and — because ties
+favor the stored side — that divergence can be permanent: a subsequent full sync's own merge uses
+the identical `MergeAccepts` comparison, so an equal (or now-equal) stamp on the wrong pairing never
+self-corrects either. So on an active node these commands instead ship the key's CURRENT full
+state under a guarded name: a string ships as
+`SET key value [PXAT abs_ms] [STICK] [_MCFLAGS n]` (no TTL → a plain `SET key value`); every other
+type ships as `RESTORE key <abs_ms or 0> <dump> REPLACE ABSTTL [STICK]`, reusing the exact
+serialization `RENAME`/`COPY` already use. The cost is real — an `EXPIRE` on a large collection now
+ships the whole serialized value, not a handful of bytes — but it buys back a single, comparable
+stamp per key, which a delta cannot offer no matter how it is journaled. The serialization itself
+also runs INSIDE the shard callback (`JournalFullStateSet`, `multimaster_lww.h`, and the
+`RESTORE`-journaling path alike), so this is an O(value) latency cost on that shard's own thread
+for every `EXPIRE`/`PERSIST`/`GETEX`/`GAT`/`SET ... KEEPTTL`/`PFMERGE`/`BITOP` on an active node,
+not merely extra wire bytes. A `PERSIST`/`GETEX
+PERSIST` against a key that has no TTL to begin with changes nothing and journals nothing (not even
+a no-op `PERSIST`) rather than paying that cost for free. `EXPIRE` with a past/negative time (or
+its `GETEX`/`GAT` equivalents) still deletes the key outright and journals a bare `DEL` — already
+this key's full state, nothing to ship instead. A non-active node keeps journaling
+`PEXPIREAT`/`PERSIST`/`KEEPTTL` exactly as upstream Dragonfly does (the upstream byte-identity
+invariant); those entries carry `mvcc 0` and are never guarded regardless, so `PEXPIREAT` and
+`PERSIST` are absent from the guarded table entirely, not merely unguarded by name.
+
+State-carrying RMW results that journal under a guarded name are deliberately guarded too, because
+a journaled `SET`/`DEL`/`RESTORE` is a blind full-state write on the receiver exactly like any
+other: `PFMERGE` → `SET` (`hll_family.cc`), `BITOP` → `SET`/`DEL` (`bitops_family.cc`), a
+`*STORE`-family command's empty result → `DEL` (every `*STORE` command below gets this treatment,
+guarded), a cross-shard `SORT ... STORE`'s *non*-empty result → `RESTORE ... REPLACE` specifically
+(the set/zset `*STORE` commands' own non-empty result does NOT get this treatment — see the
+residual exposure just below), `COPY` (same-shard or cross-shard — it always goes through the
+RESTORE-journaling path, never the verbatim-recipe one) → `RESTORE ... REPLACE`, and a cross-shard
+`RENAME`'s `DEL` src + `RESTORE ... REPLACE` dest. **Delta-journaled RMW is deliberately never
+guarded** — `INCR`, `APPEND`, `LPUSH`, `HSET`-style commands, `PFADD`, and similar always resolve
+by plain arrival order, guard on or off: dropping a delta permanently loses it rather than merely
+reordering it, and there is no full "result" to journal instead.
+
+**Shipping the TTL change as full state means it no longer commutes with a concurrent unguarded
+delta on the same key.** Both node A and node B run `INCR k`, then A runs `EXPIRE k 60`: A's
+`EXPIRE` ships the CURRENT value under a guarded `SET` — but A only has its own copy of `k`, so
+that guarded `SET` carries A's own count, not B's. If B's own `INCR` happened first — its stamp is
+OLDER than A's own stored stamp by the time A's `EXPIRE` runs, i.e. A's count already reflects B's
+`INCR` too — the guarded `SET` correctly carries both increments and B converges to it. But if B's
+`INCR`'s own stamp is NEWER than A's `EXPIRE`-derived `SET`'s stamp (B's own local clock ran ahead,
+or A's `EXPIRE` simply ran first in real time), A's `EXPIRE`-derived `SET` carries a count that has
+NOT yet seen B's `INCR`. Which of these two stamp orderings holds — not merely which message
+happens to arrive at which node first — decides which of the two outcomes below results (see D-24,
+[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), for the concrete trace of both):
+
+- **TTL-change-newer order: bounded.** Because A's `SET` is a guarded full-state write, a receiver
+  applying it OVERWRITES whatever count it locally holds, discarding an increment that had nothing
+  to do with the TTL change at all — B ends up one count behind A, with the TTL itself identical on
+  both (an absolute deadline, carried verbatim). This is NOT permanent: every LATER TTL change on
+  the same key ships the full value again (whatever it is by then), so the next
+  `EXPIRE`/`PERSIST`/`GETEX`/`SET ... KEEPTTL` re-converges the two nodes' counts, and once both
+  copies carry the same absolute deadline, they expire together.
+- **Delta-newer order: an identical-stamp divergence, inherited from D-23, not introduced here.**
+  If B's `INCR` stamp is instead NEWER than A's `EXPIRE`-derived `SET`'s stamp, A's guarded `SET`
+  is the OLDER write at B and is correctly dropped as stale, while B's `INCR`, unguarded, applies
+  to A verbatim on top of A's TTL'd copy (an unguarded delta is never LWW-compared before
+  applying, regardless of which stamp is newer). Both nodes end at the SAME stamp with the SAME
+  count, but only
+  A's copy carries the TTL — B's does not, since `INCR` never touches TTL. Expiry deletes are never
+  forwarded on peer links, so A's key eventually vanishes locally while B's identically-stamped,
+  TTL-less copy lives on indefinitely, until the next full-state write touches this key. Any delta
+  racing any guarded full-state write on the same key already had this shape before TTL changes
+  shipped full state (see D-23) — this is that same exposure, not a new one.
+- **Still generally an improvement over a bare TTL delta, though not a universal fix.**
+  Previously, every TTL-changing command journaled a bare `PEXPIREAT`/`PERSIST`/`KEEPTTL` delta
+  instead of full state, and a `SET` racing that delta could also land two nodes on IDENTICAL stamps with
+  DIFFERENT values. When the delta happened to be a `PEXPIREAT` carrying the SAME absolute deadline
+  onto both copies, the key's own expiry eventually deletes both sides at (approximately) the same
+  instant, which at least made the stale pairing moot rather than truly repairing it — but that
+  coincidence never held for `PERSIST`/`KEEPTTL` (no deadline to share), and it does not apply to
+  the delta-newer order above either: there, only ONE copy ever carries a TTL, so only that one
+  side ever expires, and the other survives indefinitely. Shipping the TTL change as full state
+  does not remove that residual — see the delta-newer order above — but it does give the
+  TTL-change-newer order a real, general repair path that a bare TTL delta never had.
+- **Operator rule:** avoid mixing cross-node deltas (`INCR`/`APPEND`/`HSET`-style commands/`PFADD`)
+  with concurrent TTL changes or `SET`s on the same key from a different node — that combination
+  (a delta racing a full-state write: a TTL change, a `SET`, `PFMERGE`, `BITOP`, ...) has the gap
+  described above. A delta is NOT otherwise safe on its own, though: applied after this key's TTL
+  has already elapsed on the RECEIVING node (no concurrent write anywhere required — see D-27,
+  [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md)), it silently re-creates the key with NO TTL. Run
+  `EXPIRE k ttl NX` after every increment, not only when the counter happens to read back as
+  freshly-created, if a key is ever expected to expire again: `NX` fires precisely when there is
+  currently no TTL to protect against re-creation, and stays a cheap no-op otherwise.
+- **The real fix, future work:** a per-key TTL stamp — a separate LWW register for the TTL, decoupled
+  from the value's own stamp — so a TTL change never needs to carry (or clobber) the value at all.
+  Not attempted here.
+
+**A non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/
+`ZDIFFSTORE`/`ZRANGESTORE`, or `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST` result is a
+known gap, not yet fixed.** Unlike `SORT ... STORE`'s own destination write, every one of these
+commands' `Op` functions is called with `overwrite`/`override` hardcoded `true` — unconditionally,
+whether or not the destination previously existed — so a non-empty result always journals `DEL`
+(guarded) and `SADD`/`ZADD` (delta-journaled, unguarded) as two SEPARATE entries. A guarded
+receiver whose own destination is newer correctly drops the `DEL`, but then blindly applies the
+unguarded add on top of its own untouched, newer value anyway, producing a third state neither
+node ever actually held. Their EMPTY-result case is not the same shape both ways: a destination
+that *becomes* absent (it held a value, now deleted) journals a bare, guarded `DEL`; a destination
+that *stays* absent (nothing was there to delete) journals nothing at all — neither has this
+problem, since there is never an add to follow either way. See
+[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md) (D-21).
+
+**A same-shard `RENAME`/`RENAMENX`, a same-shard `SORT ... STORE`, an exact (non-approximate,
+non-`MAXLEN`) `XTRIM`, and a handful of name-ambiguous commands are unguarded by design, not by
+oversight.** The first three revive auto-journal at runtime (`Transaction::ReviveAutoJournal`) and
+journal the client's own command verbatim under its own name — none of `RENAME`/`RENAMENX`/`SORT`/
+`XTRIM` is in the guarded table, so all four resolve by plain arrival order on a guarded link (the
+*cross-shard* form of `RENAME`/`RENAMENX`/`SORT ... STORE` takes the RESTORE-journaling path above
+instead, and is guarded). Separately, `JSON.SET`/`JSON.MERGE`/`JSON.DEL`/`JSON.FORGET`/
+`JSON.CLEAR` at the root (`"$"`) path are full-value writes under a name that cannot tell that path
+from an ordinary partial one, so guarding the name would also guard-and-drop their everyday partial
+uses; `CMS.MERGE` (always a full reset-then-recompute of the destination sketch, but journaled
+under its own name rather than a guarded one) and `BF.LOADCHUNK`'s `cursor == 1` init phase
+(overwrites any existing key wholesale, same name as every other, incremental chunk) are the same
+class of problem for a different reason — all left unguarded, resolving by arrival order like any
+other unguarded command. See
+[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md) (D-18) for the full account.
+
+**Four commands are rewritten on the receiver before dispatch, so their journaled form reproduces
+the author's *result* rather than the author's *command*, but only when the link is actually
+guarded for that entry** (`LwwGuardActive(repl_lww_guard, repl_mvcc)` — the flag off, a plain
+replica, or an unstamped entry all skip the rewrite and apply verbatim, same as before P4-4):
+`SETNX` (conditional on non-existence — applying it verbatim on a receiver that already holds the
+key would be a silent no-op even once the guard has already let it through) becomes a plain `SET`;
+`GETSET` and `GETDEL` (each a type-checked read-modify-write — applying either verbatim against a
+receiver holding a *different* type for this key errors `WRONGTYPE` and applies nothing, even
+though the guard has already decided this write should win) become a plain `SET` and a plain
+`DEL`, respectively; `RESTORE` without `REPLACE` errors on an existing key, and that reply-level
+error is reported back by `DispatchCommand` as an applied `OK` — so `REPLACE` is injected. Once
+triggered, all four rewrites (`ApplyLwwRewrites`, `multimaster_lww.h`) are unconditional name/arg
+edits with no lock hazard, so they run pre-dispatch; the stamp *compare* itself still runs inside
+the transaction, under the key's lock (the generic single-key veto for the now-`SET`-shaped
+applies; `OpDelV2`'s own per-key veto, below, for the now-`DEL`-shaped `GETDEL` apply, since `DEL`
+is self-guarded, not single-key).
+
+**A guarded `MSET`/`DEL` applies — and journals — only its non-stale keys.** `GetShardArgs` hands
+these two commands a whole run of keys (and, for `MSET`, values) rather than a single key, so the
+generic single-key veto skips them by design; `OpMSet` and `OpDelV2`
+(`string_family.cc`/`generic_family.cc`) run the per-key compare themselves, under the same
+shard's key locks, and journal exactly the surviving keys in their original relative order — never
+a prefix of the original argument list, and never all-or-nothing (one stale key in an `MSET` does
+not sink the fresh keys beside it). This is not a new atomicity hole: a cross-shard `MSET`/`DEL`
+was never atomic across shards under replication even before this guard existed — each shard's own
+`OpMSet`/`OpDelV2` call already journals its own entry independently, applied by that shard's own
+flow with no cross-shard barrier — the per-key split only adds the possibility of a *single
+shard's* own partial application, on top of an atomicity gap that already existed one level up.
+
+**Classic (non-DFLY-protocol) links are never guarded, by construction. A DFLY link to a
+non-active peer is guarded exactly like any other peer link, by construction — but never actually
+drops anything, because every entry it carries fails the guard's own per-entry data check
+instead.** These are two different mechanisms, not one.
+
+`Replica::ConsumeRedisStream` (`replica.cc`) never touches `JournalExecutor` at all: it builds its
+own bare `ConnectionContext` and sets `is_replicating`, `journal_emulated`, `skip_acl_validation`,
+`ns`, and `repl_origin_idx` on it directly — but never calls `SetApplyLwwGuard`, so `repl_lww_guard`
+stays at its default `false` for the whole classic link's lifetime regardless. That is a structural
+property of the link, fixed before a single command ever dispatches (independently, this protocol
+also never carries a per-key `mvcc` at all, so `LwwGuardActive` would exclude it a second way even
+if the bit were somehow true). A non-transactional command with no keys at all (`SELECT`, `PING`)
+never even reaches a `Transaction`'s own callback machinery in the first place, so it is trivially
+"never guarded" too — there is no callback for a veto to skip. Not every keyless command is like
+this, though: `DEBUG POPULATE` (an admin command, `DetermineKeys` returns no keys for it either)
+DOES build its own `Transaction` and reach `RunSquashedMultiCb` (see the `SQUASHED_STUB` producer
+list below) — it is unguarded for the ordinary reason every command on this link is, not because
+it skips the callback machinery: it never runs on a peer link to begin with (an operator-issued
+local command), so the stub it builds inherits an always-`false` `repl_lww_guard` regardless.
+
+The stream's own batching does not change any of that, even though the batching itself is not
+specific to replication at all: `Service::DispatchSquashedBatch` (`main_service.cc`) is the SAME
+pipeline-squashing mechanism an ordinary client connection's own pipelined command burst uses too
+(`facade::Connection`'s own dispatch loop calls it directly) — `ConsumeRedisStream` is just one of
+its callers, not the reason it builds a non-atomic transaction. It collects a run of commands,
+stopping at the first one it cannot batch at all (an unknown command, `MULTI`/`EXEC`, `EVAL`, a
+blocking command, an admin command, a connection-state command, or a subscribe-family one) and
+returns how many it consumed; `ConsumeRedisStream`'s own loop dispatches whatever it stopped on
+through an ordinary `DispatchCommand` call before retrying the batch from there. Whatever it *did*
+collect gets handed, once per batch, to one **non-atomic** `MultiCommandSquasher` — built over a
+`Transaction` started with `StartMultiNonAtomic(Transaction::DEFAULT)`, which is what
+`DispatchSquashedBatch` always builds, for any caller. Inside it, `TrySquash` rejects any command
+that is not transactional, is `CO::BLOCKING`, is `CO::GLOBAL_TRANS`, or spans more than one shard's
+keys; those run through `ExecuteStandalone`, directly on that same non-atomic `Transaction`.
+Everything `TrySquash` *does* accept is grouped per shard and later dispatched by `SquashedHopCb`,
+which — in non-atomic mode — runs directly on each shard's own thread against a per-shard
+`Transaction` built with `StartMultiNonAtomic(Transaction::SHARD_LOCAL)`.
+
+Neither of *those* two transactions is ever a `SQUASHED_STUB`, so neither reaches
+`RunSquashedMultiCb` directly — but the classic link CAN reach that function by a different route.
+`EVAL`/`EVALSHA` is in `DispatchSquashedBatch`'s own break list above, so it falls straight to
+`ConsumeRedisStream`'s ordinary `DispatchCommand` fallback and takes the normal Lua-eval path. When
+a script's declared keys all hash to one shard, `CanRunSingleShardMulti` builds its own stub with
+`new Transaction{tx, real_sid, ...}` — the *other* stub constructor, the one that unconditionally
+sets `SQUASHED_STUB` no matter what mode its parent `tx` (the script's own outer transaction) is
+in — so the script's inner commands DO run through `RunSquashedMultiCb`. (The same constructor
+also backs three other `SQUASHED_STUB` producers, for completeness: `DEBUG POPULATE`'s own stub,
+built directly over an explicitly non-atomic `SHARD_LOCAL` parent — proof by construction that this
+role is not atomic-only — the atomic squasher's own asynchronous `EVAL` command flush, and an
+ATOMIC client `MULTI`/`EXEC` body's own direct squashing (`--multi_exec_squash`, `Service::Exec`'s
+own call into `MultiCommandSquasher::Execute` over the already-atomic top-level transaction
+`StartMulti` built — `MultiCommandSquasher::PrepareShardInfo`'s `IsAtomic()` branch is what all
+three of these share, `multi_command_squasher.cc`.) None of
+this actually changes anything observable on the classic link, though: that constructor also
+copies `repl_lww_guard_` straight from its own parent `tx`, and `tx` itself got that bit from the
+SAME always-`false` connection, the ordinary way any transaction on this link does. So
+`RunSquashedMultiCb`'s `LOG(DFATAL)` tripwire still never fires here — not because the classic link
+cannot reach the function, but because `IsLwwGuarded()` reads `false` there exactly as it does
+everywhere else on this link.
+
+A DFLY-protocol peer link to a peer that is itself non-active is a genuinely different case. The
+guard *bit* is set exactly the way it would be for any other peer link — `peer_mode_ &&
+IsActiveReplica() && --multi_master_stream_lww` depends only on THIS node's own state, never on
+whether the remote peer is active — so `repl_lww_guard` reads `true` there too. What keeps it from
+ever dropping anything is `LwwGuardActive`'s other half, `incoming_mvcc != 0`, evaluated fresh for
+every entry: a non-active peer never stamps anything on its own side (`MvccEnabled()` is false
+there), so it writes journal framing v1 — the format with no `mvcc` field on the wire at all (see
+`docs/UPSTREAM-SYNC.md`'s framing-version row) — and every entry it ever sends therefore decodes
+here with `mvcc == 0`, excluded by `LwwGuardActive` on that basis alone, every single time. That is
+a runtime fact about each entry's own data, not a structural property of the link the way the
+classic case above is.
+
+**`DEBUG MVCC`'s `origin:` field can end up naming no real node in the mesh.** The applied-write
+stamp floor (`FloorAppliedStamp`, `mvcc.h`) that protects an *unguarded* applied write (arrival
+order — guard off, a delta-RMW command, or a plain replica) whose author stamp is older than the
+key's stored stamp `S` commits `{S.mvcc, S.origin_hash - 1}` instead of that older stamp verbatim —
+one tick below `S`, keeping the key's stamp monotone for practical purposes, so a later, clean full
+sync from a peer holding `S` still wins the next merge compare and the two copies re-converge --
+**provided no OTHER delta lands on this key in between** (see D-23,
+[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md): an unguarded delta applied after the floor commits
+its OWN author's stamp verbatim, on top of the floored one, which can leave two nodes at the
+IDENTICAL stamp on DIFFERENT values — a full sync's tie-breaking cannot tell those apart, so it
+takes a further write to heal, not the floor by itself).
+(Edge case: `FloorAppliedStamp` already excludes `S.Mvcc() == 0` — the fresh-key/uncommitted-
+placeholder shape — before reaching this branch at all, so `S.origin_hash == 0` here means a real,
+non-zero-`mvcc` stamp whose hash field happens to be exactly `0`; the floor then lands at
+`{S.mvcc - 1, UINT64_MAX}`, dropping the `mvcc` field by one tick instead of underflowing a hash of
+`0`.) The cost is that the resulting `origin_hash` is an arbitrary
+derived number, not any node's own registered hash, so `DEBUG MVCC <key>`'s `origin:` line can show
+a value that matches no peer in the mesh once this has happened even once. Extend the "do not diff
+`DEBUG MVCC` across peers" rule (see Observability, below) to cover this case too.
+
 ## Tombstones
 
-Before this phase, every delete simply erased its slot; a peer's stale full sync could then
+Previously, every delete simply erased its slot; a peer's stale full sync could then
 "resurrect" the deleted key with no way to tell that a delete had ever happened. drakeydb now
 keeps a **tombstone** — the deleted key's MVCC slot, with its top bit set, kept instead of erased
 — for `kExplicit` (an ordinary `DEL`/`UNLINK`/etc.) and `kExpired` (lazy or active TTL expiry)
@@ -104,23 +415,67 @@ as before this phase. This is intentional: eviction is a local capacity decision
 fact about the dataset, and the peer's copy is treated as authoritative for that key. See the
 `--cache_mode` section below for the operational consequence.
 
-**An expiry's tombstone stamp is per-node, by design.** A `kExpired` tombstone is minted
-*locally*, by whichever node actually reaps the key, from that node's own clock and under its own
-`origin` (`RecordExpiryBlocking`/`CommitOwnTombstone`, `tx_base.cc`) — an expiry is always a local
-decision (D-10). And an expiry `DEL` is deliberately **not** forwarded on a peer link:
-`journal::PassesPeerEchoFilter` (`journal/types.cc`) drops every entry carrying
-`kEntryFlagExpired`, and `SliceSnapshot::ConsumeJournalChange` applies the same filter to a full
-sync's concurrent journal blob. Both are intentional — an expiry that replicated as a foreign
-delete would re-propagate one node's clock as authority over another's.
+**An expiry's tombstone stamp is one origin_hash tick above the value it replaces.** A `kExpired`
+tombstone is `ExpiryTombstoneFor(value)` (`mvcc.h`) applied to the expired value's own
+pre-deletion stamp — the same `mvcc`, `origin_hash + 1`, tombstone bit set
+(`RecordExpiryBlocking`/`CommitOwnTombstone`, `tx_base.cc`/`mvcc.cc`; the same function backs the
+member-expiry reaper, `DbSlice::DeleteReapedContainer`, `db_slice.cc`, and a merge load's
+synthetic tombstone for an already-expired incoming key, `rdb_load.cc`) — never the value's own
+stamp reused verbatim, unless the value carried no real stamp at all (mvcc 0 — one that never
+received a stamp), in which case NO tombstone is installed at all: the slot is simply ERASED, the
+same as eviction above, since an `Mvcc()==0` tombstone would itself lose every future compare
+unconditionally, a worse failure mode than leaving nothing behind (see D-29,
+[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), for the resurrection residual this leaves: a
+peer's own unstamped `{0,0}` copy of the same key can resurrect it at the next merge, since
+`MergeAccepts` against an absent — not tombstoned — local slot always accepts). The `kEntryFlagExpired`
+journal entry for this expiry's own `DEL` still gets a freshly minted LOCAL stamp in this case (the same
+minting any self-originated, never-stamped write receives), but that stamp only ever reaches a
+plain, non-mesh replica: `journal::PassesPeerEchoFilter` drops every `kEntryFlagExpired` entry
+before it reaches a peer-mesh link, so the minted wire stamp plays no role in the mesh merge
+comparison this whole section is about. Landing exactly on the value (verbatim reuse) was tried and rejected:
+a receiver that re-creates this exact key at this exact stamp — reachable via a delta RMW
+(INCR/APPEND/...) applied on a node that already reaped the key — would tie against such a
+tombstone forever, permanently unrepairable once it is GC'd; one tick above forecloses that tie
+while still costing nothing against any later write with real authority of its own (see
+`ExpiryTombstoneFor`'s own doc comment, `mvcc.h`, for the full argument). This is the same rule a
+merge load already applies to an incoming key whose TTL has already elapsed
+(`ApplyMergeTombstoneOnShard`'s caller, `rdb_load.cc`): a peer's write with a stamp strictly newer
+than the expired value still wins the next `MergeAccepts` compare, and a peer's write with an
+OLDER stamp still loses — a freshly minted reap-time stamp, by contrast, would outrank every write
+between the value's own stamp and the moment of reaping, including ones that should have won.
 
-The consequence, which is **correct and expected**: when the same TTL fires on two peers (the
-normal case, since the TTL itself replicates), each node ends up holding a *different*
-`{mvcc, origin}` tombstone for that key. `DEBUG MVCC <key>` on the two nodes will legitimately
-disagree — different `mvcc`, different `origin`, possibly several seconds apart — while both
-report the key as **absent** and both return nil for `GET`. Values and absence converge; an
-expiry tombstone's stamp is not a mesh-wide consensus value and should not be compared across
-nodes. (A tombstone for an expiry reaped on exactly one node *does* propagate verbatim, via the
-opcode-225 section of the next full sync from that node; it is the two-sided case that differs.)
+An expiry `DEL` is still deliberately **not** forwarded on a peer link: `journal::
+PassesPeerEchoFilter` (`journal/types.cc`) drops every entry carrying `kEntryFlagExpired`, and
+`SliceSnapshot::ConsumeJournalChange` applies the same filter to a full sync's concurrent journal
+blob. This remains intentional even though the tombstone's stamp is now a deterministic function
+of the value: an expiry is still each node's own local decision about when to reap, and
+forwarding it as a foreign delete would apply one node's reap timing to another node's copy of
+the key.
+
+The consequence: when the same TTL fires on two peers (the normal case, since the TTL itself
+replicates), both nodes reap the SAME logical value and install the SAME tombstone for that key —
+`DEBUG MVCC <key>` on the two nodes now **agrees**. What can still differ is the tombstone's own
+age relative to `--multi_master_tombstone_ttl`: because its `mvcc` field is (almost always) still
+the value's write-time, not the reap-time (`ExpiryTombstoneFor`'s one-tick advance almost always
+lands in `origin_hash`, not `mvcc` — see its own doc comment for the rare carry case), its GC
+deadline (`DeadlineMs`, `mvcc.h`) is `write_time + tombstone_ttl`, not `reap_time + tombstone_ttl`
+— see "Sizing the TTL" below for the operational consequence. (A tombstone reaped on exactly one
+node still propagates verbatim to peers via the opcode-225 section of that node's next full sync,
+exactly as before.)
+
+On a PLAIN (non-`--active_replica`) replica specifically, this expiry `DEL` still arrives — only a
+peer link filters it — but that replica has no mvcc side table to stamp it into at all: `MvccEnabled`
+is exactly `IsActiveReplica()` (`db_slice.cc`), and a plain replica is never `--active_replica`
+(`ServerFamily::ReplicaOfInternal` unconditionally routes an `--active_replica` node's own
+`REPLICAOF` through the peer-mode path, so a node that IS `--active_replica` can never attach as a
+plain replica of anything, and `--active_replica` is boot-only — not a race, an unreachable
+combination). The `DEL` is therefore applied exactly like any other ordinary Redis command: the key
+is simply removed, with no stamp, no tombstone, and no `origin` recorded anywhere — `DEBUG MVCC`
+itself requires `--active_replica` and would refuse to run there regardless. `ExpiryTombstoneFor`'s
+own masked `mvcc` still travels on the wire as this `DEL` entry's nominal author stamp (the value's
+own magnitude in the near-universal case, one tick above it only on the rare carry, see above), but
+a plain replica has nowhere to file it — the field is simply unused on that link, the same as any
+other journal metadata a plain Redis-protocol consumer already ignores.
 
 **Tombstones are default-namespace-only.** `PerformDeletionAtomic`'s tombstone-earning check
 (`db_slice.cc`) is gated on `ns_ == &namespaces->GetDefaultNamespace()`. A delete in an ACL
@@ -162,16 +517,35 @@ its own to defend that key, this `ttl=0` node has nothing to compare a *later*, 
 (`MergeAccepts(std::nullopt, incoming)` always accepts) — resurrecting the value even though the
 correct peer's tombstone is still live and unexpired elsewhere in the mesh.
 
-**Sizing the TTL against expected partition length.** A tombstone protects a delete only for as
-long as it is retained: if a peer is partitioned (network split, long maintenance window, extended
-`REPLICAOF` gap) for longer than `--multi_master_tombstone_ttl`, and a key on this node was
-deleted during that gap, the tombstone may already be gone by the time the peer reconnects and
-full-syncs — and the peer's stale copy resurrects the key exactly as if tombstoning were off. Set
-the TTL comfortably longer than the longest partition you expect to recover from automatically;
-600s (10 minutes) is a starting point for a mesh on a stable LAN, not a universal answer. There is
-no cost to setting it much higher other than the tombstone's own memory (one MVCC side-table slot,
-independent of the tombstoned key's own now-freed prime-table slot) and the risk of hitting
-`--multi_master_max_tombstones` sooner on a delete-heavy shard.
+**Sizing the TTL against expected partition length -- and against key TTLs.** A tombstone protects
+a delete only for as long as it is retained: if a peer is partitioned (network split, long
+maintenance window, extended `REPLICAOF` gap) for longer than `--multi_master_tombstone_ttl`, and
+a key on this node was deleted during that gap, the tombstone may already be gone by the time the
+peer reconnects and full-syncs — and the peer's stale copy resurrects the key exactly as if
+tombstoning were off. Set the TTL comfortably longer than the longest partition you expect to
+recover from automatically; 600s (10 minutes) is a starting point for a mesh on a stable LAN, not a
+universal answer. There is no cost to setting it much higher other than the tombstone's own memory
+(one MVCC side-table slot, independent of the tombstoned key's own now-freed prime-table slot) and
+the risk of hitting `--multi_master_max_tombstones` sooner on a delete-heavy shard.
+
+An expiry tombstone's GC deadline is measured from the expired value's OWN write time, not from
+when it was actually reaped (see "one origin_hash tick above the value it replaces" above) — so for
+a key
+whose own TTL is close to, or exceeds, `--multi_master_tombstone_ttl` (e.g. `SET k v EX 3600` under
+the 600s default), the tombstone can be born already past its deadline, or close to it, and get
+reclaimed by the very next idle GC pass — losing the resurrection-protection window for that key
+entirely, or nearly so. Size the tombstone TTL comfortably above the LONGEST key TTL you expect to
+use, in addition to the longest partition length above (the two add, they do not take the max):
+a key with a 1-hour TTL that expires right as a peer reconnects from an hour-long partition needs
+tombstone protection for the partition length PLUS however long that key's own value had already
+been live.
+
+A container with per-member TTLs (`SADD`+`FIELDEXPIRE`, `HSET`+`HEXPIRE`, …) is even more exposed:
+its own empty-container tombstone is measured from the container's LAST WRITE, not from any one
+member's TTL, and a container can go a long time between writes while its individual members expire
+on their own independent schedules. By the time the last member finally expires and the container
+itself empties, the gap since that last write can be far larger than any single key's own TTL — size
+the tombstone TTL with that in mind for workloads that lean on per-member expiry.
 
 **Hitting the cap degrades to resurrection.** When a (database, shard) pair's tombstone count is
 already at `--multi_master_max_tombstones`, the next delete for a key on that database and shard
@@ -213,6 +587,19 @@ reminder of this split, not because the combination is unsupported.
 
 - `INFO memory`: `mvcc_table_bytes`, `mvcc_entries`, `mvcc_tombstones`, `mvcc_tombstones_dropped`
   (all gated on `--active_replica`; absent, not zero, on a non-active node).
+- `INFO replication`: `multimaster_lww_dropped` — counts one per dropped *key*, not per replicated
+  command (a guarded `MSET`/`DEL` naming several keys can contribute more than one to a single
+  applied entry), on this node's peer links, summed across every shard/proactor thread
+  (`ServerState::Stats::multimaster_lww_dropped`, `multimaster_lww.h`'s `NoteLwwDrop`). Same gate
+  as the other `mvcc_*` replication fields: gated on `--active_replica`, absent (not zero)
+  otherwise. Also exported as the Prometheus counter `dragonfly_multimaster_lww_dropped_total`,
+  same gate. The INFO field's own value is covered by a C++ unit test
+  (`InfoReplicationShowsLwwDroppedSummedAcrossShards`, `multi_master_test.cc`); the Prometheus
+  counter is covered by a pytest
+  (`test_stream_lww_dropped_counter_renders_as_prometheus_metric`, `multimaster_test.py`), via
+  `DflyInstance.metrics()` (`instance.py`, which scrapes `/metrics` for real), asserting it is
+  present and equal to `INFO replication`'s own value on an active node, and entirely absent on a
+  non-active one.
 - `DEBUG MVCC <key>`: prints `state:value|tombstone|absent`, and for `value`/`tombstone` the raw
   `mvcc:`, `ms:`, `counter:` (value only), and `origin:` fields for that key on its own shard.
 - `DEBUG MVCC` (no key): per-shard aggregate — `shard<N>_entries`, `shard<N>_tombstones`,
@@ -224,11 +611,34 @@ reminder of this split, not because the combination is unsupported.
 All three `DEBUG MVCC` forms require `--active_replica` and are local-only (default namespace
 only — the journal wire has no namespace identity to carry a non-default one's state).
 
-**Do not diff `DEBUG MVCC <key>` across peers for an expired key.** Two nodes that each expired
-the same key hold different `{mvcc, origin}` tombstones for it, by design — see "An expiry's
-tombstone stamp is per-node" above. Both will report `state:tombstone` (or `absent`, once the
-tombstone is GC'd) and both will return nil; only the stamps differ. For a `DEL`, and for an
-expiry reaped on exactly one node, the stamps do match across peers.
+**A failed conditional delete, `SET ... NX`, or BUSYKEY-rejected `RESTORE` bumps
+`mvcc_unstamped_writes` even though nothing changed.** `DELEX key IFEQ v` (predicate false),
+`SET key v NX` (key already present), and `RESTORE key ttl payload` without `REPLACE` against an
+existing key (D-26, [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md)) all open the key with
+`FindMutable`, which arms an MVCC slot for it regardless of whether anything is actually written;
+when the predicate/condition/existence check then skips the write, nothing journals, so
+`EndOfWriteEpoch` finds that arm still pending and counts it as an unstamped write. This is benign
+— no data changed, nothing was journaled — but a lock-release-style pattern that polls a
+conditional delete or a `SET NX` in a loop (e.g. `DELEX lock IFEQ <token>`) will visibly raise this
+counter without indicating any real problem.
+
+**Do not diff `DEBUG MVCC <key>` across peers.** Two mesh peers that each expire the same key
+independently now install the SAME tombstone (see "An expiry's tombstone stamp is one
+origin_hash tick above the value it replaces" above) — as do a `DEL`'s stamp and an expiry reaped
+on exactly one node and propagated to the rest. What still legitimately differs: the
+applied-write stamp floor (see "Streaming LWW" above) produces a floored stamp whose `origin:` is
+a number derived from, not equal to, a real registered origin hash, so it is not comparable to any
+peer's own reporting.
+
+`DEBUG MVCC` is never meaningfully comparable against a PLAIN (non-peer) replica's own state to
+begin with: an `--active_replica` node's own `REPLICAOF` (`ServerFamily::ReplicaOfInternal`)
+unconditionally routes through `ReplicaOfActive`, which always negotiates peer mode — a node with
+`--active_replica` set can therefore never attach, in either direction, as a plain (non-peer)
+replica of anything, and `--active_replica` is boot-only, so this is not a race, just an
+unreachable combination. A genuinely plain replica is therefore never `--active_replica`, `DEBUG
+MVCC` requires `--active_replica` (above), and `MvccEnabled` is exactly `IsActiveReplica()`
+(`db_slice.cc`) — so a plain replica never allocates an mvcc side table at all and has nothing for
+`DEBUG MVCC` to report in the first place.
 
 ## Compatibility: the RDB one-way doors
 
@@ -243,10 +653,13 @@ Two RDB opcodes are drakeydb-specific and hard-fail an older loader:
 
 Both opcodes are written **only** by an active-replica node's save path, and the read side parses
 them unconditionally (any drakeydb binary, active or not, consumes and — if not active — discards
-them). `kDrakeydbReplVersion` (currently `67`) is the fork's own replication protocol version,
-exchanged via `REPLCONF DRAKEY-VERSION` before a single RDB byte is sent; an active node refuses
-to admit a consumer advertising a version older than its own, so a pre-P4-3 drakeydb peer is
-refused *before* full sync rather than being admitted and hard-failing mid-stream on opcode 225.
+them). `kDrakeydbReplVersion` (currently `68`, bumped from `67` in P4-4) is the fork's own
+replication protocol version, exchanged via `REPLCONF DRAKEY-VERSION` before a single RDB byte is
+sent; an active node refuses to admit a consumer advertising a version older than its own, so a
+pre-P4-3 drakeydb peer is refused *before* full sync rather than being admitted and hard-failing
+mid-stream on opcode 225 — and, since the P4-4 bump, a pre-P4-4 peer (one that predates the
+streaming LWW guard) is refused at that same handshake step too, even though it carries no new RDB
+opcode of its own to hard-fail on. Upgrade a mesh in lockstep (see below).
 
 **The remaining one-way door is a file handed by hand.** Live drakeydb-to-drakeydb replication is
 protected by the version gate above; there is no way to receive an incompatible stream over the
@@ -273,5 +686,99 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
   a `BY`/`GET` pattern key is not a transaction key, so a peer can legitimately compute a different
   destination value under an identical MVCC stamp, and the tie-favors-stored rule then never
   repairs the divergence.
+- **D-16** — an expiry tombstone's GC deadline derives from the value's *write-time* stamp, not
+  the reap time: for a key whose own TTL exceeds `--multi_master_tombstone_ttl` (or a member-TTL
+  container whose last write predates its last member's expiry by more than that TTL), the
+  resulting tombstone can be born already past its GC deadline and get reaped almost immediately,
+  losing its resurrection-protection window (the delete itself always stands). Size
+  `--multi_master_tombstone_ttl` above the longest key TTL in use, not only the longest expected
+  partition.
+- **D-18** — the runtime-revived recipes (same-shard `RENAME`/`RENAMENX`/`SORT ... STORE`, exact
+  `XTRIM`) and the name-ambiguous full-value writes (`JSON.SET`/`MERGE`/`DEL`/`FORGET`/`CLEAR` at
+  the root path, `CMS.MERGE`, `BF.LOADCHUNK`'s init chunk) described above, all unguarded by
+  design.
+- **D-19** — two applied `EnsureMvcc` calls for the same already-committed-tombstoned key within
+  one entry (e.g. `MSET k a k b`) only let the FIRST inherit the tombstone's real prior stamp; the
+  second sees an already-cleared, non-tombstone-shaped slot and floors against nothing, so it can
+  commit below the tombstone the key had before this entry. Unreachable on the guarded path
+  (`OpMSet`/`OpDelV2`'s own per-key check drops the first pair outright); only reachable with the
+  streaming guard off.
+- **D-20** — a guarded `DEL` newer than an absent key's older tombstone leaves that tombstone
+  untouched (nothing to delete, nothing armed); a later write stamped between the two is then
+  accepted here while a peer that saw the `DEL` against a still-live value holds a newer
+  tombstone — a divergence a subsequent full sync from that peer repairs while its tombstone is
+  still live, but not otherwise, and only if no later unguarded delta lands on the key first (see
+  D-23). Owned by P4-5 (tombstone lifecycle).
+- **D-21** — a non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/
+  `ZDIFFSTORE`/`ZRANGESTORE`, or `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST` result always
+  journals `DEL` (guarded) then `SADD`/`ZADD` (delta, unguarded) as two entries; a guarded receiver
+  with a newer destination drops the `DEL` but still applies the add, merging a stale result into
+  its own newer value. A later full sync from a node still holding the clean, correctly-stamped
+  value repairs it, provided no other unguarded delta lands on the key first (see D-23); nothing in
+  steady-state streaming does. Owner: open.
+- **D-22** — an unguarded applied re-create (a delta RMW) on a key held only as an expiry
+  tombstone `T` floors to exactly `T`'s own pre-expiry stamp `P` — a stamp a third, still-lagging
+  peer's live copy of the same key may already hold. Neither side's value is wrongly resurrected
+  (ties favor stored), but the two do not converge until a peer that never itself applied this
+  delta independently reaps its own copy, landing on `T` (strictly above `P`), and even then only
+  if no unguarded delta lands on this node's copy first (D-23). A peer that DID apply the same
+  delta before reaping instead lands on the identical `P` magnitude too, not `T` — such a peer
+  ties this node forever and cannot repair it either.
+- **D-23** — any unguarded delta (`INCR`/`APPEND`/…) applies to whatever value this node already
+  holds and commits the author's stamp verbatim whenever it is not older than the stored stamp —
+  so a value divergence between two nodes becomes an IDENTICAL-stamp divergence the moment either
+  side's delta reaches the stamp the other side already holds. Ties favor stored, so a full sync
+  cannot repair it either; only the next full-state write, or the key's own expiry ON A PEER THAT
+  NEVER APPLIED THE OFFENDING DELTA (see D-22's qualification above — a peer that did apply it
+  ties instead of healing), heals it.
+- **D-24** — a TTL-changing command (`EXPIRE`/`PERSIST`/`GETEX`/…) ships the key's CURRENT full
+  value on an active node, racing a concurrent unguarded delta on the same key. TTL-change-newer
+  order self-heals at the next TTL change or full-state write; delta-newer order is D-23's general
+  case (identical stamp, only one side keeps the TTL) applied to this shape, not a new exposure.
+  Avoid mixing cross-node deltas with concurrent TTL changes/`SET`s on the same key.
+- **D-25** — fixed on active nodes (`set_cb`'s `dest_shard` filter, gated on
+  `IsActiveReplica()`): upstream's `PFMERGE` runs its destination-write callback on every shard
+  the transaction touches, not just the destination's own, creating an independent phantom copy
+  on every non-owning shard (`DBSIZE`/`SCAN` double-count it). A non-active node keeps upstream's
+  own phantom-writing shape exactly, per the byte-identity invariant.
+- **D-26** — a `RESTORE` rejected `KEY_EXISTS` (no `REPLACE`, key already exists) still arms the
+  key's MVCC slot before the check runs, so it leaks exactly one `mvcc_unstamped_writes` at this
+  transaction's epoch end. Benign — the key itself is untouched — and the same shape a failed
+  conditional delete or `SET ... NX` already produces.
+- **D-27** — an unguarded delta (`INCR`/…) authored before a key's TTL deadline, but applied on
+  another node strictly after that deadline has passed there, re-creates the key with NO TTL: the
+  applying node's own copy is already an expiry tombstone, and an unguarded RMW never consults the
+  mvcc side table before applying, so it simply creates a fresh, TTL-less value. The classic
+  rate-limiter pattern (`INCR`; `EXPIRE` only when `INCR` returns 1) is directly affected: once a
+  node's counter is silently re-created this way, `INCR` never again returns 1 there, so its own
+  `EXPIRE` never fires. Mitigation: run `EXPIRE k ttl NX` after every `INCR`, not only when `INCR`
+  returns 1 -- `NX` fires exactly when there is currently no TTL, self-healing the silently
+  re-created key, and stays a cheap no-op the rest of the time -- on an active node a firing
+  `EXPIRE` ships the key's full state and re-converges every peer. Owned by P4-5 (tombstone
+  lifecycle).
+- **D-28** — `HEXPIRE`/`FIELDEXPIRE`/`SADDEX`/`HSETEX` auto-journal the client's own RELATIVE
+  member-TTL seconds argument verbatim; each receiver computes that member's deadline from ITS OWN
+  arrival time, drifting later with replication lag, compounding across a replica chain. Same root
+  shape `RESTORE`'s own relative TTL had before it was corrected to ship an absolute one; not
+  extended to these four commands here.
+- **D-29** — an unstamped (never-received-a-stamp) value's expiry erases its mvcc slot with NO
+  tombstone rather than installing an `Mvcc()==0` one (which would itself lose every future
+  compare unconditionally). A peer's own unstamped `{0,0}` copy of the same key can then resurrect
+  it at the next merge, since `MergeAccepts` against an absent local slot always accepts.
+- **D-30** — `HDEL` emptying a hash commits its own peer-suppressed derived-delete tombstone
+  inside the callback, consuming the key's mvcc arm; `HDEL`'s own separate auto-journal entry (the
+  only one a peer actually receives) then finds no arm left and mints a bare, unfloored
+  `HopStamp`. When the hash's pre-delete stamp `S` is newer than that `HopStamp`, both sides still
+  end up tombstoned (a peer floors its own applied copy against its stored `S` too, and the arm's
+  own tombstone flag forces the bit on regardless), but at different MAGNITUDES: the author lands
+  one tick above `S`, the peer one tick below it. A later write stamped strictly between the two is
+  accepted by the peer and rejected by the author.
+- **D-31** — `RESTORE ... REPLACE` over an existing key deletes it (`DelMutable`) before attempting
+  to load the new payload; if that load then fails (`INVALID_VALUE`, or `SKIPPED` when every member
+  expired during deserialize), `RESTORE` returns without ever journaling, so the deletion never
+  reaches a peer. The old value stays genuinely gone here (only the leftover mvcc arm rolls back,
+  not the key itself) while every other node keeps it — a silent divergence pre-existing upstream,
+  not introduced by drakeydb. A guarded receiver hitting the `SKIPPED` case is also a member-TTL
+  sibling of D-28's family: no tombstone is left behind to reject a stale write arriving afterward.
 
 See that document for the full list, upstream-bug cross-references, and each entry's owning phase.

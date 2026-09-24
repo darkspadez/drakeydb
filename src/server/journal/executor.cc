@@ -14,6 +14,7 @@
 #include "facade/reply_capture.h"
 #include "facade/service_interface.h"
 #include "server/main_service.h"
+#include "server/multimaster_lww.h"
 #include "server/namespaces.h"
 
 using namespace std;
@@ -47,6 +48,14 @@ facade::DispatchResult JournalExecutor::Execute(DbIndex dbid, journal::ParsedEnt
   SelectDb(dbid);
   CommandContext cntx_cmd;
   cntx_cmd.Init(reply_builder_.get(), &conn_context_);
+
+  // drakeydb: P4-4 Task A9 -- SETNX->SET / GETSET->SET / GETDEL->DEL / RESTORE->+REPLACE, see
+  // ApplyLwwRewrites' (multimaster_lww.h) own comment for why. Gated on EXACTLY LwwGuardActive --
+  // the same predicate Transaction::IsLwwGuarded() uses -- never on repl_lww_guard alone: an
+  // unstamped (mvcc 0) SETNX rewritten to SET would become an UNGUARDED blind SET that clobbers
+  // the key. Must run before SwapArgs below: the rewrite mutates `cmd`, not `cntx_cmd`.
+  if (LwwGuardActive(conn_context_.repl_lww_guard, conn_context_.repl_mvcc))
+    ApplyLwwRewrites(&cmd);
 
   // TODO: we should improve interfaces in callers (replica and rdb_load) so that we pass
   // CommandContext directly and avoid this swap.

@@ -22,7 +22,11 @@ namespace dfly {
 // P4-3 bumps 66 to 67 because its snapshot stream adds opcode 225 (RDB_OPCODE_DF_TOMBSTONES,
 // rdb_extensions.h): a P4-2-era consumer advertising 66 cannot parse that opcode either and must
 // likewise be refused before full sync, not admitted and then hard-failed mid-stream.
-inline constexpr unsigned kDrakeydbReplVersion = 67;
+// P4-4 bumps 67 to 68 for the streaming LWW guard (multimaster_lww.h) plus its applied-write
+// stamp floor change to apply semantics: a P4-3-era peer neither drops a stale replicated write
+// nor floors an applied stamp the same way, so a mixed 67/68 mesh must be refused at handshake
+// rather than silently diverging.
+inline constexpr unsigned kDrakeydbReplVersion = 68;
 
 inline constexpr char kNodeUuidFileName[] = "drakeydb.uuid";
 

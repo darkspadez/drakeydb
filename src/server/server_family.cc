@@ -3149,6 +3149,16 @@ string ServerFamily::FormatInfoMetrics(
         append("mvcc_clock_ahead_ms", m.mvcc_clock_ahead_ms);
         append("mvcc_unstamped_writes", m.mvcc_unstamped_writes);
         append("mvcc_stale_epoch", m.mvcc_stale_epoch);
+        // drakeydb: P4-4 -- replicated writes the streaming LWW guard (multimaster_lww.h,
+        // NoteLwwDrop) has dropped on this node's peer links. The counter itself lives on
+        // ServerState::Stats (per shard/proactor thread); m.coordinator_stats is already the sum
+        // over every thread by the time FormatInfoMetrics sees it -- Metrics::InitFromThread
+        // seeds coordinator_stats from that thread's own ServerState::Stats, and Metrics::Merge
+        // folds every thread's Metrics into one via ServerState::Stats::Add (metrics.cc), same
+        // path mvcc_unstamped_writes above and every other coordinator_stats field already take.
+        // Same gate as its siblings above: the guard can only engage on an active-replica peer
+        // link, so this stays exactly 0 -- never printed -- on a non-active node.
+        append("multimaster_lww_dropped", m.coordinator_stats.multimaster_lww_dropped);
       }
     } else {
       append("role", GetFlag(FLAGS_info_replication_valkey_compatible) ? "slave" : "replica");
@@ -3357,7 +3367,20 @@ void ServerFamily::Info(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
   for (string_view section_arg : section_range) {
     sections.emplace_back(absl::AsciiStrToUpper(section_arg));
     const auto& section = sections.back();
-    need_metrics |= (section != "SERVER") && (section != "REPLICATION");
+    // drakeydb: P4-4 -- upstream 8bd2b9ed ("optimize info command", #4137) deliberately excluded
+    // both SERVER and REPLICATION from need_metrics (the variable itself, and the multi-section
+    // support around it, came later via 54e2de90 #6093; the current `|=` expression's exact form
+    // is from 7f1f003c #7746): those two sections are the ones a client or management component
+    // polls most often, so skipping GetMetrics()'s cross-thread fan-out for them is a real latency
+    // win upstream measured and wants kept, not an oversight to blanket-reverse. But REPLICATION
+    // now reads `Metrics` fields too on an active-replica node
+    // (mvcc_clock_ahead_ms/mvcc_unstamped_writes/mvcc_stale_epoch/multimaster_lww_dropped, all
+    // gated on IsActiveReplica() in add_repl_info below and always 0 -- never read -- otherwise),
+    // so it must fetch metrics on THAT node only: a bare `INFO replication` used to leave
+    // `metrics` at this function's default-constructed value there, silently reporting all four
+    // fields as 0 regardless of the node's real state. A non-active node (the common case
+    // upstream's optimization targets) keeps the fast path unchanged.
+    need_metrics |= section != "SERVER" && (section != "REPLICATION" || IsActiveReplica());
 
     const bool is_all = section == "ALL";
     opts.replication_memory |= is_all || (section == "MEMORY");

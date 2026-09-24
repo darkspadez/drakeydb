@@ -4,6 +4,8 @@
 
 #include "server/journal/journal.h"
 
+#include <algorithm>  // std::max
+
 #include "base/logging.h"
 #include "server/common.h"
 #include "server/db_slice.h"
@@ -100,8 +102,7 @@ LSN GetLsn() {
 }
 
 void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
-                 Entry::Payload payload, uint32_t origin_idx, uint64_t mvcc, uint8_t entry_flags,
-                 std::optional<uint32_t> stamp_origin_idx) {
+                 Entry::Payload payload, uint32_t origin_idx, uint64_t mvcc, uint8_t entry_flags) {
   Entry entry{txid, opcode, dbid, slot, std::move(payload)};
   // drakeydb: Phase 3 -- stamp origin/mvcc/entry_flags onto the entry; defaults to self/0/none
   // for callers that don't pass them. See journal.h for why this isn't folded into the Entry
@@ -110,14 +111,34 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
   entry.mvcc = mvcc;
   entry.entry_flags = entry_flags;
 
+  // drakeydb: P4-4 Task A5 -- an entry is "applied" iff the CALLER supplied a non-zero mvcc,
+  // BEFORE the mint below ever runs. This distinguishes FloorAppliedStamp's floor (below, in the
+  // Commit() callback) from D3's LocalMintFloor (just below this comment): only a caller-supplied
+  // author stamp (an applied write's, guarded or not, on a peer link or a plain replica) can
+  // legitimately be OLDER than the key's own stored stamp and needs FloorAppliedStamp's
+  // one-tick-below landing -- a local mint (mvcc == 0 here) is never older than stored in that
+  // sense, but D3 still floors it strictly ABOVE stored (LocalMintFloor, not FloorAppliedStamp).
+  const bool applied = mvcc != 0;
+
   // drakeydb: Phase 4 -- mint AFTER entry.mvcc = mvcc above (an assignment from the possibly-zero
   // caller-supplied parameter, which would otherwise clobber a mint placed earlier straight back
   // to 0) and BEFORE AddLogRecord below, so the wire carries this exact value. HopStamp takes
   // now_ms explicitly (Task 4, design point 3): mvcc.cc itself never calls GetCurrentTimeMs(), so
   // the caller -- here, already deep in EngineShard territory -- does. entry.mvcc == 0 is a safe
   // "caller supplied no stamp" test: 0 is unreachable for a real stamp (ms << 20, ms ~ 1.77e12).
-  if (MvccEnabled() && opcode == Op::COMMAND && entry.mvcc == 0)
-    entry.mvcc = MvccStamper::tlocal()->HopStamp(GetCurrentTimeMs());
+  //
+  // drakeydb: P4-4 Task A5b -- spec D3: a LOCAL mint must land strictly above the stored stamp of
+  // every key this entry is about to commit, not just above the wall clock -- LocalMintFloor
+  // (mvcc.h) reads the arms Arm()/ArmTombstone() already placed for THIS entry (PostUpdate/
+  // PerformDeletionAtomic both run before RecordEntry) and returns the highest prev+1 among them,
+  // or 0 (a no-op) if none carries a real prior stamp. Deliberately max()'d with HopStamp rather
+  // than folded into MvccClock itself: the clock (and hop_stamp_'s memo) stay untouched, so a
+  // LATER, unrelated local mint in the same epoch still gets a plain clock tick -- one skewed peer
+  // must never be able to poison this whole shard's clock for every other key too.
+  if (MvccEnabled() && opcode == Op::COMMAND && entry.mvcc == 0) {
+    MvccStamper* stamper = MvccStamper::tlocal();
+    entry.mvcc = std::max(stamper->HopStamp(GetCurrentTimeMs()), stamper->LocalMintFloor());
+  }
 
   journal_slice.AddLogRecord(entry);
 
@@ -135,12 +156,47 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
   // non-default namespaces before they reach RecordEntry; DbSlice::PostUpdate applies the same
   // boundary before arming. Looked up once, not once per armed key, since a single journal entry
   // can arm many keys (for example MSET).
-  if (MvccEnabled() && opcode == Op::COMMAND) {
+  //
+  // drakeydb: P4-4 -- excludes a kEntryFlagExpired entry: RecordExpiryBlocking's own
+  // CommitOwnTombstone call (mvcc.cc) already committed (and removed) this key's own tombstone arm
+  // before this entry was ever built, so there is nothing left for this sweep to do for the key
+  // this entry's own payload names. Running it anyway would instead reach any OTHER key still
+  // armed this epoch -- a sibling of a multi-key command whose lazy expiry of an unrelated key
+  // fired mid-callback -- and consume that sibling's arm with THIS entry's stamp, before the
+  // command's own trailing entry (whose payload actually names the sibling) ever gets a chance to.
+  // Leaving the sibling armed here means that later entry commits it instead, with the exact stamp
+  // that entry puts on the wire -- keeping the stored and propagated stamps for that key equal, as
+  // every other path already guarantees.
+  if (MvccEnabled() && opcode == Op::COMMAND && !(entry_flags & kEntryFlagExpired)) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     MvccStamper::tlocal()->Commit(
-        entry.mvcc, stamp_origin_idx.value_or(entry.origin_idx),
-        [&db_slice](DbIndex db, std::string_view key, const MvccStamp& st) {
-          db_slice.SetExistingMvcc(db, key, st);
+        entry.mvcc, entry.origin_idx,
+        [&db_slice, applied](DbIndex db, std::string_view key, const MvccStamp& st, bool tombstone,
+                             const MvccStamp& prev_stamp) {
+          if (!applied) {
+            db_slice.SetExistingMvcc(db, key, st);
+            return;
+          }
+          // drakeydb: P4-4 Task A5 -- floor an applied write's stamp against the
+          // ARM's own captured prev_stamp, for BOTH arm kinds, never a live DbSlice::GetMvcc
+          // lookup: by commit time the slot may no longer hold this key's true prior stamp --
+          // EnsureMvcc's tombstone-clearing branch, or PerformDeletionAtomic's own placeholder
+          // write (both db_slice.cc), can already have overwritten it, possibly well before this
+          // call ever runs.
+          //
+          // The result's own tombstone bit is decided from `tombstone` (the arm's ground truth,
+          // set by ArmTombstone vs Arm, never influenced by wire input), not from `st`'s own bit:
+          // an applied write's author-supplied mvcc is unsanitized wire data, and
+          // FloorAppliedStamp's internal incoming.IsTombstone() check trusts it -- relying on that
+          // alone would let a stray high bit on an ORDINARY write's wire mvcc mark this key's
+          // committed, still-LIVE stamp as a tombstone.
+          MvccStamp floored = FloorAppliedStamp(prev_stamp, st);
+          if (tombstone) {
+            floored.packed |= MvccClock::kTombstoneBit;
+          } else {
+            floored.packed &= MvccClock::kStampMask;
+          }
+          db_slice.SetExistingMvcc(db, key, floored);
         });
   }
 }

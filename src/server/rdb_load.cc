@@ -2991,6 +2991,12 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
     // the stable-sync path (replica.cc). journal_executor_ is reused across every JOURNAL_BLOB
     // opcode in this load, so this runs once per loader, not per entry.
     journal_executor_->SetApplyOrigin(apply_origin_idx_);
+    // drakeydb: P4-4 Task A10 -- same one-time-per-loader placement as SetApplyOrigin immediately
+    // above, for the streaming LWW guard: this loader's concurrent-journal-blob applier now
+    // agrees with that same link's stable-sync executor_ (DflyShardReplica, replica.cc) on
+    // whether writes are LWW-guarded, instead of always applying in plain arrival order while the
+    // RDB key stream beside it is merge-compared (see CreateObjectOnShard's merge_lww_ use).
+    journal_executor_->SetApplyLwwGuard(apply_lww_guard_);
   }
 
   io::BytesSource bs{io::Buffer(journal_blob)};
@@ -3558,20 +3564,13 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
   // write, correctly losing against the newer `stamp` this call was trying to install, could then
   // wrongly win against the stale one left behind instead -- an intermediate resurrection.
   // `would_grow` mirrors SetTombstone's own `was_tombstone` test (absent slot, or a slot that is
-  // not currently a tombstone).
-  if (TombstonesEnabled()) {
-    DbTable* cur_table = db_slice->GetDBTable(db_index);
-    if (cur_table != nullptr) {
-      const std::optional<MvccStamp> existing = db_slice->GetMvcc(db_index, key);
-      const bool would_grow = !existing.has_value() || !existing->IsTombstone();
-      if (!would_grow ||
-          cur_table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
-        db_slice->SetTombstone(db_index, key, stamp);
-      } else {
-        ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly
-      }
-    }
-  }
+  // not currently a tombstone). drakeydb: P4-4 -- this exact would_grow/cap-and-degrade logic is
+  // now DbSlice::InstallAbsentKeyTombstone (db_slice.h/.cc), shared with SetCmd::Set/OpRestore/
+  // Renamer::DeserializeDest's own identical no-live-key tombstone install (string_family.cc/
+  // generic_family.cc) rather than copied a third time; it re-resolves the table fresh via
+  // IsDbValid(db_ind) internally, matching this function's own re-resolve-not-reuse discipline
+  // above for exactly the same reason (a stale table pointer captured before a yield).
+  db_slice->InstallAbsentKeyTombstone(db_index, key, stamp);
 }
 
 void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, DbSlice* db_slice) {
@@ -3797,14 +3796,18 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   // record takes (ApplyMergeTombstoneOnShard, above in this file -- extracted for precisely this
   // reason), carrying a synthetic tombstone built from `incoming`:
   //
-  //   * item->has_mvcc  -> the peer's own per-key stamp, with bit 63 set. Deliberately NOT a
-  //     freshly minted one: the value's stamp is the most authoritative thing the wire tells us
-  //     about this key, and AsTombstone's usual "must be strictly greater than the value being
-  //     deleted" precondition (mvcc.h) is satisfied against the side that matters here -- the
-  //     RESIDENT value, which only loses this compare when it is strictly older. Order-equivalence
-  //     with the peer's own live copy of that same value is correct and intended: ties favor the
-  //     stored side, so a third peer still holding that exact value neither resurrects it here nor
-  //     has it deleted there (it carries the same elapsed TTL and expires locally anyway).
+  //   * item->has_mvcc  -> ExpiryTombstoneFor(the peer's own per-key stamp) -- mvcc.h: one
+  //     origin_hash tick above it, tombstone bit set. Deliberately NOT a freshly minted one: the
+  //     value's stamp is the most authoritative thing the wire tells us about this key, and one
+  //     tick above it satisfies AsTombstone's "must be strictly greater than the value being
+  //     deleted" precondition (mvcc.h) against the side that matters here -- the RESIDENT value,
+  //     which only loses this compare when it is strictly older than the peer's value -- while
+  //     staying the smallest such stamp, so it costs nothing against a third peer's later,
+  //     genuinely newer write for the same key. Landing exactly ON the peer's stamp instead (order-
+  //     equivalent to it) was rejected: a third peer that re-creates this exact key at this exact
+  //     {mvcc, origin_hash} pair (a delta RMW applied on a node that already reaped the key ties
+  //     the same way CommitOwnTombstone's own comment, mvcc.h, describes) would tie against this
+  //     tombstone forever once installed.
   //   * classic-PSYNC, unstamped -> the ctime-derived stamp computed just above, i.e. exactly the
   //     authority Task 13 already grants that link's live values, no more.
   //   * DFLY, unstamped -> D-7's {0, 0}, whose tombstone form has Mvcc() == 0 and therefore LOSES
@@ -3820,8 +3823,8 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
       DbTable* table = db_slice->GetDBTable(db_cntx.db_index);
       const bool resident_live =
           table != nullptr && !table->prime.Find(string_view{item->key}).is_done();
-      ApplyMergeTombstoneOnShard(db_slice, db_cntx.db_index, item->key, incoming.AsTombstone(),
-                                 resident_live);
+      ApplyMergeTombstoneOnShard(db_slice, db_cntx.db_index, item->key,
+                                 ExpiryTombstoneFor(incoming), resident_live);
       return;
     }
     VLOG(2) << "Expire key on load: " << item->key;

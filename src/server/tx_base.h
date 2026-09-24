@@ -81,10 +81,15 @@ struct DbContext {
   // drakeydb: Phase 4 -- the applied entry's MVCC stamp, mirroring repl_origin_idx above. Lets
   // delete paths that stamp directly (rather than through arm/commit) reproduce the author's
   // stamp byte for byte. 0 means "mint locally". Consumed by RecordDelete(const DbContext&, ...)
-  // and RecordDerivedDelete below (review wave 2, F2 -- landed here in Task 6 but left unread
-  // until then, so every derived/expiry DEL an applier produced minted its own local stamp
-  // instead of reproducing the author's).
+  // and RecordDerivedDelete below -- every derived/expiry DEL an applier produces reproduces the
+  // author's stamp through this field, instead of minting its own local one.
   uint64_t repl_mvcc = 0;
+
+  // drakeydb: P4-4 -- mirrors Transaction::repl_lww_guard_/ConnectionContext::repl_lww_guard: true
+  // iff this apply came in over a guarded peer link. Copied by Transaction::GetDbContext()
+  // (transaction.h); read by OpMSet (string_family.cc) and OpDelV2 (generic_family.cc) via
+  // LwwGuardActive to decide whether their own per-key veto runs at all.
+  bool repl_lww_guard = false;
 
   // Convenience method.
   DbSlice& GetDbSlice(ShardId shard_id) const;
@@ -276,9 +281,17 @@ void RecordDerivedDelete(const DbContext& db_cntx, std::string_view key);
 // (tx_base.cc) rather than inline here because it needs journal::kEntryFlagExpired and can no
 // longer just forward to RecordDelete(DbIndex, ...), which must stay flag-free.
 //
-// drakeydb: Phase 4, review wave 2 (F4) -- takes a DbContext (not a bare DbIndex) so it can pass
-// db_cntx.repl_mvcc to journal::RecordEntry instead of always minting a fresh local stamp; see
-// the .cc for why origin_idx deliberately does NOT get the same treatment.
+// drakeydb: Phase 4 -- takes a DbContext (not a bare DbIndex) for db_cntx.time_now_ms/db_index
+// (needed to look up and commit this key's own tombstone arm, mvcc.h's CommitOwnTombstone) and,
+// as a fallback source for journal::RecordEntry's own mvcc (db_cntx.repl_mvcc) for the case where
+// CommitOwnTombstone finds NO arm at all for this key (TombstonesEnabled() false, or the
+// per-(db, shard) cap already hit -- PerformDeletionAtomic never armed anything). When an arm
+// DOES exist, the wire mvcc instead comes from that arm's own committed value's masked magnitude
+// -- a real, non-zero derived tombstone stamp when the expiring value itself carried a real prior
+// stamp, or a literal 0 when it did not (an unstamped value's expiry installs NO tombstone at
+// all, D-29, ISSUE-REGISTER.md -- that literal 0 is what makes journal::RecordEntry mint a fresh
+// LOCAL stamp for the wire entry in that narrow case, never db_cntx.repl_mvcc). See the .cc for
+// the full account, and for why origin_idx deliberately does NOT get any equivalent treatment.
 void RecordExpiryBlocking(const DbContext& db_cntx, std::string_view key);
 
 }  // namespace dfly

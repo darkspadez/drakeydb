@@ -3821,6 +3821,71 @@ TEST_F(RdbMvccTest, MergeLwwAcceptsNewerIncomingInstallingValueAndStamp) {
   EXPECT_EQ(*got, kIncomingStamp);
 }
 
+// drakeydb: P4-4 Task A5 -- item (iii) of the "just-below" floor's end-to-end proof (see
+// UnguardedAppliedRmwWithOlderAuthorMvccFloorsInsteadOfRewindingTheStamp, multi_master_test.cc,
+// for items (i)/(ii), and mvcc.h's FloorAppliedStamp declaration for the pure-function why): a
+// merge-on-full-sync load carrying the ORIGINAL clean stamp `S` must heal the divergence an
+// applied floor otherwise leaves behind. `max(S, incoming)` was rejected specifically because it
+// cannot do this -- it would give the dirty RMW result the SAME stamp as a clean copy of S, and
+// ties favor the stored side, so a merge could never repair it.
+//
+// This test builds the "dirty" end state directly -- FloorAppliedStamp (the ACTUAL production
+// function) applied to a stale incoming stamp, then poked into the mvcc table alongside the RMW's
+// resulting value -- rather than re-driving a full applied-write execution through a
+// JournalExecutor: multi_master_test.cc's own end-to-end test already covers HOW that dirty state
+// arises (an unguarded APPEND with an author mvcc older than S); this test's entire point is what
+// a later merge load does to it, which needs only this fixture's single-shard RdbLoader
+// machinery, not a multi-shard active-replica harness. The split keeps each test's setup in
+// whichever file can express it most directly.
+TEST_F(RdbMvccTest, MergeLwwOnFullSyncHealsRmwDivergenceLeftByAnAppliedFloor) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kS{0x2000, kSelfHash};              // the ORIGINAL, clean stamp
+  const MvccStamp kStaleIncoming{0x1000, kPeerHash};  // older than S -- floored, not verbatim
+  const MvccStamp kFloored = FloorAppliedStamp(kS, kStaleIncoming);
+  ASSERT_TRUE(kFloored < kS) << "sanity: the floor must be strictly older than S, or this test "
+                                "proves nothing about healing";
+
+  ASSERT_EQ(Run({"set", "k", "v1x"}), "OK");  // the dirty RMW's resulting value
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kFloored);
+  });
+
+  // A merge-on-full-sync load carrying "k" = "v1" at exactly S.
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kS.packed);
+  absl::little_endian::Store64(block + 9, kS.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k");
+  AppendString(&body, "v1");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k"}), "v1")
+      << "the clean snapshot value must replace the dirty RMW result -- MergeAccepts(floored, S) "
+         "is true, so the merge must overwrite it";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(0, [&] {
+    got = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"k"});
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kS) << "the resident stamp must heal to exactly S, closing the divergence the "
+                         "applied floor otherwise leaves behind";
+}
+
 // ---- P4-3 final fix wave (F-1): an ALREADY-EXPIRED incoming key on a merge load ----------------
 //
 // These four pin the adversarial review's refutation. Before the fix, an incoming key whose
@@ -3913,9 +3978,11 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsReplica) {
     mismatches = db_slice.TEST_VerifyMvccTable(0);
   });
   ASSERT_TRUE(got.has_value()) << "the synthetic tombstone must be installed";
-  EXPECT_EQ(*got, kIncomingStamp.AsTombstone())
-      << "the tombstone carries the peer's OWN stamp with bit 63 set -- never our stale one, and "
-         "never a locally minted one";
+  // Independently constructed, not by calling ExpiryTombstoneFor: one origin_hash tick above the
+  // peer's own incoming stamp (mvcc.h), never our stale one, and never a locally minted one.
+  EXPECT_EQ(*got, (MvccStamp{kIncomingStamp.packed | MvccClock::kTombstoneBit, kPeerHash + 1}))
+      << "the tombstone must derive from the peer's OWN stamp -- one origin_hash tick above it -- "
+         "never our stale one, and never a locally minted one";
   EXPECT_TRUE(got->IsTombstone());
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after the delete";
 }
@@ -3971,7 +4038,9 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsMaster) {
     mismatches = db_slice.TEST_VerifyMvccTable(0);
   });
   ASSERT_TRUE(got.has_value()) << "the synthetic tombstone must be installed";
-  EXPECT_EQ(*got, kIncomingStamp.AsTombstone());
+  // Independently constructed, not by calling ExpiryTombstoneFor: one origin_hash tick above the
+  // peer's own incoming stamp (mvcc.h).
+  EXPECT_EQ(*got, (MvccStamp{kIncomingStamp.packed | MvccClock::kTombstoneBit, kPeerHash + 1}));
   EXPECT_TRUE(got->IsTombstone());
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after the delete";
 }
@@ -5707,7 +5776,7 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyDoesNotStealConcurrentAr
     // Mirrors PerformDeletionAtomic's own synchronous placeholder write + arm (db_slice.cc) for a
     // concurrent DEL of "ghost" that has not yet reached its own journal Commit().
     db_slice.SetTombstone(0, std::string_view{"ghost"}, MvccStamp{MvccClock::kTombstoneBit, 0});
-    MvccStamper::tlocal()->ArmTombstone(0, std::string_view{"ghost"});
+    MvccStamper::tlocal()->ArmTombstone(0, std::string_view{"ghost"}, MvccStamp{});
   });
 
   std::string body = BuildTombstoneSection(0, {{"ghost", kIncomingTombstone}});
@@ -5736,8 +5805,8 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyDoesNotStealConcurrentAr
     auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     got = db_slice.GetMvcc(0, std::string_view{"ghost"});
     arm_survived = MvccStamper::tlocal()->CommitOwnTombstone(
-        0, std::string_view{"ghost"}, GetCurrentTimeMs(),
-        [](DbIndex, std::string_view, const MvccStamp&) {});
+        0, std::string_view{"ghost"},
+        [](DbIndex, std::string_view, const MvccStamp&, bool, const MvccStamp&) {});
   });
   ASSERT_TRUE(got.has_value());
   EXPECT_EQ(*got, kIncomingTombstone)

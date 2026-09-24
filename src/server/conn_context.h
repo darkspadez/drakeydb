@@ -369,6 +369,14 @@ class ConnectionContext : public facade::ConnectionContext {
   uint32_t repl_origin_idx = 0;
   uint64_t repl_mvcc = 0;
 
+  // drakeydb: P4-4 -- the streaming LWW guard's per-link bit, set once via
+  // JournalExecutor::SetApplyLwwGuard() at flow setup for a guarded peer replication link (see
+  // journal/executor.h); stays false for an ordinary client connection and for every other
+  // link (plain replica, classic Redis/KeyDB stream). Same lifetime discipline as
+  // repl_origin_idx above: never reset per command. Copied onto the Transaction in
+  // PrepareTransaction (main_service.cc) via Transaction::SetReplOrigin.
+  bool repl_lww_guard = false;
+
   bool monitor = false;  // when a monitor command is sent over a given connection, we need to aware
                          // of it as a state for the connection
   bool journal_emulated = false;  // whether it is used to dispatch journal commands

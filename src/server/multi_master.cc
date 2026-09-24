@@ -12,6 +12,7 @@
 #include "facade/cmd_arg_parser.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/journal.h"
+#include "server/multimaster_lww.h"  // drakeydb: P4-4 -- for FLAGS_multi_master_stream_lww
 
 ABSL_FLAG(bool, active_replica, false,
           "drakeydb: stay a writable master while replicating from the masters given to "
@@ -132,20 +133,29 @@ bool ValidateMultiMasterFlags() {
                     "peer's full sync -- an explicit DEL on this node still tombstones and is "
                     "immune to that";
   }
-  // drakeydb: P4-3 Task 8, controller fix (I6) -- this warning still described the pre-P4-3
-  // world (full-sync merge unconditionally overwriting with whatever loaded last, "until P6").
-  // P4-3 landed merge-LWW for full sync; the warning now names what actually remains true:
-  // stable-sync (steady-state, post-full-sync) applies are still arrival-order, not compared
-  // against a local stamp at all -- MergeAccepts (mvcc.h) has no caller outside the full-sync
-  // loader (rdb_load.cc) today. See docs/multi-master.md for the full merge/tombstone contract.
+  // drakeydb: P4-4 -- this warning used to say every stable-sync apply stayed arrival-order
+  // "until P4-4", with no flag to change that. P4-4 added --multi_master_stream_lww (default
+  // true): a guarded command's own replicated write (SET, SETNX, GETSET, GETDEL, RESTORE, and
+  // MSET/DEL's own per-key split -- see docs/multi-master.md for the full table) is now
+  // LWW-compared against the local stamp on stream, the same rule full-sync merge
+  // already used (ties favor the stored side). Only turning that flag off brings back the old
+  // arrival-order behavior for those commands; full-sync merge LWW (MergeAccepts, mvcc.h) is
+  // unconditional either way and does not read this flag.
   LOG(WARNING) << "--active_replica: known limitations -- a local read (e.g. HTTL) can lazily "
                   "expire and delete a peer's not-yet-expired key under clock skew; full-sync "
                   "merge is last-write-wins per key since P4-3 (ties favor the stored side; a "
                   "classic-protocol peer's unstamped keys use an approximate snapshot-time "
-                  "authority and can resurrect an older delete -- see docs/multi-master.md), but "
-                  "STEADY-STATE stable-sync applies (ordinary replicated writes after the initial "
-                  "sync) remain arrival-order until P4-4 -- a peer's write can still overwrite a "
-                  "newer local write if it simply arrives later; see docs/PLAN.md";
+                  "authority and can resurrect an older delete -- see docs/multi-master.md); "
+                  "delta-journaled RMW commands (INCR, APPEND, ...) always resolve by arrival "
+                  "order, never LWW-compared -- dropping a delta would lose it outright, not "
+                  "merely reorder it";
+  if (!absl::GetFlag(FLAGS_multi_master_stream_lww)) {
+    LOG(WARNING) << "--multi_master_stream_lww=false: streamed peer writes for otherwise-guarded "
+                    "commands apply in plain arrival order, same as every stable-sync apply "
+                    "before P4-4 -- a peer's write can still overwrite a newer local write if it "
+                    "simply arrives later. Full-sync merge LWW (see above) is unaffected and "
+                    "stays on regardless";
+  }
   return true;
 }
 

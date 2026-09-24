@@ -57,12 +57,20 @@ class JournalExecutor {
   }
 
   // drakeydb: Phase 4 -- the applied entry's author stamp, so PrepareTransaction's
-  // SetReplOrigin(repl_origin_idx, repl_mvcc) (main_service.cc) forwards it verbatim onto the
-  // Transaction, and RecordEntry (journal.cc) stores it as-is instead of minting a fresh
-  // HopStamp. Per-ENTRY, unlike SetApplyOrigin which is per-link: call this before every
-  // Execute(), not once at flow setup.
+  // SetReplOrigin(...) call (main_service.cc) forwards it verbatim onto the Transaction, and
+  // RecordEntry (journal.cc) stores it as-is instead of minting a fresh HopStamp. Per-ENTRY,
+  // unlike SetApplyOrigin which is per-link: call this before every Execute(), not once at flow
+  // setup.
   void SetApplyMvcc(uint64_t mvcc) {
     conn_context_.repl_mvcc = mvcc;
+  }
+
+  // drakeydb: P4-4 -- marks this executor's link as LWW-guarded (see
+  // ConnectionContext::repl_lww_guard and LwwGuardActive, multimaster_lww.h). Per-LINK, exactly
+  // like SetApplyOrigin above, not per entry: call this once at flow setup (DflyShardReplica's
+  // constructor, replica.cc), never before each Execute().
+  void SetApplyLwwGuard(bool on) {
+    conn_context_.repl_lww_guard = on;
   }
 
  private:

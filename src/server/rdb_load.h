@@ -293,6 +293,20 @@ class RdbLoaderBase {
   // ConnectionContext::repl_origin_idx, conn_context.h).
   uint32_t apply_origin_idx_ = 0;
 
+  // drakeydb: P4-4 Task A10 -- mirrors apply_origin_idx_ immediately above, but for the streaming
+  // LWW guard (JournalExecutor::SetApplyLwwGuard, ConnectionContext::repl_lww_guard) instead of
+  // origin: applied to journal_executor_ at the same lazy-construction point in HandleJournalBlob
+  // (rdb_load.cc), so a peer's full-sync concurrent journal blob is guarded exactly like that
+  // same link's stable-sync executor_ (DflyShardReplica), not left to apply in plain arrival
+  // order while the RDB key stream beside it is merge-compared (merge_lww_ above). Set via
+  // RdbLoader::SetApplyLwwGuard before Load() runs -- unlike apply_origin_idx_ above, this is NOT
+  // set in DflyShardReplica's constructor: it is set in FullSyncDflyFb's peer_mode_ block, via
+  // DflyShardReplica::ApplyPeerFullSyncLwwGuard() (replica.cc), before FullSyncDflyFb's call to
+  // Load(). Stays false for every other loader (local RDB file load, plain replica's full sync, a
+  // test construction that never calls the setter), matching apply_origin_idx_'s own default
+  // story.
+  bool apply_lww_guard_ = false;
+
   // State for the tagged chunk currently being parsed
   struct ActiveTaggedChunk {
     // Identifies which interleaved object stream this chunk belongs to
@@ -332,6 +346,17 @@ class RdbLoader : protected RdbLoaderBase {
   // replaying a peer's full sync.
   void SetApplyOrigin(uint32_t idx) {
     apply_origin_idx_ = idx;
+  }
+
+  // drakeydb: P4-4 Task A10 -- see apply_lww_guard_'s doc comment (RdbLoaderBase, above this
+  // class). `on` should be the SAME value the flow's stable-sync executor_ was given at
+  // construction (DflyShardReplica::ApplyPeerFullSyncLwwGuard, called from FullSyncDflyFb's
+  // peer_mode_ block, reads it back from executor_->connection_context()->repl_lww_guard rather
+  // than recomputing peer_mode_ && IsActiveReplica() && the flag a second time, so this loader and
+  // executor_ can never disagree about one link's guard). Leave unset (default false) for a plain
+  // (non-peer) replica's loader.
+  void SetApplyLwwGuard(bool on) {
+    apply_lww_guard_ = on;
   }
 
   // drakeydb: P4-2 Task 3 -- the origin_hash HandleAux stamps onto a parsed KeyDB "mvcc-tstamp"

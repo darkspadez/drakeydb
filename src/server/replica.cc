@@ -37,6 +37,7 @@ extern "C" {
 #include "server/journal/serializer.h"
 #include "server/main_service.h"
 #include "server/multi_master.h"
+#include "server/multimaster_lww.h"
 #include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/node_identity.h"
@@ -784,11 +785,12 @@ error_code Replica::InitiatePSync() {
     loader.SetLoadOriginHash(peer_origin_hash_);
     if (IsPeerMode()) {
       loader.SetOverrideExistingKeys(true);  // drakeydb: merge
-      // drakeydb: P4-3 Task 4 -- last-loaded-wins (SetOverrideExistingKeys above, left untouched)
-      // is replaced by an actual LWW compare for a peer-mode link specifically: a peer's full sync
-      // must merge into this node's own dataset, not blindly replace a concurrently-newer resident
-      // value. peer_origin_hash_ is this link's authenticated author identity, same as the
-      // SetLoadOriginHash call just above.
+      // drakeydb: P4-3 Task 4 -- SetOverrideExistingKeys above only suppresses a duplicate-key
+      // LOG(WARNING) (its one reader, rdb_load.cc) and never decided whether an incoming value
+      // replaces a resident one; the merge below (SetMergeLww) is the actual LWW compare, added
+      // here for a peer-mode link specifically: a peer's full sync must merge into this node's own
+      // dataset, not blindly replace a concurrently-newer resident value. peer_origin_hash_ is
+      // this link's authenticated author identity, same as the SetLoadOriginHash call just above.
       //
       // drakeydb: P4-3 Task 13 -- classic_protocol=true: this is the legacy Redis/KeyDB-protocol
       // (classic PSYNC) full-sync path (see the P4-2 Task 3 comment on SetLoadOriginHash just
@@ -1456,10 +1458,10 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
   rdb_loader_->SetOverrideExistingKeys(true);
 
   if (peer_mode_) {
-    // drakeydb: P4-3 Task 4 -- SetOverrideExistingKeys above is left exactly as it is (Global
-    // Constraints: it has three live callers, and this exact call site, reached by a PLAIN
-    // Dragonfly replica's full sync too when peer_mode_ is false, must keep loading verbatim for
-    // that caller). Guarded on peer_mode_ specifically, unlike SetOverrideExistingKeys just above:
+    // drakeydb: P4-3 Task 4 -- SetOverrideExistingKeys above is left exactly as it is: it has
+    // three live callers, and this exact call site, reached by a PLAIN Dragonfly replica's full
+    // sync too when peer_mode_ is false, must keep loading verbatim for that caller. Guarded on
+    // peer_mode_ specifically, unlike SetOverrideExistingKeys just above:
     // this method is the only full-sync path a plain (non-peer) Replica of a Dragonfly master also
     // reaches, so an unguarded SetMergeLww(true, ...) here would make a plain replica start
     // rejecting resident-but-stale-looking writes its master already legitimately applied --
@@ -1476,6 +1478,13 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
     // RDB_OPCODE_DF_MVCC outright for a {0,0} stamp, so an unversioned drakeydb peer, or a whole
     // non-active drakeydb master, must never be able to override this node's resident dataset.
     rdb_loader_->SetMergeLww(true, MvccStamper::tlocal()->OriginHash(origin_idx));
+    // drakeydb: P4-4 Task A10 -- this flow's THIRD applier (RdbLoaderBase::HandleJournalBlob's own
+    // journal_executor_, replaying the concurrent journal blob embedded in this same full sync)
+    // must agree with executor_ (the stable-sync applier, set up in this class's constructor --
+    // below in this file -- via executor_->SetApplyLwwGuard) on whether the link is LWW-guarded.
+    // See ApplyPeerFullSyncLwwGuard's own comment for why this is a separate method rather than
+    // inlined here.
+    ApplyPeerFullSyncLwwGuard();
   }
 
   // Load incoming rdb stream.
@@ -1515,6 +1524,21 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
                       "Error finding journal offset in stream");
   }
   VLOG(1) << "FullSyncDflyFb finished after reading " << rdb_loader_->bytes_read() << " bytes";
+}
+
+// drakeydb: P4-4 Task A10 -- factored out of FullSyncDflyFb's peer_mode_ block (its only caller)
+// into its own method, rather than inlined next to the SetMergeLww call above it, purely so a
+// unit test can drive it directly on a socket-free DflyShardReplica the same way
+// DflyShardReplicaPeerModeTest already drives AdoptAuthoritativeLsn below -- FullSyncDflyFb
+// itself needs a live master connection (Sock()), which this codebase's unit tests never
+// exercise directly (see AdoptAuthoritativeLsn's own tests' comments for why). Threads this
+// flow's per-link LWW guard bit -- already decided once, at construction, onto executor_'s
+// ConnectionContext (see the constructor's SetApplyLwwGuard call, below in this file) -- onto
+// rdb_loader_'s OWN journal-blob applier (RdbLoaderBase::HandleJournalBlob), so the two appliers
+// of one link can never disagree: this reads the value back from executor_ rather than
+// recomputing peer_mode_ && IsActiveReplica() && the flag a second time.
+void DflyShardReplica::ApplyPeerFullSyncLwwGuard() {
+  rdb_loader_->SetApplyLwwGuard(executor_->connection_context()->repl_lww_guard);
 }
 
 // drakeydb: Phase 3 T6b -- see replica.h's declaration for the summary; called from
@@ -1720,6 +1744,16 @@ DflyShardReplica::DflyShardReplica(ServerContext server_context, MasterContext m
   // here at flow setup, not per entry. Also read back by StableSyncDflyReadFb's PING re-record
   // below, via executor_->connection_context()->repl_origin_idx.
   executor_->SetApplyOrigin(origin_idx);
+  // drakeydb: P4-4 Task A2 -- the streaming LWW guard's per-link bit (see
+  // ConnectionContext::repl_lww_guard, JournalExecutor::SetApplyLwwGuard,
+  // Transaction::IsLwwGuarded). Read ONCE here, at flow setup, matching SetApplyOrigin above --
+  // never per entry (journal.cc's own MvccEnabled() helper documents an uncached absl::GetFlag on
+  // a hot path as a known defect class in this codebase). A plain replica (peer_mode == false) is
+  // never guarded
+  // regardless of the flag or IsActiveReplica(); this constructor does not yield (see the long
+  // comment below), and reading a flag does not yield either.
+  executor_->SetApplyLwwGuard(peer_mode && IsActiveReplica() &&
+                              absl::GetFlag(FLAGS_multi_master_stream_lww));
   // drakeydb: Phase 4, fix round (F1v2) -- the origin_idx -> author hash registration this flow
   // needs (see Replica::peer_origin_hash_'s doc comment) is deliberately NOT done here. An
   // earlier version of this constructor called shard_set->pool()->AwaitBrief(...) at this exact

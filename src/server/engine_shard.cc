@@ -911,7 +911,7 @@ void EngineShard::RetireExpiredAndEvict() {
       // divides by zero a few lines down and (on ARM64, silently) zeroes its own traversal
       // budget, so DeleteExpiredStep's reaper extension never actually runs. Authorized
       // exception to the "engine_shard stays untouched" constraint, confined to this one `if`
-      // block; see task-2b-report.md.
+      // block.
       //
       // drakeydb: P4-0 Task 2b, fix round 1 -- the member term is gated on IsActiveReplica():
       // with --active_replica off, DeleteExpiredStep's reaper branch is itself inert

@@ -33,6 +33,9 @@
 #include "server/execution_state.h"
 #include "server/family_utils.h"
 #include "server/journal/journal.h"
+#include "server/multi_master.h"
+#include "server/multimaster_lww.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/search/doc_index.h"
 #include "server/table.h"
@@ -135,7 +138,8 @@ class SetCmd {
   void PostEdit(const SetParams& params, std::string_view key, std::string_view value, PrimeKey* pk,
                 PrimeValue* pv, DbSlice::AutoUpdater& post_updater);
 
-  void RecordJournal(const SetParams& params, std::string_view key, std::string_view value);
+  void RecordJournal(const SetParams& params, std::string_view key, std::string_view value,
+                     const PrimeKey& pk, const PrimeValue& pv);
 
   OpStatus CachePrevIfNeeded(const SetParams& params, DbSlice::Iterator it);
 
@@ -406,22 +410,56 @@ OpStatus OpMSet(const OpArgs& op_args, const ShardArgs& args) {
   SetCmd::SetParams params;
   SetCmd sg(op_args, false);
 
+  // drakeydb: P4-4 -- MSET is classified kMultiKeySelfGuarded (multimaster_lww.h): GetShardArgs
+  // hands it keys AND values in one contiguous range, so the generic single-key veto
+  // (Transaction::ShouldDropForLww) deliberately skips it rather than misreading that range as
+  // one key. The per-pair LWW compare therefore has to happen right here, under this shard's own
+  // key locks, so a guarded replicated MSET applies -- and journals -- only its non-stale pairs.
+  const DbContext& db_cntx = op_args.db_cntx;
+  const bool guarded = LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc);
+  const std::optional<MvccStamp> incoming =
+      guarded ? IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx) : std::nullopt;
+  // drakeydb: P4-4 -- `incoming` is nullopt only for an unregistered origin (IncomingStamp already
+  // DCHECKed that should never happen); failing open here, same as the single-key veto, is safer
+  // than guessing.
+  const bool split = guarded && incoming.has_value();
+
+  auto& db_slice = op_args.GetDbSlice();
   OpStatus result = OpStatus::OK;
   size_t stored = 0;
+  vector<string_view> survivors;
+  if (split)
+    survivors.reserve(args.Size());
   for (auto it = args.begin(); it != args.end();) {
     string_view key = *(it++);
     string_view value = *(it++);
+
+    if (split && LwwShouldDropKey(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
+      NoteLwwDrop("MSET", key);
+      continue;
+    }
+
     if (auto status = sg.Set(params, key, value); status != OpStatus::OK) {
       result = status;
       break;
     }
 
     stored++;
+    if (split) {
+      survivors.push_back(key);
+      survivors.push_back(value);
+    }
   }
 
   // Above loop could have parial success (e.g. OOM), replicate only what changed
   if (auto journal = op_args.shard->journal(); journal) {
-    if (stored * 2 == args.Size()) {
+    if (split) {
+      // drakeydb: P4-4 -- push_back'd above, never resize(stored * 2): a dropped MIDDLE pair
+      // breaks the "first N survived" prefix the unguarded branches below rely on, so truncating
+      // to a prefix here could journal a different key than the one actually written.
+      if (!survivors.empty())
+        RecordJournal(op_args, "MSET", survivors, op_args.tx->GetUniqueShardCnt());
+    } else if (stored * 2 == args.Size()) {
       RecordJournal(op_args, "MSET", args, op_args.tx->GetUniqueShardCnt());
       DCHECK_EQ(result, OpStatus::OK);
     } else if (stored > 0) {
@@ -858,7 +896,15 @@ OpResult<DbSlice::Iterator> FindKeyAndSetExpiry(const GetAndTouchParams& params)
     return OpStatus::KEY_NOTFOUND;
   }
 
-  find_res->post_updater.Run();
+  // drakeydb: P4-4 -- captured BEFORE UpdateExpire, which always clears the TTL for a persist
+  // request regardless of whether one existed: without this, a GAT 0 against a key that never
+  // had a TTL looks identical, post-update, to one that genuinely lost its TTL.
+  const bool had_expire_before = find_res->it->first.HasExpire();
+  const bool noop_persist = params.expire_params.persist && !had_expire_before;
+  if (noop_persist)
+    find_res->post_updater.RunWithoutMvccArm();  // nothing changes -- never advance this stamp
+  else
+    find_res->post_updater.Run();
 
   auto update = db_slice.UpdateExpire(ctx, find_res->it, params.expire_params);
   if (!update.ok()) {
@@ -871,6 +917,14 @@ OpResult<DbSlice::Iterator> FindKeyAndSetExpiry(const GetAndTouchParams& params)
     const OpArgs& op_args = params.t->GetOpArgs(params.shard);
     if (expired) {
       RecordJournal(op_args, "DEL"sv, ArgSlice{(params.key)});
+    } else if (IsActiveReplica()) {
+      // On an active node, ship the key's full state under SET instead of a delta: a
+      // PERSIST/PEXPIREAT delta lets a receiver combine the author's TTL change with ITS OWN,
+      // possibly different, value -- a pairing neither peer ever actually wrote. A persist that
+      // changed nothing (no TTL existed) must journal nothing at all, not even a no-op PERSIST.
+      if (!noop_persist) {
+        JournalFullStateSet(op_args, params.key, find_res->it->first, find_res->it->second);
+      }
     } else if (params.expire_params.persist) {
       // GAT 0 removes the expiry; PEXPIREAT with the returned 0 would delete the replica's key.
       RecordJournal(op_args, "PERSIST"sv, ArgSlice{(params.key)});
@@ -942,8 +996,24 @@ OpStatus SetCmd::Set(const SetParams& params, string_view key, string_view value
     auto find_res = db_slice.FindMutable(op_args_.db_cntx, key);
     if (auto status = CachePrevIfNeeded(params, find_res.it); status != OpStatus::OK)
       return status;
-    if (!IsValid(find_res.it))
+    if (!IsValid(find_res.it)) {
+      // drakeydb: P4-4 -- a guarded applied write whose absolute TTL has already elapsed, against
+      // a key this node does not hold, still carries the author's authority: install it as a
+      // tombstone so a strictly OLDER write for this key, racing in from a third peer, is
+      // rejected exactly as it would be everywhere else this key's expiry is already known.
+      // Without this, this node silently forgets the write ever happened and a stale peer write
+      // can resurrect the key with no TTL. Reuses the same install
+      // RdbLoader::ApplyMergeTombstoneOnShard (rdb_load.cc) applies for the identical shape
+      // reached via a full sync (DbSlice::InstallAbsentKeyTombstone, db_slice.cc/.h).
+      const DbContext& db_cntx = op_args_.db_cntx;
+      if (LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)) {
+        if (auto incoming = IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx);
+            incoming && MergeAccepts(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
+          db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming));
+        }
+      }
       return OpStatus::OK;
+    }
     return DeleteExpiredKey(key, &find_res);
   }
 
@@ -1068,11 +1138,31 @@ void SetCmd::PostEdit(const SetParams& params, std::string_view key, std::string
     if (skip_journal_)
       journal::ClearBuffer();
     else
-      RecordJournal(params, key, value);
+      RecordJournal(params, key, value, *pk, *pv);
   }
 }
 
-void SetCmd::RecordJournal(const SetParams& params, string_view key, string_view value) {
+void SetCmd::RecordJournal(const SetParams& params, string_view key, string_view value,
+                           const PrimeKey& pk, const PrimeValue& pv) {
+  // drakeydb: P4-4 -- on an active node, KEEPTTL must ship the surviving absolute TTL (and STICK
+  // / memcache flags) as part of this write's own full state, through the one shared builder
+  // every full-state-SET site uses (JournalFullStateSet, multimaster_lww.h): the journaled name
+  // carries no memory of "this receiver's OWN ttl", so a receiver applying a bare KEEPTTL SET
+  // verbatim keeps ITS OWN, possibly different, TTL instead of converging on the author's.
+  // SET_KEEP_EXPIRE fires on a fresh key too (AddNew reaches this function exactly like
+  // SetExisting does, when a client sends `SET k v KEEPTTL` for a key that doesn't exist yet) --
+  // pk/pv are this write's own resulting key state either way, so the shared builder reads the
+  // right thing regardless of which path got here. A non-active node has no per-key stamp to
+  // protect and must see the exact upstream KEEPTTL shape, so it skips this branch entirely.
+  // drakeydb: P4-4 -- operand order matters: this branch runs on every journaled SET, and
+  // IsActiveReplica() is an uncached absl::GetFlag (multi_master.cc) -- journal.cc's own
+  // MvccEnabled() comment names this exact defect class. SET_KEEP_EXPIRE first means the flag
+  // read only happens for the (rare) KEEPTTL case, not on every call.
+  if ((params.flags & SET_KEEP_EXPIRE) && IsActiveReplica()) {
+    JournalFullStateSet(op_args_, key, pk, pv);
+    return;
+  }
+
   absl::InlinedVector<string_view, 5> cmds({key, value});  // 5 is theoretical maximum;
 
   std::string exp_str;
@@ -1086,9 +1176,16 @@ void SetCmd::RecordJournal(const SetParams& params, string_view key, string_view
   if (params.flags & SET_STICK) {
     cmds.push_back("STICK");
   }
+  // drakeydb: an upstream bug, not new here -- `mcflags_str` must be a NAMED local that outlives
+  // the RecordJournal call below: `cmds.push_back(absl::StrCat(...))` would push a string_view
+  // bound to StrCat's return value, a temporary destroyed at the end of this statement, leaving a
+  // dangling entry in `cmds` for RecordJournal to read. Bytes on the wire are unchanged either
+  // way; only the storage's lifetime is the fix.
+  std::string mcflags_str;
   if (params.memcache_flags) {
+    mcflags_str = absl::StrCat(params.memcache_flags);
     cmds.push_back("_MCFLAGS");
-    cmds.push_back(absl::StrCat(params.memcache_flags));
+    cmds.push_back(mcflags_str);
   }
 
   // Skip NX/XX because SET operation was executed.
@@ -1425,17 +1522,37 @@ cmd::CmdR CmdGetEx(CmdArgParser parser, CommandContext* cmd_cntx) {
 
     StringResult value = ReadString(t->GetDbIndex(), key, it_res->it->second, shard);
 
+    // drakeydb: P4-4 -- captured BEFORE UpdateExpire, which always clears the TTL for a persist
+    // request regardless of whether one existed: "GETEX k PERSIST" on a key with no TTL must be
+    // recognized as a genuine no-op, not merely "persist requested".
+    const bool had_expire_before = it_res->it->first.HasExpire();
+    const bool noop_persist = exp_params.persist && !had_expire_before;
+
     bool key_expired = false;
     if (exp_params.IsDefined()) {
-      it_res->post_updater.Run();  // Run manually before possible delete due to negative expire
+      if (noop_persist)
+        it_res->post_updater.RunWithoutMvccArm();  // nothing changes -- never advance this stamp
+      else
+        it_res->post_updater.Run();  // Run manually before possible delete due to negative expire
       auto expire_res = op_args.GetDbSlice().UpdateExpire(op_args.db_cntx, it_res->it, exp_params);
       RETURN_ON_BAD_STATUS(expire_res);
       key_expired = *expire_res == -1;
     }
 
-    // Replicate GETEX as DEL (already-past expiration), PEXPIREAT or PERSIST.
+    // Replicate GETEX as DEL (already-past expiration); otherwise, on an active node, ship the
+    // key's full state under SET instead of a delta (PERSIST/PEXPIREAT only carry a TTL change,
+    // so a receiver applying it against its OWN differing value ends up with a pairing neither
+    // peer ever actually wrote) -- except a no-op PERSIST, which must journal nothing at all
+    // (that no-op used to stamp the receiver's unrelated value with the author's mvcc). A
+    // non-active node keeps the exact upstream PERSIST/PEXPIREAT shape.
     if (shard->journal() && exp_params.IsDefined()) {
-      if (exp_params.persist) {
+      if (IsActiveReplica()) {
+        if (key_expired) {
+          RecordJournal(op_args, "DEL", {key});
+        } else if (!noop_persist) {
+          JournalFullStateSet(op_args, key, it_res->it->first, it_res->it->second);
+        }
+      } else if (exp_params.persist) {
         RecordJournal(op_args, "PERSIST", {key});
       } else if (key_expired) {
         RecordJournal(op_args, "DEL", {key});
@@ -1820,6 +1937,37 @@ void CmdClThrottle(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 }  // namespace
+
+// drakeydb: P4-4 -- declared in multimaster_lww.h (every caller across generic_family.cc,
+// string_family.cc, hll_family.cc and bitops_family.cc shares one prototype); defined here, at
+// this file's own (non-anonymous) namespace scope rather than inside the block above, so it gets
+// external linkage those other translation units can actually call -- and here, rather than in
+// multimaster_lww.cc, because it needs DbSlice::GetMCFlag, and this file already links against
+// the library that provides it (see the header comment for the full reason).
+void JournalFullStateSet(const OpArgs& op_args, string_view key, const PrimeKey& pk,
+                         const PrimeValue& pv) {
+  DCHECK(!pv.IsExternal());
+  DCHECK_EQ(pv.ObjType(), OBJ_STRING);
+  auto& db_slice = op_args.GetDbSlice();
+
+  const string value_str = pv.ToString();
+  absl::InlinedVector<string_view, 6> cmds({key, value_str});
+
+  string exp_str;
+  if (pk.HasExpire()) {
+    exp_str = absl::StrCat(pk.GetExpireTime());
+    cmds.insert(cmds.end(), {"PXAT"sv, exp_str});
+  }
+  if (pk.IsSticky())
+    cmds.push_back("STICK"sv);
+  string mcflags_str;
+  if (pv.HasFlag()) {
+    mcflags_str = absl::StrCat(db_slice.GetMCFlag(op_args.db_cntx.db_index, pk));
+    cmds.push_back("_MCFLAGS"sv);
+    cmds.push_back(mcflags_str);
+  }
+  RecordJournal(op_args, "SET"sv, ArgSlice{cmds});
+}
 
 #define HFUNC(x) SetHandler(&Cmd##x)
 

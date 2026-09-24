@@ -116,66 +116,89 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
   if (!IsDefaultNamespace(db_cntx))
     return;
 
-  // drakeydb: P4-3 Task 11, review ruling I2 -- BEFORE anything below: an expiry is always a
-  // local decision (D-10), so ITS OWN tombstone arm (PerformDeletionAtomic, db_slice.cc) must be
-  // stamped with a freshly minted self stamp, never db_cntx.repl_mvcc/repl_origin_idx. Without
-  // this, a lazy expiry firing while applying a peer's command (e.g. a replicated multi-key
+  // drakeydb: P4-4 -- an expiry is always a local decision, so ITS OWN tombstone arm
+  // (PerformDeletionAtomic, db_slice.cc) carries a stamp derived from the expired value's OWN
+  // pre-deletion stamp -- one origin_hash tick above it (ExpiryTombstoneFor, mvcc.h), never that
+  // stamp reused verbatim, never db_cntx.repl_mvcc/repl_origin_idx, and never a freshly minted
+  // one. A lazy expiry can fire while applying a peer's command (e.g. a replicated multi-key
   // command whose processing discovers a DIFFERENT, unrelated key already expired -- a single
   // replicated DEL of an already-expired key is the simplest case: FindMutable's lookup expires
-  // it via this same function before the DEL's own OpDelV2 ever runs) would inherit that peer's
-  // mvcc/origin for the tombstone. If the peer's stamp is OLDER than the value being replaced
-  // (clock skew, or simply an old command applied late), the tombstone loses every future LWW
-  // comparison against that value, and a peer's still-live copy of the same key resurrects it
-  // forever. Wire-safe regardless of what this mints: PassesPeerEchoFilter (journal/types.cc)
-  // already drops every kEntryFlagExpired entry before it reaches a mesh peer, and a plain
-  // (non-active) replica ignores mvcc entirely (D-7). Committing (and disarming) this key's own
-  // tombstone here, before RecordEntry below, means the ordinary Commit() call inside RecordEntry
-  // never sees this arm again -- it is already gone -- so it cannot re-stamp it with the wrong
-  // value. This does NOT touch the F4 sibling-sweep case immediately below: a sibling key armed
-  // earlier in the SAME epoch (e.g. a replicated MSET's other pair) is a PLAIN arm, not a
-  // tombstone one, so CommitOwnTombstone (which matches only this exact key's own tombstone arm)
-  // leaves it untouched, and it is still correctly swept up and stamped with the author's real
-  // mvcc/origin by the Commit() call inside RecordEntry below, via db_cntx.repl_mvcc/
-  // repl_origin_idx exactly as before -- see ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc
-  // (multi_master_test.cc) and LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp (same file)
-  // for the two cases' regression coverage.
-  MvccStamper::tlocal()->CommitOwnTombstone(
-      db_cntx.db_index, key, db_cntx.time_now_ms,
-      [](DbIndex db, string_view k, const MvccStamp& st) {
-        namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+  // it via this same function before the DEL's own OpDelV2 ever runs); inheriting that peer's
+  // mvcc/origin for the tombstone would be wrong regardless of which stamp ends up on it, since
+  // that peer never authored this delete. CommitOwnTombstone (mvcc.cc) does the actual work,
+  // reading this exact arm's own captured prior stamp -- see its own comment for what it does
+  // when that arm carries no real prior stamp at all (erases the slot rather than tombstoning
+  // it). `committed` captures the exact value it wrote (or stays empty in the erase case), for
+  // the wire entry just below to reuse rather than re-derive.
+  //
+  // Wire-safe regardless of what this commits: PassesPeerEchoFilter (journal/types.cc) already
+  // drops every kEntryFlagExpired entry before it reaches a mesh peer. Committing (and disarming)
+  // this key's own tombstone here, before RecordEntry below, means that entry's own commit logic
+  // never sees this arm again -- it is already gone -- so it cannot re-stamp it with a different
+  // value. A sibling key armed earlier in the SAME epoch (e.g. a replicated MSET's other pair) is
+  // a PLAIN arm, not a tombstone one, so CommitOwnTombstone (which matches only this exact key's
+  // own tombstone arm) leaves it untouched -- and RecordEntry below no longer sweeps it either
+  // (see that call's own comment), so it survives armed until the enclosing command's own,
+  // later journal entry commits it with whatever stamp that entry actually carries.
+  MvccStamp committed;
+  const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
+      db_cntx.db_index, key,
+      [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
+                   const MvccStamp&) {
+        // drakeydb: P4-4 -- has_prior_stamp false means the expired value never had a real stamp
+        // of its own (see CommitOwnTombstone's own comment, mvcc.h): erase the slot -- no
+        // tombstone survives locally for this key -- rather than install an unsafe Mvcc()==0
+        // tombstone. `committed` stays default (Empty()), so the wire-entry mvcc below sends the
+        // LITERAL value 0 (`committed.Mvcc()`) on this branch -- NOT the same as the separate
+        // "CommitOwnTombstone found no arm at all" case a few lines below, which instead forwards
+        // db_cntx.repl_mvcc verbatim (possibly non-zero, e.g. while applying a peer's command).
+        // journal::RecordEntry (journal.cc) itself mints a fresh LOCAL stamp for this entry's own
+        // wire mvcc -- its own inline mint, BEFORE AddLogRecord, treating an incoming mvcc of
+        // exactly 0 as self-originated the same as any other unstamped local write, never a
+        // peer's own authority. `Commit()` is a SEPARATE step, and does not run at all for this
+        // entry: RecordEntry's own call to it is gated on `!(entry_flags & kEntryFlagExpired)`,
+        // which this entry sets -- this key's arm is already gone, consumed by CommitOwnTombstone
+        // just above, so there is nothing left for a generic Commit() sweep to do here anyway.
+        if (has_prior_stamp) {
+          committed = st;
+          namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+        } else {
+          namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
+        }
       });
 
   // drakeydb: Phase 3 -- see the declaration in tx_base.h. origin_idx stays default (0 ==
   // kSelfIdx; an expiry is always a local decision); entry_flags carries kEntryFlagExpired.
   //
-  // drakeydb: Phase 4, review wave 2 (F4, IMPORTANT) -- mvcc is now db_cntx.repl_mvcc, not a
-  // hardcoded 0, but origin_idx deliberately stays kSelfIdx -- these two, unlike RecordDelete/
-  // RecordDerivedDelete above, are NOT symmetric here, and that asymmetry is load-bearing, not an
-  // oversight:
+  // drakeydb: P4-4 -- the wire mvcc is the just-committed tombstone's own masked magnitude
+  // (Mvcc() -- never the tombstone bit itself: every other entry's wire mvcc is a bare magnitude
+  // too, and each receiver decides locally, from its own arm's ground truth, whether the
+  // committed stamp gets the tombstone bit). A plain (non-`--active_replica`) replica has no mvcc
+  // side table to floor anything against at all (MvccEnabled == IsActiveReplica(), db_slice.cc,
+  // and a plain replica is never --active_replica -- ServerFamily::ReplicaOfInternal
+  // unconditionally routes an --active_replica node's own REPLICAOF through the peer-mode path,
+  // so the two can never coincide): it applies this DEL as an ordinary command and this wire mvcc
+  // field simply goes unused there. When no tombstone was actually committed above
+  // (TombstonesEnabled() is false, or
+  // PerformDeletionAtomic degraded to a plain erase at the tombstone cap) there is no such value
+  // to reuse, so this falls back to forwarding db_cntx.repl_mvcc verbatim, exactly as every DEL
+  // derived from an applied write already does (RecordDelete/RecordDerivedDelete above) --
+  // journal::RecordEntry mints a fresh local stamp itself when that is 0 (a self-originated
+  // command), the same as it always has.
   //
-  // The bug: MvccStamper::Commit(mvcc, origin_idx, fn) (mvcc.cc) stamps EVERY currently-armed
-  // key with the SAME stamp, not just the key this call's own payload names. A whole-key lazy
-  // expiry firing mid-callback (ExpireIfNeeded, this file) while an applier is still processing
-  // an earlier key of the SAME replicated multi-key command (e.g. MSET arms key-by-key via
-  // AddOrFind -> FindInternal -> ExpireIfNeeded, string_family.cc) sweeps that earlier,
-  // already-armed sibling key into THIS entry's Commit() call, permanently consuming its arm
-  // before the MSET's own trailing RecordJournal ever gets a chance to stamp it correctly. Before
-  // this fix, that sibling key was left stamped with a freshly LOCAL HopStamp (the applier's own
-  // "now") instead of the replicated command's real author stamp.
+  // origin_idx stays self-originated because this node's clock made the expiry decision and the
+  // resulting DEL must not be echoed to peers. Unlike RecordDelete/RecordDerivedDelete, mvcc and
+  // origin_idx are therefore NOT the matching pair from the same source here -- deliberate, not
+  // an oversight.
   //
-  // Threading db_cntx.repl_mvcc through closes the numeric-ordering half of this: the sibling key
-  // now gets the AUTHOR's real mvcc, which is what operator< compares first (MvccStamp::Mvcc()),
-  // so this is what actually protects LWW ordering for that key in the overwhelmingly common
-  // case.
-  //
-  // origin_idx is kept self-originated because this node's clock made the expiry decision and the
-  // resulting DEL must not be echoed to peers. The transient stamp_origin_idx is separate: when
-  // this expiry fires while an applier is still processing a replicated multi-key command,
-  // Commit() may sweep sibling arms into this entry. Those siblings must retain the command
-  // author's origin hash as well as its mvcc, or an exact-MVCC tie can diverge on LWW ordering.
+  // The generic per-arm commit inside RecordEntry never runs for a kEntryFlagExpired entry (see
+  // that function's own comment, journal.h/.cc): this key's arm is already gone (committed
+  // above), and any sibling key still armed this epoch is left for the enclosing command's own,
+  // later entry to commit instead.
   journal::RecordEntry(0, journal::Op::COMMAND, db_cntx.db_index, KeySlot(key),
-                       Payload("DEL", ArgSlice{key}), /* origin_idx= */ 0, db_cntx.repl_mvcc,
-                       journal::kEntryFlagExpired, db_cntx.repl_origin_idx);
+                       Payload("DEL", ArgSlice{key}), /* origin_idx= */ 0,
+                       found_tombstone ? committed.Mvcc() : db_cntx.repl_mvcc,
+                       journal::kEntryFlagExpired);
 }
 
 LockTag::LockTag(std::string_view key) {

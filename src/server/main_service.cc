@@ -886,8 +886,11 @@ pair<intrusive_ptr<Transaction>, OpStatus> PrepareTransaction(const CommandId* c
   // instead of always kSelfIdx. Covers both branches above: a fresh transaction and MULTI reuse
   // (MultiSwitchCmd) alike, since both flow through SetupTx just above. A no-op for ordinary
   // client connections, whose repl_origin_idx/repl_mvcc stay at their kSelfIdx/0 defaults.
+  // drakeydb: P4-4 -- also copies repl_lww_guard the same way (see
+  // ConnectionContext::repl_lww_guard, Transaction::SetReplOrigin).
   if (dfly_cntx->transaction) {
-    dfly_cntx->transaction->SetReplOrigin(dfly_cntx->repl_origin_idx, dfly_cntx->repl_mvcc);
+    dfly_cntx->transaction->SetReplOrigin(dfly_cntx->repl_origin_idx, dfly_cntx->repl_mvcc,
+                                          dfly_cntx->repl_lww_guard);
   }
 
   if (init) {
@@ -1807,7 +1810,10 @@ uint32_t Service::DispatchSquashedBatch(facade::ParsedCommand* first, unsigned c
       // drakeydb: Phase 3 fix-round-1 -- this Transaction is built fresh (not via
       // PrepareTransaction), so it would otherwise always journal as kSelfIdx regardless of the
       // connection's actual apply-origin. Copy it explicitly, once, at construction.
-      dist_trans->SetReplOrigin(dfly_cntx->repl_origin_idx, dfly_cntx->repl_mvcc);
+      // drakeydb: P4-4 -- also copies repl_lww_guard the same way; see the other SetReplOrigin
+      // call site above (PrepareTransaction) for the field's own doc comment.
+      dist_trans->SetReplOrigin(dfly_cntx->repl_origin_idx, dfly_cntx->repl_mvcc,
+                                dfly_cntx->repl_lww_guard);
     } else {
       // Reset to original command id as it's changed during squashing
       dist_trans->MultiSwitchCmd(exec_cid_);

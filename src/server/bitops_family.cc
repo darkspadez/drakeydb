@@ -19,6 +19,8 @@
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
+#include "server/multi_master.h"
+#include "server/multimaster_lww.h"
 #include "server/namespaces.h"
 #include "server/tiered_storage.h"
 #include "server/transaction.h"
@@ -296,6 +298,17 @@ class ElementAccess {
   // return nullopt when key exists but it's not encoded as string
   // return true if key exists and false if it doesn't
   std::optional<bool> Exists();
+
+  // drakeydb: P4-4 -- this key's own current stored state, for a caller that needs to journal
+  // full state (value, TTL, STICK, memcache flags) rather than just the value this class itself
+  // tracks. Only valid after a non-empty Commit(): a deleted (empty-result) entry has no key left
+  // to read back.
+  const PrimeKey& Key() const {
+    return updater_.it->first;
+  }
+  const PrimeValue& Val() const {
+    return updater_.it->second;
+  }
 };
 
 std::optional<bool> ElementAccess::Exists() {
@@ -1259,6 +1272,15 @@ void BitOp(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
               if (!operation.IsNewEntry()) {
                 RecordJournal(t->GetOpArgs(shard), "DEL", {dest_key});
               }
+            } else if (IsActiveReplica()) {
+              // drakeydb: P4-4 -- Commit above overwrites the VALUE in place (ElementAccess::
+              // Commit -> PrimeValue::SetString), never touching the destination key's own TTL --
+              // an existing, TTL-carrying destination keeps that TTL. A bare "SET key result"
+              // would silently drop it on the receiver (the same partial-state defect
+              // SET ... KEEPTTL had), so an active node ships the destination's full state --
+              // value, TTL, STICK, memcache flags -- through the shared builder instead; a
+              // non-active node keeps the exact upstream shape.
+              JournalFullStateSet(t->GetOpArgs(shard), dest_key, operation.Key(), operation.Val());
             } else {
               RecordJournal(t->GetOpArgs(shard), "SET", {dest_key, op_result});
             }
