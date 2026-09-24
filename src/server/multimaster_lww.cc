@@ -119,8 +119,11 @@ void NoteLwwDrop(std::string_view journaled_name, std::string_view key) {
   ServerState::Stats& stats = ServerState::tlocal()->stats;
   ++stats.multimaster_lww_dropped;
   VLOG(2) << "multi-master LWW guard dropped " << journaled_name << " on key " << key;
+  // stats.multimaster_lww_dropped is this SHARD/proactor thread's own counter (ServerState is
+  // thread-local); this rollup is per-thread too, not the cross-shard sum INFO replication and
+  // the Prometheus counter report (ServerState::Stats::Add, server_state.cc).
   LOG_EVERY_T(INFO, 60) << "multi-master LWW guard has dropped " << stats.multimaster_lww_dropped
-                        << " replicated writes so far";
+                        << " replicated writes so far on this shard";
 }
 
 }  // namespace dfly

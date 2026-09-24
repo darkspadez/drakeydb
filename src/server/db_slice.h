@@ -397,7 +397,7 @@ class DbSlice {
   // stamp the slot held BEFORE this call -- a fresh {0,0} for a newly inserted slot, an existing
   // live stamp left untouched, or a tombstone this call itself just cleared (see below). Callers
   // that arm the key right after (PostUpdate, db_slice.cc) carry this on the arm as its
-  // pre-mutation stamp (drakeydb P4-4 Task A5 fix round 1): by the time journal::RecordEntry's
+  // pre-mutation stamp (drakeydb P4-4 Task A5): by the time journal::RecordEntry's
   // Commit() runs, the slot may no longer hold it -- this call's own tombstone-clearing branch
   // (below) can have already overwritten it, before any commit ever runs -- so the arm is the
   // only place guaranteed to still have it. This is the only allocation-capable half of

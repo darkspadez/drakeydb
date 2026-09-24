@@ -47,14 +47,15 @@ add_library(dfly_transaction db_slice.cc blocking_controller.cc
             multimaster_lww.cc
             server_state.cc table.cc  transaction.cc tx_base.cc
             serializer_commons.cc
-            # drakeydb: P4-4 Task A1 -- moved from dragonfly_lib below. Its only callers
-            # (server_state.h/.cc's egress_throttler_ member) live here in dfly_transaction, which
-            # dragonfly_lib depends on, not the reverse; leaving it in dragonfly_lib left a static
-            # archive whose only symbol-resolution route back to dfly_transaction's server_state.cc.o
-            # was never exercised by a test that pulls in server_state.cc.o without ALSO already
-            # needing dragonfly_lib first (mvcc_test is the first one that doesn't) -- ld's single
-            # left-to-right archive scan then never revisits dragonfly_lib.a to resolve
-            # EgressThrottler::SetLimit, and the link fails with an undefined reference.
+            # drakeydb: P4-4 -- moved from dragonfly_lib below. Its callers (server_state.h/.cc's
+            # egress_throttler_ member, snapshot.*, and journal/streamer.cc) all live in or below
+            # dfly_transaction, which dragonfly_lib depends on, not the reverse; leaving it in
+            # dragonfly_lib left a static archive whose only symbol-resolution route back to
+            # dfly_transaction's server_state.cc.o was never exercised by a test that pulls in
+            # server_state.cc.o without ALSO already needing dragonfly_lib first (mvcc_test is the
+            # first one that doesn't) -- ld's single left-to-right archive scan then never revisits
+            # dragonfly_lib.a to resolve EgressThrottler::SetLimit, and the link fails with an
+            # undefined reference.
             detail/egress_throttle.cc
             acl/acl_log.cc slowlog.cc channel_store.cc)
 cxx_link(dfly_transaction dfly_core strings_lib TRDP::fast_float TRDP::hdr_histogram)

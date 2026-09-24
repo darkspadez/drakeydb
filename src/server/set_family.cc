@@ -28,6 +28,7 @@ extern "C" {
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/journal/journal.h"
+#include "server/multi_master.h"
 #include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/transaction.h"
@@ -1024,11 +1025,55 @@ OpStatus OpPop(const OpArgs& op_args, string_view key, unsigned count, cmn::Back
       return true;
     });
 
-    // Delete the set as it is now empty
-    db_slice.DelMutable(op_args.db_cntx, std::move(*find_res));
-
     // All members may have expired during iteration (lazy expiry), leaving the result empty.
-    if (dest->empty()) {
+    // Decide this BEFORE DelMutable, which never touches `dest`, so the reason below can match.
+    const bool all_expired = dest->empty();
+
+    // Delete the set as it is now empty. `all_expired` gets kExpired (matching every other
+    // member-expiry emptiness -- SetFamily::DeleteSetIfEmpty's own DelMutable call), never
+    // kExplicit: nothing about this delete was an explicit client request, it just happens to
+    // coincide with a "pop everything" SPOP that found nothing left to pop.
+    db_slice.DelMutable(
+        op_args.db_cntx, std::move(*find_res),
+        all_expired ? DbSlice::DeleteReason::kExpired : DbSlice::DeleteReason::kExplicit);
+
+    if (all_expired) {
+      // drakeydb: P4-4 Task FW-A2 -- SPOP is NO_AUTOJOURNAL (its result is non-deterministic), so
+      // nothing else ever journals this delete. Before this fix, the tombstone arm
+      // DelMutable(kExpired) above just placed (PerformDeletionAtomic's own ArmTombstone) rolled
+      // back uncommitted at this transaction's own epoch end -- an mvcc_unstamped_writes leak --
+      // and the key was left with NO tombstone at all, unlike every OTHER member-expiry emptiness
+      // (SetFamily::DeleteSetIfEmpty's own `derived` branch). Route it through the identical
+      // CommitOwnTombstone + peer-suppressed derived DEL shape on ACTIVE nodes, matching
+      // DeleteSetIfEmpty exactly. Non-active nodes must stay byte-identical to upstream, which
+      // never journals this branch at all (SPOP's all-expired case is silent there too) -- gated
+      // on IsActiveReplica(), like every other active-only journaling change (PFMERGE, BITOP,
+      // the TTL-carrying commands' full-state journaling).
+      if (IsActiveReplica() && op_args.shard->journal()) {
+        MvccStamp committed;
+        const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
+            op_args.db_cntx.db_index, key,
+            [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
+                         const MvccStamp&) {
+              if (has_prior_stamp) {
+                committed = st;
+                namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+              } else {
+                namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
+              }
+            });
+        if (found_tombstone) {
+          DCHECK_EQ(MvccStamper::tlocal()->ArmedCount(), 0u)
+              << "a sibling key was still armed when this derived DEL's own RecordEntry call was "
+                 "about to run its generic per-arm sweep -- that sweep would floor the sibling "
+                 "against this tombstone's own stamp instead of its real author stamp";
+          DbContext patched_cntx = op_args.db_cntx;
+          patched_cntx.repl_mvcc = committed.Mvcc();
+          RecordDerivedDelete(patched_cntx, key);
+        } else {
+          RecordDerivedDelete(op_args.db_cntx, key);
+        }
+      }
       return OpStatus::KEY_NOTFOUND;
     }
 
@@ -1701,10 +1746,18 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
       if (derived) {
         MvccStamp committed;
         const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
-            db_cntx.db_index, key, db_cntx.time_now_ms,
-            [&committed](DbIndex db, string_view k, const MvccStamp& st, bool, const MvccStamp&) {
-              committed = st;
-              namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+            db_cntx.db_index, key,
+            [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
+                         const MvccStamp&) {
+              // drakeydb: P4-4 Task FW-A1 -- has_prior_stamp false means the set's own
+              // pre-delete stamp was never real (see CommitOwnTombstone's own comment, mvcc.h):
+              // erase the slot rather than install an unsafe Mvcc()==0 tombstone.
+              if (has_prior_stamp) {
+                committed = st;
+                namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+              } else {
+                namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
+              }
             });
         if (found_tombstone) {
           DCHECK_EQ(MvccStamper::tlocal()->ArmedCount(), 0u)

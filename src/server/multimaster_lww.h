@@ -59,8 +59,9 @@ enum class LwwClass : uint8_t { kUnguarded, kSingleKey, kMultiKeySelfGuarded };
 // guarded) is applied unguarded, in plain arrival order, against whatever this node already holds
 // for that key; FloorAppliedStamp (mvcc.cc) then governs the local commit exactly as it does for
 // any other applied write -- verbatim when the incoming mvcc is not older than this key's own
-// stored stamp, floored one tick below it when the incoming mvcc IS older (F9's comment, mvcc.h)
-// -- while this node's own downstream re-journal of that apply (OpExpire/OpPersist's own
+// stored stamp, floored one tick below it when the incoming mvcc IS older (FloorAppliedStamp's
+// own doc comment, mvcc.h) -- while this node's own downstream re-journal of that apply
+// (OpExpire/OpPersist's own
 // full-state SET/RESTORE) carries the incoming mvcc UNFLOORED, exactly as received regardless of
 // which branch the local commit took -- the local commit and the forwarded wire entry can
 // therefore disagree on the exact stamp for one hop whenever the floor fires. A SAME-SHARD

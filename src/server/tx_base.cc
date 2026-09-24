@@ -125,10 +125,11 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
   // replicated DEL of an already-expired key is the simplest case: FindMutable's lookup expires
   // it via this same function before the DEL's own OpDelV2 ever runs); inheriting that peer's
   // mvcc/origin for the tombstone would be wrong regardless of which stamp ends up on it, since
-  // that peer never authored this delete. CommitOwnTombstone (mvcc.cc) does the actual reuse,
-  // reading this exact arm's own captured prior stamp -- see its own comment for the fallback
-  // when that arm carries no real prior stamp at all. `committed` captures the exact value it
-  // wrote, for the wire entry just below to reuse rather than re-derive.
+  // that peer never authored this delete. CommitOwnTombstone (mvcc.cc) does the actual work,
+  // reading this exact arm's own captured prior stamp -- see its own comment for what it does
+  // when that arm carries no real prior stamp at all (erases the slot rather than tombstoning
+  // it). `committed` captures the exact value it wrote (or stays empty in the erase case), for
+  // the wire entry just below to reuse rather than re-derive.
   //
   // Wire-safe regardless of what this commits: PassesPeerEchoFilter (journal/types.cc) already
   // drops every kEntryFlagExpired entry before it reaches a mesh peer. Committing (and disarming)
@@ -141,10 +142,19 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
   // later journal entry commits it with whatever stamp that entry actually carries.
   MvccStamp committed;
   const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
-      db_cntx.db_index, key, db_cntx.time_now_ms,
-      [&committed](DbIndex db, string_view k, const MvccStamp& st, bool, const MvccStamp&) {
-        committed = st;
-        namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+      db_cntx.db_index, key,
+      [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
+                   const MvccStamp&) {
+        // drakeydb: P4-4 Task FW-A1 -- has_prior_stamp false means the expired value never had
+        // a real stamp of its own (see CommitOwnTombstone's own comment, mvcc.h): erase the slot
+        // rather than install an unsafe Mvcc()==0 tombstone. `committed` stays default (Empty()),
+        // which the wire-entry mvcc below already treats the same as "nothing was committed".
+        if (has_prior_stamp) {
+          committed = st;
+          namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+        } else {
+          namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
+        }
       });
 
   // drakeydb: Phase 3 -- see the declaration in tx_base.h. origin_idx stays default (0 ==

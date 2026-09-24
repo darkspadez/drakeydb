@@ -1389,9 +1389,11 @@ OpResult<uint32_t> OpDelV2(const OpArgs& op_args, const ShardArgs& keys, bool as
     // FindMutable + post_updater.Run() arms a LIVE stale key for this shard's callback, and this
     // replicated DEL has no right to do that once its own author stamp has already lost the LWW
     // compare against what's stored (or tombstoned) for `key`. An armed-but-never-deleted key
-    // then either gets floored by a surviving key's own journal commit in the same DEL, or -- if
-    // every key here is dropped -- is armed and abandoned uncommitted (caught by
-    // unstamped_writes).
+    // then either gets floored (or, for an exact tie against `stored`, committed VERBATIM --
+    // FloorAppliedStamp only floors a strictly older incoming stamp, and a tie's own value is
+    // order-equivalent to what was already stored) by a surviving key's own journal commit in the
+    // same DEL, or -- if every key here is dropped -- is armed and abandoned uncommitted (caught
+    // by unstamped_writes).
     if (split && LwwShouldDropKey(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
       NoteLwwDrop("DEL", key);
       continue;

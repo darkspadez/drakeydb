@@ -81,14 +81,14 @@ struct DbContext {
   // drakeydb: Phase 4 -- the applied entry's MVCC stamp, mirroring repl_origin_idx above. Lets
   // delete paths that stamp directly (rather than through arm/commit) reproduce the author's
   // stamp byte for byte. 0 means "mint locally". Consumed by RecordDelete(const DbContext&, ...)
-  // and RecordDerivedDelete below (review wave 2, F2 -- landed here in Task 6 but left unread
-  // until then, so every derived/expiry DEL an applier produced minted its own local stamp
-  // instead of reproducing the author's).
+  // and RecordDerivedDelete below -- every derived/expiry DEL an applier produces reproduces the
+  // author's stamp through this field, instead of minting its own local one.
   uint64_t repl_mvcc = 0;
 
   // drakeydb: P4-4 -- mirrors Transaction::repl_lww_guard_/ConnectionContext::repl_lww_guard: true
   // iff this apply came in over a guarded peer link. Copied by Transaction::GetDbContext()
-  // (transaction.h); nothing reads it yet (the veto is task A3).
+  // (transaction.h); read by OpMSet (string_family.cc) and OpDelV2 (generic_family.cc) via
+  // LwwGuardActive to decide whether their own per-key veto runs at all.
   bool repl_lww_guard = false;
 
   // Convenience method.

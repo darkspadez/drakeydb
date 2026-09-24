@@ -785,11 +785,12 @@ error_code Replica::InitiatePSync() {
     loader.SetLoadOriginHash(peer_origin_hash_);
     if (IsPeerMode()) {
       loader.SetOverrideExistingKeys(true);  // drakeydb: merge
-      // drakeydb: P4-3 Task 4 -- last-loaded-wins (SetOverrideExistingKeys above, left untouched)
-      // is replaced by an actual LWW compare for a peer-mode link specifically: a peer's full sync
-      // must merge into this node's own dataset, not blindly replace a concurrently-newer resident
-      // value. peer_origin_hash_ is this link's authenticated author identity, same as the
-      // SetLoadOriginHash call just above.
+      // drakeydb: P4-3 Task 4 -- SetOverrideExistingKeys above only suppresses a duplicate-key
+      // LOG(WARNING) (its one reader, rdb_load.cc) and never decided whether an incoming value
+      // replaces a resident one; the merge below (SetMergeLww) is the actual LWW compare, added
+      // here for a peer-mode link specifically: a peer's full sync must merge into this node's own
+      // dataset, not blindly replace a concurrently-newer resident value. peer_origin_hash_ is
+      // this link's authenticated author identity, same as the SetLoadOriginHash call just above.
       //
       // drakeydb: P4-3 Task 13 -- classic_protocol=true: this is the legacy Redis/KeyDB-protocol
       // (classic PSYNC) full-sync path (see the P4-2 Task 3 comment on SetLoadOriginHash just
@@ -1457,10 +1458,10 @@ void DflyShardReplica::FullSyncDflyFb(std::string eof_token, BlockingCounter bc,
   rdb_loader_->SetOverrideExistingKeys(true);
 
   if (peer_mode_) {
-    // drakeydb: P4-3 Task 4 -- SetOverrideExistingKeys above is left exactly as it is (Global
-    // Constraints: it has three live callers, and this exact call site, reached by a PLAIN
-    // Dragonfly replica's full sync too when peer_mode_ is false, must keep loading verbatim for
-    // that caller). Guarded on peer_mode_ specifically, unlike SetOverrideExistingKeys just above:
+    // drakeydb: P4-3 Task 4 -- SetOverrideExistingKeys above is left exactly as it is: it has
+    // three live callers, and this exact call site, reached by a PLAIN Dragonfly replica's full
+    // sync too when peer_mode_ is false, must keep loading verbatim for that caller. Guarded on
+    // peer_mode_ specifically, unlike SetOverrideExistingKeys just above:
     // this method is the only full-sync path a plain (non-peer) Replica of a Dragonfly master also
     // reaches, so an unguarded SetMergeLww(true, ...) here would make a plain replica start
     // rejecting resident-but-stale-looking writes its master already legitimately applied --

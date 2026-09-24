@@ -112,9 +112,12 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
   entry.entry_flags = entry_flags;
 
   // drakeydb: P4-4 Task A5 -- an entry is "applied" iff the CALLER supplied a non-zero mvcc,
-  // BEFORE the mint below ever runs. A local mint (mvcc == 0 here) is never floored -- only a
-  // caller-supplied author stamp (an applied write's, guarded or not, on a peer link or a plain
-  // replica) can legitimately be older than the key's own stored stamp.
+  // BEFORE the mint below ever runs. This distinguishes FloorAppliedStamp's floor (below, in the
+  // Commit() callback) from D3's LocalMintFloor (just below this comment): only a caller-supplied
+  // author stamp (an applied write's, guarded or not, on a peer link or a plain replica) can
+  // legitimately be OLDER than the key's own stored stamp and needs FloorAppliedStamp's
+  // one-tick-below landing -- a local mint (mvcc == 0 here) is never older than stored in that
+  // sense, but D3 still floors it strictly ABOVE stored (LocalMintFloor, not FloorAppliedStamp).
   const bool applied = mvcc != 0;
 
   // drakeydb: Phase 4 -- mint AFTER entry.mvcc = mvcc above (an assignment from the possibly-zero
@@ -174,7 +177,7 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
             db_slice.SetExistingMvcc(db, key, st);
             return;
           }
-          // drakeydb: P4-4 Task A5 fix round 1 -- floor an applied write's stamp against the
+          // drakeydb: P4-4 Task A5 -- floor an applied write's stamp against the
           // ARM's own captured prev_stamp, for BOTH arm kinds, never a live DbSlice::GetMvcc
           // lookup: by commit time the slot may no longer hold this key's true prior stamp --
           // EnsureMvcc's tombstone-clearing branch, or PerformDeletionAtomic's own placeholder
