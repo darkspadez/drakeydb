@@ -372,15 +372,21 @@ class DbSlice {
   facade::OpResult<int64_t> UpdateExpire(const Context& cntx, Iterator prime_it,
                                          const ExpireParams& params);
 
-  // drakeydb: P4-4 -- read-only pre-check for UpdateExpire's own NX/XX/GT/LT condition, against
-  // this exact iterator's CURRENT expiry state, without mutating anything. A caller (OpExpire,
-  // generic_family.cc) that must decide whether to arm this key's mvcc slot BEFORE calling
-  // UpdateExpire needs this: UpdateExpire's own already-in-the-past branch calls Del(), which can
-  // invalidate `prime_it`, so the arm-or-not decision has to be made first, not after inspecting
-  // UpdateExpire's return status. Returns false (never a SKIP) for `persist`, an undefined params,
-  // or an out-of-range deadline -- those are not this predicate's concern; the caller's normal,
-  // unconditional path already handles them exactly as before.
-  bool WouldExpireSkip(Iterator prime_it, const ExpireParams& params, uint64_t now_ms) const;
+  // drakeydb: P4-4 -- read-only prediction of whether UpdateExpire, called with these exact
+  // params against this exact iterator's CURRENT expiry state, would be a pure no-op: the
+  // NX/XX/GT/LT condition unsatisfied (SKIPPED) or the deadline out of range (OUT_OF_RANGE) --
+  // either way, nothing gets mutated. A caller (OpExpire, generic_family.cc) that must decide
+  // whether to arm this key's mvcc slot BEFORE calling UpdateExpire needs this as a HINT for that
+  // decision only: UpdateExpire's own already-in-the-past branch calls Del(), which can invalidate
+  // `prime_it`, so the arm-or-not choice has to be made before any mutation is attempted, not
+  // after inspecting UpdateExpire's own return status. This predicate is never a behavioral gate --
+  // the caller must still call UpdateExpire unconditionally, on every node type, exactly as
+  // upstream does; if this prediction ever drifts from UpdateExpire's own logic, the worst case is
+  // a wrong arm choice (a benign extra arm, or a missed no-arm optimization), never a silently
+  // skipped EXPIRE. Returns false (never a no-op) for `persist` or an undefined params -- neither
+  // is a shape OpExpire's own callers produce, and persist's own no-op handling (OpPersist, above)
+  // is unrelated to this predicate.
+  bool WouldExpireBeNoop(Iterator prime_it, const ExpireParams& params, uint64_t now_ms) const;
 
   // Publishes the expired keyspace event; call AFTER the deletion has been journaled.
   void SendExpiredKeyEvent(const Context& cntx, std::string_view key) const;

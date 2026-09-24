@@ -1827,7 +1827,7 @@ void DbSlice::ReleaseOffloadedValue(DbIndex db_ind, std::string_view key, PrimeV
 
 namespace {
 // drakeydb: P4-4 -- the NX/XX/GT/LT condition, factored out of UpdateExpire so
-// DbSlice::WouldExpireSkip (db_slice.h) can answer the identical question read-only, without
+// DbSlice::WouldExpireBeNoop (db_slice.h) can predict the identical outcome read-only, without
 // duplicating this logic and risking the two copies drifting apart.
 bool ExpireConditionSatisfied(bool has_expire, int64_t current_cmp, int32_t expire_options,
                               int64_t abs_msec) {
@@ -1843,13 +1843,13 @@ bool ExpireConditionSatisfied(bool has_expire, int64_t current_cmp, int32_t expi
 }
 }  // namespace
 
-bool DbSlice::WouldExpireSkip(Iterator prime_it, const ExpireParams& params,
-                              uint64_t now_ms) const {
+bool DbSlice::WouldExpireBeNoop(Iterator prime_it, const ExpireParams& params,
+                                uint64_t now_ms) const {
   if (params.persist || !params.IsDefined())
-    return false;  // never a NX/XX/GT/LT SKIP path -- the caller's normal path handles it
+    return false;  // not a shape OpExpire's own callers produce; see this method's own comment
   auto [rel_msec, abs_msec] = params.Calculate(now_ms, false);
   if (abs_msec < 0 || rel_msec > kMaxExpireDeadlineMs)
-    return false;  // OUT_OF_RANGE, not a SKIP -- let the real call report it, unarmed as before
+    return true;  // OUT_OF_RANGE -- also a no-op: nothing gets mutated on this path either
   const bool has_expire = prime_it->first.HasExpire();
   const int64_t current_cmp =
       has_expire ? prime_it->first.GetExpireTime() : numeric_limits<int64_t>::max();

@@ -1373,17 +1373,20 @@ TEST_F(MvccStoreTest, ReadOnlyGetExDoesNotStampKey) {
          "silently rejects peer writes that should have won";
 }
 
-// drakeydb: P4-4 -- EXPIRE ... NX/XX/GT/LT whose condition is not satisfied must never arm this
-// key's mvcc slot at all (OpExpire's own WouldExpireSkip pre-check, generic_family.cc/db_slice.h,
-// mirroring OpPersist's identical no-op handling above). Unlike GETEX above, this was never an
-// accepted over-stamp cost: nothing ever journals a SKIPPED EXPIRE, so arming and then abandoning
-// it was a pure, avoidable mvcc_unstamped_writes leak -- on exactly the `EXPIRE k ttl NX` pattern
-// D-27's own operator mitigation (docs/ISSUE-REGISTER.md) recommends running after every INCR.
+// drakeydb: P4-4 -- EXPIRE ... NX/XX/GT/LT whose condition is not satisfied, or whose deadline is
+// out of range, must never arm this key's mvcc slot (OpExpire's own WouldExpireBeNoop pre-check,
+// generic_family.cc/db_slice.h, mirroring OpPersist's identical no-op handling above). Unlike
+// GETEX above, this was never an accepted over-stamp cost: nothing ever journals a no-op EXPIRE,
+// so arming and then abandoning it was a pure, avoidable mvcc_unstamped_writes leak -- on exactly
+// the `EXPIRE k ttl NX` pattern D-27's own operator mitigation (docs/ISSUE-REGISTER.md)
+// recommends running after every INCR. UpdateExpire (db_slice.cc) itself is always called
+// regardless of what WouldExpireBeNoop predicts -- that predicate is a hint for this arm choice
+// only, never a behavioral gate; see its own declaration (db_slice.h) for why.
 //
-// Falsifying: reverting OpExpire's WouldExpireSkip pre-check (generic_family.cc) back to an
+// Falsifying: reverting OpExpire's WouldExpireBeNoop pre-check (generic_family.cc) back to an
 // unconditional `find_res.post_updater.Run()` before UpdateExpire makes each
 // `EXPECT_EQ(TotalUnstampedWrites(), before_unstamped)` below observe `before_unstamped + 1`
-// instead, one at a time, for NX, XX, GT and LT.
+// instead, one at a time, for NX, XX, GT, LT and PEXPIREAT-out-of-range.
 TEST_F(MvccStoreTest, SkippedExpireDoesNotArmOrStampKey) {
   ASSERT_EQ(Run({"set", "k", "v"}), "OK");
   auto before_stamp = StampOf("k");
@@ -1398,15 +1401,31 @@ TEST_F(MvccStoreTest, SkippedExpireDoesNotArmOrStampKey) {
     EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
   }
   {
-    // A real, non-skipped EXPIRE first, so NX below has a TTL to find. This one DOES arm and
-    // commit normally -- it must not itself perturb the baseline the next sub-block reads.
+    SCOPED_TRACE("GT against a key with no TTL");
+    const uint64_t before_unstamped = TotalUnstampedWrites();
+    // current_cmp is "infinity" with no TTL set -- no finite deadline is ever greater -> fails.
+    EXPECT_EQ(0, CheckedInt({"expire", "k", "100", "GT"}));
+    EXPECT_EQ(CheckedInt({"pttl", "k"}), -1) << "sanity: still genuinely no TTL";
+    EXPECT_EQ(StampOf("k"), before);
+    EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+  }
+
+  MvccStamp with_ttl;
+  {
+    // A real, non-skipped EXPIRE, so NX/GT/LT/OUT_OF_RANGE below all have a TTL to find. This one
+    // DOES arm and commit normally -- it must not itself perturb the baseline the next sub-blocks
+    // read.
     SCOPED_TRACE("sanity: bare EXPIRE actually sets a TTL");
     ASSERT_EQ(1, CheckedInt({"expire", "k", "100"}));
+    auto stamp = StampOf("k");
+    ASSERT_TRUE(stamp.has_value());
+    with_ttl = *stamp;
   }
   {
     SCOPED_TRACE("NX against a key that already has a TTL");
     const uint64_t before_unstamped = TotalUnstampedWrites();
     EXPECT_EQ(0, CheckedInt({"expire", "k", "200", "NX"}));  // already has one -> predicate fails
+    EXPECT_EQ(StampOf("k"), with_ttl);
     EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
   }
   {
@@ -1414,6 +1433,7 @@ TEST_F(MvccStoreTest, SkippedExpireDoesNotArmOrStampKey) {
     const uint64_t before_unstamped = TotalUnstampedWrites();
     // 50s < the 100s set above -> the new deadline is not greater -> predicate fails.
     EXPECT_EQ(0, CheckedInt({"expire", "k", "50", "GT"}));
+    EXPECT_EQ(StampOf("k"), with_ttl);
     EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
   }
   {
@@ -1421,6 +1441,19 @@ TEST_F(MvccStoreTest, SkippedExpireDoesNotArmOrStampKey) {
     const uint64_t before_unstamped = TotalUnstampedWrites();
     // 500s > the 100s still in effect (the GT above was itself skipped) -> not less -> fails.
     EXPECT_EQ(0, CheckedInt({"expire", "k", "500", "LT"}));
+    EXPECT_EQ(StampOf("k"), with_ttl);
+    EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+  }
+  {
+    // The leak the round-2 re-review found: PEXPIREAT with an absolute deadline overflowing
+    // kMaxExpireDeadlineMs returns OUT_OF_RANGE -- also a pure no-op, on `main` too, not specific
+    // to this fix -- and used to arm the key regardless, exactly like a failed NX/XX/GT/LT.
+    SCOPED_TRACE("PEXPIREAT out of range");
+    const uint64_t before_unstamped = TotalUnstampedWrites();
+    auto res = Run({"pexpireat", "k", absl::StrCat(INT64_MAX)});
+    EXPECT_THAT(res, ArgType(RespExpr::ERROR));
+    EXPECT_EQ(Run({"get", "k"}), "v") << "the key's own value must be untouched";
+    EXPECT_EQ(StampOf("k"), with_ttl);
     EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
   }
 }
@@ -2352,12 +2385,15 @@ TEST_F(MvccStoreTest, RecreateAfterContainerEmptiedByCommandClearsTheTombstone) 
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-3 Task 2 review fix (C1, Critical) -- the single-command variant: OpRestore
-// (generic_family.cc) deletes an existing key itself (DelMutable, default reason kExplicit, so it
-// tombstones) then re-adds the restored value, all inside ONE auto-journaled RESTORE command
-// (CO::JOURNALED, not NO_AUTOJOURNAL) -- so the eventual commit is deferred past
-// OnCbFinishBlocking's check exactly like a deferred/auto-journaled write, unlike DEL's own
-// explicit, synchronous RecordJournal.
+// drakeydb: P4-4 -- the single-command variant: OpRestore (generic_family.cc) deletes an existing
+// key itself (DelMutable, default reason kExplicit, so it tombstones) then re-adds the restored
+// value, all inside ONE RESTORE command. RESTORE is CO::JOURNALED | CO::NO_AUTOJOURNAL now: a
+// non-active node revives the verbatim auto-journal (deferred past OnCbFinishBlocking's check,
+// like any auto-journaled write), while an active node (this fixture's own default) journals
+// explicitly instead, from inside OpRestore's own callback body (synchronous, not deferred). What
+// actually clears the stale tombstone bit here, either way, is EnsureMvcc's own synchronous branch
+// (PostUpdate, db_slice.cc), which runs at the moment the new value is created -- independent of
+// when the journal entry itself eventually commits.
 TEST_F(MvccStoreTest, RestoreReplaceRecreatesClearingTheTombstone) {
   Run({"set", "k", "v1"});
   std::string dump = Run({"dump", "k"}).GetString();
@@ -3692,9 +3728,11 @@ TEST_F(MvccStoreTest, ExactTieDroppedWhenIncomingOriginHashIsSmaller) {
 // Falsifying: making RunCallback's own callback-skip unconditional-false (i.e. always run
 // `(*cb_ptr_)(this, shard)` regardless of `lww_dropped`) makes the SET/SETNX/GETSET/RESTORE blocks
 // fail: `EXPECT_EQ(consumer.commands.load(), pre)` observes one more entry than expected, and each
-// block's own `Run(...)` read observes the peer's value, not the local one -- their shared
-// callback-skip mechanism is gone, so each one's own explicit/auto journal call now runs and its
-// value change actually lands. The GETDEL block stays GREEN under this exact revert: its drop is
+// block's own follow-up read observes the write actually landed -- `Run({"get", ...})` returns the
+// peer's value for SET/GETSET/RESTORE, and `Run({"exists", ...}).GetInt()` returns 1 for SETNX
+// (the key it must NOT have created) -- their shared callback-skip mechanism is gone, so each
+// one's own explicit/auto journal call now runs and its value change actually lands. The GETDEL
+// block stays GREEN under this exact revert: its drop is
 // OpDelV2's own per-key veto (the SEPARATE mechanism this test's own first paragraph, above,
 // already names), which independently re-derives that the key is stale and skips it before Del()
 // ever runs -- completely unaffected by whether RunCallback's callback-skip itself ran, since
@@ -4891,9 +4929,9 @@ TEST_F(MvccStoreTest, DelLwwIsNotDroppedAgainstAnOlderTombstone) {
 
 // ---------------------------------------------------------------------------
 // drakeydb: P4-4 Task A11b -- DELEX journals its RESULT (DEL), never its own name
-// (generic_family.cc). A bare
-// `DELEX key` delegates to CmdDel/OpDelV2, which already has its own per-key guard --
-// the defect this fixes was purely in the AUTO-JOURNAL epilogue re-forwarding "DELEX key"
+// (generic_family.cc). A bare `DELEX key` delegates to CmdDel/OpDelV2, which already has its own
+// per-key guard -- the defect this fixes was purely in the AUTO-JOURNAL epilogue re-forwarding
+// "DELEX key"
 // verbatim regardless of what OpDelV2 decided, since the generic single-key veto never classifies
 // DELEX (same reason it never classifies DEL/MSET -- see UnguardedAndSelfGuardedClassesAreNot-
 // VetoedByTheGenericSingleKeyCheck, above). The conditional forms now hand-journal "DEL key"
@@ -5549,8 +5587,9 @@ TEST_F(MvccStoreTest, GetdelRewrittenToDelAppliesOverMismatchedType) {
 }
 
 // ---------------------------------------------------------------------------
-// drakeydb: P4-4 Task A5 -- FloorAppliedStamp's end-to-end proof. See mvcc.h's declaration for the
-// pure- function why; mvcc_test.cc's FloorAppliedStampTest suite covers the function in isolation.
+// drakeydb: P4-4 Task A5 -- FloorAppliedStamp's end-to-end proof. See mvcc.h's declaration for why
+// it is a pure function; mvcc_test.cc's FloorAppliedStampTest suite covers the function in
+// isolation.
 // ---------------------------------------------------------------------------
 
 // drakeydb: P4-4 Task A5 -- the headline case the floor exists for: an UNGUARDED applied RMW

@@ -1018,20 +1018,29 @@ OpStatus OpExpire(const OpArgs& op_args, string_view key, const DbSlice::ExpireP
   }
 
   // drakeydb: P4-4 -- mirrors OpPersist's own no-op handling, above: an EXPIRE ... NX/XX/GT/LT
-  // whose condition is not satisfied must never arm this key's mvcc slot, since nothing is going
-  // to journal it. The decision has to be made BEFORE calling UpdateExpire, not after inspecting
-  // its return status -- UpdateExpire's own already-past-deadline branch calls Del(), which can
-  // invalidate find_res.it, so by the time a SKIPPED/non-SKIPPED status came back it would already
-  // be too late to still call Run() safely on the pre-mutation iterator. WouldExpireSkip
-  // (db_slice.h/.cc) answers the identical NX/XX/GT/LT question UpdateExpire itself will,
-  // read-only.
-  if (db_slice.WouldExpireSkip(find_res.it, params, op_args.db_cntx.time_now_ms)) {
+  // whose condition is not satisfied (or whose deadline is out of range) must never arm this
+  // key's mvcc slot, since nothing is going to journal it. The decision has to be made BEFORE
+  // calling UpdateExpire, not after inspecting its return status -- UpdateExpire's own
+  // already-past-deadline branch calls Del(), which can invalidate find_res.it, so by the time a
+  // SKIPPED/OUT_OF_RANGE/real status came back it would already be too late to still call Run()
+  // safely on the pre-mutation iterator. WouldExpireBeNoop (db_slice.h/.cc) predicts the identical
+  // outcome UpdateExpire itself will compute, read-only, for exactly that reason -- but it is a
+  // HINT for this arm choice only, never a behavioral gate: UpdateExpire below always runs,
+  // unconditionally, on every node type, exactly as upstream does, so if this prediction ever
+  // drifts from UpdateExpire's own logic the worst case is a wrong arm choice, never a silently
+  // skipped EXPIRE. The DCHECK_EQ just below catches that drift in debug builds.
+  const bool would_be_noop =
+      db_slice.WouldExpireBeNoop(find_res.it, params, op_args.db_cntx.time_now_ms);
+  if (would_be_noop) {
     find_res.post_updater.RunWithoutMvccArm();
-    return OpStatus::SKIPPED;
+  } else {
+    find_res.post_updater.Run();
   }
 
-  find_res.post_updater.Run();
   auto res = db_slice.UpdateExpire(op_args.db_cntx, find_res.it, params);
+  DCHECK_EQ(would_be_noop, !res.ok())
+      << "WouldExpireBeNoop drifted from UpdateExpire's own no-op cases (status=" << res.status()
+      << ")";
 
   // If the value was deleted, replicate as DEL (already this key's full state). Otherwise, on an
   // active node, ship the key's full state under a guarded name instead of a bare PEXPIREAT: a
