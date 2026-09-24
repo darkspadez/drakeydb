@@ -225,11 +225,13 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
 }
 
 // drakeydb: P4-4 -- see the declaration (mvcc.h) for the contract. RecordExpiryBlocking
-// (tx_base.cc) is the only caller, and calls this BEFORE its own journal::RecordEntry: an
-// expiry's own tombstone always carries the expired value's own pre-deletion stamp, decoupled
-// from whatever ambient (possibly a replicated peer's, possibly old) mvcc/origin a later journal
-// entry's own commit logic would otherwise apply to every key still armed then -- this key's arm
-// is gone by that point regardless, since it is committed and erased right here.
+// (tx_base.cc), DbSlice::DeleteReapedContainer (db_slice.cc), SetFamily::DeleteSetIfEmpty
+// (set_family.cc), and HSetFamily::DeleteIfEmpty (hset_family.cc) each call this BEFORE their own
+// journal::RecordEntry: an expiry's own tombstone always carries the expired value's own
+// pre-deletion stamp, decoupled from whatever ambient (possibly a replicated peer's, possibly old)
+// mvcc/origin a later journal entry's own commit logic would otherwise apply to every key still
+// armed then -- this key's arm is gone by that point regardless, since it is committed and erased
+// right here.
 bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uint64_t now_ms,
                                      const CommitFn& fn) {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn called CommitOwnTombstone() re-entrantly -- this "

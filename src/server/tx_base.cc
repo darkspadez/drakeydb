@@ -117,8 +117,9 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
     return;
 
   // drakeydb: P4-4 -- an expiry is always a local decision, so ITS OWN tombstone arm
-  // (PerformDeletionAtomic, db_slice.cc) carries the expired value's OWN pre-deletion stamp --
-  // order-equivalent to it, never db_cntx.repl_mvcc/repl_origin_idx and never a freshly minted
+  // (PerformDeletionAtomic, db_slice.cc) carries a stamp derived from the expired value's OWN
+  // pre-deletion stamp -- one origin_hash tick above it (ExpiryTombstoneFor, mvcc.h), never that
+  // stamp reused verbatim, never db_cntx.repl_mvcc/repl_origin_idx, and never a freshly minted
   // one. A lazy expiry can fire while applying a peer's command (e.g. a replicated multi-key
   // command whose processing discovers a DIFFERENT, unrelated key already expired -- a single
   // replicated DEL of an already-expired key is the simplest case: FindMutable's lookup expires

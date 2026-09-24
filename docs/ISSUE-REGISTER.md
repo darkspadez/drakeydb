@@ -428,6 +428,17 @@ resurrection-protection window that tombstone was meant to provide. See `docs/mu
 guidance this motivates: size `--multi_master_tombstone_ttl` above the longest key TTL in use, in
 addition to the longest partition length expected, since the two needs add rather than take a max.
 
+A member-TTL container (a set/hash whose members carry individual TTLs — `SADD`+`FIELDEXPIRE`,
+`HSET`+`HEXPIRE`, …) is even more exposed than a whole-key TTL: its eventual empty-container
+tombstone derives from the container's own *last write* stamp (`DeleteReapedContainer`,
+`DbSlice::DeleteSetIfEmpty`/`HSetFamily::DeleteIfEmpty` — all through the same `CommitOwnTombstone`/
+`ExpiryTombstoneFor` rule), not from any one member's own TTL. A container can receive its last
+write long before its last member finally expires — each member's TTL is independent and can be far
+longer than `--multi_master_tombstone_ttl`, and the container itself may never be written again in
+between — so the gap between that write-time stamp and the moment the container actually empties can
+be arbitrarily larger than a single key's own TTL, making the resulting tombstone born even further
+past its GC deadline than the whole-key-expiry case above.
+
 Failure scenario (three peers, merge-load case): C partitioned before A's `SET k v2 EX 3600`; A's
 key expires and A's sweep lags; full sync A→B applies the synthetic tombstone, which is GC'd within
 an idle tick; C rejoins and full-syncs to B carrying its older live `k` → B has no tombstone →
@@ -638,3 +649,36 @@ the same treatment for.
 already gets) instead of a `DEL` + delta-add pair, for all nine affected commands
 (`SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`/`ZRANGESTORE`,
 `GEORADIUS`/`GEORADIUSBYMEMBER`). **From:** P4-4.
+
+### D-22. An unguarded applied re-create after an expiry tombstone ties a third peer at `P`
+
+**Where:** `FloorAppliedStamp` (`src/server/mvcc.h`, `src/server/mvcc.cc`) landing one origin_hash
+tick *below* `stored`, applied to the specific case where `stored` is an expiry tombstone
+`T = {P.Mvcc(), P.origin_hash + 1}` (`ExpiryTombstoneFor`'s own output, mvcc.h) and `incoming` is an
+UNGUARDED applied write (a delta RMW — `INCR`/`APPEND`/… — never LWW-compared before applying)
+whose own author stamp is older than `T`. `FloorAppliedStamp`'s `stored.origin_hash != 0` branch
+computes `{T.Mvcc(), T.origin_hash - 1}`, which is exactly `{P.Mvcc(), P.origin_hash}` — `P`
+itself, bit for bit, since `T` is *always* exactly one origin_hash tick above `P` by construction.
+
+Consequence: this node's `k` is now live again, stamped exactly `P`, holding a value the delta RMW
+manufactured from scratch (the key was absent going in — same "third, merged state neither node
+ever actually held" shape as D-21's `*STORE` split, not `P`'s own original value). A third peer
+that has not yet reaped its own still-live copy of `k` — plausible, since an expiry-caused DEL is
+peer-suppressed and every node reaps on its own clock, not on a schedule replication drives — is
+still holding that original value at that exact same stamp `P`. Whichever side of the next
+comparison between them is evaluating keeps its own stored side (`MergeAccepts` ties favor stored),
+so neither node's value is wrongly resurrected onto the other, but the two sides do not converge
+either: this node's manufactured value and the third peer's original value both sit at stamp `P`
+indefinitely, immune to each other's writes. Resolution arrives only when the third peer
+independently reaps its own copy: its own tombstone is `{P.Mvcc(), P.origin_hash + 1}`, strictly
+greater than this node's `P`-stamped value, so the next full sync between them converges — to
+absent, since a tombstone is what wins.
+
+**How established:** static derivation from `FloorAppliedStamp`'s documented one-tick-below
+landing (mvcc.h) composed with `ExpiryTombstoneFor`'s documented one-tick-above landing; not
+reproduced against a live three-node topology (see D-15's identical three-peer coverage gap).
+
+**Owner:** unassigned; only reachable with the streaming guard off for the re-creating write (a
+delta RMW is unguarded by design regardless of the flag — see the global constraints' guarded-name
+table) and a third peer lagging behind this node's own reap, both already-accepted shapes elsewhere
+in this register (D-19, D-21). **From:** P4-4.

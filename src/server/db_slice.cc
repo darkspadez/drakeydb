@@ -2599,6 +2599,10 @@ void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterat
           namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
         });
     if (found_tombstone) {
+      DCHECK_EQ(MvccStamper::tlocal()->ArmedCount(), 0u)
+          << "a sibling key was still armed when this derived DEL's own RecordEntry call was "
+             "about to run its generic per-arm sweep -- that sweep would floor the sibling "
+             "against this tombstone's own stamp instead of its real author stamp";
       Context patched_cntx = cntx;
       patched_cntx.repl_mvcc = committed.Mvcc();
       RecordDerivedDelete(patched_cntx, key_owned);
@@ -3317,12 +3321,14 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
       // later, and both need the slot's ORIGINAL value, not the placeholder: an applied
       // (replicated) delete's own journal commit floors that delete's author stamp against `S` if
       // the author's stamp is older (journal::RecordEntry's Commit() call, journal.cc); a
-      // `kExpired` delete's own tombstone instead reuses `S` verbatim, order-equivalent to it,
-      // rather than flooring anything (MvccStamper::CommitOwnTombstone, mvcc.cc, via
-      // RecordExpiryBlocking, tx_base.cc). By the time either one runs the slot no longer holds `S`
-      // -- only this placeholder does. GetMvcc always finds a slot here: the dense invariant
-      // guarantees a live prime key (the only kind PerformDeletionAtomic ever deletes) already owns
-      // one.
+      // `kExpired` delete's own tombstone instead derives from `S` one origin_hash tick above it
+      // (ExpiryTombstoneFor, mvcc.h -- never `S` reused verbatim), rather than flooring anything
+      // (MvccStamper::CommitOwnTombstone, mvcc.cc, via RecordExpiryBlocking (tx_base.cc),
+      // DeleteReapedContainer (below), or a member-TTL container-emptying helper (set_family.cc,
+      // hset_family.cc), whichever caused this delete). By the time either one runs the slot no
+      // longer holds `S` -- only this placeholder does. GetMvcc always finds a slot here: the
+      // dense invariant guarantees a live prime key (the only kind PerformDeletionAtomic ever
+      // deletes) already owns one.
       const MvccStamp prev_stamp = GetMvcc(table->index, del_it.key()).value_or(MvccStamp{});
       SetTombstone(table->index, del_it.key(), MvccStamp{MvccClock::kTombstoneBit, 0});
       MvccStamper::tlocal()->ArmTombstone(table->index, del_it.key(), prev_stamp);

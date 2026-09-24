@@ -453,7 +453,11 @@ async def _run_fuzzer(df_factory, seed, rounds, ops_per_round, extra_a=None, ext
             # match (ordinary replication lag on a straddling key) -- so it is not predictable by
             # this model, and not required to match across nodes. The `got["value"] ==
             # exp["value"]` assertion above (exp["value"] is None for every expiry) is what catches
-            # a resurrection, and it is what an unbounded-tombstone-GC-deadline regression fails on.
+            # a resurrection -- in particular, it is what a regression in the merge load's own
+            # already-expired-incoming-key handling (RdbLoader::ApplyMergeTombstoneOnShard's
+            # caller, rdb_load.cc) fails on: dropping that synthetic tombstone, or minting it with
+            # the wrong stamp, would resurrect the expired value on this side of the merge instead
+            # of leaving the key absent.
             # else: the model's winning write left no discoverable stamp on its own author (e.g.
             # --multi_master_tombstone_ttl=0 erasing a delete's tombstone) -- the value check
             # above is what catches a resurrection in that case; there is no real stamp left

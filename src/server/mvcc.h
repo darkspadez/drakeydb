@@ -155,20 +155,23 @@ inline bool MergeAccepts(const std::optional<MvccStamp>& stored, const MvccStamp
 
 // drakeydb: P4-4 -- the "just-above" tombstone for a value an expiry replaces, never a value's
 // own stamp reused verbatim (AsTombstone's own precondition, above) and never a freshly minted,
-// wall-clock-derived one either. One shared rule for every expiry tombstone in the phase: local
-// lazy/active expiry (MvccStamper::CommitOwnTombstone, below), the member-expiry reaper
-// (DbSlice::DeleteReapedContainer, db_slice.cc), and a merge load's synthetic tombstone for an
-// already-expired incoming key (RdbLoader::ApplyMergeTombstoneOnShard's caller, rdb_load.cc) all
-// call this, so the three can never drift onto different tombstone stamps for what is logically
-// the same kind of event.
+// wall-clock-derived one either. One shared rule for every expiry tombstone in the phase: called
+// directly by a merge load's synthetic tombstone for an already-expired incoming key
+// (RdbLoader::ApplyMergeTombstoneOnShard's caller, rdb_load.cc), and indirectly by every local
+// expiry-caused delete path via MvccStamper::CommitOwnTombstone (below) -- RecordExpiryBlocking
+// (tx_base.cc), the member-expiry reaper (DbSlice::DeleteReapedContainer, db_slice.cc), and the
+// member-TTL container-emptying helpers (SetFamily::DeleteSetIfEmpty, HSetFamily::DeleteIfEmpty)
+// alike -- so none of them can drift onto a different tombstone stamp for what is logically the
+// same kind of event.
 //
 // `{value.Mvcc(), value.origin_hash + 1}`, tombstone bit set -- one origin_hash tick above
 // `value`, mirroring FloorAppliedStamp's one-tick-BELOW landing above for the opposite direction.
-// Strictly greater than `value` (satisfies AsTombstone's own precondition: this is genuinely new
-// authority, not `value`'s own stamp reused), yet the smallest such stamp, so it costs nothing
-// against a later write with real authority of its own (a guarded apply, or a later local write):
-// nothing with legitimate authority over this key can land strictly between `value` and this
-// tombstone, since no author ever mints (or is floored/advanced to) a stamp that exactly
+// Strictly greater than `value` for every representable `value` except one boundary case (see the
+// UINT64_MAX paragraph below) -- satisfying AsTombstone's own precondition (this is genuinely new
+// authority, not `value`'s own stamp reused) everywhere else -- yet the smallest such stamp, so it
+// costs nothing against a later write with real authority of its own (a guarded apply, or a later
+// local write): nothing with legitimate authority over this key can land strictly between `value`
+// and this tombstone, since no author ever mints (or is floored/advanced to) a stamp that exactly
 // reproduces a stamp that already exists here.
 //
 // Landing exactly ON `value` instead (order-equivalent to it, reusing `value`'s own stamp
@@ -184,7 +187,17 @@ inline bool MergeAccepts(const std::optional<MvccStamp>& stored, const MvccStamp
 // (which would REGRESS the ordering, not advance it) -- capped at kStampMask, mirroring
 // LocalMintFloor's own cap (mvcc.cc) for the identical overflow-into-kTombstoneBit hazard: see
 // ExpiryTombstoneForCarriesIntoMvccAtOriginHashMax and
-// ExpiryTombstoneForCapsAtStampMaskOnDoubleOverflow (mvcc_test.cc).
+// ExpiryTombstoneForCapsAtStampMaskOnDoubleOverflow (mvcc_test.cc). That cap is itself the one
+// boundary case where the result is NOT strictly greater than `value`: at
+// `value == {kStampMask, UINT64_MAX}` (both fields already at their maximum), the cap lands the
+// result at `{kStampMask, 0}`, which compares LESS than `value` (Mvcc() ties, but 0 < UINT64_MAX
+// on origin_hash) -- see ExpiryTombstoneForCapsAtStampMaskOnDoubleOverflow's own assertions, which
+// deliberately do not claim `value < got` there. Only reachable with `value.Mvcc()` already at
+// exactly kStampMask, which needs the packed ms component at its own 43-bit ceiling (~year 2248 on
+// the wall clock this format encodes) AND the low 20-bit per-ms counter simultaneously maxed out --
+// effectively a hostile or corrupted stamp, not one any real clock/counter pair mints; accepted as
+// an unreached-in-practice exception rather than a third overflow tier, matching
+// FloorAppliedStamp's own accepted bound (above) for the opposite direction.
 inline MvccStamp ExpiryTombstoneFor(const MvccStamp& value) {
   if (value.origin_hash == UINT64_MAX) {
     return MvccStamp{std::min(value.Mvcc() + 1, MvccClock::kStampMask) | MvccClock::kTombstoneBit,
@@ -417,10 +430,16 @@ class MvccStamper {
   // never a freshly minted, wall-clock-derived one, even when a sibling key armed earlier in the
   // SAME epoch (e.g. a replicated multi-key command's other pair) correctly must retain that
   // peer's stamp -- which happens via the enclosing command's own, LATER journal entry and its own
-  // Commit() call, never this one: RecordExpiryBlocking (tx_base.cc) is the only caller, and calls
-  // this BEFORE its own journal::RecordEntry, so this key's arm (if any) has already been removed
-  // and stamped here by the time that entry's own commit logic runs, and a sibling's arm is left
-  // untouched by this call for that later entry to pick up.
+  // Commit() call, never this one: RecordExpiryBlocking (tx_base.cc), the member-expiry reaper
+  // (DbSlice::DeleteReapedContainer, db_slice.cc), and the member-TTL container-emptying helpers
+  // (SetFamily::DeleteSetIfEmpty, set_family.cc; HSetFamily::DeleteIfEmpty, hset_family.cc) all
+  // call this the same way, before their own subsequent journal entry, so this key's arm (if any)
+  // has already been removed and stamped here by the time that entry's own commit logic runs. For
+  // RecordExpiryBlocking specifically, a sibling key armed earlier in the SAME multi-key command
+  // (its own motivating case) is left untouched by this call for that command's own, later journal
+  // entry to pick up; the other three callers only ever run inside a single-key command, so no
+  // sibling arm is ever pending there today -- but this call leaves one alone exactly the same way
+  // if one ever were (ArmedCount(), below, lets each of them confirm that with a DCHECK).
   //
   // Falls back to a freshly minted self stamp (HopStamp(now_ms)) only when that arm's own
   // prev_stamp carries no real authority (Mvcc() == 0: a value that never received a stamp, or a
@@ -430,9 +449,10 @@ class MvccStamper {
   // the fallback branch, advancing the shared per-thread clock) on every expiry when nothing is
   // armed (TombstonesEnabled() is false, the delete was outside the default namespace, or
   // PerformDeletionAtomic degraded to a plain erase at the tombstone cap). Returns true if it
-  // found and committed (removing) that arm; false otherwise -- the caller has no narrower way to
-  // know which of those cases applies, and does not need to: either way, its own subsequent
-  // journal entry is unaffected.
+  // found and committed (removing) that arm; false otherwise -- every caller branches on this to
+  // decide whether to forward the committed stamp's masked Mvcc() into its own subsequent journal
+  // entry (true) or leave that entry's repl_mvcc/repl_origin_idx exactly as the causing command (or
+  // lack of one) already set them (false); see the four callers listed above for the shared shape.
   //
   // Same reentrancy contract as Commit()/EndOfWriteEpoch() above: fn must not call Arm()/Disarm()/
   // Commit()/EndOfWriteEpoch()/this method itself -- DCHECK'd the same way, via commit_depth_.
@@ -452,6 +472,19 @@ class MvccStamper {
   // erase_fn must not call Arm()/Disarm()/Commit()/EndOfWriteEpoch(): this call is mid-iteration
   // over armed_/arena_ for the same reason Commit()'s fn may not, above -- DCHECK'd the same way.
   void EndOfWriteEpoch(const EraseFn& erase_fn);
+
+  // drakeydb: P4-4 -- diagnostic only (DCHECK use), not load-bearing for any production decision.
+  // CommitOwnTombstone's callers (DbSlice::DeleteReapedContainer, SetFamily::DeleteSetIfEmpty,
+  // HSetFamily::DeleteIfEmpty) forward the committed tombstone through a derived DEL whose own
+  // journal::RecordEntry call still runs the ordinary per-arm Commit() sweep (unlike
+  // RecordExpiryBlocking's entry, which is flagged kEntryFlagExpired and skips it) -- if any OTHER
+  // key were still armed at that point, this sweep would floor it against the tombstone's own
+  // stamp instead of its real author stamp. No caller today ever arms a sibling before reaching
+  // that point; this lets each one confirm that with a DCHECK rather than relying on it staying
+  // true by accident as the callers around CommitOwnTombstone change.
+  size_t ArmedCount() const {
+    return armed_.size();
+  }
 
   const Stats& stats() const {
     return stats_;

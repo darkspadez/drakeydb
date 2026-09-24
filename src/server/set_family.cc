@@ -1707,6 +1707,10 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
               namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
             });
         if (found_tombstone) {
+          DCHECK_EQ(MvccStamper::tlocal()->ArmedCount(), 0u)
+              << "a sibling key was still armed when this derived DEL's own RecordEntry call was "
+                 "about to run its generic per-arm sweep -- that sweep would floor the sibling "
+                 "against this tombstone's own stamp instead of its real author stamp";
           DbContext patched_cntx = db_cntx;
           patched_cntx.repl_mvcc = committed.Mvcc();
           RecordDerivedDelete(patched_cntx, key);

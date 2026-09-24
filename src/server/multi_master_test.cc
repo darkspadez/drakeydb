@@ -2724,11 +2724,11 @@ TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandKeepsExpiredValuesOwnSta
 // incoming author stamp against the key's LIVE, still-unreaped stamp S (a pure side-table read,
 // GetMvcc, that never itself triggers expiry), so a stamp X strictly greater than S passes the
 // veto and the callback runs. Only INSIDE that callback does the write's own key lookup
-// (FindMutable /AddOrFind) lazily expire the key -- and that expiry's own tombstone must be
-// order-equivalent to S (never a fresh, wall-clock-derived mint that would land far above X for no
-// reason related to X at all), or the resulting stamp would wrongly outrank every future write
-// between S and that mint, including this one and any later one whose author stamp sits in that
-// same range.
+// (FindMutable /AddOrFind) lazily expire the key -- and that expiry's own tombstone must derive
+// from S, one origin_hash tick above it (ExpiryTombstoneFor, mvcc.h; never a fresh, wall-clock-
+// derived mint that would land far above X for no reason related to X at all), or the resulting
+// stamp would wrongly outrank every future write between S and that mint, including this one and
+// any later one whose author stamp sits in that same range.
 //
 // Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
 // unconditionally makes the SECOND ApplyReplicatedCommand below get dropped (Run({"get","k"})
@@ -3208,6 +3208,58 @@ TEST_F(MvccStoreTest, MemberTtlEmptiedHashByCommandEarnsExpiryTombstoneAndApplie
       ApplyReplicatedCommand({"set", "mhash", "peer_v"}, kPeerIdx, stamp_i, /*lww_guard=*/true),
       facade::DispatchResult::OK);
   EXPECT_EQ(Run({"get", "mhash"}), "peer_v")
+      << "a write strictly newer than S must still apply, not be wrongly dropped against a "
+         "reap-time mint that landed near this node's wall clock instead of near S";
+}
+
+// drakeydb: P4-4 -- a READ-ONLY hash command's own emptying (ExecuteRO, hset_family.cc) is a
+// third, distinct route to HSetFamily::DeleteIfEmpty, alongside HTTL's above and HRANDFIELD's: a
+// read-only callback can never itself remove a field, so ExecuteRO's own `hw.Length() == 0` check
+// can only fire from lazy field-TTL expiry, discovered here by HGET's own HMapWrap::Find call.
+// Before this test's own fix, ExecuteRO instead called DeleteHw (further up this file) with its
+// default suppress_peer=true, minting a fresh reap-time stamp for this exact case -- the identical
+// defect DeleteSetIfEmpty/DeleteIfEmpty were already fixed for via other callers, just unreached by
+// those fixes because ExecuteRO's own call site had not been switched over yet.
+//
+// Falsifying: reverting ExecuteRO's own call (hset_family.cc) from
+// `HSetFamily::DeleteIfEmpty(op_args.GetDbSlice(), op_args.db_cntx, key, pv)` back to
+// `DeleteHw(hw, op_args, key)` reproduces the old behavior: the first EXPECT_EQ below fails (tomb
+// comes back self-originated with a freshly-minted Mvcc(), not one tick above S), and the guarded
+// peer write below gets wrongly dropped (Run({"get",...}) stays nil, not "peer_v").
+TEST_F(MvccStoreTest,
+       MemberTtlEmptiedHashByReadCommandEarnsExpiryTombstoneAndAppliesLaterPeerWrite) {
+  constexpr uint32_t kPeerIdx = 65;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-1515-4000-8000-000000000065");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"hset", "mhash2", "f", "v"}).GetInt(), 1);
+  Run({"fieldexpire", "mhash2", "1", "f"});
+  auto s_stamp = StampOf("mhash2");
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(1100);
+
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+  // HGET's own HMapWrap::Find call lazily expires "f", then ExecuteRO's own emptiness check
+  // (default derived=true via HSetFamily::DeleteIfEmpty) removes the now-empty hash.
+  EXPECT_THAT(Run({"hget", "mhash2", "f"}), ArgType(RespExpr::NIL));
+  ASSERT_EQ(Run({"exists", "mhash2"}).GetInt(), 0) << "guard against a vacuous pass";
+
+  auto tomb = StampOf("mhash2");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(*tomb,
+            (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
+      << "must be one origin_hash tick above S, never a freshly minted self stamp";
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+
+  const uint64_t stamp_i = (s_stamp->MsPart() + 500) << MvccClock::kCounterBits;
+  ASSERT_GT(stamp_i, s_stamp->Mvcc()) << "sanity: I is strictly after S";
+  ASSERT_LT(stamp_i, GetCurrentTimeMs() << MvccClock::kCounterBits)
+      << "sanity: I is nowhere near this node's own wall clock";
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "mhash2", "peer_v"}, kPeerIdx, stamp_i, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "mhash2"}), "peer_v")
       << "a write strictly newer than S must still apply, not be wrongly dropped against a "
          "reap-time mint that landed near this node's wall clock instead of near S";
 }
@@ -7813,16 +7865,26 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteCarriesDerivedFlag) {
 TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteEarnsATombstone) {
   EXPECT_EQ(Run({"sadd", "rs-tomb", "m"}).GetInt(), 1);
   Run({"fieldexpire", "rs-tomb", "1", "m"});
+
+  // S: rs-tomb's own pre-reap stamp, captured before AdvanceTime so the reaper's tombstone can be
+  // checked against it exactly, the same way MvccStoreTest's own expiry tests check against
+  // `before`/`s_stamp`.
+  std::optional<MvccStamp> s_stamp;
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    s_stamp = db_slice.GetMvcc(0, "rs-tomb");
+  });
+  ASSERT_TRUE(s_stamp.has_value());
+  ASSERT_FALSE(s_stamp->IsTombstone());
+
   AdvanceTime(1100);
 
   std::optional<MvccStamp> tomb;
-  uint64_t self_origin_hash = 0;
   shard_set->RunBriefInParallel([&](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
     DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100);
     tomb = db_slice.GetMvcc(0, "rs-tomb");
-    self_origin_hash = MvccStamper::tlocal()->OriginHash(0);
   });
 
   // Guard against a vacuous pass: the container must have actually been reaped.
@@ -7830,13 +7892,12 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteEarnsATombstone) {
 
   ASSERT_TRUE(tomb.has_value())
       << "the reaper's derived DEL must earn a tombstone, not leave the slot absent";
-  EXPECT_TRUE(tomb->IsTombstone());
-  EXPECT_NE(tomb->Mvcc(), 0u)
-      << "must carry the derived DEL's own real stamp -- not the zero-authority "
-         "{kTombstoneBit, 0} placeholder PerformDeletionAtomic writes synchronously";
-  EXPECT_EQ(tomb->origin_hash, self_origin_hash + 1)
-      << "a reaper-derived delete is a local decision -- must derive from this node's own prior "
-         "stamp (advanced one origin_hash tick), never attributed to a peer";
+  // Independently constructed from S, not by calling ExpiryTombstoneFor: one origin_hash tick
+  // above S, tombstone bit set, mvcc unchanged.
+  EXPECT_EQ(*tomb,
+            (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
+      << "must derive from the set's own prior stamp S -- one origin_hash tick above S's own mvcc "
+         "AND origin_hash -- never a freshly minted self stamp, and never S reused verbatim";
 }
 
 TEST_F(ReaperJournalFamilyTest, LocalOnlyReaperDoesNotJournalNamespaceBlindDelete) {

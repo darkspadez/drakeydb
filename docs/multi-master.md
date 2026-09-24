@@ -423,6 +423,13 @@ a key with a 1-hour TTL that expires right as a peer reconnects from an hour-lon
 tombstone protection for the partition length PLUS however long that key's own value had already
 been live.
 
+A container with per-member TTLs (`SADD`+`FIELDEXPIRE`, `HSET`+`HEXPIRE`, …) is even more exposed:
+its own empty-container tombstone is measured from the container's LAST WRITE, not from any one
+member's TTL, and a container can go a long time between writes while its individual members expire
+on their own independent schedules. By the time the last member finally expires and the container
+itself empties, the gap since that last write can be far larger than any single key's own TTL — size
+the tombstone TTL with that in mind for workloads that lean on per-member expiry.
+
 **Hitting the cap degrades to resurrection.** When a (database, shard) pair's tombstone count is
 already at `--multi_master_max_tombstones`, the next delete for a key on that database and shard
 does not error and does not block — it silently falls back to a plain erase, trading resurrection
