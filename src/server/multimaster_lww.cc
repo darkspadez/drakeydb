@@ -37,7 +37,6 @@ struct ClassifiedCommand {
 constexpr ClassifiedCommand kJournaledClasses[] = {
     {"DEL", LwwClass::kMultiKeySelfGuarded}, {"GETDEL", LwwClass::kSingleKey},
     {"GETSET", LwwClass::kSingleKey},        {"MSET", LwwClass::kMultiKeySelfGuarded},
-    {"PERSIST", LwwClass::kSingleKey},       {"PEXPIREAT", LwwClass::kSingleKey},
     {"RESTORE", LwwClass::kSingleKey},       {"SET", LwwClass::kSingleKey},
     {"SETNX", LwwClass::kSingleKey},
 };

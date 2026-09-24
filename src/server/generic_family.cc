@@ -38,6 +38,7 @@ extern "C" {
 #include "server/family_utils.h"
 #include "server/hset_family.h"
 #include "server/journal/journal.h"
+#include "server/multi_master.h"
 #include "server/multimaster_lww.h"
 #include "server/namespaces.h"
 #include "server/rdb_extensions.h"
@@ -312,6 +313,57 @@ OpResult<string> DumpToString(string_view key, const PrimeValue& pv, const OpArg
   }
 
   return {std::move(str_res)};
+}
+
+// drakeydb: P4-4 -- ships this key's CURRENT full state (value, absolute TTL, and STICK/memcache
+// flags) under a guarded name, in place of a delta (PEXPIREAT/PERSIST): a delta only tells a
+// receiver "change the TTL", so a receiver that independently holds a different value for this
+// key applies that TTL change to ITS OWN value, producing a value/TTL pairing neither peer ever
+// actually wrote. A string ships as SET (mirroring SetCmd::RecordJournal's own SET shape byte for
+// byte); every other type ships as its own RESTORE dump, reusing exactly the serialization
+// Renamer::SerializeSrc/DeserializeDest already use for RENAME/COPY. Tiering refuses to run
+// alongside --active_replica (see ValidateMultiMasterFlags, multi_master.cc), so a value reaching
+// this function -- always on an active node -- is never offloaded; the DCHECK documents that
+// assumption instead of silently mishandling an external value.
+void RecordFullStateJournal(const OpArgs& op_args, string_view key, const PrimeKey& pk,
+                            const PrimeValue& pv) {
+  DCHECK(!pv.IsExternal());
+  auto& db_slice = op_args.GetDbSlice();
+
+  if (pv.ObjType() == OBJ_STRING) {
+    const string value_str = pv.ToString();
+    absl::InlinedVector<string_view, 6> cmds({key, value_str});
+    string exp_str;
+    if (pk.HasExpire()) {
+      exp_str = absl::StrCat(pk.GetExpireTime());
+      cmds.insert(cmds.end(), {"PXAT"sv, exp_str});
+    }
+    if (pk.IsSticky())
+      cmds.push_back("STICK"sv);
+    string mcflags_str;
+    if (pv.HasFlag()) {
+      mcflags_str = absl::StrCat(db_slice.GetMCFlag(op_args.db_cntx.db_index, pk));
+      cmds.push_back("_MCFLAGS"sv);
+      cmds.push_back(mcflags_str);
+    }
+    RecordJournal(op_args, "SET"sv, ArgSlice{cmds});
+    return;
+  }
+
+  OpResult<string> dump = DumpToString(key, pv, op_args);
+  if (!dump.ok()) {
+    // The DCHECK above already rules out the only failure DumpToString has on an active node (a
+    // stalled tiered read); nothing sane is left to journal, so the receiver simply keeps
+    // whatever it already held for this key.
+    LOG(DFATAL) << "drakeydb: full-state journal serialization failed for key " << key << ": "
+                << dump.status();
+    return;
+  }
+  const string exp_str = absl::StrCat(pk.HasExpire() ? pk.GetExpireTime() : 0);
+  absl::InlinedVector<string_view, 6> args({key, exp_str, *dump, "REPLACE"sv, "ABSTTL"sv});
+  if (pk.IsSticky())
+    args.push_back("STICK"sv);
+  RecordJournal(op_args, "RESTORE"sv, args);
 }
 
 OpStatus OpPersist(const OpArgs& op_args, string_view key);
@@ -610,10 +662,24 @@ OpStatus OpPersist(const OpArgs& op_args, string_view key) {
 
   if (!IsValid(res.it)) {
     return OpStatus::KEY_NOTFOUND;
-  } else {
-    bool cleared = db_slice.RemoveExpire(op_args.db_cntx.db_index, res.it);
-    return cleared ? OpStatus::OK : OpStatus::SKIPPED;
   }
+
+  const bool cleared = db_slice.RemoveExpire(op_args.db_cntx.db_index, res.it);
+  if (!cleared) {
+    // drakeydb: P4-4 -- nothing changed (PERSIST on a key that never had a TTL): never arm this
+    // key's stamp for a no-op, and never journal it either. PERSIST's own registration
+    // is CO::NO_AUTOJOURNAL now (GenericFamily::Register), so on a non-active node the caller
+    // (GenericFamily::Persist) has already decided whether to revive the verbatim auto-journal;
+    // this function only ever journals explicitly, on an active node, for an actual change.
+    res.post_updater.RunWithoutMvccArm();
+    return OpStatus::SKIPPED;
+  }
+
+  res.post_updater.Run();
+  if (IsActiveReplica() && op_args.shard->journal()) {
+    RecordFullStateJournal(op_args, key, res.it->first, res.it->second);
+  }
+  return OpStatus::OK;
 }
 
 OpResult<std::string> OpDump(const OpArgs& op_args, string_view key) {
@@ -886,11 +952,16 @@ OpStatus OpExpire(const OpArgs& op_args, string_view key, const DbSlice::ExpireP
   find_res.post_updater.Run();
   auto res = db_slice.UpdateExpire(op_args.db_cntx, find_res.it, params);
 
-  // If the value was deleted, replicate as DEL.
-  // Else, replicate as PEXPIREAT with exact time.
+  // If the value was deleted, replicate as DEL (already this key's full state). Otherwise, on an
+  // active node, ship the key's full state under a guarded name instead of a bare PEXPIREAT: a
+  // PEXPIREAT only carries the new TTL, so a receiver applying it against its OWN, possibly
+  // different, value for this key ends up with a value/TTL pairing neither peer ever actually
+  // wrote (drakeydb: P4-4). A non-active node keeps the exact upstream PEXPIREAT shape.
   if (op_args.shard->journal() && res.ok()) {
     if (res.value() == -1) {
       RecordJournal(op_args, "DEL"sv, ArgSlice{key});
+    } else if (IsActiveReplica()) {
+      RecordFullStateJournal(op_args, key, find_res.it->first, find_res.it->second);
     } else {
       auto time = absl::StrCat(res.value());
       // Note: Don't forget to change this when adding arguments to expire commands.
@@ -1458,6 +1529,17 @@ void GenericFamily::Delex(facade::CmdArgParser parser, CommandContext* cmd_cntx)
     return cmd_cntx->SendError(facade::WrongNumArgsError("DELEX"), kSyntaxErrType);
   }
 
+  // drakeydb: P4-4 -- DELEX's own auto-journal stays suppressed (CO::NO_AUTOJOURNAL, statically)
+  // on an active node, where the explicit result-journal below (or CmdDel/OpDelV2's own, for the
+  // bare form) is the only thing allowed to reach the wire. A non-active node has no per-key
+  // stamp to protect and must see exactly what plain Dragonfly sends -- including its upstream
+  // quirk of double-journaling a bare DELEX (CmdDel/OpDelV2's own "DEL key" AND DELEX's own
+  // revived auto-journal "DELEX key") and of auto-journaling a conditional DELEX's own recipe
+  // unconditionally, even on a predicate that never deletes anything. Revived here, in command
+  // setup, before the Execute hop -- the same contract RENAME/SORT/PERSIST already follow.
+  if (!IsActiveReplica())
+    cmd_cntx->tx()->ReviveAutoJournal();
+
   // If no condition, delegate to standard DEL
   if (cond == Condition::NONE) {
     CmdDel(facade::CmdArgParser{cmd_cntx->tail_args()}, cmd_cntx);
@@ -1512,22 +1594,29 @@ void GenericFamily::Delex(facade::CmdArgParser parser, CommandContext* cmd_cntx)
     if (should_delete) {
       db_slice.DelMutable(tx->GetDbContext(), std::move(*it_res));
 
-      // drakeydb: P4-4 Task A11b -- DELEX is CO::NO_AUTOJOURNAL, so nothing journals this delete
-      // unless we do it here. Journaling the RESULT ("DEL key"), not the recipe ("DELEX key IFEQ
-      // v"), mirrors OpDelV2's own "Del then RecordJournal" order for a reason, not just style:
-      // DelMutable above only ARMS a zero-authority tombstone placeholder (PerformDeletionAtomic's
-      // SetTombstone+ArmTombstone, db_slice.cc) -- it is THIS RecordJournal call's Commit()
-      // (journal.cc) that stamps the real author stamp into that slot. Journaling first would run
-      // Commit() before the arm exists, so DelMutable's later arm is never revisited by this
-      // callback: EndOfWriteEpoch's rollback erases the orphaned placeholder (the tombstone
-      // vanishes) and counts it as an unstamped write. Journaling the RESULT also means a receiver
-      // applies a guarded DEL against its OWN value instead of re-evaluating this predicate
-      // against a value that may already differ -- the same SETNX->SET precedent Task A9
-      // established for SETNX. A failed predicate (should_delete == false, below) journals
-      // nothing at all: NO_AUTOJOURNAL plus no explicit RecordJournal call is exactly "nothing".
-      auto op_args = tx->GetOpArgs(es);
-      if (op_args.shard->journal())
-        RecordJournal(op_args, "DEL"sv, ArgSlice{key});
+      // drakeydb: P4-4 -- on an ACTIVE node, nothing else journals this delete (DELEX's
+      // auto-journal stays suppressed there), so this call does it explicitly. Journaling the
+      // RESULT ("DEL key"), not the recipe ("DELEX key IFEQ v"), mirrors OpDelV2's own "Del then
+      // RecordJournal" order for a reason, not just style: DelMutable above only ARMS a
+      // zero-authority tombstone placeholder (PerformDeletionAtomic's SetTombstone+ArmTombstone,
+      // db_slice.cc) -- it is THIS RecordJournal call's Commit() (journal.cc) that stamps the real
+      // author stamp into that slot. Journaling first would run Commit() before the arm exists, so
+      // DelMutable's later arm is never revisited by this callback: EndOfWriteEpoch's rollback
+      // erases the orphaned placeholder (the tombstone vanishes) and counts it as an unstamped
+      // write. Journaling the RESULT also means a receiver applies a guarded DEL against its OWN
+      // value instead of re-evaluating this predicate against a value that may already differ --
+      // the same SETNX->SET precedent established for SETNX. A failed predicate (should_delete ==
+      // false, below) journals nothing at all on an active node.
+      //
+      // On a NON-active node, the caller already revived DELEX's own auto-journal instead (see
+      // Delex's top-of-function comment): that forwards the client's ORIGINAL recipe verbatim,
+      // unconditionally, matching upstream -- so this explicit call must not also fire, or a
+      // non-active downstream link would see this delete journaled twice.
+      if (IsActiveReplica()) {
+        auto op_args = tx->GetOpArgs(es);
+        if (op_args.shard->journal())
+          RecordJournal(op_args, "DEL"sv, ArgSlice{key});
+      }
       return 1;
     }
 
@@ -1591,6 +1680,13 @@ void GenericFamily::Exists(facade::CmdArgParser parser, CommandContext* cmd_cntx
 
 void GenericFamily::Persist(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
   string_view key = parser.Next();
+
+  // drakeydb: P4-4 -- PERSIST is CO::NO_AUTOJOURNAL now (OpPersist journals the full state
+  // itself on an active node). A non-active node has no per-key stamp to protect and must see
+  // the exact upstream shape, so it revives the verbatim auto-journal here, in command setup,
+  // before the Execute hop -- the same contract RENAME/SORT/DELEX already follow.
+  if (!IsActiveReplica())
+    cmd_cntx->tx()->ReviveAutoJournal();
 
   auto cb = [&](Transaction* t, EngineShard* shard) { return OpPersist(t->GetOpArgs(shard), key); };
 
@@ -3201,13 +3297,18 @@ void GenericFamily::Register(CommandRegistry* registry) {
   registry->StartFamily();
   *registry
       << CI{"DEL", CO::JOURNALED | CO::NO_AUTOJOURNAL, -2, 1, -1, acl::kDel}.SetAsyncHandler(CmdDel)
-      // drakeydb: P4-4 Task A11b -- NO_AUTOJOURNAL added. A bare `DELEX key` delegates to CmdDel,
-      // which already journals `DEL key` explicitly (OpDelV2); without NO_AUTOJOURNAL here, the
-      // transaction epilogue ALSO auto-journaled `DELEX key` verbatim under DELEX's own cid_ (the
-      // generic single-key veto only classifies kSingleKey names, never DELEX) -- a double journal
-      // that, on a guarded receiver, forwarded a delete OpDelV2's own per-key guard had just
-      // dropped. The conditional forms (IFEQ/IFNE/IFDEQ/IFDNE) now hand-journal their own result
-      // (see Delex above) instead of relying on auto-journal to forward the recipe verbatim.
+      // drakeydb: P4-4 -- NO_AUTOJOURNAL added. On an ACTIVE node: a bare `DELEX key` delegates
+      // to CmdDel, which already journals `DEL key` explicitly (OpDelV2); without NO_AUTOJOURNAL
+      // here, the transaction epilogue would ALSO auto-journal `DELEX key` verbatim under DELEX's
+      // own cid_ (the generic single-key veto only classifies kSingleKey names, never DELEX) --
+      // a double journal that, on a guarded receiver, forwarded a delete OpDelV2's own per-key
+      // guard had just dropped. The conditional forms (IFEQ/IFNE/IFDEQ/IFDNE) hand-journal their
+      // own result instead (see Delex above) of relying on auto-journal to forward the recipe
+      // verbatim. The static flag stays NO_AUTOJOURNAL either way -- on a NON-active node, Delex
+      // itself revives the auto-journal at runtime (Transaction::ReviveAutoJournal, in command
+      // setup) and skips its own conditional-form hand-journal, restoring upstream's behavior
+      // exactly (including the bare form's double journal and the conditional forms' unconditional
+      // recipe auto-journal) for a link with no per-key stamp to protect.
       << CI{"DELEX", CO::JOURNALED | CO::NO_AUTOJOURNAL | CO::FAST, -2, 1, 1, acl::kDel}.HFUNC(
              Delex)
       /* Redis compatibility:
@@ -3222,7 +3323,11 @@ void GenericFamily::Register(CommandRegistry* registry) {
              Expire)
       << CI{"EXPIREAT", CO::JOURNALED | CO::FAST | CO::NO_AUTOJOURNAL, -3, 1, 1, acl::kExpireAt}
              .HFUNC(ExpireAt)
-      << CI{"PERSIST", CO::JOURNALED | CO::FAST, 2, 1, 1, acl::kPersist}.HFUNC(Persist)
+      // drakeydb: P4-4 -- NO_AUTOJOURNAL added: OpPersist now journals the full state itself on
+      // an active node (see its own comment). A non-active node revives the verbatim auto-journal
+      // in GenericFamily::Persist, so this is byte-identical to upstream there.
+      << CI{"PERSIST", CO::JOURNALED | CO::NO_AUTOJOURNAL | CO::FAST, 2, 1, 1, acl::kPersist}.HFUNC(
+             Persist)
       << CI{"KEYS", CO::READONLY, 2, 0, 0, acl::kKeys}.HFUNC(Keys)
       << CI{"PEXPIREAT", CO::JOURNALED | CO::FAST | CO::NO_AUTOJOURNAL, -3, 1, 1, acl::kPExpireAt}
              .HFUNC(PexpireAt)

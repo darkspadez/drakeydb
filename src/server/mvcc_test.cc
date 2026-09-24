@@ -816,11 +816,27 @@ TEST(MultimasterLwwTest, ClassifyJournaledCommandMatchesEveryTableRow) {
   EXPECT_EQ(ClassifyJournaledCommand("GETDEL"), LwwClass::kSingleKey);
   EXPECT_EQ(ClassifyJournaledCommand("GETSET"), LwwClass::kSingleKey);
   EXPECT_EQ(ClassifyJournaledCommand("MSET"), LwwClass::kMultiKeySelfGuarded);
-  EXPECT_EQ(ClassifyJournaledCommand("PERSIST"), LwwClass::kSingleKey);
-  EXPECT_EQ(ClassifyJournaledCommand("PEXPIREAT"), LwwClass::kSingleKey);
   EXPECT_EQ(ClassifyJournaledCommand("RESTORE"), LwwClass::kSingleKey);
   EXPECT_EQ(ClassifyJournaledCommand("SET"), LwwClass::kSingleKey);
   EXPECT_EQ(ClassifyJournaledCommand("SETNX"), LwwClass::kSingleKey);
+}
+
+// drakeydb: P4-4 -- PEXPIREAT and PERSIST are removed from the guarded table entirely (fail-safe:
+// an active author never emits either name any more -- OpExpire/OpPersist ship the key's full
+// state under SET/RESTORE/DEL instead -- and a non-active sender's PEXPIREAT/PERSIST entries
+// carry mvcc 0, which is never guarded regardless of table membership; see LwwGuardActive above).
+// Deliberately a SEPARATE test from ClassifyJournaledCommandMatchesEveryTableRow above (not
+// folded into it, and not into ClassifyJournaledCommandUnknownNamesAreUnguarded below): unlike an
+// unrecognized name, these are two commands the classifier used to recognize and guard, so this
+// pins a removal, not an absence.
+//
+// Falsifying: restoring either entry to kJournaledClasses (multimaster_lww.cc) makes the
+// corresponding EXPECT_EQ below observe kSingleKey instead of kUnguarded.
+TEST(MultimasterLwwTest, ClassifyJournaledCommandNoLongerGuardsPexpireatOrPersist) {
+  EXPECT_EQ(ClassifyJournaledCommand("PEXPIREAT"), LwwClass::kUnguarded);
+  EXPECT_EQ(ClassifyJournaledCommand("PERSIST"), LwwClass::kUnguarded);
+  EXPECT_EQ(ClassifyJournaledCommand("pexpireat"), LwwClass::kUnguarded);
+  EXPECT_EQ(ClassifyJournaledCommand("persist"), LwwClass::kUnguarded);
 }
 
 TEST(MultimasterLwwTest, ClassifyJournaledCommandIsCaseInsensitive) {

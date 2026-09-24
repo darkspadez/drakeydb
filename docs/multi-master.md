@@ -135,30 +135,50 @@ wasteful, steady state, not a fault that should force a resync.
   so the two appliers of one link can never disagree about whether it is guarded.
 
 **The guarded vocabulary is keyed on the JOURNALED command name**, not the client-facing one
-(`ClassifyJournaledCommand`, `multimaster_lww.h`): `SET`, `SETNX`, `GETSET`, `GETDEL`, `PEXPIREAT`,
-`PERSIST`, `RESTORE` (single-key, compared generically before the Op function runs), and
-`MSET`/`DEL` (multi-key, self-guarded — see the per-key split below). Every other journaled name is
-unguarded; an unrecognized name fails open, never closed. The master already normalizes several
-client-facing commands onto one of those names before journaling — `SETEX`/`SET ... EX` → `SET`,
-`UNLINK` → `DEL`, the `EXPIRE` family → `PEXPIREAT`/`DEL` (it sets a TTL, or deletes the key
-outright when the given expiry is already in the past — it never just removes a TTL while leaving
-the key alive; that is `PERSIST`'s own separate top-level command, which the `EXPIRE` family never
-journals under), `MSETNX` → `MSET`, and `GETEX`'s own expiry path and
-`GAT` (a separate call site, picking the same three names independently) → `PEXPIREAT`/`DEL`/
-`PERSIST` — so those inherit the guard through whichever guarded name they land on. State-carrying
-RMW results that journal under a guarded name are
-deliberately guarded too, because a journaled `SET`/`DEL`/`RESTORE` is a blind full-state write on
-the receiver exactly like any other: `PFMERGE` → `SET` (`hll_family.cc`), `BITOP` → `SET`/`DEL`
-(`bitops_family.cc`), a `*STORE`-family command's empty result → `DEL` (every `*STORE` command
-below gets this treatment, guarded), a cross-shard `SORT ... STORE`'s *non*-empty result →
-`RESTORE ... REPLACE` specifically (the set/zset `*STORE` commands' own non-empty result does NOT
-get this treatment — see the residual exposure just below), `COPY` (same-shard or cross-shard — it
-always goes through the RESTORE-journaling path, never the verbatim-recipe one) →
-`RESTORE ... REPLACE`, and a cross-shard `RENAME`'s `DEL` src + `RESTORE ... REPLACE` dest.
-**Delta-journaled RMW is deliberately never guarded** — `INCR`,
-`APPEND`, `LPUSH`, `HSET`-style commands, `PFADD`, and similar always resolve by plain arrival
-order, guard on or off: dropping a delta permanently loses it rather than merely reordering it, and
-there is no full "result" to journal instead.
+(`ClassifyJournaledCommand`, `multimaster_lww.h`): `SET`, `SETNX`, `GETSET`, `GETDEL`, `RESTORE`
+(single-key, compared generically before the Op function runs), and `MSET`/`DEL` (multi-key,
+self-guarded — see the per-key split below). Every other journaled name is unguarded; an
+unrecognized name fails open, never closed. The master already normalizes several client-facing
+commands onto one of those names before journaling — `SETEX`/`SET ... EX` → `SET`, `UNLINK` →
+`DEL`, and a cross-shard `RENAME` → `DEL` src + `RESTORE ... REPLACE` dest.
+
+**Every TTL-changing command ships this key's FULL STATE on an active node, not a delta.** The
+`EXPIRE` family, `PERSIST`, `GETEX`, `GAT`, and `SET ... KEEPTTL` used to journal a bare
+`PEXPIREAT`/`PERSIST`/`KEEPTTL` delta — "change this key's TTL", nothing about its value. On a
+plain (non-active) replica that is fine: there is only ever one copy of the key downstream of any
+given delta. On an active node, two peers can race on the SAME key — one writing a new value, the
+other only touching its TTL — and a delta can't tell a receiver anything about the value it should
+be paired with. A receiver applying `PEXPIREAT`/`PERSIST` against ITS OWN, independently-written
+value ends up holding a value/TTL pairing NEITHER peer ever actually wrote, and — because ties
+favor the stored side — that divergence can be permanent: a subsequent full sync's own merge uses
+the identical `MergeAccepts` comparison, so an equal (or now-equal) stamp on the wrong pairing never
+self-corrects either. So on an active node these commands instead ship the key's CURRENT full
+state under a guarded name: a string ships as
+`SET key value [PXAT abs_ms] [STICK] [_MCFLAGS n]` (no TTL → a plain `SET key value`); every other
+type ships as `RESTORE key <abs_ms or 0> <dump> REPLACE ABSTTL [STICK]`, reusing the exact
+serialization `RENAME`/`COPY` already use. The cost is real — an `EXPIRE` on a large collection now
+ships the whole serialized value, not a handful of bytes — but it buys back a single, comparable
+stamp per key, which a delta cannot offer no matter how it is journaled. A `PERSIST`/`GETEX
+PERSIST` against a key that has no TTL to begin with changes nothing and journals nothing (not even
+a no-op `PERSIST`) rather than paying that cost for free. `EXPIRE` with a past/negative time (or
+its `GETEX`/`GAT` equivalents) still deletes the key outright and journals a bare `DEL` — already
+this key's full state, nothing to ship instead. A non-active node keeps journaling
+`PEXPIREAT`/`PERSIST`/`KEEPTTL` exactly as upstream Dragonfly does (the upstream byte-identity
+invariant); those entries carry `mvcc 0` and are never guarded regardless, so `PEXPIREAT` and
+`PERSIST` are absent from the guarded table entirely, not merely unguarded by name.
+
+State-carrying RMW results that journal under a guarded name are deliberately guarded too, because
+a journaled `SET`/`DEL`/`RESTORE` is a blind full-state write on the receiver exactly like any
+other: `PFMERGE` → `SET` (`hll_family.cc`), `BITOP` → `SET`/`DEL` (`bitops_family.cc`), a
+`*STORE`-family command's empty result → `DEL` (every `*STORE` command below gets this treatment,
+guarded), a cross-shard `SORT ... STORE`'s *non*-empty result → `RESTORE ... REPLACE` specifically
+(the set/zset `*STORE` commands' own non-empty result does NOT get this treatment — see the
+residual exposure just below), `COPY` (same-shard or cross-shard — it always goes through the
+RESTORE-journaling path, never the verbatim-recipe one) → `RESTORE ... REPLACE`, and a cross-shard
+`RENAME`'s `DEL` src + `RESTORE ... REPLACE` dest. **Delta-journaled RMW is deliberately never
+guarded** — `INCR`, `APPEND`, `LPUSH`, `HSET`-style commands, `PFADD`, and similar always resolve
+by plain arrival order, guard on or off: dropping a delta permanently loses it rather than merely
+reordering it, and there is no full "result" to journal instead.
 
 **A non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/
 `ZDIFFSTORE`/`ZRANGESTORE`, or `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST` result is a

@@ -42,22 +42,29 @@ enum class LwwClass : uint8_t { kUnguarded, kSingleKey, kMultiKeySelfGuarded };
 
 // drakeydb: P4-4 -- classifies a JOURNALED command name for the streaming LWW guard. Keyed on the
 // JOURNALED name, not the client-facing one: the master normalizes SETEX / `SET ... EX` -> SET,
-// UNLINK -> DEL, the EXPIRE family -> PEXPIREAT/DEL, MSETNX -> MSET, GAT -> PEXPIREAT/DEL/PERSIST
-// (FindKeyAndSetExpiry, string_family.cc -- a different call site from GETEX's own, which picks
-// the same three names independently), and a CROSS-SHARD RENAME -> DEL src + RESTORE dst ...
-// REPLACE, before journaling, so classifying anything else would silently miss those. A SAME-SHARD
-// RENAME/RENAMENX, a same-shard SORT ... STORE, and an exact (non-approximate, non-MAXLEN) XTRIM
-// instead revive auto-journal at runtime (Transaction::ReviveAutoJournal) and journal the client's
-// own command verbatim under its OWN name (RENAME/RENAMENX/SORT/XTRIM) -- none of those four names
-// are in this table, so they all classify kUnguarded; a documented residual of the runtime-revival
-// mechanism, not an oversight here. State-carrying RMW results that journal under a
-// guarded name (PFMERGE/BITOP -> SET/DEL) are deliberately guarded here: a journaled SET is a
-// blind full-state write on the receiver, exactly as droppable as any other SET. Delta-journaled
-// RMW (INCR, APPEND, PFADD, ...) is deliberately absent: dropping a delta permanently loses it
-// rather than merely reordering it, so those always fall through to kUnguarded. Unknown name ->
-// kUnguarded is the fail-safe: an unrecognized name must never be silently guarded. Matches
-// case-insensitively (journaled names are upper-case in practice, but callers should not have to
-// guarantee it).
+// UNLINK -> DEL, and a CROSS-SHARD RENAME -> DEL src + RESTORE dst ... REPLACE, before journaling,
+// so classifying anything else would silently miss those. On an ACTIVE node, every TTL-changing
+// command (the EXPIRE family, PERSIST, GETEX, GAT, and SET ... KEEPTTL) also normalizes down to
+// this table's names: SET (with an absolute PXAT, or none) for a string, RESTORE ... REPLACE
+// ABSTTL for anything else, or DEL when the change deletes the key -- never PEXPIREAT/PERSIST,
+// which carry only a delta and can no longer converge two peers that raced on the same key (see
+// OpExpire/OpPersist, generic_family.cc, and CmdGetEx/FindKeyAndSetExpiry, string_family.cc). A
+// NON-active node still journals PEXPIREAT/PERSIST verbatim for byte-identity with upstream, but
+// those entries carry mvcc 0 and are never guarded regardless (LwwGuardActive below) -- PEXPIREAT
+// and PERSIST are therefore absent from this table entirely, not merely unguarded by name: an
+// old-format entry that somehow arrived with a real mvcc still fails open rather than being
+// guarded against a name this node's own writers no longer produce. A SAME-SHARD RENAME/RENAMENX,
+// a same-shard SORT ... STORE, and an exact (non-approximate, non-MAXLEN) XTRIM instead revive
+// auto-journal at runtime (Transaction::ReviveAutoJournal) and journal the client's own command
+// verbatim under its OWN name (RENAME/RENAMENX/SORT/XTRIM) -- none of those four names are in this
+// table, so they all classify kUnguarded; a documented residual of the runtime-revival mechanism,
+// not an oversight here. State-carrying RMW results that journal under a guarded name
+// (PFMERGE/BITOP -> SET/DEL) are deliberately guarded here: a journaled SET is a blind full-state
+// write on the receiver, exactly as droppable as any other SET. Delta-journaled RMW (INCR, APPEND,
+// PFADD, ...) is deliberately absent: dropping a delta permanently loses it rather than merely
+// reordering it, so those always fall through to kUnguarded. Unknown name -> kUnguarded is the
+// fail-safe: an unrecognized name must never be silently guarded. Matches case-insensitively
+// (journaled names are upper-case in practice, but callers should not have to guarantee it).
 LwwClass ClassifyJournaledCommand(std::string_view journaled_name);
 
 // True iff this apply should be LWW-guarded: the link is a guarded peer link AND the entry
