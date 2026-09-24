@@ -971,9 +971,11 @@ fires, permanently.
 **Operator mitigation:** run `EXPIRE k ttl NX` after EVERY `INCR`, not only when `INCR` returns 1.
 `NX` means "set expiry only when the key currently has none" (Redis semantics), which is exactly
 the self-healing property needed here: on an ordinary `INCR` the key already carries its correct
-TTL, so `NX`'s own precondition fails,
-`UpdateExpire` (`db_slice.cc`) returns `SKIPPED` before ever reaching `OpExpire`'s full-state-ship
-branch, and nothing is journaled — no wasted O(value) cost on the common path. Once D-27 silently
+TTL, so `NX`'s own precondition fails, `UpdateExpire` (`db_slice.cc`) — called unconditionally on
+every `EXPIRE`, regardless of the precondition — returns `SKIPPED` (a cheap NX/XX/GT/LT condition
+check only, no O(value) work), and `OpExpire`'s own `res.ok()` gate (`generic_family.cc`) is what
+keeps its full-state-ship branch from ever being reached for it. Nothing is journaled — no wasted
+O(value) cost on the common path. Once D-27 silently
 re-creates the key with NO TTL, the very next `EXPIRE ... NX` finds none, its precondition holds,
 and it ships the key's full current state (`OpExpire`'s `JournalFullStateSet` branch,
 `generic_family.cc`), which re-converges every peer's copy on that state, closing the split the
