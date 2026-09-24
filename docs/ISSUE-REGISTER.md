@@ -214,13 +214,21 @@ end-to-end — three separate agents independently said so.
 
 **Owner:** P7. **From:** P4-1.
 
-### D-4. `origin_hash` residual on an expiry-swept sibling key
+### D-4. `origin_hash` residual on an expiry-swept sibling key -- resolved
 
-Wrong `origin_hash`, correct `mvcc`, and only on an exact tie — `operator<` is lexicographic on
-`(Mvcc(), origin_hash)`. Closing it needs `Commit()` to accept a stamp differing from its
-enclosing journal entry, which is a design change.
+Described a residual on the sibling key an expiry's own journal entry used to sweep into ITS
+Commit() call, mid a multi-key command: that sweep stamped the sibling with the expiry entry's own
+`mvcc` paired with a separately-supplied origin index for the sibling's true author, which could
+diverge from the enclosing command's own origin on an exact `mvcc` tie (`operator<` is
+lexicographic on `(Mvcc(), origin_hash)`).
 
-**Owner:** unassigned (revisit if ties become observable). **From:** P4-1.
+Resolved as a side effect of a later change: an expiry's own journal entry no longer sweeps any
+key but its own (`RecordExpiryBlocking`/`journal::RecordEntry`, `tx_base.cc`/`journal.cc`); a
+sibling armed earlier in the same epoch is left alone until the enclosing command's own, later
+journal entry commits it, with that entry's own `{mvcc, origin_idx}` pair directly -- there is no
+longer a second, separately-supplied origin index for `Commit()` to disagree with `mvcc` on.
+
+**Owner:** none (resolved). **From:** P4-1.
 
 ### D-5. `--active_replica`-off byte-identity has two documented exceptions
 
@@ -384,12 +392,12 @@ fully. What is untested is the *composition*: three or more peers where a stale 
 can sit between two nodes' stamps. Concretely — the reasoning that motivated Task 13's
 `would_grow` cap fix and several `Disarm` scopings is all of the form "a THIRD peer's later write,
 correctly losing against the newer stamp, could wrongly win against a stale one left behind". That
-argument has never been run. The same applies to the P4-3 final fix wave's synthetic expiry
-tombstone (it carries the incoming *value's* stamp, so it is order-equivalent to that value on a
-third peer that still holds it live — ties favor the stored side, which is why it is believed
-safe, but that too is reasoned rather than measured) and to F-2's per-node expiry stamps, where a
-third peer holding a value stamped *between* the two nodes' tombstones is exactly the case the
-adversarial review flagged as unbounded in general.
+argument has never been run. The same applies to an expiry tombstone, whether it comes from a
+merge load's synthetic tombstone for an already-expired incoming key (`ApplyMergeTombstoneOnShard`,
+`rdb_load.cc`) or from a live reap on this node (`CommitOwnTombstone`, `mvcc.cc`): both now carry
+the incoming or expired *value's own* stamp, so both are order-equivalent to that value on a third
+peer that still holds it live — ties favor the stored side, which is why this is believed safe, but
+that too is reasoned rather than measured, not composed across three peers.
 
 **How established:** coverage audit during P4-3's final whole-branch review. No failure is known;
 this is an untested risk, not a reproduced defect.
@@ -397,37 +405,51 @@ this is an untested risk, not a reproduced defect.
 **Owner:** unassigned; wants a three-node pytest topology (fan-in mesh already exists in
 `multimaster_test.py`, so the fixture cost is low). **From:** P4-3 final review.
 
-### D-16. A synthetic expiry tombstone can be born GC-eligible
+### D-16. An expiry tombstone can be born GC-eligible
 
-**Where:** `src/server/rdb_load.cc`, the merge-load path for an incoming key whose TTL has already
-elapsed (`ApplyMergeTombstoneOnShard`, added by the P4-3 final fix wave for adversarial finding
-F-1); `DbSlice::TombstoneGcStep` reaps when `DeadlineMs(ttl) <= now`, and `DeadlineMs` is
-`MsPart() + ttl` (`src/server/mvcc.h`).
+**Where:** originally `src/server/rdb_load.cc`'s merge-load path for an incoming key whose TTL has
+already elapsed (`ApplyMergeTombstoneOnShard`); as of the change that made a LIVE expiry's own
+tombstone order-equivalent to the value it replaces too (`RecordExpiryBlocking`/
+`CommitOwnTombstone`, `tx_base.cc`/`mvcc.cc`), this now applies to most `kExpired` tombstones,
+not only the merge-load one. `DbSlice::TombstoneGcStep` reaps when `DeadlineMs(ttl) <= now`, and
+`DeadlineMs` is `MsPart() + ttl` (`src/server/mvcc.h`).
 
-The synthetic tombstone reuses the peer's *value write-time* stamp (bit 63 set) so that it compares
-exactly as the peer's authority would. Its GC deadline is therefore `write_time + tombstone_ttl`,
-not `reap_time + tombstone_ttl`. For any key whose own TTL exceeded `--multi_master_tombstone_ttl`
-(default 600 s — e.g. `SET k v EX 3600`), the tombstone installed on the receiver is already past
-its deadline, is reaped on the next idle GC pass, and is excluded from outgoing opcode-225
-sections. The delete stands; what is lost is the resurrection-protection window, asymmetrically
-with the author, which mints a fresh reap-time stamp with the full window.
+Both paths reuse the value's *write-time* stamp (bit 63 set) so the tombstone compares exactly as
+that value's own authority would. Its GC deadline is therefore `write_time + tombstone_ttl`, not
+`reap_time + tombstone_ttl`. For any key whose own TTL exceeds `--multi_master_tombstone_ttl`
+(default 600 s — e.g. `SET k v EX 3600`), the resulting tombstone is born already past its
+deadline, or close to it, and is reaped on the next idle GC pass (or soon after), then excluded
+from outgoing opcode-225 sections. The delete itself always stands; what is lost is the
+resurrection-protection window that tombstone was meant to provide. See `docs/multi-master.md`'s
+"Sizing the TTL against expected partition length -- and against key TTLs" for the operator-facing
+guidance this motivates: size `--multi_master_tombstone_ttl` above the longest key TTL in use, in
+addition to the longest partition length expected, since the two needs add rather than take a max.
 
-Failure scenario (three peers): C partitioned before A's `SET k v2 EX 3600`; A's key expires and
-A's sweep lags; full sync A→B applies the synthetic tombstone, which is GC'd within an idle tick;
-C rejoins and full-syncs to B carrying its older live `k` → B has no tombstone → `MergeAccepts`
-accepts → `k` resurrects on B (not on A) until A's next full sync to B. Strictly better than the
-pre-fix state, which kept the stale value with no delete at all.
+Failure scenario (three peers, merge-load case): C partitioned before A's `SET k v2 EX 3600`; A's
+key expires and A's sweep lags; full sync A→B applies the synthetic tombstone, which is GC'd within
+an idle tick; C rejoins and full-syncs to B carrying its older live `k` → B has no tombstone →
+`MergeAccepts` accepts → `k` resurrects on B (not on A) until A's next full sync to B. The live-reap
+case is the same shape without needing a merge load at all: A's own `k` (TTL 3600s) expires
+locally, A installs a tombstone already 3000s past its GC deadline, A's idle GC reaps it almost
+immediately, and A's next full sync to any peer carries no tombstone for `k` at all -- a peer
+holding a stale live copy of `k` (never having applied A's delete) resurrects it on that peer. Both
+are strictly better than erasing with no tombstone at all, which is what happens once the GC
+deadline passes regardless.
 
-Why not mint a fresh receiver-side stamp: that would fabricate authority the peer never carried,
-which D-7 forbids and which the P4-2 review reversed a controller ruling to prevent. The honest
-alternatives are a separate reap-deadline field (rejected by D-10 for the 16-byte layout) or
-clamping the deadline to `max(write_time, receive_time) + ttl` at install — a design choice for
-the owner.
+Why not mint a fresh stamp instead, sized to give the tombstone its full protection window: that
+would fabricate authority the value's own write never carried (or, for the live-reap case, is
+exactly the design this change reverses -- a fresh reap-time mint that outranks writes it has no
+business outranking; see the surrounding review's findings for why that is worse, not better). The
+honest alternatives are a separate reap-deadline field (rejected for the 16-byte per-key layout) or
+clamping the deadline to `max(write_time, receive_time_or_reap_time) + ttl` at install -- a design
+choice left open here.
 
-**How established:** static analysis in the scoped re-review of the P4-3 final fix wave; the
-three-peer scenario is unmeasured (see D-15).
+**How established:** static analysis in the scoped re-review that added the merge-load path; the
+three-peer scenario is unmeasured (see D-15). The live-reap path's identical exposure was
+identified when that path was changed to reuse the value's own stamp too.
 
-**Status:** open. **Owner:** P4-4 or P4-5 (tombstone lifecycle). **From:** P4-3 final fix wave.
+**Status:** open. **Owner:** unassigned (tombstone lifecycle). **From:** the merge-load synthetic
+tombstone's own introduction; widened when the live-reap path adopted the same stamp-reuse rule.
 
 ### D-18. Runtime-revived recipes and name-level full-value writes are unguarded
 

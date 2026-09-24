@@ -2432,9 +2432,9 @@ TEST_F(MvccStoreTest, LazyExpiryEarnsATombstoneWithSelfOrigin) {
       << "a lazily-expired key must keep its slot, as a tombstone -- not an absent slot";
   EXPECT_TRUE(tomb->IsTombstone());
   EXPECT_NE(tomb->Mvcc(), 0u)
-      << "must carry the expiry DEL's own real, minted stamp -- not the zero-authority "
-         "{kTombstoneBit, 0} placeholder PerformDeletionAtomic writes synchronously, which "
-         "EndOfWriteEpoch rolls back if nothing ever commits over it";
+      << "must carry the expiry DEL's own real stamp -- not the zero-authority {kTombstoneBit, 0} "
+         "placeholder PerformDeletionAtomic writes synchronously, which EndOfWriteEpoch rolls "
+         "back if nothing ever commits over it";
   EXPECT_EQ(tomb->origin_hash, self_origin_hash)
       << "an expiry is always a local decision (RecordExpiryBlocking pins origin_idx to "
          "kSelfIdx) -- it must never be attributed to a peer";
@@ -2567,34 +2567,35 @@ TEST_F(MvccStoreTest, AppliedWriteOnFreshKeyKeepsAuthorStampVerbatim) {
   EXPECT_EQ(st->origin_hash, peer_hash) << "and must record the AUTHOR, not itself";
 }
 
-// drakeydb: review wave 2 (F4, IMPORTANT) -- MvccStamper::Commit stamps EVERY currently-armed key
-// with the entry it is given, not just the key its own payload names (mvcc.h). MSET arms
-// key-by-key (OpMSet, string_family.cc: one Set() call per pair, one post_updater.Run() each) and
-// only journals once at the very end -- so if a LATER key in the same MSET already has an expired
-// whole-key TTL, AddOrFind -> FindInternal -> ExpireIfNeeded (db_slice.cc) fires
-// RecordExpiryBlocking (tx_base.cc) for it MID-CALLBACK, and that call's own Commit() sweeps up
-// every key armed so far -- including k1 here, armed by its own Set() one iteration earlier --
-// before MSET's own trailing RecordJournal ever gets a chance to stamp it. Before this fix, k1
-// came out stamped with a freshly-minted LOCAL HopStamp (RecordExpiryBlocking's hardcoded mvcc=0)
-// instead of the replicated MSET's real author stamp.
+// drakeydb: P4-4 -- MvccStamper::Commit stamps EVERY currently-armed key with the entry it is
+// given, not just the key its own payload names (mvcc.h). MSET arms key-by-key (OpMSet,
+// string_family.cc: one Set() call per pair, one post_updater.Run() each) and only journals once
+// at the very end -- so if a LATER key in the same MSET already has an expired whole-key TTL,
+// AddOrFind -> FindInternal -> ExpireIfNeeded (db_slice.cc) fires RecordExpiryBlocking (tx_base.cc)
+// for it MID-CALLBACK. That call's own journal entry no longer sweeps anything but k2's own
+// tombstone arm (RecordExpiryBlocking/journal::RecordEntry), so k1 -- armed by its own Set() one
+// iteration earlier -- stays armed until MSET's own trailing RecordJournal commits it, with the
+// replicated MSET's real author stamp, exactly as if k2 had never expired at all.
 //
-// Falsifying: reverting RecordExpiryBlocking's `db_cntx.repl_mvcc` argument (tx_base.cc) back to
-// a hardcoded 0 makes k1's EXPECT_EQ below fail -- st->Mvcc() comes back larger than kAuthorMvcc
-// (a real HopStamp minted from the live wall clock, not this literal).
+// Falsifying k1's own assertion: reintroducing the removed sibling sweep (the unconditional
+// Commit() call inside journal::RecordEntry, gated here on `!(entry_flags & kEntryFlagExpired)`,
+// journal.cc) makes k1's EXPECT_EQ below fail -- st1->Mvcc() comes back equal to whatever
+// RecordExpiryBlocking's own entry carried for k2 (see below) instead of kAuthorMvcc.
 //
-// drakeydb: P4-4 Task A5 -- k2's LIVE recreate (OpMSet's own Set() call for it, right after its
-// lazy expiry) floors against that expiry's OWN self-minted tombstone stamp E -- DbSlice::
-// EnsureMvcc (db_slice.cc) captures whatever the slot held before this write, including a
-// tombstone it itself just cleared, and PostUpdate carries that on k2's arm for exactly this
-// purpose. E is minted by RecordExpiryBlocking's CommitOwnTombstone -> HopStamp(db_cntx.
-// time_now_ms) (tx_base.cc, mvcc.cc), and MvccClock::Next(now_ms) = max(now_ms << kCounterBits,
-// last_ + 1). This fixture's clock is frozen (GetCurrentTimeMs() returns TEST_current_time_ms,
-// engine_shard_set.h) and AdvanceTime only ever moves it forward, so E.Mvcc() is predicted below,
-// independently and exactly, BEFORE the apply ever runs: `now_ms` is read directly, and shard 0's
-// own clock().last() reflects k2's own earlier local SET (the only prior mint on this shard --
-// EndOfWriteEpoch resets hop_stamp_/hop_started_ms_ after every command, but never clock_ itself,
-// mvcc.cc, so `last_` persists across commands). k1's own assertions are unrelated to any of
-// this -- see the comment above for that half.
+// k2 itself is RECREATED by this same MSET (its own Set() call writes "v2" right after the
+// expiry), so its FINAL stamp is not the transient tombstone at all -- it is that recreate's own
+// applied-write floor (FloorAppliedStamp, mvcc.h), computed against whatever prev_stamp the
+// recreate's arm captured. That prev_stamp is now the expiry's own committed tombstone --
+// `P.AsTombstone()` (order-equivalent to the value's pre-expiry stamp `P`, captured below as
+// `p_before_expiry`) -- never a freshly minted, wall-clock-scale one. kAuthorMvcc below is a
+// small, fixed constant, strictly OLDER than P's own wall-clock-derived Mvcc(), so
+// FloorAppliedStamp takes its "incoming is older" branch and floors one origin_hash tick below
+// P -- never below P's own Mvcc(), and never above it either, the way flooring against a fresh,
+// larger reap-time mint used to.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// unconditionally makes k2's EXPECT_EQ below fail -- st2 comes back floored one origin_hash tick
+// below a freshly-minted (larger) Mvcc(), not one tick below P's own.
 TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   constexpr uint32_t kPeerIdx = 6;
   constexpr uint64_t kAuthorMvcc = 0x7777'0000'2222ULL;
@@ -2625,90 +2626,62 @@ TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   ASSERT_TRUE(p_before_expiry.has_value());
   AdvanceTime(50);
 
-  // Predict E.Mvcc() independently, from MvccClock::Next's own formula, BEFORE the apply below
-  // ever runs -- see the comment above the test for why this is exact, not a guess: nothing else
-  // mints on shard 0 between this read and the expiry's own HopStamp call inside the apply.
-  const uint64_t now_ms_before_apply = GetCurrentTimeMs();
-  uint64_t last_before_apply = 0;
-  shard_set->Await(0, [&] { last_before_apply = MvccStamper::tlocal()->clock().last(); });
-  const uint64_t predicted_e_mvcc =
-      std::max(now_ms_before_apply << MvccClock::kCounterBits, last_before_apply + 1);
-
   ApplyReplicatedCommand({"mset", k1, "v1", k2, "v2"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
 
   auto st1 = StampOf(k1);
   ASSERT_TRUE(st1.has_value());
   EXPECT_EQ(st1->Mvcc(), kAuthorMvcc)
-      << "k1 was armed by its own Set() before k2's lazy expiry swept it into that entry's "
-         "Commit() call -- it must still end up stamped with the MSET's real author mvcc";
-  EXPECT_EQ(st1->origin_hash, peer_hash)
-      << "k1 was swept into the expiry commit and must retain the MSET author's origin hash";
+      << "k1 was armed by its own Set() before k2's lazy expiry, and must stay armed through it "
+         "-- it must end up stamped with the MSET's real author mvcc, from MSET's OWN trailing "
+         "journal entry, never k2's expiry entry";
+  EXPECT_EQ(st1->origin_hash, peer_hash) << "k1 must retain the MSET author's origin hash";
 
   auto st2 = StampOf(k2);
   ASSERT_TRUE(st2.has_value());
-  EXPECT_EQ(st2->Mvcc(), predicted_e_mvcc)
-      << "verifies the prediction above: E.Mvcc() must be EXACTLY max(now_ms << kCounterBits, "
-         "last_ + 1) as computed BEFORE the apply ran, not merely 'some value bigger than "
-         "kAuthorMvcc' -- a wrong capture (e.g. flooring against P instead of E) would produce "
-         "P->Mvcc(), which is a real HopStamp too and would otherwise pass a looser check";
-  EXPECT_GT(st2->Mvcc(), p_before_expiry->Mvcc())
-      << "E must be strictly newer than P: both are minted by the SAME shard's MvccClock, which "
-         "is strictly monotone across every mint regardless of how many epochs (commands) pass "
-         "in between (mvcc.h) -- this holds for any correct capture, so it is a meaningful extra "
-         "guard rail alongside the exact prediction above, not a substitute for it";
-  uint64_t self_origin_hash = 0;
-  shard_set->pool()->AwaitBrief(
-      [&](unsigned, auto*) { self_origin_hash = MvccStamper::tlocal()->OriginHash(0); });
-  // Whole-stamp equality against the INDEPENDENTLY predicted E (never st2's own Mvcc(), never
-  // P's): pins origin_hash at EXACTLY self_origin_hash - 1 -- one below E's own self-mint, never
-  // the peer's -- and bit 63 at EXACTLY 0 -- a live write, never left looking like a tombstone.
-  EXPECT_EQ(*st2, (MvccStamp{predicted_e_mvcc, self_origin_hash - 1}));
+  EXPECT_FALSE(st2->IsTombstone()) << "k2 is recreated within this same MSET, so it ends up live";
+  // Derived independently from FloorAppliedStamp's own documented formula (mvcc.h), not by
+  // calling it: kAuthorMvcc is strictly older than P.Mvcc() here (a small fixed constant against
+  // a wall-clock-scale value), and P's own origin_hash is a real, non-zero self hash (P came from
+  // a local write), so the "incoming is older, origin_hash != 0" branch applies exactly.
+  EXPECT_EQ(*st2, (MvccStamp{p_before_expiry->Mvcc(), p_before_expiry->origin_hash - 1}))
+      << "k2's re-created value must floor against P's own tombstone-shaped prev_stamp -- one "
+         "origin_hash tick below P -- never against a fresh, wall-clock-scale reap-time mint";
 }
 
-// drakeydb: P4-3 Task 11, review ruling I2 -- a lazy expiry firing while applying a peer's
-// command must mint its OWN fresh self stamp for its tombstone, never inherit that peer
-// command's mvcc/origin (db_cntx.repl_mvcc/repl_origin_idx) -- an expiry is always a local
-// decision (D-10), regardless of whose command happened to trigger it. Before this fix,
-// RecordExpiryBlocking (tx_base.cc) forwarded db_cntx.repl_mvcc/repl_origin_idx unconditionally
-// (review wave 2, F4) so a sibling key swept into the SAME Commit() call mid a replicated
-// multi-key command would correctly retain the author's stamp (see
-// ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc above) -- but that same forwarding also
-// reached the EXPIRING key's own tombstone arm, with no way to tell the two apart. If the
-// peer's forwarded stamp predates the expired key's own prior stamp (clock skew, or simply an
-// old command applied late, as here), the resulting tombstone is OLDER than the value it
-// replaces and a peer's still-live copy of the same key would resurrect it forever.
+// drakeydb: P4-4 -- a lazy expiry firing while applying a peer's command must keep its tombstone
+// order-equivalent to the value it replaces -- the value's OWN pre-deletion stamp -- never inherit
+// that peer command's mvcc/origin (db_cntx.repl_mvcc/repl_origin_idx), and never mint a fresh one
+// either: an expiry is always a local decision about WHEN to reap, regardless of whose command
+// happened to trigger it, but the tombstone it leaves is order-equivalent to the exact value that
+// was reaped, not a new, independent event with its own timestamp. If the tombstone instead
+// inherited the peer's forwarded stamp verbatim, and that stamp predates the expired key's own
+// prior stamp (clock skew, or simply an old command applied late, as here), the resulting
+// tombstone would be OLDER than the value it replaces and a peer's still-live copy of the same key
+// would resurrect it forever; if it instead minted a fresh reap-time stamp, it would outrank every
+// write between the value's own stamp and the moment of reaping, including ones that should have
+// won.
 //
 // The simplest repro needs no multi-key command at all: replaying a peer's plain DEL of a key
-// that is ALREADY (lazily, not yet swept) expired routes through DbSlice::FindMutable ->
+// that is ALREADY (lazily, not yet reaped) expired routes through DbSlice::FindMutable ->
 // FindInternal -> ExpireIfNeeded BEFORE GenericFamily::OpDelV2 ever gets a valid iterator for it
 // (IsValid(it.it) is false, so OpDelV2 just skips it and journals nothing of its own, per its
 // journal_args/deleted_cnt bookkeeping) -- the ONLY journal entry this command produces is the
 // expiry's own RecordExpiryBlocking call, so whatever it stamps "j" with is exactly, and only,
-// what this test observes; nothing else can overwrite it afterward the way k2's resurrection
-// masks the same transient stamp in the sibling test above.
+// what this test observes.
 //
 // kOldPeerMvcc is deliberately tiny (far smaller than any real HopStamp, which is derived from
 // wall-clock ms) so a stamp that wrongly inherited it would be strictly OLDER than "j"'s own
-// prior live stamp -- exactly the resurrection hazard the ruling describes.
+// prior live stamp -- exactly the resurrection hazard this test guards against.
 //
-// Falsifying: removing the MvccStamper::tlocal()->CommitOwnTombstone(...) call at the top of
-// RecordExpiryBlocking (tx_base.cc) reproduces this -- see task-11-report.md's fix report for
-// the verbatim failure (tomb->Mvcc() comes back equal to kOldPeerMvcc, tomb->origin_hash equal
-// to peer_hash, instead of a fresh self stamp).
-TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp) {
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// unconditionally makes the EXPECT_EQ below fail -- tomb comes back self-originated with a
+// freshly-minted (larger) Mvcc(), not equal to `before`.
+TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandKeepsExpiredValuesOwnStamp) {
   constexpr uint32_t kPeerIdx = 11;
   constexpr uint64_t kOldPeerMvcc = 0x1000ULL;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-0000-4000-8000-0000000000ee");
   shard_set->pool()->AwaitBrief(
       [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
-
-  // An ordinary self-authored write, purely so this test can compare its origin_hash against the
-  // expiry tombstone's below without hardcoding this node's uuid hash (same technique as
-  // LazyExpiryEarnsATombstoneWithSelfOrigin above).
-  Run({"set", "control", "v"});
-  auto control_stamp = StampOf("control");
-  ASSERT_TRUE(control_stamp.has_value());
-  const uint64_t self_origin_hash = control_stamp->origin_hash;
 
   Run({"set", "j", "v", "px", "10"});
   auto before_stamp = StampOf("j");
@@ -2724,14 +2697,169 @@ TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp) {
   ASSERT_TRUE(tomb.has_value())
       << "the applied peer DEL's own lazy expiry of j must still leave a tombstone";
   EXPECT_TRUE(tomb->IsTombstone());
-  EXPECT_GT(tomb->Mvcc(), before.Mvcc())
-      << "must be a freshly minted self stamp, strictly newer than the value it replaces -- not "
-         "the peer's old mvcc, or a peer's still-live copy of j would resurrect it";
+  EXPECT_EQ(*tomb, before.AsTombstone())
+      << "must be order-equivalent to the value it replaced -- same mvcc AND origin_hash as "
+         "`before`, tombstone bit set -- never the peer's old mvcc/origin and never a freshly "
+         "minted self stamp";
   EXPECT_NE(tomb->Mvcc(), kOldPeerMvcc);
-  EXPECT_EQ(tomb->origin_hash, self_origin_hash)
-      << "an expiry is always a local decision -- it must be self-originated even while applying "
-         "a peer's command, never attributed to that peer";
-  EXPECT_NE(tomb->origin_hash, peer_hash);
+  EXPECT_NE(tomb->origin_hash, peer_hash)
+      << "an expiry is always a local decision -- it must never be attributed to the peer whose "
+         "command happened to trigger it";
+}
+
+// drakeydb: P4-4 -- a guarded applied write can legitimately arrive for a key whose TTL has
+// already elapsed but which this node has not yet reaped: the guard's own veto compares the
+// incoming author stamp against the key's LIVE, still-unreaped stamp S (a pure side-table read,
+// GetMvcc, that never itself triggers expiry), so a stamp X strictly greater than S passes the
+// veto and the callback runs. Only INSIDE that callback does the write's own key lookup
+// (FindMutable /AddOrFind) lazily expire the key -- and that expiry's own tombstone must be
+// order-equivalent to S (never a fresh, wall-clock-derived mint that would land far above X for no
+// reason related to X at all), or the resulting stamp would wrongly outrank every future write
+// between S and that mint, including this one and any later one whose author stamp sits in that
+// same range.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// unconditionally makes the SECOND ApplyReplicatedCommand below get dropped (Run({"get","k"})
+// stays "v1", not "v2") -- the expiry's own fresh mint outranks Y, even though the peer never saw
+// that mint and never lost to it.
+TEST_F(MvccStoreTest, GuardedApplyAgainstAnUnreapedExpiredKeyAppliesWithTheAuthorsStampExactly) {
+  constexpr uint32_t kPeerIdx = 60;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-c1c1-4000-8000-000000000060");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "old", "px", "10"}), "OK");
+  auto s_stamp = StampOf("k");  // S: k's own pre-expiry stamp
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(50);  // k's TTL has now elapsed, but nothing has read/reaped it yet
+
+  // X: a peer's write, strictly newer than S, but nowhere near this node's own (much later, after
+  // AdvanceTime) wall clock -- exactly the shape a freshly-minted reap-time stamp would wrongly
+  // outrank.
+  const uint64_t stamp_x = s_stamp->Mvcc() + 1;
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "v1"}, kPeerIdx, stamp_x, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "v1");
+  auto after_x = StampOf("k");
+  ASSERT_TRUE(after_x.has_value());
+  EXPECT_FALSE(after_x->IsTombstone());
+  EXPECT_EQ(*after_x, (MvccStamp{stamp_x, peer_hash}))
+      << "must apply with the author's stamp EXACTLY -- not floored above X by the key's own "
+         "lazy expiry, which fires mid-callback while this SET is looking up 'k' to write it";
+
+  // Y: a second peer write, strictly newer than X, still far below this node's current wall
+  // clock -- must also apply; it would be wrongly dropped if the expiry above had floored the
+  // stored stamp above X.
+  const uint64_t stamp_y = stamp_x + 1;
+  ASSERT_LT(stamp_y, GetCurrentTimeMs() << MvccClock::kCounterBits)
+      << "sanity: Y is nowhere near this node's own wall clock";
+  const uint64_t before_dropped = TotalLwwDropped();
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "v2"}, kPeerIdx, stamp_y, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "k"}), "v2")
+      << "a write strictly newer than X must still apply, not be wrongly dropped against a stamp "
+         "an earlier reap-time mint would have raised above it";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped);
+}
+
+// drakeydb: P4-4 -- the mirror-image case: this node reaps an expired key ON ITS OWN (no peer
+// command involved), and only LATER does a peer's legitimate write for that same key arrive.
+// Because the tombstone this node installed is order-equivalent to the value it replaced (S, not
+// a fresh reap-time mint), a peer write authored strictly after S still applies, even though this
+// node's own reap happened long before -- on its own clock -- and even though the peer's write
+// carries a stamp nowhere near this node's wall clock at reap time.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// unconditionally makes the ApplyReplicatedCommand below get dropped (Run({"get","k"}) stays nil,
+// not "peer_v") -- this node's own fresh reap-time mint outranks a peer write it never even saw.
+TEST_F(MvccStoreTest, GuardedApplyAfterThisNodeAlreadyReapedTheKeyStillApplies) {
+  constexpr uint32_t kPeerIdx = 61;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a3a3-4000-8000-000000000061");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "k", "old", "px", "10"}), "OK");
+  auto s_stamp = StampOf("k");
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(50);
+
+  // This node reaps k itself, well before any peer write arrives.
+  Run({"get", "k"});
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value());
+  ASSERT_TRUE(tomb->IsTombstone());
+  ASSERT_EQ(*tomb, s_stamp->AsTombstone())
+      << "sanity: this node's own reap is order-equivalent to S, not a fresh mint";
+
+  // I: a peer's write authored slightly after the TTL deadline -- just above S, nowhere near this
+  // node's own wall clock at reap time.
+  const uint64_t stamp_i = s_stamp->Mvcc() + 1;
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "peer_v"}, kPeerIdx, stamp_i, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", "k"}), "peer_v")
+      << "a peer write authored strictly after the value's own stamp must apply, even against a "
+         "tombstone this node reaped long before the peer's write ever arrived";
+  auto after = StampOf("k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_FALSE(after->IsTombstone());
+  EXPECT_EQ(*after, (MvccStamp{stamp_i, peer_hash}));
+}
+
+// drakeydb: P4-4 -- both a lazy (read-triggered) and an active (heartbeat/DeleteExpiredStep)
+// whole-key expiry must install a tombstone order-equivalent to the value they replace, checked
+// both via the side table directly (StampOf) and via the operator-facing DEBUG MVCC command
+// (DebugCmd::Mvcc, debugcmd.cc), which reports the identical stamp from the same side table.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// unconditionally makes both EXPECT_EQ(*tomb, ...AsTombstone()) below fail, and DEBUG MVCC's own
+// `mvcc:<N>` substring no longer matches either `before` stamp's Mvcc().
+TEST_F(MvccStoreTest, LazyAndActiveExpiryTombstonesCarryTheExpiredValuesOwnStamp) {
+  // Lazy (read-triggered) half.
+  ASSERT_EQ(Run({"set", "lazykey", "v", "px", "10"}), "OK");
+  auto lazy_before = StampOf("lazykey");
+  ASSERT_TRUE(lazy_before.has_value());
+  AdvanceTime(50);
+  Run({"get", "lazykey"});  // triggers lazy expiry (DbSlice::ExpireIfNeeded, the read path)
+
+  auto lazy_tomb = StampOf("lazykey");
+  ASSERT_TRUE(lazy_tomb.has_value());
+  EXPECT_TRUE(lazy_tomb->IsTombstone());
+  EXPECT_EQ(*lazy_tomb, lazy_before->AsTombstone());
+
+  {
+    const std::string body = Run({"debug", "mvcc", "lazykey"}).GetString();
+    EXPECT_THAT(body, testing::HasSubstr("state:tombstone"));
+    EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("mvcc:", lazy_tomb->Mvcc())));
+    EXPECT_THAT(body, testing::HasSubstr(absl::StrCat(
+                          "origin:", absl::Hex(lazy_tomb->origin_hash, absl::kZeroPad16))));
+  }
+
+  // Active (heartbeat) half: DbSlice::DeleteExpiredStep, not a client read.
+  ASSERT_EQ(Run({"set", "activekey", "v", "px", "10"}), "OK");
+  auto active_before = StampOf("activekey");
+  ASSERT_TRUE(active_before.has_value());
+  AdvanceTime(50);
+
+  const unsigned sid = Shard("activekey", shard_set->size());
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+    db_slice.DeleteExpiredStep(db_cntx, 100000);
+  });
+
+  ASSERT_EQ(Run({"exists", "activekey"}).GetInt(), 0) << "guard against a vacuous pass";
+  auto active_tomb = StampOf("activekey");
+  ASSERT_TRUE(active_tomb.has_value());
+  EXPECT_TRUE(active_tomb->IsTombstone());
+  EXPECT_EQ(*active_tomb, active_before->AsTombstone());
+
+  {
+    const std::string body = Run({"debug", "mvcc", "activekey"}).GetString();
+    EXPECT_THAT(body, testing::HasSubstr("state:tombstone"));
+    EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("mvcc:", active_tomb->Mvcc())));
+    EXPECT_THAT(body, testing::HasSubstr(absl::StrCat(
+                          "origin:", absl::Hex(active_tomb->origin_hash, absl::kZeroPad16))));
+  }
 }
 
 // drakeydb: Phase 4 Task 9, fix round (F1v2) -- proves ExecuteTx applies an author's mvcc AND
@@ -2862,6 +2990,82 @@ TEST_F(MvccStoreTest, DerivedDeleteFromAppliedWriteKeepsAuthorStamp) {
   EXPECT_EQ(del->mvcc, kAuthorMvcc) << "a derived DEL caused by an applied write must reproduce "
                                        "the author's stamp, not mint a fresh local one";
   EXPECT_EQ(del->origin_idx, kPeerIdx);
+}
+
+// drakeydb: P4-4 -- a LOCAL multi-key DEL where ONE key (k2) lazily expires mid-command must not
+// let that expiry's own journal entry sweep up the OTHER key (k1), still armed from earlier in
+// the SAME command, with the expiry entry's own stamp: k1 must stay armed until the DEL command's
+// own trailing journal entry commits it, so k1's stored stamp equals EXACTLY what that entry
+// carries onto the wire -- never a different value left over from k2's own, earlier entry. k1
+// already carries a peer stamp P ahead of this node's own local clock, so the DEL's own D3 local
+// mint must floor above P, not merely above whatever the wall clock alone would give.
+//
+// Falsifying: reintroducing the removed sibling sweep (the unconditional Commit() call inside
+// journal::RecordEntry, gated here on `!(entry_flags & kEntryFlagExpired)`, journal.cc) makes
+// k1_after->Mvcc() come back EQUAL to k2's own synthetic expiry entry's mvcc (a strictly SMALLER
+// value, minted earlier in the same command) instead of equal to `del->mvcc` -- the two entries'
+// mints are never simultaneous, so this is never a false pass.
+TEST_F(MvccStoreTest, LocalDelWithMidCommandLazyExpiryStampsSiblingWithItsOwnWireMvcc) {
+  constexpr uint32_t kPeerIdx = 62;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-1010-4000-8000-000000000062");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  // Two distinct keys that hash to the same shard, so OpDelV2 processes both within one shard
+  // callback (one MvccStamper::armed_ list) -- see
+  // ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc above for why this matters and how the
+  // search below finds such a pair.
+  const unsigned num_shards = shard_set->size();
+  std::string k1, k2;
+  for (int i = 0; k2.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find two keys hashing to the same shard";
+    std::string cand = absl::StrCat("i1_", i);
+    if (Shard(cand, num_shards) == 0) {
+      (k1.empty() ? k1 : k2) = cand;
+    }
+  }
+
+  // P: k1's own prior stamp, a peer's write far ahead of this node's local clock.
+  const uint64_t stamp_p = (GetCurrentTimeMs() + 100'000'000ULL) << MvccClock::kCounterBits;
+  ASSERT_EQ(ApplyReplicatedCommand({"set", k1, "v0"}, kPeerIdx, stamp_p, /*lww_guard=*/false),
+            facade::DispatchResult::OK);
+  auto p_stamp = StampOf(k1);
+  ASSERT_TRUE(p_stamp.has_value());
+  ASSERT_EQ(p_stamp->Mvcc(), stamp_p);
+
+  // k2 has a whole-key TTL that has already elapsed by the time the DEL below re-probes it.
+  ASSERT_EQ(Run({"set", k2, "old", "px", "10"}), "OK");
+  AdvanceTime(50);
+
+  MvccCapturingConsumer consumer;
+  uint32_t consumer_id = 0;
+  shard_set->Await(0, [&] { consumer_id = journal::RegisterConsumer(&consumer); });
+
+  ASSERT_EQ(Run({"del", k1, k2}).GetInt(), 1)
+      << "only k1 is really deleted by this command -- k2 is already gone via lazy expiry";
+
+  shard_set->Await(0, [&] { journal::UnregisterConsumer(consumer_id); });
+
+  const MvccCapturedEntry* del = nullptr;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    for (auto it = consumer.entries.rbegin(); it != consumer.entries.rend(); ++it) {
+      if (it->cmd == "DEL") {
+        del = &*it;  // the LAST "DEL" entry is the command's own, recorded after k2's own
+                     // synthetic expiry entry.
+        break;
+      }
+    }
+    ASSERT_NE(nullptr, del) << "the DEL command must still journal its own entry for k1";
+  }
+
+  auto k1_after = StampOf(k1);
+  ASSERT_TRUE(k1_after.has_value());
+  EXPECT_TRUE(k1_after->IsTombstone()) << "k1 was really deleted (kExplicit) by this command";
+  EXPECT_EQ(k1_after->Mvcc(), del->mvcc)
+      << "k1's committed stamp must equal the exact stamp the command's own DEL entry carries on "
+         "the wire, not a different value left over from k2's own expiry entry";
+  EXPECT_GT(k1_after->Mvcc(), p_stamp->Mvcc())
+      << "the local DEL's own D3 mint must land strictly above k1's own prior stamp P";
 }
 
 // drakeydb: P4-4 Task A3 -- the generic single-key LWW veto's core case: a guarded peer link must
@@ -3018,7 +3222,7 @@ TEST_F(MvccStoreTest, NewerPeerSetAppliesWithExactIncomingStamp) {
 // (mvcc.h), so a tie must be broken by origin_hash alone, and the greater one must win/apply.
 // self_hash is read off a throwaway control write rather than hardcoded, since it depends on this
 // process's randomly-generated boot uuid (same technique as
-// LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp, above).
+// LazyExpiryEarnsATombstoneWithSelfOrigin, above).
 TEST_F(MvccStoreTest, ExactTieAppliesWhenIncomingOriginHashIsGreater) {
   constexpr uint32_t kPeerIdx = 24;
 
@@ -4989,16 +5193,18 @@ TEST_F(MvccStoreTest, BackwardSkewedMultiKeyLocalMsetRaisesBothKeysToTheSameStam
          "had a stored stamp to floor against on its own";
 }
 
-// drakeydb: P4-4 Task A5b -- D3 applies to an expiry's own tombstone too (CommitOwnTombstone,
-// mvcc.cc): a key a future-skewed peer wrote with a short TTL, expired LOCALLY, must get an
-// expiry tombstone strictly above that peer's value stamp -- never a bare HopStamp that could
-// land below it under clock skew, which would let a peer's still-live copy resurrect it forever.
+// drakeydb: P4-4 -- an expiry's own tombstone (CommitOwnTombstone, mvcc.cc) is order-equivalent to
+// the value it replaces -- same mvcc AND origin_hash, tombstone bit set -- EVEN when that value's
+// stamp is a future-skewed peer's. This is deliberately NOT "strictly above": raising the
+// tombstone above a future-skewed value would outrank every write between that value's own stamp
+// and the moment of reaping, including a legitimate one this node has not seen yet -- exactly the
+// hazard reusing the value's own stamp verbatim avoids (see AsTombstone()'s own comment, mvcc.h,
+// and CommitOwnTombstone's, for the full argument).
 //
-// Falsifying: reverting CommitOwnTombstone's floor (mvcc.cc) back to a bare
-// `HopStamp(now_ms) | MvccClock::kTombstoneBit` reproduces: tomb->Mvcc() comes back <=
-// before->Mvcc() (this node's frozen fixture clock is far behind the peer's future stamp)
-// instead of strictly greater.
-TEST_F(MvccStoreTest, BackwardSkewedExpiryTombstoneRaisesAboveFuturePeerValueStamp) {
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`,
+// floored above `before`'s own stamp, reproduces the OLD behavior this replaces: tomb comes back
+// strictly greater than (and no longer equal to) `before`.
+TEST_F(MvccStoreTest, ExpiryTombstoneAgainstAFutureSkewedPeerValueStaysOrderEquivalentToIt) {
   constexpr uint32_t kPeerIdx = 54;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-d3d3-4000-8000-000000000054");
   RegisterPeerOriginHash(kPeerIdx, peer_hash);
@@ -5017,9 +5223,9 @@ TEST_F(MvccStoreTest, BackwardSkewedExpiryTombstoneRaisesAboveFuturePeerValueSta
   auto tomb = StampOf("j");
   ASSERT_TRUE(tomb.has_value()) << "a lazily-expired key must keep its slot, as a tombstone";
   EXPECT_TRUE(tomb->IsTombstone());
-  EXPECT_GT(tomb->Mvcc(), before->Mvcc())
-      << "D3: the expiry's own tombstone must land strictly above the value it replaces, even "
-         "though that value's stamp is a future-skewed peer's";
+  EXPECT_EQ(*tomb, before->AsTombstone())
+      << "the expiry's own tombstone must be order-equivalent to the value it replaced -- same "
+         "mvcc AND origin_hash -- even though that value's stamp is a future-skewed peer's";
 }
 
 // drakeydb: P4-4 Task A5b -- D3 is explicitly NOT a per-shard HLC ratchet (design doc D3: "not a

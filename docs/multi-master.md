@@ -304,23 +304,43 @@ as before this phase. This is intentional: eviction is a local capacity decision
 fact about the dataset, and the peer's copy is treated as authoritative for that key. See the
 `--cache_mode` section below for the operational consequence.
 
-**An expiry's tombstone stamp is per-node, by design.** A `kExpired` tombstone is minted
-*locally*, by whichever node actually reaps the key, from that node's own clock and under its own
-`origin` (`RecordExpiryBlocking`/`CommitOwnTombstone`, `tx_base.cc`) — an expiry is always a local
-decision (D-10). And an expiry `DEL` is deliberately **not** forwarded on a peer link:
-`journal::PassesPeerEchoFilter` (`journal/types.cc`) drops every entry carrying
-`kEntryFlagExpired`, and `SliceSnapshot::ConsumeJournalChange` applies the same filter to a full
-sync's concurrent journal blob. Both are intentional — an expiry that replicated as a foreign
-delete would re-propagate one node's clock as authority over another's.
+**An expiry's tombstone stamp is order-equivalent to the value it replaces.** A `kExpired`
+tombstone carries the expired value's OWN pre-deletion stamp — the same `mvcc` AND the same
+`origin`, with the tombstone bit set (`RecordExpiryBlocking`/`CommitOwnTombstone`,
+`tx_base.cc`/`mvcc.cc`) — never a freshly minted one, unless the value carried no real stamp at
+all (a genuinely fresh key), in which case a fresh self stamp is minted instead, exactly as before.
+This is the same rule a merge load already applies to an incoming key whose TTL has already
+elapsed (`ApplyMergeTombstoneOnShard`, `rdb_load.cc`): reusing the value's own stamp keeps the
+tombstone comparing exactly as the value it replaces would have, so a peer's write with a stamp
+strictly newer than the expired value still wins the next `MergeAccepts` compare, and a peer's
+write with an OLDER stamp still loses — a freshly minted reap-time stamp, by contrast, would
+outrank every write between the value's own stamp and the moment of reaping, including ones that
+should have won.
 
-The consequence, which is **correct and expected**: when the same TTL fires on two peers (the
-normal case, since the TTL itself replicates), each node ends up holding a *different*
-`{mvcc, origin}` tombstone for that key. `DEBUG MVCC <key>` on the two nodes will legitimately
-disagree — different `mvcc`, different `origin`, possibly several seconds apart — while both
-report the key as **absent** and both return nil for `GET`. Values and absence converge; an
-expiry tombstone's stamp is not a mesh-wide consensus value and should not be compared across
-nodes. (A tombstone for an expiry reaped on exactly one node *does* propagate verbatim, via the
-opcode-225 section of the next full sync from that node; it is the two-sided case that differs.)
+An expiry `DEL` is still deliberately **not** forwarded on a peer link: `journal::
+PassesPeerEchoFilter` (`journal/types.cc`) drops every entry carrying `kEntryFlagExpired`, and
+`SliceSnapshot::ConsumeJournalChange` applies the same filter to a full sync's concurrent journal
+blob. This remains intentional even though the tombstone's stamp is now order-equivalent to the
+value: an expiry is still each node's own local decision about when to reap, and forwarding it as
+a foreign delete would apply one node's reap timing to another node's copy of the key.
+
+The consequence: when the same TTL fires on two peers (the normal case, since the TTL itself
+replicates), both nodes reap the SAME logical value and install the SAME `{mvcc, origin}`
+tombstone for that key — `DEBUG MVCC <key>` on the two nodes now **agrees**. What can still differ
+is the tombstone's own age relative to `--multi_master_tombstone_ttl`: because the stamp is the
+value's write-time, not the reap-time, its GC deadline (`DeadlineMs`, `mvcc.h`) is `write_time +
+tombstone_ttl`, not `reap_time + tombstone_ttl` — see "Sizing the TTL" below for the operational
+consequence. (A tombstone reaped on exactly one node still propagates verbatim to peers via the
+opcode-225 section of that node's next full sync, exactly as before.)
+
+On a PLAIN (non-active-mesh) replica specifically, this expiry `DEL` still arrives — only a peer
+link filters it — and carries the tombstone's own masked `mvcc` on the wire, so that replica's own
+floor lands on or under the SAME value the source node just committed, rather than minting one of
+its own. Its recorded `origin`, though, can differ from the source's: the replicated command's
+origin is resolved from this link's own registered author (the source node itself, from the
+replica's point of view), never from the expired value's original `origin_hash`, which does not
+travel on the wire at all. A plain replica already needs a full resync before it can join the mesh
+as a peer, so this divergence is accepted rather than fixed here.
 
 **Tombstones are default-namespace-only.** `PerformDeletionAtomic`'s tombstone-earning check
 (`db_slice.cc`) is gated on `ns_ == &namespaces->GetDefaultNamespace()`. A delete in an ACL
@@ -362,16 +382,27 @@ its own to defend that key, this `ttl=0` node has nothing to compare a *later*, 
 (`MergeAccepts(std::nullopt, incoming)` always accepts) — resurrecting the value even though the
 correct peer's tombstone is still live and unexpired elsewhere in the mesh.
 
-**Sizing the TTL against expected partition length.** A tombstone protects a delete only for as
-long as it is retained: if a peer is partitioned (network split, long maintenance window, extended
-`REPLICAOF` gap) for longer than `--multi_master_tombstone_ttl`, and a key on this node was
-deleted during that gap, the tombstone may already be gone by the time the peer reconnects and
-full-syncs — and the peer's stale copy resurrects the key exactly as if tombstoning were off. Set
-the TTL comfortably longer than the longest partition you expect to recover from automatically;
-600s (10 minutes) is a starting point for a mesh on a stable LAN, not a universal answer. There is
-no cost to setting it much higher other than the tombstone's own memory (one MVCC side-table slot,
-independent of the tombstoned key's own now-freed prime-table slot) and the risk of hitting
-`--multi_master_max_tombstones` sooner on a delete-heavy shard.
+**Sizing the TTL against expected partition length -- and against key TTLs.** A tombstone protects
+a delete only for as long as it is retained: if a peer is partitioned (network split, long
+maintenance window, extended `REPLICAOF` gap) for longer than `--multi_master_tombstone_ttl`, and
+a key on this node was deleted during that gap, the tombstone may already be gone by the time the
+peer reconnects and full-syncs — and the peer's stale copy resurrects the key exactly as if
+tombstoning were off. Set the TTL comfortably longer than the longest partition you expect to
+recover from automatically; 600s (10 minutes) is a starting point for a mesh on a stable LAN, not a
+universal answer. There is no cost to setting it much higher other than the tombstone's own memory
+(one MVCC side-table slot, independent of the tombstoned key's own now-freed prime-table slot) and
+the risk of hitting `--multi_master_max_tombstones` sooner on a delete-heavy shard.
+
+An expiry tombstone's GC deadline is measured from the expired value's OWN write time, not from
+when it was actually reaped (see "order-equivalent to the value it replaces" above) — so for a key
+whose own TTL is close to, or exceeds, `--multi_master_tombstone_ttl` (e.g. `SET k v EX 3600` under
+the 600s default), the tombstone can be born already past its deadline, or close to it, and get
+reclaimed by the very next idle GC pass — losing the resurrection-protection window for that key
+entirely, or nearly so. Size the tombstone TTL comfortably above the LONGEST key TTL you expect to
+use, in addition to the longest partition length above (the two add, they do not take the max):
+a key with a 1-hour TTL that expires right as a peer reconnects from an hour-long partition needs
+tombstone protection for the partition length PLUS however long that key's own value had already
+been live.
 
 **Hitting the cap degrades to resurrection.** When a (database, shard) pair's tombstone count is
 already at `--multi_master_max_tombstones`, the next delete for a key on that database and shard

@@ -102,8 +102,7 @@ LSN GetLsn() {
 }
 
 void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
-                 Entry::Payload payload, uint32_t origin_idx, uint64_t mvcc, uint8_t entry_flags,
-                 std::optional<uint32_t> stamp_origin_idx) {
+                 Entry::Payload payload, uint32_t origin_idx, uint64_t mvcc, uint8_t entry_flags) {
   Entry entry{txid, opcode, dbid, slot, std::move(payload)};
   // drakeydb: Phase 3 -- stamp origin/mvcc/entry_flags onto the entry; defaults to self/0/none
   // for callers that don't pass them. See journal.h for why this isn't folded into the Entry
@@ -154,10 +153,21 @@ void RecordEntry(TxId txid, Op opcode, DbIndex dbid, std::optional<SlotId> slot,
   // non-default namespaces before they reach RecordEntry; DbSlice::PostUpdate applies the same
   // boundary before arming. Looked up once, not once per armed key, since a single journal entry
   // can arm many keys (for example MSET).
-  if (MvccEnabled() && opcode == Op::COMMAND) {
+  //
+  // drakeydb: P4-4 -- excludes a kEntryFlagExpired entry: RecordExpiryBlocking's own
+  // CommitOwnTombstone call (mvcc.cc) already committed (and removed) this key's own tombstone arm
+  // before this entry was ever built, so there is nothing left for this sweep to do for the key
+  // this entry's own payload names. Running it anyway would instead reach any OTHER key still
+  // armed this epoch -- a sibling of a multi-key command whose lazy expiry of an unrelated key
+  // fired mid-callback -- and consume that sibling's arm with THIS entry's stamp, before the
+  // command's own trailing entry (whose payload actually names the sibling) ever gets a chance to.
+  // Leaving the sibling armed here means that later entry commits it instead, with the exact stamp
+  // that entry puts on the wire -- keeping the stored and propagated stamps for that key equal, as
+  // every other path already guarantees.
+  if (MvccEnabled() && opcode == Op::COMMAND && !(entry_flags & kEntryFlagExpired)) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     MvccStamper::tlocal()->Commit(
-        entry.mvcc, stamp_origin_idx.value_or(entry.origin_idx),
+        entry.mvcc, entry.origin_idx,
         [&db_slice, applied](DbIndex db, std::string_view key, const MvccStamp& st, bool tombstone,
                              const MvccStamp& prev_stamp) {
           if (!applied) {

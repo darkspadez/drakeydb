@@ -224,12 +224,12 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
     fn(a.db_index, ArmedKey(a), a.tombstone ? tomb_stamp : stamp, a.tombstone, a.prev_stamp);
 }
 
-// drakeydb: P4-3 Task 11, review ruling I2 -- see the declaration (mvcc.h) for the contract.
-// RecordExpiryBlocking (tx_base.cc) is the only caller, and calls this BEFORE its own
-// journal::RecordEntry -> Commit(): an expiry's own tombstone must always get a freshly minted
-// self stamp, decoupled from whatever ambient (possibly a replicated peer's, possibly old) mvcc/
-// origin that later Commit() call would otherwise apply to every currently armed key, including
-// this one, if it were still armed by then.
+// drakeydb: P4-4 -- see the declaration (mvcc.h) for the contract. RecordExpiryBlocking
+// (tx_base.cc) is the only caller, and calls this BEFORE its own journal::RecordEntry: an
+// expiry's own tombstone always carries the expired value's own pre-deletion stamp, decoupled
+// from whatever ambient (possibly a replicated peer's, possibly old) mvcc/origin a later journal
+// entry's own commit logic would otherwise apply to every key still armed then -- this key's arm
+// is gone by that point regardless, since it is committed and erased right here.
 bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uint64_t now_ms,
                                      const CommitFn& fn) {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn called CommitOwnTombstone() re-entrantly -- this "
@@ -238,23 +238,23 @@ bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uin
                                  "iteration over the same container";
   for (auto it = armed_.begin(); it != armed_.end(); ++it) {
     if (it->db_index == db_index && it->tombstone && ArmedKey(*it) == key) {
-      // drakeydb: P4-4 Task A5b -- spec D3 applies to an expiry's own tombstone too: it must not
-      // stamp below the value it deletes (clock skew can otherwise make the freshly-minted
-      // HopStamp alone land below `it->prev_stamp`, the value this exact arm is replacing).
-      // Floored against THIS arm's own prev only -- never armed_ as a whole -- since this call
-      // commits exactly one arm, unlike Commit()'s sweep of every currently-armed key.
-      //
-      // drakeydb: P4-4 Task A5b fix round 1 -- capped at kStampMask, mirroring LocalMintFloor's
-      // own cap (see its comment, mvcc.cc, for the full why): prev_mvcc == kStampMask would
-      // otherwise overflow prev_mvcc + 1 into EXACTLY kTombstoneBit, which the `| kTombstoneBit`
-      // below is then a no-op on -- the committed tombstone's own Mvcc() would mask right back
-      // down to 0, losing every bit of the "strictly newer" guarantee this floor exists to give
-      // it. See CommitOwnTombstoneCapsAtStampMaskNeverOverflowingTheMaskedMvccToZero
-      // (mvcc_test.cc).
+      // drakeydb: P4-4 -- order-equivalent to the value this tombstone replaces: same mvcc AND
+      // origin_hash as `it->prev_stamp` (this exact arm's own captured pre-delete stamp),
+      // tombstone bit set. No floor and no fresh mint here -- this compares the tombstone against
+      // the very value it deletes, on this same node, so there is nothing for a floor to protect
+      // against (see AsTombstone()'s own comment, mvcc.h, for why reusing the value's stamp
+      // verbatim is safe for exactly this shape of call, unlike an ordinary delete's fresh-minted
+      // tombstone). `prev_mvcc == 0` means this arm carries no real prior stamp at all (a
+      // genuinely fresh key, or a slot the caller's own GetMvcc lookup found nothing for) -- there
+      // is then no value to be order-equivalent WITH, so this falls back to a freshly minted self
+      // stamp instead, with no floor term of its own to add: LocalMintFloor's identical `prev_mvcc
+      // == 0` check (above in this file) already reduces to a no-op floor in that same shape, so
+      // a bare HopStamp here matches what a local mint would already do with nothing to floor
+      // against.
       const uint64_t prev_mvcc = it->prev_stamp.Mvcc();
-      const uint64_t floor = prev_mvcc == 0 ? 0 : std::min(prev_mvcc + 1, MvccClock::kStampMask);
-      const MvccStamp stamp{std::max(HopStamp(now_ms), floor) | MvccClock::kTombstoneBit,
-                            OriginHash(0)};
+      const MvccStamp stamp =
+          prev_mvcc == 0 ? MvccStamp{HopStamp(now_ms) | MvccClock::kTombstoneBit, OriginHash(0)}
+                         : it->prev_stamp.AsTombstone();
       ++commit_depth_;
       // RAII, matching Commit()'s own exception-safety contract (fn may throw): erase this one
       // arm and restore commit_depth_ whether or not fn throws. Does not touch arena_ -- same as
@@ -264,10 +264,9 @@ bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uin
         --commit_depth_;
         armed_.erase(it);
       };
-      // drakeydb: P4-4 Task A5 fix round 1 -- passes true (this is always a tombstone arm, per
-      // the `it->tombstone` check above) and the arm's own prev_stamp through, matching Commit()'s
-      // own call above; both harmless here since this stamp is always a fresh self-mint (never an
-      // applied write), so RecordExpiryBlocking's fn (tx_base.cc) ignores both arguments entirely.
+      // Passes true (this is always a tombstone arm, per the `it->tombstone` check above) and the
+      // arm's own prev_stamp through, matching Commit()'s own call above -- RecordExpiryBlocking's
+      // fn (tx_base.cc) ignores both, since `stamp` above already IS the final committed value.
       fn(db_index, ArmedKey(*it), stamp, /*tombstone=*/true, it->prev_stamp);
       return true;
     }

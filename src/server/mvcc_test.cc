@@ -521,15 +521,20 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
     EXPECT_EQ(rec.writes[i].key, keys[i]) << "arm " << i << " was corrupted by later growth";
 }
 
-// drakeydb: P4-3 Task 11, review ruling I2 -- CommitOwnTombstone's headline contract: it commits
-// (and removes) ONLY the named key's own tombstone arm, minting its own stamp independently of
-// whatever an ordinary Commit() call elsewhere in the same epoch would use. A sibling PLAIN arm
-// for a different key must survive untouched, so a later ordinary Commit() call still sees and
-// correctly stamps it -- this is what lets RecordExpiryBlocking (tx_base.cc) give an expiring
-// key's own tombstone a fresh self stamp while a sibling key swept from a replicated multi-key
-// command still gets that command's real author stamp (see
-// ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc, multi_master_test.cc).
-TEST(MvccStamperTest, CommitOwnTombstoneMintsSelfStampAndSparesSiblingArm) {
+// drakeydb: P4-4 -- CommitOwnTombstone's headline contract: it commits (and removes) ONLY the
+// named key's own tombstone arm, independently of whatever an ordinary Commit() call elsewhere in
+// the same epoch would use. A sibling PLAIN arm for a different key must survive untouched, so a
+// later ordinary Commit() call still sees and correctly stamps it -- this is what lets
+// RecordExpiryBlocking (tx_base.cc) give an expiring key's own tombstone the value's own stamp
+// while a sibling key from a replicated multi-key command still gets that command's real author
+// stamp from its own, later journal entry.
+//
+// This exercises the arm's captured prior stamp being EMPTY (a genuinely fresh key, or a slot the
+// caller's own lookup found nothing for): with no real value to be order-equivalent with,
+// CommitOwnTombstone falls back to a freshly minted self stamp instead -- see
+// CommitOwnTombstoneReusesTheArmsPriorStampVerbatim (below) for the ordinary case, where a real
+// prior stamp exists and is reused exactly rather than minted.
+TEST(MvccStamperTest, CommitOwnTombstoneMintsSelfStampWhenNoPriorStampExistsAndSparesSiblingArm) {
   MvccStamper* s = FreshStamper();
   s->Arm(0, "sibling", MvccStamp{});
   s->ArmTombstone(0, "victim", MvccStamp{});
@@ -564,6 +569,36 @@ TEST(MvccStamperTest, CommitOwnTombstoneMintsSelfStampAndSparesSiblingArm) {
   EXPECT_FALSE(sibling_rec.writes[0].stamp.IsTombstone());
   EXPECT_EQ(sibling_rec.writes[0].stamp.Mvcc(), 999u);
   EXPECT_EQ(sibling_rec.writes[0].stamp.origin_hash, 0xBEEFu);
+}
+
+// drakeydb: P4-4 -- the ordinary case: when the arm's own captured prior stamp carries real
+// authority (Mvcc() != 0), CommitOwnTombstone reuses it EXACTLY -- same mvcc AND origin_hash,
+// tombstone bit set -- rather than minting anything. Proven two ways: the origin_hash below
+// (0xC0FFEE) is neither this stamper's own self hash nor a value HopStamp/OriginHash(0) could ever
+// produce, and now_ms is chosen far enough in the future that a fresh mint would produce a
+// strictly LARGER Mvcc() than the arm's own -- so an unwanted mint cannot masquerade as a correct
+// result here.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to always mint `HopStamp(now_ms) |
+// kTombstoneBit` (this test file's own git history has that exact prior version) makes both
+// EXPECT_EQ below fail -- the stamp comes back self-originated and freshly minted from `kNowMs`
+// instead of equal to `prior`.
+TEST(MvccStamperTest, CommitOwnTombstoneReusesTheArmsPriorStampVerbatim) {
+  MvccStamper* s = FreshStamper();
+  constexpr uint64_t kPriorMvcc = 42;
+  constexpr uint64_t kPriorOriginHash = 0xC0FFEEu;
+  const MvccStamp prior{kPriorMvcc, kPriorOriginHash};
+  s->ArmTombstone(0, "k", prior);
+
+  constexpr uint64_t kNowMs =
+      999'999'999'999ULL;  // far future: a fresh mint would dwarf kPriorMvcc
+  Recorder rec;
+  EXPECT_TRUE(s->CommitOwnTombstone(0, "k", kNowMs, rec.Fn()));
+  ASSERT_EQ(rec.writes.size(), 1u);
+  EXPECT_EQ(rec.writes[0].stamp, prior.AsTombstone())
+      << "must reuse the value's own stamp exactly (order-equivalent to it), not mint a new one";
+  EXPECT_EQ(rec.writes[0].stamp.Mvcc(), kPriorMvcc);
+  EXPECT_EQ(rec.writes[0].stamp.origin_hash, kPriorOriginHash);
 }
 
 // No tombstone arm for the named key -- e.g. TombstonesEnabled() was false, or
@@ -669,27 +704,29 @@ TEST(MvccStamperTest, LocalMintFloorCapsAtStampMaskNeverOverflowingIntoTheTombst
       << "must cap at kStampMask, never overflow prev_mvcc + 1 into exactly kTombstoneBit";
 }
 
-// drakeydb: P4-4 Task A5b fix round 1 -- CommitOwnTombstone's own floor (mvcc.cc) needs the
-// identical cap: uncapped, prev_mvcc == kStampMask overflows prev_mvcc + 1 into kTombstoneBit,
-// which the subsequent `| kTombstoneBit` is then a no-op on -- so the committed tombstone's own
-// Mvcc() masks right back down to 0, losing every bit of the "strictly newer" guarantee this floor
-// exists to give it (a regression distinct from, but the same shape as, the plain-arm one above).
+// drakeydb: P4-4 -- CommitOwnTombstone no longer computes prev_mvcc + 1 at all (it reuses the
+// arm's own prior stamp verbatim, via AsTombstone() -- see
+// CommitOwnTombstoneReusesTheArmsPriorStampVerbatim above), so the one arithmetic case worth
+// pinning here is the boundary value itself: prev_stamp.Mvcc() == kStampMask (every bit but bit
+// 63) must still come back as kStampMask after OR'ing in the tombstone bit, not silently mask
+// down to 0 the way a naive `prev_mvcc + 1` (mvcc + 1 overflowing into exactly kTombstoneBit)
+// would have under the OLD floor-based mechanism this replaces.
 //
-// Falsifying: removing CommitOwnTombstone's own `std::min(prev_mvcc + 1, MvccClock::kStampMask)`
-// cap (mvcc.cc) back to a bare `prev_mvcc + 1` reproduces this: the committed tombstone's Mvcc()
-// comes back 0 instead of kStampMask.
-TEST(MvccStamperTest, CommitOwnTombstoneCapsAtStampMaskNeverOverflowingTheMaskedMvccToZero) {
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `std::max(HopStamp(now_ms),
+// std::min(prev_mvcc + 1, kStampMask)) | kTombstoneBit` unconditionally (the prior version) still
+// happens to produce the same Mvcc() here (that version's own cap already guarded this exact
+// value) but comes back with THIS stamper's own self origin_hash instead of the arm's own 111.
+TEST(MvccStamperTest, CommitOwnTombstoneAtTheStampMaskBoundaryReusesThePriorStampVerbatim) {
   MvccStamper* s = FreshStamper();
   s->ArmTombstone(0, "k", MvccStamp{MvccClock::kStampMask, 111});
   Recorder rec;
-  // Deliberately tiny: HopStamp(1) is far below kStampMask, so the floor -- not HopStamp -- is
-  // what determines the result below.
   EXPECT_TRUE(s->CommitOwnTombstone(0, "k", /*now_ms=*/1, rec.Fn()));
   ASSERT_EQ(rec.writes.size(), 1u);
   EXPECT_TRUE(rec.writes[0].stamp.IsTombstone());
   EXPECT_EQ(rec.writes[0].stamp.Mvcc(), MvccClock::kStampMask)
-      << "must cap at kStampMask, never overflow prev_mvcc + 1 into exactly kTombstoneBit -- which "
-         "the tombstone bit already being OR'd in then masks straight back down to a Mvcc() of 0";
+      << "OR'ing in the tombstone bit must never disturb the masked Mvcc() magnitude";
+  EXPECT_EQ(rec.writes[0].stamp.origin_hash, 111u)
+      << "the arm's own prior origin_hash must be reused verbatim, not this stamper's self hash";
 }
 
 // ---------------------------------------------------------------------------

@@ -3287,12 +3287,17 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
       // placeholder, not a delete stamp. If the real commit never arrives, EndOfWriteEpoch's
       // rollback (review fix I3) erases this placeholder instead, generically.
       //
-      // drakeydb: P4-4 Task A5 -- capture this key's PRE-delete stamp (`S`) BEFORE the placeholder
-      // write below overwrites the slot: journal::RecordEntry's Commit() call floors an applied
-      // (replicated) delete's author stamp against `S` if that author's stamp is older, and by
-      // the time that Commit() runs the slot no longer holds `S` -- only this placeholder does.
-      // GetMvcc always finds a slot here: the dense invariant guarantees a live prime key (the
-      // only kind PerformDeletionAtomic ever deletes) already owns one.
+      // drakeydb: P4-4 -- capture this key's PRE-delete stamp (`S`) BEFORE the placeholder write
+      // below overwrites the slot. Two different consumers read this arm's captured `S` back
+      // later, and both need the slot's ORIGINAL value, not the placeholder: an applied
+      // (replicated) delete's own journal commit floors that delete's author stamp against `S` if
+      // the author's stamp is older (journal::RecordEntry's Commit() call, journal.cc); a
+      // `kExpired` delete's own tombstone instead reuses `S` verbatim, order-equivalent to it,
+      // rather than flooring anything (MvccStamper::CommitOwnTombstone, mvcc.cc, via
+      // RecordExpiryBlocking, tx_base.cc). By the time either one runs the slot no longer holds `S`
+      // -- only this placeholder does. GetMvcc always finds a slot here: the dense invariant
+      // guarantees a live prime key (the only kind PerformDeletionAtomic ever deletes) already owns
+      // one.
       const MvccStamp prev_stamp = GetMvcc(table->index, del_it.key()).value_or(MvccStamp{});
       SetTombstone(table->index, del_it.key(), MvccStamp{MvccClock::kTombstoneBit, 0});
       MvccStamper::tlocal()->ArmTombstone(table->index, del_it.key(), prev_stamp);
