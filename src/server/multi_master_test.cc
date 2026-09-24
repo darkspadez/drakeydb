@@ -5185,6 +5185,62 @@ TEST_F(MvccStoreTest, RestoreActiveNodeExpiredReplaceJournalsDelAndCommitsTheArm
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
 }
 
+// drakeydb: P4-4 -- SetCmd::Set's own absent-key sibling of the RESTORE fix above: a guarded
+// applied SET whose absolute TTL has already elapsed, against a key this node does not hold,
+// must still install a tombstone -- otherwise this node silently forgets the write ever
+// happened, and a strictly OLDER write for the same key, arriving afterwards from a third peer,
+// is wrongly accepted instead of rejected.
+//
+// Falsifying: reverting the `if (!IsValid(find_res.it))` branch in SetCmd::Set
+// (string_family.cc) to a bare `return OpStatus::OK;` (no tombstone install) makes
+// `EXPECT_TRUE(after_x.has_value())` below fail (StampOf comes back nullopt instead of a
+// tombstone), and the final `EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0)` observes 1 instead (the
+// older write W is wrongly accepted against an absent slot).
+TEST_F(MvccStoreTest, SetActiveNodeExpiredAbsentKeyInstallsTombstoneRejectingOlderWrite) {
+  constexpr uint32_t kPeerIdx = 87;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000087");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
+
+  // X: a guarded SET with an ABSOLUTE deadline already in the past (PXAT 1 -- 1ms since the
+  // epoch). The key is absent, so the veto's own MergeAccepts(nullopt, X) accepts it and lets it
+  // reach SetCmd::Set's own expire_in_past branch.
+  constexpr uint64_t kXMvcc = 0x5000ULL;
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "x_val", "PXAT", "1"}, kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0) << "the already-expired write must create nothing";
+
+  auto after_x = StampOf("k");
+  ASSERT_TRUE(after_x.has_value())
+      << "an already-expired guarded write against an absent key must still install a tombstone";
+  EXPECT_TRUE(after_x->IsTombstone());
+  const MvccStamp x_stamp{kXMvcc, peer_hash};
+  EXPECT_EQ(*after_x,
+            (MvccStamp{x_stamp.packed | MvccClock::kTombstoneBit, x_stamp.origin_hash + 1}))
+      << "must derive from X's own stamp (ExpiryTombstoneFor), never a freshly minted one";
+
+  // W: an OLDER write (mvcc strictly below X) for the same key, reaching this node afterwards
+  // from a third peer. It must be dropped -- the tombstone this node just installed for X is
+  // strictly newer than W, exactly as it would be on every other node that saw X applied while
+  // the key was still live.
+  constexpr uint32_t kPeerIdx2 = 88;
+  const uint64_t peer_hash2 = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000088");
+  RegisterPeerOriginHash(kPeerIdx2, peer_hash2);
+  constexpr uint64_t kWMvcc = 0x1000ULL;
+  ASSERT_LT(kWMvcc, kXMvcc) << "sanity: W must be strictly older than X";
+  const uint64_t before_dropped = TotalLwwDropped();
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "w_val"}, kPeerIdx2, kWMvcc, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0)
+      << "W must be dropped -- it is older than the tombstone X installed";
+  EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
+  EXPECT_EQ(StampOf("k"), after_x) << "the tombstone must survive W's drop untouched";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
 // drakeydb: P4-4 Task A9 -- the premise the SETNX rewrite depends on, pinned directly: a
 // client-issued SETNX that does NOT set (the key already exists) must reach the journal ZERO
 // times. SETNX has no CO::NO_AUTOJOURNAL (string_family.cc), so its only journal path is ever
