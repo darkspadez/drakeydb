@@ -427,12 +427,13 @@ class DbSlice {
   // drakeydb: P4-4 -- installs `stamp` as an ABSENT key's tombstone: the caller has already
   // established there is no live PrimeKey slot for `key` and that
   // MergeAccepts(GetMvcc(db_ind, key), stamp) holds -- this call does not re-check either. Gated
-  // on TombstonesEnabled() and capped at --multi_master_max_tombstones, the same would_grow/cap
-  // accounting PerformDeletionAtomic's own earns_tombstone branch (db_slice.cc) applies to a live
-  // delete's tombstone, and RdbLoader::ApplyMergeTombstoneOnShard's no-resident-key install
-  // (rdb_load.cc) applies to the identical shape reached via a full sync -- reused here rather
-  // than copied a third time. Callers: SetCmd::Set's already-expired absent-key branch, OpRestore,
-  // Renamer::DeserializeDest (string_family.cc / generic_family.cc).
+  // on TombstonesEnabled(), IsDbValid(db_ind), and capped at --multi_master_max_tombstones, the
+  // same would_grow/cap accounting PerformDeletionAtomic's own earns_tombstone branch
+  // (db_slice.cc) applies to a live delete's tombstone. Shared by RdbLoader::
+  // ApplyMergeTombstoneOnShard (rdb_load.cc), whose own no-resident-key install reaches the
+  // identical shape via a full sync, rather than copied a third time there; and by SetCmd::Set's
+  // already-expired absent-key branch, OpRestore, and Renamer::DeserializeDest (string_family.cc
+  // / generic_family.cc).
   void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);

@@ -3564,20 +3564,13 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
   // write, correctly losing against the newer `stamp` this call was trying to install, could then
   // wrongly win against the stale one left behind instead -- an intermediate resurrection.
   // `would_grow` mirrors SetTombstone's own `was_tombstone` test (absent slot, or a slot that is
-  // not currently a tombstone).
-  if (TombstonesEnabled()) {
-    DbTable* cur_table = db_slice->GetDBTable(db_index);
-    if (cur_table != nullptr) {
-      const std::optional<MvccStamp> existing = db_slice->GetMvcc(db_index, key);
-      const bool would_grow = !existing.has_value() || !existing->IsTombstone();
-      if (!would_grow ||
-          cur_table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
-        db_slice->SetTombstone(db_index, key, stamp);
-      } else {
-        ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly
-      }
-    }
-  }
+  // not currently a tombstone). drakeydb: P4-4 -- this exact would_grow/cap-and-degrade logic is
+  // now DbSlice::InstallAbsentKeyTombstone (db_slice.h/.cc), shared with SetCmd::Set/OpRestore/
+  // Renamer::DeserializeDest's own identical no-live-key tombstone install (string_family.cc/
+  // generic_family.cc) rather than copied a third time; it re-resolves the table fresh via
+  // IsDbValid(db_ind) internally, matching this function's own re-resolve-not-reuse discipline
+  // above for exactly the same reason (a stale table pointer captured before a yield).
+  db_slice->InstallAbsentKeyTombstone(db_index, key, stamp);
 }
 
 void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, DbSlice* db_slice) {

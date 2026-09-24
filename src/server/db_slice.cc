@@ -1677,8 +1677,13 @@ void DbSlice::SetTombstone(DbIndex db_ind, string_view key, const MvccStamp& sta
 // SetTombstone's own `was_tombstone` guard: SetTombstone does not increment mvcc_tombstones when
 // the slot it overwrites is already a tombstone, so refusing that case at the cap would be a
 // spurious, miscounted drop that also strands the older (losing) stamp already in place.
+// IsDbValid guards against a db_ind whose table was never activated (or, out of bounds) --
+// unreachable for this method's own live-command callers (SetCmd::Set, OpRestore,
+// Renamer::DeserializeDest all run under an already-scheduled transaction for a real db), but
+// load-bearing for RdbLoader::ApplyMergeTombstoneOnShard's own merge-load caller, which can name a
+// db index this node has never activated for a key arriving from an unfamiliar source.
 void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
-  if (!TombstonesEnabled())
+  if (!TombstonesEnabled() || !IsDbValid(db_ind))
     return;
   auto& db = *db_arr_[db_ind];
   const std::optional<MvccStamp> existing = GetMvcc(db_ind, key);
