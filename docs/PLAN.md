@@ -257,7 +257,7 @@ Governing choices:
 
 | Path | Contents |
 |---|---|
-| `src/server/node_identity.h/.cc` | UUID create/load/persist, `--node_uuid` override, `kDrakeydbReplVersion = 67` (P4-3) |
+| `src/server/node_identity.h/.cc` | UUID create/load/persist, `--node_uuid` override, `kDrakeydbReplVersion = 68` (P4-4) |
 | `src/server/multi_master.h/.cc` | `PeerRegistry` (uuid ↔ origin_idx, 0 = self, P1). **P2 (done):** `active_replica`/`multi_master` flags, `IsActiveReplica()`/`IsMultiMaster()`, `ValidateMultiMasterFlags()`, `ParsePeerReplicaOfArgs()`, `RenderPeerReplicationInfo()`. `MvccClock` (P4, not yet built) |
 | `src/server/peer_replication.h/.cc` (new, P2) | `SyncGate` (FIFO ticket queue, cancellable, deferred while the process is LOADING for another reason, notifies under its mutex), `PeerReplicationManager` (peer links keyed by stored endpoint; add/remove/no-one; replace-vs-append by `--multi_master`) |
 | `src/server/multi_master_test.cc` | C++ units (registry; **P2:** flag validation, arg parser, INFO renderer, `ActiveReplicaFamilyTest`) |
