@@ -516,6 +516,46 @@ RespExpr BaseFamilyTest::RunViaNamespace(Namespace* ns, ArgSlice slice) {
   return conn_wrapper->ParseResponse(single_response_);
 }
 
+RespExpr BaseFamilyTest::RunWithReplContext(std::string_view id, ArgSlice slice,
+                                            uint32_t repl_origin_idx, uint64_t repl_mvcc,
+                                            bool repl_lww_guard) {
+  if (!ProactorBase::IsProactorThread()) {
+    return pp_->at(0)->Await([&] {
+      return this->RunWithReplContext(id, slice, repl_origin_idx, repl_mvcc, repl_lww_guard);
+    });
+  }
+
+  TestConnWrapper* conn_wrapper = AddFindConn(Protocol::REDIS, id);
+
+  CmdArgVec args = conn_wrapper->Args(slice);
+
+  ConnectionContext* context = conn_wrapper->cmd_cntx();
+  context->ns = &namespaces->GetDefaultNamespace();
+  context->repl_origin_idx = repl_origin_idx;
+  context->repl_mvcc = repl_mvcc;
+  context->repl_lww_guard = repl_lww_guard;
+
+  DCHECK(context->transaction == nullptr) << id;
+  CommandContext cmd_cntx;
+  cmd_cntx.Init(conn_wrapper->builder(), context);
+  cmd_cntx.Assign(args.begin(), args.end(), args.size());
+  service_->DispatchCommand(ParsedArgs{cmd_cntx}, &cmd_cntx, AsyncPreference::ONLY_SYNC);
+
+  DCHECK(context->transaction == nullptr);
+
+  // See the declaration (test_utils.h) for why: repl_lww_guard is never reset per command in
+  // production either, but a plain client connection's ConnectionContext must not silently stay
+  // guarded for whatever this test's own connection id dispatches next.
+  context->repl_origin_idx = 0;
+  context->repl_mvcc = 0;
+  context->repl_lww_guard = false;
+
+  unique_lock lk(mu_);
+  last_cmd_dbg_info_ = context->last_cmd_stats;
+
+  return conn_wrapper->ParseResponse(single_response_);
+}
+
 void BaseFamilyTest::RunMany(const std::vector<std::vector<std::string>>& cmds) {
   if (!ProactorBase::IsProactorThread()) {
     return pp_->at(0)->Await([&] { return this->RunMany(cmds); });

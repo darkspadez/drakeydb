@@ -110,6 +110,23 @@ class BaseFamilyTest : public ::testing::Test {
   // multi/scripting test.
   RespExpr RunViaNamespace(Namespace* ns, ArgSlice list);
 
+  // drakeydb: P4-4 -- another deliberately narrower sibling of Run(id, slice), for the mirror
+  // image reason RunViaNamespace exists: it lets a test set a connection's repl_origin_idx/
+  // repl_mvcc/repl_lww_guard (ConnectionContext, conn_context.h) directly before dispatch, the
+  // same fields JournalExecutor's own conn_context_ carries in production (SetApplyOrigin/
+  // SetApplyMvcc/SetApplyLwwGuard, executor.h) -- but dispatches through the ordinary
+  // service_->DispatchCommand path, never through JournalExecutor::Execute. That matters because
+  // ApplyLwwRewrites (multimaster_lww.cc, SETNX->SET/GETSET->SET/GETDEL->DEL/RESTORE->+REPLACE)
+  // lives exclusively inside JournalExecutor::Execute: a test needing the generic single-key veto
+  // (Transaction::ShouldDropForLww) to see an UNREWRITTEN guarded name -- e.g. to prove
+  // LogAutoJournalOnShard's own `if (lww_dropped) return;` still does its job, in isolation from
+  // the rewrite that makes it unreachable in production -- has no other way to construct that
+  // shape. Resets all three fields to their defaults after dispatch, so a later Run(id, ...) on
+  // the SAME connection id never inherits them (repl_lww_guard's own comment, conn_context.h,
+  // warns it is "never reset per command" otherwise).
+  RespExpr RunWithReplContext(std::string_view id, ArgSlice list, uint32_t repl_origin_idx,
+                              uint64_t repl_mvcc, bool repl_lww_guard);
+
   void RunMany(const std::vector<std::vector<std::string>>& cmds);
 
   using MCResponse = std::vector<std::string>;
