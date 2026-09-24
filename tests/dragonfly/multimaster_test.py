@@ -1742,7 +1742,7 @@ async def test_three_node_mesh_converges_without_forwarding(df_factory: DflyInst
 async def test_three_node_mesh_reconverges_after_kill_and_restart(
     df_factory: DflyInstanceFactory, tmp_path, port_picker
 ):
-    """P3 T11 item 2, upgraded by A13 (P4-4): kills one node of a live 3-node mesh (SIGKILL, mid
+    """Kills one node of a live 3-node mesh (SIGKILL, mid
     write-load -- not a clean REPLICAOF REMOVE or graceful shutdown) and restarts it from its own
     on-disk snapshot, re-attaching via --replicaof boot flags (test_fanin_restart_remerge's
     restart pattern, extended here to a true reciprocal mesh instead of one-way fan-in into a
@@ -1820,7 +1820,7 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
     sync of C2, landing on the exact same CreateObjectOnShard merge compare described above --
     never through anything on the streaming path.
 
-    Falsifying the STRENGTHENED (newest-wins) assertion below (A13, verified by hand, one run):
+    Falsifying the STRENGTHENED (newest-wins) assertion below (verified by hand, one run):
     narrowed to hit only that merge compare, not the streaming guard which also calls
     MergeAccepts (via LwwShouldDropKey) -- temporarily forced both of rdb_load.cc's merge_lww_
     gates (the fast-path check at :3837 and the authoritative recheck at :3858) to `false`,
@@ -1899,8 +1899,8 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
 
     await reconverged()
 
-    # NEWEST-STAMP-WINS (A13/P4-4, strengthened from the original mutual-convergence-only check --
-    # see docstring): A's post-kill write is the only one of the two with a genuinely newer stamp,
+    # NEWEST-STAMP-WINS (strengthened from the original mutual-convergence-only check -- see
+    # docstring): A's post-kill write is the only one of the two with a genuinely newer stamp,
     # so it -- specifically, not "whichever value" -- must be what every node holds, with A's own
     # origin, once C's stale on-disk copy has lost the merge compare on rejoin.
     val_a = await c_a.get("conflict-key")
@@ -2618,7 +2618,7 @@ async def _find_same_shard_keys(
 async def test_stream_lww_newer_local_write_survives_stale_peer_write(
     df_factory: DflyInstanceFactory, proxy_factory, stream_lww
 ):
-    """A13 test 1. B is a peer of A through a proxy. While the proxy is paused, A writes `k` (an
+    """B is a peer of A through a proxy. While the proxy is paused, A writes `k` (an
     older stamp) and B writes its OWN, later `k` (a newer stamp, minted directly on B with no
     compare at all -- a local write is never guarded). Only once both writes exist does the proxy
     resume, so A's stale write reaches B's guarded receiving flow strictly after B's own fresher
@@ -2683,9 +2683,8 @@ async def test_stream_lww_newer_local_write_survives_stale_peer_write(
 async def test_stream_lww_dropped_counter_renders_as_prometheus_metric(
     df_factory: DflyInstanceFactory, proxy_factory
 ):
-    """Review #2: dragonfly_multimaster_lww_dropped_total must actually render on /metrics, not
-    only in INFO replication -- docs/multi-master.md used to claim no test in this codebase
-    exercised the Prometheus text output at all. Reuses
+    """dragonfly_multimaster_lww_dropped_total must actually render on /metrics, not
+    only in INFO replication. Reuses
     test_stream_lww_newer_local_write_survives_stale_peer_write's own forced-drop setup (B is a
     peer of A through a paused proxy; A's stale write reaches B strictly after B's own fresher
     write, so B's guard drops it) to make the counter advance on an ACTIVE node, then checks:
@@ -2738,7 +2737,7 @@ async def test_stream_lww_dropped_counter_renders_as_prometheus_metric(
 async def test_stream_lww_bidirectional_conflict_converges_on_newer_origin(
     df_factory: DflyInstanceFactory, proxy_factory
 ):
-    """A13 test 2. A and B are RECIPROCAL peers, each through its own proxy. Both proxies are
+    """A and B are RECIPROCAL peers, each through its own proxy. Both proxies are
     paused BEFORE either side writes `k`: A writes first, B strictly later (a real wall-clock gap,
     well over the localhost clock-skew tolerance test_peer_clock_skew_reported measures, so B's
     stamp is genuinely the newer one) -- with both directions frozen, neither side's write can
@@ -2811,7 +2810,7 @@ async def test_stream_lww_bidirectional_conflict_converges_on_newer_origin(
 async def test_stream_lww_mset_splits_per_key_on_same_shard(
     df_factory: DflyInstanceFactory, proxy_factory, tmp_path
 ):
-    """A13 test 3. MSET's own per-key LWW veto (OpMSet's kMultiKeySelfGuarded loop,
+    """MSET's own per-key LWW veto (OpMSet's kMultiKeySelfGuarded loop,
     string_family.cc) is a per-KEY decision, not a per-command or per-shard one: k1 (absent on B)
     must be created from A's MSET while k2 (already resident on B with a newer stamp) must resist
     the SAME MSET -- and both keys are forced onto the SAME shard (verified via DEBUG MVCC's own
@@ -2862,7 +2861,7 @@ async def test_stream_lww_mset_splits_per_key_on_same_shard(
 async def test_stream_lww_restore_without_replace_pinned_by_flag(
     df_factory: DflyInstanceFactory, proxy_factory, stream_lww
 ):
-    """A13 test 5. B already holds `k` (an older stamp). A performs RESTORE k (without REPLACE)
+    """B already holds `k` (an older stamp). A performs RESTORE k (without REPLACE)
     onto a key it never had itself, so the RESTORE succeeds locally on A and carries a genuinely
     newer stamp than B's stored `k`. The receiver-side RESTORE->+REPLACE rewrite (ApplyLwwRewrites,
     multimaster_lww.cc) and the LWW compare it enables are both gated on the SAME predicate,
