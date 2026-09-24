@@ -67,6 +67,16 @@ A **non-merge** load — a local RDB file, `DEBUG LOAD`, a plain Dragonfly repli
 dropping an already-expired key
 verbatim, exactly as upstream does.
 
+The identical rule applies on the **streaming** (stable-sync) path too, not only on a full-sync
+merge load: a guarded `SET`/`RESTORE` whose absolute ttl has already elapsed by the time it reaches
+this node, against a key this node does not currently hold live, installs that same
+`ExpiryTombstoneFor`-derived tombstone instead of silently recording nothing
+(`DbSlice::InstallAbsentKeyTombstone`, shared with the merge-load path above; `SetCmd::Set`'s own
+`expire_in_past` branch, `OpRestore`, `Renamer::DeserializeDest`). Without it, an already-expired
+guarded write against an absent key would leave no local record that it ever happened, letting a
+strictly older write for the same key — arriving afterwards from a third peer — be wrongly accepted
+instead of rejected.
+
 **What it does not do:** merge-LWW only ever compares against *this node's own resident stamp*
 for a key. It has no notion of a global "true" value, no quorum, and no read-repair outside a
 full sync. Two nodes can each accept different values for the same key from different partitions
@@ -231,9 +241,10 @@ happens to arrive at which node first — decides which of the two outcomes belo
   (a delta racing a full-state write: a TTL change, a `SET`, `PFMERGE`, `BITOP`, ...) has the gap
   described above. A delta is NOT otherwise safe on its own, though: applied after this key's TTL
   has already elapsed on the RECEIVING node (no concurrent write anywhere required — see D-27,
-  [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md)), it silently re-creates the key with NO TTL. Set
-  the TTL on every increment unconditionally (`EXPIRE k ttl`, never `NX`, never only when the
-  counter happens to read back as freshly-created) if a key is ever expected to expire again.
+  [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md)), it silently re-creates the key with NO TTL. Run
+  `EXPIRE k ttl NX` after every increment, not only when the counter happens to read back as
+  freshly-created, if a key is ever expected to expire again: `NX` fires precisely when there is
+  currently no TTL to protect against re-creation, and stays a cheap no-op otherwise.
 - **The real fix, future work:** a per-key TTL stamp — a separate LWW register for the TTL, decoupled
   from the value's own stamp — so a TTL change never needs to carry (or clobber) the value at all.
   Not attempted here.
@@ -416,8 +427,8 @@ same as eviction above, since an `Mvcc()==0` tombstone would itself lose every f
 unconditionally, a worse failure mode than leaving nothing behind (see D-29,
 [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), for the resurrection residual this leaves: a
 peer's own unstamped `{0,0}` copy of the same key can resurrect it at the next merge, since
-`MergeAccepts` against an absent — not tombstoned — local slot always accepts). The DERIVED journal
-entry for this expiry's own `DEL` still gets a freshly minted LOCAL stamp in this case (the same
+`MergeAccepts` against an absent — not tombstoned — local slot always accepts). The `kEntryFlagExpired`
+journal entry for this expiry's own `DEL` still gets a freshly minted LOCAL stamp in this case (the same
 minting any self-originated, never-stamped write receives), but that stamp only ever reaches a
 plain, non-mesh replica: `journal::PassesPeerEchoFilter` drops every `kEntryFlagExpired` entry
 before it reaches a peer-mesh link, so the minted wire stamp plays no role in the mesh merge
@@ -740,9 +751,11 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
   mvcc side table before applying, so it simply creates a fresh, TTL-less value. The classic
   rate-limiter pattern (`INCR`; `EXPIRE` only when `INCR` returns 1) is directly affected: once a
   node's counter is silently re-created this way, `INCR` never again returns 1 there, so its own
-  `EXPIRE` never fires. Mitigation: always re-apply `EXPIRE k ttl` after every `INCR`, unconditionally
-  (never `NX`, never only-when-1) — on an active node this ships the key's full state and
-  re-converges every peer. Owned by P4-5 (tombstone lifecycle).
+  `EXPIRE` never fires. Mitigation: run `EXPIRE k ttl NX` after every `INCR`, not only when `INCR`
+  returns 1 -- `NX` fires exactly when there is currently no TTL, self-healing the silently
+  re-created key, and stays a cheap no-op the rest of the time -- on an active node a firing
+  `EXPIRE` ships the key's full state and re-converges every peer. Owned by P4-5 (tombstone
+  lifecycle).
 - **D-28** — `HEXPIRE`/`FIELDEXPIRE`/`SADDEX`/`HSETEX` auto-journal the client's own RELATIVE
   member-TTL seconds argument verbatim; each receiver computes that member's deadline from ITS OWN
   arrival time, drifting later with replication lag, compounding across a replica chain. Same root
@@ -755,8 +768,17 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
 - **D-30** — `HDEL` emptying a hash commits its own peer-suppressed derived-delete tombstone
   inside the callback, consuming the key's mvcc arm; `HDEL`'s own separate auto-journal entry (the
   only one a peer actually receives) then finds no arm left and mints a bare, unfloored
-  `HopStamp`. When the hash's pre-delete stamp is newer than that `HopStamp`, a peer floors its own
-  applied copy against ITS stored stamp instead, landing on a different stamp SHAPE (live, no
-  tombstone) than the author's own commit for the same delete.
+  `HopStamp`. When the hash's pre-delete stamp `S` is newer than that `HopStamp`, both sides still
+  end up tombstoned (a peer floors its own applied copy against its stored `S` too, and the arm's
+  own tombstone flag forces the bit on regardless), but at different MAGNITUDES: the author lands
+  one tick above `S`, the peer one tick below it. A later write stamped strictly between the two is
+  accepted by the peer and rejected by the author.
+- **D-31** — `RESTORE ... REPLACE` over an existing key deletes it (`DelMutable`) before attempting
+  to load the new payload; if that load then fails (`INVALID_VALUE`, or `SKIPPED` when every member
+  expired during deserialize), `RESTORE` returns without ever journaling, so the deletion never
+  reaches a peer. The old value stays genuinely gone here (only the leftover mvcc arm rolls back,
+  not the key itself) while every other node keeps it — a silent divergence pre-existing upstream,
+  not introduced by drakeydb. A guarded receiver hitting the `SKIPPED` case is also a member-TTL
+  sibling of D-28's family: no tombstone is left behind to reject a stale write arriving afterward.
 
 See that document for the full list, upstream-bug cross-references, and each entry's owning phase.
