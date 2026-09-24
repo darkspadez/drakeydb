@@ -1764,9 +1764,12 @@ async def test_three_node_mesh_reconverges_after_kill_and_restart(
     (rdb_load.cc) compares every incoming key against C's own resident stamp via MergeAccepts
     BEFORE any mutation and returns early -- skipping the key outright -- when the resident side
     wins (rdb_load.cc:3837, reconfirmed authoritatively at :3864 after the loader's own last
-    possible yield point). SetOverrideExistingKeys(true), passed on EVERY full sync (peer or
-    plain), was never the gate the pre-A13 version of this docstring blamed for "last-loaded-wins":
-    it has exactly one reader (rdb_load.cc:3939), and that reader only decides whether a duplicate
+    possible yield point). SetOverrideExistingKeys(true) -- passed on every DFLY-protocol full
+    sync, peer or plain (replica.cc:1457, unconditional), but only on a PEER-mode classic-protocol
+    one (replica.cc:787, inside its own IsPeerMode() branch -- a plain classic replica flushes
+    first instead, so there is nothing resident left to override) -- was never the gate this
+    docstring used to blame for "last-loaded-wins": it has exactly one reader (rdb_load.cc:3939),
+    and that reader only decides whether a duplicate
     key logs a LOG(WARNING) -- it has never controlled whether an incoming value replaces a
     resident one, on any full sync, peer or plain. What made "whichever load applies last wins"
     true before P4-3 was simply that nothing compared stamps at all; merge_lww_'s own early-return

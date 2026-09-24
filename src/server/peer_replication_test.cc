@@ -655,9 +655,10 @@ class DflyShardReplicaOriginTest : public BaseFamilyTest {
     CHECK(!ec) << ec.message();
   }
 
-  // drakeydb: P4-4 Task A10 -- the THIRD applier this task guards: constructs a DflyShardReplica
-  // with peer_mode=true (ObservedReplayedOriginIdx above already covers this loader's origin
-  // threading) and sets rdb_loader_'s OWN SetApplyLwwGuard(guard_on) directly -- exactly what
+  // drakeydb: P4-4 Task A10 -- the THIRD applier the streaming LWW guard covers: constructs a
+  // DflyShardReplica with peer_mode=true (ObservedReplayedOriginIdx above already covers this
+  // loader's origin threading) and sets rdb_loader_'s OWN SetApplyLwwGuard(guard_on) directly --
+  // exactly what
   // ApplyPeerFullSyncLwwGuard (replica.cc) sets it to in production, not a reimplementation of the
   // guard/compare logic itself (that lives in Transaction::ShouldDropForLww/MergeAccepts, both
   // untouched here). `key` must hash to shard 0, same convention and reason as
@@ -928,7 +929,10 @@ TEST_F(DflyShardReplicaLwwGuardTest, PeerFullSyncJournalBlobHonorsLwwGuard) {
 // executor_ -- the most important case (not separately re-run with the flag off here:
 // ApplyPeerFullSyncLwwGuard has no peer_mode-dependent branch of its own, only a verbatim read of
 // executor_'s bit, and A2's ConstructorThreadsLwwGuardIntoExecutor already covers executor_ under
-// peer_mode=false regardless of the flag); peer_mode=true + flag=OFF -> unguarded. That third case
+// peer_mode=false with the flag on -- the flag-off sub-case is not separately re-run for
+// peer_mode=false in either test, since a plain replica is unguarded either way and the flag's
+// only observable effect is on the peer_mode=true branch, which IS covered below with flag=OFF);
+// peer_mode=true + flag=OFF -> unguarded. That third case
 // is the one cell that actually distinguishes "reads back executor_'s bit" from a broken
 // "SetApplyLwwGuard(peer_mode_)" implementation -- without it, the first two cases alone are
 // equally consistent with either. A fourth case pins that the read happens ONCE, at executor_'s
@@ -1047,7 +1051,7 @@ TEST_F(DflyShardReplicaLwwGuardTest, ApplyPeerFullSyncLwwGuardMirrorsExecutorGua
 //
 // Falsifying (verified by hand): dropping the `repl_lww_guard_ = lww_guard;` line from
 // SetReplOrigin (transaction.h) makes the first EXPECT_TRUE and the stub's EXPECT_TRUE below fail
-// (both observe false); the F1 (zero-mvcc) and lww_guard=false checks are unaffected, since they
+// (both observe false); the zero-mvcc and lww_guard=false checks below are unaffected, since they
 // already expect false. Separately, dropping `repl_lww_guard_ = parent->repl_lww_guard_;` from
 // the squashed-stub constructor (transaction.cc) makes only the stub's EXPECT_TRUE fail, with the
 // parent's own checks above it unaffected -- isolating the stub-inheritance line specifically.
@@ -1061,7 +1065,7 @@ TEST_F(BaseFamilyTest, ReplOriginLwwGuardReachesTransactionDbContextAndStub) {
   EXPECT_TRUE(tx->IsLwwGuarded());
   EXPECT_TRUE(tx->GetDbContext().repl_lww_guard);
 
-  // F1: a zero mvcc (classic Redis/KeyDB link, or a DFLY link to a non-active node) is never
+  // A zero mvcc (classic Redis/KeyDB link, or a DFLY link to a non-active node) is never
   // guarded, even with the link bit set.
   tx->SetReplOrigin(/*origin_idx=*/1, /*mvcc=*/0, /*lww_guard=*/true);
   EXPECT_FALSE(tx->IsLwwGuarded());

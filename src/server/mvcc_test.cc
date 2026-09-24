@@ -493,17 +493,16 @@ TEST(MvccStamperTest, DisarmIsScopedToTheDbIndex) {
                                     "Disarm(1, \"k\") was supposed to remove";
 }
 
-// drakeydb: review wave 2 (F1, CRITICAL) -- the core-mechanism unit test behind
+// drakeydb: the core-mechanism unit test behind
 // multi_master_test.cc's HdelEmptyingHashDoesNotResurrectAStamp and its two FieldExpire siblings,
 // isolated from any specific command: a key can be armed twice before it is deleted (e.g. HDEL
 // emptying a hash -- ExecuteW's own post_updater.Run() arms it once, then DeleteHw takes a
 // second, independent FindMutable/AutoUpdater on the same still-present key and arms it again
 // before calling Del). Disarm's only caller, PerformDeletionAtomic, calls it exactly once per
-// deleted key regardless of how many times that key was armed -- so a single-match Disarm left
-// one arm behind, which the deleting command's own Commit() then re-stamped, corrupting the mvcc
-// side table with an entry for a key PerformDeletionAtomic had just erased from `prime`
-// (reproduced verbatim: `HSET h f v` then `HDEL h f` under --active_replica aborts the process --
-// see final-fix-report.md).
+// deleted key regardless of how many times that key was armed -- so a single-match Disarm would
+// leave one arm behind, which the deleting command's own Commit() would then re-stamp, corrupting
+// the mvcc side table with an entry for a key PerformDeletionAtomic had just erased from `prime`
+// (reproduced verbatim: `HSET h f v` then `HDEL h f` under --active_replica aborts the process).
 //
 // Falsifying: restoring the early `return` inside Disarm's erase loop (mvcc.cc) makes rec.writes
 // non-empty here (size 1, key "h") instead of empty.
@@ -599,34 +598,37 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
 // real author stamp from its own, later journal entry.
 //
 // This exercises the arm's captured prior stamp being EMPTY (a value that never received a
-// stamp, or a slot the caller's own lookup found nothing for): with no real value to advance,
-// CommitOwnTombstone falls back to a freshly minted self stamp instead -- see
+// stamp, or a slot the caller's own lookup found nothing for): with no real value to advance
+// from, CommitOwnTombstone erases the slot instead of minting a self stamp -- a reap-time mint
+// would exceed a peer's write authored before this node's reap (the same hazard
+// ExpiryTombstoneFor itself exists to close), and ExpiryTombstoneFor's own {0,1}|tombstone result
+// for a {0,0} input has Mvcc()==0, which TombstoneGcStep/rdb_load both treat as
+// PerformDeletionAtomic's own mid-epoch placeholder rather than a genuine committed tombstone --
+// installing one would make it immortal. See
 // CommitOwnTombstoneAdvancesTheArmsPriorStampByOneOriginHashTick (below) for the ordinary case,
-// where a real prior stamp exists and is advanced by one tick rather than minted.
-TEST(MvccStamperTest, CommitOwnTombstoneMintsSelfStampWhenNoPriorStampExistsAndSparesSiblingArm) {
+// where a real prior stamp exists and is advanced by one tick rather than erased.
+//
+// Falsifying: reverting CommitOwnTombstone (mvcc.cc) to mint `HopStamp(now_ms) | kTombstoneBit`
+// for this branch (this file's own git history has that exact prior version) makes the
+// IsTombstone()/Empty() checks below fail -- the stamp comes back self-originated and freshly
+// minted instead of empty (this test's own erase signal).
+TEST(MvccStamperTest, CommitOwnTombstoneErasesWhenNoPriorStampExistsAndSparesSiblingArm) {
   MvccStamper* s = FreshStamper();
   s->Arm(0, "sibling", MvccStamp{});
   s->ArmTombstone(0, "victim", MvccStamp{});
 
-  constexpr uint64_t kNowMs = 123'456'789;
-  const uint64_t expected_mvcc = s->HopStamp(kNowMs);  // memoized -- CommitOwnTombstone below
-                                                       // must return this same value, not a
-                                                       // second, different mint.
-
   Recorder victim_rec;
-  EXPECT_TRUE(s->CommitOwnTombstone(0, "victim", kNowMs, victim_rec.Fn()));
+  EXPECT_TRUE(s->CommitOwnTombstone(0, "victim", victim_rec.Fn()));
   ASSERT_EQ(victim_rec.writes.size(), 1u);
   EXPECT_EQ(victim_rec.writes[0].key, "victim");
-  EXPECT_TRUE(victim_rec.writes[0].stamp.IsTombstone());
-  EXPECT_EQ(victim_rec.writes[0].stamp.Mvcc(), expected_mvcc);
-  EXPECT_EQ(victim_rec.writes[0].stamp.origin_hash,
-            NodeUuidHash("6f1c4c3e-0000-4000-8000-00000000000a"))
-      << "must always be self-originated, regardless of anything an ambient replicated-apply "
-         "context might otherwise carry";
+  EXPECT_FALSE(victim_rec.writes[0].stamp.IsTombstone())
+      << "no real prior stamp exists to advance from, and a committed Mvcc()==0 tombstone would "
+         "be immortal -- the caller must erase the slot instead of installing one";
+  EXPECT_TRUE(victim_rec.writes[0].stamp.Empty());
 
   // The sibling arm must be untouched: a later, ordinary Commit() call (using a DIFFERENT
   // mvcc/origin, standing in for a replicated command's real author stamp) must still see and
-  // correctly stamp it, and must NOT see "victim" again (already committed and removed above).
+  // correctly stamp it, and must NOT see "victim" again (already processed and removed above).
   constexpr uint32_t kPeerIdx = 3;
   s->RegisterOriginHash(kPeerIdx, 0xBEEFu);
   Recorder sibling_rec;
@@ -652,8 +654,8 @@ TEST(MvccStamperTest, CommitOwnTombstoneMintsSelfStampWhenNoPriorStampExistsAndS
 //
 // Falsifying: reverting CommitOwnTombstone (mvcc.cc) to always mint `HopStamp(now_ms) |
 // kTombstoneBit` (this test file's own git history has that exact prior version) makes the
-// EXPECT_EQ below fail -- the stamp comes back self-originated and freshly minted from `kNowMs`
-// instead of one tick above `prior`.
+// EXPECT_EQ below fail -- the stamp comes back self-originated and freshly minted instead of one
+// tick above `prior`.
 TEST(MvccStamperTest, CommitOwnTombstoneAdvancesTheArmsPriorStampByOneOriginHashTick) {
   MvccStamper* s = FreshStamper();
   constexpr uint64_t kPriorMvcc = 42;
@@ -661,10 +663,8 @@ TEST(MvccStamperTest, CommitOwnTombstoneAdvancesTheArmsPriorStampByOneOriginHash
   const MvccStamp prior{kPriorMvcc, kPriorOriginHash};
   s->ArmTombstone(0, "k", prior);
 
-  constexpr uint64_t kNowMs =
-      999'999'999'999ULL;  // far future: a fresh mint would dwarf kPriorMvcc
   Recorder rec;
-  EXPECT_TRUE(s->CommitOwnTombstone(0, "k", kNowMs, rec.Fn()));
+  EXPECT_TRUE(s->CommitOwnTombstone(0, "k", rec.Fn()));
   ASSERT_EQ(rec.writes.size(), 1u);
   EXPECT_EQ(rec.writes[0].stamp,
             (MvccStamp{kPriorMvcc | MvccClock::kTombstoneBit, kPriorOriginHash + 1}))
@@ -683,7 +683,7 @@ TEST(MvccStamperTest, CommitOwnTombstoneIsANoopWhenNothingIsArmed) {
   s->Arm(0, "unrelated", MvccStamp{});
 
   Recorder rec;
-  EXPECT_FALSE(s->CommitOwnTombstone(0, "missing", 123, rec.Fn()));
+  EXPECT_FALSE(s->CommitOwnTombstone(0, "missing", rec.Fn()));
   EXPECT_TRUE(rec.writes.empty());
 
   Recorder rec2;
@@ -700,7 +700,7 @@ TEST(MvccStamperTest, CommitOwnTombstoneIgnoresAPlainArmOfTheSameKey) {
   s->Arm(0, "k", MvccStamp{});
 
   Recorder rec;
-  EXPECT_FALSE(s->CommitOwnTombstone(0, "k", 123, rec.Fn()));
+  EXPECT_FALSE(s->CommitOwnTombstone(0, "k", rec.Fn()));
   EXPECT_TRUE(rec.writes.empty());
 
   Recorder rec2;
@@ -718,7 +718,7 @@ TEST(MvccStamperTest, CommitOwnTombstoneIsScopedToTheDbIndex) {
   s->ArmTombstone(1, "k", MvccStamp{});
 
   Recorder rec;
-  EXPECT_FALSE(s->CommitOwnTombstone(0, "k", 123, rec.Fn()));
+  EXPECT_FALSE(s->CommitOwnTombstone(0, "k", rec.Fn()));
   EXPECT_TRUE(rec.writes.empty());
 
   Recorder rec2;
@@ -761,7 +761,7 @@ TEST(MvccStamperTest, CommitDepthRecoversAfterCommitFnThrows) {
   EXPECT_EQ(rec.writes[0].key, "k2");
 }
 
-// drakeydb: P4-4 Task A5b fix round 1 -- a corrupt or hostile peer stamp with Mvcc() exactly
+// drakeydb: P4-4 Task A5b -- a corrupt or hostile peer stamp with Mvcc() exactly
 // MvccClock::kStampMask (the maximum representable non-tombstone value: every bit but bit 63)
 // must not let LocalMintFloor overflow prev+1 into precisely kTombstoneBit -- journal.cc's mint
 // would then commit that value verbatim for a PLAIN arm, silently marking a live write's stamp as
@@ -794,7 +794,7 @@ TEST(MvccStamperTest, CommitOwnTombstoneDelegatesToExpiryTombstoneForAtTheStampM
   MvccStamper* s = FreshStamper();
   s->ArmTombstone(0, "k", MvccStamp{MvccClock::kStampMask, 111});
   Recorder rec;
-  EXPECT_TRUE(s->CommitOwnTombstone(0, "k", /*now_ms=*/1, rec.Fn()));
+  EXPECT_TRUE(s->CommitOwnTombstone(0, "k", rec.Fn()));
   ASSERT_EQ(rec.writes.size(), 1u);
   EXPECT_TRUE(rec.writes[0].stamp.IsTombstone());
   EXPECT_EQ(rec.writes[0].stamp.Mvcc(), MvccClock::kStampMask)

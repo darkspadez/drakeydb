@@ -5805,7 +5805,7 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyDoesNotStealConcurrentAr
     auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     got = db_slice.GetMvcc(0, std::string_view{"ghost"});
     arm_survived = MvccStamper::tlocal()->CommitOwnTombstone(
-        0, std::string_view{"ghost"}, GetCurrentTimeMs(),
+        0, std::string_view{"ghost"},
         [](DbIndex, std::string_view, const MvccStamp&, bool, const MvccStamp&) {});
   });
   ASSERT_TRUE(got.has_value());
