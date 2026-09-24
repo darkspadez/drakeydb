@@ -1017,6 +1017,19 @@ OpStatus OpExpire(const OpArgs& op_args, string_view key, const DbSlice::ExpireP
     return OpStatus::KEY_NOTFOUND;
   }
 
+  // drakeydb: P4-4 -- mirrors OpPersist's own no-op handling, above: an EXPIRE ... NX/XX/GT/LT
+  // whose condition is not satisfied must never arm this key's mvcc slot, since nothing is going
+  // to journal it. The decision has to be made BEFORE calling UpdateExpire, not after inspecting
+  // its return status -- UpdateExpire's own already-past-deadline branch calls Del(), which can
+  // invalidate find_res.it, so by the time a SKIPPED/non-SKIPPED status came back it would already
+  // be too late to still call Run() safely on the pre-mutation iterator. WouldExpireSkip
+  // (db_slice.h/.cc) answers the identical NX/XX/GT/LT question UpdateExpire itself will,
+  // read-only.
+  if (db_slice.WouldExpireSkip(find_res.it, params, op_args.db_cntx.time_now_ms)) {
+    find_res.post_updater.RunWithoutMvccArm();
+    return OpStatus::SKIPPED;
+  }
+
   find_res.post_updater.Run();
   auto res = db_slice.UpdateExpire(op_args.db_cntx, find_res.it, params);
 

@@ -211,9 +211,8 @@ inline MvccStamp ExpiryTombstoneFor(const MvccStamp& value) {
 // stamp is OLDER than the key's own current stamp `stored`. Guarded writes (the streaming LWW
 // veto) only ever apply when incoming > stored, so verbatim is correct for them -- this floor
 // only matters for an UNGUARDED applied write (a delta RMW like INCR/APPEND, or any apply on a
-// plain, non-active-peer
-// replica), which can legitimately carry an author stamp older than what this node already has,
-// because that author authored it before it ever saw `stored`.
+// plain, non-active-peer replica), which can legitimately carry an author stamp older than what
+// this node already has, because that author authored it before it ever saw `stored`.
 //
 // Committing `incoming` verbatim there would REWIND the key's stamp, after which a stale guarded
 // write whose stamp sits between the rewound value and `stored` wrongly wins the next comparison.

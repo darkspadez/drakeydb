@@ -1796,9 +1796,9 @@ void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult resul
   // (multi_master_test.cc) reaches it directly, bypassing the rewrite, to prove it still works.
   // Without it, a drop would still forward the client's original command to sub-replicas even
   // though this node's own copy was never touched -- the exact divergence the veto exists to
-  // prevent. Checked before the SQUASHER/IsJournaled/journal()
-  // gates below only because it is cheapest; those gates are also correct for a dropped entry
-  // (result.status is OpStatus::OK, so they would not catch this on their own).
+  // prevent. Checked before the SQUASHER/IsJournaled/journal() gates below only because it is
+  // cheapest; those gates are also correct for a dropped entry (result.status is OpStatus::OK, so
+  // they would not catch this on their own).
   if (lww_dropped)
     return;
 

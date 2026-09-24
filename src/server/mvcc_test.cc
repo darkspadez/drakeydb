@@ -936,10 +936,10 @@ TEST(MultimasterLwwDeathTest, IncomingStampUnregisteredOriginDies) {
 #endif  // NDEBUG
 
 // ---------------------------------------------------------------------------
-// ApplyLwwRewrites (P4-4 Task A9 for SETNX->SET / RESTORE->+REPLACE, extended below for
-// GETSET->SET / GETDEL->DEL): the pre-dispatch rewrite for every guarded single-key command whose
-// journaled form reproduces the author's COMMAND rather than the author's RESULT. See executor.cc
-// for where this is actually called, gated on LwwGuardActive.
+// ApplyLwwRewrites (P4-4 Task A9): the pre-dispatch rewrite for every guarded single-key command
+// whose journaled form reproduces the author's COMMAND rather than the author's RESULT --
+// SETNX->SET / RESTORE->+REPLACE originally, extended below for GETSET->SET / GETDEL->DEL. See
+// executor.cc for where this is actually called, gated on LwwGuardActive.
 // ---------------------------------------------------------------------------
 namespace {
 

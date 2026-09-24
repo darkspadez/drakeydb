@@ -1825,6 +1825,37 @@ void DbSlice::ReleaseOffloadedValue(DbIndex db_ind, std::string_view key, PrimeV
     shard_owner()->tiered_storage()->Delete(db_ind, key, pv);
 }
 
+namespace {
+// drakeydb: P4-4 -- the NX/XX/GT/LT condition, factored out of UpdateExpire so
+// DbSlice::WouldExpireSkip (db_slice.h) can answer the identical question read-only, without
+// duplicating this logic and risking the two copies drifting apart.
+bool ExpireConditionSatisfied(bool has_expire, int64_t current_cmp, int32_t expire_options,
+                              int64_t abs_msec) {
+  bool satisfied = expire_options == ExpireFlags::EXPIRE_ALWAYS;
+  if (has_expire) {
+    satisfied |= (expire_options & ExpireFlags::EXPIRE_XX);
+  } else {
+    satisfied |= (expire_options & ExpireFlags::EXPIRE_NX);
+  }
+  satisfied |= (expire_options & ExpireFlags::EXPIRE_LT) && (abs_msec < current_cmp);
+  satisfied |= (expire_options & ExpireFlags::EXPIRE_GT) && (abs_msec > current_cmp);
+  return satisfied;
+}
+}  // namespace
+
+bool DbSlice::WouldExpireSkip(Iterator prime_it, const ExpireParams& params,
+                              uint64_t now_ms) const {
+  if (params.persist || !params.IsDefined())
+    return false;  // never a NX/XX/GT/LT SKIP path -- the caller's normal path handles it
+  auto [rel_msec, abs_msec] = params.Calculate(now_ms, false);
+  if (abs_msec < 0 || rel_msec > kMaxExpireDeadlineMs)
+    return false;  // OUT_OF_RANGE, not a SKIP -- let the real call report it, unarmed as before
+  const bool has_expire = prime_it->first.HasExpire();
+  const int64_t current_cmp =
+      has_expire ? prime_it->first.GetExpireTime() : numeric_limits<int64_t>::max();
+  return !ExpireConditionSatisfied(has_expire, current_cmp, params.expire_options, abs_msec);
+}
+
 OpResult<int64_t> DbSlice::UpdateExpire(const Context& cntx, Iterator prime_it,
                                         const ExpireParams& params) {
   constexpr uint64_t kPersistValue = 0;
@@ -1842,19 +1873,12 @@ OpResult<int64_t> DbSlice::UpdateExpire(const Context& cntx, Iterator prime_it,
   }
 
   int64_t current_cmp = numeric_limits<int64_t>::max();  // inf if no expiry is set
-  bool satisfied = params.expire_options == ExpireFlags::EXPIRE_ALWAYS;
-
-  if (prime_it->first.HasExpire()) {
+  const bool has_expire = prime_it->first.HasExpire();
+  if (has_expire) {
     current_cmp = prime_it->first.GetExpireTime();
-    satisfied |= (params.expire_options & ExpireFlags::EXPIRE_XX);
-  } else {
-    satisfied |= (params.expire_options & ExpireFlags::EXPIRE_NX);
   }
 
-  satisfied |= (params.expire_options & ExpireFlags::EXPIRE_LT) && (abs_msec < current_cmp);
-  satisfied |= (params.expire_options & ExpireFlags::EXPIRE_GT) && (abs_msec > current_cmp);
-
-  if (!satisfied)
+  if (!ExpireConditionSatisfied(has_expire, current_cmp, params.expire_options, abs_msec))
     return OpStatus::SKIPPED;
 
   // If we update and the new value is already expired, delete the key

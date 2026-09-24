@@ -372,6 +372,16 @@ class DbSlice {
   facade::OpResult<int64_t> UpdateExpire(const Context& cntx, Iterator prime_it,
                                          const ExpireParams& params);
 
+  // drakeydb: P4-4 -- read-only pre-check for UpdateExpire's own NX/XX/GT/LT condition, against
+  // this exact iterator's CURRENT expiry state, without mutating anything. A caller (OpExpire,
+  // generic_family.cc) that must decide whether to arm this key's mvcc slot BEFORE calling
+  // UpdateExpire needs this: UpdateExpire's own already-in-the-past branch calls Del(), which can
+  // invalidate `prime_it`, so the arm-or-not decision has to be made first, not after inspecting
+  // UpdateExpire's return status. Returns false (never a SKIP) for `persist`, an undefined params,
+  // or an out-of-range deadline -- those are not this predicate's concern; the caller's normal,
+  // unconditional path already handles them exactly as before.
+  bool WouldExpireSkip(Iterator prime_it, const ExpireParams& params, uint64_t now_ms) const;
+
   // Publishes the expired keyspace event; call AFTER the deletion has been journaled.
   void SendExpiredKeyEvent(const Context& cntx, std::string_view key) const;
 
