@@ -1041,9 +1041,11 @@ stamp of its own (mvcc 0, e.g. a `D-7`-style verbatim-loaded or otherwise unauth
 REMOVED entirely, not tombstoned, and `committed` stays default (`Mvcc() == 0`).
 
 The `kEntryFlagExpired` journal entry for this expiry's own `DEL` (`RecordEntry`, `journal.cc` —
-not a `kEntryFlagDerived` one; that flag names a different class, a container-emptying delete
-caused by a WRITE command's own effect, e.g. `RecordDerivedDelete`, `tx_base.cc`) still gets a
-freshly MINTED local stamp whenever its own incoming mvcc argument is exactly 0 — which is exactly
+not a `kEntryFlagDerived` one; that flag names a different class, a collection-emptying delete
+issued indirectly rather than directly by the client, covering BOTH a command-caused empty (e.g.
+`RecordDerivedDelete`, `tx_base.cc`) and an expiry-caused one, per that flag's own comment,
+`journal/types.h`) still gets a freshly MINTED local stamp whenever its own incoming mvcc argument
+is exactly 0 — which is exactly
 what this erase branch sends (`committed.Mvcc()`, i.e. 0) — the same minting every other
 self-originated, never-stamped local write receives. That minted stamp only ever reaches a PLAIN
 (non-mesh) replica, though: `journal::PassesPeerEchoFilter` drops every `kEntryFlagExpired` entry
@@ -1141,10 +1143,22 @@ tombstone placeholder, exactly like the `Expired()` branch two entries above) BE
 malformed/untrusted body, or `OpStatus::SKIPPED` when every member of the incoming value expired
 during deserialize (`rdb::errc::value_expired`, `RdbRestoreValue::Add`) — `OpRestore` returns that
 status directly, never reaching its own explicit journal calls (all of which live either in the
-`Expired()` branch above or after a successful `Add`, further down). `RESTORE` is `CO::JOURNALED`
-without `NO_AUTOJOURNAL`, and `Transaction::LogAutoJournalOnShard`'s `if (result.status !=
-OpStatus::OK) return;` gate then suppresses the generic auto-journal too, since the returned status
-is never `OK`. Nothing about this delete ever reaches the wire.
+`Expired()` branch above or after a successful `Add`, further down).
+
+`RESTORE`'s own registration is `CO::JOURNALED | CO::NO_AUTOJOURNAL` (`generic_family.cc`), not
+`CO::JOURNALED` alone. On an ACTIVE node, the `Restore` command handler never calls
+`Transaction::ReviveAutoJournal()` (guarded on `!IsActiveReplica()`, since `OpRestore` journals
+explicitly instead, with an ABSOLUTE ttl, on its own success path below), so
+`IsAutoJournalSuppressed()` (`transaction.cc`) would suppress the generic auto-journal on its own,
+independent of this failure. On a NON-active node,
+`Restore` DOES call `ReviveAutoJournal()` (a plain replica has no per-key stamp to protect and must
+see the exact upstream shape), reviving the ordinary verbatim auto-journal — but
+`LogAutoJournalOnShard`'s own `if (result.status != OpStatus::OK) return;` gate, checked BEFORE
+`IsAutoJournalSuppressed()` in program order, already fires first here regardless of node type,
+since `OpRestore`'s own return status is never `OK` on this path: the same universal "a failed
+auto-journaled command never journals" rule every command relies on, not a P4-4/LWW-specific
+mechanism. Nothing about this delete ever reaches the wire, on either node type, for two related
+but distinct reasons.
 
 Locally, this is not a no-op: the old value is genuinely gone (`DelMutable` performs the real prime-
 table erase immediately; it does not wait for a journal commit). Only the leftover MVCC side-table
@@ -1166,13 +1180,27 @@ for the same key arriving afterward from a third peer is wrongly accepted here i
 rejected — the guarded sibling of D-28's already-registered member-TTL family (`HEXPIRE`,
 `FIELDEXPIRE`, `SADDEX`, `HSETEX`), not the relative-deadline replay D-28 itself describes.
 
+A separate, narrower instance of the same gap reaches a genuinely ABSENT key too: `Add`'s own
+`SKIPPED` return (member-level expiry discovered only during deserialize) is entirely independent
+of `restore_args.Expired()`'s own whole-key-TTL check above — `found_prev` can be `false` (the key
+never existed here at all) while `Add` still returns `SKIPPED`, and this branch has no
+tombstone-install logic of its own, unlike the `Expired()` + `!found_prev` branch, which installs
+one via `InstallAbsentKeyTombstone`. A guarded RESTORE with this exact shape — absent key, every
+member already expired inside the dump payload itself — installs nothing at all here: no value, no
+tombstone, no trace this write was ever authored. A strictly OLDER write for the same key, arriving
+afterward from a third peer, is then wrongly accepted, with no tombstone here to reject it.
+Registered, not fixed, same as the `found_prev` case above.
+
 **How established:** static reading of `OpRestore`'s control flow (the `DelMutable`-before-`Add`
-ordering, both `Add` failure returns, and the early, journal-call-free `return add_res.status();`)
-composed with `RollbackUncommittedTombstone`'s own body (`EraseMvcc` only, no prime-table restore)
-and `LogAutoJournalOnShard`'s non-`OK` gate; not reproduced with a live two-node divergence repro
-(`RestoreReplaceFailureRollsBackTheOrphanedTombstone` already exercises the identical failure path
-for its own, narrower I3 purpose, and its own assertions were read to confirm they stop at the
-stamp table).
+ordering, both `Add` failure returns, the early, journal-call-free `return add_res.status();`, and
+the absence of any tombstone-install call reachable from that same early return) composed with
+`RollbackUncommittedTombstone`'s own body (`EraseMvcc` only, no prime-table restore) and
+`LogAutoJournalOnShard`'s non-`OK` gate; not reproduced with a live two-node divergence repro.
+`RestoreReplaceFailureRollsBackTheOrphanedTombstone` (`multi_master_test.cc`) already exercises the
+identical `DelMutable`-then-`Add`-fails control flow this entry's `found_prev` half describes, but
+for a different purpose (pinning `RollbackUncommittedTombstone`'s own arm-rollback behavior, not
+this entry's divergence claim) — its own assertions were read to confirm they stop at the stamp
+table, never observing `EXISTS`/`GET`.
 
 **Owner:** open; pre-existing upstream shape (`DelMutable`-then-`Add` for `REPLACE` predates
 drakeydb's own MVCC/LWW work), not introduced by P4-4. Registered only, not fixed. **From:** P4-4.
