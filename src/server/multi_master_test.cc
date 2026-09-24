@@ -3783,6 +3783,7 @@ std::string FindKeyOnShard(std::string_view prefix, ShardId target_sid, size_t n
 // is the entire question this task's tests turn on.
 struct MsetLwwJournalEntry {
   std::vector<std::string> args;  // args[0] is the command name, upper-case.
+  uint64_t mvcc{0};               // the wire entry's own mvcc, for stamp==wire pins.
 };
 
 class MsetLwwJournalConsumer : public journal::JournalConsumerInterface {
@@ -3800,7 +3801,7 @@ class MsetLwwJournalConsumer : public journal::JournalConsumerInterface {
       args.emplace_back(sv);
 
     util::fb2::LockGuard lk(mu_);
-    entries.push_back({std::move(args)});
+    entries.push_back({std::move(args), parsed.mvcc});
   }
   void ThrottleIfNeeded() override {
   }
@@ -6454,11 +6455,11 @@ TEST_F(MvccStoreTest, EmittedNamePinsMatchClassifiedGuardedNames) {
   }
   // PERSIST on a key WITHOUT a TTL -> a genuine no-op: journals NOTHING at all on an active
   // node, not even a no-op PERSIST. Unlike the GETEX/GAT persist-no-op pins below, this one
-  // cannot distinguish the fix from the pre-change code: PERSIST auto-journaled verbatim only
-  // when OpPersist returned OpStatus::OK (a TTL actually removed); on a no-op it already returned
-  // SKIPPED, and the auto-journal epilogue already gated on `result.status == OpStatus::OK`, so
-  // nothing reached the wire before this task either. Kept as a live pin of that property, not as
-  // evidence of this task's own change.
+  // cannot distinguish full-state journaling from a bare-delta PERSIST: PERSIST auto-journaled
+  // verbatim only when OpPersist returned OpStatus::OK (a TTL actually removed); on a no-op it
+  // already returned SKIPPED, and the auto-journal epilogue already gated on
+  // `result.status == OpStatus::OK`, so nothing reaches the wire either way. Kept as a live pin
+  // of that property, not as evidence of full-state journaling specifically.
   {
     Run({"set", "k15b", "v"});
     ASSERT_EQ(Run({"ttl", "k15b"}).GetInt(), -1) << "sanity: no TTL to begin with";
@@ -6643,10 +6644,13 @@ TEST_F(MvccStoreTest, PersistOnHashKeyShipsFullStateRestoreWithZeroTtl) {
 // key, with a strictly newer stamp SP, and must converge on v0 -- the value a bare
 // PEXPIREAT/PERSIST delta could never have carried.
 //
-// Falsifying: reverting OpPersist's active-node branch (generic_family.cc) back to the
-// unconditional auto-journaled PERSIST makes the very first assertion after the capture fail:
-// `ASSERT_EQ(author_args.size(), 3u)` observes 2u (author_args comes back as
-// {"PERSIST", "r1_author_k"}), before this test ever reaches the receiver half.
+// Falsifying: removing OpPersist's active-node full-state journal call (generic_family.cc)
+// without also reverting PERSIST's registration off `CO::NO_AUTOJOURNAL` back to plain
+// auto-journal leaves PERSIST journaling NOTHING at all (no manual call, and auto-journal still
+// disabled) -- the actual observed failure is `ASSERT_EQ(author_consumer.entries.size(), 1u)`
+// observing 0u, before this test ever reaches the `author_args` checks or the receiver half. A
+// true revert to the pre-full-state shape (a bare, unconditional "PERSIST key" auto-journaled
+// entry) needs both the branch AND the `CO::NO_AUTOJOURNAL` flag reverted together.
 TEST_F(MvccStoreTest, PersistFullStateLetsReceiverConvergeOnAuthorsValueNotItsOwn) {
   constexpr uint32_t kPeerIdx = 90;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a14a-4000-8000-000000000090");
@@ -6702,9 +6706,10 @@ TEST_F(MvccStoreTest, PersistFullStateLetsReceiverConvergeOnAuthorsValueNotItsOw
 // applying that exact captured entry, with a DIFFERENT existing TTL for this key, must end up
 // with THIS write's TTL, not its own.
 //
-// Falsifying: reverting SetCmd::RecordJournal's active-node branch (string_family.cc) back to
-// the unconditional `cmds.push_back("KEEPTTL")` makes the very first assertion after the capture
-// fail: `ASSERT_EQ(args.size(), 5u)` observes 4u (args comes back as
+// Falsifying: reverting SetCmd::RecordJournal's active-node branch (string_family.cc) so it falls
+// through to the generic path (still unconditionally journaled, just with the bare `KEEPTTL`
+// token) makes the very first size assertion after the capture fail:
+// `ASSERT_EQ(author_args.size(), 5u)` observes 4u (author_args comes back as
 // {"SET", "r4_author_k", "v1", "KEEPTTL"}), before this test ever reaches the receiver half.
 TEST_F(MvccStoreTest, SetKeepttlShipsAbsoluteTtlSoReceiverConvergesOnAuthorsTtl) {
   constexpr uint32_t kPeerIdx = 91;
@@ -6811,7 +6816,7 @@ TEST_F(MvccStoreTest, ExpireAuthoredFullStateAppliedNewerThanTombstoneRecreatesK
 
 // drakeydb: P4-4 -- GETEX k PERSIST, on a key that HAS a real TTL to remove, ships a bare
 // "SET k v" -- no PXAT, since no TTL survives this write. GETEX with an already-past absolute
-// expiry still ships a bare "DEL k" -- already this key's full state, unchanged by this task.
+// expiry still ships a bare "DEL k" -- already this key's full state, nothing further to add.
 TEST_F(MvccStoreTest, GetexPersistAndPastExpiryEmissionPins) {
   auto capture_cmd = [&](std::vector<std::string> cmd) {
     MsetLwwJournalConsumer consumer;
@@ -6836,6 +6841,7 @@ TEST_F(MvccStoreTest, GetexPersistAndPastExpiryEmissionPins) {
     EXPECT_EQ(entries[0][0], "SET");
     EXPECT_EQ(entries[0][1], "gx_persist_k");
     EXPECT_EQ(entries[0][2], "v");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kSingleKey);
   }
 
   {  // GETEX with an already-past absolute expiry -> DEL k.
@@ -6846,6 +6852,7 @@ TEST_F(MvccStoreTest, GetexPersistAndPastExpiryEmissionPins) {
     EXPECT_EQ(entries[0][0], "DEL");
     EXPECT_EQ(entries[0][1], "gx_past_k");
     EXPECT_EQ(Run({"exists", "gx_past_k"}).GetInt(), 0);
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kMultiKeySelfGuarded);
   }
 }
 
@@ -6877,6 +6884,7 @@ TEST_F(MvccStoreTest, GatPersistAndPastExpiryEmissionPins) {
     EXPECT_EQ(entries[0][0], "SET");
     EXPECT_EQ(entries[0][1], "gat_persist_k");
     EXPECT_EQ(entries[0][2], "v");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kSingleKey);
   }
 
   {  // GAT with an already-past absolute expiry -> DEL k.
@@ -6889,6 +6897,7 @@ TEST_F(MvccStoreTest, GatPersistAndPastExpiryEmissionPins) {
     EXPECT_EQ(entries[0][0], "DEL");
     EXPECT_EQ(entries[0][1], "gat_past_k");
     EXPECT_EQ(Run({"exists", "gat_past_k"}).GetInt(), 0);
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kMultiKeySelfGuarded);
   }
 }
 
@@ -6921,6 +6930,7 @@ TEST_F(MvccStoreTest, SetKeepttlOnNoTtlKeyEmissionPins) {
     EXPECT_EQ(entries[0][0], "SET");
     EXPECT_EQ(entries[0][1], "kt_existing_k");
     EXPECT_EQ(entries[0][2], "v");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kSingleKey);
   }
 
   {  // k does NOT exist.
@@ -6931,6 +6941,7 @@ TEST_F(MvccStoreTest, SetKeepttlOnNoTtlKeyEmissionPins) {
     EXPECT_EQ(entries[0][0], "SET");
     EXPECT_EQ(entries[0][1], "kt_fresh_k");
     EXPECT_EQ(entries[0][2], "v");
+    EXPECT_EQ(ClassifyJournaledCommand(entries[0][0]), LwwClass::kSingleKey);
   }
 }
 
@@ -6996,7 +7007,7 @@ TEST_F(MvccStoreTest, GatPersistNoopOnNoTtlKeyJournalsNothing) {
       << "a no-op must never arm-then-abandon this key either";
 }
 
-// drakeydb: P4-4 -- for every full-state write this task ships, the LOCAL committed stamp must
+// drakeydb: P4-4 -- for every TTL-changing full-state write, the LOCAL committed stamp must
 // equal the mvcc the wire entry itself carries: journal::RecordEntry mints a fresh HopStamp for a
 // self-originated write and commits that SAME value to every key armed for this entry
 // (journal.cc) -- if a call site armed the wrong key, forgot to arm at all, or armed via
@@ -7072,11 +7083,10 @@ TEST_F(MvccStoreTest, FullStateWritesCommitTheSameMvccTheyJournal) {
 // -- a bare "SET dest v" would silently drop it on the receiver, the same partial-state defect
 // SET ... KEEPTTL had. On an active node, PFMERGE ships the destination's full state instead.
 TEST_F(MvccStoreTest, PfmergeIntoTtlCarryingDestinationShipsFullState) {
-  // drakeydb: P4-4 -- both keys pinned to the SAME shard, deliberately: PFMergeInternal's write
-  // phase (hll_family.cc) runs its destination `set_cb` on every shard the transaction touches,
-  // unconditionally, not just the destination's own -- a cross-shard PFMERGE journals once per
-  // shard. That is pre-existing behavior this task does not change; pinning avoids it so this
-  // test's own single-entry assertion is about the TTL-preserving fix, not that separate shape.
+  // drakeydb: P4-4 -- both keys pinned to the SAME shard, deliberately: this keeps the test to a
+  // single write-phase shard so its own single-entry assertion is only about the TTL-preserving
+  // full-state fix. The CROSS-shard case (destination and source on different shards) is its own
+  // shape and is pinned separately by PfmergeAcrossShardsJournalsOnlyFromOwningShard below.
   const size_t n = shard_set->size();
   const std::string dst = FindKeyOnShard("pf_dst_", 0, n);
   const std::string src = FindKeyOnShard("pf_src_", 0, n);
@@ -7105,8 +7115,122 @@ TEST_F(MvccStoreTest, PfmergeIntoTtlCarryingDestinationShipsFullState) {
          "own GET";
   EXPECT_EQ(args[3], "PXAT");
   EXPECT_EQ(args[4], abs_ttl) << "PFMERGE must not silently drop the destination's own TTL";
+  EXPECT_EQ(ClassifyJournaledCommand(args[0]), LwwClass::kSingleKey);
   EXPECT_EQ(Run({"pexpiretime", dst}).GetInt(), std::stoll(abs_ttl))
       << "sanity: PFMERGE itself must not have changed the local TTL either";
+}
+
+// drakeydb: P4-4 -- cross-shard PFMERGE (destination and source pinned to DIFFERENT shards):
+// PFMergeInternal's write phase (hll_family.cc) runs its `set_cb` on every shard the transaction
+// touches, not just the destination's own. Without a destination-shard filter, the shard that
+// does NOT own dest still runs AddOrFind(dest) in its OWN table, creating an independent phantom
+// copy there -- armed, stamped, and journaled separately from the owning shard's full-state
+// write. A guarded receiver applying both entries races them, and whichever lands second silently
+// clobbers whatever the first one carried (including the TTL). `set_cb` now skips every non-owning
+// shard on an active node (mirroring BITOP's own dest_shard filter), so a cross-shard PFMERGE
+// journals exactly once, from the shard that actually owns dest.
+//
+// Falsifying: dropping the `shard->shard_id() != dest_shard` filter in PFMergeInternal's `set_cb`
+// (hll_family.cc) makes `consumer.entries.size()` come back 2 instead of 1, and
+// `Run({"keys", dst}).GetVec().size()` come back 2 instead of 1 (the phantom copy on the
+// non-owning shard).
+TEST_F(MvccStoreTest, PfmergeAcrossShardsJournalsOnlyFromOwningShard) {
+  const size_t n = shard_set->size();
+  ASSERT_GT(n, 1u) << "sanity: this pin needs at least two shards to put dst and src on different "
+                      "ones";
+  const std::string dst = FindKeyOnShard("pf_xs_dst_", 0, n);
+  const std::string src = FindKeyOnShard("pf_xs_src_", 1, n);
+  Run({"del", dst, src});
+  Run({"pfadd", dst, "x", "y"});
+  const std::string abs_ttl = absl::StrCat(TEST_current_time_ms + 200'000);
+  ASSERT_EQ(Run({"pexpireat", dst, abs_ttl}).GetInt(), 1);
+  Run({"pfadd", src, "a", "b", "c"});
+
+  const int64_t dbsize_before = *Run({"dbsize"}).GetInt();
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  ASSERT_EQ(Run({"pfmerge", dst, src}), "OK");
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), 1u)
+      << "exactly one entry, from the shard that owns dest -- not one per participating shard";
+  const auto& e = consumer.entries[0];
+  ASSERT_EQ(e.args.size(), 5u) << "SET key value PXAT abs";
+  EXPECT_EQ(e.args[0], "SET");
+  EXPECT_EQ(e.args[1], dst);
+  EXPECT_EQ(e.args[2], Run({"get", dst}).GetString());
+  EXPECT_EQ(e.args[3], "PXAT");
+  EXPECT_EQ(e.args[4], abs_ttl) << "the owning shard's write must still carry dest's own TTL";
+  EXPECT_EQ(ClassifyJournaledCommand(e.args[0]), LwwClass::kSingleKey);
+
+  auto committed = StampOf(dst);
+  ASSERT_TRUE(committed.has_value());
+  EXPECT_EQ(committed->Mvcc(), e.mvcc)
+      << "the owning shard's committed stamp must equal the mvcc this same entry put on the wire";
+
+  EXPECT_EQ(Run({"keys", dst}).GetVec().size(), 1u)
+      << "no phantom copy of dest may exist in any non-owning shard's own table";
+  EXPECT_EQ(Run({"dbsize"}).GetInt(), dbsize_before)
+      << "PFMERGE overwrites dest's value in place; it must not create a new key anywhere";
+
+  // RECEIVER side: applying the exact entry the owning shard recorded must leave the receiver
+  // with dest's merged value AND its TTL -- the same convergence pin R4/R5 use for SET ...
+  // KEEPTTL/EXPIRE, driven here from PFMERGE's own recorded shape.
+  constexpr uint32_t kPeerIdx = 93;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a14a-4000-8000-000000000093");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+  ASSERT_EQ(Run({"set", "pf_xs_recv_k", "vB", "PX", "500000"}), "OK");
+  auto sb = StampOf("pf_xs_recv_k");
+  ASSERT_TRUE(sb.has_value());
+  const uint64_t sp = sb->Mvcc() + 1;
+
+  std::vector<std::string> recv_args = e.args;
+  recv_args[1] = "pf_xs_recv_k";
+  auto res = ApplyReplicatedCommand(recv_args, kPeerIdx, sp, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "pf_xs_recv_k"}), e.args[2]);
+  EXPECT_EQ(Run({"pexpiretime", "pf_xs_recv_k"}).GetInt(), std::stoll(abs_ttl))
+      << "the receiver must end up with dest's own TTL, not its own pre-existing one";
+}
+
+// drakeydb: P4-4 -- on a non-active node, upstream's own phantom-writing shape for a cross-shard
+// PFMERGE is left completely alone: every participating shard still runs AddOrFind(dest) in its
+// own table and journals its own bare "SET dest v", exactly as upstream does. A non-active link
+// has no per-key stamp to protect and must stay byte-identical to upstream, phantom copies and
+// all -- see D-25, docs/ISSUE-REGISTER.md.
+TEST_F(BaseFamilyTest, NonActivePfmergeAcrossShardsKeepsUpstreamPhantomShape) {
+  ASSERT_FALSE(IsActiveReplica());
+  const size_t n = shard_set->size();
+  ASSERT_GT(n, 1u);
+  const std::string dst = FindKeyOnShard("na_pf_xs_dst_", 0, n);
+  const std::string src = FindKeyOnShard("na_pf_xs_src_", 1, n);
+  Run({"del", dst, src});
+  Run({"pfadd", dst, "x"});
+  Run({"pexpireat", dst, absl::StrCat(TEST_current_time_ms + 100'000)});
+  Run({"pfadd", src, "y"});
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+  };
+
+  Run({"pfmerge", dst, src});
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), 2u)
+      << "upstream's own shape: one bare SET per participating shard, phantom included";
+  EXPECT_EQ(Run({"keys", dst}).GetVec().size(), 2u)
+      << "upstream's own phantom copy on the non-owning shard, left untouched off the active path";
 }
 
 // drakeydb: P4-4 -- same defect and same fix as PFMERGE above, for BITOP's destination
@@ -7137,6 +7261,7 @@ TEST_F(MvccStoreTest, BitopIntoTtlCarryingDestinationShipsFullState) {
   EXPECT_EQ(args[2], Run({"get", "bop_dst"}).GetString());
   EXPECT_EQ(args[3], "PXAT");
   EXPECT_EQ(args[4], abs_ttl) << "BITOP must not silently drop the destination's own TTL";
+  EXPECT_EQ(ClassifyJournaledCommand(args[0]), LwwClass::kSingleKey);
   EXPECT_EQ(Run({"pexpiretime", "bop_dst"}).GetInt(), std::stoll(abs_ttl))
       << "sanity: BITOP itself must not have changed the local TTL either";
 }
@@ -7170,6 +7295,7 @@ TEST_F(MvccStoreTest, SetKeepttlOnStickyKeyWithTtlJournalsStick) {
   EXPECT_EQ(args[3], "PXAT");
   EXPECT_EQ(args[5], "STICK")
       << "the key's OWN sticky bit must be reflected, not this SET's own (absent) STICK flag";
+  EXPECT_EQ(ClassifyJournaledCommand(args[0]), LwwClass::kSingleKey);
 }
 
 // drakeydb: an ordinary (non-KEEPTTL) SET with memcache flags must journal the flags value
@@ -7177,6 +7303,9 @@ TEST_F(MvccStoreTest, SetKeepttlOnStickyKeyWithTtlJournalsStick) {
 // an `absl::StrCat` temporary directly into the InlinedVector -- the temporary is destroyed at
 // the end of that statement, so the pushed view dangled by the time RecordJournal read it a few
 // lines later. Named-local storage fixes the dangling reference without changing the wire bytes.
+// The dangling-view regression is only reliably detectable under ASAN (CI's sanitizer job runs
+// this binary); a plain debug build does not reproduce it, so this test stands as a wire-shape
+// pin rather than a regression reproducer.
 TEST_F(MvccStoreTest, SetWithMemcacheFlagsJournalsCorrectValue) {
   Run({"del", "mc_flags_k"});
 
@@ -7196,14 +7325,13 @@ TEST_F(MvccStoreTest, SetWithMemcacheFlagsJournalsCorrectValue) {
   EXPECT_EQ(args[1], "mc_flags_k");
   EXPECT_EQ(args[2], "v");
   EXPECT_EQ(args[3], "_MCFLAGS");
-  EXPECT_EQ(args[4], "42") << "the journaled flags value must be exactly what was set, not "
-                              "whatever happened to occupy that freed stack slot";
+  EXPECT_EQ(args[4], "42") << "the journaled flags value must be exactly what was set";
+  EXPECT_EQ(ClassifyJournaledCommand(args[0]), LwwClass::kSingleKey);
 }
 
-// drakeydb: P4-4 -- "off means byte-identical to upstream" for every TTL-changing site this task
-// touched: EXPIRE, PERSIST, SET ... KEEPTTL and GETEX must still journal EXACTLY what they did
-// before this task on a non-active node -- a bare PEXPIREAT/PERSIST/KEEPTTL delta, never the
-// active node's full-state SET/RESTORE.
+// drakeydb: P4-4 -- "off means byte-identical to upstream" for every TTL-changing command: EXPIRE,
+// PERSIST, SET ... KEEPTTL and GETEX must still journal upstream's own shape on a non-active node
+// -- a bare PEXPIREAT/PERSIST/KEEPTTL delta, never the active node's full-state SET/RESTORE.
 //
 // Falsifying: swapping OpExpire's `else if (IsActiveReplica())` full-state branch
 // (generic_family.cc) to `else if (!IsActiveReplica())` makes this test's own EXPIRE block
@@ -7275,9 +7403,8 @@ TEST_F(BaseFamilyTest, NonActiveTtlCommandsJournalUpstreamVerbatim) {
     EXPECT_EQ(entries[0][1], "na_getex_k");
   }
 
-  // GETEX k PERSIST -> bare PERSIST, unconditionally, even on a key with no TTL to remove --
-  // upstream's own shape, ground truth read directly from `main`'s FindKeyAndSetExpiry/CmdGetEx
-  // (string_family.cc), not copied from the active-node code above.
+  // GETEX k PERSIST, k HAS a TTL to remove -> bare PERSIST -- upstream's own shape, not the
+  // active-node code above's full-state SET.
   {
     Run({"set", "na_getex_persist_k", "v", "PX", "100000"});
     auto entries = capture_cmd({"getex", "na_getex_persist_k", "PERSIST"});
@@ -7285,6 +7412,22 @@ TEST_F(BaseFamilyTest, NonActiveTtlCommandsJournalUpstreamVerbatim) {
     ASSERT_EQ(entries[0].size(), 2u);
     EXPECT_EQ(entries[0][0], "PERSIST");
     EXPECT_EQ(entries[0][1], "na_getex_persist_k");
+  }
+
+  // GETEX k PERSIST, k has NO TTL to remove -> upstream's own PERSIST call site
+  // (FindKeyAndSetExpiry, string_family.cc) does not special-case this the way the active-node
+  // OpPersist branch does: it still unconditionally revives the verbatim "PERSIST key"
+  // auto-journal for a no-op removal, since a non-active node never runs the no-change/no-journal
+  // check that only exists on the active-node full-state path.
+  {
+    Run({"set", "na_getex_persist_noop_k", "v"});
+    ASSERT_EQ(Run({"ttl", "na_getex_persist_noop_k"}).GetInt(), -1)
+        << "sanity: no TTL to begin with";
+    auto entries = capture_cmd({"getex", "na_getex_persist_noop_k", "PERSIST"});
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_EQ(entries[0].size(), 2u);
+    EXPECT_EQ(entries[0][0], "PERSIST");
+    EXPECT_EQ(entries[0][1], "na_getex_persist_noop_k");
   }
 
   // GAT persist form (exptime 0) -> bare PERSIST, its own independent call site
@@ -7304,6 +7447,44 @@ TEST_F(BaseFamilyTest, NonActiveTtlCommandsJournalUpstreamVerbatim) {
     ASSERT_EQ(args.size(), 2u);
     EXPECT_EQ(args[0], "PERSIST");
     EXPECT_EQ(args[1], "na_gat_persist_k");
+  }
+
+  // GAT with a future absolute expiry -> bare PEXPIREAT (name, key, abs time), never the
+  // active node's full-state SET.
+  {
+    using MP = MemcacheParser;
+    Run({"set", "na_gat_expire_k", "v"});
+    size_t pre;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      pre = consumer.entries.size();
+    }
+    GetMC(MP::GAT, {absl::StrCat(TEST_current_time_ms / 1000 + 100), "na_gat_expire_k"});
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), pre + 1);
+    const auto& args = consumer.entries[pre].args;
+    ASSERT_EQ(args.size(), 3u);
+    EXPECT_EQ(args[0], "PEXPIREAT");
+    EXPECT_EQ(args[1], "na_gat_expire_k");
+  }
+
+  // GAT with an already-past absolute expiry -> bare DEL, never a full-state SET/RESTORE.
+  {
+    using MP = MemcacheParser;
+    Run({"set", "na_gat_past_k", "v"});
+    size_t pre;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      pre = consumer.entries.size();
+    }
+    GetMC(MP::GAT, {absl::StrCat(TEST_current_time_ms / 1000 - 100), "na_gat_past_k"});
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), pre + 1);
+    const auto& args = consumer.entries[pre].args;
+    ASSERT_EQ(args.size(), 2u);
+    EXPECT_EQ(args[0], "DEL");
+    EXPECT_EQ(args[1], "na_gat_past_k");
+    EXPECT_EQ(Run({"exists", "na_gat_past_k"}).GetInt(), 0);
   }
 }
 

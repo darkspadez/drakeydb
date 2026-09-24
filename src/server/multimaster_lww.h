@@ -54,18 +54,21 @@ enum class LwwClass : uint8_t { kUnguarded, kSingleKey, kMultiKeySelfGuarded };
 // those entries carry mvcc 0 and are never guarded regardless (LwwGuardActive below) -- PEXPIREAT
 // and PERSIST are therefore absent from this table entirely, not merely unguarded by name. A
 // stale-binary active author that still emits a guarded PEXPIREAT/PERSIST with a real mvcc (only
-// reachable pre-release, mid-rollout, between peers that skip the replication-version gate --
-// kDrakeydbReplVersion, node_identity.h) is applied unguarded, in plain arrival order, against
-// whatever this node already holds for that key; the local stamp is then floored to stay
-// monotonic (FloorAppliedStamp, mvcc.cc) rather than set to the incoming mvcc verbatim, while this
-// node's own downstream re-journal of that apply (OpExpire/OpPersist's own full-state SET/RESTORE)
-// carries the incoming mvcc UNFLOORED, exactly as received -- the local commit and the forwarded
-// wire entry can therefore disagree on the exact stamp for one hop. A SAME-SHARD RENAME/RENAMENX,
-// a same-shard SORT ... STORE, and an exact (non-approximate, non-MAXLEN) XTRIM instead revive
-// auto-journal at runtime (Transaction::ReviveAutoJournal) and journal the client's own command
-// verbatim under its OWN name (RENAME/RENAMENX/SORT/XTRIM) -- none of those four names are in this
-// table, so they all classify kUnguarded; a documented residual of the runtime-revival mechanism,
-// not an oversight here. State-carrying RMW results that journal under a guarded name
+// reachable pre-release, between two peers running pre-release builds of the same replication
+// version -- kDrakeydbReplVersion, node_identity.h; a released binary never emits these two names
+// guarded) is applied unguarded, in plain arrival order, against whatever this node already holds
+// for that key; FloorAppliedStamp (mvcc.cc) then governs the local commit exactly as it does for
+// any other applied write -- verbatim when the incoming mvcc is not older than this key's own
+// stored stamp, floored one tick below it when the incoming mvcc IS older (F9's comment, mvcc.h)
+// -- while this node's own downstream re-journal of that apply (OpExpire/OpPersist's own
+// full-state SET/RESTORE) carries the incoming mvcc UNFLOORED, exactly as received regardless of
+// which branch the local commit took -- the local commit and the forwarded wire entry can
+// therefore disagree on the exact stamp for one hop whenever the floor fires. A SAME-SHARD
+// RENAME/RENAMENX, a same-shard SORT ... STORE, and an exact (non-approximate, non-MAXLEN) XTRIM
+// instead revive auto-journal at runtime (Transaction::ReviveAutoJournal) and journal the client's
+// own command verbatim under its OWN name (RENAME/RENAMENX/SORT/XTRIM) -- none of those four names
+// are in this table, so they all classify kUnguarded; a documented residual of the runtime-revival
+// mechanism, not an oversight here. State-carrying RMW results that journal under a guarded name
 // (PFMERGE/BITOP -> SET/DEL) are deliberately guarded here: a journaled SET is a blind full-state
 // write on the receiver, exactly as droppable as any other SET. Delta-journaled RMW (INCR, APPEND,
 // PFADD, ...) is deliberately absent: dropping a delta permanently loses it rather than merely
@@ -124,9 +127,13 @@ void NoteLwwDrop(std::string_view journaled_name, std::string_view key);
 // an earlier command). Reading the stored state instead of the command's flags is what keeps
 // every caller's output identical for the same resulting key state, regardless of which command
 // produced it. Callers: OpExpire/OpPersist's string branch and CmdGetEx/FindKeyAndSetExpiry
-// (a key changing only its TTL), SetCmd::RecordJournal's KEEPTTL branch (same reason), and
-// PFMERGE/BITOP's destination-already-has-a-TTL branch (hll_family.cc/bitops_family.cc) -- a
-// blind in-place value overwrite that keeps whatever TTL the destination already had.
+// (a key changing only its TTL), SetCmd::RecordJournal's KEEPTTL branch (same reason), and every
+// active-node PFMERGE/BITOP destination write (hll_family.cc/bitops_family.cc) -- unconditionally,
+// not only when the destination happens to already have a TTL: both blindly overwrite the VALUE in
+// place, so shipping the destination's current state is what keeps whatever TTL/STICK/memcache
+// flags it already had from being silently dropped on a receiver; a destination with none of those
+// degenerates to a plain `SET key value` on the wire, the same as this builder's output for any
+// other caller with nothing extra to carry.
 // DCHECK(!pv.IsExternal()): tiering is refused together with --active_replica
 // (ValidateMultiMasterFlags, multi_master.cc), so a value reaching this function -- always on an
 // active node -- is never offloaded. Declared here (so every caller shares one prototype) but

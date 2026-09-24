@@ -572,7 +572,10 @@ tombstone record, `T2` is strictly newer than `W`, so it wins and installs the t
 both nodes converge to absent. The repair is contingent on timing, though: if the peer's own
 `TombstoneGcStep` reaps `T2` (its TTL elapsed) before that full sync ever happens, the peer no
 longer sends anything for this key at all (no live value, no tombstone), and this node's `W` stands
-permanently — the delete is lost, not merely delayed.
+permanently — the delete is lost, not merely delayed. It is also contingent on nothing else landing
+on `W` first: an unguarded delta applied to this node's `W` between now and that full sync commits
+its own stamp verbatim if not older (D-23), which can push this node's stored stamp past `T2` and
+make the incoming tombstone lose the merge compare instead of winning it.
 
 **A second cause, not just an absent key's skip.** An applied, guarded `DEL`/`GETDEL` of a key
 whose TTL has already elapsed but which this node has not yet reaped hits the same symptom from a
@@ -588,8 +591,8 @@ not `X`. Since `X` can be arbitrarily larger than `ExpiryTombstoneFor(S)`, a thi
 stamped strictly between them applies HERE (it beats the low tombstone) while it is correctly
 dropped AT THE AUTHOR (whose own copy of the key was still live, non-expired, at command time, so
 its local `DEL` committed the real `X` directly, no expiry involved) — diverging exactly as the
-absent-key case does, repaired the same way by the author's next full sync, and lost the same way
-if that tombstone is GC'd first.
+absent-key case does, repaired the same way (subject to the same D-23 caveat above) by the author's
+next full sync, and lost the same way if that tombstone is GC'd first.
 
 **How established:** static reading of `OpDelV2`'s per-key skip-before-`FindMutable` ordering and
 of `ApplyMergeTombstoneOnShard`'s own `MergeAccepts` call; not reproduced with a live three-node
@@ -675,7 +678,9 @@ either: this node's manufactured value and the third peer's original value both 
 indefinitely, immune to each other's writes. Resolution arrives only when the third peer
 independently reaps its own copy: its own tombstone is `{P.Mvcc(), P.origin_hash + 1}`, strictly
 greater than this node's `P`-stamped value, so the next full sync between them converges — to
-absent, since a tombstone is what wins.
+absent, since a tombstone is what wins — provided no unguarded delta lands on this node's own copy
+of `k` first and pushes its stamp up to or past the third peer's tombstone (D-23); if one does, the
+full sync's compare no longer favors the incoming tombstone.
 
 **How established:** static derivation from `FloorAppliedStamp`'s documented one-tick-below
 landing (mvcc.h) composed with `ExpiryTombstoneFor`'s documented one-tick-above landing; not
@@ -690,10 +695,12 @@ in this register (D-19, D-21). **From:** P4-4.
 
 **Where:** every unguarded applied write (a delta RMW — `INCR`/`APPEND`/`HSET`-style commands/
 `PFADD`/… — never LWW-compared before applying, by design: see the guarded-vocabulary table,
-`multimaster_lww.h`) commits its OWN author's stamp verbatim (`journal.cc`'s `applied` branch,
-`!applied` path — the ordinary, non-floored commit; `FloorAppliedStamp` only ever fires for a write
-whose author stamp is OLDER than the stored one, never for a newer one, which an unguarded write's
-own author stamp always is relative to whatever it is racing).
+`multimaster_lww.h`) goes through `FloorAppliedStamp` (`src/server/mvcc.h`, `mvcc.cc`) like any
+other applied write. That function commits the incoming author stamp VERBATIM whenever it is NOT
+older than the key's own stored stamp; the floor (one origin_hash tick below `stored`, see F9's
+comment in `mvcc.h`) only fires for the opposite case, an incoming stamp OLDER than `stored`
+(D-21/D-22). So the stamps go identical specifically in the not-older case: whenever the delta's
+own author stamp equals or exceeds the receiver's stored stamp, it is committed as-is.
 
 Consequence: an unguarded delta applies to whatever value THIS node already holds for the key, then
 commits the author's stamp verbatim to it — regardless of whether some OTHER node holds a
@@ -701,18 +708,19 @@ DIFFERENT value for the same key at an OLDER stamp. Direct form, no prior diverg
 runs `SET k 5` stamped `S`; node B independently runs `INCR k` (starting from `0`) stamped `I`, with
 `I > S`. A's guarded `SET` reaches B: `I > S`, so B's guard correctly drops it (ties/older favor
 stored) — B keeps `1@I`, its own `INCR` result. B's unguarded `INCR` reaches A: a delta is never
-LWW-compared, so it applies unconditionally to A's OWN stored value (`5`) and commits `I` verbatim
-— A ends at `6@I`. The two nodes now sit at the SAME stamp `I` with DIFFERENT values (`6` and `1`)
-— ties favor the stored side, so a full sync cannot tell them apart either; only the next
-full-state write (`SET`/`DEL`/`RESTORE`, or one of the TTL-changing commands above) or the key's own
-expiry heals it. Consequence for the floor text above and D-21: their "heals at full sync" claims
-hold only up to the NEXT delta that lands on the same key — the floor (or the full sync itself)
-fixes the value/stamp pairing at that instant, but a delta applied afterward commits its own stamp
-on top, unconditionally, and can re-open the identical-stamp gap this entry describes.
+LWW-compared, so it applies to A's OWN stored value (`5`); `I` is not older than A's stored stamp
+`S`, so `FloorAppliedStamp` commits it verbatim — A ends at `6@I`. The two nodes now sit at the SAME
+stamp `I` with DIFFERENT values (`6` and `1`) — ties favor the stored side, so a full sync cannot
+tell them apart either; only the next full-state write (`SET`/`DEL`/`RESTORE`, or one of the
+TTL-changing commands above) or the key's own expiry heals it. Consequence for the floor text above
+and D-21: their "heals at full sync" claims hold only up to the NEXT delta that lands on the same
+key — the floor (or the full sync itself) fixes the value/stamp pairing at that instant, but a delta
+applied afterward commits its own stamp on top whenever that stamp is not older than what is
+currently stored, and can re-open the identical-stamp gap this entry describes.
 
-**How established:** static derivation from `MvccStamper::Commit`'s `!applied` branch (`journal.cc`)
-composed with `MergeAccepts`'s tie-favors-stored rule (`mvcc.h`); not reproduced against a live
-two-node divergence.
+**How established:** static derivation from `FloorAppliedStamp`'s not-older-than-`stored` verbatim
+branch (`mvcc.cc`) composed with `MergeAccepts`'s tie-favors-stored rule (`mvcc.h`); not reproduced
+against a live two-node divergence.
 
 **Owner:** future work (CRDT-style deltas, or a per-field/per-key stamp finer than one MVCC stamp
 per key, so a delta and a full-state write on the same key stop competing for the same stamp).
@@ -728,24 +736,76 @@ applies it OVERWRITES whatever value it locally holds, exactly like any other gu
 Consequence: node A and node B both run `INCR k` (converging on the same count once both deltas
 land on both sides), then A alone runs `EXPIRE k 60` before B's own `INCR` has reached it. A's
 `EXPIRE` ships a guarded `SET k <A's own count> PXAT <abs>` — A's count at that instant, which does
-NOT yet include B's still-in-flight `INCR`. When that guarded `SET` reaches B (newer stamp, so it
-applies), B's own more-current count (which DOES include its own `INCR`) is overwritten wholesale
-by A's stale-relative-to-B count. One node ends up one count behind the other, with the TTL itself
-identical on both (an absolute deadline, carried verbatim). This is the same shape as D-23 — a
-guarded full-state write clobbering a delta it never saw — specialized to the TTL-changing
-commands specifically, since those are the ones that turn an everyday `EXPIRE`/`PERSIST`/`GETEX`
-into a full-state, guarded write as of this phase.
+NOT yet include B's still-in-flight `INCR`. This is the same shape as D-23 — a guarded full-state
+write and an unguarded delta racing on the same key — specialized to the TTL-changing commands,
+since those are the ones that turn an everyday `EXPIRE`/`PERSIST`/`GETEX` into a full-state,
+guarded write as of this phase. Which stamp ends up newer decides which of two different outcomes
+results:
 
-- **The divergence is bounded**: the next TTL change on the same key ships the CURRENT value again
-  (whatever it is by then) and re-converges the two nodes; the TTL deadline itself is never in
-  question, since it is carried as an absolute timestamp identical on every node regardless of
-  which count won.
+- **TTL-change-newer order: bounded.** When that guarded `SET` reaches B with a newer stamp than
+  B's own `INCR`, it applies: B's own more-current count is overwritten wholesale by A's
+  stale-relative-to-B count. One node ends up one count behind the other, with the TTL itself
+  identical on both (an absolute deadline, carried verbatim) — but this is NOT permanent: every
+  LATER TTL change on the same key ships the CURRENT value again (whatever it is by then), so the
+  next `EXPIRE`/`PERSIST`/`GETEX`/`SET ... KEEPTTL` re-converges the two nodes' counts, and once
+  both copies carry the same absolute deadline, they expire together.
+- **Delta-newer order: an identical-stamp divergence, not new here.** If instead B's `INCR` reaches
+  A AFTER A's own `EXPIRE`, A's guarded `SET` loses at B (B's guard compares it against B's own
+  newer, `INCR`-derived stamp and correctly drops it as stale) while B's `INCR`, unguarded, applies
+  to A verbatim (`FloorAppliedStamp` commits it as-is: it is not older than A's own stored stamp).
+  Both nodes now sit at the SAME stamp with the SAME count, but only A's copy carries the TTL — B's
+  does not, since `INCR` never touches TTL. Expiry deletes are never forwarded on peer links (see
+  D-22), so A's key eventually vanishes locally while B's identically-stamped, TTL-less copy lives
+  on: the divergence persists until the next full-state write touches this key (or one of D-23's
+  own resolution conditions). This is D-23's general case, not a new exposure that shipping the TTL
+  change as full state introduced — any delta racing any guarded full-state write on the same key
+  already had this shape before this phase; full-state TTL journaling inherits it rather than
+  causing it.
 - **Operator rule:** avoid mixing cross-node deltas with concurrent TTL changes (or `SET`s) on the
   same key from a different node; each is safe alone, only the combination has this gap.
 
 **How established:** static derivation from the full-state TTL design (this phase) composed with
-`MergeAccepts`'s guarded-write-wins-on-newer-stamp rule (`mvcc.h`); not reproduced against a live
-two-node divergence.
+`MergeAccepts`'s guarded-write-wins-on-newer-stamp rule (`mvcc.h`) and D-23's own delta-verbatim-
+commit mechanism; not reproduced against a live two-node divergence.
 
-**Owner:** future work — same fix as D-23 (a per-key TTL stamp, decoupled from the value's own
-stamp, so a TTL change never needs to carry the value at all). **From:** P4-4.
+**Owner:** the TTL-change-newer order is self-healing and needs no separate fix. The delta-newer
+order IS D-23 — not a distinct defect with its own owner — so it shares D-23's owner and fix: a
+per-key TTL stamp, decoupled from the value's own stamp, would close both at once, since a TTL
+change would then never need to carry the value to begin with. **From:** P4-4.
+
+### D-25. Upstream `PFMERGE` writes a phantom destination on every participating shard
+
+**Where:** `HllFamily::PFMergeInternal`'s destination-write callback, `set_cb` (`hll_family.cc`).
+`tx->Execute(set_cb, true)` runs `set_cb` on EVERY shard the transaction touches — the destination
+key's own shard plus every source key's shard — not just the destination's. The callback itself
+never checks which shard it is running on before calling `db_slice.AddOrFind(t->GetDbContext(),
+key, OBJ_STRING)` on the closure-captured destination `key`: on a shard that does not own that key,
+`AddOrFind` still succeeds (a `DashTable` has no notion of "the wrong shard" for a key it is simply
+asked to insert), creating an independent, phantom entry named identically to the real destination,
+living only in that shard's own table. A live probe against a non-active binary confirmed it:
+`DBSIZE` read back one higher than the number of distinct keys actually written, and `SCAN`
+returned the destination's name twice.
+
+Effects: on a non-active node, `DBSIZE`/`SCAN`/`KEYS` all double-count the destination for as long
+as the phantom's shard is never asked to overwrite or delete it independently (nothing else ever
+touches a key by that name on that shard, so the phantom is inert but persists). Under multi-master
+before this phase's fix, the phantom was additionally armed, stamped by ITS OWN shard's clock, and
+journaled as its own separate `SET dest v` entry racing the owning shard's, letting whichever of the
+two arrived at a guarded receiver second silently overwrite whatever the first one carried
+(including a TTL the owning shard's own write correctly preserved) — see the TTL-preserving
+full-state fix earlier in this phase, and `PfmergeAcrossShardsJournalsOnlyFromOwningShard`/
+`NonActivePfmergeAcrossShardsKeepsUpstreamPhantomShape` (`multi_master_test.cc`) for the pins.
+
+**How established:** static reading of `PFMergeInternal`'s `set_cb`, confirmed live against a
+non-active binary (`DBSIZE`/`SCAN` both showed the duplicate) and against an active one (the
+cross-shard journal duplication, closed by this phase's `dest_shard` filter on `IsActiveReplica()`
+links only). `BITOP`'s own `store_cb` (`bitops_family.cc`) already filtered to its `dest_shard`
+before this phase and never had this defect; `PFMERGE`'s `set_cb` did not.
+
+**Under multi-master:** fixed on active nodes — `set_cb` now skips every shard that does not own the
+destination when `IsActiveReplica()`. A non-active node keeps upstream's own phantom-writing shape
+exactly, unchanged, per the byte-identity invariant.
+
+**Owner:** candidate upstream report (the defect is upstream's own; drakeydb only fixes it on the
+active-node path, since a non-active node must stay byte-identical to upstream, phantom copies
+included). **From:** P4-4.

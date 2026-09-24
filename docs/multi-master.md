@@ -70,8 +70,9 @@ verbatim, exactly as upstream does.
 **What it does not do:** merge-LWW only ever compares against *this node's own resident stamp*
 for a key. It has no notion of a global "true" value, no quorum, and no read-repair outside a
 full sync. Two nodes can each accept different values for the same key from different partitions
-without either node knowing the other one exists; the next full sync between them is what
-resolves it (again by the tie rule above).
+without either node knowing the other one exists; the next full sync between them resolves it
+(again by the tie rule above), provided no later unguarded delta lands on that key first and
+re-opens an identical-stamp gap of its own (see D-23, [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md)).
 
 ### Stamped peers vs. unstamped peers
 
@@ -183,26 +184,40 @@ reordering it, and there is no full "result" to journal instead.
 **Shipping the TTL change as full state means it no longer commutes with a concurrent unguarded
 delta on the same key.** Both node A and node B run `INCR k`, then A runs `EXPIRE k 60`: A's
 `EXPIRE` ships the CURRENT value under a guarded `SET` — but A only has its own copy of `k`, so
-that guarded `SET` carries A's own count, not B's. If A's `INCR` landed first (so A's count already
-reflects B's `INCR` too), the guarded `SET` correctly carries both increments and B converges to
-it. But if the two `INCR`s are still in flight relative to each other, A's `EXPIRE`-derived `SET`
-can carry a count that has NOT yet seen B's `INCR`, and — because it is a guarded full-state write
-— a receiver applying it OVERWRITES whatever count it locally holds, discarding an increment that
-had nothing to do with the TTL change at all. One node can end up at the pre-`EXPIRE` count, the
-other at a count one higher, with the TTL itself correctly identical on both (see D-24,
-[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), for the concrete trace).
+that guarded `SET` carries A's own count, not B's. If B's `INCR` reaches A FIRST (so A's count
+already reflects B's `INCR` too before A ever runs `EXPIRE`), the guarded `SET` correctly carries
+both increments and B converges to it. But if A's `EXPIRE` ships before B's `INCR` reaches A, A's
+`EXPIRE`-derived `SET` carries a count that has NOT yet seen B's `INCR`. Which of these two
+orderings occurs decides which of the two outcomes below results (see D-24,
+[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), for the concrete trace of both):
 
-- **The divergence is bounded, not permanent — unlike a SET/TTL race, an EXPIRE/delta race always
-  has a way out**: every LATER TTL change on that key ships the full value again (whatever it is
-  by then), so the next `EXPIRE`/`PERSIST`/`GETEX`/`SET ... KEEPTTL` re-converges the two nodes;
-  and the TTL itself is never in question — a TTL'd key expires at the identical absolute deadline
-  on every node regardless of which count won, so the divergence cannot outlive the key.
-- **Still strictly better than journaling the TTL as a delta.** A `SET` racing a bare `PEXPIREAT`
-  delta (the pre-this-task shape) left two nodes with IDENTICAL stamps on DIFFERENT VALUES — ties
-  favor the stored side, so neither a later TTL change (still just a delta, carrying no value) nor
-  the key's own expiry could ever repair that pairing; it was permanent. Shipping full state trades
-  that permanent divergence for a bounded one that the next full-state write on the SAME key always
-  closes.
+- **TTL-change-newer order: bounded.** Because A's `SET` is a guarded full-state write, a receiver
+  applying it OVERWRITES whatever count it locally holds, discarding an increment that had nothing
+  to do with the TTL change at all — B ends up one count behind A, with the TTL itself identical on
+  both (an absolute deadline, carried verbatim). This is NOT permanent: every LATER TTL change on
+  the same key ships the full value again (whatever it is by then), so the next
+  `EXPIRE`/`PERSIST`/`GETEX`/`SET ... KEEPTTL` re-converges the two nodes' counts, and once both
+  copies carry the same absolute deadline, they expire together.
+- **Delta-newer order: an identical-stamp divergence, inherited from D-23, not introduced here.**
+  If B's `INCR` instead reaches A after A's own `EXPIRE` already shipped, A's guarded `SET` is the
+  OLDER write at B and is correctly dropped as stale, while B's `INCR`, unguarded, applies to A
+  verbatim on top of A's TTL'd copy. Both nodes end at the SAME stamp with the SAME count, but only
+  A's copy carries the TTL — B's does not, since `INCR` never touches TTL. Expiry deletes are never
+  forwarded on peer links, so A's key eventually vanishes locally while B's identically-stamped,
+  TTL-less copy lives on indefinitely, until the next full-state write touches this key. Any delta
+  racing any guarded full-state write on the same key already had this shape before TTL changes
+  shipped full state (see D-23) — this is that same exposure, not a new one.
+- **Still generally an improvement over a bare TTL delta, though not a universal fix.** Before this
+  phase, every TTL-changing command journaled a bare `PEXPIREAT`/`PERSIST`/`KEEPTTL` delta instead
+  of full state, and a `SET` racing that delta could also land two nodes on IDENTICAL stamps with
+  DIFFERENT values. When the delta happened to be a `PEXPIREAT` carrying the SAME absolute deadline
+  onto both copies, the key's own expiry eventually deletes both sides at (approximately) the same
+  instant, which at least made the stale pairing moot rather than truly repairing it — but that
+  coincidence never held for `PERSIST`/`KEEPTTL` (no deadline to share), and it does not apply to
+  the delta-newer order above either: there, only ONE copy ever carries a TTL, so only that one
+  side ever expires, and the other survives indefinitely. Shipping the TTL change as full state
+  does not remove that residual — see the delta-newer order above — but it does give the
+  TTL-change-newer order a real, general repair path that a bare TTL delta never had.
 - **Operator rule:** avoid mixing cross-node deltas (`INCR`/`APPEND`/`HSET`-style commands/`PFADD`)
   with concurrent TTL changes or `SET`s on the same key from a different node. Deltas and TTL
   changes are each safe on their own; only the combination — a delta racing a full-state write
@@ -619,12 +634,14 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
   untouched (nothing to delete, nothing armed); a later write stamped between the two is then
   accepted here while a peer that saw the `DEL` against a still-live value holds a newer
   tombstone — a divergence a subsequent full sync from that peer repairs while its tombstone is
-  still live, but not otherwise. Owned by P4-5 (tombstone lifecycle).
+  still live, but not otherwise, and only if no later unguarded delta lands on the key first (see
+  D-23). Owned by P4-5 (tombstone lifecycle).
 - **D-21** — a non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/
   `ZDIFFSTORE`/`ZRANGESTORE`, or `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST` result always
   journals `DEL` (guarded) then `SADD`/`ZADD` (delta, unguarded) as two entries; a guarded receiver
   with a newer destination drops the `DEL` but still applies the add, merging a stale result into
   its own newer value. A later full sync from a node still holding the clean, correctly-stamped
-  value repairs it; nothing in steady-state streaming does. Owner: open.
+  value repairs it, provided no other unguarded delta lands on the key first (see D-23); nothing in
+  steady-state streaming does. Owner: open.
 
 See that document for the full list, upstream-bug cross-references, and each entry's owning phase.

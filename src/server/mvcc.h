@@ -222,7 +222,9 @@ inline MvccStamp ExpiryTombstoneFor(const MvccStamp& value) {
 //
 // Landing one origin_hash below `stored` (or one mvcc tick below it, at origin_hash 0) keeps two
 // properties `max()` could not: the result is still strictly LESS than `stored`, so a clean copy
-// stamped exactly `stored` beats it on the next merge and heals the divergence; and it still
+// stamped exactly `stored` beats it on the next merge and heals the divergence -- provided no
+// later unguarded delta lands on this key first and commits its own stamp on top (see D-23,
+// docs/ISSUE-REGISTER.md, for the case where it does); and it still
 // rejects every stamp `stored` itself would have rejected, EXCEPT `stored` itself -- a tie always
 // rejects itself, but the floor must not, or the clean copy above could never win and heal the
 // divergence -- so no other previously-dropped stale write starts winning either. This also means

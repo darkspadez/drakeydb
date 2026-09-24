@@ -319,7 +319,23 @@ OpResult<int> PFMergeInternal(string_view key, Transaction* tx, SinkReplyBuilder
   hll.resize(getDenseHllSize());
   createDenseHll(StringToHllPtr(hll));
   int result = pfmerge(ptrs.data(), ptrs.size(), StringToHllPtr(hll));
+  const ShardId dest_shard = Shard(key, shard_set->size());
   auto set_cb = [&](Transaction* t, EngineShard* shard) {
+    // drakeydb: P4-4 -- this callback runs on every shard the transaction touches (the
+    // destination plus every source key), not just the destination's own shard. Without this
+    // filter, each NON-owning shard's AddOrFind(key) below creates its own, independent, PHANTOM
+    // copy of the destination in that shard's own table (see D-25, docs/ISSUE-REGISTER.md) --
+    // upstream's own shape, mirrored here for a non-active node. On an active node that phantom
+    // gets its own arm and its own bare "SET key v" journal entry, racing the owning shard's
+    // full-state one: a guarded receiver applies both, and whichever lands second silently
+    // clobbers the TTL the first one carried. Filtered to the owning shard only, mirroring
+    // BITOP's own dest_shard filter (bitops_family.cc). A non-active node has no per-key stamp to
+    // protect and must see upstream's own (phantom-writing) shape exactly, so this filter is
+    // active-only.
+    if (IsActiveReplica() && shard->shard_id() != dest_shard) {
+      return OpStatus::OK;
+    }
+
     const OpArgs& op_args = t->GetOpArgs(shard);
     auto& db_slice = op_args.GetDbSlice();
     auto op_res = db_slice.AddOrFind(t->GetDbContext(), key, OBJ_STRING);
