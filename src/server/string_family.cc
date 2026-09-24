@@ -1156,9 +1156,16 @@ void SetCmd::RecordJournal(const SetParams& params, string_view key, string_view
   if (params.flags & SET_STICK) {
     cmds.push_back("STICK");
   }
+  // drakeydb: an upstream bug, not new here -- `mcflags_str` must be a NAMED local that outlives
+  // the RecordJournal call below: `cmds.push_back(absl::StrCat(...))` would push a string_view
+  // bound to StrCat's return value, a temporary destroyed at the end of this statement, leaving a
+  // dangling entry in `cmds` for RecordJournal to read. Bytes on the wire are unchanged either
+  // way; only the storage's lifetime is the fix.
+  std::string mcflags_str;
   if (params.memcache_flags) {
+    mcflags_str = absl::StrCat(params.memcache_flags);
     cmds.push_back("_MCFLAGS");
-    cmds.push_back(absl::StrCat(params.memcache_flags));
+    cmds.push_back(mcflags_str);
   }
 
   // Skip NX/XX because SET operation was executed.

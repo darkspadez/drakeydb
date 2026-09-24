@@ -7172,6 +7172,34 @@ TEST_F(MvccStoreTest, SetKeepttlOnStickyKeyWithTtlJournalsStick) {
       << "the key's OWN sticky bit must be reflected, not this SET's own (absent) STICK flag";
 }
 
+// drakeydb: an ordinary (non-KEEPTTL) SET with memcache flags must journal the flags value
+// byte-correct: `SetCmd::RecordJournal`'s `_MCFLAGS` append used to push a `string_view` bound to
+// an `absl::StrCat` temporary directly into the InlinedVector -- the temporary is destroyed at
+// the end of that statement, so the pushed view dangled by the time RecordJournal read it a few
+// lines later. Named-local storage fixes the dangling reference without changing the wire bytes.
+TEST_F(MvccStoreTest, SetWithMemcacheFlagsJournalsCorrectValue) {
+  Run({"del", "mc_flags_k"});
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> ids(shard_set->size());
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { ids[shard->shard_id()] = journal::RegisterConsumer(&consumer); });
+  ASSERT_EQ(Run({"set", "mc_flags_k", "v", "_MCFLAGS", "42"}), "OK");
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(consumer.entries.size(), 1u);
+  const auto& args = consumer.entries[0].args;
+  ASSERT_EQ(args.size(), 5u) << "SET key value _MCFLAGS n";
+  EXPECT_EQ(args[0], "SET");
+  EXPECT_EQ(args[1], "mc_flags_k");
+  EXPECT_EQ(args[2], "v");
+  EXPECT_EQ(args[3], "_MCFLAGS");
+  EXPECT_EQ(args[4], "42") << "the journaled flags value must be exactly what was set, not "
+                              "whatever happened to occupy that freed stack slot";
+}
+
 // drakeydb: P4-4 -- "off means byte-identical to upstream" for every TTL-changing site this task
 // touched: EXPIRE, PERSIST, SET ... KEEPTTL and GETEX must still journal EXACTLY what they did
 // before this task on a non-active node -- a bare PEXPIREAT/PERSIST/KEEPTTL delta, never the
