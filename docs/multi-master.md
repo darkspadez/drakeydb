@@ -180,6 +180,37 @@ guarded** — `INCR`, `APPEND`, `LPUSH`, `HSET`-style commands, `PFADD`, and sim
 by plain arrival order, guard on or off: dropping a delta permanently loses it rather than merely
 reordering it, and there is no full "result" to journal instead.
 
+**Shipping the TTL change as full state means it no longer commutes with a concurrent unguarded
+delta on the same key.** Both node A and node B run `INCR k`, then A runs `EXPIRE k 60`: A's
+`EXPIRE` ships the CURRENT value under a guarded `SET` — but A only has its own copy of `k`, so
+that guarded `SET` carries A's own count, not B's. If A's `INCR` landed first (so A's count already
+reflects B's `INCR` too), the guarded `SET` correctly carries both increments and B converges to
+it. But if the two `INCR`s are still in flight relative to each other, A's `EXPIRE`-derived `SET`
+can carry a count that has NOT yet seen B's `INCR`, and — because it is a guarded full-state write
+— a receiver applying it OVERWRITES whatever count it locally holds, discarding an increment that
+had nothing to do with the TTL change at all. One node can end up at the pre-`EXPIRE` count, the
+other at a count one higher, with the TTL itself correctly identical on both (see D-24,
+[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), for the concrete trace).
+
+- **The divergence is bounded, not permanent — unlike a SET/TTL race, an EXPIRE/delta race always
+  has a way out**: every LATER TTL change on that key ships the full value again (whatever it is
+  by then), so the next `EXPIRE`/`PERSIST`/`GETEX`/`SET ... KEEPTTL` re-converges the two nodes;
+  and the TTL itself is never in question — a TTL'd key expires at the identical absolute deadline
+  on every node regardless of which count won, so the divergence cannot outlive the key.
+- **Still strictly better than journaling the TTL as a delta.** A `SET` racing a bare `PEXPIREAT`
+  delta (the pre-this-task shape) left two nodes with IDENTICAL stamps on DIFFERENT VALUES — ties
+  favor the stored side, so neither a later TTL change (still just a delta, carrying no value) nor
+  the key's own expiry could ever repair that pairing; it was permanent. Shipping full state trades
+  that permanent divergence for a bounded one that the next full-state write on the SAME key always
+  closes.
+- **Operator rule:** avoid mixing cross-node deltas (`INCR`/`APPEND`/`HSET`-style commands/`PFADD`)
+  with concurrent TTL changes or `SET`s on the same key from a different node. Deltas and TTL
+  changes are each safe on their own; only the combination — a delta racing a full-state write
+  (a TTL change, a `SET`, `PFMERGE`, `BITOP`, ...) on the SAME key from ANOTHER node — has this gap.
+- **The real fix, future work:** a per-key TTL stamp — a separate LWW register for the TTL, decoupled
+  from the value's own stamp — so a TTL change never needs to carry (or clobber) the value at all.
+  Not attempted here.
+
 **A non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/
 `ZDIFFSTORE`/`ZRANGESTORE`, or `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST` result is a
 known gap, not yet fixed.** Unlike `SORT ... STORE`'s own destination write, every one of these
@@ -302,7 +333,12 @@ stamp floor (`FloorAppliedStamp`, `mvcc.h`) that protects an *unguarded* applied
 order — guard off, a delta-RMW command, or a plain replica) whose author stamp is older than the
 key's stored stamp `S` commits `{S.mvcc, S.origin_hash - 1}` instead of that older stamp verbatim —
 one tick below `S`, keeping the key's stamp monotone for practical purposes, so a later, clean full
-sync from a peer holding `S` still wins the next merge compare and the two copies re-converge.
+sync from a peer holding `S` still wins the next merge compare and the two copies re-converge --
+**provided no OTHER delta lands on this key in between** (see D-23,
+[`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md): an unguarded delta applied after the floor commits
+its OWN author's stamp verbatim, on top of the floored one, which can leave two nodes at the
+IDENTICAL stamp on DIFFERENT values — a full sync's tie-breaking cannot tell those apart, so it
+takes a further write to heal, not the floor by itself).
 (Edge case: `FloorAppliedStamp` already excludes `S.Mvcc() == 0` — the fresh-key/uncommitted-
 placeholder shape — before reaching this branch at all, so `S.origin_hash == 0` here means a real,
 non-zero-`mvcc` stamp whose hash field happens to be exactly `0`; the floor then lands at

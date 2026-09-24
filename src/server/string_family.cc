@@ -95,32 +95,6 @@ StringResult BorrowStringOrRead(DbIndex dbid, string_view key, const PrimeValue&
   return ReadString(dbid, key, pv, es);
 }
 
-// drakeydb: P4-4 -- journals this string key's full state (value, absolute TTL, STICK, memcache
-// flags) under SET, in place of a delta (PERSIST/PEXPIREAT), on an active node: a delta only
-// tells a receiver "change the TTL", so a receiver holding a different value for this key ends up
-// applying that change to ITS OWN value, producing a pairing neither peer ever actually wrote.
-// Every call site of this helper (GETEX, GAT, SET ... KEEPTTL) already filtered to OBJ_STRING
-// before reaching it, so unlike generic_family.cc's OpExpire/OpPersist there is no RESTORE branch
-// to dispatch to here; it mirrors SetCmd::RecordJournal's own SET shape byte for byte.
-void RecordFullStateSet(const OpArgs& op_args, string_view key, string_view value,
-                        const PrimeKey& pk, uint32_t mcflags) {
-  absl::InlinedVector<string_view, 6> cmds({key, value});
-  string exp_str;
-  if (pk.HasExpire()) {
-    exp_str = absl::StrCat(pk.GetExpireTime());
-    cmds.insert(cmds.end(), {"PXAT"sv, exp_str});
-  }
-  if (pk.IsSticky())
-    cmds.push_back("STICK"sv);
-  string mcflags_str;
-  if (mcflags != 0) {
-    mcflags_str = absl::StrCat(mcflags);
-    cmds.push_back("_MCFLAGS"sv);
-    cmds.push_back(mcflags_str);
-  }
-  dfly::RecordJournal(op_args, "SET"sv, ArgSlice{cmds});
-}
-
 // Helper for performing SET operations with various options
 class SetCmd {
  public:
@@ -165,7 +139,7 @@ class SetCmd {
                 PrimeValue* pv, DbSlice::AutoUpdater& post_updater);
 
   void RecordJournal(const SetParams& params, std::string_view key, std::string_view value,
-                     const PrimeKey& pk);
+                     const PrimeKey& pk, const PrimeValue& pv);
 
   OpStatus CachePrevIfNeeded(const SetParams& params, DbSlice::Iterator it);
 
@@ -949,12 +923,7 @@ OpResult<DbSlice::Iterator> FindKeyAndSetExpiry(const GetAndTouchParams& params)
       // possibly different, value -- a pairing neither peer ever actually wrote. A persist that
       // changed nothing (no TTL existed) must journal nothing at all, not even a no-op PERSIST.
       if (!noop_persist) {
-        DCHECK(!find_res->it->second.IsExternal());
-        const PrimeValue& pv = find_res->it->second;
-        const PrimeKey& pk = find_res->it->first;
-        const string value_str = pv.ToString();
-        const uint32_t mcflags = pv.HasFlag() ? db_slice.GetMCFlag(ctx.db_index, pk) : 0;
-        RecordFullStateSet(op_args, params.key, value_str, pk, mcflags);
+        JournalFullStateSet(op_args, params.key, find_res->it->first, find_res->it->second);
       }
     } else if (params.expire_params.persist) {
       // GAT 0 removes the expiry; PEXPIREAT with the returned 0 would delete the replica's key.
@@ -1153,12 +1122,27 @@ void SetCmd::PostEdit(const SetParams& params, std::string_view key, std::string
     if (skip_journal_)
       journal::ClearBuffer();
     else
-      RecordJournal(params, key, value, *pk);
+      RecordJournal(params, key, value, *pk, *pv);
   }
 }
 
 void SetCmd::RecordJournal(const SetParams& params, string_view key, string_view value,
-                           const PrimeKey& pk) {
+                           const PrimeKey& pk, const PrimeValue& pv) {
+  // drakeydb: P4-4 -- on an active node, KEEPTTL must ship the surviving absolute TTL (and STICK
+  // / memcache flags) as part of this write's own full state, through the one shared builder
+  // every full-state-SET site uses (JournalFullStateSet, multimaster_lww.h): the journaled name
+  // carries no memory of "this receiver's OWN ttl", so a receiver applying a bare KEEPTTL SET
+  // verbatim keeps ITS OWN, possibly different, TTL instead of converging on the author's.
+  // SET_KEEP_EXPIRE fires on a fresh key too (AddNew reaches this function exactly like
+  // SetExisting does, when a client sends `SET k v KEEPTTL` for a key that doesn't exist yet) --
+  // pk/pv are this write's own resulting key state either way, so the shared builder reads the
+  // right thing regardless of which path got here. A non-active node has no per-key stamp to
+  // protect and must see the exact upstream KEEPTTL shape, so it skips this branch entirely.
+  if (IsActiveReplica() && (params.flags & SET_KEEP_EXPIRE)) {
+    JournalFullStateSet(op_args_, key, pk, pv);
+    return;
+  }
+
   absl::InlinedVector<string_view, 5> cmds({key, value});  // 5 is theoretical maximum;
 
   std::string exp_str;
@@ -1166,22 +1150,7 @@ void SetCmd::RecordJournal(const SetParams& params, string_view key, string_view
     exp_str = absl::StrCat(params.expire_after_ms + op_args_.db_cntx.time_now_ms);
     cmds.insert(cmds.end(), {"PXAT", exp_str});
   } else if (params.flags & SET_KEEP_EXPIRE) {
-    // drakeydb: P4-4 -- on an active node, KEEPTTL must ship the surviving absolute TTL as part
-    // of this write's own full state: the journaled name carries no memory of "this receiver's
-    // OWN ttl", so a receiver applying a bare KEEPTTL SET verbatim keeps ITS OWN,
-    // possibly different, TTL instead of converging on the author's. SET_KEEP_EXPIRE only ever
-    // fires on an EXISTING key (SetExisting), so pk is the same key this write just left alone --
-    // its TTL (if any) is exactly what survives. A non-active node has no per-key stamp to
-    // protect and must see the exact upstream KEEPTTL shape.
-    if (IsActiveReplica()) {
-      if (pk.HasExpire()) {
-        exp_str = absl::StrCat(pk.GetExpireTime());
-        cmds.insert(cmds.end(), {"PXAT", exp_str});
-      }
-      // else: no TTL survives this write -- a plain "SET key value" already says that.
-    } else {
-      cmds.push_back("KEEPTTL");
-    }
+    cmds.push_back("KEEPTTL");
   }
 
   if (params.flags & SET_STICK) {
@@ -1554,13 +1523,7 @@ cmd::CmdR CmdGetEx(CmdArgParser parser, CommandContext* cmd_cntx) {
         if (key_expired) {
           RecordJournal(op_args, "DEL", {key});
         } else if (!noop_persist) {
-          DCHECK(!it_res->it->second.IsExternal());
-          const PrimeValue& pv = it_res->it->second;
-          const PrimeKey& pk = it_res->it->first;
-          const string value_str = pv.ToString();
-          const uint32_t mcflags =
-              pv.HasFlag() ? op_args.GetDbSlice().GetMCFlag(op_args.db_cntx.db_index, pk) : 0;
-          RecordFullStateSet(op_args, key, value_str, pk, mcflags);
+          JournalFullStateSet(op_args, key, it_res->it->first, it_res->it->second);
         }
       } else if (exp_params.persist) {
         RecordJournal(op_args, "PERSIST", {key});
@@ -1947,6 +1910,37 @@ void CmdClThrottle(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 }  // namespace
+
+// drakeydb: P4-4 -- declared in multimaster_lww.h (every caller across generic_family.cc,
+// string_family.cc, hll_family.cc and bitops_family.cc shares one prototype); defined here, at
+// this file's own (non-anonymous) namespace scope rather than inside the block above, so it gets
+// external linkage those other translation units can actually call -- and here, rather than in
+// multimaster_lww.cc, because it needs DbSlice::GetMCFlag, and this file already links against
+// the library that provides it (see the header comment for the full reason).
+void JournalFullStateSet(const OpArgs& op_args, string_view key, const PrimeKey& pk,
+                         const PrimeValue& pv) {
+  DCHECK(!pv.IsExternal());
+  DCHECK_EQ(pv.ObjType(), OBJ_STRING);
+  auto& db_slice = op_args.GetDbSlice();
+
+  const string value_str = pv.ToString();
+  absl::InlinedVector<string_view, 6> cmds({key, value_str});
+
+  string exp_str;
+  if (pk.HasExpire()) {
+    exp_str = absl::StrCat(pk.GetExpireTime());
+    cmds.insert(cmds.end(), {"PXAT"sv, exp_str});
+  }
+  if (pk.IsSticky())
+    cmds.push_back("STICK"sv);
+  string mcflags_str;
+  if (pv.HasFlag()) {
+    mcflags_str = absl::StrCat(db_slice.GetMCFlag(op_args.db_cntx.db_index, pk));
+    cmds.push_back("_MCFLAGS"sv);
+    cmds.push_back(mcflags_str);
+  }
+  RecordJournal(op_args, "SET"sv, ArgSlice{cmds});
+}
 
 #define HFUNC(x) SetHandler(&Cmd##x)
 

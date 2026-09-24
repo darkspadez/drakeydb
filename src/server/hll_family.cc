@@ -17,6 +17,8 @@ extern "C" {
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
+#include "server/multi_master.h"
+#include "server/multimaster_lww.h"
 #include "server/tiered_storage.h"
 #include "server/transaction.h"
 
@@ -339,7 +341,17 @@ OpResult<int> PFMergeInternal(string_view key, Transaction* tx, SinkReplyBuilder
     res.post_updater.Run();
 
     if (op_args.shard->journal()) {
-      RecordJournal(op_args, "SET", ArgSlice{key, hll});
+      // drakeydb: P4-4 -- SetString above overwrites the VALUE in place, never touching the
+      // destination key's own TTL (TTL lives on the key, not the value) -- an existing,
+      // TTL-carrying destination keeps that TTL. A bare "SET key hll" would silently drop it on
+      // the receiver (the same partial-state defect SET ... KEEPTTL had), so an active node ships
+      // the destination's full state -- value, TTL, STICK, memcache flags -- through the shared
+      // builder instead; a non-active node keeps the exact upstream shape.
+      if (IsActiveReplica()) {
+        JournalFullStateSet(op_args, key, res.it->first, res.it->second);
+      } else {
+        RecordJournal(op_args, "SET", ArgSlice{key, hll});
+      }
     }
 
     return OpStatus::OK;

@@ -319,34 +319,20 @@ OpResult<string> DumpToString(string_view key, const PrimeValue& pv, const OpArg
 // flags) under a guarded name, in place of a delta (PEXPIREAT/PERSIST): a delta only tells a
 // receiver "change the TTL", so a receiver that independently holds a different value for this
 // key applies that TTL change to ITS OWN value, producing a value/TTL pairing neither peer ever
-// actually wrote. A string ships as SET (mirroring SetCmd::RecordJournal's own SET shape byte for
-// byte); every other type ships as its own RESTORE dump, reusing exactly the serialization
-// Renamer::SerializeSrc/DeserializeDest already use for RENAME/COPY. Tiering refuses to run
-// alongside --active_replica (see ValidateMultiMasterFlags, multi_master.cc), so a value reaching
-// this function -- always on an active node -- is never offloaded; the DCHECK documents that
-// assumption instead of silently mishandling an external value.
+// actually wrote. A string ships as SET, through the one shared builder
+// (JournalFullStateSet, multimaster_lww.h) every other full-state-SET site uses too, so they can
+// never disagree on where a field comes from; every other type ships as its own RESTORE dump,
+// reusing exactly the serialization Renamer::SerializeSrc/DeserializeDest already use for
+// RENAME/COPY. Tiering refuses to run alongside --active_replica (see ValidateMultiMasterFlags,
+// multi_master.cc), so a value reaching this function -- always on an active node -- is never
+// offloaded; the DCHECK documents that assumption instead of silently mishandling an external
+// value.
 void RecordFullStateJournal(const OpArgs& op_args, string_view key, const PrimeKey& pk,
                             const PrimeValue& pv) {
   DCHECK(!pv.IsExternal());
-  auto& db_slice = op_args.GetDbSlice();
 
   if (pv.ObjType() == OBJ_STRING) {
-    const string value_str = pv.ToString();
-    absl::InlinedVector<string_view, 6> cmds({key, value_str});
-    string exp_str;
-    if (pk.HasExpire()) {
-      exp_str = absl::StrCat(pk.GetExpireTime());
-      cmds.insert(cmds.end(), {"PXAT"sv, exp_str});
-    }
-    if (pk.IsSticky())
-      cmds.push_back("STICK"sv);
-    string mcflags_str;
-    if (pv.HasFlag()) {
-      mcflags_str = absl::StrCat(db_slice.GetMCFlag(op_args.db_cntx.db_index, pk));
-      cmds.push_back("_MCFLAGS"sv);
-      cmds.push_back(mcflags_str);
-    }
-    RecordJournal(op_args, "SET"sv, ArgSlice{cmds});
+    JournalFullStateSet(op_args, key, pk, pv);
     return;
   }
 

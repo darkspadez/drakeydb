@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "server/mvcc.h"
+#include "server/table.h"
 
 // drakeydb: P4-4 -- forward declaration only: ApplyLwwRewrites below takes a pointer, so callers
 // never need the complete type from this header. Every caller of ApplyLwwRewrites already has
@@ -51,9 +52,15 @@ enum class LwwClass : uint8_t { kUnguarded, kSingleKey, kMultiKeySelfGuarded };
 // OpExpire/OpPersist, generic_family.cc, and CmdGetEx/FindKeyAndSetExpiry, string_family.cc). A
 // NON-active node still journals PEXPIREAT/PERSIST verbatim for byte-identity with upstream, but
 // those entries carry mvcc 0 and are never guarded regardless (LwwGuardActive below) -- PEXPIREAT
-// and PERSIST are therefore absent from this table entirely, not merely unguarded by name: an
-// old-format entry that somehow arrived with a real mvcc still fails open rather than being
-// guarded against a name this node's own writers no longer produce. A SAME-SHARD RENAME/RENAMENX,
+// and PERSIST are therefore absent from this table entirely, not merely unguarded by name. A
+// stale-binary active author that still emits a guarded PEXPIREAT/PERSIST with a real mvcc (only
+// reachable pre-release, mid-rollout, between peers that skip the replication-version gate --
+// kDrakeydbReplVersion, node_identity.h) is applied unguarded, in plain arrival order, against
+// whatever this node already holds for that key; the local stamp is then floored to stay
+// monotonic (FloorAppliedStamp, mvcc.cc) rather than set to the incoming mvcc verbatim, while this
+// node's own downstream re-journal of that apply (OpExpire/OpPersist's own full-state SET/RESTORE)
+// carries the incoming mvcc UNFLOORED, exactly as received -- the local commit and the forwarded
+// wire entry can therefore disagree on the exact stamp for one hop. A SAME-SHARD RENAME/RENAMENX,
 // a same-shard SORT ... STORE, and an exact (non-approximate, non-MAXLEN) XTRIM instead revive
 // auto-journal at runtime (Transaction::ReviveAutoJournal) and journal the client's own command
 // verbatim under its OWN name (RENAME/RENAMENX/SORT/XTRIM) -- none of those four names are in this
@@ -107,5 +114,26 @@ inline bool LwwShouldDropKey(const std::optional<MvccStamp>& stored, const MvccS
 // cmd + key, and a LOG_EVERY_T(INFO, 60) rollup of the running total. Never a per-drop
 // LOG(INFO) -- a conflicting workload drops thousands per second.
 void NoteLwwDrop(std::string_view journaled_name, std::string_view key);
+
+// drakeydb: P4-4 -- the single builder for a STRING key's full-state SET, journaled under a
+// guarded name in place of a delta: `SET key value [PXAT abs] [STICK] [_MCFLAGS n]`. Every field
+// is read from `pk`/`pv` -- this key's own, CURRENT, post-write stored state -- never from
+// whatever flags happened to appear on the client command that produced it: a command's own
+// flags describe what THAT command asked for, not what the key ends up holding (KEEPTTL asks for
+// nothing about the TTL; a plain SET without STICK doesn't mean the key isn't already sticky from
+// an earlier command). Reading the stored state instead of the command's flags is what keeps
+// every caller's output identical for the same resulting key state, regardless of which command
+// produced it. Callers: OpExpire/OpPersist's string branch and CmdGetEx/FindKeyAndSetExpiry
+// (a key changing only its TTL), SetCmd::RecordJournal's KEEPTTL branch (same reason), and
+// PFMERGE/BITOP's destination-already-has-a-TTL branch (hll_family.cc/bitops_family.cc) -- a
+// blind in-place value overwrite that keeps whatever TTL the destination already had.
+// DCHECK(!pv.IsExternal()): tiering is refused together with --active_replica
+// (ValidateMultiMasterFlags, multi_master.cc), so a value reaching this function -- always on an
+// active node -- is never offloaded. Declared here (so every caller shares one prototype) but
+// defined in string_family.cc, not multimaster_lww.cc: the body reads the destination key's
+// memcache flags via DbSlice, which multimaster_lww.cc's own link target (the dfly_transaction
+// library, shared by mvcc_test's narrower link closure) does not otherwise pull in.
+void JournalFullStateSet(const OpArgs& op_args, std::string_view key, const PrimeKey& pk,
+                         const PrimeValue& pv);
 
 }  // namespace dfly

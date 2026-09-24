@@ -633,7 +633,10 @@ later full sync from any node still holding the clean value stamped exactly `S` 
 next merge compare and overwrites the corrupted merge. Nothing in steady-state streaming repairs
 it on its own (an ordinary streamed write only ever compares against whatever is *currently*
 stored, never specifically targets undoing this) — only a subsequent full sync from a clean-`S`
-holder does.
+holder does, PROVIDED no other unguarded delta lands on this same key first: a delta applied after
+this floor commits its OWN author's stamp verbatim on top of the floored one (D-23), which can
+reach or pass `S` and leave the corrupted merge at an identical-or-newer stamp that full sync's own
+tie-breaking treats as equally or more authoritative than the clean copy.
 
 **How established:** static reading of `SetFamily::OpAdd`/`ZSetFamily::OpAdd`'s journaling
 branches, every call site that passes `overwrite`/`override`, and the applied-write stamp floor
@@ -682,3 +685,67 @@ reproduced against a live three-node topology (see D-15's identical three-peer c
 delta RMW is unguarded by design regardless of the flag — see the global constraints' guarded-name
 table) and a third peer lagging behind this node's own reap, both already-accepted shapes elsewhere
 in this register (D-19, D-21). **From:** P4-4.
+
+### D-23. Any divergence on a key becomes an identical-stamp divergence at the next unguarded delta
+
+**Where:** every unguarded applied write (a delta RMW — `INCR`/`APPEND`/`HSET`-style commands/
+`PFADD`/… — never LWW-compared before applying, by design: see the guarded-vocabulary table,
+`multimaster_lww.h`) commits its OWN author's stamp verbatim (`journal.cc`'s `applied` branch,
+`!applied` path — the ordinary, non-floored commit; `FloorAppliedStamp` only ever fires for a write
+whose author stamp is OLDER than the stored one, never for a newer one, which an unguarded write's
+own author stamp always is relative to whatever it is racing).
+
+Consequence: an unguarded delta applies to whatever value THIS node already holds for the key, then
+commits the author's stamp verbatim to it — regardless of whether some OTHER node holds a
+DIFFERENT value for the same key at an OLDER stamp. Direct form, no prior divergence needed: node A
+runs `SET k 5` stamped `S`; node B independently runs `INCR k` (starting from `0`) stamped `I`, with
+`I > S`. A's guarded `SET` reaches B: `I > S`, so B's guard correctly drops it (ties/older favor
+stored) — B keeps `1@I`, its own `INCR` result. B's unguarded `INCR` reaches A: a delta is never
+LWW-compared, so it applies unconditionally to A's OWN stored value (`5`) and commits `I` verbatim
+— A ends at `6@I`. The two nodes now sit at the SAME stamp `I` with DIFFERENT values (`6` and `1`)
+— ties favor the stored side, so a full sync cannot tell them apart either; only the next
+full-state write (`SET`/`DEL`/`RESTORE`, or one of the TTL-changing commands above) or the key's own
+expiry heals it. Consequence for the floor text above and D-21: their "heals at full sync" claims
+hold only up to the NEXT delta that lands on the same key — the floor (or the full sync itself)
+fixes the value/stamp pairing at that instant, but a delta applied afterward commits its own stamp
+on top, unconditionally, and can re-open the identical-stamp gap this entry describes.
+
+**How established:** static derivation from `MvccStamper::Commit`'s `!applied` branch (`journal.cc`)
+composed with `MergeAccepts`'s tie-favors-stored rule (`mvcc.h`); not reproduced against a live
+two-node divergence.
+
+**Owner:** future work (CRDT-style deltas, or a per-field/per-key stamp finer than one MVCC stamp
+per key, so a delta and a full-state write on the same key stop competing for the same stamp).
+**From:** P4-4.
+
+### D-24. A TTL change racing a concurrent delta clobbers the delta on one node
+
+**Where:** `OpExpire`/`OpPersist` (`generic_family.cc`) and `CmdGetEx`/`FindKeyAndSetExpiry`
+(`string_family.cc`), on an active node, ship the key's CURRENT full value alongside its TTL change
+(see the full-state TTL paragraph, `docs/multi-master.md`) — a guarded write, so a receiver that
+applies it OVERWRITES whatever value it locally holds, exactly like any other guarded `SET`.
+
+Consequence: node A and node B both run `INCR k` (converging on the same count once both deltas
+land on both sides), then A alone runs `EXPIRE k 60` before B's own `INCR` has reached it. A's
+`EXPIRE` ships a guarded `SET k <A's own count> PXAT <abs>` — A's count at that instant, which does
+NOT yet include B's still-in-flight `INCR`. When that guarded `SET` reaches B (newer stamp, so it
+applies), B's own more-current count (which DOES include its own `INCR`) is overwritten wholesale
+by A's stale-relative-to-B count. One node ends up one count behind the other, with the TTL itself
+identical on both (an absolute deadline, carried verbatim). This is the same shape as D-23 — a
+guarded full-state write clobbering a delta it never saw — specialized to the TTL-changing
+commands specifically, since those are the ones that turn an everyday `EXPIRE`/`PERSIST`/`GETEX`
+into a full-state, guarded write as of this phase.
+
+- **The divergence is bounded**: the next TTL change on the same key ships the CURRENT value again
+  (whatever it is by then) and re-converges the two nodes; the TTL deadline itself is never in
+  question, since it is carried as an absolute timestamp identical on every node regardless of
+  which count won.
+- **Operator rule:** avoid mixing cross-node deltas with concurrent TTL changes (or `SET`s) on the
+  same key from a different node; each is safe alone, only the combination has this gap.
+
+**How established:** static derivation from the full-state TTL design (this phase) composed with
+`MergeAccepts`'s guarded-write-wins-on-newer-stamp rule (`mvcc.h`); not reproduced against a live
+two-node divergence.
+
+**Owner:** future work — same fix as D-23 (a per-key TTL stamp, decoupled from the value's own
+stamp, so a TTL change never needs to carry the value at all). **From:** P4-4.
