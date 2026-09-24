@@ -27,6 +27,8 @@ extern "C" {
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/family_utils.h"
+#include "server/mvcc.h"
+#include "server/namespaces.h"
 #include "server/search/doc_index.h"
 #include "server/tiered_storage.h"
 #include "server/tiering/decoders.h"
@@ -1669,8 +1671,33 @@ bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std:
       // unaffected. (SetFamily::DeleteSetIfEmpty, set_family.cc, has an analogous second
       // carve-out for SORT -- OBJ_HASH is not one of SORT's sortable types, so it never reaches
       // this helper.)
+      //
+      // drakeydb: P4-4 -- the `derived` branch's own tombstone must derive from the hash's own
+      // prior stamp (`ExpiryTombstoneFor`, mvcc.h -- one origin_hash tick above it), mirroring
+      // the member-expiry reaper (DbSlice::DeleteReapedContainer, db_slice.cc): this DEL is
+      // peer-suppressed (kEntryFlagDerived), exactly the shape RecordExpiryBlocking's own
+      // whole-key expiry has, so a freshly minted local stamp here is the identical reap-time-
+      // stamp defect. The `else` branch (OpFieldExpire's carve-out) is UNCHANGED: that DEL IS
+      // forwarded to peers (via the plain RecordDelete below, never suppressed), so it must keep
+      // carrying the causing command's own stamp (db_cntx.repl_mvcc, applied or local), never an
+      // expiry-style advance of the hash's OLD prior stamp -- a peer replaying this exact command
+      // needs to see the SAME stamp this node just committed, not a different one derived from
+      // data the peer never had.
       if (derived) {
-        RecordDerivedDelete(db_cntx, key);
+        MvccStamp committed;
+        const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
+            db_cntx.db_index, key, db_cntx.time_now_ms,
+            [&committed](DbIndex db, string_view k, const MvccStamp& st, bool, const MvccStamp&) {
+              committed = st;
+              namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+            });
+        if (found_tombstone) {
+          DbContext patched_cntx = db_cntx;
+          patched_cntx.repl_mvcc = committed.Mvcc();
+          RecordDerivedDelete(patched_cntx, key);
+        } else {
+          RecordDerivedDelete(db_cntx, key);
+        }
       } else {
         RecordDelete(db_cntx, key);
       }

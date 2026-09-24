@@ -3103,6 +3103,115 @@ TEST_F(MvccStoreTest, LocalDelWithMidCommandLazyExpiryStampsSiblingWithItsOwnWir
       << "k1 staying armed across k2's expiry must not leak it as an unstamped write";
 }
 
+// drakeydb: P4-4 -- SetFamily::DeleteSetIfEmpty's `derived` (default true) branch must earn the
+// SAME kind of tombstone the member-expiry reaper and RecordExpiryBlocking's own whole-key expiry
+// do: `ExpiryTombstoneFor` (mvcc.h) applied to the set's own prior stamp, never a freshly minted
+// local one. This DEL is peer-suppressed (kEntryFlagDerived, RecordDerivedDelete) exactly like the
+// reaper's own, so a fresh mint here is the identical reap-time-stamp defect: it would outrank
+// every write between the value's own stamp and the moment of reaping, including a guarded peer
+// write with real authority that this node has not seen yet -- just reached through a command
+// (SISMEMBER) discovering the member-TTL expiry lazily instead of
+// the heartbeat discovering a whole-key one. SISMEMBER (not FIELDEXPIRE) is the trigger
+// deliberately: FIELDEXPIRE's own emptying uses the `derived=false` carve-out (RecordDelete, the
+// causing command's own stamp, correctly unaffected by this change -- see
+// FieldExpireEmptyingSetEarnsATombstone, above in this file, which already covers that path and
+// needed no change here), so this test exercises the OTHER, default branch instead.
+//
+// Falsifying: reverting the `derived` branch's own CommitOwnTombstone call (set_family.cc) back to
+// an unconditional `RecordDerivedDelete(db_cntx, key)` reproduces the old behavior: the first
+// EXPECT_EQ below fails (tomb comes back self-originated with a freshly-minted Mvcc(), not one
+// tick above S), and the guarded peer write below gets wrongly dropped (Run({"get",...}) stays
+// nil, not "peer_v") -- the fresh mint outranks a peer write it never even saw.
+TEST_F(MvccStoreTest, MemberTtlEmptiedSetByCommandEarnsExpiryTombstoneAndAppliesLaterPeerWrite) {
+  constexpr uint32_t kPeerIdx = 63;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-1313-4000-8000-000000000063");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"sadd", "mset", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "mset", "1", "m"});
+  auto s_stamp = StampOf("mset");  // S: the set's own stamp after arming the member TTL
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(1100);  // past the 1s member TTL
+
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+  // SISMEMBER queries the expired member specifically: IsInSet's own time-aware lookup
+  // (StringSetWrapper::Contains) lazily reaps it, and SetFamily::DeleteSetIfEmpty (default
+  // derived=true) then removes the now-empty set.
+  EXPECT_EQ(Run({"sismember", "mset", "m"}).GetInt(), 0);
+  ASSERT_EQ(Run({"exists", "mset"}).GetInt(), 0) << "guard against a vacuous pass";
+
+  auto tomb = StampOf("mset");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  // Independently constructed, not by calling ExpiryTombstoneFor.
+  EXPECT_EQ(*tomb,
+            (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
+      << "must be one origin_hash tick above S, never a freshly minted self stamp";
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+
+  // A guarded peer write stamped strictly between S and this node's own (much later, after
+  // AdvanceTime) wall clock must still apply -- it would be wrongly dropped against a reap-time
+  // mint, which would land near "now", not near S.
+  const uint64_t stamp_i = (s_stamp->MsPart() + 500) << MvccClock::kCounterBits;
+  ASSERT_GT(stamp_i, s_stamp->Mvcc()) << "sanity: I is strictly after S";
+  ASSERT_LT(stamp_i, GetCurrentTimeMs() << MvccClock::kCounterBits)
+      << "sanity: I is nowhere near this node's own wall clock";
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "mset", "peer_v"}, kPeerIdx, stamp_i, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "mset"}), "peer_v")
+      << "a write strictly newer than S must still apply, not be wrongly dropped against a "
+         "reap-time mint that landed near this node's wall clock instead of near S";
+}
+
+// drakeydb: P4-4 -- the HSetFamily::DeleteIfEmpty analogue of the test directly above: its own
+// `derived` (default true) branch must earn the identical kind of tombstone, for the identical
+// reason (this DEL is peer-suppressed too). HTTL (not FIELDEXPIRE) is the trigger deliberately, for
+// the same reason SISMEMBER is above: FIELDEXPIRE's own emptying uses the `derived=false` carve-out
+// (see FieldExpireEmptyingHashEarnsATombstone, above in this file, unaffected by this change);
+// HTTL's own lazy field-expiry discovery (HSetFamily::FieldExpireTime) reaches the OTHER, default
+// branch instead.
+//
+// Falsifying: reverting the `derived` branch's own CommitOwnTombstone call (hset_family.cc) back to
+// an unconditional `RecordDerivedDelete(db_cntx, key)` reproduces the old behavior: the first
+// EXPECT_EQ below fails, and the guarded peer write below gets wrongly dropped.
+TEST_F(MvccStoreTest, MemberTtlEmptiedHashByCommandEarnsExpiryTombstoneAndAppliesLaterPeerWrite) {
+  constexpr uint32_t kPeerIdx = 64;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-1414-4000-8000-000000000064");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"hset", "mhash", "f", "v"}).GetInt(), 1);
+  Run({"fieldexpire", "mhash", "1", "f"});
+  auto s_stamp = StampOf("mhash");
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(1100);
+
+  const uint64_t before_unstamped = TotalUnstampedWrites();
+  // HTTL triggers HSetFamily::FieldExpireTime's own lazy field-expiry check, then
+  // HSetFamily::DeleteIfEmpty (default derived=true) removes the now-empty hash.
+  Run({"httl", "mhash", "fields", "1", "f"});
+  ASSERT_EQ(Run({"exists", "mhash"}).GetInt(), 0) << "guard against a vacuous pass";
+
+  auto tomb = StampOf("mhash");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(*tomb,
+            (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
+      << "must be one origin_hash tick above S, never a freshly minted self stamp";
+  EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+
+  const uint64_t stamp_i = (s_stamp->MsPart() + 500) << MvccClock::kCounterBits;
+  ASSERT_GT(stamp_i, s_stamp->Mvcc()) << "sanity: I is strictly after S";
+  ASSERT_LT(stamp_i, GetCurrentTimeMs() << MvccClock::kCounterBits)
+      << "sanity: I is nowhere near this node's own wall clock";
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"set", "mhash", "peer_v"}, kPeerIdx, stamp_i, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "mhash"}), "peer_v")
+      << "a write strictly newer than S must still apply, not be wrongly dropped against a "
+         "reap-time mint that landed near this node's wall clock instead of near S";
+}
+
 // drakeydb: P4-4 Task A3 -- the generic single-key LWW veto's core case: a guarded peer link must
 // drop a replicated SET whose author stamp is not strictly newer than the key's own stored stamp,
 // leaving the local value AND its stamp completely untouched while still reporting the hop as
