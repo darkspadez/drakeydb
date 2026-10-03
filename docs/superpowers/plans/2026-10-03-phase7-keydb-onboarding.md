@@ -45,13 +45,20 @@ Ledger (reports, progress): the same directory.
   still `fb2::Mutex` here); no `std::regex`; Google style, `snake_case` vars, `PascalCase`
   functions, `kPascalCase` constants; no commented-out code; comment density matches the file.
 - Malformed input from a master is **skipped, counted and warned with `LOG_EVERY_T`, never a
-  disconnect, never a `CHECK`**; `repl_offs_` stays exact.
+  disconnect, never a `CHECK`**; `repl_offs_` stays exact. The carve-out: input that breaks the
+  framing cannot be skipped past, so it is a logged error and a reconnect, still never a `CHECK` — a
+  malformed full-sync header or tail (Task 0.6, ISSUE-REGISTER U-11) and a RESP framing error in the
+  stream. Envelope-level malformations (a bad envelope, an unknown inner command, a failing apply)
+  are the ones that skip.
 - Build: `ninja -C /home/user/drakeydb/build-dbg -j4 <target>` (never more than `-j4`; `-Werror`;
   keep `WITH_SEARCH` ON; run a complete `ninja` before any `ctest -L DFLY`).
 - Pytest (absolute paths, from the repo root):
   `cd /home/user/drakeydb && DRAGONFLY_PATH=/home/user/drakeydb/build-dbg/dragonfly
-  KEYDB_SERVER_PATH=<abs keydb-server> /root/drakey-venv/bin/python -m pytest
-  tests/dragonfly/<file> -x -q`. Gate runs add `KEYDB_REQUIRED=1`. Timing-sensitive tests run x10.
+  KEYDB_SERVER_PATH=<abs keydb-server> /root/drakey-venv-pinned/bin/python -m pytest
+  tests/dragonfly/<file> -x -q` (`/root/drakey-venv-pinned` is redis-py 7.4.1, what
+  `requirements.txt`'s `redis>=5.2.1,<8.0.0` pin resolves to; the older `/root/drakey-venv` has
+  redis-py 8.1.0 and must not be used for a gate). Gate runs add `KEYDB_REQUIRED=1`.
+  Timing-sensitive tests run x10.
   **Wrap every pytest run in `flock /tmp/drakey-pytest.lock …`**: `conftest.py` `rmtree`s
   `/tmp/dragonfly_logs` at session start, so concurrent sessions in one container corrupt each other.
 - `pre-commit run --files <changed files>` before every commit. Commit subjects <= 100 characters,
@@ -80,10 +87,9 @@ Ledger (reports, progress): the same directory.
   /home/user/drakeydb/build-opt -j4 dragonfly` (free disk first by deleting the non-gate debug
   test binaries; they relink from objects later). Debug builds and CI run the functional smoke only.
 - Anchors below were re-read at `c60dfdb`; `src/` is unchanged since except the P7-0
-  implementation commit `a0ee234` (Tasks 0.4-0.6 and 0.9, which shifted lines in `replica.cc`,
-  `rdb_load.cc` and `main_service.cc`); the other commits since are ledger/doc commits and the
-  test/CI harness (`5199f34`, `89414e5`). Re-verify before editing; if one drifted, fix it here in
-  the same commit.
+  implementation (Tasks 0.4-0.6 and 0.9, which shifted lines in `replica.cc`, `rdb_load.cc` and
+  `main_service.cc`); the other commits since are ledger/doc commits and the test/CI harness (Tasks
+  0.7, 0.8). Re-verify before editing; if one drifted, fix it here in the same commit.
 
 ## Verified anchors (c60dfdb)
 
@@ -148,18 +154,19 @@ Ledger (reports, progress): the same directory.
 
 ## P7-0 `feat/phase7-0-closeout-and-harness`
 
-### Task 0.1: P4 close-out docs and the U-8 live test (done; review pending)
+### Task 0.1: P4 close-out docs and the U-8 live test (done; review folded into the whole-branch review)
 
 **Goal:** Make the repo's status text true before building on it: PLAN.md/README status, P4-4
 record, version 67 to 68, Phase 5/6 notes, stale "(once it exists)", re-owned register items, and
 settle the U-8 dispute.
 **Files:** `docs/PLAN.md`, `docs/README.md`/`README.md`, `docs/UPSTREAM-SYNC.md`,
 `docs/ISSUE-REGISTER.md`.
-- [x] Committed as `a162d75` and `a549973`. U-8 was **withdrawn** by a live re-test (16/16
+- [x] Committed on the P7-0 branch. U-8 was **withdrawn** by a live re-test (16/16
   `GEORADIUS*/STORE*` destinations replicated; `geo_family.cc:654` sets `journal_update` and
   `ZSetFamily::OpAdd` hand-journals, `zset_family.cc:1963`, `:2053-2072`). The active-KeyDB
   handshake failure was also reproduced live and recorded in `progress.md`.
-- [ ] Reviewer pass (spec + quality); fix loop.
+- [ ] Reviewer pass (spec + quality); fix loop. (Done as part of the P7-0 whole-branch review,
+  below.)
 
 **Falsification:** docs-only; the live U-8 test is its own evidence (ledger `progress.md`).
 **Done:** review green; register owners no longer say "P4-5"/"PR-B".
@@ -168,17 +175,20 @@ settle the U-8 dispute.
 
 **Goal:** A full P4 exit-gate baseline, so P7 regressions are separable from pre-existing flakes.
 **Files:** none (ledger `progress.md`, `docs/PLAN.md` P4-4 record).
-- [ ] `ninja -C /home/user/drakeydb/build-dbg -j4` (warning-free), then
-  `cd /home/user/drakeydb/build-dbg && ctest -L DFLY` (full).
-- [ ] Pytest, each file separately: `multimaster_test.py`, `multimaster_merge_test.py`,
+- [x] `ninja -C /home/user/drakeydb/build-dbg -j4` (warning-free), then
+  `cd /home/user/drakeydb/build-dbg && ctest -L DFLY` (full; run as `-j3`: 86 of 88 passed).
+- [x] Pytest, each file separately: `multimaster_test.py`, `multimaster_merge_test.py`,
   `redis_replication_test.py` (the upstream suite for `Greet`/`InitiatePSync`/`ConsumeRedisStream`,
   runnable here through the `redis-server` fallback), `replication_test.py`,
   `replication_specific_test.py`, `replication_resilience_test.py`, `replication_config_test.py`,
   `cluster_test.py::test_cluster_migrations_sequence`.
-- [ ] Triage each failure: rerun x3 in isolation, classify as flake or real, record evidence. The
+- [x] Triage each failure: rerun x3 in isolation, classify as flake or real, record evidence. The
   baseline's `ReaperJournalFamilyTest.MemberExpiryReaperDoesNotBlockOnConcurrentBgsave` failure
-  (`multi_master_test.cc:10148`, loaded `-j3` run only) is owned by Task 0.9.
-- [ ] Counts into the ledger and into `docs/PLAN.md`'s P4-4 record.
+  (`multi_master_test.cc:10148`, loaded `-j3` run only) is owned by Task 0.9. (Done differently:
+  every pytest failure but the IPv6 one was re-run under the redis-py pin and passed, and the reaper
+  test passed 20 of 20 isolated, rather than x3 for each; the ledger has it. The cause was the
+  client, not the code.)
+- [x] Counts into the ledger and into `docs/PLAN.md`'s P4-4 record.
 
 **Falsification:** n/a (measurement). **Done:** 0 unexplained failures; counts recorded.
 
@@ -187,7 +197,8 @@ settle the U-8 dispute.
 **Goal:** Commit the Phase 7 design spec and implementation plan in the P4 documents' house style.
 **Files:** `docs/superpowers/specs/2026-10-03-phase7-keydb-onboarding-design.md`,
 `docs/superpowers/plans/2026-10-03-phase7-keydb-onboarding.md`.
-- [ ] Reviewer pass; fix loop; the orchestrator commits.
+- [x] Reviewer pass; fix loop; the orchestrator commits. (The spec/plan review and the advisor's
+  resolutions are folded in.)
 
 **Falsification:** n/a. **Done:** both documents committed; `pre-commit` clean.
 
@@ -204,26 +215,30 @@ dfly_test_lib LABELS DFLY)`; `:202-207` add to `check_dfly`); Test
 keydb_fastsync_save; }` and `CapaReply ParseCapaReply(std::string_view)` (first token exactly `OK`,
 case-sensitive; later tokens space-separated, unknown words ignored).
 
-- [ ] **Step 1: Failing tests.** `ClassicReplayTest.ParseCapaReplyAcceptsOkAndSuffixes` (`OK`,
+- [x] **Step 1: Failing tests.** `ClassicReplayTest.ParseCapaReplyAcceptsOkAndSuffixes` (`OK`,
   `OK active-replica`, `OK keydb-fastsync-save`, `OK active-replica keydb-fastsync-save`, extra
   spaces) and `ClassicReplayTest.ParseCapaReplyRejectsNonOk` (`OKAY`, `ok`, `ERR`, empty,
   `OKactive-replica`). Pytest `test_greet_accepts_keydb_active_replica_capa_reply`, two halves,
   each with its own `proxy_factory` proxy in front of the `redis_server` fixture master and a plain
   drakeydb replica: half A overrides the reply to `REPLCONF capa eof` with `+OK active-replica\r\n`
   (site `replica.cc:432`); half B overrides the reply to `REPLCONF capa dragonfly` (site `:611`).
-  Each asserts `REPLICAOF` returns `OK`, `master_link_status:up`, and a seeded key arrives.
-- [ ] **Step 2: Run, observe failure.** gtest does not build (no header). Pytest: `REPLICAOF`
+  Each asserts `REPLICAOF` returns `OK`, `master_link_status:up`, and a seeded key arrives. (Built
+  in `multimaster_test.py`, not `keydb_onboarding_test.py`: they need only a stock Redis; see the
+  Task 0.4 report.)
+- [x] **Step 2: Run, observe failure.** gtest does not build (no header). Pytest: `REPLICAOF`
   fails; the drakeydb log shows `Bad response to "REPLCONF capa eof capa psync2":
   "+OK active-replica\r\n"` (as reproduced live in `progress.md`).
-- [ ] **Step 3: Implement** `ParseCapaReply`; in `Greet()` replace the two strict checks with
+- [x] **Step 3: Implement** `ParseCapaReply`; in `Greet()` replace the two strict checks with
   `ParseCapaReply` over `LastResponseArgs()` (exactly one `STRING` arg), keeping
   `PC_RETURN_ON_BAD_RESPONSE` diagnostics. Do **not** record or act on `active_replica` yet
-  (Task 1.4). All other `CheckRespIsSimpleReply("OK")` calls in `Greet()` stay.
-- [ ] **Step 4: Run tests; falsify** by restoring the strict-equality checks: both pytest halves
+  (Task 1.4). All other `CheckRespIsSimpleReply("OK")` calls in `Greet()` stay. (Deviation: the bit
+  is recorded in `master_active_replica_` already, per spec D-2; nothing reads it until P7-1.)
+- [x] **Step 4: Run tests; falsify** by restoring the strict-equality checks: both pytest halves
   and the `ParseCapaReply*` tests fail. Restore, record verbatim.
-- [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`, `./classic_replay_test`, the pytest;
+- [x] **Step 5:** `ninja -j4 classic_replay_test dragonfly`, `./classic_replay_test`, the pytest;
   pre-commit; commit
-  `fix: accept "+OK <suffix>" capa replies so an active KeyDB can be greeted (P7)`.
+  `fix: accept "+OK <suffix>" capa replies so an active KeyDB can be greeted (P7)`. (Committed with
+  Tasks 0.5, 0.6 and 0.9 as one P7-0 implementation commit.)
 
 **Done:** both halves pass against a real Redis master and `redis_replication_test.py` stays green
 (the stock-Redis handshake path is unchanged; a byte-level check needs the `Proxy` request capture
@@ -235,7 +250,7 @@ that arrives with Task 1.4, so this task does not claim one).
 null connection.
 **Files:** Modify `src/server/main_service.cc` (`:2459`); Test `src/server/dragonfly_test.cc`;
 `docs/ISSUE-REGISTER.md`.
-- [ ] **Step 1: Failing test** `DflyEngineTest.EvalReplicatedApplyNoConnNoCrash`: build a
+- [x] **Step 1: Failing test** `DflyEngineTest.EvalReplicatedApplyNoConnNoCrash`: build a
   `ConnectionContext{nullptr, acl::UserCredentials{}}` exactly as `ConsumeRedisStream`
   (`replica.cc:1113-1117`) does (`is_replicating`, `journal_emulated`, `skip_acl_validation`, `ns`),
   a `facade::CapturingReplyBuilder{ReplyMode::NONE}`, and dispatch `EVAL "return
@@ -243,14 +258,14 @@ null connection.
   as `MvccStoreTest::ApplyReplicatedCommand`, `multi_master_test.cc:839`) with `<key>` chosen so
   `Shard(key, shard_set->size())` differs from thread 0's shard. Assert the key is then set. Needs
   `proactor_threads >= 2` shards; check the fixture's shard count.
-- [ ] **Step 2: Run, observe failure:** SIGSEGV in `RequestAsyncMigration` (null `this`).
-- [ ] **Step 3: Implement** `&& conn_cntx->conn() != nullptr` in the condition at `:2459`.
-- [ ] **Step 4: Run; falsify** by removing the guard again: the test binary crashes. Restore,
+- [x] **Step 2: Run, observe failure:** SIGSEGV in `RequestAsyncMigration` (null `this`).
+- [x] **Step 3: Implement** `&& conn_cntx->conn() != nullptr` in the condition at `:2459`.
+- [x] **Step 4: Run; falsify** by removing the guard again: the test binary crashes. Restore,
   record.
-- [ ] **Step 5:** `ISSUE-REGISTER.md`: mark U-9 resolved by this task. The adjacent unguarded
+- [x] **Step 5:** `ISSUE-REGISTER.md`: mark U-9 resolved by this task. The adjacent unguarded
   `dfly_cntx.conn()->IsPrivileged()` in the `TAKEN_OVER` branch (`main_service.cc:1430`),
-  reachable on the same null-`conn()` apply context, was fixed in the same commit (`a0ee234`) and
-  registered as U-10. Run
+  reachable on the same null-`conn()` apply context, was fixed in the same task and registered as
+  U-10; the third site, `DispatchCommand`'s `MarkForClose()`, in its review round as U-12. Run
   `./dragonfly_test --gtest_filter='DflyEngineTest.Eval*'`; pre-commit; commit
   `fix: guard EvalInternal's migration against a null connection (P7)`.
 
@@ -285,7 +300,7 @@ everything behind the RDB — the loader's `Leftover()` and the `UnusedPrefix()`
 stream-prefix buffer, which `ConsumeRedisStream` parses before its first socket read and counts into
 `repl_offs_`. D-8 reuses the same buffer for `+CONTINUE`.
 
-- [ ] **Step 1: Failing tests** (plain drakeydb replica, fake master, `REPLICAOF` non-blocking):
+- [x] **Step 1: Failing tests** (plain drakeydb replica, fake master, `REPLICAOF` non-blocking):
   `test_psync_bad_eof_token_size_does_not_abort_replica` (`+FULLRESYNC <id> 0` then `$EOF:short`,
   site `:1910`); `test_psync_full_sync_tail_mismatch_does_not_abort_replica` — (a) a **token
   mismatch** (a valid empty RDB then a wrong 40-byte token) and (b) a `$<len>` that is shorter than
@@ -295,26 +310,26 @@ stream-prefix buffer, which `ConsumeRedisStream` parses before its first socket 
   the fake master writes `+FULLRESYNC`, `$<len>`, the RDB bytes and a raw `SET a 1` in **one**
   `write()` (and the `$EOF:<token>` framing with the token and the command in one write): `a == 1`,
   the link stays up, and `slave_repl_offset` equals the bytes of the command (exact offsets).
-- [ ] **Step 2: Run, observe failure:** the drakeydb process dies on a `Check failed:` line and the
+- [x] **Step 2: Run, observe failure:** the drakeydb process dies on a `Check failed:` line and the
   pytest sees a dead node; for the C2 tests the replica aborts or loops in resync and `a` is never
   set.
-- [ ] **Step 3: Implement:** replace `CHECK_EQ(kRdbEofMarkSize, token.size())` and the six
+- [x] **Step 3: Implement:** replace `CHECK_EQ(kRdbEofMarkSize, token.size())` and the six
   `InitiatePSync` `CHECK`s with `LOG(ERROR)` plus `return std::make_error_code(errc::bad_message)`
   (or the `illegal_byte_sequence` the neighbouring header errors use); clamp the loader's first
   read; hand the bytes behind a correct RDB to the stream-prefix buffer. Clean up the `LOADING`
   state via the existing `absl::Cleanup` (`:756`).
-- [ ] **Step 4: Run; falsify** by restoring one `CHECK` at a time (`:1910`, then `:823`): the
+- [x] **Step 4: Run; falsify** by restoring one `CHECK` at a time (`:1910`, then `:823`): the
   matching test fails with the abort; then un-clamp the first read: the C2 tests fail; then drop
   the hand-off (discard the prefix): `a == 0`; then count the hand-off twice: the offset assertion
   fails. Restore, record.
-- [ ] **Step 5:** pre-commit; commit
+- [x] **Step 5:** pre-commit; commit
   `fix: report a malformed PSYNC reply as an error and keep the stream behind the RDB (P7)`. The
   upstream latent crash (a master that sends stream bytes right after the RDB aborts the replica)
   is registered as an ISSUE-REGISTER U-item by the orchestrator, not by this task's commit.
 
 **Done:** all tests pass; the fake master is reusable by Tasks 1.2, 3.1.
 
-### Task 0.7: KeyDB harness and the first real-KeyDB smoke test (done: `5199f34`, `89414e5`)
+### Task 0.7: KeyDB harness and the first real-KeyDB smoke test (done)
 
 **Goal:** Tests can start a real KeyDB v6.3.4; locally they skip without it, gates fail without it.
 **Files:** `tests/dragonfly/instance.py` (`RedisServer` fallback, new `KeyDBServer`),
@@ -350,7 +365,7 @@ real server is refused; `rdb-key-save-delay` is a v6.3.4 config; the tests read 
 **Done:** the smoke tests pass with the binary (the two active ones with Task 0.4), skip without
 it, and fail under `KEYDB_REQUIRED=1`.
 
-### Task 0.8: `drakeydb-ci.yml` (done: `5199f34`, `89414e5`)
+### Task 0.8: `drakeydb-ci.yml` (done)
 
 **Goal:** CI builds drakeydb and KeyDB v6.3.4 and runs the KeyDB suite, unable to skip silently.
 **Files:** `.github/workflows/drakeydb-ci.yml`.
@@ -368,7 +383,7 @@ it, and fail under `KEYDB_REQUIRED=1`.
 with the KeyDB tests shown *passed, not skipped* in the summary, belong to the P7-0 PR (below).
 **Done:** the workflow is green on the P7-0 PR with the KeyDB tests actually executed.
 
-### Task 0.9: Make `ReaperJournalFamilyTest.MemberExpiryReaperDoesNotBlockOnConcurrentBgsave` robust
+### Task 0.9: Make `ReaperJournalFamilyTest.MemberExpiryReaperDoesNotBlockOnConcurrentBgsave` robust (done, with deviations)
 
 **Goal:** Remove a load-dependent flake from the P7 gate: root-cause why the test's last assertion
 fails under CPU contention, and make it deterministic — in the test, or in the code if it is a real
@@ -392,18 +407,21 @@ persistent `db.expire_cursor`; the first call, skipped because the consumer is r
 that cursor by a time-dependent number of steps, so whether the second call's 33 steps reach the
 bucket of `rs` among 33 keys depends on timing. (H3) The consumer is still registered when the
 follow-up call runs (unregistration versus `WaitSnapshotting`).
-- [ ] **Step 1: Reproduce.** `ninja -C /home/user/drakeydb/build-dbg -j4 multi_master_test`; run the
+- [x] **Step 1: Reproduce.** `ninja -C /home/user/drakeydb/build-dbg -j4 multi_master_test`; run the
   one test x50 idle for a baseline pass rate, then x50 under artificial load shaped like the failing
   gate: `stress-ng --cpu 6` if present, else six `sh -c 'while :; do :; done'` spinners plus three
   concurrent copies of the test (`--gtest_repeat=50
   --gtest_filter='ReaperJournalFamilyTest.MemberExpiryReaperDoesNot*'`). Record both failure
-  rates. Do not change the test yet.
-- [ ] **Step 2: Root-cause, test-side instrumentation only.** Keep the `DeleteExpiredStats` each
+  rates. Do not change the test yet. (Done as 20 idle runs and a 3 x 25 loaded comparison over the
+  suite filter, not 50 + 50.)
+- [x] **Step 2: Root-cause, test-side instrumentation only.** Keep the `DeleteExpiredStats` each
   `DeleteExpiredStep` call returns (`traversed`), log `ThisFiber::GetRunningTimeCycles()` at the
   entry of each call and, if the accessor is reachable, `HasRegisteredCallbacks()`. A failing run
   that shows a small `traversed` or a large entry time confirms H1/H2; a registered consumer
-  confirms H3. Record the output in `task-0.9-report.md`; remove the instrumentation.
-- [ ] **Step 3: Fix.** If H1/H2 (a test that demands one bounded call hit a specific bucket): make
+  confirms H3. Record the output in `task-0.9-report.md`; remove the instrumentation. (The root
+  cause, H1, rests on reading `db_slice.cc` and the stall falsification; no instrumentation output
+  was saved.)
+- [x] **Step 3: Fix.** If H1/H2 (a test that demands one bounded call hit a specific bucket): make
   the follow-up reap a bounded loop — call `DeleteExpiredStep(db_cntx, 100,
   {.ensure_member_reaping = true, .journal_deletions = false, .reset_time_quota = true})` until
   `exists rs` is 0, at most 64 times (enough to wrap the table several times), and on exhaustion
@@ -411,20 +429,26 @@ follow-up call runs (unregistration versus `WaitSnapshotting`).
   the consumer is gone) without depending on one 1 ms quota. Leave the first, skip-while-registered
   assertion untouched. If H3, wait for the unregistration explicitly. If instead the evidence shows
   a product defect (for example `reset_time_quota` semantics starving a container in the production
-  heartbeat), fix `db_slice.cc` with its own failing test and keep this test strict.
-- [ ] **Step 4: Falsify under load, both directions.** (a) The original test under the Step 1 load
-  fails at the recorded rate and the fixed one passes 200/200 under the same load. (b) The fixed
+  heartbeat), fix `db_slice.cc` with its own failing test and keep this test strict. (Built as at
+  most 100 calls with `{.reset_time_quota = true}` only; H1, so no `db_slice.cc` change.)
+- [x] **Step 4 (partly run): Falsify under load, both directions.** (a) The original test under
+  the Step 1 load fails at the recorded rate and the fixed one passes 200/200 under the same load. (b) The fixed
   test still catches what it exists for: make the reaper skip permanently (force the
   `!HasRegisteredCallbacks()` term at `db_slice.cc:2394` to `false`): the follow-up assertion
   fails; remove that term: the first assertion (`exists rs == 1`) fails. Restore each; record the
-  commands and verbatim outputs.
-- [ ] **Step 5:** `./multi_master_test --gtest_filter='ReaperJournalFamilyTest.*'` x10 idle plus the
+  commands and verbatim outputs. **Not run:** (a)'s 200/200 (a 3 x 25 = 75-run comparison ran
+  instead: 3 of 75 failures before, 0 of 75 after, plus a forced 3 ms stall that fails the old test
+  3 of 3 and passes the new one 3 of 3) and all of (b). A follow-up to give the load-sensitive
+  sibling tests the same treatment has a task card.
+- [x] **Step 5:** `./multi_master_test --gtest_filter='ReaperJournalFamilyTest.*'` x10 idle plus the
   loaded runs; pre-commit; commit
-  `test: make the reaper-resume assertion independent of the sweep's time quota (P7)`.
+  `test: make the reaper-resume assertion independent of the sweep's time quota (P7)`. (Committed
+  with the P7-0 implementation commit. Idle runs: 20 of the target test, 5 repeats of the 13-test
+  suite filter and the full 221-test binary once, not x10 of the suite.)
 
-**Done:** the root cause is recorded with the instrumentation output, the test passes 200/200 under
-the artificial load, and each falsification fails as named. Lands before the P7-0 gate so
-`multi_master_test` is not a flake source.
+**Done as planned:** the root cause is recorded. **Not met:** the test passing 200/200 under the
+artificial load, and each falsification failing as named (Step 4; the report says what was run).
+Lands before the P7-0 gate so `multi_master_test` is not a flake source.
 
 ### P7-0 gate and PR
 
@@ -532,6 +556,12 @@ local to each call).
   before every inner dispatch: `RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope` fails;
   (f) accept a second inner command: the two-commands case of `MalformedEnvelopeSkippedAndCounted`
   fails; (g) use the `NONE` builder: `KnownCommandErrorReplyCounted` fails.
+- [ ] **Step 4b: Remove the P7-0 stopgap** (the whole-branch review's I-1): until this task, a
+  build drops every RREPLAY envelope, so `Greet()` logs a `WARNING` when the master answers
+  `active-replica` ("... applies its full sync but NOT its RREPLAY stream yet ...") and
+  `ConsumeRedisStream` keeps an `rreplay_dropped` counter with a `LOG_EVERY_T(ERROR, 30)` per
+  dropped envelope. Delete both, and delete `test_active_keydb_stream_drop_is_logged` (or turn it
+  into a test that the unwrapped writes arrive and nothing is logged as dropped).
 - [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; run both suites; pre-commit; commit
   `feat: unwrap RREPLAY envelopes on classic replication links (P7)`.
 
@@ -601,7 +631,8 @@ for a stock master unchanged.
 request capture); Test `src/server/classic_replay_test.cc` (or `engine_shard_set_test.cc`),
 `tests/dragonfly/keydb_onboarding_test.py`.
 **Interfaces:** `Replica::master_active_replica_` (set per `Greet()` from
-`CapaReply::active_replica`, cleared at its top); `EngineShard::SetReplicaActiveExpiry(bool)` /
+`CapaReply::active_replica`, cleared at its top; it can be stale after a **failed** `Greet()`, so
+INFO and the `activeExpire` decision read it only once `R_GREETED` is set in `state_mask_`); `EngineShard::SetReplicaActiveExpiry(bool)` /
 `ReplicaActiveExpiry()`; `RetireExpiredAndEvict(bool expire_only = false)`.
 - [ ] **Step 1: Failing tests.** gtest `ReplicaActiveExpiryTest.ReapsExpiredKeysButNeverEvicts` (a
   fixture friended in `engine_shard.h` to reach `Heartbeat()`; shards in replica mode with the flag

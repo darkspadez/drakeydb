@@ -83,7 +83,7 @@ the single failing run above was.
 - U-10's allow-vs-refuse decision has a cost, now recorded in the register: a takeover on a
   cascaded node can wait on a moving journal LSN.
 
-## Review fix round (not committed when this was written)
+## Review fix round (committed in `2298570`, P7-0 whole-branch review round 1)
 
 **U-12, a third null-`conn()` site, fixed.** `Service::DispatchCommand` ends with
 `cmd_cntx->SendError("Internal Error"); dfly_cntx->conn()->MarkForClose();` when `InvokeCmd` returns

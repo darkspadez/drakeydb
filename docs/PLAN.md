@@ -852,7 +852,25 @@ record no gate run, and no full `ctest -L DFLY` or `replication_specific_test.py
 `replication_resilience_test.py` / `cluster_test.py` sweep on the final head is recorded. The full
 Phase-4 exit gate is therefore re-run as P7-0 Task 0.2's baseline.
 
-Baseline gate results: see Task 0.2 (pending)
+**Baseline gate results (P7-0 Task 0.2).** Run on the unmodified `c60dfdb`, debug build, 4 cores;
+the evidence is in the Phase 7 ledger (`docs/superpowers/ledgers/2026-10-03-phase7-keydb-onboarding/
+progress.md`).
+
+- `ctest -L DFLY -j3`: **86 of 88 passed.** `ServerFamilyTest.GetTcpSocketInfoIPv6` fails because the
+  container has no IPv6; `ReaperJournalFamilyTest.MemberExpiryReaperDoesNotBlockOnConcurrentBgsave`
+  failed under the `-j3` load and passed 20 of 20 in isolation (a load-sensitive test, fixed in
+  P7-0 Task 0.9).
+- Pytest, each file separately (`multimaster_test.py`, `multimaster_merge_test.py`,
+  `redis_replication_test.py`, `replication_test.py`, `replication_specific_test.py`,
+  `replication_resilience_test.py`, `replication_config_test.py`,
+  `cluster_test.py::test_cluster_migrations_sequence`): every failure except `test_ipv6_replication`
+  (no IPv6 in the container) came from the redis-py 8 test client, not from the code. redis-py 8.0
+  defaults asyncio clients to a 5 s socket timeout with 10 retries and changed some reply shapes,
+  and `tests/dragonfly/requirements.txt` was `redis>=5.2.1`, so a fresh install got 8.1.0. Upstream
+  pins `redis>=5.2.1,<8.0.0`; the fork adopted the same line, which resolves to redis-py 7.4.1. Under
+  that pin, each of the other tests that had failed passed when re-run.
+- The first pytest run was discarded (concurrent pytest sessions wiped `/tmp/dragonfly_logs`), so
+  every pytest run now takes `flock /tmp/drakey-pytest.lock`.
 
 <a id="phase-5"></a>
 

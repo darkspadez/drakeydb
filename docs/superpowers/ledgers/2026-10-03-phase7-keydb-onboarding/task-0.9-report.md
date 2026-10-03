@@ -94,6 +94,30 @@ whole 221-test `multi_master_test` binary, 20 runs with a failure, `MvccStoreTes
 TombstoneGcReapsExpiredTombstonesWithinBudget` in 14 of them. A follow-up to give them the same
 quota treatment is queued; this task fixed the one test the baseline gate failed on.
 
+## Plan items not run
+
+- **Step 4(a), "200/200 under the same load" was not run.** What ran instead: the 3 x 25 = 75-run
+  loaded comparison above (the target test failed in 3 of 75 runs before the fix and in 0 of 75
+  after), the isolated 20/20 idle run, and the forced 3 ms stall (3 of 3 failed before, 3 of 3 passed
+  after). 0 failures in 75 runs bounds the residual failure rate only to about 4% (95% confidence),
+  where the plan's 200 runs would have bounded it to about 1.5%; the stall run is the deterministic
+  evidence.
+- **Step 4(b), the falsification that the fixed test still catches a reaper that never resumes, was
+  not run** (making the reaper skip permanently, or removing the `HasRegisteredCallbacks()` term, to
+  see the follow-up and the first assertion fail). That the loop fails after `kMaxReapCalls` calls
+  when `rs` is never reaped is by reading the test, not by observation.
+- Step 1 (50 idle plus 50 loaded runs of the original) was replaced by the 20 idle runs and the
+  75-run comparison. (The same load on the single test alone, `sf-iso-before.*` and `sf-iso-after.*`,
+  did not reproduce the failure even before the fix, 0 of 60 runs, so those runs show nothing either
+  way and are not counted above.) Step 2's `traversed` and entry-time instrumentation output is not
+  among the saved evidence: the root cause above rests on reading `db_slice.cc` and on the stall
+  falsification, and the only saved loaded failure (`t09-failing-run-evidence.txt`) is the failing
+  run itself.
+- Step 3 as built: at most 100 calls with `{.reset_time_quota = true}` only; the plan sketched 64
+  calls with `.ensure_member_reaping = true, .journal_deletions = false` as well.
+- **Sibling tests stay load-sensitive** (see "Not fixed" above); giving them the same treatment is a
+  follow-up with a task card, not part of this task.
+
 ## Deviations from the plan
 
 - The plan listed three hypotheses (H1 the wall-time quota, H2 a time-dependent `expire_cursor`, H3

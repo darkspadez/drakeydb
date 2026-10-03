@@ -404,7 +404,11 @@ error_code Replica::Greet() {
       capa = ParseCapaReply(ToSV(LastResponseArgs()[0].GetBuf()));
     if (capa.active_replica && !master_active_replica_) {
       master_active_replica_ = true;
-      VLOG(1) << "Master " << server().Description() << " advertises active-replica";
+      // Once per link: the flag is cleared at the top of every Greet(). Loud on purpose, because
+      // the link otherwise looks healthy while ConsumeRedisStream drops what the master streams.
+      LOG(WARNING) << "Master " << server().Description()
+                   << " advertises active-replica: this build applies its full sync but NOT its "
+                      "RREPLAY stream yet; writes after the sync are dropped (Phase 7, P7-1)";
     }
     return capa;
   };
@@ -1214,6 +1218,7 @@ error_code Replica::ConsumeRedisStream() {
   batch.reserve(max_batch);
 
   std::vector<CommandContext> ctx_pool(max_batch);
+  uint64_t rreplay_dropped = 0;
 
   while (exec_st_.IsRunning()) {
     // Skipped commands (MULTI/EXEC/PING) may drain buffered data without I/O or dispatch, so
@@ -1250,6 +1255,16 @@ error_code Replica::ConsumeRedisStream() {
           for (const auto& arg : LastResponseArgs()) {
             LOG(INFO) << absl::CHexEscape(ToSV(arg.GetBuf()));
           }
+        }
+
+        // drakeydb: P7-0 -- an active KeyDB wraps every write it streams in RREPLAY, which this
+        // build cannot unwrap until P7-1: the dispatch below drops it as an unknown command. Say
+        // so, since nothing else does and the link keeps reporting "up" while the data diverges.
+        if (absl::EqualsIgnoreCase(cmd, "RREPLAY")) {
+          ++rreplay_dropped;
+          LOG_EVERY_T(ERROR, 30) << "Dropping RREPLAY envelopes from an active KeyDB master "
+                                    "(unsupported until P7-1); "
+                                 << rreplay_dropped << " dropped so far";
         }
 
         CommandContext* ctx = &ctx_pool[batch.size()];

@@ -13,12 +13,16 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
 - Debug build: `./helio/blaze.sh -DWITH_AWS=OFF -DWITH_GCP=OFF`, `ninja -C build-dbg -j4`
   (search ON). Third-party GitHub `/archive/` tarballs come from a local mirror via a
   never-committed shim (see `decisions.md`, "Local sandbox note").
-- pytest venv: `/root/drakey-venv` (`tests/dragonfly/requirements.txt`).
+- pytest venv: **`/root/drakey-venv-pinned`** (redis-py 7.4.1, pytest 9.1.1): what
+  `tests/dragonfly/requirements.txt` resolves to under its `redis>=5.2.1,<8.0.0` pin, as CI gets it.
+  `/root/drakey-venv` (redis-py 8.1.0, from the earlier unpinned `redis>=5.2.1`) is **superseded**:
+  redis-py 8 retries a slow command up to 10 times, which broke tests that are fine under the pin
+  (see the baseline triage below). Do not use it for a gate. `task-0.4-report.md` records its runs
+  as made in `/root/drakey-venv`, before the pin.
 - **One pytest session at a time:** `tests/dragonfly/conftest.py:155` `rmtree`s
   `/tmp/dragonfly_logs` at session start, so concurrent sessions in one container destroy each
   other's logs (`INTERNALERROR … FileNotFoundError` in `copy_failed_logs`). Every pytest run is
   wrapped in `flock /tmp/drakey-pytest.lock`.
-- Python test deps resolve to `redis` 8.1.0 / `pytest` 9.1.1 (requirements are `>=`-only).
 - KeyDB v6.3.4 built from source: `make -j2 BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc` — built
   cleanly on gcc 13.3 with no workaround (`KeyDB server v=6.3.4 sha=7e7e5e57:0 malloc=libc`),
   closing the advisor's [unverified] gcc-13 build risk.
@@ -27,16 +31,18 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
 
 | Task | Status | Notes |
 |---|---|---|
-| 0.1 P4 close-out docs + U-8 live test | docs committed `a162d75`; review pending | U-8 withdrawn (live: 16/16 STORE destinations replicate) |
-| 0.2 Baseline full gate on main | ctest done; pytest re-run pending | see "Baseline gate" below |
-| 0.3 Spec + plan docs | in progress | |
-| 0.4 Greet accepts `+OK <suffix>` | done (`a0ee234`), review fixes pending commit | `task-0.4-report.md` |
-| 0.5 U-9 EvalInternal null `conn()` (+ U-10, and U-12 in the review round) | done (`a0ee234`), review fixes pending commit | `task-0.5-report.md` |
-| 0.6 Graceful PSYNC CHECKs and the full-sync tail | done (`a0ee234`), review fixes pending commit | `task-0.6-report.md`; ISSUE-REGISTER U-11 |
-| 0.7 KeyDB harness + smoke test | done (`5199f34`, `89414e5`) | `task-0.7-report.md` |
-| 0.8 `drakeydb-ci.yml` | done (`5199f34`, `89414e5`) | `task-0.7-report.md` |
-| 0.9 Reaper-resume test robust under load | done (`a0ee234`), review fixes pending commit | `task-0.9-report.md` |
-| Whole-branch review / adversarial / gate / PR | pending | |
+| 0.1 P4 close-out docs + U-8 live test | done: `a162d75`, `a549973` | U-8 withdrawn (live: 16/16 STORE destinations replicate); its reviewer pass is the whole-branch review |
+| 0.2 Baseline full gate on main | done: `e5cb771` (ctest), `5098963`, `44a0cc0`, `b11594d` (pytest, the pin), counts in `docs/PLAN.md` | ctest 86/88 (IPv6 env, reaper load flake fixed in 0.9); every non-IPv6 pytest failure was the redis-py 8 client, re-run green under the pin; see "Baseline gate" below |
+| 0.3 Spec + plan docs | done: `8e362ef`, `87d5312`, `f94b38d` | decisions folded in after the spec/plan review and the advisor's resolutions |
+| 0.4 Greet accepts `+OK <suffix>` | done: `a0ee234`; review fixes `2298570` | `task-0.4-report.md` |
+| 0.5 U-9 EvalInternal null `conn()` (+ U-10; U-12 in the review round) | done: `a0ee234` (U-9, U-10), `2298570` (U-12) | `task-0.5-report.md` |
+| 0.6 Graceful PSYNC CHECKs and the full-sync tail | done: `a0ee234`; review fixes `2298570` | `task-0.6-report.md`; ISSUE-REGISTER U-11 |
+| 0.7 KeyDB harness + smoke test | done: `5199f34`, `89414e5`; review fixes `2298570` | `task-0.7-report.md` |
+| 0.8 `drakeydb-ci.yml` | done: `5199f34`, `89414e5` (not yet observed on GitHub) | `task-0.7-report.md` |
+| 0.9 Reaper-resume test robust under load | done: `a0ee234`; report `2298570` | `task-0.9-report.md`: the plan's 200/200-under-load run and falsification (b) were not run; sibling tests stay load-sensitive (follow-up queued) |
+| 0.10 `test_narrowed_window_admits_peer_during_winners_full_sync` "hang" (ledger-only, not a plan task) | done, no code change: not a server bug | redis-py 8 re-sent a 30 s `DEBUG POPULATE` up to 10 times; resolved by the pin (`44a0cc0`), recorded in `b11594d`; see the triage below |
+| Whole-branch review fix round (I-1, I-2, M-1 ... M-8) | applied, awaiting commit | the RREPLAY-drop log lines and `test_active_keydb_stream_drop_is_logged` (I-1), docs status, the xfail `raises=`, stable references in the register, the `keydb` marker, `// drakeydb:` markers and UPSTREAM-SYNC watchlist rows, U-11 retry note, the malformed-input carve-out |
+| Adversarial pass / gate / PR | pending | |
 
 ### Live evidence recorded before any code change (debug build of `c60dfdb`)
 

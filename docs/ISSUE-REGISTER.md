@@ -308,7 +308,7 @@ debug build.
 `replica.cc:829 Check failed: chained.UnusedPrefix().empty()` (diskless); also `replica.cc:1910
 Check failed: kRdbEofMarkSize == token.size()` and `io.cc:143 … (0 vs. 8)`.
 
-**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.6, a0ee234): the loader's first read honors
+**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.6): the loader's first read honors
 the source limit, the bytes behind a correct full sync go to `ConsumeRedisStream` and into
 `repl_offs_`, and every other tail disagreement is an error that reconnects. Tests
 `RdbTest.LoaderFirstReadHonorsTheSourceLimit`,
@@ -316,6 +316,14 @@ the source limit, the bytes behind a correct full sync go to `ConsumeRedisStream
 `keydb_onboarding_test.py::test_psync_{stream_bytes_behind_full_sync_are_applied,
 full_sync_tail_mismatch_does_not_abort_replica,bad_eof_token_size_does_not_abort_replica}`. Not
 filed upstream.
+
+**Retry behavior, not changed:** a persistently malformed master is retried every ~0.5 s with no
+backoff (`MainReplicationFb`'s reconnect loop sleeps 500 ms), where it used to abort the process.
+Each attempt logs an `ERROR` and a `WARNING`; a plain replica `FlushAll`s its dataset per attempt
+(the flush precedes the load, so it is empty again each time); a peer-mode node takes exclusive
+`LOADING` and re-merges per attempt. That is strictly better than the abort and matches upstream's
+pattern for its other full-sync failures. Follow-up candidate: rate-limited logging and a reconnect
+backoff for a master that fails the same way repeatedly.
 
 **Related, not changed:** a `$0` header (`+FULLRESYNC <id> <offset>` then `$0`) is not a full sync
 here. `InitiatePSync`'s `if (snapshot_size || token != nullptr)` (`replica.cc:759`) sends it to the

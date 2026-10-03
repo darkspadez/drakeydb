@@ -1,12 +1,15 @@
-"""Interop tests for a drakeydb node replicating from a real KeyDB master (v6.3.4).
+"""Interop tests for a drakeydb node replicating from a real KeyDB master (v6.3.4), and tests that
+script a classic master instead (fake_classic_master.py).
 
-They need a keydb-server binary: $KEYDB_SERVER_PATH, else `keydb-server` on PATH (see
-docs/build-from-source.md). Without one they skip, and with KEYDB_REQUIRED=1 they fail instead, as
-they do whenever $KEYDB_SERVER_PATH is set but is not an executable.
+The KeyDB tests (marked `keydb`) need a keydb-server binary: $KEYDB_SERVER_PATH, else `keydb-server`
+on PATH (see docs/build-from-source.md). Without one they skip, and with KEYDB_REQUIRED=1 they fail
+instead, as they do whenever $KEYDB_SERVER_PATH is set but is not an executable. The scripted-master
+tests need no KeyDB.
 """
 
 import asyncio
 import functools
+import re
 
 import pytest
 import redis
@@ -23,8 +26,6 @@ from .fake_classic_master import (
 )
 from .instance import DflyInstanceFactory
 from .utility import assert_eventually, wait_available_async
-
-pytestmark = pytest.mark.keydb
 
 PRE_STRINGS = {f"pre:{i}": f"v{i}" for i in range(100)}
 
@@ -175,6 +176,7 @@ async def assert_keydb_saw_one_full_sync(k):
     assert (await k.info("replication"))["connected_slaves"] == 1
 
 
+@pytest.mark.keydb
 async def test_keydb_plain_master_full_sync_and_stream(
     df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
 ):
@@ -217,6 +219,7 @@ async def test_keydb_plain_master_full_sync_and_stream(
         assert info["master_link_status"] == "up", info
 
 
+@pytest.mark.keydb
 async def test_keydb_active_handshake_and_full_sync(
     df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
 ):
@@ -244,6 +247,7 @@ async def test_keydb_active_handshake_and_full_sync(
         await assert_keyspaces_match(c, k)
 
 
+@pytest.mark.keydb
 async def test_keydb_active_handshake_peer_mode(
     df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
 ):
@@ -263,9 +267,13 @@ async def test_keydb_active_handshake_peer_mode(
         await assert_keyspaces_match(c, k)
 
 
+@pytest.mark.keydb
 # drakeydb: strict xfail until P7-1 Task 1.2 unwraps RREPLAY envelopes; a pass then fails the run so
-# the marker cannot outlive the fix.
-@pytest.mark.xfail(strict=True, reason="needs RREPLAY unwrap (P7-1 Task 1.2)")
+# the marker cannot outlive the fix. Only an AssertionError (the writes never arrive) is the expected
+# failure: a crash or a connection error fails the test.
+@pytest.mark.xfail(
+    strict=True, raises=AssertionError, reason="needs RREPLAY unwrap (P7-1 Task 1.2)"
+)
 @pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
 async def test_keydb_active_live_write_during_full_sync(
     df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, peer_mode
@@ -297,6 +305,63 @@ async def test_keydb_active_live_write_during_full_sync(
         await assert_live_writes_arrived(c, live)
         await assert_keyspaces_match(c, k)
         await assert_keydb_saw_one_full_sync(k)
+
+
+def running_node_logged(node, pattern):
+    """Whether a running node has logged a line matching `pattern`. find_in_logs wants the node
+    stopped; WARNING and ERROR lines are flushed as they are logged, so these can be polled for."""
+    matcher = re.compile(pattern)
+    for path in node.log_files:
+        with open(path) as log:
+            if any(matcher.search(line) for line in log):
+                return True
+    return False
+
+
+# glog lines start with their severity letter, so these also pin that the lines are loud (W, E).
+ACTIVE_MASTER_WARNING = (
+    r"^W\d{4} .*advertises active-replica: this build applies its full sync but NOT its"
+)
+RREPLAY_DROP_ERROR = (
+    r"^E\d{4} .*Dropping RREPLAY envelopes from an active KeyDB master \(unsupported until P7-1\); "
+    r"[1-9]\d* dropped so far"
+)
+
+
+@pytest.mark.keydb
+async def test_active_keydb_stream_drop_is_logged(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """Until P7-1 unwraps RREPLAY, a replica of an active KeyDB loses every write streamed after
+    its full sync (it drops the envelope as an unknown command), and says so: a WARNING at the
+    handshake and an ERROR that counts the dropped envelopes. Without them the link looks healthy
+    while the data diverges. P7-1 deletes this test together with the drop."""
+    keydb = keydb_server_factory(active_replica=True)
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"))
+    node.start()
+    c = node.client()
+
+    async with keydb.client() as k:
+        await k.set("pre:key", "v")
+        assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+        await wait_available_async(c)
+
+        @assert_eventually(times=100)
+        async def replica_online():
+            slave = (await k.info("replication")).get("slave0")
+            assert slave is not None and slave["state"] == "online", slave
+
+        await replica_online()
+        await k.set("post:key", "streamed")
+
+        @assert_eventually(times=100)
+        async def drop_logged():
+            logged = running_node_logged(node, RREPLAY_DROP_ERROR)
+            assert logged, "the dropped writes are not logged"
+
+        await drop_logged()
+        node.stop()
+        assert node.find_in_logs(ACTIVE_MASTER_WARNING), "no log line warning about the master"
 
 
 async def attach_and_watch_retries(df_factory, tmp_path, master, retries=3):

@@ -4,9 +4,10 @@
 > and the advisor's resolution of its forks (per-author dedup reservation, offset/watermark
 > coupling, the release-build perf bar, the full-sync tail). Branch
 > `feat/phase7-0-closeout-and-harness` off `origin/main` (`c60dfdb`); `src/` is unchanged since
-> except the P7-0 implementation commit `a0ee234` (Tasks 0.4-0.6 and 0.9, which also fixed U-10)
-> and the review fix round that followed it (U-12, a log fix in `ParseReplicationHeader`).
-> The other commits since are ledger/doc commits and the test/CI harness (`5199f34`, `89414e5`).
+> except the P7-0 implementation (Tasks 0.4-0.6 and 0.9, which also fixed U-10), the review fix round
+> that followed it (U-12, a log fix in `ParseReplicationHeader`) and the whole-branch review's loud
+> log lines for the RREPLAY envelopes a build without P7-1 drops (`replica.cc`). The other commits
+> since are ledger/doc commits and the test/CI harness (Tasks 0.7, 0.8).
 > Ships as five stacked sub-PRs — see [PR stack](#pr-stack).
 >
 > This is the next numbered phase: Phase 5 was superseded by P4-4, Phase 6 was delivered by P4-3,
@@ -309,7 +310,10 @@ space-separated, unknown words ignored. `Greet()` replaces its two strict checks
 bad response. Every other `CheckRespIsSimpleReply("OK")` in `Greet()` is unchanged.
 
 - `active_replica` is recorded per `Greet()` in a `Replica` member (`master_active_replica_`),
-  cleared at the top of each `Greet()`. It is the *only* trigger for D-9 and for activeExpire.
+  cleared at the top of each `Greet()`. It is the *only* trigger for D-9 and for activeExpire. It is
+  set by the capa reply, which is not the last step of `Greet()`, so after a **failed** `Greet()` it
+  may be stale: anything that reads it (INFO, D-9, activeExpire) does so only once `R_GREETED` is set
+  in `state_mask_`.
 - **`capa activeExpire`.** Immediately after the first capa reply (`replica.cc:431-432`) reveals
   `active-replica`, send `REPLCONF capa activeExpire` as its **own** command. KeyDB answers
   `+OK active-replica` again; this reply is parsed leniently (warn once, continue) — the master
@@ -771,8 +775,8 @@ strictly more permissive; the write side is untouched.
 (`journal/executor.cc:34-42`). Fix: `&& conn_cntx->conn() != nullptr`, **ungated**. Test
 `EvalReplicatedApplyNoConnNoCrash`. The `TAKEN_OVER` branch of `VerifyCommandState` dereferenced
 `conn()` the same way (`main_service.cc:1430`); it was fixed alongside as ISSUE-REGISTER U-10
-(`a0ee234`). So did `DispatchCommand`'s `MarkForClose()` after a handler threw, fixed in the review
-round that followed as U-12 (`ReplicatedApplyHandlerThrowNoConnNoCrash`).
+(P7-0 Task 0.5). So did `DispatchCommand`'s `MarkForClose()` after a handler threw, fixed in the
+review round that followed as U-12 (`ReplicatedApplyHandlerThrowNoConnNoCrash`).
 
 ### D-12. Throughput bar (decision 12)
 
@@ -866,11 +870,11 @@ jobs are dropped on onboarding" (Task 1.3). Docs: `docs/multi-master.md` "Onboar
 
 Also `docs/differences.md`, `docs/UPSTREAM-SYNC.md` watchlist rows, ISSUE-REGISTER (close D-1, D-8,
 U-9, U-10; add the `MarkForClose` and subexpire-conversion follow-ups; the full-sync-tail U-item,
-D-10), `docs/build-from-source.md` (KeyDB build recipe, delivered in `5199f34`).
+D-10), `docs/build-from-source.md` (KeyDB build recipe, delivered by Task 0.7).
 
 ### D-14. Test harness and CI (decisions 16-17)
 
-Delivered in `5199f34` and hardened in `89414e5` (Tasks 0.7, 0.8):
+Delivered by Tasks 0.7 and 0.8, and hardened in their review round:
 
 - `RedisServer` (`tests/dragonfly/instance.py:563`) falls back to `$REDIS_SERVER_PATH`, then
   `redis-server` on `PATH`, when its pinned binaries are absent (the fixture used to skip,
@@ -890,11 +894,13 @@ Delivered in `5199f34` and hardened in `89414e5` (Tasks 0.7, 0.8):
   `keydb_onboarding_test.py` and `multimaster_test.py` with `KEYDB_REQUIRED=1`. Upstream `ci.yml` is
   untouched. Not yet observed on GitHub.
 
-Still to come: `tests/dragonfly/fake_classic_master.py` (Task 0.6) — a minimal asyncio classic
-master (handshake replies, scripted `PSYNC` reply and raw bytes, request capture), needed because
-the existing `Proxy` replaces only the first line of one response (`proxy.py:21-37`): it makes the
-post-load paths, malformed envelopes, mixed raw/envelope ordering and coalesced
-`+CONTINUE` + stream bytes deterministic. `Proxy` gains an additive request-capture list (Task 1.4).
+Delivered by Task 0.6: `tests/dragonfly/fake_classic_master.py` — a minimal asyncio classic master
+(handshake replies, a scripted `PSYNC` reply and raw bytes, an optionally delayed second write, and a
+record of every request, connection and `REPLCONF ACK` offset), needed because the existing `Proxy`
+replaces only the first line of one response (`proxy.py:21-37`): it makes the post-load paths,
+malformed envelopes, mixed raw/envelope ordering and coalesced `+CONTINUE` + stream bytes
+deterministic. Tasks 1.2 and 3.1 reuse it. Still to come: the `Proxy`'s additive request-capture
+list (Task 1.4).
 
 ### D-15. Tests
 
@@ -961,25 +967,22 @@ observe changes only here:
      error with a log line. Upstream tripped a helio `DCHECK` in a debug build and returned the same
      error, without the line, in a release build.
    - **Stream hand-off** (Task 0.6): the bytes behind a correct RDB, in either framing, are applied
-     as the start of the stream, only where upstream aborted on them (ISSUE-REGISTER U-11).
+     as the start of the stream, only where upstream aborted on them (ISSUE-REGISTER U-11). A
+     non-KeyDB master observes it: a disk-based master, Redis included, flushes the commands it
+     buffered right behind the file, and such a master now syncs where it used to kill or loop the
+     replica.
    - **EOF-token size and tail errors** (Task 0.6): a `$EOF:` token that is not 40 bytes, and a tail
      that disagrees with its header, are a logged error that reconnects. Upstream aborted on a
      `CHECK`.
 3. **Loader** accepts KeyDB type 64 and subexpire aux, quiets noisy aux: strictly more permissive.
-4. **Full-sync tail** (ungated, Task 0.6): the loader's first read honors the source limit and the
-   bytes behind a correct RDB — either framing — are applied as the start of the stream instead of
-   aborting the replica (a disk-based master flushing commands right after the file). A non-KeyDB
-   master observes it: a Redis master that sends stream bytes at once now syncs where it used to
-   kill or loop the replica. Graceful errors likewise replace `CHECK` aborts on a malformed
-   handshake/full-sync tail.
-5. **Raw-path KeyDB-only drop** (ungated, D-7): `PEXPIREMEMBERAT` and the rest of
+4. **Raw-path KeyDB-only drop** (ungated, D-7): `PEXPIREMEMBERAT` and the rest of
    `IsKeyDbOnlyCommand` are dropped and counted on the raw path instead of being dispatched as
    unknown commands. Reachable from a **non-active** KeyDB master (it sends `PEXPIREMEMBERAT` raw).
-6. **Reachable only from an active KeyDB** (the one master that answers `active-replica` and sends
+5. **Reachable only from an active KeyDB** (the one master that answers `active-replica` and sends
    RREPLAY; upstream cannot even complete that handshake): `REPLCONF capa activeExpire`, RREPLAY
    unwrap with its rewrites, EVAL stamping and dedup,
    `KEYDB.MVCCRESTORE` translation, replica active expiry (and its journaled expiry `DEL`s).
-7. **Observability** (additive; INFO is already outside byte identity, ISSUE-REGISTER D-5.1):
+6. **Observability** (additive; INFO is already outside byte identity, ISSUE-REGISTER D-5.1):
    classic INFO fields and Prometheus `_total` series render only when the master answered
    `active-replica` or a counter is nonzero (D-13), so a stock Redis master's INFO and `/metrics`
    are upstream's.
@@ -1025,7 +1028,7 @@ forwarding KeyDB masters double-applies deltas (`INCR`, `APPEND`, ...), and that
 | `src/server/CMakeLists.txt` | `classic_replay.cc` in `dragonfly_lib` (`:109-125`); `classic_replay_test` (`:200`, `:202-207`) | 0 |
 | `src/server/dragonfly_test.cc` | `EvalReplicatedApplyNoConnNoCrash`, `ReplicatedApplyDuringTakeoverNoCrash`, `ReplicatedApplyHandlerThrowNoConnNoCrash` | 0 |
 | `tests/dragonfly/keydb_onboarding_test.py` **(new)**, `fake_classic_master.py` **(new)** | KeyDB and fake-master suites | 0-4 |
-| `tests/dragonfly/{instance,conftest,proxy}.py`, `tests/pytest.ini`, `keydb_harness_test.py`, `data/`, `tools/` | Harness, fixtures, marker, captures (delivered `5199f34`, `89414e5`); request capture (1) | 0, 1 |
+| `tests/dragonfly/{instance,conftest,proxy}.py`, `tests/pytest.ini`, `keydb_harness_test.py`, `data/`, `tools/` | Harness, fixtures, marker, captures (delivered by Tasks 0.7, 0.8); request capture (1) | 0, 1 |
 | `.github/workflows/drakeydb-ci.yml` **(new)** | KeyDB build + suite | 0 |
 | `docs/{PLAN,README,UPSTREAM-SYNC,ISSUE-REGISTER,multi-master,differences,build-from-source}.md` | Close-out, KeyDB recipe, operator docs | 0, 4 |
 
@@ -1045,7 +1048,11 @@ forwarding KeyDB masters double-applies deltas (`INCR`, `APPEND`, ...), and that
    no commented-out code; comment density matches the surrounding file.
 5. Do not edit `helio/`. Do not touch `src/core/dash.h`, `src/core/compact_object.*`.
 6. Malformed input from a master is **skipped, counted and warned (rate-limited), never a
-   disconnect and never a `CHECK`**; offsets stay exact.
+   disconnect and never a `CHECK`**; offsets stay exact. The carve-out: input that breaks the
+   framing cannot be skipped past, so it is a logged error and a reconnect, still never a `CHECK`.
+   That covers a malformed full-sync header or tail (Task 0.6, ISSUE-REGISTER U-11) and a RESP
+   framing error in the stream; envelope-level malformations (a bad envelope, an unknown inner
+   command, a failing apply) are the ones that skip.
 7. `-Werror` clean; `ninja -C /home/user/drakeydb/build-dbg -j4` (never more than `-j4`); keep
    `WITH_SEARCH` ON.
 8. **Falsify every test** and record the verbatim failing and passing output in

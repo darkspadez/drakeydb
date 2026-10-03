@@ -18,7 +18,7 @@ an active KeyDB at all: `REPLICAOF` failed with `replication cancelled`.
 | `src/server/classic_replay.cc:13-29` (new) | `ParseCapaReply`: `ok` iff the first token is exactly `OK` (case-sensitive) and what follows is empty or starts with a space; later tokens are space-separated, `active-replica` and `keydb-fastsync-save` are recognized, unknown words are ignored. |
 | `src/server/replica.cc:401` | `read_capa_reply` lambda in `Greet()`: parses `LastResponseArgs()` (exactly one `STRING` arg) with `ParseCapaReply`. |
 | `src/server/replica.cc:447`, `:626` | The two strict `CheckRespIsSimpleReply("OK")` calls (`REPLCONF capa eof capa psync2`, and the Redis branch of `REPLCONF capa dragonfly`) become `PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok)`. Every other `CheckRespIsSimpleReply("OK")` in `Greet()` is unchanged. |
-| `src/server/replica.cc:395`, `src/server/replica.h:291` | `master_active_replica_` is cleared at the top of every `Greet()` and set when a capa reply carries `active-replica` (a `VLOG(1)` says so). Nothing reads it yet (P7-1). |
+| `src/server/replica.cc:395`, `src/server/replica.h:291` | `master_active_replica_` is cleared at the top of every `Greet()` and set when a capa reply carries `active-replica` (a `VLOG(1)` said so at `a0ee234`; see the whole-branch fix round below). Nothing reads it yet (P7-1). |
 | `src/server/CMakeLists.txt:114`, `:201`, `:209` | `classic_replay.cc` in `dragonfly_lib`; `helio_cxx_test(classic_replay_test ...)`; added to `check_dfly`. |
 
 Not changed: the stock-Redis path. A reply of exactly `+OK` parses to `ok = true` as before.
@@ -33,9 +33,11 @@ Not changed: the stock-Redis path. A reply of exactly `+OK` parses to `ok = true
 | `multimaster_test.py::test_greet_still_refuses_malformed_capa_reply` (`:523`; 2 sites x 4 bad replies = 8 cases) | `+OKAY`, `+ok active-replica`, `+OKactive-replica`, `+active-replica` still give `replication cancelled` and the node stays a master. |
 | `keydb_onboarding_test.py::test_keydb_active_handshake_and_full_sync`, `::test_keydb_active_handshake_peer_mode` (real KeyDB, plain and `--active_replica` replica) | The live twin. |
 
-The two proxy tests live in `multimaster_test.py`, not `keydb_onboarding_test.py`, because the
-latter's module marker (`pytestmark = pytest.mark.keydb`) skips them wherever there is no KeyDB
-binary, and they need only a stock Redis.
+The two proxy tests live in `multimaster_test.py`, not `keydb_onboarding_test.py`, because at
+`a0ee234` the latter carried a module-level `pytestmark = pytest.mark.keydb`, which labelled every
+test in it as needing a KeyDB binary, and they need only a stock Redis. (The marker only labels; the
+skip or failure comes from the `keydb_server_factory` fixture. The whole-branch review round removed
+the module mark: only the tests that start a KeyDB are marked `keydb` now.)
 
 Results at `a0ee234` (implementer, `t04-after.txt`, venv `/root/drakey-venv`):
 
@@ -126,7 +128,7 @@ fals:  WRONGLY ACCEPTED: 'OKAY'
 - The plan's "Done" asked for `redis_replication_test.py` to stay green; the Phase 7 baseline gate
   ran it before (12 passed) and the final gate reruns it. Not rerun for this report.
 
-## Review fix round (not committed when this was written)
+## Review fix round (committed in `2298570`, P7-0 whole-branch review round 1)
 
 `keydb_onboarding_test.py::test_keydb_active_handshake_peer_mode` failed 20 of 20 runs under CPU
 load and 10 of 10 without it. For a peer node `link_status=up` only means the TCP connection is up,
@@ -165,3 +167,54 @@ tests/dragonfly/keydb_onboarding_test.py:91: in assert_full_sync_arrived
 E               redis.exceptions.BusyLoadingError: Dragonfly is loading the dataset in memory
 ============================== 1 failed in 1.90s ===============================
 ```
+
+## Whole-branch review fix round: I-1, an active-KeyDB link must not drop its stream silently
+
+Until P7-1, a link to an active KeyDB connects and loads the full sync, but `ConsumeRedisStream`
+dispatches every RREPLAY-wrapped write as an unknown command and drops it, and the link keeps
+reporting `up`. The round makes that loud, with no change in behavior:
+
+- `replica.cc`, `Greet()`: the `VLOG(1)` in `read_capa_reply` is a `LOG(WARNING)`, once per link (the
+  flag is cleared at the top of every `Greet()`): `Master <host:port> advertises active-replica: this
+  build applies its full sync but NOT its RREPLAY stream yet; writes after the sync are dropped
+  (Phase 7, P7-1)`.
+- `replica.cc`, `ConsumeRedisStream`: a command named `RREPLAY` (`absl::EqualsIgnoreCase` on the name
+  already in hand) bumps a per-stream counter and logs `LOG_EVERY_T(ERROR, 30)` `Dropping RREPLAY
+  envelopes from an active KeyDB master (unsupported until P7-1); N dropped so far`. The command is
+  still dispatched and dropped as before.
+- Test `keydb_onboarding_test.py::test_active_keydb_stream_drop_is_logged` (real KeyDB, plain
+  replica): attach, wait for `slave0.state == online`, write a key, poll the node's log files for the
+  `E...` line, stop the node and find the `W...` line. The patterns start with glog's severity
+  letter, so they also pin the severity. P7-1 deletes the test with the drop.
+
+Log lines of a passing run (`/tmp/dragonfly_logs/...`):
+
+```
+W1003 23:09:13.823131   30144 replica.cc:409] Master localhost:5555 advertises active-replica: this build applies its full sync but NOT its RREPLAY stream yet; writes after the sync are dropped (Phase 7, P7-1)
+E1003 23:09:13.926120   30144 replica.cc:1265] Dropping RREPLAY envelopes from an active KeyDB master (unsupported until P7-1); 1 dropped so far
+```
+
+Falsification. Command (both rows): `flock /tmp/drakey-pytest.lock env
+DRAGONFLY_PATH=/home/user/drakeydb/build-dbg/dragonfly KEYDB_SERVER_PATH=<abs keydb-server>
+KEYDB_REQUIRED=1 /root/drakey-venv-pinned/bin/python -m pytest
+tests/dragonfly/keydb_onboarding_test.py::test_active_keydb_stream_drop_is_logged -x -q`; rebuilt with
+`nice -n 10 ninja -C build-dbg -j3 dragonfly` each time, `replica.cc` restored from a saved copy after.
+
+| Mutation | Result |
+| --- | --- |
+| none | `1 passed in 1.83s` |
+| `Greet()`'s `LOG(WARNING)` back to `VLOG(1)` (same text) | `E AssertionError: no log line warning about the master` ... `1 failed in 1.01s` |
+| the `LOG_EVERY_T(ERROR, 30)` to `VLOG(2)` | `E AssertionError: the dropped writes are not logged` ... `1 failed in 11.79s` (100 polls) |
+
+A first version matched the message text alone, and with the warning demoted to `VLOG(1)` it still
+passed (the harness runs `--vmodule=replica=1`, so the `VLOG(1)` line reaches the log with the same
+text); the severity-letter anchors above are the fix.
+
+Also in this round: the strict `xfail` of `test_keydb_active_live_write_during_full_sync` gained
+`raises=AssertionError`. Under `--runxfail` both parametrizations fail with `AssertionError: 328 of
+328 live writes missing` from `assert_live_writes_arrived`, i.e. after `assert_full_sync_arrived` and
+`assert_ttl_and_db1_arrived` had passed (the bulk-keyspace check comes after it and was not reached).
+With `raises=ConnectionError` instead, the same run is a hard
+`FAILED` (`1 failed in 35.67s`), so a crash or a connection error under `raises=AssertionError` fails
+the test too. Residual: an `AssertionError` from an earlier step would also count as the expected
+failure; the `--runxfail` run above is what shows it is the right one today.

@@ -151,7 +151,7 @@ review's I2 finding and is done below.
 - Not changed, noted in U-11: a `$0` header takes `InitiatePSync`'s partial-resync branch (stale data
   kept, master offset adopted); pre-existing, for P7-3.
 
-## Review fix round (not committed when this was written)
+## Review fix round (committed in `2298570`, P7-0 whole-branch review round 1)
 
 **I2, offset exactness.** `FakeClassicMaster.wait_for_ack(offset)` passed as soon as the expected
 offset appeared anywhere in the ACK list. It is replaced by `wait_for_settled_ack(since, repeats=3)`

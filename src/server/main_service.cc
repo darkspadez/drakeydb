@@ -1426,9 +1426,9 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId& cid,
       // Only PING, admin commands, and all commands via admin connections are allowed
       // we prohibit even read commands, because read commands running in pipeline can take a while
       // to send all data to a client which leads to fail in takeover.
-      // A context without a connection is a replicated apply (see above): a cascaded node keeps
-      // applying its own master's stream while it is being taken over, and refusing that would
-      // drop writes.
+      // drakeydb: U-10 -- a context without a connection is a replicated apply (see above): a
+      // cascaded node keeps applying its own master's stream while it is being taken over, and
+      // refusing that would drop writes.
       allowed_by_state = dfly_cntx.conn() == nullptr || dfly_cntx.conn()->IsPrivileged() ||
                          (cid.opt_mask() & CO::ADMIN) || cid.name() == "PING";
       break;
@@ -1647,7 +1647,7 @@ DispatchResult Service::DispatchCommand(facade::ParsedArgs args, facade::ParsedC
 
   if ((res != DispatchResult::OK) && (res != DispatchResult::OOM)) {
     cmd_cntx->SendError("Internal Error");
-    // A replicated apply (see VerifyCommandState) has no connection to close.
+    // drakeydb: U-12 -- a replicated apply (see VerifyCommandState) has no connection to close.
     if (auto* conn = dfly_cntx->conn(); conn != nullptr)
       conn->MarkForClose();
   }
@@ -2460,8 +2460,9 @@ void Service::EvalInternal(const EvalArgs& eval_args, Interpreter* interpreter, 
       return OpStatus::OK;
     });
 
-    // Migration only makes sense if there are distinct shards, and for a context that has a
-    // connection to migrate: a replicated apply (Replica, JournalExecutor) has none.
+    // Migration only makes sense if there are distinct shards.
+    // drakeydb: U-9 -- and for a context that has a connection to migrate: a replicated apply
+    // (Replica, JournalExecutor) has none.
     if (sid.has_value() && *sid != ss->thread_index() && conn_cntx->conn() != nullptr) {
       VLOG(2) << "Migrating connection " << conn_cntx->conn() << " from "
               << ProactorBase::me()->GetPoolIndex() << " to " << real_sid;
