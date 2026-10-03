@@ -74,7 +74,7 @@ Decided 2026-10-03. Numbers match `decisions.md`.
 | 5 | Topology | Every drakeydb node attaches to KeyDB directly; v1 no-forward invariant kept; cutover via `REPLICAOF REMOVE` |
 | 6 | RREPLAY unwrap | On **every** classic link, plain replicas included |
 | 7 | Streaming LWW | Stamp KeyDB writes `{envelope mvcc, author-uuid hash}`; audit KeyDB's propagated forms; then guard ON under `--multi_master_stream_lww` |
-| 8 | KeyDB extras | Skip + rate-limited warn + counters (RDB type 64 CRON, `keydb-subexpire-*` aux, EXPIREMEMBER family, `KEYDB.*`); member TTLs documented as lost. `KEYDB.MVCCRESTORE` is carved out — see [O-1](#open-design-items) |
+| 8 | KeyDB extras | Skip + rate-limited warn + counters (RDB type 64 CRON, `keydb-subexpire-*` aux, EXPIREMEMBER family, `KEYDB.*`); member TTLs documented as lost. `KEYDB.MVCCRESTORE` is **not** one of the drops: it is applied (decision 22, D-7) |
 | 9 | KeyDB mesh | N KeyDB masters; per-author-uuid monotonic mvcc dedup shared by all classic links, bounded; docs recommend KeyDB `multi-master-no-forward yes`; nested unwrap <= 64; self-uuid drop |
 | 10 | Partial PSYNC | In scope for **all** classic links behind `--classic_partial_psync` (default true); in-memory only (restart means full resync) |
 | 11 | Apply path | Per-command dispatch for RREPLAY (own mvcc/origin each); raw classic streams keep squashing |
@@ -88,6 +88,7 @@ Decided 2026-10-03. Numbers match `decisions.md`.
 | 19 | Rigor | Per task: brief, implement + falsify, spec+quality review, fix loop. Per sub-PR: whole-branch review + adversarial pass |
 | 20 | Ledger | `docs/superpowers/ledgers/2026-10-03-phase7-keydb-onboarding/`, committed |
 | 21 | Verification | Build in the session container; per-task targeted tests; full gate per sub-PR |
+| 22 | `KEYDB.MVCCRESTORE` (owner, 2026-10-03; closes [O-1](#open-design-items)) | **Applied, LWW-guarded**: translated to `RESTORE key <ttl> <payload> REPLACE ABSTTL`, stamped with the command's own `<mvcc>` plus the envelope author's uuid hash, guarded on peer links, verbatim and unstamped on plain replicas; an unloadable payload is skipped, counted (`keydb_mvccrestore_failed`) and warned with a rate limit. Task 2.6 (P7-2) |
 
 **Owner amendments to the advisor design** (the advisor's B.5 / B.10 text predates them):
 `capa activeExpire` is sent as a *separate* `REPLCONF`, only after an `active-replica` capa reply,
@@ -98,24 +99,27 @@ PSYNC is in scope (D-8); the perf bar is bounded lag with a squasher micro-batch
 
 ### Open design items
 
-**O-1. `KEYDB.MVCCRESTORE` handling — owner decision pending.** The command is in v6.3.4's command
-table (`server.cpp:1168`; handler `mvccrestoreCommand`, `cluster.cpp:5206`):
-`KEYDB.MVCCRESTORE key <mvcc> <expire-ms-abs|-1> <DUMP payload>` sets the key's mvcc to `<mvcc>` and
-merges with `dbMerge` (`db.cpp:376-390`: overwrite when `old_mvcc <= incoming`). It is **live**: an
-active KeyDB that has replicas emits one per key it inserts while loading an RDB — including a merge
-full sync from one of its own masters — via `replicationNotifyLoadedKey`
+None. The one that was open is decided:
+
+**O-1. `KEYDB.MVCCRESTORE` handling — decided 2026-10-03: Option A (decision 22).** The command is
+in v6.3.4's command table (`server.cpp:1168`; handler `mvccrestoreCommand`, `cluster.cpp:5206`):
+`KEYDB.MVCCRESTORE key <mvcc> <expire> <DUMP payload>` sets the key's mvcc to `<mvcc>` and merges
+with `dbMerge` (`db.cpp:376-390`: overwrite when `old_mvcc <= incoming`). `<expire>` is an absolute
+ms deadline, and a key with no TTL is sent as `INVALID_EXPIRE` (`LLONG_MAX`), not `-1` (D-1.15). It
+is **live**: an active KeyDB that has replicas emits one per key it inserts while loading an RDB —
+including a merge full sync from one of its own masters — via `replicationNotifyLoadedKey`
 (`replication.cpp:5573-5594`, called from `rdb.cpp:2942`), RREPLAY-wrapped. It is data-carrying, so
 unlike the `KEYDB.CRON` / `EXPIREMEMBER` family a drop is silent key loss on a KeyDB mesh resync.
-Options:
+The options were:
 
-- **(A) Apply** as `RESTORE key <ttl> <payload> REPLACE ABSTTL` (ttl = the absolute ms, or 0 for
-  `-1`), stamped with its own `<mvcc>` (envelope mvcc when `<mvcc>` is 0, has bit 63 set, or is
-  `OBJ_MVCC_INVALID`) and LWW-guarded on peer links; a plain replica applies it unguarded.
-  Exact-tie semantics differ from KeyDB (stored side wins here, incoming wins there).
+- **(A) Apply — chosen.** Translate to `RESTORE key <ttl> <payload> REPLACE ABSTTL`, stamp it with
+  its own `<mvcc>`, LWW-guard it on peer links; a plain replica applies it unguarded.
 - **(B) Drop** + count + rate-limited warn, like the other `KEYDB.*` extras, and document the loss.
+  Rejected: the loss is silent data loss, not a missing feature.
 
-Until decided, `KEYDB.MVCCRESTORE` is **not** in the D-7 drop list and is not specially handled; it
-reaches the unknown-command path (counted, warned, not applied). Resolution is Task 2.6.
+How (A) is built: D-7 (translation, failure accounting), D-4 and D-6 (stamp source, guard path),
+D-13 (counter). It lands as Task 2.6 in P7-2. Until then — P7-1 and earlier — the command is not in
+the D-7 drop list and reaches the unknown-command path (counted, warned, not applied).
 
 ## Corrections to PLAN.md's Phase 7 stub
 
@@ -133,19 +137,25 @@ reaches the unknown-command path (counted, warned, not applied). Resolution is T
 **Corrections found while re-verifying the ledger against the tree:**
 
 - The recommended KeyDB directive is **`multi-master-no-forward yes`** (`config.cpp:2976`,
-  `keydb.conf:2040`), not `multimaster-no-forward`. KeyDB logs that it *requires a mesh topology*
-  when set (`config.cpp:2705-2710`): every KeyDB master must replicate from every other.
+  `keydb.conf:2040`), not `multimaster-no-forward` — which makes KeyDB abort at startup (`Bad
+  directive or wrong number of arguments`, confirmed against v6.3.4). KeyDB logs that it *requires
+  a mesh topology* when set (`config.cpp:2705-2710`): every KeyDB master must replicate from every
+  other.
 - ISSUE-REGISTER U-8 (GEORADIUS `STORE` "never replicates") is wrong: `geo_family.cc:652-657` passes
-  `journal_update = true` and `ZSetFamily::OpAdd` hand-journals (`zset_family.cc:1963`, `:2053`).
-  Task 0.1's live re-test (16/16 destinations replicated) withdrew it.
+  `journal_update = true` and `ZSetFamily::OpAdd` hand-journals (`zset_family.cc:1963` for an empty
+  result; `:2053` opens the branch that records `DEL`, `:2055`, then `ZADD`, `:2072`). Task 0.1's
+  live re-test (16/16 destinations replicated) withdrew it.
 - KeyDB refusing PSYNC while loading in active mode is `startBgsaveForReplication` failing
   (`replication.cpp:1293-1296`), surfacing as `-ERR BGSAVE failed, replication can't continue`
   (`:1341`) — handled by the existing bad-header reconnect, not a distinct reply.
 - `KEYDB.MVCCRESTORE` is in v6.3.4's command table and is live on the wire — the earlier ledger
-  note to the contrary must not be carried forward. Its handling is open item O-1.
+  note to the contrary was wrong and must not be carried forward. Decided: it is applied
+  (decision 22, D-7). Its `<expire>` field is an absolute ms deadline with `INVALID_EXPIRE`
+  (`LLONG_MAX`) for "no TTL", not `-1` as an earlier draft of O-1 assumed (D-1.15).
 - The advisor's `[unverified]` gcc-13 KeyDB build risk is closed: v6.3.4 built cleanly on gcc 13.3.
-- Line anchors in `advisor-design.md` drifted in places; every anchor in this spec and in the plan's
-  "Verified anchors" table was re-read at `c60dfdb`.
+- Line anchors in `advisor-design.md` drifted in places (thirteen are listed, with the correct
+  values, in that file's "Corrections after review" table); every anchor in this spec and in the
+  plan's "Verified anchors" table was re-read at `c60dfdb`.
 
 ## Design
 
@@ -220,6 +230,24 @@ reaches the unknown-command path (counted, warned, not applied). Resolution is T
     without an expiry, `SET k v NX|XX|KEEPTTL` propagates verbatim and `GET` is stripped;
     `SETEX`/`PSETEX`/`GETSET`/`INCRBYFLOAT` propagate as `SET`; `MSETNX` propagates verbatim;
     `EXPIRE*` as `PEXPIREAT`; member TTLs as `PEXPIREMEMBERAT`.
+15. **`KEYDB.MVCCRESTORE`** (`server.cpp:1168`, arity 5; `mvccrestoreCommand`, `cluster.cpp:5206`;
+    emitter `replicationNotifyLoadedKey`, `replication.cpp:5573-5594`, called from `rdb.cpp:2942`,
+    which returns unless `fActiveReplica` and a replica is attached). On the wire it is
+    `KEYDB.MVCCRESTORE <key> <mvcc> <expire> <DUMP payload>` inside an RREPLAY envelope (the db
+    travels in the envelope). `<mvcc>` is the key's own mvcc (`mvccFromObj`), not the envelope's.
+    `<expire>` is the key's absolute ms deadline, or `INVALID_EXPIRE` = `LLONG_MAX` (`expire.h:8`)
+    when it has none; the handler applies a TTL only for `expire >= 0`, and live-checked on v6.3.4
+    `-1` and `INVALID_EXPIRE` both leave no TTL while `0` expires the key at once. The payload is
+    `createDumpPayload`: type byte, value, an AUX `mvcc-tstamp` field, the 2-byte RDB version (9)
+    and an 8-byte CRC64. drakeydb's `RESTORE` loads such payloads (live-checked on an unmodified
+    `c60dfdb` build: string raw and int, list, hash, set intset and hashtable, zset and stream,
+    small and large; the trailing aux is ignored), with these edges: on a replicated-apply context
+    it skips the CRC and checks only length and `version <= RDB_VERSION` (`journal_emulated` becomes
+    `ignore_crc`, `generic_family.cc:69`, `:2892`); `ABSTTL 0` means no TTL, `-1` is an error, and
+    `LLONG_MAX` is accepted but clamped to a TTL about 8.5 years out; with `REPLACE` it deletes the
+    resident key *before* it parses the payload (`OpRestore`, ISSUE-REGISTER D-31); an elapsed
+    absolute TTL deletes the resident key and creates nothing. `rdbIsObjectTypeDF` rejects
+    `RDB_TYPE_CRON` (64, KeyDB `rdb.h:96`), the one KeyDB-only object type.
 
 ### D-2. Handshake and capability negotiation (B.5, owner amendment)
 
@@ -286,8 +314,9 @@ keyed in **normalized lowercase** form (`NormalizeNodeUuid`), including the self
 4. Parse `inner` with a link-owned `RedisParser(Mode::SERVER)` (never `parser_`; created once,
    recreated after any non-`OK` result) until fully consumed. For each inner command:
    `MULTI`/`EXEC`/`PING`/`REPLCONF` skip; `SELECT n` sets the db; `RREPLAY` recurses with
-   `depth + 1`, malformed at 65; KeyDB-only commands drop and count (D-7); `FindCmd == nullptr`
-   counts `classic_unknown_cmds_dropped`; anything else dispatches with the apply context (D-4).
+   `depth + 1`, malformed at 65; KeyDB-only commands drop and count (D-7); `KEYDB.MVCCRESTORE` is
+   translated to a `RESTORE` first (D-7); `FindCmd == nullptr` counts
+   `classic_unknown_cmds_dropped`; anything else dispatches with the apply context (D-4).
    Partial or trailing inner bytes are malformed.
 5. Advance the dedup watermark (D-5) once the envelope was *consumed*.
 
@@ -308,6 +337,8 @@ link origin — it has no mvcc side table and its sub-replicas speak framing v1)
 
 1. `repl_origin_idx = ClassicAuthorMap::IdxFor(uuid)`; `repl_mvcc = envelope.mvcc` (0 means local
    mint and never guarded). The author is the **innermost** envelope's uuid, not the forwarder's.
+   The one exception to the mvcc source is `KEYDB.MVCCRESTORE`, which stamps with its **own**
+   `<mvcc>` argument (D-7).
 2. `repl_lww_guard` is set once at link setup to `IsPeerMode() && IsActiveReplica() &&
    FLAGS_multi_master_stream_lww` — the same expression as `replica.cc:1755`. Raw commands have
    mvcc 0, so the guard is inert for them.
@@ -332,7 +363,8 @@ stamping is off.
 
 RDB-aux stamps (`mvcc-tstamp`, P4-2) carry the *sender's* origin hash because the file has no
 author; a stream write carries the true author's. The two can differ for one forwarded key on an
-exact mvcc tie only — documented as a residual.
+exact mvcc tie only — documented as a residual. A `KEYDB.MVCCRESTORE` stamp has the same property
+as an RDB-aux one: the key's own mvcc with the sending author's hash (D-7a).
 
 ### D-5. Author dedup (B.3)
 
@@ -344,7 +376,8 @@ or peer. It is process-wide state by definition — KeyDB's watermark is (`g_map
 - `ShouldDrop(uuid, mvcc)` iff `mvcc != 0 && entry.mvcc >= mvcc` (KeyDB parity). `mvcc == 0` is
   never deduped and never advances.
 - `Advance(uuid, mvcc)` after an envelope was *consumed*: applied, or intentionally skipped (inner
-  `PING`/`MULTI`/`EXEC`, KeyDB-only drop, unknown drop) — KeyDB advances on `fExec || CLIENT_MULTI`
+  `PING`/`MULTI`/`EXEC`, KeyDB-only drop, unknown drop, a rejected `KEYDB.MVCCRESTORE`) — KeyDB
+  advances on `fExec || CLIENT_MULTI`
   (D-1.4). **Never** for a malformed, self-authored or deduped envelope, and never when the link
   was cancelled mid-dispatch (the command may not have run; advancing would turn the replay into a
   silent drop). The advance happens before `repl_offs_` moves, with no yield between.
@@ -374,6 +407,7 @@ propagated forms (D-1.14) classify as follows; two need `ClassicApplyRewrites`, 
 | `INCR*`, `APPEND`, `H*`, `L*`, ... deltas | unguarded | By design |
 | `RENAME`, `FLUSHALL/DB`, `EVAL*` | unguarded | `EVAL` dispatched with mvcc 0 (D-4.4) |
 | expiry deletes | not propagated | Each node expires itself (D-9) |
+| `KEYDB.MVCCRESTORE` (inside an envelope only) | not a command here | Translated to `RESTORE ... REPLACE ABSTTL` (`kSingleKey`), stamped with its own `<mvcc>`, guarded like any other `RESTORE` (D-7) |
 
 A `SET` with `EX|PX|EXAT|PXAT` — with or without NX/XX/GET — already propagates as exactly
 `SET k v PXAT abs`, so only the no-expiry NX/XX forms need the strip. The classifier table in
@@ -385,13 +419,66 @@ A `SET` with `EX|PX|EXAT|PXAT` — with or without NX/XX/GET — already propaga
 `PEXPIREMEMBERAT` (the only member-expiry form KeyDB propagates, `aof.cpp:716-718`),
 `EXPIREMEMBER`, `EXPIREMEMBERAT`, `PERSIST key subkey` (the 3-arg form only; `PERSIST key` is
 standard), `KEYDB.CRON`, `KEYDB.HRENAME`, `KEYDB.NHSET`, `KEYDB.NHGET`, `KEYDB.MEXISTS`, and
-`RREPLAY` (never dispatched as a command). **`KEYDB.MVCCRESTORE` is not on this list — see O-1.**
+`RREPLAY` (never dispatched as a command). **`KEYDB.MVCCRESTORE` is not on this list: it is
+applied (D-7a).**
 
 Inside envelopes, a command with `FindCmd == nullptr` is counted `classic_unknown_cmds_dropped`
 with its own rate-limited warning instead of being dispatched into a `NONE` builder. On the raw
 path (a non-active KeyDB sends `PEXPIREMEMBERAT` raw) only the KeyDB-only check runs; raw-path
 unknowns stay on upstream's `unknown_*` accounting so the squashed hot path gains no second registry
 lookup. Member TTLs are documented as lost; native conversion is a registered follow-up.
+
+#### D-7a. `KEYDB.MVCCRESTORE` is applied (decision 22)
+
+It carries data: an active KeyDB with replicas emits one per key it inserts while loading an RDB,
+including a merge full sync from one of its own masters (D-1.15), so dropping it would lose keys
+silently on a KeyDB mesh resync. **It only ever arrives inside an RREPLAY envelope** — the emitter
+returns unless the sender is an active replica, and an active master wraps every replica-bound
+command (D-1.2), a forwarded one included (nested) — so it is handled in the envelope loop only. A
+raw-path occurrence is not translated (a raw stream carries no mvcc authority) and stays on
+upstream's `unknown_*` accounting.
+
+`TranslateMvccRestore` (`classic_replay.cc`) rewrites `KEYDB.MVCCRESTORE key <mvcc> <expire>
+<payload>` (exactly five arguments) in place to `RESTORE key <ttl> <payload> REPLACE ABSTTL` and
+returns the command's own mvcc:
+
+| `<expire>` | `<ttl>` | Why |
+|---|---|---|
+| negative, or `LLONG_MAX` (`INVALID_EXPIRE`) | `0` (no TTL) | KeyDB sends `INVALID_EXPIRE` for a TTL-less key, not `-1`; passed through, `ABSTTL` would clamp it to a TTL about 8.5 years out |
+| `0` | `1` | KeyDB's `0` is a deadline at the epoch, so the key is already expired; `RESTORE`'s `0` means no TTL |
+| anything else | unchanged | An absolute ms deadline, which `ABSTTL` takes as is |
+
+- **mvcc source.** The stamp's mvcc is the command's own `<mvcc>`, the key's mvcc as the sender
+  holds it, *not* the envelope's, which is a fresh tick minted when the command was fed. Stamping
+  with the envelope's would make a restored key look as new as the resync itself, so it would beat
+  every newer local write. When `<mvcc>` is 0 or has bit 63 set (`OBJ_MVCC_INVALID`, a key KeyDB
+  synced from plain Redis; the loader treats the `mvcc-tstamp` aux the same way, `rdb_load.cc:3193`)
+  the envelope's mvcc is used instead. The origin hash is the envelope author's (innermost), so the
+  D-4 residual applies: it names the sender, not the key's original writer, which matters on an
+  exact mvcc tie only. The dedup watermark (D-5) is unaffected; it advances with the envelope's
+  mvcc.
+- **Guard path.** Peer mode: `repl_mvcc` is the value above and `repl_origin_idx` the author's, then
+  the ordinary D-4.3 sequence (`ApplyLwwRewrites` finds `REPLACE` already present;
+  `ClassicApplyRewrites` leaves it alone), and `Transaction::ShouldDropForLww` vetoes the restore
+  when the stored stamp wins (`RESTORE` is `kSingleKey`). Ties favor the stored side where KeyDB's
+  `dbMerge` lets the incoming side win, and the compare is on `{mvcc, origin_hash}` where KeyDB's is
+  on mvcc alone; both differ on an exact mvcc tie only. `--multi_master_stream_lww=false` applies it
+  in arrival order, still stamped. A plain replica keeps `repl_mvcc = 0`: the translated `RESTORE`
+  applies verbatim and unstamped, like every plain classic write.
+- **Failure accounting.** Before dispatch the translator rejects: not five arguments; `<mvcc>` not a
+  u64 or `<expire>` not an i64 (KeyDB itself replies an error, `cluster.cpp:5212-5216`); and a
+  payload `RESTORE` would not load: shorter than the 10-byte footer, a footer version above
+  `RDB_VERSION`, or a first byte outside `rdbIsObjectTypeDF` (a KeyDB-only type). A rejected command
+  is skipped, `keydb_mvccrestore_failed` is bumped, a `LOG_EVERY_T(WARNING, 60)` names the key and
+  the reason, and the envelope still counts as consumed (the dedup watermark advances, D-5). The
+  checks run *before* dispatch because `OpRestore` with `REPLACE` deletes the resident key before it
+  parses the payload (ISSUE-REGISTER D-31); an unloadable payload must never erase a good key, as it
+  does not in KeyDB (`cluster.cpp:5232`). The CRC is not verified, matching a replicated-apply
+  `RESTORE` (D-1.15) and KeyDB's own handler for replication links (`cluster.cpp:5219`). The one
+  residual is a payload that passes these checks and still fails inside the loader (a module-typed
+  value, a deep-integrity failure): the translated command is dispatched into a capturing reply
+  builder instead of the `NONE` one, an error reply also counts as `keydb_mvccrestore_failed`, and
+  the resident key is lost locally exactly as D-31 describes.
 
 ### D-8. Partial PSYNC on classic links (B.4, decision 10)
 
@@ -512,8 +599,9 @@ Per-link counters on `Replica` (relaxed atomics, copied into `ReplicaSummary`,
 `replica_types.h:14`), rendered only for **classic** links in the plain-replica block
 (`server_family.cc:3164-3192`) as `key:value` lines and in `RenderPeerReplicationInfo`
 (`multi_master.cc:195-216`) as `,key=value`: `rreplay_unwrapped`, `rreplay_malformed`,
-`rreplay_self_dropped`, `keydb_cmds_dropped`, `classic_unknown_cmds_dropped`,
-`classic_psync_partial_ok`, `classic_psync_partial_fallback`, plus `repl_offset` on peer lines.
+`rreplay_self_dropped`, `keydb_cmds_dropped`, `keydb_mvccrestore_failed` (rejected
+`KEYDB.MVCCRESTORE`s, D-7a), `classic_unknown_cmds_dropped`, `classic_psync_partial_ok`,
+`classic_psync_partial_fallback`, plus `repl_offset` on peer lines.
 Process-wide (relaxed atomics in `classic_replay.cc`, **not** `ServerState::Stats`, D-1.13):
 `multimaster_rreplay_deduped`, `multimaster_keydb_author_overflow`,
 `multimaster_keydb_rdb_cron_skipped`, `multimaster_keydb_rdb_subexpire_dropped`,
@@ -523,7 +611,8 @@ process-wide sums for the per-link ones.
 Flag: `--classic_partial_psync`. The boot limitations warning (`multi_master.cc:144-151`) gains
 "KeyDB member TTLs and cron jobs are dropped on onboarding". Docs: `docs/multi-master.md`
 "Onboarding from KeyDB" (topology, `multi-master-no-forward yes` and its full-mesh requirement,
-backlog sizing, cutover, expiry semantics, member-TTL/cron loss, counters; rewrite `:87-122` and
+backlog sizing, cutover, expiry semantics, member-TTL/cron loss, `KEYDB.MVCCRESTORE` applied and
+its failure counter, counters; rewrite `:87-122` and
 `:311-381`), `docs/differences.md`, `docs/UPSTREAM-SYNC.md` watchlist rows, ISSUE-REGISTER (close
 D-1, D-8, U-9; add the TAKEN_OVER and subexpire-conversion follow-ups), `docs/build-from-source.md`
 (KeyDB build recipe).
@@ -568,6 +657,10 @@ still pass under if the feature were removed.
 | `test_keydb_lww_concurrent_set_converges` (pause KeyDB link, newer local write on drakeydb, resume: stale KeyDB write must lose; guard off: it wins) | Guard bit off |
 | `test_keydb_set_nx_wins_over_stale_local` | Removing `ClassicApplyRewrites` (NX evaluates against the stale local key) |
 | `test_keydb_writes_not_forwarded_to_peers` (no-forward; `assert_no_command_storm`) | Stamping classic authors with `kSelfIdx` |
+| `ClassicReplayTest.TranslateMvccRestore*` (table-driven: `<expire>` mapping, own-mvcc extraction, arity, payload pre-checks, byte-exact output) | Passing `INVALID_EXPIRE` through; taking the envelope's mvcc; dropping the type-byte check |
+| `ClassicApplyFamilyTest.MvccRestore*` (stamp is own mvcc + author hash; a stale restore loses to a newer local write; plain link applies verbatim and unstamped; a bad payload leaves the resident key and counts) | Envelope mvcc; guard bit off; pre-checks removed (D-31 deletes the key) |
+| `test_keydb_mvccrestore_from_keydb_mesh_merge_applies` (KeyDB B with a peer and a plain drakeydb attached merge-syncs from KeyDB A: keys and TTLs arrive; the peer keeps a newer local write, the plain replica takes A's) | Envelope mvcc or guard off (the peer takes A's stale value); `INVALID_EXPIRE` passthrough (TTL-less keys gain a TTL); no translation (keys never arrive) |
+| `test_keydb_mvccrestore_unloadable_payload_skipped_and_counted` (fake master) | Removing the pre-checks (resident key deleted); not counting |
 | `test_classic_partial_psync_*` (exact INCR count, master `sync_partial_ok == 1`, `sync_full == 1`, `sync_partial_err == 0`), flag-off, mid-load drop, new-replid, KeyDB envelope variant, coalesced leftover | Fresh `io_buf` (lost bytes); `+0` offset; flag ignored |
 | `RdbKeyDbTest.*` (type 64 skip + next key unstamped, subexpire, aux once, bit-63 throttle, opcode 221 beats aux) | Not calling `settings.Reset()` (cron stamp leaks) |
 | `EvalReplicatedApplyNoConnNoCrash` | Removing the `conn() != nullptr` guard (null deref) |
@@ -586,8 +679,8 @@ observe changes only here:
 4. **Graceful errors** replace `CHECK` aborts on a malformed master handshake/full-sync tail.
 5. **Reachable only from an active KeyDB** (the one master that answers `active-replica` and sends
    RREPLAY; upstream cannot even complete that handshake): `+OK <suffix>` acceptance,
-   `REPLCONF capa activeExpire`, RREPLAY unwrap, replica active expiry (and its journaled expiry
-   `DEL`s).
+   `REPLCONF capa activeExpire`, RREPLAY unwrap, `KEYDB.MVCCRESTORE` translation, replica active
+   expiry (and its journaled expiry `DEL`s).
 6. **Observability** (additive; INFO is already outside byte identity, ISSUE-REGISTER D-5.1):
    per-link INFO fields on classic links only, Prometheus `_total` series.
 
@@ -601,9 +694,9 @@ rebased onto `origin/main` after the predecessor squash-merges; each PR is opene
 
 | PR | Branch | Scope |
 |---|---|---|
-| **P7-0** | `feat/phase7-0-closeout-and-harness` | P4 close-out docs (U-8 withdrawn), baseline gate on unmodified main, this spec and plan, `Greet()` accepts `+OK <suffix>`, U-9, graceful PSYNC `CHECK`s, KeyDB harness + fake classic master + smoke test, `drakeydb-ci.yml` |
+| **P7-0** | `feat/phase7-0-closeout-and-harness` | P4 close-out docs (U-8 withdrawn), baseline gate on unmodified main, this spec and plan, `Greet()` accepts `+OK <suffix>`, U-9, graceful PSYNC `CHECK`s, KeyDB harness + fake classic master + smoke test, `drakeydb-ci.yml`, a load-robust reaper-resume test (Task 0.9) |
 | **P7-1** | `feat/phase7-1-rreplay-unwrap` | Envelope parse, unwrap in `ConsumeRedisStream`, KeyDB-only/unknown drop and counters, `capa activeExpire` + replica active expiry, throughput bar (conditional micro-batch task) |
-| **P7-2** | `feat/phase7-2-author-stamps-dedup-guard` | Author map, per-command stamps, author dedup, guard ON + classic rewrites, D-1 closed, `KEYDB.MVCCRESTORE` (O-1) |
+| **P7-2** | `feat/phase7-2-author-stamps-dedup-guard` | Author map, per-command stamps, author dedup, guard ON + classic rewrites, D-1 closed, `KEYDB.MVCCRESTORE` applied (decision 22) |
 | **P7-3** | `feat/phase7-3-classic-partial-psync` | `--classic_partial_psync`, leftover hand-off, peer partial skips merge |
 | **P7-4** | `feat/phase7-4-keydb-rdb-extras-docs-exit` | Type 64 skip, subexpire/aux noise, D-8 precedence test, operator docs, phase exit gate |
 
@@ -615,7 +708,7 @@ makes it convergent; P7-3 and P7-4 are independent of each other and land last b
 
 | Path | Change | PR |
 |---|---|---|
-| `src/server/classic_replay.{h,cc}` **(new)** | `CapaReply`/`ParseCapaReply`; `RreplayEnvelope`/`ParseRreplayEnvelope`; `ClassicApplier`; `ClassicApplyRewrites`; `IsKeyDbOnlyCommand`; `ClassicAuthorMap`; `AuthorDedup`; `ClassicLinkStats`/process counters; `--classic_partial_psync` (split into a second pair if it passes ~800 lines) | 0, 1, 2, 3 |
+| `src/server/classic_replay.{h,cc}` **(new)** | `CapaReply`/`ParseCapaReply`; `RreplayEnvelope`/`ParseRreplayEnvelope`; `ClassicApplier`; `ClassicApplyRewrites`; `TranslateMvccRestore`; `IsKeyDbOnlyCommand`; `ClassicAuthorMap`; `AuthorDedup`; `ClassicLinkStats`/process counters; `--classic_partial_psync` (split into a second pair if it passes ~800 lines) | 0, 1, 2, 3 |
 | `src/server/classic_replay_test.cc` **(new)** | Pure units and `ClassicApplyFamilyTest` | 0-3 |
 | `src/server/replica.{h,cc}` | Capa parse + activeExpire send; unwrap hook and batch-flush lambda; expiry flag set/clear; PSYNC offset/CONTINUE/leftover; graceful `CHECK`s; counters | 0-3 |
 | `src/server/replica_types.h` | `ReplicaSummary` classic fields | 1 |
@@ -682,7 +775,7 @@ triage recorded, counts into PLAN.md.
 |---|---|---|
 | 1 | **Handshake blocker** — nothing is testable against real KeyDB until fixed | P7-0 Task 0.4 first, reproduced live and falsified |
 | 2 | **Per-command dispatch throughput** vs the owner's "must keep up" bar | D-12 test in P7-1, re-run in peer mode in P7-2; conditional Task 1.6 |
-| 3 | **`KEYDB.MVCCRESTORE`** is silently unapplied on a KeyDB mesh resync until O-1 is decided | Owner decision requested before P7-1's gate; counted and warned meanwhile; Task 2.6 |
+| 3 | **`KEYDB.MVCCRESTORE`** (decision 22) is data on the wire: until Task 2.6 (P7-2) it is unapplied, which is key loss on a KeyDB mesh resync; a bad payload sent on to `RESTORE ... REPLACE` deletes the resident key (ISSUE-REGISTER D-31); a resync sends one envelope per key through the per-command path | P7-1 counts it as an unknown command and the PR says so; Task 2.6 pre-checks the payload, counts and warns, and pytest resyncs a few thousand keys; the D-12 load test covers the burst |
 | 4 | **Guard on classic links** ends `multi-master.md`'s structural claim; EVAL must stay unguarded | Rewrite `:311-381`; tripwire comment; EVAL dispatched with mvcc 0 |
 | 5 | **Partial-PSYNC leftover hand-off** (silent loss) and the FULLRESYNC header overwrite | D-8; fake master makes the coalesced case deterministic; repeat x10 |
 | 6 | **Dedup watermark** never resets and can evict at 4096 | KeyDB shares the exposure; documented |

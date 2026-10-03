@@ -14,7 +14,7 @@ Phase 6 delivered by P4-3; the spec's P4-5 tombstones shipped inside P4-3).
 | 6 | RREPLAY unwrap | On **every** classic link (plain replicas too) |
 | 7 | Streaming LWW | Stamp KeyDB writes `{envelope mvcc, author-uuid hash}`; audit KeyDB's propagated forms; then guard ON under `--multi_master_stream_lww` |
 | 8 | KeyDB extras | Skip + rate-limited warn + counters (RDB type 64 CRON, `keydb-subexpire-*` aux, EXPIREMEMBER family, `KEYDB.*`); member TTLs documented as lost |
-| 9 | KeyDB mesh | N KeyDB masters; per-author-uuid monotonic mvcc dedup shared across all classic links, bounded; docs recommend KeyDB `multimaster-no-forward yes`; nested unwrap ≤ 64; self-uuid drop |
+| 9 | KeyDB mesh | N KeyDB masters; per-author-uuid monotonic mvcc dedup shared across all classic links, bounded; docs recommend KeyDB `multi-master-no-forward yes` (`config.cpp:2976`; the spelling `multimaster-no-forward` makes KeyDB fail to start); nested unwrap ≤ 64; self-uuid drop |
 | 10 | Partial PSYNC | In scope for all classic links behind `--classic_partial_psync` (default true); in-memory only (restart → full resync) |
 | 11 | Apply path | Per-command dispatch for RREPLAY (own mvcc/origin each); raw classic streams keep squashing |
 | 12 | Perf bar | **Must keep up with KeyDB**: bounded lag under sustained load, else optimize within P7 |
@@ -27,13 +27,29 @@ Phase 6 delivered by P4-3; the spec's P4-5 tombstones shipped inside P4-3).
 | 19 | Rigor | Per task: brief → implement + falsify → spec+quality review → fix loop. Per sub-PR: whole-branch review + adversarial pass |
 | 20 | Ledger | This directory, committed |
 | 21 | Verification | Build in the session container; per-task targeted tests; full gate per sub-PR |
+| 22 | `KEYDB.MVCCRESTORE` (owner, 2026-10-03; closes spec open item O-1) | **Applied, LWW-guarded.** Translated to `RESTORE key <ttl> <DUMP payload> REPLACE ABSTTL` (ttl = absolute ms, 0 = none), stamped with the command's **own** `<mvcc>` argument plus the envelope author's uuid hash, and run through the LWW guard on peer links; plain replicas apply it verbatim and unstamped. A payload drakeydb cannot load (KeyDB-only type, unsupported RDB version) is skipped, counted (`keydb_mvccrestore_failed`) and warned with a rate limit. Lands in P7-2 (Task 2.6) |
 
 ## Corrections to PLAN.md's Phase 7 stub
 
 - KeyDB does **not** refuse a replica without `capa activeExpire`; it only logs a deprecation warning
   (`KeyDB/src/replication.cpp:1798-1803`, v6.3.4).
 - KeyDB's RREPLAY dedup is per **author uuid**, process-wide (`g_mapremote`), not per link.
-- `KEYDB.MVCCRESTORE` does not exist in v6.3.4's command table.
+- **`KEYDB.MVCCRESTORE` exists in v6.3.4 and is live** (an earlier version of this list said the
+  opposite; that was wrong). It is in the command table (`server.cpp:1168`, arity 5, flags
+  `write use-memory @keyspace @dangerous`); the handler is `mvccrestoreCommand`
+  (`cluster.cpp:5206`): `KEYDB.MVCCRESTORE key <mvcc> <expire> <DUMP payload>`. It loads the
+  payload, sets the object's mvcc to `<mvcc>`, and merges with `dbMerge` (`db.cpp:376-390`: add if
+  absent, overwrite when `old_mvcc <= incoming`, otherwise keep the stored value); the reply is
+  `+OK` either way. An active KeyDB that has replicas emits one per key it inserts while loading an
+  RDB — including a merge full sync from one of its own masters — via `replicationNotifyLoadedKey`
+  (`replication.cpp:5573-5594`, called from `rdb.cpp:2942`), RREPLAY-wrapped. `<expire>` is an
+  **absolute ms deadline**, and a key with no TTL is sent as `INVALID_EXPIRE` = `LLONG_MAX`
+  (`expire.h:8`, `rdb.cpp:3101`), **not** `-1`. The handler applies `setExpire` only for
+  `expire >= 0`; live-checked on v6.3.4, `-1` and `INVALID_EXPIRE` both leave the key with no TTL
+  and `0` makes it expire at once. Live capture (an active KeyDB with an attached raw replica,
+  then `REPLICAOF` an active KeyDB holding 3 keys): 3 envelopes, db `0`, `<mvcc>` = the key's own
+  mvcc, `<expire>` = `9223372036854775807` for the TTL-less keys and an absolute ms for the TTL'd
+  one. Decision 22 applies it.
 - An active KeyDB never propagates expiry deletes (`db.cpp:1966-1985`) — see decision 13.
 - "Apply-context from envelope" cannot ride the squasher: `repl_mvcc` is copied once per batch
   (`main_service.cc:1815-1816`, `multi_command_squasher.cc:114-115`).

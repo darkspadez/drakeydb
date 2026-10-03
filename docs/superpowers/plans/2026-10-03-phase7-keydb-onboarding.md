@@ -52,9 +52,12 @@ Ledger (reports, progress): the same directory.
   `cd /home/user/drakeydb && DRAGONFLY_PATH=/home/user/drakeydb/build-dbg/dragonfly
   KEYDB_SERVER_PATH=<abs keydb-server> /root/drakey-venv/bin/python -m pytest
   tests/dragonfly/<file> -x -q`. Gate runs add `KEYDB_REQUIRED=1`. Timing-sensitive tests run x10.
+  **Wrap every pytest run in `flock /tmp/drakey-pytest.lock …`**: `conftest.py` `rmtree`s
+  `/tmp/dragonfly_logs` at session start, so concurrent sessions in one container corrupt each other.
 - `pre-commit run --files <changed files>` before every commit. Commit subjects <= 100 characters,
-  conventional-commit prefix, suffix `(P7)`, every body line <= 100; commits are signed off. Do not
-  commit or push unless the orchestrator says so; never push to `main`.
+  conventional-commit prefix, suffix `(P7)`, every body line <= 100. No `Signed-off-by` trailer
+  (owner squash-merges; the local signed-commit hook is not enforced in CI). Do not commit or push
+  unless the orchestrator says so; never push to `main`.
 - **Falsify every test:** revert the code under test (or flip the guarded condition), rebuild, run,
   capture the failing output, restore, rerun. Record the exact commands and the verbatim failing and
   passing output in
@@ -120,7 +123,9 @@ Ledger (reports, progress): the same directory.
 | Fixtures: `MvccStoreTest`; `ApplyReplicatedCommand`; `DflyEngineTest` | `multi_master_test.cc:793`, `:839`; `dragonfly_test.cc:134` |
 | pytest: `RedisServer`; `redis_server` fixture; `Proxy`; `wait_for_peers`; `active_args`; `attach`; `STORM_BOUND` / `assert_no_command_storm`; `_parse_mvcc`; metrics | `instance.py:560-612`; `conftest.py:613-623`; `proxy.py:21-37`, `:174-211`; `multimaster_test.py:475`, `:595`, `:609`, `:1404`, `:1407`, `:2292`; `instance.py:391` |
 | Docs: "classic links never guarded" paragraph; stamped vs unstamped peers | `docs/multi-master.md:311-381`; `:87-122` |
-| KeyDB v6.3.4 (read-only reference): capa reply; warning; wire; nesting; dedup; MVCCRESTORE | `replication.cpp:1740-1753`; `:1798-1803`; `:562-694`; `:5297`; `:5435`, `:5453`, `:5485`; `:5573-5594` + `server.cpp:1168`, `cluster.cpp:5206` |
+| KeyDB v6.3.4 (read-only reference): capa reply; warning; wire; nesting; dedup | `replication.cpp:1740-1753`; `:1798-1803`; `:562-694`; `:5297`; `:5435`, `:5453`, `:5485` |
+| KeyDB `KEYDB.MVCCRESTORE`: command entry; handler (mvcc, expire, verify skip, bad data, merge, TTL); emitter + caller; `INVALID_EXPIRE`; `dbMerge`; `RDB_TYPE_CRON` | `server.cpp:1168`; `cluster.cpp:5206` (`:5212`, `:5215`, `:5219`, `:5232`, `:5238-5239`); `replication.cpp:5573-5594`, `rdb.cpp:2942`; `expire.h:8`; `db.cpp:376-390`; `rdb.h:96` |
+| drakeydb `RESTORE`: footer check (`ignore_crc`); type gate; `OpRestore` delete-before-load; handler; guard rewrite | `generic_family.cc:69-97`; `:191-199`; `:716`, `:734`; `:2878`, `:2892`; `multimaster_lww.cc:111-125` |
 | KeyDB: config names; propagate forms; RDB cron/aux | `config.cpp:2976`, `:2949`, `:742-753`; `aof.cpp:682-726`; `rdb.cpp:1167`, `:1194-1195`, `:2577-2588`, `rdb.h:96` |
 
 ---
@@ -136,8 +141,8 @@ settle the U-8 dispute.
 `docs/ISSUE-REGISTER.md`.
 - [x] Committed as `a162d75` and `a549973`. U-8 was **withdrawn** by a live re-test (16/16
   `GEORADIUS*/STORE*` destinations replicated; `geo_family.cc:654` sets `journal_update` and
-  `ZSetFamily::OpAdd` hand-journals, `zset_family.cc:1963`, `:2053`). The active-KeyDB handshake
-  failure was also reproduced live and recorded in `progress.md`.
+  `ZSetFamily::OpAdd` hand-journals, `zset_family.cc:1963`, `:2053-2072`). The active-KeyDB
+  handshake failure was also reproduced live and recorded in `progress.md`.
 - [ ] Reviewer pass (spec + quality); fix loop.
 
 **Falsification:** docs-only; the live U-8 test is its own evidence (ledger `progress.md`).
@@ -152,7 +157,9 @@ settle the U-8 dispute.
 - [ ] Pytest, each file separately: `multimaster_test.py`, `multimaster_merge_test.py`,
   `replication_test.py`, `replication_specific_test.py`, `replication_resilience_test.py`,
   `replication_config_test.py`, `cluster_test.py::test_cluster_migrations_sequence`.
-- [ ] Triage each failure: rerun x3 in isolation, classify as flake or real, record evidence.
+- [ ] Triage each failure: rerun x3 in isolation, classify as flake or real, record evidence. The
+  baseline's `ReaperJournalFamilyTest.MemberExpiryReaperDoesNotBlockOnConcurrentBgsave` failure
+  (`multi_master_test.cc:10148`, loaded `-j3` run only) is owned by Task 0.9.
 - [ ] Counts into the ledger and into `docs/PLAN.md`'s P4-4 record.
 
 **Falsification:** n/a (measurement). **Done:** 0 unexplained failures; counts recorded.
@@ -311,6 +318,62 @@ bytes; records every request line and connection count. A valid empty RDB comes 
 **Done:** the workflow is green on the P7-0 PR with the KeyDB tests actually executed (the summary
 shows them passed, not skipped).
 
+### Task 0.9: Make `ReaperJournalFamilyTest.MemberExpiryReaperDoesNotBlockOnConcurrentBgsave` robust
+
+**Goal:** Remove a load-dependent flake from the P7 gate: root-cause why the test's last assertion
+fails under CPU contention, and make it deterministic — in the test, or in the code if it is a real
+bug.
+**Evidence:** Task 0.2's baseline `ctest -L DFLY -j3` on a loaded box failed `multi_master_test` at
+`src/server/multi_master_test.cc:10148`: `Run({"exists", "rs"}).GetInt()` was 1, expected 0 (`"the
+reaper did not resume once the snapshot consumer unregistered"`), after 228 ms in-suite; the same
+test passed 20/20 in isolation.
+**Files:** Test `src/server/multi_master_test.cc` (the test is `:10050-10150`); read
+`src/server/db_slice.{h,cc}`; modify `db_slice.cc` only if the root cause is a product defect.
+**Hypotheses to confirm or kill** (read from the code, not yet proven): (H1) the follow-up reap is
+`DeleteExpiredStep(db_cntx, 100)` with default options, and `reset_time_quota` defaults to false
+(`db_slice.h:643`), so `quota_start` is 0 (`db_slice.cc:2283`) and `quota_remains()` (`:2284-2287`)
+compares the running fiber's **cumulative** running time with 1 ms; it gates every `Traverse`
+iteration (`:2580`, `:2587`) and the member walk itself (`:2394`), and a cycle count includes time
+the thread was descheduled, so under load the sweep can end before it reaches `rs`. (H2) With no
+deletions the sweep makes at most `count / 3` = 33 `Traverse` steps per call (`:2580-2587`) from the
+persistent `db.expire_cursor`; the first call, skipped because the consumer is registered, moves
+that cursor by a time-dependent number of steps, so whether the second call's 33 steps reach the
+bucket of `rs` among 33 keys depends on timing. (H3) The consumer is still registered when the
+follow-up call runs (unregistration versus `WaitSnapshotting`).
+- [ ] **Step 1: Reproduce.** `ninja -C /home/user/drakeydb/build-dbg -j4 multi_master_test`; run the
+  one test x50 idle for a baseline pass rate, then x50 under artificial load shaped like the failing
+  gate: `stress-ng --cpu 6` if present, else six `sh -c 'while :; do :; done'` spinners plus three
+  concurrent copies of the test (`--gtest_repeat=50
+  --gtest_filter='ReaperJournalFamilyTest.MemberExpiryReaperDoesNot*'`). Record both failure
+  rates. Do not change the test yet.
+- [ ] **Step 2: Root-cause, test-side instrumentation only.** Keep the `DeleteExpiredStats` each
+  `DeleteExpiredStep` call returns (`traversed`), log `ThisFiber::GetRunningTimeCycles()` at the
+  entry of each call and, if the accessor is reachable, `HasRegisteredCallbacks()`. A failing run
+  that shows a small `traversed` or a large entry time confirms H1/H2; a registered consumer
+  confirms H3. Record the output in `task-0.9-report.md`; remove the instrumentation.
+- [ ] **Step 3: Fix.** If H1/H2 (a test that demands one bounded call hit a specific bucket): make
+  the follow-up reap a bounded loop — call `DeleteExpiredStep(db_cntx, 100,
+  {.ensure_member_reaping = true, .journal_deletions = false, .reset_time_quota = true})` until
+  `exists rs` is 0, at most 64 times (enough to wrap the table several times), and on exhaustion
+  fail with the per-call `traversed` list. The assertion keeps its meaning (the reaper resumes once
+  the consumer is gone) without depending on one 1 ms quota. Leave the first, skip-while-registered
+  assertion untouched. If H3, wait for the unregistration explicitly. If instead the evidence shows
+  a product defect (for example `reset_time_quota` semantics starving a container in the production
+  heartbeat), fix `db_slice.cc` with its own failing test and keep this test strict.
+- [ ] **Step 4: Falsify under load, both directions.** (a) The original test under the Step 1 load
+  fails at the recorded rate and the fixed one passes 200/200 under the same load. (b) The fixed
+  test still catches what it exists for: make the reaper skip permanently (force the
+  `!HasRegisteredCallbacks()` term at `db_slice.cc:2394` to `false`): the follow-up assertion
+  fails; remove that term: the first assertion (`exists rs == 1`) fails. Restore each; record the
+  commands and verbatim outputs.
+- [ ] **Step 5:** `./multi_master_test --gtest_filter='ReaperJournalFamilyTest.*'` x10 idle plus the
+  loaded runs; pre-commit; commit
+  `test: make the reaper-resume assertion independent of the sweep's time quota (P7)`.
+
+**Done:** the root cause is recorded with the instrumentation output, the test passes 200/200 under
+the artificial load, and each falsification fails as named. Lands before the P7-0 gate so
+`multi_master_test` is not a flake source.
+
 ### P7-0 gate and PR
 
 - [ ] Whole-branch review (Opus) and an adversarial pass; fix loops.
@@ -391,7 +454,8 @@ ordered.
 ### Task 1.3: KeyDB-only and unknown commands, per-link counters, INFO and Prometheus
 
 **Goal:** What drakeydb cannot represent is dropped loudly and counted, never silently.
-`KEYDB.MVCCRESTORE` is **excluded** here — see Task 2.6 / spec O-1.
+`KEYDB.MVCCRESTORE` is **excluded** here: it is applied, not dropped (decision 22, Task 2.6); until
+that task lands it is counted as an unknown command.
 **Files:** Modify `src/server/classic_replay.{h,cc}`, `src/server/replica.{h,cc}`,
 `src/server/replica_types.h`, `src/server/server_family.cc`, `src/server/multi_master.cc`,
 `src/server/metrics.cc`; Test `src/server/classic_replay_test.cc`,
@@ -511,8 +575,9 @@ advisor signs the design — `src/server/main_service.cc`, `src/server/multi_com
 ### P7-1 gate and PR
 
 - [ ] Whole-branch review, adversarial pass, fix loops. Gate and PR as in P7-0.
-- [ ] **Before the gate:** request the owner's O-1 decision on `KEYDB.MVCCRESTORE` — until then it
-  is counted and warned as an unknown command, not applied.
+- [ ] O-1 is decided (decision 22: `KEYDB.MVCCRESTORE` is applied, Task 2.6 in P7-2). Until then
+  the command is counted and warned as an unknown command, not applied: say so in the PR
+  description.
 
 ---
 
@@ -635,15 +700,96 @@ tokens (anywhere after the value, case-insensitive; `PX|PXAT|EX|EXAT <n>` and `K
 
 **Falsification:** docs-only. **Done:** register consistent with the code.
 
-### Task 2.6: `KEYDB.MVCCRESTORE` handling — pending owner decision
+### Task 2.6: `KEYDB.MVCCRESTORE` — applied, LWW-guarded (decision 22)
 
-**Status: placeholder. The orchestrator fills this in once the owner decides spec O-1.**
-The decision is between (A) apply as `RESTORE key <ttl> <payload> REPLACE ABSTTL`, stamped with the
-command's own mvcc and LWW-guarded on peer links, and (B) drop + count + rate-limited warn.
-Context to carry into the brief: the command is live in v6.3.4 (`server.cpp:1168`,
-`cluster.cpp:5206`, emitted by `replicationNotifyLoadedKey`, `replication.cpp:5573-5594`, from
-`rdb.cpp:2942`) and is data-carrying; until this task lands it is counted as an unknown command.
-- [ ] To be written.
+**Goal:** A KeyDB mesh resync no longer loses keys. An active KeyDB with replicas emits one
+`KEYDB.MVCCRESTORE key <mvcc> <expire> <DUMP payload>` per key it loads from an RDB, RREPLAY-wrapped
+(`replication.cpp:5573-5594`); the applier translates it to `RESTORE key <ttl> <payload> REPLACE
+ABSTTL`, stamps it with the command's **own** `<mvcc>` and the envelope author's hash, and the LWW
+guard decides it on peer links. Spec D-7a is binding.
+**Files:** Modify `src/server/classic_replay.{h,cc}` (`TranslateMvccRestore`, the applier hook,
+`ClassicLinkStats::keydb_mvccrestore_failed`), `src/server/replica_types.h`,
+`src/server/server_family.cc`, `src/server/multi_master.cc`, `src/server/metrics.cc` (the counter,
+rendered like `keydb_cmds_dropped`); Test `src/server/classic_replay_test.cc`,
+`tests/dragonfly/keydb_onboarding_test.py`. No edits to `generic_family.cc`.
+**Depends on:** Tasks 1.2, 1.3 (applier, counters) and 2.1, 2.2, 2.4 (author map, stamps, guard).
+**Interfaces:** `enum class MvccRestoreParse { kOk, kBadArity, kBadMvcc, kBadExpire, kBadPayload }`;
+`MvccRestoreParse TranslateMvccRestore(cmn::BackedArguments* args, uint64_t* own_mvcc)` rewrites in
+place, returns the command's own mvcc through `own_mvcc` (0 when unusable: 0, or bit 63 set). The
+`<expire>` mapping: negative or `LLONG_MAX` becomes `0`; `0` becomes `1`; anything else is kept
+(spec D-7a table). Payload pre-checks mirror what a replicated-apply `RESTORE` accepts: longer than
+the 10-byte footer, footer version `<= RDB_VERSION`, first byte in `rdbIsObjectTypeDF`
+(`rdb_extensions.h:21`); the CRC is not verified. `GetRdbVersion` is anonymous in
+`generic_family.cc`, so reimplement the ten-line length/version check and say why in a comment.
+
+- [ ] **Step 0: Re-probe KeyDB before coding** (the design session did this on 2026-10-03; repeat
+  and record in `task-2.6-report.md`): (a) with the Task 0.7 harness, an active KeyDB X with a raw
+  replica attached merge-syncs from an active KeyDB Z holding a TTL'd key, a TTL-less key and a
+  hash, and the capture shows one `KEYDB.MVCCRESTORE` envelope per key; keep the bytes as a golden
+  vector for the gtests; (b) `DUMP` each type from KeyDB and `RESTORE ... REPLACE ABSTTL` it onto a
+  drakeydb; (c) `RESTORE` with `ABSTTL` `0`, `1`, `-1`, `9223372036854775807` and read `PTTL`.
+- [ ] **Step 1: Failing tests.** `ClassicReplayTest.TranslateMvccRestore*`: `MapsExpire` (`-1`,
+  `-7`, `LLONG_MAX` give `0`; `0` gives `1`; an absolute ms deadline is unchanged),
+  `ExtractsOwnMvcc` (a valid value; `0`, `1<<63` and all-ones give `*own_mvcc == 0` and still
+  `kOk`), `RejectsMalformed` (4 and 6 arguments; `<mvcc>` `-5`, `abc`, overflow; `<expire>`
+  `abc`, overflow), `RejectsUnloadablePayload` (empty; shorter than the footer; footer version
+  `RDB_VERSION + 1`; type byte 64 with footer version 9), `OutputIsByteExact` (binary payload with
+  `\r\n` and NULs, key with a space; result is exactly `RESTORE key ttl payload REPLACE ABSTTL`).
+  `ClassicApplyFamilyTest` (the peer applier of Task 2.2):
+  `.MvccRestoreStampsOwnMvccWithAuthorHash` (envelope mvcc 900, command `<mvcc>` 500:
+  `StampOf(key) == {500, NodeUuidHash(author)}`),
+  `.MvccRestoreFallsBackToEnvelopeMvccWhenOwnInvalid` (all-ones `<mvcc>` gives `{900, hash}`),
+  `.StaleMvccRestoreLosesToNewerLocalWrite` (local stamp 700 > 500: the local value survives,
+  `multimaster_lww_dropped` +1),
+  `.NewerMvccRestoreWinsOverOlderLocalWrite` (800 over 700),
+  `.PlainApplierAppliesMvccRestoreVerbatimUnstamped`, `.NoTtlRestoreHasNoTtl` (`INVALID_EXPIRE`
+  gives `PTTL == -1`), `.AbsoluteTtlRestoredAsDeadline`, and
+  `.BadPayloadLeavesResidentKeyCountsAndAdvancesWatermark` (resident `k = good`; type-64 payload:
+  `k == good`, `keydb_mvccrestore_failed == 1`, the D-5 watermark advanced — the D-31 contract).
+  Pytest (`keydb` marker): `test_keydb_mvccrestore_from_keydb_mesh_merge_applies` — KeyDB A
+  (active) seeded with 2000 `bulk:<i>` strings, `ttl_key` (`PX 3600000`), `plain_key` (no TTL), a
+  hash, a list and `stale = "from-A"` (written first); KeyDB B (active, **empty**); an
+  `--active_replica` drakeydb D and a plain drakeydb D2 both `REPLICAOF B` and synced; then
+  `sleep 0.05` and `SET stale newer-on-D` on D; then `REPLICAOF A` on B (a merge full sync: B
+  emits one `KEYDB.MVCCRESTORE` per key to D and D2, and since B started empty every key reaching
+  D/D2 came through it). Assert on both: all keys equal A's; `PTTL ttl_key` is a real remaining
+  deadline (`3_000_000 .. 3_600_000` ms); `PTTL plain_key == -1`; on D `GET stale ==
+  "newer-on-D"` and `multimaster_lww_dropped >= 1`; on D2 `GET stale == "from-A"` (a plain
+  replica applies verbatim); `keydb_mvccrestore_failed == 0`. Record the time from `REPLICAOF A`
+  to full arrival. `test_keydb_mvccrestore_unloadable_payload_skipped_and_counted` (fake master,
+  plain link; wrap every pytest run in `flock /tmp/drakey-pytest.lock`): `SET k good`, then three
+  scripted `KEYDB.MVCCRESTORE` envelopes — a type-64 payload with footer version 9, a footer
+  version `0xFFFF`, and a four-argument one — then `SET after 1`: `k == good`, `after == 1`,
+  `keydb_mvccrestore_failed == 3`, the link stays up, offsets exact.
+- [ ] **Step 2: Run, observe failure.** gtest: no symbol. Pytest: today the command reaches the
+  unknown-command path, so D and D2 stay empty and `classic_unknown_cmds_dropped` rises.
+- [ ] **Step 3: Implement.** In the applier's inner loop, before the `FindCmd == nullptr` path: on
+  `KEYDB.MVCCRESTORE` call `TranslateMvccRestore`; any non-`kOk` result bumps
+  `keydb_mvccrestore_failed`, logs with `LOG_EVERY_T(WARNING, 60)` (key and reason), counts the
+  envelope as consumed and moves on, never dispatching. Otherwise, in peer mode set `repl_mvcc =
+  own_mvcc != 0 ? own_mvcc : envelope.mvcc` and the author's `repl_origin_idx`, run the usual D-4.3
+  sequence, dispatch into a capturing builder in `ReplyMode::FULL` (not the `NONE` one) and count an
+  error reply as failed too; a plain replica keeps `repl_mvcc = 0`. Then the usual restore of the
+  context. Add `keydb_mvccrestore_failed` to `ClassicLinkStats`, `ReplicaSummary`, the plain-replica
+  INFO block, the peer line and the Prometheus mirror; `IsKeyDbOnlyCommand` stays unchanged.
+- [ ] **Step 4: Run; falsify**, one at a time, restore and record verbatim: (a) stamp with
+  `envelope.mvcc`: `MvccRestoreStampsOwnMvccWithAuthorHash` and the pytest `stale` assertion on D
+  fail (D takes "from-A"); (b) drop the `INVALID_EXPIRE` mapping: `MapsExpire`,
+  `NoTtlRestoreHasNoTtl` and the pytest `plain_key` assertion fail (`PTTL` near 268435454996); (c)
+  drop the type-byte
+  pre-check: `BadPayloadLeavesResidentKey...` fails with `k` gone (D-31); (d) clear the link's
+  `repl_lww_guard`: `StaleMvccRestoreLosesToNewerLocalWrite` fails; (e) skip the hook so the command
+  falls to the unknown path: both pytest and the apply gtests fail; (f) do not bump the counter:
+  the counter assertions fail. Record what each test would still pass under without the feature:
+  the fake-master test's `k == good` and `after == 1` pass vacuously, so its
+  `keydb_mvccrestore_failed == 3` is the load-bearing assertion.
+- [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; both gtest and pytest suites; if the
+  recorded resync time falls behind the Task 1.5 bound, open Task 1.6; pre-commit; commit
+  `feat: apply KEYDB.MVCCRESTORE with LWW on classic peer links (P7)`.
+
+**Done:** every key of a KeyDB mesh merge resync reaches D and D2 with the right TTL, a stale
+restore loses to a newer local write on the peer and not on the plain replica, a bad payload never
+erases a resident key, and every rejection is counted.
 
 ### P7-2 gate and PR
 
@@ -772,7 +918,8 @@ Test `src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test
   attaches to KeyDB directly; no-forward kept), the recommended KeyDB `multi-master-no-forward yes`
   and its **full-mesh requirement**, `repl-backlog-size` sizing for partial resync, cutover with
   `REPLICAOF REMOVE`, expiry semantics (decision 13, `--replica_delete_expired` note), member-TTL
-  and cron loss, `KEYDB.MVCCRESTORE` outcome, counters; rewrite `:87-122` (classic peers now carry
+  and cron loss, `KEYDB.MVCCRESTORE` applied (and `keydb_mvccrestore_failed`), counters; rewrite
+  `:87-122` (classic peers now carry
   real stamps when KeyDB is active) and confirm `:311-381` matches Task 2.4.
 - [ ] `docs/differences.md` entry; `docs/UPSTREAM-SYNC.md` watchlist rows for the newly touched
   files (`replica.{h,cc}`, `engine_shard.{h,cc}`, `db_slice.cc`, `rdb_load.cc`, `metrics.cc`) and

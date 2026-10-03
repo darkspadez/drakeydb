@@ -1,5 +1,45 @@
 # Phase 7 — advisor design (verified against `origin/main` @ `c60dfdb` and KeyDB v6.3.4)
 
+## Corrections after review (2026-10-03)
+
+The body below is the advisor's design as delivered. Where it disagrees with this section,
+`decisions.md` and the Phase 7 spec win.
+
+- **`KEYDB.MVCCRESTORE` exists, is live, and is applied** (decision 22). B.7's drop list is right
+  for the `KEYDB.CRON` / `EXPIREMEMBER` family but must not grow this command: it carries data (one
+  per key an active KeyDB loads from an RDB, RREPLAY-wrapped, `replication.cpp:5573-5594`), so it
+  is translated to `RESTORE key <abs-ms|0> <dump> REPLACE ABSTTL`, stamped with its own `<mvcc>`
+  argument and LWW-guarded on peer links (spec D-7a, Task 2.6). Its `<expire>` is an absolute ms
+  deadline, or `INVALID_EXPIRE` = `LLONG_MAX` for a key with no TTL (not `-1`).
+- **The KeyDB directive is `multi-master-no-forward`** (`config.cpp:2976`). B.10's
+  `multimaster-no-forward yes` makes KeyDB abort at startup (`Bad directive or wrong number of
+  arguments`, confirmed against v6.3.4).
+- **U-8 is withdrawn**; the explorer's reading was right and the advisor's was wrong (see
+  "Verification notes" below). `store_cb` sets `zparams.journal_update = true`
+  (`geo_family.cc:654`) and `ZSetFamily::OpAdd` hand-journals the destination (`zset_family.cc:1963`
+  for an empty result; `:2053-2072` for `DEL` then `ZADD`). Live: 16/16 destinations replicated.
+- **Counter names**: process-wide counters carry the `multimaster_` prefix in the spec (D-13), e.g.
+  `multimaster_keydb_author_overflow`; B.10's `keydb_author_overflow` and `keydb_rdb_*` are the
+  short forms. `keydb_mvccrestore_failed` is new (per-link, decision 22).
+- **Line drift** (anchors re-read at `c60dfdb`; the spec and the plan's anchor table use the right
+  column):
+
+| Advisor anchor | At `c60dfdb` |
+|---|---|
+| `main_service.cc:1540-1549` (unknown command into the NONE builder) | `:1538-1548` |
+| `transaction.cc:807-840` (`ShouldDropForLww`) | `:807-842` |
+| `journal/executor.cc:76-79` (dispatch), `:52-53` (rewrite gate) | `:80-83`, `:57-58` |
+| `journal/executor.cc:36` (null-owner context) | `:34-42` |
+| `journal/journal.cc:109-116` (applied-write floor flag) | `:114-121` |
+| `replica.cc:555-559` (`RegisterOriginHash` via `AwaitBrief`) | `:545-549` |
+| `replica.cc:585-596` (`DRAKEY-VERSION` / `PEER` tolerance) | `:573-584` |
+| `replica.cc:1218-1227` (deferred skipped bytes) | `:1217-1227` |
+| `multimaster_lww.cc:122-126` (`IncomingStamp` `DCHECK`) | `:134-140` |
+| `main_service.cc:~2448-2452` (`EvalInternal` migration) | `:2458-2463` |
+| `main_service.cc:1431` (`TAKEN_OVER` `conn()` deref) | `:1430` |
+| `multi_master.cc:130-141` (boot limitations warning) | `:144-151` |
+| `docs/multi-master.md:316-381` | `:311-381` |
+
 Produced by the design advisor on 2026-10-03; decisions 13 (replica active expiry) and the
 `capa activeExpire` gating were amended afterwards by the owner (see `decisions.md`). Line numbers
 are at `c60dfdb` unless noted; KeyDB paths are `KeyDB/src/*` at tag v6.3.4. Items marked

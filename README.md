@@ -27,7 +27,7 @@ behavior can differ; see [BRANDING.md](BRANDING.md) for the compatibility policy
 
 ## Multi-master interface
 
-The multi-master interface is implemented (phases 2-3). For merge, tombstone, and operational
+The multi-master interface is implemented (phases 2–4). For merge, tombstone, and operational
 guidance see [docs/multi-master.md](docs/multi-master.md). For example:
 
 ```bash
