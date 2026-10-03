@@ -635,12 +635,15 @@ def redis_local_server(port_picker) -> RedisServer:
 def keydb_server_factory(port_picker, df_log_dir) -> typing.Callable[..., KeyDBServer]:
     """Creates started KeyDB servers via `create(**kwargs)`; all are stopped at teardown.
 
-    Without a keydb-server binary the test is skipped, unless KEYDB_REQUIRED=1 (gate and CI runs),
-    where a missing binary must fail instead of silently dropping the interop coverage.
+    Without a keydb-server binary the test is skipped, unless KEYDB_REQUIRED is 1, true or yes (gate
+    and CI runs), where a missing binary must fail instead of silently dropping the interop
+    coverage. A KEYDB_SERVER_PATH that does not resolve to an executable always fails (see
+    KeyDBServer.unavailable).
     """
-    if KeyDBServer.find_binary() is None:
-        reason = "keydb-server not found (set KEYDB_SERVER_PATH or add it to PATH)"
-        if os.environ.get("KEYDB_REQUIRED") == "1":
+    unavailable = KeyDBServer.unavailable()
+    if unavailable:
+        reason, fatal = unavailable
+        if fatal:
             pytest.fail(reason, pytrace=False)
         pytest.skip(reason)
 

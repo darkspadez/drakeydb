@@ -6,7 +6,6 @@ import re
 import shlex
 import shutil
 import signal
-import socket
 import subprocess
 import tempfile
 import threading
@@ -16,6 +15,7 @@ from dataclasses import dataclass
 
 import aiohttp
 import psutil
+import redis
 from prometheus_client.parser import text_string_to_metric_families
 from redis.asyncio import Redis as RedisClient
 from redis.asyncio import RedisCluster as RedisCluster
@@ -567,15 +567,27 @@ class RedisServer:
         self.log_dir = log_dir
         self.server_bin = None
 
+    @staticmethod
+    def _major_version(binary):
+        """The major version `binary --version` reports ('Redis server v=7.0.15 ...'), else 0."""
+        try:
+            out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return 0
+        match = re.search(r"\bv=(\d+)\.", out.stdout)
+        return int(match.group(1)) if match else 0
+
     def start(self, redis7=None, **kwargs):
         servers = ["redis-server-7.2.2"]
         if not redis7:
             servers += ["redis-server-6.2.11", "valkey-server-8.0.1"]
         if not any(shutil.which(s) for s in servers):
-            # None of the version-suffixed CI binaries is installed (a developer machine): use the
-            # configured server, else a plain `redis-server` on PATH.
+            # drakeydb: none of the version-suffixed CI binaries is installed (a developer machine):
+            # use the configured server, else a plain `redis-server` on PATH, but only one that
+            # satisfies the request. Without a fallback the Popen below raises FileNotFoundError,
+            # which the fixtures turn into a skip outside CI.
             fallback = os.environ.get("REDIS_SERVER_PATH") or shutil.which("redis-server")
-            if fallback:
+            if fallback and (not redis7 or self._major_version(fallback) >= 7):
                 servers = [fallback]
         self.server_bin = random.choice(servers)
         command = [
@@ -653,8 +665,32 @@ class KeyDBServer:
 
     @staticmethod
     def find_binary():
-        """Path of the keydb-server to run, or None when there is none."""
+        """Path of the keydb-server to run, or None when there is none.
+
+        A KEYDB_SERVER_PATH that is set must resolve to an executable: it is never replaced by a
+        `keydb-server` found on PATH, so a mistyped path cannot run a different KeyDB.
+        """
         return shutil.which(os.environ.get("KEYDB_SERVER_PATH") or "keydb-server")
+
+    @staticmethod
+    def required():
+        """Whether a missing keydb-server must fail the tests instead of skipping them."""
+        return os.environ.get("KEYDB_REQUIRED", "").strip().lower() in ("1", "true", "yes")
+
+    @classmethod
+    def unavailable(cls):
+        """None when a keydb-server can be started, else (reason, fatal) for tests that need one.
+
+        `fatal` says they must fail instead of skipping: the gate and CI runs ask for that with
+        KEYDB_REQUIRED, and a KEYDB_SERVER_PATH that is set but is not an executable is always
+        fatal, because someone asked for that binary and a typo must not look like an absent KeyDB.
+        """
+        if cls.find_binary() is not None:
+            return None
+        configured = os.environ.get("KEYDB_SERVER_PATH")
+        if configured:
+            return f"KEYDB_SERVER_PATH={configured!r} is not an executable", True
+        return "keydb-server not found (set KEYDB_SERVER_PATH or add it to PATH)", cls.required()
 
     def _config(self):
         """Config directives for the command line, keyed by directive name."""
@@ -669,8 +705,9 @@ class KeyDBServer:
         }
         if self.active_replica:
             config["active-replica"] = "yes"
-            # Only an active replica forwards what it replays, so the option means nothing (and
-            # KeyDB warns about it) on a plain master.
+            # Only an active replica forwards what it replays, so the option is only passed to one.
+            # KeyDB logs a warning whenever it is set to yes (validateMultiMasterNoForward in its
+            # config.cpp): expect it in the log of a default KeyDBServer.
             config["multi-master-no-forward"] = self.no_forward
         if self.multi_master:
             config["multi-master"] = "yes"
@@ -713,13 +750,14 @@ class KeyDBServer:
             self.stop()
             raise
 
-    def _ping(self):
+    def _served_by(self):
+        """The pid of the server answering on our port, or None while nothing answers."""
         try:
-            with socket.create_connection(("localhost", self.port), timeout=1) as sock:
-                sock.sendall(b"*1\r\n$4\r\nPING\r\n")
-                return sock.recv(64).startswith(b"+PONG")
-        except OSError:
-            return False
+            # RESP2: a plain INFO, and no HELLO for a stub or an old server to trip over.
+            with redis.Redis(port=self.port, socket_timeout=1, protocol=2) as r:
+                return int(r.info("server")["process_id"])
+        except (redis.RedisError, OSError, KeyError, ValueError):
+            return None
 
     def _wait_ready(self, timeout):
         deadline = time.monotonic() + timeout
@@ -730,11 +768,19 @@ class KeyDBServer:
                     f"keydb-server on port {self.port} exited with code {ret} during startup\n"
                     f"{self.log_tail()}"
                 )
-            if self._ping():
+            pid = self._served_by()
+            if pid == self.proc.pid:
                 return
+            if pid is not None:
+                # Anything answering is not enough: a stale server on a reused port would pass for
+                # ours while the one we started fails to bind.
+                raise RuntimeError(
+                    f"port {self.port} is served by process {pid}, not by the keydb-server we "
+                    f"started (pid {self.proc.pid})\n{self.log_tail()}"
+                )
             time.sleep(0.05)
         raise TimeoutError(
-            f"keydb-server on port {self.port} did not answer PING in {timeout}s\n"
+            f"keydb-server on port {self.port} did not answer INFO in {timeout}s\n"
             f"{self.log_tail()}"
         )
 

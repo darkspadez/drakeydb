@@ -4,6 +4,9 @@ name: drakeydb-ci
 # of ci.yml stay conflict free.
 
 on:
+  # Not just a formality: a run on main saves the KeyDB build under main's cache scope, and a pull
+  # request can only restore caches saved by its own branch or by its base branch. Without these
+  # runs every pull request would build KeyDB from source.
   push:
     branches: [main]
   pull_request:
@@ -30,6 +33,8 @@ jobs:
 
     env:
       KEYDB_VERSION: v6.3.4
+      # Part of the KeyDB cache key, so that a changed flag builds a new binary.
+      KEYDB_MAKE_FLAGS: BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc
 
     # Same container as ci.yml's Debug g++ leg.
     container:
@@ -57,43 +62,73 @@ jobs:
           rm -rf /hostroot/opt/ghc
           df -h
 
-      # Also needed on a cache hit below: keydb-server links these libraries dynamically.
-      - name: Install KeyDB dependencies
+      - name: Compute KeyDB cache key
+        id: keydb-key
+        # Built against the container's libraries, so the container is part of the key, and so are
+        # the make flags (spelled out: '=' becomes '_' and the space between flags '-').
+        run: |
+          flags="$(echo "${KEYDB_MAKE_FLAGS}" | tr '= ' '_-')"
+          echo "key=keydb-${KEYDB_VERSION}-${flags}-${RUNNER_OS}-ubuntu-dev-24" >> "${GITHUB_OUTPUT}"
+
+      # actions/cache would restore and save in one step, but its save is a post step that only runs
+      # when the whole job succeeds, so a red run would throw away the KeyDB it just built. Hence the
+      # explicit restore here and the explicit save right after the build below.
+      - name: Restore KeyDB
+        id: keydb-cache
+        uses: actions/cache/restore@v5
+        with:
+          # Workspace relative: actions/cache runs inside the container, where host paths do not exist.
+          path: keydb-bin/keydb-server
+          key: ${{ steps.keydb-key.outputs.key }}
+
+      - name: Install KeyDB build dependencies
+        if: steps.keydb-cache.outputs.cache-hit != 'true'
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential nasm autotools-dev autoconf libjemalloc-dev tcl tcl-dev uuid-dev \
             libcurl4-openssl-dev libbz2-dev libzstd-dev liblz4-dev libsnappy-dev libssl-dev
 
-      - name: Restore KeyDB
-        id: keydb-cache
-        uses: actions/cache@v6
-        with:
-          # Workspace relative: actions/cache runs inside the container, where host paths do not exist.
-          path: keydb-bin/keydb-server
-          # Built against the container's libraries, so the container is part of the key.
-          key: keydb-${{ env.KEYDB_VERSION }}-${{ runner.os }}-ubuntu-dev-24
+      # What `ldd keydb-server` lists beyond the C and C++ runtime that comes with the container's
+      # compiler is libuuid and libcurl, and libcurl's own dependencies come with its package. The
+      # names are Ubuntu 24.04's (the container is ubuntu-dev:24), where libcurl4 is libcurl4t64.
+      - name: Install KeyDB runtime libraries
+        if: steps.keydb-cache.outputs.cache-hit == 'true'
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libuuid1 libcurl4t64
 
       - name: Build KeyDB
         if: steps.keydb-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch "${KEYDB_VERSION}" https://github.com/Snapchat/KeyDB \
             "${RUNNER_TEMP}/KeyDB"
-          make -C "${RUNNER_TEMP}/KeyDB" -j"$(nproc)" BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc
+          # shellcheck disable=SC2086 # the flags are meant to split into words
+          make -C "${RUNNER_TEMP}/KeyDB" -j"$(nproc)" ${KEYDB_MAKE_FLAGS}
           mkdir -p "${GITHUB_WORKSPACE}/keydb-bin"
           cp "${RUNNER_TEMP}/KeyDB/src/keydb-server" "${GITHUB_WORKSPACE}/keydb-bin/keydb-server"
+
+      - name: Save KeyDB
+        if: steps.keydb-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: keydb-bin/keydb-server
+          key: ${{ steps.keydb-key.outputs.key }}
 
       - name: Check KeyDB
         run: |
           "${GITHUB_WORKSPACE}/keydb-bin/keydb-server" --version
 
-      # The inputs match ci.yml's Debug g++ ubuntu-dev:24 leg (apart from the targets), so the two
-      # workflows share one ccache and one third-party deps cache. Change them together.
+      # The inputs match ci.yml's Debug g++ ubuntu-dev:24 leg (apart from the targets and ccache-save),
+      # so the two workflows share one ccache and one third-party deps cache. ci.yml's leg writes the
+      # ccache; this job only reads it, so two writers do not race for one key. Change the inputs
+      # together.
       - name: Build drakeydb
         uses: ./.github/actions/builder
         with:
           enable-ccache: 'true'
-          ccache-save: 'true'
+          ccache-save: 'false'
           enable-deps-cache: 'true'
           build-type: Debug
           cache-key-suffix: ubuntu-dev:24
@@ -109,13 +144,27 @@ jobs:
       - name: Install Python test requirements
         run: ${GITHUB_WORKSPACE}/.github/scripts/install-pytest-requirements.sh
 
+      # multimaster_test.py is not about KeyDB but is kept in this job on purpose: this is the one
+      # place it runs next to a real KeyDB. The marker filter is the one ci.yml's Debug leg gives the
+      # regression tests (no `large`, no `opt_only`).
       - name: Run KeyDB interop and multi-master tests
+        shell: bash
         run: |
           export DRAGONFLY_PATH="${GITHUB_WORKSPACE}/build/dragonfly"
           export KEYDB_SERVER_PATH="${GITHUB_WORKSPACE}/keydb-bin/keydb-server"
           export KEYDB_REQUIRED=1
+          code=0
           timeout 90m pytest tests/dragonfly/keydb_onboarding_test.py tests/dragonfly/multimaster_test.py \
-            -v --timeout=300 --color=yes --log-cli-level=INFO
+            -m "not large and not opt_only" \
+            -v --timeout=300 --color=yes --log-cli-level=INFO || code=$?
+
+          # timeout exits with 124 when it cut the run short. pytest then never copied the logs of
+          # the test it was running to /tmp/failed, so do it here, like the regression-tests action.
+          if [[ $code -eq 124 && -f /tmp/last_test_log_dir.txt ]]; then
+            mkdir -p /tmp/failed
+            xargs -I {} mv {}/ /tmp/failed/ < /tmp/last_test_log_dir.txt
+          fi
+          exit $code
 
       - name: Upload logs on failure
         if: failure()

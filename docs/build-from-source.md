@@ -133,7 +133,8 @@ cd KeyDB && make -j4 BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc
 ```
 
 The test harness runs `$KEYDB_SERVER_PATH`, or `keydb-server` from `PATH`. Set `KEYDB_REQUIRED=1`
-to make a missing binary fail the tests instead of skipping them (CI and gate runs do):
+(`true` and `yes` work too) to make a missing binary fail the tests instead of skipping them (CI and
+gate runs do). A `KEYDB_SERVER_PATH` that is not an executable always fails them:
 
 ```bash
 # in the KeyDB directory
@@ -144,4 +145,5 @@ DRAGONFLY_PATH=$PWD/build-dbg/dragonfly python3 -m pytest tests/dragonfly/keydb_
 
 Tests that use the `redis_server` fixture (a real Redis master) look for the version-suffixed
 binaries CI installs (`redis-server-7.2.2`, ...); without them they use `$REDIS_SERVER_PATH`, or
-`redis-server` from `PATH`.
+`redis-server` from `PATH`, unless the test needs Redis 7 and that binary is older (the test then
+skips).
