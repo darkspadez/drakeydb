@@ -201,9 +201,13 @@ against a live replica.
 
 **Status:** not filed.
 
-**Status (2026-10-03):** disputed — live re-test scheduled in P7-0 Task 0.1; see the Phase 7
-ledger (`docs/superpowers/ledgers/2026-10-03-phase7-keydb-onboarding/advisor-design.md`,
-"Verification notes from the advisor").
+**Status (2026-10-03): withdrawn — not a bug.** The static argument above missed that the
+`STORE` callback sets `zparams.journal_update = true` (`geo_family.cc:654`) and writes through
+`ZSetFamily::OpAdd`, which hand-journals the destination itself (`zset_family.cc:1963`, `:2053`).
+Live re-test (P7-0 Task 0.1, debug build of `c60dfdb`, `--proactor_threads 4` → 4 shards): after
+stable sync was confirmed with a marker key, 8 `GEORADIUS … STORE` and 8 `GEORADIUSBYMEMBER …
+STOREDIST` destinations written on the master all reached a plain replica byte-for-byte (16/16,
+`ZRANGE … WITHSCORES` digests equal). Kept here for one phase as a record, then delete.
 
 ### U-9. `EvalInternal`'s connection migration can null-deref on a classic replicated-apply link
 
