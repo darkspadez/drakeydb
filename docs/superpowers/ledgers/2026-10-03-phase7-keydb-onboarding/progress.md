@@ -61,7 +61,37 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
     **20/20 passed isolated**. Load-sensitive fork test from P4-0 → Task 0.9 (root-cause + fix).
 - **pytest run 1 — discarded**: concurrent pytest sessions from implementer agents wiped
   `/tmp/dragonfly_logs` mid-run (INTERNALERROR in 4 suites) and competing builds loaded the CPU.
-  Raw logs kept out of tree. Re-run serialized on a quiet box (run 2) — results pending.
+- **pytest run 2** (serialized under the lock; `main` snapshot binary; tests tree = `origin/main` +
+  the harness-only files from `5199f34` so `redis-server` 7.0.15 is usable; redis-py 8.1.0):
+
+  | Suite | Result |
+  |---|---|
+  | `multimaster_test.py` | 58 passed, 1 failed (+1 teardown error) |
+  | `multimaster_merge_test.py` | 4 passed |
+  | `redis_replication_test.py` | 12 passed, 7 deselected |
+  | `replication_test.py` | 38 passed, 5 failed, 21 deselected |
+  | `replication_specific_test.py` | see triage (6 failed) |
+  | `replication_resilience_test.py` | 39 passed, 2 failed, 1 xfailed, 8 deselected |
+  | `replication_config_test.py` | see triage (4 failed) |
+  | `cluster_test.py::test_cluster_migrations_sequence` | 1 passed |
+
+- **Triage** (each failure re-run alone on the `main` snapshot):
+  - **Client-library (redis-py 8.1.0), not code — 8 tests:** `test_replicate_search_index_to_old_replica`,
+    `test_search`, `test_search_with_stream`, `test_xreadgroup_replication`, `test_rewrites`,
+    `test_save_with_replication`, `test_empty_hash_map_replicate_old_master`,
+    `test_empty_hashmap_loading_bug` all **pass with redis-py 5.3.1** and fail with 8.1.0. Gates use a
+    venv pinned to `redis>=5.2.1,<6` (`/root/drakey-venv-redis5`); upstream's requirements file is
+    left untouched.
+  - **Environment:** `test_ipv6_replication` (no IPv6).
+  - **Load-only:** `test_replication_timeout_on_full_sync` passes isolated.
+  - **Fail isolated, resource-bound upstream tests on a 4-core debug build** (timeouts, no code
+    signal): `test_replication_all[…-6-t_replicas5-…-20000]` ×4, `test_big_containers[16-30000]`,
+    `test_master_too_big`, `test_replicaof_reject_on_load`. Tracked as known-environmental for the
+    P7 gates; P7 must not add failures beyond this set.
+  - **Fork test hangs on `main` — Task 0.10:**
+    `multimaster_test.py::test_narrowed_window_admits_peer_during_winners_full_sync` fails 3/3
+    (incl. isolated): an `--active_replica --multi_master` node stops answering and does not exit
+    within 120 s of SIGTERM. Root-cause investigation in progress.
 
 ## P7-1 … P7-4
 
