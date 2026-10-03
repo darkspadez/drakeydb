@@ -14,7 +14,9 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
   (search ON). Third-party GitHub `/archive/` tarballs come from a local mirror via a
   never-committed shim (see `decisions.md`, "Local sandbox note").
 - pytest venv: `/root/drakey-venv` (`tests/dragonfly/requirements.txt`).
-- KeyDB v6.3.4 built from source: `make -j2 BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc`.
+- KeyDB v6.3.4 built from source: `make -j2 BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc` — built
+  cleanly on gcc 13.3 with no workaround (`KeyDB server v=6.3.4 sha=7e7e5e57:0 malloc=libc`),
+  closing the advisor's [unverified] gcc-13 build risk.
 
 ## P7-0 `feat/phase7-0-closeout-and-harness`
 
