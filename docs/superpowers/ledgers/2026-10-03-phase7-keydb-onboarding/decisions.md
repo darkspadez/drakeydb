@@ -29,6 +29,40 @@ Phase 6 delivered by P4-3; the spec's P4-5 tombstones shipped inside P4-3).
 | 21 | Verification | Build in the session container; per-task targeted tests; full gate per sub-PR |
 | 22 | `KEYDB.MVCCRESTORE` (owner, 2026-10-03; closes spec open item O-1) | **Applied, LWW-guarded.** Translated to `RESTORE key <ttl> <DUMP payload> REPLACE ABSTTL` (ttl = absolute ms, 0 = none), stamped with the command's **own** `<mvcc>` argument plus the envelope author's uuid hash, and run through the LWW guard on peer links; plain replicas apply it verbatim and unstamped. A payload drakeydb cannot load (KeyDB-only type, unsupported RDB version) is skipped, counted (`keydb_mvccrestore_failed`) and warned with a rate limit. Lands in P7-2 (Task 2.6) |
 
+## Clarifications (2026-10-03, from spec review + advisor)
+
+Clarifications of decisions 9, 12, 14 and 22. None of them changes a decision; the spec carries the
+mechanism (D-n).
+
+- **Decision 9: `multi-master-no-forward yes` has a precondition.** The docs recommend it only when
+  every drakeydb node is `--active_replica --multi_master` and attached to every KeyDB master. A
+  plain replica attaches to one master only, and with the directive on a write reaches a node only
+  from the KeyDB it was written on; KeyDB itself warns that the directive needs a mesh or "dataloss
+  will occur" (`config.cpp:2705-2710`; the forward is skipped at `replication.cpp:5507`). With one
+  KeyDB master there is nothing to forward. In any other topology forwarding stays on and the
+  per-author dedup absorbs the duplicates. (Spec D-5, D-13.)
+- **Decision 12: "keep up" is a measurement.** On release builds of both servers (`taskset`-pinned,
+  KeyDB `--server-threads 1`, drakeydb `--proactor_threads 2`, `redis-benchmark -P 100 -c 50 -t
+  set,incr -r 100000`, `master_repl_offset` / `slave_repl_offset` sampled at 1 Hz):
+  `apply_rate / produce_rate >= 0.95` over the steady window; maximum lag `<= max(2 s x
+  produce_rate, 8 MB)`; the lag drains within 2 s of the load stopping; a second KeyDB attached as
+  an active replica is the comparator (drakeydb within 1.5x of its lag); three runs, median; the
+  raw squashed path is recorded as a reference. The release bar runs under `DRAKEYDB_PERF=1`; CI
+  and debug builds run a rate-capped (about 5k ops/s) functional smoke with loose bounds (ratio
+  `>= 0.5`, lag `< 32 MB`, drain `< 10 s`). The conditional squasher micro-batching task is
+  triggered only by a failure of the release bar. (Spec D-12.)
+- **Decision 14: "malformed" is per nesting level.** A malformed inner envelope is skipped, counted
+  and warned, and does not advance its own watermark, but the enclosing envelope's author still
+  advances (KeyDB parity: the inner `rreplay` is itself an executed command); at the 65th level the
+  65th is the malformed one and the 64th still advances. A malformed or self-authored envelope never
+  moves a watermark, and none of it disconnects. (Spec D-3, D-5.)
+- **Decision 22: `<mvcc>` fallback and cron payloads.** When a `KEYDB.MVCCRESTORE`'s own `<mvcc>`
+  is unusable (0, or bit 63 set: KeyDB's `OBJ_MVCC_INVALID` for a key it synced from plain Redis)
+  the stamp falls back to the envelope's mvcc, as the RDB loader already treats the same sentinel
+  (`rdb_load.cc:3193`). A payload whose type byte is 64 (a KeyDB cron job) is a counted drop in
+  `keydb_cmds_dropped`, like `KEYDB.CRON`, and not a `keydb_mvccrestore_failed` failure. (Spec
+  D-7a.)
+
 ## Corrections to PLAN.md's Phase 7 stub
 
 - KeyDB does **not** refuse a replica without `capa activeExpire`; it only logs a deprecation warning

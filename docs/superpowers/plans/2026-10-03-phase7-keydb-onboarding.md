@@ -64,18 +64,26 @@ Ledger (reports, progress): the same directory.
   `docs/superpowers/ledgers/2026-10-03-phase7-keydb-onboarding/task-<N.M>-report.md`.
   Also record what each test would still pass under with the feature removed.
 - **The gate** (every sub-PR; `KEYDB_REQUIRED=1`, absolute paths): a complete
-  `ninja -C /home/user/drakeydb/build-dbg -j4`; then
+  `ninja -C /home/user/drakeydb/build-dbg -j4`; then the **full** suite — never a subset, because a
+  PR regresses suites it did not expect to touch —
   ```
-  R='multi_master_test|rdb_test|journal_test|peer_replication_test'
-  R="$R|dragonfly_test|server_family_test|classic_replay_test"
-  cd /home/user/drakeydb/build-dbg && ctest -L DFLY --output-on-failure -R "$R"
+  cd /home/user/drakeydb/build-dbg && ctest -L DFLY --output-on-failure
   ```
-  (`classic_replay_test` exists from Task 0.4); then the pytest command above on
-  `multimaster_test.py` and `keydb_onboarding_test.py` (plus `replication_test.py` for P7-3).
-  Timing-sensitive tests run x10 for a pass rate. The PR also needs upstream `ci.yml` and
-  `drakeydb-ci.yml` green before it is called done.
-- Anchors below were re-read at `c60dfdb` (the tree is unchanged since except ledger/doc commits).
-  Re-verify before editing; if one drifted, fix it here in the same commit.
+  (about 220 s here; `classic_replay_test` exists from Task 0.4); then the pytest command above on
+  `multimaster_test.py`, `keydb_onboarding_test.py`, `keydb_harness_test.py` and
+  **`redis_replication_test.py`** (the upstream suite that drives `Greet`, `InitiatePSync` and
+  `ConsumeRedisStream` against a plain Redis; it runs locally through the `redis-server` fallback),
+  plus `replication_test.py` for P7-3. Timing-sensitive tests run x10 for a pass rate. The PR also
+  needs upstream `ci.yml` and `drakeydb-ci.yml` green before it is called done.
+- **Performance is measured on release builds** (spec D-12): `./helio/blaze.sh -release
+  -DWITH_AWS=OFF -DWITH_GCP=OFF`, then only `CCACHE_DISABLE=1 ninja -C
+  /home/user/drakeydb/build-opt -j4 dragonfly` (free disk first by deleting the non-gate debug
+  test binaries; they relink from objects later). Debug builds and CI run the functional smoke only.
+- Anchors below were re-read at `c60dfdb`; `src/` is unchanged since except the P7-0
+  implementation commit `a0ee234` (Tasks 0.4-0.6 and 0.9, which shifted lines in `replica.cc`,
+  `rdb_load.cc` and `main_service.cc`); the other commits since are ledger/doc commits and the
+  test/CI harness (`5199f34`, `89414e5`). Re-verify before editing; if one drifted, fix it here in
+  the same commit.
 
 ## Verified anchors (c60dfdb)
 
@@ -109,7 +117,7 @@ Ledger (reports, progress): the same directory.
 | `PeerRegistry` (append-only, `Op::ORIGIN` fan-out) | `multi_master.h:93-130`; `multi_master.cc:226-278` |
 | `IsValidNodeUuid`; `NormalizeNodeUuid`; `kDrakeydbReplVersion` | `node_identity.h:47`, `:50`; `:29` (= 68) |
 | `FLAGS_dbnum` | `generic_family.cc:57` |
-| `Heartbeat`; the replica expiry gate; `RetireExpiredAndEvict`; `eviction_goal`; `DeleteExpiredStep` call; eviction call | `engine_shard.cc:776`; `:847`; `:863`; `:885`; `:942`; `:962` |
+| `Heartbeat`; the replica expiry gate; `RetireExpiredAndEvict`; `eviction_goal`; `DeleteExpiredStep` call; eviction call | `engine_shard.cc:776`; `:847`; `:863`; `:885`; `:942`; `:964` |
 | `SetReplica` / `is_replica_`; `RetireExpiredAndEvict` decl | `engine_shard.h:158`, `:327`; `:302` |
 | `--replica_delete_expired`; `ExpireIfNeeded` gate; sweep call; `FreeMemWithEvictionStepAtomic` + `DCHECK` | `db_slice.cc:60`; `:2097-2098`; `:2574`; `:2674`, `:2681` |
 | RDB load loop; `DF_MVCC`; `AUX`; `DF_TOMBSTONES`; type check; `settings.Reset()` | `rdb_load.cc:2468-2720`; `:2508-2523`; `:2620-2622`; `:2672`; `:2703-2711`; `:2718` |
@@ -121,12 +129,20 @@ Ledger (reports, progress): the same directory.
 | `ServerState::Stats` size assert | `server_state.cc:67` (`31 * 8`) |
 | CMake: `dragonfly_lib` sources; tests; `check_dfly` deps | `src/server/CMakeLists.txt:109-125` (`:114`); `:172`, `:200`; `:202-207` |
 | Fixtures: `MvccStoreTest`; `ApplyReplicatedCommand`; `DflyEngineTest` | `multi_master_test.cc:793`, `:839`; `dragonfly_test.cc:134` |
-| pytest: `RedisServer`; `redis_server` fixture; `Proxy`; `wait_for_peers`; `active_args`; `attach`; `STORM_BOUND` / `assert_no_command_storm`; `_parse_mvcc`; metrics | `instance.py:560-612`; `conftest.py:613-623`; `proxy.py:21-37`, `:174-211`; `multimaster_test.py:475`, `:595`, `:609`, `:1404`, `:1407`, `:2292`; `instance.py:391` |
+| pytest: `RedisServer`; `redis_server` fixture; `Proxy`; `wait_for_peers`; `active_args`; `attach`; `STORM_BOUND` / `assert_no_command_storm`; `_parse_mvcc`; metrics | `instance.py:563` (`RedisServer`), `:636` (`KeyDBServer`); `conftest.py:614` (`redis_server`), `:635`, `:665` (`keydb_server*`); `proxy.py:21-37`, `:174-211`; `multimaster_test.py:475`, `:595`, `:609`, `:1404`, `:1407`, `:2292`; `instance.py:391` |
 | Docs: "classic links never guarded" paragraph; stamped vs unstamped peers | `docs/multi-master.md:311-381`; `:87-122` |
 | KeyDB v6.3.4 (read-only reference): capa reply; warning; wire; nesting; dedup | `replication.cpp:1740-1753`; `:1798-1803`; `:562-694`; `:5297`; `:5435`, `:5453`, `:5485` |
 | KeyDB `KEYDB.MVCCRESTORE`: command entry; handler (mvcc, expire, verify skip, bad data, merge, TTL); emitter + caller; `INVALID_EXPIRE`; `dbMerge`; `RDB_TYPE_CRON` | `server.cpp:1168`; `cluster.cpp:5206` (`:5212`, `:5215`, `:5219`, `:5232`, `:5238-5239`); `replication.cpp:5573-5594`, `rdb.cpp:2942`; `expire.h:8`; `db.cpp:376-390`; `rdb.h:96` |
 | drakeydb `RESTORE`: footer check (`ignore_crc`); type gate; `OpRestore` delete-before-load; handler; guard rewrite | `generic_family.cc:69-97`; `:191-199`; `:716`, `:734`; `:2878`, `:2892`; `multimaster_lww.cc:111-125` |
 | KeyDB: config names; propagate forms; RDB cron/aux | `config.cpp:2976`, `:2949`, `:742-753`; `aof.cpp:682-726`; `rdb.cpp:1167`, `:1194-1195`, `:2577-2588`, `rdb.h:96` |
+| Full-sync tail: loader first read (unclamped) and later reads (clamped); the tail `CHECK`s; `FlushSlots` / `FlushAll` | `rdb_load.cc:2421-2427`; `:1203`; `replica.cc:823-835`; `:769`, `:771` |
+| `DispatchCommand` reject paths; `InvokeCmd` `ConsumeLastError` and the DENYOOM gate; the `MarkForClose` null `conn()` (side finding) | `main_service.cc:1589-1610`, `:1628-1632`; `:1740`, `:1750`, `:1721-1724`; `:1645-1647`, `:1744-1747` |
+| `IsLwwGuarded`; `ReplicaOfInternal` critical section; `PeerRegistry::Size` | `transaction.h:400-401`; `server_family.cc:3667-3677`; `multi_master.h` |
+| `GetRdbVersion` (rejects `size <= 10`); `RESTORE` rejects length/version before `OpRestore`; aux stamp ignored when `load_origin_hash_ == 0`; aux overwrite | `generic_family.cc:69-73`; `:2891-2895`; `rdb_load.cc:3196`; `:3206` |
+| `CapturingReplyBuilder` records `last_error_` before `SKIP_LESS`; `ONLY_ERR` mode | `facade/reply_capture.cc:22-26`; `reply_mode.h:10` |
+| helio: `fb2::Mutex` non-reentrant; `CondVarAny::wait_for`; `GetRunningTimeCycles` (time since last resume) | `synchronization.cc:70`, `:94`; `synchronization.h`; `fiber_interface.cc:336-339`, `:565` |
+| KeyDB: uuid minted per start; mvcc `ms << 20`; only dirtying commands propagate; failed NX/XX and `MSETNX` return before the write; no-forward warning and forward skip; `repl-diskless-sync` default | `server.cpp:4082`; `server.h:960`, `server.cpp:7270-7287`; `server.cpp:4618-4648`; `t_string.cpp:104-108`, `:556-563`; `config.cpp:2705-2710`, `replication.cpp:5507`; `config.cpp:2826` |
+| Golden RREPLAY captures (per-segment table in the README) | `tests/dragonfly/data/keydb_v6.3.4_rreplay_{stream,nested_stream}.bin` |
 
 ---
 
@@ -155,8 +171,10 @@ settle the U-8 dispute.
 - [ ] `ninja -C /home/user/drakeydb/build-dbg -j4` (warning-free), then
   `cd /home/user/drakeydb/build-dbg && ctest -L DFLY` (full).
 - [ ] Pytest, each file separately: `multimaster_test.py`, `multimaster_merge_test.py`,
-  `replication_test.py`, `replication_specific_test.py`, `replication_resilience_test.py`,
-  `replication_config_test.py`, `cluster_test.py::test_cluster_migrations_sequence`.
+  `redis_replication_test.py` (the upstream suite for `Greet`/`InitiatePSync`/`ConsumeRedisStream`,
+  runnable here through the `redis-server` fallback), `replication_test.py`,
+  `replication_specific_test.py`, `replication_resilience_test.py`, `replication_config_test.py`,
+  `cluster_test.py::test_cluster_migrations_sequence`.
 - [ ] Triage each failure: rerun x3 in isolation, classify as flake or real, record evidence. The
   baseline's `ReaperJournalFamilyTest.MemberExpiryReaperDoesNotBlockOnConcurrentBgsave` failure
   (`multi_master_test.cc:10148`, loaded `-j3` run only) is owned by Task 0.9.
@@ -207,8 +225,9 @@ case-sensitive; later tokens space-separated, unknown words ignored).
   pre-commit; commit
   `fix: accept "+OK <suffix>" capa replies so an active KeyDB can be greeted (P7)`.
 
-**Done:** both halves pass against a real Redis master; handshake bytes to a non-KeyDB master are
-unchanged (the proxy-fronted Redis sees the same requests).
+**Done:** both halves pass against a real Redis master and `redis_replication_test.py` stays green
+(the stock-Redis handshake path is unchanged; a byte-level check needs the `Proxy` request capture
+that arrives with Task 1.4, so this task does not claim one).
 
 ### Task 0.5: U-9 — null `conn()` in `EvalInternal`
 
@@ -228,95 +247,126 @@ null connection.
 - [ ] **Step 3: Implement** `&& conn_cntx->conn() != nullptr` in the condition at `:2459`.
 - [ ] **Step 4: Run; falsify** by removing the guard again: the test binary crashes. Restore,
   record.
-- [ ] **Step 5:** `ISSUE-REGISTER.md`: mark U-9 resolved by this task; **add** a new entry for the
-  adjacent unguarded `dfly_cntx.conn()->IsPrivileged()` in the `TAKEN_OVER` branch
-  (`main_service.cc:1430`), reachable on a null-`conn()` apply context. Run
+- [ ] **Step 5:** `ISSUE-REGISTER.md`: mark U-9 resolved by this task. The adjacent unguarded
+  `dfly_cntx.conn()->IsPrivileged()` in the `TAKEN_OVER` branch (`main_service.cc:1430`),
+  reachable on the same null-`conn()` apply context, was fixed in the same commit (`a0ee234`) and
+  registered as U-10. Run
   `./dragonfly_test --gtest_filter='DflyEngineTest.Eval*'`; pre-commit; commit
   `fix: guard EvalInternal's migration against a null connection (P7)`.
 
-**Done:** test crashes without the one-line guard and passes with it; TAKEN_OVER item registered.
+**Done:** test crashes without the one-line guard and passes with it; the `TAKEN_OVER` deref is closed as U-10.
 
-### Task 0.6: Graceful PSYNC `CHECK`s, and the fake classic master
+### Task 0.6: Graceful PSYNC `CHECK`s, the full-sync tail, and the fake classic master
 
 **Goal:** A malformed full-sync header or tail from a master reconnects instead of aborting the
-process; and a scripted fake master exists for every later test the `Proxy` cannot express.
-**Files:** Modify `src/server/replica.cc` (`:823-835`, `:1910`); Create
+process; **a correct full sync whose stream follows the RDB at once no longer counts as corrupt, and
+those stream bytes are applied** (spec D-10, review C2); and a scripted fake master exists for every
+later test the `Proxy` cannot express.
+**Evidence:** bytes after the RDB are the start of the replication stream. `RdbLoader::Load`'s
+first read (`rdb_load.cc:2421-2427`) is the one read `source_limit_` does not clamp (later reads
+are, `:1203`), and a disk-based master (KeyDB's default `repl-diskless-sync no`,
+`config.cpp:2826`) flushes its buffered commands right behind the file. Live, 2 of 6 trials hit
+`Bad full sync tail ... bytes left over` and looped in resync; on unmodified main the tail
+`CHECK`s abort the process (an upstream latent crash).
+**Files:** Modify `src/server/replica.{h,cc}` (`:823-835`, `:1910`; a `Replica` stream-prefix
+buffer that `InitiatePSync` fills and `ConsumeRedisStream` drains before its first read),
+`src/server/rdb_load.cc` (the first read clamped to `source_limit_`; an RDB running past its
+declared size is `rdb_file_corrupted`, not a `DCHECK`); Create
 `tests/dragonfly/fake_classic_master.py`; Test `tests/dragonfly/keydb_onboarding_test.py`.
 **Interfaces:** `FakeClassicMaster(port)` — asyncio server that answers the handshake (`PING`,
 `REPLCONF listening-port|capa|UUID|DRAKEY-VERSION|PEER`), answers `PSYNC` with a scripted byte
 string (written as one `write()` so coalescing is deterministic), then sends scripted stream
 bytes; records every request line and connection count. A valid empty RDB comes from
 `src/server/testdata/empty.rdb`.
+**Design:** only a short read, an overrun (the RDB runs past its declared size) or an EOF-token
+mismatch is malformed (`LOG(ERROR)` plus an error code: reconnect). After a *correct* load
+everything behind the RDB — the loader's `Leftover()` and the `UnusedPrefix()` of `ps` (the
+`$<len>` framing) or of the chained source (the `$EOF:` framing, after the token) — goes into the
+stream-prefix buffer, which `ConsumeRedisStream` parses before its first socket read and counts into
+`repl_offs_`. D-8 reuses the same buffer for `+CONTINUE`.
 
 - [ ] **Step 1: Failing tests** (plain drakeydb replica, fake master, `REPLICAOF` non-blocking):
   `test_psync_bad_eof_token_size_does_not_abort_replica` (`+FULLRESYNC <id> 0` then `$EOF:short`,
-  site `:1910`); `test_psync_full_sync_tail_mismatch_does_not_abort_replica` (valid empty RDB then
-  a wrong 40-byte token; and a `$<len>` disk-style RDB whose length disagrees with the bytes read:
-  sites `:823-835`). Each asserts the process is alive, `INFO` answers, the error is logged, and the
-  fake master sees a **second** connection (the replica reconnects).
-- [ ] **Step 2: Run, observe failure:** the drakeydb process dies on a `Check failed:` line; the
-  pytest sees a dead node.
+  site `:1910`); `test_psync_full_sync_tail_mismatch_does_not_abort_replica` — (a) a **token
+  mismatch** (a valid empty RDB then a wrong 40-byte token) and (b) a `$<len>` that is shorter than
+  the RDB (overrun) and one that is longer (short read): sites `:823-835`. Each asserts the process
+  is alive, `INFO` answers, the error is logged, and the fake master sees a **second** connection
+  (the replica reconnects). And the C2 tests, `test_psync_stream_bytes_behind_full_sync_are_applied`:
+  the fake master writes `+FULLRESYNC`, `$<len>`, the RDB bytes and a raw `SET a 1` in **one**
+  `write()` (and the `$EOF:<token>` framing with the token and the command in one write): `a == 1`,
+  the link stays up, and `slave_repl_offset` equals the bytes of the command (exact offsets).
+- [ ] **Step 2: Run, observe failure:** the drakeydb process dies on a `Check failed:` line and the
+  pytest sees a dead node; for the C2 tests the replica aborts or loops in resync and `a` is never
+  set.
 - [ ] **Step 3: Implement:** replace `CHECK_EQ(kRdbEofMarkSize, token.size())` and the six
   `InitiatePSync` `CHECK`s with `LOG(ERROR)` plus `return std::make_error_code(errc::bad_message)`
-  (or the `illegal_byte_sequence` the neighbouring header errors use). Clean up the `LOADING` state
-  via the existing `absl::Cleanup` (`:756`).
+  (or the `illegal_byte_sequence` the neighbouring header errors use); clamp the loader's first
+  read; hand the bytes behind a correct RDB to the stream-prefix buffer. Clean up the `LOADING`
+  state via the existing `absl::Cleanup` (`:756`).
 - [ ] **Step 4: Run; falsify** by restoring one `CHECK` at a time (`:1910`, then `:823`): the
-  matching test fails with the abort. Restore, record.
+  matching test fails with the abort; then un-clamp the first read: the C2 tests fail; then drop
+  the hand-off (discard the prefix): `a == 0`; then count the hand-off twice: the offset assertion
+  fails. Restore, record.
 - [ ] **Step 5:** pre-commit; commit
-  `fix: report a malformed PSYNC reply as an error instead of aborting (P7)`.
+  `fix: report a malformed PSYNC reply as an error and keep the stream behind the RDB (P7)`. The
+  upstream latent crash (a master that sends stream bytes right after the RDB aborts the replica)
+  is registered as an ISSUE-REGISTER U-item by the orchestrator, not by this task's commit.
 
-**Done:** both tests pass; the fake master is reusable by Tasks 1.2, 3.1.
+**Done:** all tests pass; the fake master is reusable by Tasks 1.2, 3.1.
 
-### Task 0.7: KeyDB harness and the first real-KeyDB smoke test
+### Task 0.7: KeyDB harness and the first real-KeyDB smoke test (done: `5199f34`, `89414e5`)
 
 **Goal:** Tests can start a real KeyDB v6.3.4; locally they skip without it, gates fail without it.
-**Files:** Modify `tests/dragonfly/instance.py` (`RedisServer`, new `KeyDBServer`),
-`tests/dragonfly/conftest.py`, `tests/pytest.ini`, `docs/build-from-source.md`; Create/extend
-`tests/dragonfly/keydb_onboarding_test.py`.
-- [ ] **Step 1: Failing tests / checks.** `test_keydb_active_handshake_and_full_sync`: KeyDB
-  `--active-replica yes` with seeded keys (strings, hash, list, set, zset, a TTL key, db 1) and a
-  live write during sync; a plain drakeydb **and** an `--active_replica` one `REPLICAOF` it; assert
-  `master_link_status:up` / peer link up and every key arrives, TTL preserved. Harness checks:
-  `KEYDB_SERVER_PATH` unset, no `KEYDB_REQUIRED`: skipped; `KEYDB_REQUIRED=1` with a bad path:
-  **failed**, not skipped.
-- [ ] **Step 2: Run, observe** the smoke test failing before Task 0.4 and the harness absent.
-- [ ] **Step 3: Implement.** `RedisServer.start` falls back to `$REDIS_SERVER_PATH`, then
-  `redis-server` on `PATH`, when the pinned binaries raise `FileNotFoundError`. `KeyDBServer`
-  (`port`, `log_dir`, flags such as `--active-replica yes` — which must precede any `replicaof`,
-  `config.cpp:742-753` — `--multi-master yes`, `--save ""`, `--appendonly no`, `--protected-mode
-  no`, `--logfile`); fixtures `keydb_server` / `keydb_server_factory` honouring `KEYDB_SERVER_PATH`
-  and `KEYDB_REQUIRED`; a `keydb` marker in `tests/pytest.ini`. `docs/build-from-source.md` gains
-  the recipe: `git clone --depth 1 --branch v6.3.4 https://github.com/Snapchat/KeyDB && cd KeyDB &&
-  make -j4 BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc` (clean on gcc 13.3; fallbacks if a toolchain
-  objects: `CXXFLAGS='-include cstdint'`, then gcc-12).
-- [ ] **Step 4: Run; falsify** (a) with Task 0.4 reverted the smoke test fails at `REPLICAOF`;
-  (b) run it with `KEYDB_REQUIRED=1 KEYDB_SERVER_PATH=/nonexistent`: must fail. Record the first
-  real KeyDB sync (versions, ports, key counts) in the ledger, and save one **golden RREPLAY byte
-  capture** from KeyDB (a `SET`, a `PING`, a `MULTI`/`EXEC` pair) for Task 1.1's test vectors.
-- [ ] **Step 5:** pre-commit (`black` on Python); commit
-  `test: add the KeyDB harness and a real-KeyDB sync smoke test (P7)`.
+**Files:** `tests/dragonfly/instance.py` (`RedisServer` fallback, new `KeyDBServer`),
+`tests/dragonfly/conftest.py`, `tests/pytest.ini`, `docs/build-from-source.md`,
+`tests/dragonfly/keydb_onboarding_test.py`, `tests/dragonfly/keydb_harness_test.py`,
+`tests/dragonfly/data/`, `tests/dragonfly/tools/capture_keydb_rreplay.py`.
+- [x] **Delivered.** `RedisServer.start` falls back to `$REDIS_SERVER_PATH`, then `redis-server` on
+  `PATH` (honoring `redis7`); `KeyDBServer` (`--active-replica yes` before any `replicaof`,
+  `config.cpp:742-753`; `--multi-master yes`, `--save ""`, `--appendonly no`, `--protected-mode no`,
+  `--logfile`), with readiness meaning the answering process is the one we started; fixtures
+  `keydb_server` / `keydb_server_factory` honoring `KEYDB_SERVER_PATH` (a set-but-bad path always
+  fails) and `KEYDB_REQUIRED` (1/true/yes); the `keydb` marker; the KeyDB build recipe in
+  `docs/build-from-source.md`. Smoke tests `test_keydb_plain_master_full_sync_and_stream`,
+  `test_keydb_active_handshake_and_full_sync` and `test_keydb_active_handshake_peer_mode` seed
+  strings, a hash, a list, a set, a zset, a TTL key (`900 < TTL <= 1000`), a db-1 key and 5000 bulk
+  keys under `rdb-key-save-delay` (so the sync lasts at least 2 s), and `assert_keydb_saw_one_full_sync`
+  (`sync_full == 1`, no partial) keeps a silent resync from passing; `keydb_harness_test.py` (21
+  tests, no KeyDB needed) pins the harness rules. The first real KeyDB sync (5105 keys in 3.7 s)
+  and every falsification are in `task-0.7-report.md`.
+- [x] **Golden RREPLAY captures** from a real KeyDB v6.3.4:
+  `tests/dragonfly/data/keydb_v6.3.4_rreplay_stream.bin` (1953 bytes, 14 envelopes) and
+  `keydb_v6.3.4_rreplay_nested_stream.bin` (1944 bytes, 9 envelopes, depth 2), with a README of
+  per-segment offsets and lengths, regenerated by `tests/dragonfly/tools/capture_keydb_rreplay.py`.
+  Task 1.1 uses them as test vectors.
 
-**Done:** smoke test passes with the binary, skips without it, fails under `KEYDB_REQUIRED=1`.
+**Residuals.** The live write during a full sync against an *active* KeyDB is covered by
+`test_keydb_active_live_write_during_full_sync[plain_replica|peer_mode]`. It fails until RREPLAY is
+unwrapped, so it carries a **strict `xfail`** (`reason="needs RREPLAY unwrap (P7-1 Task 1.2)"`) and
+**Task 1.2 removes the marker** — a pass with the marker still on fails the run. `_wait_ready`
+compares `process_id` with the `Popen` pid, so a `KEYDB_SERVER_PATH` wrapper script that forks the
+real server is refused; `rdb-key-save-delay` is a v6.3.4 config; the tests read `INFO replication`'s
+`slave0.state` and `INFO stats` `sync_*` as v6.3.4 prints them.
+**Done:** the smoke tests pass with the binary (the two active ones with Task 0.4), skip without
+it, and fail under `KEYDB_REQUIRED=1`.
 
-### Task 0.8: `drakeydb-ci.yml`
+### Task 0.8: `drakeydb-ci.yml` (done: `5199f34`, `89414e5`)
 
 **Goal:** CI builds drakeydb and KeyDB v6.3.4 and runs the KeyDB suite, unable to skip silently.
-**Files:** Create `.github/workflows/drakeydb-ci.yml`.
-- [ ] **Step 1:** Workflow on `pull_request` to `main` (and `workflow_dispatch`): checkout with
-  submodules; build drakeydb with `./.github/actions/builder` (as `ci.yml` does); restore/build
-  KeyDB with `actions/cache` keyed on the `v6.3.4` tag and the compiler; install
-  `tests/dragonfly/requirements.txt`; run `keydb_onboarding_test.py` and `multimaster_test.py` with
-  `KEYDB_REQUIRED=1` and `KEYDB_SERVER_PATH` pointing at the built binary. Upstream `ci.yml` is
-  untouched.
-- [ ] **Step 2: Validate locally:** parse the YAML (`python -c 'import yaml; yaml.safe_load(...)'`)
-  and `actionlint` if available; run each `run:` step's shell by hand, including the KeyDB build.
-- [ ] **Step 3: Falsify** the no-silent-skip property: run the pytest command from the workflow with
-  `KEYDB_SERVER_PATH` unset and `KEYDB_REQUIRED=1`: it must fail, not skip. Record.
-- [ ] **Step 4:** pre-commit; commit
-  `ci: add a fork-owned workflow that builds KeyDB and runs the suite (P7)`.
-
-**Done:** the workflow is green on the P7-0 PR with the KeyDB tests actually executed (the summary
-shows them passed, not skipped).
+**Files:** `.github/workflows/drakeydb-ci.yml`.
+- [x] **Delivered.** Triggers: `pull_request` to `main`, `workflow_dispatch`, and `push` to `main`
+  (a run on main saves the KeyDB build under main's cache scope, which PRs can restore). Builds
+  drakeydb with `./.github/actions/builder`; restores and **explicitly saves** the KeyDB build with
+  `actions/cache/restore` + `actions/cache/save` keyed on the make flags, compiler and tag (a red run
+  still saves it); installs only the runtime libraries on a hit; runs `keydb_onboarding_test.py` and
+  `multimaster_test.py` with `KEYDB_REQUIRED=1`, filtered `-m "not large and not opt_only"` like
+  `ci.yml`'s debug leg, and moves the last failing test's logs aside on a timeout. `yaml.safe_load`
+  and `actionlint` pass (its only complaint is the upstream builder-action metadata quirk that
+  `ci.yml` has too); the no-silent-skip property is falsified (`KEYDB_REQUIRED=1` with the path unset
+  fails, not skips).
+**Residual.** Nothing was observed on GitHub: the real cache restore/save and the first green run,
+with the KeyDB tests shown *passed, not skipped* in the summary, belong to the P7-0 PR (below).
+**Done:** the workflow is green on the P7-0 PR with the KeyDB tests actually executed.
 
 ### Task 0.9: Make `ReaperJournalFamilyTest.MemberExpiryReaperDoesNotBlockOnConcurrentBgsave` robust
 
@@ -332,7 +382,9 @@ test passed 20/20 in isolation.
 **Hypotheses to confirm or kill** (read from the code, not yet proven): (H1) the follow-up reap is
 `DeleteExpiredStep(db_cntx, 100)` with default options, and `reset_time_quota` defaults to false
 (`db_slice.h:643`), so `quota_start` is 0 (`db_slice.cc:2283`) and `quota_remains()` (`:2284-2287`)
-compares the running fiber's **cumulative** running time with 1 ms; it gates every `Traverse`
+compares `ThisFiber::GetRunningTimeCycles()` with 1 ms. That accessor is the time since the fiber
+was last resumed (`cpu_tsc_` is stamped at every switch-in, `fiber_interface.cc:565`, read at
+`:336-339`), not a cumulative total, but the conclusion holds: the quota gates every `Traverse`
 iteration (`:2580`, `:2587`) and the member walk itself (`:2394`), and a cycle count includes time
 the thread was descheduled, so under load the sweep can end before it reaches `rs`. (H2) With no
 deletions the sweep makes at most `count / 3` = 33 `Traverse` steps per call (`:2580-2587`) from the
@@ -389,17 +441,25 @@ the artificial load, and each falsification fails as named. Lands before the P7-
 
 **Goal:** A pure, KeyDB-faithful envelope parser.
 **Files:** Modify `src/server/classic_replay.{h,cc}`; Test `src/server/classic_replay_test.cc`.
-**Interfaces:** `struct RreplayEnvelope { std::string_view uuid; std::string_view inner;
-std::optional<DbIndex> db; uint64_t mvcc = 0; }`; `enum class RreplayParse { kOk, kBadArity,
-kBadUuid, kBadDb, kBadMvcc }`; `RreplayParse ParseRreplayEnvelope(const facade::RespVec&,
-RreplayEnvelope*)`. Validation mirrors `replication.cpp:5389-5433`: `argc >= 3`; uuid is
-`IsValidNodeUuid` (case-insensitive, returned/keyed normalized); inner is a string; optional db an
-integer with `0 <= db < FLAGS_dbnum`; optional mvcc a `u64`.
+**Interfaces:** `struct RreplayEnvelope { std::string uuid; std::string_view inner;
+std::optional<DbIndex> db; uint64_t mvcc = 0; }` — `uuid` is an **owned**, normalized (lowercase)
+string, because the normalized form is not a view of the wire bytes and it keys the dedup and
+author maps; `inner` views the stream buffer and must not outlive the loop iteration;
+`enum class RreplayParse { kOk, kBadArity, kBadUuid, kBadDb, kBadMvcc }`;
+`RreplayParse ParseRreplayEnvelope(const facade::RespVec&, RreplayEnvelope*)`. Validation mirrors
+`replication.cpp:5389-5433`: `argc >= 3`; uuid is `IsValidNodeUuid` (case-insensitive,
+returned/keyed normalized); inner is a string; optional db an integer with `0 <= db < FLAGS_dbnum`;
+optional mvcc a `u64`.
 - [ ] **Step 1: Failing tests** `ClassicReplayTest.ParseRreplayEnvelope*`: build `RespVec`s by
-  running `RedisParser` over the golden bytes from Task 0.7 and hand-built variants: full 5-arg
-  `kOk`; 3-arg `kOk` (db nullopt, mvcc 0); `kBadArity` at 2 and 1 args; `kBadUuid` (35 chars, bad
-  dash position, non-hex, uppercase accepted); `kBadDb` (`-1`, `16` with dbnum 16, `abc`,
-  overflow); `kBadMvcc` (`-5`, `abc`, overflow).
+  running `RedisParser` over the **golden captures** from Task 0.7
+  (`tests/dragonfly/data/keydb_v6.3.4_rreplay_{stream,nested_stream}.bin`; its README gives each
+  segment's offset and length and prints segment 1 and the nested segment 1 as literals, which the
+  gtest embeds, since it does not read `tests/`) and hand-built variants: full 5-arg `kOk` (the
+  real `SET`, the `MULTI`/`EXEC` segments, the cron `ping` in lower case, and the nested depth-2
+  envelope whose `inner` is itself an envelope); 3-arg `kOk` (db nullopt, mvcc 0); `kBadArity` at 2
+  and 1 args; `kBadUuid` (35 chars, bad dash position, non-hex; uppercase accepted and returned
+  lowercase); `kBadDb` (`-1`, `16` with dbnum 16, `abc`, overflow); `kBadMvcc` (`-5`, `abc`,
+  overflow).
 - [ ] **Step 2: Run, observe failure** (symbols absent). **Step 3: Implement.**
 - [ ] **Step 4: Falsify** by changing `db < dbnum` to `<=` (the `16` case fails) and by accepting
   only lowercase (the uppercase case fails). Restore, record.
@@ -409,83 +469,128 @@ integer with `0 <= db < FLAGS_dbnum`; optional mvcc a `u64`.
 
 ### Task 1.2: Unwrap in `ConsumeRedisStream`
 
-**Goal:** RREPLAY commands apply on every classic link, in order, with exact offsets and no
-dispatch of control commands.
+**Goal:** RREPLAY commands apply on every classic link, in order, with exact offsets, no dispatch
+of control commands, and a defined outcome when the link is cancelled (spec D-3 and D-5
+"Cancellation and offsets").
 **Files:** Modify `src/server/classic_replay.{h,cc}` (`ClassicApplier`, `ClassicLinkStats`),
 `src/server/replica.{h,cc}`; Test `src/server/classic_replay_test.cc`,
-`tests/dragonfly/keydb_onboarding_test.py`.
-**Interfaces:** `ClassicApplier` (constructed with `Service*`, `ConnectionContext*`, the null reply
-builder, self uuid, link uuid, `ClassicLinkStats*`, a `running()` callback, and **optional** seams
-`AuthorDedup*` / `ClassicAuthorMap*` that stay null until P7-2) with `bool IsRreplay(const
-RespExpr&)`, `void HandleRreplay(const facade::RespVec&, unsigned depth = 1)`, a `SelectDb(DbIndex)`
-helper mirroring `journal/executor.cc:85-100`, and the inner-command loop of spec D-3.
+`tests/dragonfly/keydb_onboarding_test.py` (remove the strict `xfail` from
+`test_keydb_active_live_write_during_full_sync`).
+**Interfaces:** `ClassicApplier` (constructed with `Service*`, `ConnectionContext*`, a link-owned
+`facade::CapturingReplyBuilder{ReplyMode::ONLY_ERR}` — **not** the `NONE` builder, which records
+nothing while `InvokeCmd` consumes `last_error_` itself, `main_service.cc:1740`, `:1750` — self
+uuid, link uuid, `ClassicLinkStats*`, a `running()` callback, and **optional** seams `AuthorDedup*`
+/ `ClassicAuthorMap*` that stay null until P7-2) with `static bool IsRreplay(const RespExpr&)`,
+`EnvelopeResult HandleRreplay(const facade::RespVec&, unsigned depth = 1)` (`kConsumed` /
+`kNotConsumed`), a `SelectDb(DbIndex)` helper mirroring `journal/executor.cc:85-100`, and the
+inner-command handling of spec D-3 (exactly one command per inner, parsed by a `RedisParser`
+local to each call).
 
 - [ ] **Step 1: Failing tests.** `ClassicApplyFamilyTest` (a `BaseFamilyTest` fixture, driving the
   applier on `pp_->at(0)->LaunchFiber(...).Join()`): `AppliesInnerCommandInEnvelopeDb`,
-  `SkipsInnerPingMultiExecReplconf`, `SelectSetsDbWithoutTouchingOffsets`,
+  `SkipsInnerControlCommands` (`PING`, `MULTI`, `EXEC`, `REPLCONF`, `SELECT`),
+  `SelectSetsDbWithoutTouchingOffsets` (the synthetic `SELECT` for the envelope db),
   `DropsSelfAuthoredEnvelope`, `MalformedEnvelopeSkippedAndCounted` (bad uuid, bad db, bad mvcc,
-  arity, partial inner, trailing bytes), `NestedUnwrapAllowedTo64AndRefuses65th`. Pytest
-  (`keydb` marker, real KeyDB active): `test_plain_replica_unwraps_keydb_rreplay` (SET/INCR/HSET/
-  LPUSH/DEL/EXPIRE across db 0 and 1), `test_plain_replica_unwraps_nested_keydb_rreplay` (KeyDB A
-  and B active, forwarding on, drakeydb replicates B only, key written on A arrives),
-  `test_unwrap_keeps_offsets_exact` (idle: drakeydb `slave_repl_offset` equals KeyDB
-  `master_repl_offset`, through cron `PING` and `GETACK` envelopes). Fake master:
-  `test_unwrap_flushes_raw_batch_before_envelope` (raw `SET a 1`, then envelope `SET a 2`, then
-  wait for idle: `a == 2`).
+  arity, empty inner, partial inner, **two commands in one inner**, trailing bytes — none of them
+  applies anything), `NestedUnwrapAllowedTo64AndRefuses65th` (the 65th is malformed, the 64th
+  level's call still returns `kConsumed`), `KnownCommandErrorReplyCounted` (`INCR` on a hash key:
+  `classic_apply_errors == 1`, `kConsumed`, the next envelope applies),
+  `RunningFalseBeforeDispatchReturnsNotConsumed` (nothing dispatched, no synthetic `SELECT`, no
+  counter moves), `RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope` (`running()` flips
+  false from inside the first dispatch; the whole tree completes and the result is `kConsumed`),
+  `RejectedDispatchCountsAndConsumes` (an inner command that `VerifyCommandState` rejects before it
+  runs — a wrong-arity `SET k`, `main_service.cc:1412` — gives `classic_apply_errors == 1` and
+  `kConsumed`). Pytest (`keydb` marker, real KeyDB
+  active): `test_plain_replica_unwraps_keydb_rreplay` (SET/INCR/HSET/LPUSH/DEL/EXPIRE across db 0
+  and 1), `test_plain_replica_unwraps_nested_keydb_rreplay` (KeyDB A and B active, forwarding on,
+  drakeydb replicates B only, key written on A arrives), `test_unwrap_keeps_offsets_exact` (idle:
+  drakeydb `slave_repl_offset` equals KeyDB `master_repl_offset`, through cron `PING` and `GETACK`
+  envelopes), and the already-written
+  `test_keydb_active_live_write_during_full_sync[plain_replica|peer_mode]` with its `xfail` marker
+  removed. Fake master: `test_unwrap_flushes_raw_batch_before_envelope` (raw `SET a 1`, then
+  envelope `SET a 2`, then wait for idle: `a == 2`).
 - [ ] **Step 2: Run, observe failure** (today the keys never arrive; offsets advance past
-  dropped envelopes).
+  dropped envelopes; with the marker removed the live-write tests fail).
 - [ ] **Step 3: Implement** `ClassicApplier` and the stream hook: refactor the batch-dispatch block
-  (`replica.cc:1229-1270`) into a lambda; before queuing, if `IsRreplica(last_args[0])`: call the
-  lambda to flush, call `HandleRreplay(last_args)`, then `io_buf.ConsumeInput(...)`,
-  `repl_offs_ += response->total_read`, `replica_waker_.notify()`, `continue`. Process the envelope
-  **before** `ConsumeInput` (its views point into `io_buf`). Keep `RREPLAY` out of the registry. The
-  inner parser is created once per link and recreated after any non-`OK` parse. Do not advance
-  `repl_offs_` for synthetic `SELECT`s.
-- [ ] **Step 4: Run; falsify** three ways, recording each: (a) drop the pre-envelope flush: the fake
-  master test ends with `a == 1`; (b) skip `repl_offs_ += total_read` on the envelope branch:
+  (`replica.cc:1229-1270`) into a lambda; before queuing, if `ClassicApplier::IsRreplay(last_args[0])`:
+  call the lambda to flush; `if (!exec_st_.IsRunning()) break;` (without touching the envelope:
+  `repl_offs_` is then the first undispatched raw command, the right PSYNC resume point); call
+  `HandleRreplay(last_args)`; on `kNotConsumed` break; otherwise `io_buf.ConsumeInput(...)`,
+  `repl_offs_ += response->total_read` (**after** any dedup `Commit`/`Advance`, which run inside
+  `HandleRreplay`), `replica_waker_.notify()`, `continue`. Process the envelope **before**
+  `ConsumeInput` (its views point into `io_buf`) and let no `string_view` outlive the iteration.
+  Keep `RREPLAY` out of the registry. Do not advance `repl_offs_` for synthetic `SELECT`s.
+  **Side finding, not fixed here** (the orchestrator registers it): `DispatchCommand` ends with
+  `dfly_cntx->conn()->MarkForClose()` when `InvokeCmd` returns `ERROR` after catching an exception
+  (`main_service.cc:1645-1647`, `:1744-1747`) — a null `conn()` on a replica apply context, the same
+  family as U-9 and U-10.
+- [ ] **Step 4: Run; falsify** each of these, recording each: (a) drop the pre-envelope flush: the
+  fake master test ends with `a == 1`; (b) skip `repl_offs_ += total_read` on the envelope branch:
   `test_unwrap_keeps_offsets_exact` fails with the offsets apart; (c) remove the 65th-nesting
-  refusal: `NestedUnwrapAllowedTo64AndRefuses65th` fails.
+  refusal: `NestedUnwrapAllowedTo64AndRefuses65th` fails; (d) check `running()` after the first
+  dispatch instead of before it: `RunningFalseBeforeDispatchReturnsNotConsumed` fails; (e) check it
+  before every inner dispatch: `RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope` fails;
+  (f) accept a second inner command: the two-commands case of `MalformedEnvelopeSkippedAndCounted`
+  fails; (g) use the `NONE` builder: `KnownCommandErrorReplyCounted` fails.
 - [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; run both suites; pre-commit; commit
   `feat: unwrap RREPLAY envelopes on classic replication links (P7)`.
 
 **Done:** every KeyDB-written key type reaches a plain replica; offsets exact; mixed streams
-ordered.
+ordered; cancellation leaves a resumable offset; the strict `xfail` is gone and both
+`test_keydb_active_live_write_during_full_sync` variants pass.
 
 ### Task 1.3: KeyDB-only and unknown commands, per-link counters, INFO and Prometheus
 
-**Goal:** What drakeydb cannot represent is dropped loudly and counted, never silently.
-`KEYDB.MVCCRESTORE` is **excluded** here: it is applied, not dropped (decision 22, Task 2.6); until
-that task lands it is counted as an unknown command.
+**Goal:** What drakeydb cannot represent is dropped loudly and counted, never silently, and a stock
+master's INFO and `/metrics` stay exactly upstream's. `KEYDB.MVCCRESTORE` is **excluded** here: it
+is applied, not dropped (decision 22, Task 2.6); until that task lands it is counted as an unknown
+command.
 **Files:** Modify `src/server/classic_replay.{h,cc}`, `src/server/replica.{h,cc}`,
 `src/server/replica_types.h`, `src/server/server_family.cc`, `src/server/multi_master.cc`,
 `src/server/metrics.cc`; Test `src/server/classic_replay_test.cc`,
 `tests/dragonfly/keydb_onboarding_test.py`.
 **Interfaces:** `bool IsKeyDbOnlyCommand(const facade::RespVec&)` (list in spec D-7; `PERSIST` only
 with 3 args; case-insensitive; `KEYDB.*` prefix for the five named commands only);
-`ClassicLinkStats` relaxed atomics; `ReplicaSummary` gains `classic_link` and the per-link fields;
-process-wide counters in `classic_replay.cc`.
+`ClassicLinkStats` relaxed atomics (`rreplay_unwrapped`, `rreplay_malformed`,
+`rreplay_self_dropped`, `keydb_cmds_dropped`, `classic_unknown_cmds_dropped`,
+`classic_apply_errors`); `ReplicaSummary` gains `classic_link`, `master_active_replica` and the
+per-link fields; process-wide counters in `classic_replay.cc`. **Rendering rule** (spec D-13): a
+classic field renders only for a classic link whose master answered `active-replica` or whose own
+counter is nonzero; process-wide counters use the same predicate.
 - [ ] **Step 1: Failing tests.** `ClassicReplayTest.IsKeyDbOnlyCommand*` (table-driven, incl.
   `PERSIST k` vs `PERSIST k m`, mixed case, `KEYDB.MVCCRESTORE` **not** matched);
   `ClassicApplyFamilyTest.KeyDbOnlyDroppedAndCounted`, `.UnknownInnerCommandCountedNotDispatched`;
-  `MultiMasterFamilyTest.RenderPeerReplicationInfoShowsClassicFieldsOnlyForClassicLinks` (pure
-  render; includes `repl_offset=`). Pytest: `test_keydb_only_commands_dropped_with_counters` (KeyDB
-  `SADD s a b` + `EXPIREMEMBER s a 100`, `KEYDB.CRON ...`, and a normal key: the normal key syncs,
-  `keydb_cmds_dropped >= 1`, `rreplay_unwrapped` increments, drakeydb stays up);
-  `test_info_and_metrics_show_classic_counters` (INFO block fields on a classic link; `/metrics`
-  via `DflyInstance.metrics()`, `instance.py:391`: `<name>_total` present; **absent** on a
-  DFLY-to-DFLY pair).
+  `MultiMasterFamilyTest.RenderPeerReplicationInfoShowsClassicFieldsOnlyForClassicLinks` and
+  `.OmitsClassicFieldsWhenMasterNotActiveAndCountersZero` (pure render; includes `repl_offset=`).
+  Pytest: `test_keydb_only_commands_dropped_with_counters` (KeyDB `SADD s a b` + `EXPIREMEMBER s a
+  100`, `KEYDB.CRON ...`, and a normal key: the normal key syncs, `keydb_cmds_dropped >= 1`,
+  `rreplay_unwrapped` increments, drakeydb stays up); `test_info_and_metrics_show_classic_counters`
+  (INFO block fields on a classic link to an active KeyDB; `/metrics` via
+  `DflyInstance.metrics()`, `instance.py:391`: `<name>_total` present **on a plain replica too**,
+  which never reaches the master-side Prometheus branch; **absent** on a DFLY-to-DFLY pair);
+  `test_info_and_metrics_absent_for_stock_master` (a plain Redis master, every counter zero: no
+  classic field in `INFO replication`, no classic series in `/metrics`);
+  `test_active_replica_boot_warning_names_keydb_drops` (`find_in_logs` on an `--active_replica`
+  node's boot log).
 - [ ] **Step 2: Run, observe failure. Step 3: Implement** (raw path: only the KeyDB-only check;
   envelope path: KeyDB-only, then `FindCmd == nullptr`, each rate-limited with `LOG_EVERY_T`).
   Counters bump the per-link atomic and the process-wide total. Render per-link fields in the
   plain-replica block (`server_family.cc:3164-3192`) and the peer line (`multi_master.cc:195-216`);
-  Prometheus in `metrics.cc` beside `:486-489`/`:700-716`. Do not touch `ServerState::Stats`.
+  render process-wide counters in the active-node block beside `multimaster_lww_dropped`
+  (`server_family.cc:3138-3162`) and in the plain-replica block after the per-link fields;
+  Prometheus in `metrics.cc` in **both** the replica-side branch (`:486-489`, the only one a plain
+  replica reaches) and the master-side branch beside `multimaster_lww_dropped_total` (`:511-518`),
+  all behind the same predicate. Append "KeyDB member TTLs and cron jobs are dropped on onboarding"
+  to the boot limitations warning (`multi_master.cc:144-151`). Do not touch `ServerState::Stats`.
 - [ ] **Step 4: Falsify:** make `IsKeyDbOnlyCommand` return false: the drop test fails (the command
   lands in `classic_unknown_cmds_dropped`, `keydb_cmds_dropped` stays 0); omit the render branch:
-  the INFO test fails. Restore, record.
+  the INFO test fails; render unconditionally: `..._absent_for_stock_master` fails; omit the
+  replica-side Prometheus branch: the plain-replica `/metrics` assertion fails. Restore, record.
 - [ ] **Step 5:** pre-commit; commit
   `feat: drop and count KeyDB-only commands and expose classic-link counters (P7)`.
 
-**Done:** counters visible in INFO and Prometheus; non-classic INFO unchanged.
+**Done:** counters visible in INFO and Prometheus, on a plain replica as well; INFO and `/metrics`
+for a stock master unchanged.
 
 ### Task 1.4: `capa activeExpire` and replica active expiry
 
@@ -515,7 +620,10 @@ request capture); Test `src/server/classic_replay_test.cc` (or `engine_shard_set
 - [ ] **Step 3: Implement** per spec D-9 and D-2: record `master_active_replica_` from both capa
   replies (OR); send `REPLCONF capa activeExpire` right after the `:432` check when set, parse its
   reply leniently; `SetShardStates`'s sibling sets/clears the shard flag at `:272-273` / `:383-385`
-  and after each `Greet()`; `Heartbeat` split with `expire_only` forcing `eviction_goal = 0` (so
+  and after each **successful** `Greet()` (a failed one neither sets nor clears it), and only for
+  the node's main `replica_` link (`!slot_range_`): cluster `ADDREPLICAOF` replicas run the same
+  `MainReplicationFb`/`SetShardStates` (last writer wins), so replica active expiry through them is
+  unsupported and documented; `Heartbeat` split with `expire_only` forcing `eviction_goal = 0` (so
   `db_slice.cc:2681`'s `DCHECK` stays untouched and unreachable on a replica); the one-line gate at
   `db_slice.cc:2097-2098` honours the flag; deletions journal when a journal exists.
 - [ ] **Step 4: Run; falsify:** do not set the shard flag: `DBSIZE` never reaches 0; do not send
@@ -528,28 +636,43 @@ request capture); Test `src/server/classic_replay_test.cc` (or `engine_shard_set
 
 ### Task 1.5: Throughput — "must keep up with KeyDB"
 
-**Goal:** Measure whether per-command dispatch keeps up; record the numbers either way.
-**Files:** Test `tests/dragonfly/keydb_onboarding_test.py`.
-- [ ] **Step 1:** `test_keydb_onboarding_keeps_up_under_load` (`slow`, `keydb`): KeyDB active,
-  drakeydb plain replica attached and idle-synced; drive sustained pipelined writes on KeyDB for a
-  fixed window (`redis-benchmark -P 100 -c 50 -t set,incr -r 100000` if on `PATH`, else an asyncio
-  pipeline loader); sample every second. Assert (1) the link never reconnects (`reconnect_count`
-  unchanged, KeyDB `sync_full == 1`), (2) sampled lag `master_repl_offset - slave_repl_offset`
-  never exceeds `kMaxLagBytes`, (3) lag reaches 0 within `kDrainSeconds` of load stopping, and the
-  final key counts match. Bounds are **provisional** — calibrate on the first run and record them
-  and the achieved ops/s in the ledger.
-- [ ] **Step 2:** Run x3; record ops/s offered and observed lag in `task-1.5-report.md`.
-- [ ] **Step 3: Falsify** the test's sensitivity: add a `ThisFiber::SleepFor` per inner command
-  (temporary): the lag assertion must fail. Restore.
-- [ ] **Step 4:** pre-commit; commit
+**Goal:** Measure, on **release builds**, whether per-command dispatch keeps up; record the numbers
+either way (spec D-12).
+**Files:** Test `tests/dragonfly/keydb_onboarding_test.py`; ledger `task-1.5-report.md`.
+- [ ] **Step 1: Build for the measurement.** `./helio/blaze.sh -release -DWITH_AWS=OFF
+  -DWITH_GCP=OFF`, then only `CCACHE_DISABLE=1 ninja -C /home/user/drakeydb/build-opt -j4 dragonfly`
+  (free disk first by deleting the non-gate debug test binaries under `build-dbg`; they relink from
+  objects later).
+- [ ] **Step 2: The test.** `test_keydb_onboarding_keeps_up_under_load` (`slow`, `keydb`): KeyDB
+  active with `--server-threads 1`, drakeydb a plain replica with `--proactor_threads 2`, attached
+  and idle-synced; each server pinned with `taskset` to its own cpuset and the load generator to a
+  third; sustained pipelined writes over a fixed window (`redis-benchmark -P 100 -c 50 -t set,incr
+  -r 100000`, which is on `PATH` here; else an asyncio pipeline loader), sampling KeyDB's
+  `master_repl_offset` and drakeydb's `slave_repl_offset` at 1 Hz. Assert (1) the link never
+  reconnects (`reconnect_count` unchanged, KeyDB `sync_full == 1`); (2) over the steady window
+  `apply_rate / produce_rate >= 0.95` and the maximum lag `<= max(2 s x produce_rate, 8 MB)`; (3)
+  the lag reaches 0 within 2 s of the load stopping and the final key counts match. The release
+  bar runs under `DRAKEYDB_PERF=1`; **by default** the test is a rate-capped (about 5k ops/s)
+  functional smoke with loose bounds (ratio `>= 0.5`, lag `< 32 MB`, drain `< 10 s`), so CI and
+  debug builds exercise the plumbing without claiming the bar.
+- [ ] **Step 3: Measure.** Three release runs, median, `DRAKEYDB_PERF=1`; also the **comparator**
+  (the same load with a second KeyDB attached as an active replica of the same master: drakeydb's
+  lag within 1.5x of its lag) and the raw squashed path (a non-active KeyDB or a Redis master) as
+  the reference. Record offered ops/s, rates, the lag series and drain times in
+  `task-1.5-report.md`.
+- [ ] **Step 4: Falsify** the test's sensitivity: add a 1 ms `ThisFiber::SleepFor` per inner
+  command (temporary): the smoke's ratio assertion must fail (and the release one under
+  `DRAKEYDB_PERF=1`). Restore.
+- [ ] **Step 5:** pre-commit; commit
   `test: pin that the RREPLAY path keeps up with KeyDB under load (P7)`.
 
-**Done:** passes with recorded numbers — **or** fails and Task 1.6 is opened.
+**Done:** the release bar passes with recorded numbers — **or** it fails and Task 1.6 is opened.
 
 ### Task 1.6: Squasher micro-batch fallback (conditional on Task 1.5 failing)
 
-Run **only if** Task 1.5's bar fails (or Task 2.4's peer-mode re-run fails). Owner decision 12:
-"else optimize within P7".
+Run **only if** the **release-build** bar of Task 1.5 fails (or Task 2.4's peer-mode re-run of it).
+A failure of the CI/debug smoke is a bug in the test or the plumbing, not a trigger. Owner decision
+12: "else optimize within P7".
 **Goal:** Recover throughput by micro-batching same-author, same-shard envelope commands through
 the squasher **with per-command mvcc**.
 **Files:** Modify `src/server/classic_replay.{h,cc}`, `src/server/replica.cc`, and — only after the
@@ -575,9 +698,10 @@ advisor signs the design — `src/server/main_service.cc`, `src/server/multi_com
 ### P7-1 gate and PR
 
 - [ ] Whole-branch review, adversarial pass, fix loops. Gate and PR as in P7-0.
-- [ ] O-1 is decided (decision 22: `KEYDB.MVCCRESTORE` is applied, Task 2.6 in P7-2). Until then
-  the command is counted and warned as an unknown command, not applied: say so in the PR
-  description.
+- [ ] The PR description must say, in so many words: (1) until P7-2's dedup lands, a peer attached
+  to two or more **forwarding** KeyDB masters double-applies deltas (`INCR`, `APPEND`, ...); (2)
+  `KEYDB.MVCCRESTORE` (decision 22, applied in Task 2.6 of P7-2) is unhandled until then: it is
+  counted and warned as an unknown command, not applied.
 
 ---
 
@@ -585,24 +709,44 @@ advisor signs the design — `src/server/main_service.cc`, `src/server/multi_com
 
 ### Task 2.1: `ClassicAuthorMap`
 
-**Goal:** Resolve an envelope's author to a registered `PeerRegistry` index and origin hash.
-**Files:** Modify `src/server/classic_replay.{h,cc}`; Test `src/server/classic_replay_test.cc`.
-**Interfaces:** `uint32_t ClassicAuthorMap::IdxFor(std::string_view uuid)`: link uuid ->
-`peer_origin_idx_`; other uuids -> `PeerRegistry::AddOrGet` plus
-`MvccStamper::RegisterOriginHash(idx, NodeUuidHash(uuid))` on every proactor via
-`shard_set->pool()->AwaitBrief` (the primitive at `replica.cc:545-549`); memoized per link;
-process-wide cap 256 distinct classic authors (`kMaxClassicAuthors`), beyond which the link's index
-is returned, `multimaster_keydb_author_overflow` is bumped and a rate-limited warning logged.
-Registry null (tests) means stamping is off.
+**Goal:** Resolve an envelope's author to a registered `PeerRegistry` index and origin hash, with a
+bounded, observable cost (spec D-4 "Author cap").
+**Files:** Modify `src/server/classic_replay.{h,cc}` (map, `--classic_author_cap`, counters),
+`src/server/replica.{h,cc}` (`classic_link_uuid_changes`), `src/server/replica_types.h`,
+`src/server/server_family.cc`, `src/server/multi_master.cc`, `src/server/metrics.cc` (the counters
+and the registry-size gauge, rendered by spec D-13's rule); Test `src/server/classic_replay_test.cc`,
+`tests/dragonfly/keydb_onboarding_test.py`.
+**Interfaces:** `uint32_t ClassicAuthorMap::IdxFor(std::string_view uuid)`: the link uuid ->
+`peer_origin_idx_` (never counted against the cap); any other (forwarded) uuid ->
+`PeerRegistry::AddOrGet` plus `MvccStamper::RegisterOriginHash(idx, NodeUuidHash(uuid))` on every
+proactor via `shard_set->pool()->AwaitBrief` (the primitive at `replica.cc:545-549`); memoized per
+link. `--classic_author_cap` (default 4096, declared in `classic_replay.cc`) bounds the distinct
+**forwarded** authors, process-wide; beyond it the **link's** idx is returned (never `kSelfIdx`),
+the envelope's mvcc is kept, `multimaster_keydb_author_overflow` is bumped and a `LOG_EVERY_T`
+warns. No reclamation: the registry is append-only and the indices live in journaled entries.
+`Replica` remembers the previous master uuid across `Greet()`s (the per-`Greet()` clear of
+`master_context_.master_node_uuid` at `replica.cc:436-437` wipes the one it would compare with) and
+bumps `classic_link_uuid_changes` when the master presents a different one (a KeyDB restart,
+D-1.16). `multimaster_peer_registry_size` is a gauge over `PeerRegistry::Size()`. A null registry
+(tests) means stamping is off.
 - [ ] **Step 1: Failing tests** (`MultiMasterFamilyTest`-style fixture with proactors):
   `ClassicAuthorMapTest.DistinctUuidsGetDistinctIdxAndRegisteredHashOnEveryProactor`,
-  `.LinkUuidMapsToPeerIdx`, `.MemoizesPerLink`, `.CapFallsBackToLinkIdxAndCounts` (257th author).
+  `.LinkUuidMapsToPeerIdx`, `.MemoizesPerLink`, `.CapFallsBackToLinkIdxAndCounts` (one author past
+  a small `--classic_author_cap`: the link's idx, never `kSelfIdx`, the envelope mvcc kept, the
+  counter bumped), `.CapIgnoresLinkUuid` (link uuids beyond the cap still map to their own idx).
+  Pytest `test_keydb_restart_consumes_one_author_slot`: a peer-mode drakeydb attached to a KeyDB;
+  restart KeyDB (a new uuid, D-1.16) and wait for the re-attach: `classic_link_uuid_changes == 1` on
+  the link, `master0:node_uuid` changed, and `multimaster_peer_registry_size` grew by exactly one
+  (and by one more per further restart — the append-only growth of Risk 7).
 - [ ] **Step 2: Run, observe failure. Step 3: Implement.**
 - [ ] **Step 4: Falsify:** skip `RegisterOriginHash`: `OriginHash(idx) == 0` and the hash assertion
-  fails; remove the cap: the overflow test fails. Restore, record.
+  fails; remove the cap: the overflow test fails; count link uuids against the cap:
+  `CapIgnoresLinkUuid` fails; stamp the overflow with `kSelfIdx`: `CapFallsBackToLinkIdxAndCounts`
+  fails. Restore, record.
 - [ ] **Step 5:** pre-commit; commit `feat: map classic RREPLAY authors to registered origins (P7)`.
 
-**Done:** every proactor resolves each registered author's hash; the cap holds.
+**Done:** every proactor resolves each registered author's hash; the cap holds; the registry's
+growth is visible.
 
 ### Task 2.2: Per-command stamps on peer links
 
@@ -630,66 +774,131 @@ Registry null (tests) means stamping is off.
 
 ### Task 2.3: `AuthorDedup`
 
-**Goal:** A mesh of forwarding KeyDB masters never double-applies a delta.
-**Files:** Modify `src/server/classic_replay.{h,cc}`, `src/server/multi_master.cc` and
-`server_family.cc` (INFO), `src/server/metrics.cc`; Test `src/server/classic_replay_test.cc`,
-`tests/dragonfly/keydb_onboarding_test.py`.
-**Interfaces:** process-wide `AuthorDedup` (`util::fb2::Mutex`, never yields): `bool
-ShouldDrop(uuid, mvcc)`, `void Advance(uuid, mvcc)`; bound `kMaxAuthorDedupEntries = 4096`, evict
-smallest `last_seen_ms`; never reset. Applier calls `Advance` only after the envelope was consumed
-(spec D-5), before `repl_offs_` moves, and never when `running()` is false.
-- [ ] **Step 1: Failing tests.** `AuthorDedupTest.*`: drop iff `mvcc != 0 && stored >= mvcc`;
-  `mvcc == 0` never dropped and never advances; advance only forward; eviction at the bound removes
-  the oldest; concurrent producers (two proactors) lose nothing; and
-  `ClassicApplyFamilyTest.AdvancesAfterSkippedInnerAndAfterOuterWhenInnerDeduped`,
-  `.DoesNotAdvanceWhenMalformedSelfOrCancelled`. Pytest
-  `test_keydb_mesh_forwarded_duplicates_deduped`: KeyDB A and B active, mutually `replicaof`,
-  forwarding on, one drakeydb (`--active_replica --multi_master`) attached to both; `INCR c` x N on
-  A: final value exactly N and `multimaster_rreplay_deduped >= N`.
-- [ ] **Step 2: Run, observe failure** (value 2N). **Step 3: Implement**; wire the INFO/Prometheus
-  counter `multimaster_rreplay_deduped`.
-- [ ] **Step 4: Falsify:** disable `ShouldDrop`: the mesh test sees 2N. Advance on cancel: the
-  cancel test fails. Restore, record.
+**Goal:** A mesh of forwarding KeyDB masters never double-applies a delta — not even when the same
+envelope reaches two links at the same instant (spec D-5; review C1, I1, I2).
+**Files:** Modify `src/server/classic_replay.{h,cc}`, `src/server/replica.cc` (`Clear()` at the
+flush point), `src/server/multi_master.cc` and `server_family.cc` (INFO), `src/server/metrics.cc`;
+Test `src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test.py`.
+**Interfaces:** process-wide `AuthorDedup`: `Entry {applied, inflight, last_seen_ms}` under a
+`util::fb2::Mutex` plus `CondVarAny` — a **leaf** lock, never held across a dispatch or an
+`AddOrGet`, non-reentrant, with the map re-looked-up after every wait (it is not pointer-stable);
+`Verdict Reserve(uuid, mvcc, running)` (`kApply` / `kDrop` / `kCancelled`), `Commit`, `Release`,
+`Advance`, `IsApplied`, `Clear()`; bound `kMaxAuthorDedupEntries = 4096`, evicting the smallest
+`last_seen_ms` among `inflight == 0`. The applier holds an RAII reservation, so every exit of the
+leaf commits or releases. The exact protocol is spec D-5: one reservation per envelope tree on the
+innermost level only; outer levels read `IsApplied` and `Advance`; `running()` is checked once per
+outermost envelope (the point of no return); `Commit`/`Advance` happen **before** `repl_offs_ +=`;
+`ERROR`/`OOM` is `Release` plus `classic_apply_errors` and still consumed.
+- [ ] **Step 1: Failing tests.** `AuthorDedupTest.*` (two fibers on `pp_->at(0)` / `pp_->at(1)`):
+  `ConcurrentSameEnvelopeAppliesOnce` (the dispatch stub sleeps 10 ms before `Commit`: exactly one
+  `kApply`, the other `kDrop`), `ReleaseLetsSecondLinkApply`, `CancelledWaiterReturnsNotConsumed`
+  (`running()` flips while a second link waits: `kCancelled`), `MvccZeroNeverDedupedNeverAdvances`,
+  `AdvanceOnlyForward`, `EvictionSkipsInflight` (at the bound the oldest idle entry goes, a
+  reserved one never), `ClearResetsAppliedKeepsInflight`. `ClassicApplyFamilyTest`:
+  `NestedOuterAdvancesWhenInnerDeduped`, `AdvancesAfterSkippedInner`,
+  `DoesNotAdvanceWhenMalformedOrSelf`, `Depth65MalformedStillAdvancesOuter`,
+  `RunningFalseBeforeDispatchReturnsNotConsumedNoAdvance`,
+  `RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope` (now also asserting the commit),
+  `RejectedDispatchCountsBytesDoesNotAdvance` (a wrong-arity `SET k`, rejected before it runs:
+  `classic_apply_errors == 1`, `applied` unchanged, the envelope consumed, and a well-formed
+  envelope with the same author and mvcc then applies once),
+  `ReplayAfterCommitBeforeCountIsDeduped` (the harness stops after `HandleRreplay` returns, as a
+  cancel between the commit and the offset count would: replaying the same bytes is dropped,
+  `rreplay_deduped == 1`), and
+  `ClassicAuthorMapTest.DedupStillWorksForOverCapAuthor` (an over-cap author's duplicate is still
+  dropped). Pytest `test_keydb_mesh_forwarded_duplicates_deduped`: KeyDB A and B active, mutually
+  `replicaof`, forwarding on, one drakeydb (`--active_replica --multi_master`) attached to both;
+  **pipelined `INCR c` x N at full rate** on A, so the two links' deliveries overlap: the final
+  value is exactly N and `multimaster_rreplay_deduped >= N`. Pytest
+  `test_master_switch_full_sync_resets_author_dedup`: KeyDB C1 and C2 active, mutually `replicaof`,
+  forwarding on; a plain drakeydb D replicates C1; a proxy on C2's link to C1 is paused; `INCR c`
+  x N on C1 (D applies them, C2 does not have them yet); `REPLICAOF C2` on D (a flushing full
+  sync); resume the proxy, so C2 receives the N increments and forwards them nested to D:
+  **`c == N`** (without the `Clear()` D's watermark for C1 still holds the old link's mvcc and
+  drops them, `c == N - k`).
+- [ ] **Step 2: Run, observe failure** (value 2N; the master-switch test ends below N).
+  **Step 3: Implement**; wire the counter `multimaster_rreplay_deduped` by spec D-13's rendering
+  rule; call `Clear()` right after `FlushAll` (`replica.cc:771`) and `FlushSlots` (`:769`) in
+  `InitiatePSync`, and neither on a peer merge sync nor on `+CONTINUE`.
+- [ ] **Step 4: Falsify**, one at a time, restore and record: (a) the old check-only shape —
+  `Reserve` reads `applied` but never sets `inflight` and never waits (`ShouldDrop`, dispatch,
+  `Advance`): `ConcurrentSameEnvelopeAppliesOnce` sees two `kApply` (the deterministic proof) and
+  the pytest mesh test ends in (N, 2N] (statistical: record the values over 5 runs, and if it does
+  not exceed N on this box say so and rely on the gtest); (b) advance on `kNotConsumed`:
+  `RunningFalseBeforeDispatchReturnsNotConsumedNoAdvance` fails; (c) `Commit` on `ERROR`/`OOM`
+  instead of `Release`: `RejectedDispatchCountsBytesDoesNotAdvance` fails; (d) defer the `Commit`
+  until after the return: `ReplayAfterCommitBeforeCountIsDeduped` fails; (e) skip `Clear()`: the
+  master-switch pytest ends at `N - k` and `ClearResetsAppliedKeepsInflight` fails; (f) disable
+  dedup entirely: the mesh test sees 2N.
 - [ ] **Step 5:** pre-commit; commit
   `feat: dedup RREPLAY envelopes per author across classic links (P7)`.
 
-**Done:** exactly-N under forwarding; the counter moves.
+**Done:** exactly-N under forwarding and under simultaneous delivery; the counter moves; a master
+switch loses nothing.
 
-### Task 2.4: Guard ON for classic peer links
+### Task 2.4: Guard ON for classic peer links; rewrites and EVAL on every envelope link
 
-**Goal:** KeyDB's state-carrying writes are LWW-guarded on peer links (decision 7).
+**Goal:** KeyDB's state-carrying writes are LWW-guarded on peer links (decision 7), and conditional
+commands replay as their author's effect on every envelope link, plain or peer (spec D-4.3, D-4.4,
+D-6).
 **Files:** Modify `src/server/classic_replay.{h,cc}`, `src/server/replica.cc`,
-`src/server/transaction.cc` (comment only), `docs/multi-master.md:311-381`; Test
-`src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test.py`.
+`src/server/transaction.cc` and `src/server/multimaster_lww.cc` (comments only),
+`docs/multi-master.md:311-381`; Test `src/server/classic_replay_test.cc`,
+`tests/dragonfly/keydb_onboarding_test.py`.
 **Interfaces:** `bool ClassicApplyRewrites(cmn::BackedArguments*)`: `SET` loses `NX`/`XX`/`GET`
-tokens (anywhere after the value, case-insensitive; `PX|PXAT|EX|EXAT <n>` and `KEEPTTL` kept);
-`MSETNX` becomes `MSET`. `repl_lww_guard` is set once per link to `IsPeerMode() && IsActiveReplica()
-&& FLAGS_multi_master_stream_lww`. Per command: only when `LwwGuardActive`, run
-`ApplyLwwRewrites` then `ClassicApplyRewrites`. `EVAL`/`EVALSHA` dispatch with `repl_mvcc = 0`.
-- [ ] **Step 1: Failing tests.** `ClassicReplayTest.ClassicApplyRewrites*` (table-driven; non-SET
-  and unrelated args untouched); `ClassicApplyFamilyTest.StaleKeyDbSetLosesToNewerLocalWrite`,
-  `.NxSetAppliesAsGuardedSet`, `.MsetnxAppliesAsGuardedMset`,
-  `.EvalDispatchedUnguardedWithoutDfatal`, `.GuardOffAppliesInArrivalOrder`
+tokens (anywhere after the value, case-insensitive; `PX|PXAT|EX|EXAT <n>` and `KEEPTTL` kept)
+**except** that `KEEPTTL` is dropped when `NX` was present (`SET k v NX KEEPTTL` becomes `SET k v`;
+`SET k v XX KEEPTTL` becomes `SET k v KEEPTTL`); `MSETNX` becomes `MSET`. `repl_lww_guard` is set
+once per link to `IsPeerMode() && IsActiveReplica() && FLAGS_multi_master_stream_lww`. On **every**
+envelope dispatch, plain and peer: `ApplyLwwRewrites` then `ClassicApplyRewrites`,
+unconditionally (the guard decides only whether the dispatch is vetoed; raw streams are untouched;
+`JournalExecutor`'s `LwwGuardActive` gate for DFLY links is unchanged; `ApplyLwwRewrites`'s
+contract comment gets the envelope carve-out). `EVAL`/`EVALSHA`: `repl_mvcc = envelope.mvcc` and
+the author's `repl_origin_idx` with `repl_lww_guard = false` for that dispatch, restored after
+(peer mode; a plain link keeps `repl_mvcc = 0`). Evidence: KeyDB propagates only commands that
+dirtied the dataset (`server.cpp:4618-4648`) — a failed NX/XX returns before `dirty++`
+(`t_string.cpp:104-108`), `MSETNX` returns 0 before `setKey` (`:556-563`) — so every conditional on
+the wire already succeeded on its author.
+- [ ] **Step 1: Failing tests.** `ClassicReplayTest.ClassicApplyRewrites*` (table-driven, incl. `NX
+  KEEPTTL`, `XX KEEPTTL`, `NX GET`, lower case, `MSETNX`; non-SET and unrelated args untouched);
+  `ClassicApplyFamilyTest.StaleKeyDbSetLosesToNewerLocalWrite`, `.NxSetAppliesAsGuardedSet`,
+  `.MsetnxAppliesAsGuardedMset`, `.PlainApplierRewritesConditionalSet` (a plain link: `SET k v NX`
+  over a resident older `k` overwrites it), `.EvalStampedWithEnvelopeMvccUnguardedNoDfatal`
+  (`StampOf(key)` equals `{envelope mvcc, author hash}`, no `LOG(DFATAL)`),
+  `.EvalAppliesEvenWhenLocalIsNewer`, `.GuardOffAppliesInArrivalOrder`
   (`--multi_master_stream_lww=false`). Pytest: `test_keydb_lww_concurrent_set_converges` (pause the
   KeyDB link with the proxy, write `k` on KeyDB at t1, then write `k` on drakeydb at t2 > t1,
   resume: drakeydb **keeps its newer value**; with `--multi_master_stream_lww=false` it takes
-  KeyDB's) and `test_keydb_set_nx_wins_over_stale_local` (drakeydb holds an older local `k`; a later
-  `SET k v NX` on KeyDB, which succeeded there, must win on drakeydb), plus
-  `test_keydb_writes_not_forwarded_to_peers` (a second drakeydb replicating from the first sees
-  exactly N after N `INCR`s on KeyDB; `assert_no_command_storm`, `multimaster_test.py:1407`).
+  KeyDB's); `test_keydb_set_nx_wins_over_stale_local` (drakeydb holds an older local `k`; a later
+  `SET k v NX` on KeyDB, which succeeded there, must win on drakeydb);
+  `test_plain_replica_conditional_set_applies_despite_expiry_skew` (fake master, plain link:
+  envelope `SET k old PXAT <far future>`, then envelope `SET k new NX` — the state an active KeyDB
+  produces when `k` expired on it, which it never propagates, and was re-created: `k == new`); and
+  `test_keydb_writes_not_forwarded_to_peers`: a KeyDB master and **two** `--active_replica
+  --multi_master` drakeydb nodes that are each other's peers **and** both attached to the KeyDB;
+  after N `INCR`s on KeyDB each node holds exactly N, and `assert_no_command_storm`
+  (`multimaster_test.py:1407`) passes. (A plain sub-replica of the first node would make the
+  `kSelfIdx` falsification vacuous: it receives the journal either way.)
 - [ ] **Step 2: Run, observe failure** (stale KeyDB write overwrites; NX is skipped).
-- [ ] **Step 3: Implement.** Rewrite the `RunSquashedMultiCb` comment (`transaction.cc:1628-1648`)
-  and `docs/multi-master.md:311-381`: classic links are now guarded when they carry a real envelope
-  mvcc; raw classic commands (mvcc 0) and `EVAL` stay unguarded.
+- [ ] **Step 3: Implement.** Rewrite the `RunSquashedMultiCb` comment (`transaction.cc:1628-1648`),
+  the `ApplyLwwRewrites` contract comment and `docs/multi-master.md:311-381`: classic links are now
+  guarded when they carry a real envelope mvcc; raw classic commands (mvcc 0) stay unguarded and
+  `EVAL` is stamped but unguarded.
 - [ ] **Step 4: Falsify:** guard bit off (the stale write wins); remove `ClassicApplyRewrites` (the
-  NX test fails because NX evaluates against the stale local key); stamp classic authors with
-  `kSelfIdx` (the not-forwarded test sees 2N). Restore, record.
+  NX test fails because NX evaluates against the stale local key); gate the rewrites on
+  `LwwGuardActive` (`test_plain_replica_conditional_set_applies_despite_expiry_skew` and
+  `.PlainApplierRewritesConditionalSet` fail); keep `KEEPTTL` under `NX` (the table's KEEPTTL rows
+  fail); dispatch `EVAL` with the guard on (the tripwire fires) or with `repl_mvcc = 0` (the stamp
+  assertion fails); stamp classic authors with `kSelfIdx` (the not-forwarded test sees 2N).
+  Restore, record.
 - [ ] **Step 5: Peer-mode perf re-run:** parametrize Task 1.5's test over peer mode (per-link
-  `repl_offset=` makes lag observable); record the numbers. A failing peer-mode bar re-opens Task
-  1.6.
-- [ ] **Step 6:** pre-commit; commit `feat: LWW-guard KeyDB writes on classic peer links (P7)`.
+  `repl_offset=` makes lag observable); record the release-build numbers. A failing peer-mode
+  **release** bar re-opens Task 1.6.
+- [ ] **Step 6:** pre-commit; commit
+  `feat: LWW-guard KeyDB writes on classic peer links, rewrite conditionals (P7)`.
 
-**Done:** stale KeyDB writes lose, fresh ones win, "which value survived" is asserted.
+**Done:** stale KeyDB writes lose, fresh ones win, "which value survived" is asserted; conditional
+commands replay as their effect on plain links too.
 
 ### Task 2.5: Close ISSUE-REGISTER D-1
 
@@ -705,21 +914,27 @@ tokens (anywhere after the value, case-insensitive; `PX|PXAT|EX|EXAT <n>` and `K
 **Goal:** A KeyDB mesh resync no longer loses keys. An active KeyDB with replicas emits one
 `KEYDB.MVCCRESTORE key <mvcc> <expire> <DUMP payload>` per key it loads from an RDB, RREPLAY-wrapped
 (`replication.cpp:5573-5594`); the applier translates it to `RESTORE key <ttl> <payload> REPLACE
-ABSTTL`, stamps it with the command's **own** `<mvcc>` and the envelope author's hash, and the LWW
-guard decides it on peer links. Spec D-7a is binding.
+ABSTTL`, stamps it with the command's **own** `<mvcc>` (the envelope's when that one is unusable)
+and the envelope author's hash, and the LWW guard decides it on peer links. Spec D-7a is binding.
 **Files:** Modify `src/server/classic_replay.{h,cc}` (`TranslateMvccRestore`, the applier hook,
 `ClassicLinkStats::keydb_mvccrestore_failed`), `src/server/replica_types.h`,
 `src/server/server_family.cc`, `src/server/multi_master.cc`, `src/server/metrics.cc` (the counter,
 rendered like `keydb_cmds_dropped`); Test `src/server/classic_replay_test.cc`,
 `tests/dragonfly/keydb_onboarding_test.py`. No edits to `generic_family.cc`.
-**Depends on:** Tasks 1.2, 1.3 (applier, counters) and 2.1, 2.2, 2.4 (author map, stamps, guard).
-**Interfaces:** `enum class MvccRestoreParse { kOk, kBadArity, kBadMvcc, kBadExpire, kBadPayload }`;
-`MvccRestoreParse TranslateMvccRestore(cmn::BackedArguments* args, uint64_t* own_mvcc)` rewrites in
-place, returns the command's own mvcc through `own_mvcc` (0 when unusable: 0, or bit 63 set). The
-`<expire>` mapping: negative or `LLONG_MAX` becomes `0`; `0` becomes `1`; anything else is kept
-(spec D-7a table). Payload pre-checks mirror what a replicated-apply `RESTORE` accepts: longer than
-the 10-byte footer, footer version `<= RDB_VERSION`, first byte in `rdbIsObjectTypeDF`
-(`rdb_extensions.h:21`); the CRC is not verified. `GetRdbVersion` is anonymous in
+**Depends on:** Tasks 1.2, 1.3 (applier, counters) and 2.1, 2.2, 2.3, 2.4 (author map, stamps,
+dedup, guard).
+**Interfaces:** `enum class MvccRestoreParse { kOk, kBadArity, kBadMvcc, kBadExpire, kBadPayload,
+kCronPayload }`; `MvccRestoreParse TranslateMvccRestore(cmn::BackedArguments* args, uint64_t*
+own_mvcc)` rewrites in place, returns the command's own mvcc through `own_mvcc` (0 when unusable:
+0, or bit 63 set — then the envelope's mvcc is used, a clarification of decision 22). The `<expire>`
+mapping: negative or `LLONG_MAX` becomes `0`; `0` becomes `1`; anything else is kept (spec D-7a
+table). Payload pre-checks mirror what a replicated-apply `RESTORE` accepts: longer than the
+10-byte footer (`GetRdbVersion` rejects `size <= 10`), footer version `<= RDB_VERSION`, first byte
+in `rdbIsObjectTypeDF` (`rdb_extensions.h:21`); the CRC is not verified. A first byte of 64
+(`RDB_TYPE_CRON`, a KeyDB-only value drakeydb cannot represent) is `kCronPayload`: it is counted in
+`keydb_cmds_dropped`, **not** `keydb_mvccrestore_failed`. The length and version checks duplicate
+what `RESTORE` rejects itself before `OpRestore` (`generic_family.cc:2891-2895`); the type-byte check
+is the one that protects a resident key from ISSUE-REGISTER D-31. `GetRdbVersion` is anonymous in
 `generic_family.cc`, so reimplement the ten-line length/version check and say why in a comment.
 
 - [ ] **Step 0: Re-probe KeyDB before coding** (the design session did this on 2026-10-03; repeat
@@ -732,69 +947,101 @@ the 10-byte footer, footer version `<= RDB_VERSION`, first byte in `rdbIsObjectT
   `-7`, `LLONG_MAX` give `0`; `0` gives `1`; an absolute ms deadline is unchanged),
   `ExtractsOwnMvcc` (a valid value; `0`, `1<<63` and all-ones give `*own_mvcc == 0` and still
   `kOk`), `RejectsMalformed` (4 and 6 arguments; `<mvcc>` `-5`, `abc`, overflow; `<expire>`
-  `abc`, overflow), `RejectsUnloadablePayload` (empty; shorter than the footer; footer version
-  `RDB_VERSION + 1`; type byte 64 with footer version 9), `OutputIsByteExact` (binary payload with
-  `\r\n` and NULs, key with a space; result is exactly `RESTORE key ttl payload REPLACE ABSTTL`).
-  `ClassicApplyFamilyTest` (the peer applier of Task 2.2):
-  `.MvccRestoreStampsOwnMvccWithAuthorHash` (envelope mvcc 900, command `<mvcc>` 500:
-  `StampOf(key) == {500, NodeUuidHash(author)}`),
+  `abc`, overflow), `RejectsUnloadablePayload` (empty; shorter than the footer; **exactly 10
+  bytes**; footer version `RDB_VERSION + 1`; a first byte of 99 with a valid footer, all
+  `kBadPayload`), `ClassifiesCronPayloadAsDrop` (first byte 64 with footer version 9 gives
+  `kCronPayload`), `OutputIsByteExact` (binary payload with `\r\n` and NULs, key with a space;
+  result is exactly `RESTORE key ttl payload REPLACE ABSTTL`). `ClassicApplyFamilyTest` (the peer
+  applier of Task 2.2): `.MvccRestoreStampsOwnMvccWithAuthorHash` (envelope mvcc 900, command
+  `<mvcc>` 500: `StampOf(key) == {500, NodeUuidHash(author)}`),
   `.MvccRestoreFallsBackToEnvelopeMvccWhenOwnInvalid` (all-ones `<mvcc>` gives `{900, hash}`),
   `.StaleMvccRestoreLosesToNewerLocalWrite` (local stamp 700 > 500: the local value survives,
-  `multimaster_lww_dropped` +1),
-  `.NewerMvccRestoreWinsOverOlderLocalWrite` (800 over 700),
+  `multimaster_lww_dropped` +1), `.NewerMvccRestoreWinsOverOlderLocalWrite` (800 over 700),
   `.PlainApplierAppliesMvccRestoreVerbatimUnstamped`, `.NoTtlRestoreHasNoTtl` (`INVALID_EXPIRE`
-  gives `PTTL == -1`), `.AbsoluteTtlRestoredAsDeadline`, and
-  `.BadPayloadLeavesResidentKeyCountsAndAdvancesWatermark` (resident `k = good`; type-64 payload:
-  `k == good`, `keydb_mvccrestore_failed == 1`, the D-5 watermark advanced — the D-31 contract).
-  Pytest (`keydb` marker): `test_keydb_mvccrestore_from_keydb_mesh_merge_applies` — KeyDB A
-  (active) seeded with 2000 `bulk:<i>` strings, `ttl_key` (`PX 3600000`), `plain_key` (no TTL), a
-  hash, a list and `stale = "from-A"` (written first); KeyDB B (active, **empty**); an
-  `--active_replica` drakeydb D and a plain drakeydb D2 both `REPLICAOF B` and synced; then
-  `sleep 0.05` and `SET stale newer-on-D` on D; then `REPLICAOF A` on B (a merge full sync: B
-  emits one `KEYDB.MVCCRESTORE` per key to D and D2, and since B started empty every key reaching
-  D/D2 came through it). Assert on both: all keys equal A's; `PTTL ttl_key` is a real remaining
-  deadline (`3_000_000 .. 3_600_000` ms); `PTTL plain_key == -1`; on D `GET stale ==
-  "newer-on-D"` and `multimaster_lww_dropped >= 1`; on D2 `GET stale == "from-A"` (a plain
-  replica applies verbatim); `keydb_mvccrestore_failed == 0`. Record the time from `REPLICAOF A`
-  to full arrival. `test_keydb_mvccrestore_unloadable_payload_skipped_and_counted` (fake master,
-  plain link; wrap every pytest run in `flock /tmp/drakey-pytest.lock`): `SET k good`, then three
-  scripted `KEYDB.MVCCRESTORE` envelopes — a type-64 payload with footer version 9, a footer
-  version `0xFFFF`, and a four-argument one — then `SET after 1`: `k == good`, `after == 1`,
-  `keydb_mvccrestore_failed == 3`, the link stays up, offsets exact.
+  gives `PTTL == -1`), `.AbsoluteTtlRestoredAsDeadline`,
+  `.BadPayloadLeavesResidentKeyCountsAndAdvancesWatermark` (resident `k = good`; a type-99 payload:
+  `k == good`, `keydb_mvccrestore_failed == 1`, `keydb_cmds_dropped == 0`, the D-5 watermark
+  advanced — the D-31 contract) and `.CronPayloadDroppedCountedAsKeydbCmdsDropped` (a type-64
+  payload: `keydb_cmds_dropped == 1`, `keydb_mvccrestore_failed == 0`, `k == good`, watermark
+  advanced). Pytest (`keydb` marker): `test_keydb_mvccrestore_from_keydb_mesh_merge_applies` —
+  KeyDB A (active) seeded with 2000 `bulk:<i>` strings, `ttl_key` (`PX 3600000`), `plain_key` (no
+  TTL), a hash, a list and `stale = "from-A"` (written first); KeyDB B (active, **empty**); an
+  `--active_replica` drakeydb D and a plain drakeydb D2 both `REPLICAOF B` and synced; then `sleep
+  0.05` and `SET stale newer-on-D` on D; then `REPLICAOF A` on B (a merge full sync: B emits one
+  `KEYDB.MVCCRESTORE` per key to D and D2, and since B started empty every key reaching D/D2 came
+  through it). Assert on both: all keys equal A's; `PTTL ttl_key` is a real remaining deadline
+  (`3_000_000 .. 3_600_000` ms); `PTTL plain_key == -1`; on D `GET stale == "newer-on-D"` and
+  `multimaster_lww_dropped >= 1`; on D2 `GET stale == "from-A"` (a plain replica applies verbatim);
+  `keydb_mvccrestore_failed == 0`. Record the time from `REPLICAOF A` to full arrival.
+  `test_keydb_mvccrestore_unloadable_payload_skipped_and_counted` (fake master, plain link; wrap
+  every pytest run in `flock /tmp/drakey-pytest.lock`): `SET k good`, then four scripted
+  `KEYDB.MVCCRESTORE` envelopes — a type-64 payload with footer version 9, a footer version
+  `0xFFFF`, a four-argument one, and a type-99 payload with a valid footer — then `SET after 1`:
+  `k == good`, `after == 1`, `keydb_cmds_dropped == 1` (the type-64 one), `keydb_mvccrestore_failed
+  == 3` (the other three), the link stays up, offsets exact.
 - [ ] **Step 2: Run, observe failure.** gtest: no symbol. Pytest: today the command reaches the
   unknown-command path, so D and D2 stay empty and `classic_unknown_cmds_dropped` rises.
 - [ ] **Step 3: Implement.** In the applier's inner loop, before the `FindCmd == nullptr` path: on
-  `KEYDB.MVCCRESTORE` call `TranslateMvccRestore`; any non-`kOk` result bumps
-  `keydb_mvccrestore_failed`, logs with `LOG_EVERY_T(WARNING, 60)` (key and reason), counts the
-  envelope as consumed and moves on, never dispatching. Otherwise, in peer mode set `repl_mvcc =
-  own_mvcc != 0 ? own_mvcc : envelope.mvcc` and the author's `repl_origin_idx`, run the usual D-4.3
-  sequence, dispatch into a capturing builder in `ReplyMode::FULL` (not the `NONE` one) and count an
-  error reply as failed too; a plain replica keeps `repl_mvcc = 0`. Then the usual restore of the
-  context. Add `keydb_mvccrestore_failed` to `ClassicLinkStats`, `ReplicaSummary`, the plain-replica
-  INFO block, the peer line and the Prometheus mirror; `IsKeyDbOnlyCommand` stays unchanged.
+  `KEYDB.MVCCRESTORE` call `TranslateMvccRestore`; a non-`kOk` result bumps
+  `keydb_mvccrestore_failed` — or, for `kCronPayload`, `keydb_cmds_dropped` — logs with
+  `LOG_EVERY_T(WARNING, 60)` (key and reason), counts the envelope as consumed (`Advance` only) and
+  moves on, never dispatching. Otherwise it is a leaf like any dispatched command (the D-5
+  reservation): in peer mode set `repl_mvcc = own_mvcc != 0 ? own_mvcc : envelope.mvcc` and the
+  author's `repl_origin_idx`, run the usual D-4.3 sequence, dispatch through the link's `ONLY_ERR`
+  builder and count an error reply as `keydb_mvccrestore_failed` (not `classic_apply_errors`); a
+  plain replica keeps `repl_mvcc = 0`. Then the usual restore of the context. Add
+  `keydb_mvccrestore_failed` to `ClassicLinkStats`, `ReplicaSummary`, the plain-replica INFO block,
+  the peer line and the Prometheus mirror; `IsKeyDbOnlyCommand` stays unchanged.
 - [ ] **Step 4: Run; falsify**, one at a time, restore and record verbatim: (a) stamp with
   `envelope.mvcc`: `MvccRestoreStampsOwnMvccWithAuthorHash` and the pytest `stale` assertion on D
   fail (D takes "from-A"); (b) drop the `INVALID_EXPIRE` mapping: `MapsExpire`,
   `NoTtlRestoreHasNoTtl` and the pytest `plain_key` assertion fail (`PTTL` near 268435454996); (c)
-  drop the type-byte
-  pre-check: `BadPayloadLeavesResidentKey...` fails with `k` gone (D-31); (d) clear the link's
-  `repl_lww_guard`: `StaleMvccRestoreLosesToNewerLocalWrite` fails; (e) skip the hook so the command
-  falls to the unknown path: both pytest and the apply gtests fail; (f) do not bump the counter:
-  the counter assertions fail. Record what each test would still pass under without the feature:
-  the fake-master test's `k == good` and `after == 1` pass vacuously, so its
-  `keydb_mvccrestore_failed == 3` is the load-bearing assertion.
+  drop the type-byte pre-check: `BadPayloadLeavesResidentKey...` fails with `k` gone (D-31); (c2)
+  classify type 64 as a failure: `CronPayloadDroppedCountedAsKeydbCmdsDropped` fails; (d) clear the
+  link's `repl_lww_guard`: `StaleMvccRestoreLosesToNewerLocalWrite` fails; (e) skip the hook so the
+  command falls to the unknown path: both pytest and the apply gtests fail; (f) do not bump the
+  counters: the counter assertions fail. Record what each test would still pass under without the
+  feature: the fake-master test's `k == good` and `after == 1` pass vacuously, so its counter
+  assertions are the load-bearing ones.
 - [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; both gtest and pytest suites; if the
-  recorded resync time falls behind the Task 1.5 bound, open Task 1.6; pre-commit; commit
+  recorded resync time falls behind the Task 1.5 release bar, open Task 1.6; pre-commit; commit
   `feat: apply KEYDB.MVCCRESTORE with LWW on classic peer links (P7)`.
 
 **Done:** every key of a KeyDB mesh merge resync reaches D and D2 with the right TTL, a stale
 restore loses to a newer local write on the peer and not on the plain replica, a bad payload never
-erases a resident key, and every rejection is counted.
+erases a resident key, a cron payload is a counted drop, and every rejection is counted.
+
+### Task 2.7: Clock-skew estimate on classic links
+
+**Goal:** A classic link reports a clock-skew estimate although KeyDB's `REPLCONF UUID` reply is a
+bare `+<uuid>` with no clock (spec D-13, D-1.17), so INFO `clock_skew_ms` and the
+`IsClockSkewConcerning` warning work for KeyDB peers too.
+**Files:** Modify `src/server/classic_replay.{h,cc}`, `src/server/replica.{h,cc}`; Test
+`src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test.py`.
+**Interfaces:** the applier samples, for a **depth-1** envelope with `mvcc != 0`, `(mvcc >> 20) -
+now_ms` (KeyDB's mvcc is `ms << 20 | counter`, `MVCC_MS_SHIFT 20`, `server.h:960`), at most once a
+second; the link keeps the maximum of the last 60 samples (the least-aged one: each sample is a
+lower bound on the true skew) in the existing `clock_skew_ms_` atomic and warns through the
+existing `IsClockSkewConcerning` path (`LOG_EVERY_T`). A DFLY peer's handshake echo is untouched.
+- [ ] **Step 1: Failing tests.** `ClassicApplyFamilyTest.SkewSampleUsesMvccMilliseconds` (an
+  envelope whose mvcc encodes `now + 5000 ms`: the estimate is within a small tolerance of +5000,
+  and 0 before any envelope), `.SkewSampleIgnoresNestedAndZeroMvcc`, `.SkewEstimateIsMaxOfWindow`.
+  Pytest `test_keydb_clock_skew_estimate_from_envelopes`: fake master, plain link — an envelope
+  minted 60 s ahead: `clock_skew_ms` is about +60000 and the skew warning is logged
+  (`find_in_logs`); real KeyDB on the same host: after some writes `-2000 < clock_skew_ms <= 100`.
+- [ ] **Step 2: Run, observe failure** (the field stays 0). **Step 3: Implement.**
+- [ ] **Step 4: Falsify:** read `mvcc` instead of `mvcc >> 20` (a skew about a million times too
+  large: the tolerance assertion fails); sample nested envelopes (`SkewSampleIgnoresNested...`
+  fails). Restore, record.
+- [ ] **Step 5:** pre-commit; commit
+  `feat: estimate a KeyDB peer's clock skew from RREPLAY envelope stamps (P7)`.
+
+**Done:** `clock_skew_ms` is meaningful on a KeyDB link; a DFLY peer's value is unchanged.
 
 ### P7-2 gate and PR
 
 - [ ] Whole-branch review, adversarial pass (briefed only to refute the no-forward and convergence
-  claims), fix loops. Gate and PR as in P7-0.
+  claims and the dedup reservation's exactly-once claim), fix loops. Gate and PR as in P7-0.
 
 ---
 
@@ -808,10 +1055,12 @@ resync, without loss or duplication.
 `src/server/replica.{h,cc}`, `src/server/server_family.cc`/`multi_master.cc` (INFO), `metrics.cc`;
 Test `src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test.py`,
 `tests/dragonfly/replication_test.py` (regression only).
-**Interfaces:** `Replica::classic_stable_reached_` (set when the loader finishes or on
-`+CONTINUE`; **cleared where `ParseReplicationHeader` parses `+FULLRESYNC`**,
-`replica.cc:1880-1889`); a `Replica` leftover buffer filled by `InitiatePSync` and drained into
-`ConsumeRedisStream`'s `io_buf`; counters `classic_psync_partial_ok`,
+**Interfaces:** `Replica::classic_stable_reached_` (set when `InitiatePSync` **returns success** —
+the loader finished, the EOF token / `$<len>` tail validated and the bytes behind the RDB handed
+over (spec D-10) — or on `+CONTINUE`; **cleared where `ParseReplicationHeader` parses
+`+FULLRESYNC`**, `replica.cc:1880-1889`); the `Replica` stream-prefix buffer **from Task 0.6**
+(filled by `InitiatePSync`, drained into `ConsumeRedisStream`'s `io_buf`), to which this task adds
+only the `+CONTINUE` producer; counters `classic_psync_partial_ok`,
 `classic_psync_partial_fallback`.
 - [ ] **Step 1: Failing tests** against `redis_server` (7.0.15), real KeyDB and the fake master,
   each asserting master `sync_partial_ok`/`sync_full`/`sync_partial_err` (`server.cpp:6017-6019` for
@@ -830,9 +1079,9 @@ Test `src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test
 - [ ] **Step 2: Run, observe failure** (today every reconnect sends `-1`).
 - [ ] **Step 3: Implement** spec D-8: request `offs = (flag && !master_repl_id.empty() &&
   classic_stable_reached_) ? repl_offs_ + 1 : -1`; `+CONTINUE [<newid>]` consumes its line, adopts
-  `<newid>`, keeps `repl_offs_`, skips LOADING/loader/flush/merge, sets `R_SYNC_OK`; hand leftover
-  bytes into the stream consumer; verify `REPLCONF ACK 0` after a partial is harmless against both
-  masters (else send the real offset).
+  `<newid>`, keeps `repl_offs_`, skips LOADING/loader/flush/merge, sets `R_SYNC_OK`; put the bytes
+  behind the `+CONTINUE` line into the Task 0.6 stream-prefix buffer; verify `REPLCONF ACK 0` after
+  a partial is harmless against both masters (else send the real offset).
 - [ ] **Step 4: Run; falsify** each hazard separately and record: use a fresh `io_buf` (a); send
   `repl_offs_` instead of `+ 1` (b); count deferred MULTI/EXEC bytes early (c); do not clear
   `classic_stable_reached_` at the FULLRESYNC parse (g); ignore the flag (flag-off test).
@@ -871,12 +1120,19 @@ Test `src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test
 **Goal:** A KeyDB full sync that contains cron jobs loads instead of failing.
 **Files:** Modify `src/server/rdb_load.{h,cc}`, `src/server/classic_replay.{h,cc}` (counter); Test
 `src/server/rdb_test.cc`, `tests/dragonfly/keydb_onboarding_test.py`.
-- [ ] **Step 1: Failing tests.** `RdbKeyDbTest.CronTypeSkippedAndNextKeyUnstamped`: a synthetic RDB
-  (built in the test) with `AUX mvcc-tstamp`, type 64 (key, script, two 8-byte LE ms, counted
-  keys, counted args) then a normal string key with **no** aux: the load succeeds, the cron key is
-  absent, the string key is present and **not** stamped with the cron's mvcc (loaded with
-  `SetLoadOriginHash`). Pytest `test_keydb_full_sync_with_cron_and_member_ttl` (a `KEYDB.CRON` job
-  and a TTL'd set member on KeyDB: drakeydb syncs, normal keys intact).
+- [ ] **Step 1: Failing tests.** `RdbKeyDbTest` is a fixture that runs **under `--active_replica`**:
+  `SetMvcc` no-ops without it (`db.mvcc` is null), so every stamp assertion would pass vacuously on
+  a non-active node. Each test first proves stamps are observable: a control key loaded with its
+  own `mvcc-tstamp` aux reads back that stamp through `StampOf`.
+  `RdbKeyDbTest.CronTypeSkippedAndNextKeyUnstamped`: a synthetic RDB (built in the test) with `AUX
+  mvcc-tstamp`, type 64 (key, script, two 8-byte LE ms, counted keys, counted args) then a normal
+  string key with **no** aux: the load succeeds, the cron key is absent, the string key is present
+  and **not** stamped with the cron's mvcc (loaded with a **nonzero** `SetLoadOriginHash`: the aux
+  branch ignores the stamp when `load_origin_hash_ == 0`, `rdb_load.cc:3196`, which would pass
+  vacuously). Pytest `test_keydb_full_sync_with_cron_and_member_ttl` (a `KEYDB.CRON` job and a TTL'd
+  set member on KeyDB: drakeydb syncs, normal keys intact; and — where the process-wide counters
+  render on a **non-active** node — `multimaster_keydb_rdb_cron_skipped:1` in the plain replica's
+  `INFO replication` and `multimaster_keydb_rdb_cron_skipped_total` in `/metrics`, per spec D-13).
 - [ ] **Step 2: Run, observe failure:** `Unrecognized rdb object type: 64` (`rdb_load.cc:2704`).
 - [ ] **Step 3: Implement** before the `rdbIsObjectTypeDF` check (`:2703`): skip the body, count
   `multimaster_keydb_rdb_cron_skipped`, rate-limited rollup warning, `settings.Reset()`, `continue`.
@@ -887,27 +1143,41 @@ Test `src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test
 ### Task 4.2: Member-TTL aux, aux noise, bit-63 throttle
 
 **Files:** Modify `src/server/rdb_load.cc` (`HandleAux`, `:3054-3219`),
-`src/server/classic_replay.{h,cc}`; Test `src/server/rdb_test.cc`.
+`src/server/classic_replay.{h,cc}`, `src/server/server_family.cc`, `src/server/metrics.cc` (the
+loader counters, rendered by spec D-13's rule); Test `src/server/rdb_test.cc` (`RdbKeyDbTest`,
+**under `--active_replica`**, each test starting with a control key that proves stamps are
+observable), `tests/dragonfly/keydb_onboarding_test.py`.
 - [ ] **Step 1: Failing tests.** `RdbKeyDbTest.SubexpireAuxSkippedSilentlyAndCounted` (pairs
   `keydb-subexpire-key`/`-when` after a key: no per-aux warning, counter moves once per `-when`,
   `settings` untouched, one rollup); `.UnknownAuxWarnedOncePerNamePerLoader`;
   `.ReplMastersAuxRecognized`; `.MvccInvalidThrottledAndCounted` (1000 keys with the all-ones
-  sentinel: counter 1000, log lines bounded).
+  sentinel: counter 1000, log lines bounded). Pytest: `test_keydb_full_sync_with_cron_and_member_ttl`
+  also asserts `multimaster_keydb_rdb_subexpire_dropped` in INFO and `/metrics` on the plain
+  replica (loader counters can be nonzero when onboarding from a **non-active** KeyDB).
 - [ ] **Step 2-3:** run, implement (counters `multimaster_keydb_rdb_subexpire_dropped`,
-  `multimaster_keydb_rdb_mvcc_invalid`; the bit-63 warning moves behind `LOG_EVERY_T`).
+  `multimaster_keydb_rdb_mvcc_invalid`; the bit-63 warning moves behind `LOG_EVERY_T`; render all
+  three loader counters per spec D-13: active-node block, plain-replica block, both Prometheus
+  branches).
 - [ ] **Step 4: Falsify:** unthrottled warning (log-count assertion fails); count at `-key` instead
-  of `-when` (the count assertion fails). Restore, record.
+  of `-when` (the count assertion fails); skip the plain-replica INFO render (the pytest fails).
+  Restore, record.
 - [ ] **Step 5:** pre-commit; commit `feat: quiet and count KeyDB-only RDB aux fields (P7)`.
 
 ### Task 4.3: D-8 precedence test
 
 **Goal:** Pin that opcode 221 beats a KeyDB `mvcc-tstamp` aux for the same key (ISSUE-REGISTER D-8).
-**Files:** Test `src/server/rdb_test.cc`.
-- [ ] **Step 1:** `RdbKeyDbTest.Opcode221BeatsMvccTstampAuxForSameKey`: aux `mvcc-tstamp` = A, then
-  opcode 221 = B, then the key: the stored stamp is B; and the reverse stream order proves
-  last-in-stream-wins.
+**Files:** Test `src/server/rdb_test.cc` (the `RdbKeyDbTest` fixture, **under `--active_replica`**).
+- [ ] **Step 1:** `RdbKeyDbTest.Opcode221BeatsMvccTstampAuxForSameKey`, run under
+  `--active_replica` with a nonzero `SetLoadOriginHash` (without them the stamp comes from opcode
+  221 alone and the test would pass vacuously): aux `mvcc-tstamp` = A, then opcode 221 = B, then
+  the key: the stored stamp is B; and the reverse stream order (221 = B, then aux = A) proves
+  last-in-stream-wins: the stored stamp is A.
 - [ ] **Step 2-3:** pass as-is (behaviour exists; the test is the deliverable).
-- [ ] **Step 4: Falsify** by letting the aux branch overwrite an already-set stamp: the test fails.
+- [ ] **Step 4: Falsify** by flipping the **precedence**: make the aux branch first-wins (set the
+  stamp only when none is set — `rdb_load.cc:3206` overwrites unconditionally today, so "letting
+  the aux branch overwrite" would change nothing and pass vacuously) or make opcode 221 not
+  overwrite an already-set stamp: the first order stores A and the second B, so the test fails.
+  Restore.
 - [ ] **Step 5:** pre-commit; commit `test: pin that opcode 221 wins over a KeyDB mvcc aux (P7)`.
 
 ### Task 4.4: Operator docs and registers
@@ -915,18 +1185,28 @@ Test `src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test
 **Files:** `docs/multi-master.md`, `docs/differences.md`, `docs/UPSTREAM-SYNC.md`,
 `docs/ISSUE-REGISTER.md`, `docs/PLAN.md`.
 - [ ] `docs/multi-master.md`: new "Onboarding from KeyDB" section — topology (every drakeydb node
-  attaches to KeyDB directly; no-forward kept), the recommended KeyDB `multi-master-no-forward yes`
-  and its **full-mesh requirement**, `repl-backlog-size` sizing for partial resync, cutover with
-  `REPLICAOF REMOVE`, expiry semantics (decision 13, `--replica_delete_expired` note), member-TTL
-  and cron loss, `KEYDB.MVCCRESTORE` applied (and `keydb_mvccrestore_failed`), counters; rewrite
-  `:87-122` (classic peers now carry
-  real stamps when KeyDB is active) and confirm `:311-381` matches Task 2.4.
+  attaches to KeyDB directly; no-forward kept); the KeyDB directive `multi-master-no-forward yes`
+  **only when every drakeydb node is `--active_replica --multi_master` and attached to every KeyDB
+  master** (a plain replica attaches to one master only; KeyDB itself warns that the directive
+  needs a mesh or data is lost, `config.cpp:2705-2710`, and skips the forward at
+  `replication.cpp:5507`; with a single KeyDB master there is nothing to forward), otherwise
+  forwarding stays on and the dedup absorbs the duplicates; `repl-backlog-size` sizing for partial
+  resync, cutover with `REPLICAOF REMOVE`, expiry semantics (decision 13, `--replica_delete_expired`
+  note; replica active expiry is for the main `replica_` link only), member-TTL and cron loss,
+  `KEYDB.MVCCRESTORE` applied (and `keydb_mvccrestore_failed`), the counters and where they render;
+  the unsupported or by-design combinations — the dedup is reset by a flushing full sync (so a
+  cluster `ADDREPLICAOF` of a forwarding mesh is unsupported) and not by an operator `FLUSHALL`
+  (KeyDB parity), mvcc-0 envelopes are not deduped (v6.3.4 never sends one), a KeyDB restart is a
+  new author and costs one registry index (`--classic_author_cap`, `classic_link_uuid_changes`,
+  `multimaster_peer_registry_size`); rewrite `:87-122` (classic peers now carry real stamps when
+  KeyDB is active) and confirm `:311-381` matches Task 2.4.
 - [ ] `docs/differences.md` entry; `docs/UPSTREAM-SYNC.md` watchlist rows for the newly touched
   files (`replica.{h,cc}`, `engine_shard.{h,cc}`, `db_slice.cc`, `rdb_load.cc`, `metrics.cc`) and
   the "(once it exists)" fix if still present.
-- [ ] `docs/ISSUE-REGISTER.md`: close D-8 (Task 4.3); confirm U-9/D-1 are closed; add the
-  member-TTL-conversion follow-up and the `TAKEN_OVER` item if Task 0.5 did not; update D-5's
-  byte-identity list to the spec's exceptions.
+- [ ] `docs/ISSUE-REGISTER.md`: close D-8 (Task 4.3); confirm U-9/D-1 are closed; confirm the
+  orchestrator registered the full-sync-tail U-item (Task 0.6) and the `MarkForClose` null-`conn()`
+  finding (Task 1.2); add the member-TTL-conversion follow-up; update D-5's byte-identity list to
+  the spec's exceptions.
 - [ ] Commit `docs: document KeyDB onboarding, its limits, and the byte-identity exceptions (P7)`.
 
 **Falsification:** docs-only; every command and flag quoted is run once and the output recorded.
@@ -937,10 +1217,13 @@ Test `src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test
 - [ ] `ninja -C /home/user/drakeydb/build-dbg -j4` warning-free; full
   `cd /home/user/drakeydb/build-dbg && ctest -V -L DFLY`.
 - [ ] Pytest with `KEYDB_REQUIRED=1`: `multimaster_test.py`, `multimaster_merge_test.py`,
-  `keydb_onboarding_test.py` (incl. `slow`), `replication_test.py`, `replication_specific_test.py`,
-  `replication_resilience_test.py`, `replication_config_test.py`,
-  `cluster_test.py::test_cluster_migrations_sequence`; 0 failures; flake triage recorded; the
-  timing-sensitive KeyDB tests x10.
+  `keydb_onboarding_test.py` (incl. `slow`), `keydb_harness_test.py`, `redis_replication_test.py`,
+  `replication_test.py`, `replication_specific_test.py`, `replication_resilience_test.py`,
+  `replication_config_test.py`, `cluster_test.py::test_cluster_migrations_sequence`; 0 failures;
+  flake triage recorded; the timing-sensitive KeyDB tests x10.
+- [ ] The D-12 **release-build** measurement is re-run on the final tree (`DRAKEYDB_PERF=1`, plain
+  and peer mode, x3 median, with the KeyDB-replica comparator); the numbers go into the ledger and
+  `docs/PLAN.md`.
 - [ ] The P3 golden-buffer journal test passes with `--active_replica` off; an `--active_replica`
   off save emits neither opcode 221 nor 225; no `kDrakeydbReplVersion` change.
 - [ ] Every falsification recorded verbatim in the ledger; `pre-commit run --all-files` clean across
