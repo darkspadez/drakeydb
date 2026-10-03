@@ -708,7 +708,7 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
   accepted here while a peer that saw the `DEL` against a still-live value holds a newer
   tombstone — a divergence a subsequent full sync from that peer repairs while its tombstone is
   still live, but not otherwise, and only if no later unguarded delta lands on the key first (see
-  D-23). Owned by P4-5 (tombstone lifecycle).
+  D-23). Owned by the tombstone-lifecycle phase (scheduled after P7).
 - **D-21** — a non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/
   `ZDIFFSTORE`/`ZRANGESTORE`, or `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST` result always
   journals `DEL` (guarded) then `SADD`/`ZADD` (delta, unguarded) as two entries; a guarded receiver
@@ -754,8 +754,8 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
   `EXPIRE` never fires. Mitigation: run `EXPIRE k ttl NX` after every `INCR`, not only when `INCR`
   returns 1 -- `NX` fires exactly when there is currently no TTL, self-healing the silently
   re-created key, and stays a cheap no-op the rest of the time -- on an active node a firing
-  `EXPIRE` ships the key's full state and re-converges every peer. Owned by P4-5 (tombstone
-  lifecycle).
+  `EXPIRE` ships the key's full state and re-converges every peer. Owned by the tombstone-lifecycle
+  phase (scheduled after P7).
 - **D-28** — `HEXPIRE`/`FIELDEXPIRE`/`SADDEX`/`HSETEX` auto-journal the client's own RELATIVE
   member-TTL seconds argument verbatim; each receiver computes that member's deadline from ITS OWN
   arrival time, drifting later with replication lag, compounding across a replica chain. Same root

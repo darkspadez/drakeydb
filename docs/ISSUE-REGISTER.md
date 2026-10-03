@@ -201,6 +201,10 @@ against a live replica.
 
 **Status:** not filed.
 
+**Status (2026-10-03):** disputed — live re-test scheduled in P7-0 Task 0.1; see the Phase 7
+ledger (`docs/superpowers/ledgers/2026-10-03-phase7-keydb-onboarding/advisor-design.md`,
+"Verification notes from the advisor").
+
 ### U-9. `EvalInternal`'s connection migration can null-deref on a classic replicated-apply link
 
 **Where:** `src/server/main_service.cc`, `Service::EvalInternal` — the single-shard `EVAL`
@@ -409,8 +413,8 @@ token on each arm, so `Disarm` can only cancel its own), not a narrower scope.
 whole-branch review; not reproduced. `RdbMvccTest.MergeLwwTombstoneInstallForAbsentKeyDoesNot
 StealConcurrentArm` pins the half that IS closed.
 
-**Owner:** unassigned; needs per-arm ownership in `MvccStamper`. **From:** P4-3 Tasks 6/13, final
-review.
+**Owner:** tombstone-lifecycle phase (scheduled after P7); needs per-arm ownership in
+`MvccStamper`. **From:** P4-3 Tasks 6/13, final review.
 
 ### D-15. Tombstone merge is only ever tested with two peers
 
@@ -498,8 +502,9 @@ three-peer scenario is unmeasured (see D-15). The live-reap and member-expiry-re
 identical exposure was identified when those paths were changed to derive their stamp from the
 value's own too.
 
-**Status:** open. **Owner:** unassigned (tombstone lifecycle). **From:** the merge-load synthetic
-tombstone's own introduction; widened when the local-reap paths adopted the same rule.
+**Status:** open. **Owner:** tombstone-lifecycle phase (scheduled after P7). **From:** the
+merge-load synthetic tombstone's own introduction; widened when the local-reap paths adopted the
+same rule.
 
 ### D-18. Runtime-revived recipes and name-level full-value writes are unguarded
 
@@ -666,7 +671,7 @@ silently discarded by a mid-command lazy expiry this way), but that change is wh
 resulting gap between the discarded `X` and the installed tombstone precisely `X -
 ExpiryTombstoneFor(S)` rather than something already partly closed by a reap-time mint.
 
-**Owner:** P4-5 (tombstone lifecycle). **From:** P4-4.
+**Owner:** tombstone-lifecycle phase (scheduled after P7). **From:** P4-4.
 
 ### D-21. `*STORE`'s `DEL` + add split can merge a stale result into a newer destination
 
@@ -986,13 +991,13 @@ expiry's per-node independence, and `FloorAppliedStamp`'s own scope (it governs 
 COMMITTED stamp when a live value is present to floor against — it has nothing to floor against
 here, since the key is absent at apply time); not reproduced with a live three-step repro.
 
-**Owner:** PR-B (tombstone lifecycle). An expiry tombstone that records the EXPIRED VALUE'S OWN
-deadline `D` (not merely its stamp) would let a receiver applying a delta authored strictly before
-`D` drop it outright instead of re-creating the key: the key would have expired at `D` on every
-node anyway, author included, so a delta timestamped before `D` describes a value that no longer
-exists anywhere once `D` passes.
+**Owner:** tombstone-lifecycle phase (scheduled after P7). An expiry tombstone that records the
+EXPIRED VALUE'S OWN deadline `D` (not merely its stamp) would let a receiver applying a delta
+authored strictly before `D` drop it outright instead of re-creating the key: the key would have
+expired at `D` on every node anyway, author included, so a delta timestamped before `D` describes
+a value that no longer exists anywhere once `D` passes.
 
-This is not new with PR-A (P4-4): deltas have always applied in plain arrival order against each
+This is not new with P4-4: deltas have always applied in plain arrival order against each
 node's own, independently-timed expiry: the streaming guard on
 `SET`/`SETNX`/`GETSET`/`GETDEL`/`RESTORE`/`MSET`/`DEL` is what is new here, not the underlying
 gap this describes. **From:** P4-4 (documented alongside the guard; the gap itself predates it).
@@ -1075,7 +1080,7 @@ with a live two-node repro (an unstamped key reaching this path at all requires 
 never-stamped local write or a D-7-style unauthoritative merge load, followed by that same key's
 own natural expiry).
 
-**Owner:** open (tombstone lifecycle, PR-B candidate). Fix path if wanted: distinguish "no arm
+**Owner:** tombstone-lifecycle phase (scheduled after P7). Fix path if wanted: distinguish "no arm
 found" from "arm found but carries no real stamp" more finely, or accept the resurrection risk as
 inherent to a genuinely unstamped key (which, by definition, this fork never had real authority
 over to begin with). **From:** P4-4 (found while auditing `RecordExpiryBlocking`'s own text against

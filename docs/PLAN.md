@@ -3,7 +3,7 @@
 > **Continue here.** This is the approved, living plan and canonical copy for the drakeydb fork.
 > Update the status block below as phases land.
 
-## Current status (last updated 2026-08-30)
+## Current status (last updated 2026-10-03)
 
 | Phase | Status | Where |
 |---|---|---|
@@ -11,8 +11,13 @@
 | **P1 — Identity foundations** | ✅ **complete, verified** | branch `feat/phase1-identity`, commits `9e653ab3..9c491fac` |
 | **P2 — Writable multi-source replica** | ✅ **complete, verified** | PR [#3](https://github.com/darkspadez/drakeydb/pull/3) **merged** as `cd8e0602` — see [Phase 2](#phase-2) |
 | **P3 — Origin-tagged journal + active pair/mesh** | ✅ **complete, verified** | PR [#4](https://github.com/darkspadez/drakeydb/pull/4), branch `feat/phase3-origin-journal`, 30 commits `6b0c995a..7bddd7fe` — see [Phase 3](#phase-3) |
-| **P4 — MVCC store + stamping + wire** | 🚧 **in progress; P4-0 through P4-3 delivered** | see [Phase 4](#phase-4--mvcc-store--stamping--wire) |
-| P5–P9 | not started | — |
+| **P4 — MVCC store + stamping + wire** | ✅ **complete** — P4-0 [#5](https://github.com/darkspadez/drakeydb/pull/5), P4-1 [#6](https://github.com/darkspadez/drakeydb/pull/6), P4-2 [#7](https://github.com/darkspadez/drakeydb/pull/7), P4-3 [#8](https://github.com/darkspadez/drakeydb/pull/8), P4-4 [#9](https://github.com/darkspadez/drakeydb/pull/9) all merged (last: `c60dfdb`, 2026-09-24) | see [Phase 4](#phase-4--mvcc-store--stamping--wire); P4-4's own exit gate was partial, so the full Phase-4 gate is re-run as P7-0 Task 0.2's baseline |
+| P5 — Streaming LWW guard | ✅ **superseded by P4-4** | see [Phase 5](#phase-5) |
+| P6 — Merge-on-full-sync LWW | ✅ **delivered by P4-3** (PR #8) | see [Phase 6](#phase-6) |
+| **P7 — KeyDB one-way onboarding** | 🚧 **in progress** | see [Phase 7](#phase-7) and `docs/superpowers/specs/2026-10-03-phase7-keydb-onboarding-design.md` |
+| P8–P9 | not started | — |
+
+The design spec's planned P4-5 (tombstones) shipped inside P4-3, so there is no separate P4-5.
 
 **P0 verification record** (Ubuntu 24.04 arm64 container, OrbStack): debug build produces
 `build-dbg/drakeydb` + `dragonfly` compat symlink; `--version` → `drakeydb dev-…`; live server
@@ -229,7 +234,8 @@ Governing choices:
    refuse replication consumers that didn't negotiate the fork protocol, so stock readers never
    see v2.
 4. **Fork protocol version** (`kDrakeydbReplVersion`, `node_identity.h`; originally 65, bumped to
-   66 by P4-2 for RDB opcode 221; **67 as of P4-3**, for opcode 225 — see `docs/multi-master.md`), sent
+   66 by P4-2 for RDB opcode 221; 67 by P4-3 for opcode 225; **68 as of P4-4**, so a peer from
+   before the streaming guard is refused at handshake — see `docs/multi-master.md`), sent
    via existing `REPLCONF DRAKEY-VERSION` — far above upstream's VER6 so future upstream bumps
    never collide. Non-active nodes interop with stock Dragonfly unchanged.
 5. **Persistent node UUID** in `<dir>/drakeydb.uuid` (fixes KeyDB's per-boot regeneration),
@@ -258,12 +264,12 @@ Governing choices:
 | Path | Contents |
 |---|---|
 | `src/server/node_identity.h/.cc` | UUID create/load/persist, `--node_uuid` override, `kDrakeydbReplVersion = 68` (P4-4) |
-| `src/server/multi_master.h/.cc` | `PeerRegistry` (uuid ↔ origin_idx, 0 = self, P1). **P2 (done):** `active_replica`/`multi_master` flags, `IsActiveReplica()`/`IsMultiMaster()`, `ValidateMultiMasterFlags()`, `ParsePeerReplicaOfArgs()`, `RenderPeerReplicationInfo()`. `MvccClock` (P4, not yet built) |
+| `src/server/multi_master.h/.cc` | `PeerRegistry` (uuid ↔ origin_idx, 0 = self, P1). **P2 (done):** `active_replica`/`multi_master` flags, `IsActiveReplica()`/`IsMultiMaster()`, `ValidateMultiMasterFlags()`, `ParsePeerReplicaOfArgs()`, `RenderPeerReplicationInfo()`. `MvccClock` was built in P4-1, in the fork-only `mvcc.{h,cc}` rather than here |
 | `src/server/peer_replication.h/.cc` (new, P2) | `SyncGate` (FIFO ticket queue, cancellable, deferred while the process is LOADING for another reason, notifies under its mutex), `PeerReplicationManager` (peer links keyed by stored endpoint; add/remove/no-one; replace-vs-append by `--multi_master`) |
 | `src/server/multi_master_test.cc` | C++ units (registry; **P2:** flag validation, arg parser, INFO renderer, `ActiveReplicaFamilyTest`) |
 | `src/server/peer_replication_test.cc` (new, P2) | `SyncGateTest`, `PeerManagerFamilyTest` |
 | `tests/dragonfly/multimaster_test.py`, `tests/dragonfly/keydb_onboarding_test.py` | pytest suites (**P2:** fan-in suite added to `multimaster_test.py`) |
-| `docs/multi-master.md` | user-facing docs (written in P9) |
+| `docs/multi-master.md` | user-facing docs (written in P4-3) |
 
 ### New flags (declared in `multi_master.cc`)
 
@@ -281,13 +287,13 @@ tiering, and `--experimental_cascaded_partial_sync`.
 | `journal/serializer.cc` (~57-85, 205-235) | COMMAND case: header `2` + ext fields in active mode, else byte-identical `1`; reader accepts both |
 | `journal/journal_slice.cc` (~107-134) | thread origin into `JournalItem`/`JournalChangeItem` |
 | `journal/streamer.h/.cc` | `Config` += `{peer_mode}` (**as built** — a `peer_uuid` field was added then removed in the P3 fix wave: it was never read, since the filter keys on `origin_idx`, not on the peer's uuid); live + partial-replay paths drop non-self-origin, expiry-flagged, and derived-delete entries for peer consumers, via the shared `journal::PassesPeerEchoFilter` |
-| `journal/executor.h/.cc` (~36-74) | set/clear apply-context around `Execute`; P5 streaming-LWW pre-check for classified commands |
+| `journal/executor.h/.cc` (~36-74) | set/clear apply-context around `Execute`. As built (P4-4): `SetApplyLwwGuard` plus the pre-dispatch `ApplyLwwRewrites` only — the LWW compare itself runs inside the transaction (`Transaction::ShouldDropForLww`, `OpMSet`, `OpDelV2`), superseding the planned P5 executor pre-check |
 | `transaction.cc` (~1622-1663) | `LogJournalOnShard` reads origin/mvcc from context (default self + clock tick) |
 | `tx_base.cc` (~55-70) | manual `RecordJournal` helpers read origin context; expiry `DEL` sets entry-flag bit0; collection-derived `DEL` sets bit1 |
 | `conn_context.h` (~352) | += `repl_origin_id` (u32), `repl_mvcc` (u64) |
 | `replica.h/.cc` | P1 (done): greeting adds `REPLCONF UUID`. **P2 (done):** `ReplicaPeerMode{SyncGate*, PeerRegistry*, PeerIdentityClaims*}` trailing ctor param, `IsPeerMode()`; guards the `SetShardStates` flip (both directions in `MainReplicationFb`), a `SyncGate::Lease` around full sync, and the flush skip in `InitiateDflySync`/`InitiatePSync` (the latter also adds `SetOverrideExistingKeys(true)`; the DF path already had it set), plus self/duplicate UUID refusal, live claim release, and `PeerRegistry::AddOrGet`. P7 (future): `capa activeExpire` on the redis path, `ConsumeRedisStream` RREPLAY unwrap |
 | `dflycmd.cc` | **P2 (done):** `DflyCmd::TakeOver` refuses on an active node. (Future) `ReplicaInfo` stores peer uuid; refuse version <65 / missing UUID while active |
-| `debugcmd.cc` | (Future) additive `DEBUG MVCC <key>` debug subcommand |
+| `debugcmd.cc` | **P4-1 (done):** additive `DEBUG MVCC [<key> \| VERIFY]` debug subcommand |
 | `server_family.cc` | P1 (done): additive `REPLCONF UUID` case. **P2 (done):** `peers_` member; `ReplicaOfInternal` delegates to `ReplicaOfActive` (`PeerReplicationManager`) when active (replace-vs-append by `--multi_master`, `REPLICAOF REMOVE <h> <p>`, NO ONE clears all); `ReplConf` refuses all replication consumers on an active node (single choke point; P3 replaces it with peer admission); `REPLTAKEOVER` refused; INFO block appended after `master_replid`; `Shutdown`/`PauseReplication` route through `peers_`; `--replicaof` now parses a comma-separated peer list (`ParseOneReplicaOf`) and, in active mode, `Init` loads the node's own snapshot before attaching peers |
 | `dfly_main.cc` | banner/usage strings, `version_check` default. **P2 (done):** `ValidateReplicaOfFlags()` and `ValidateMultiMasterFlags()` added to the boot-time validator conjunction, before the proactor pool starts |
 | `main_service.h/.cc` | **P2 (done):** exclusive LOADING reservation for peer full sync, preventing overlap with loaders outside the peer sync gate |
@@ -314,9 +320,9 @@ origin_idx↔uuid dictionary to full-stream (non-peer) sub-replicas.
   same-key RMW across nodes can diverge (identical KeyDB limitation; CRDTs are out of scope).
   LWW guard covers the state-carrying command set. Recommend per-node key ownership for RMW-heavy
   workloads.
-- **Delete resurrection**: no tombstones — a deleted key has no stored mvcc, so an older incoming
-  value can resurrect during merge-sync (KeyDB's fix for this is verified dead code; tombstone
-  side-table is v2 work).
+- **Delete resurrection**: tombstones were delivered by P4-3 (bounded, default namespace only; see
+  Phase 4 and `docs/multi-master.md`). Residual exposure: classic-protocol peers (D-12),
+  `FLUSHALL`/`FLUSHDB`, and the tombstone-lifecycle register items (D-14, D-16, D-20, D-27, D-29).
 - **NTP is a hard requirement** for LWW quality; handshake clock-echo produces a skew warning +
   `clock_skew_ms` metric.
 - **Initial peer full sync keeps Dragonfly LOADING semantics** (commands blocked during the
@@ -745,7 +751,96 @@ operator-facing writeup: [`docs/multi-master.md`](multi-master.md). Summary:
   recorded verbatim in `task-1..13-report.md` and
   `task-8-fix-report.md` (same ledger directory).
 
-## Phase 5 — Streaming LWW guard
+**P4-4 delivered** (PR [#9](https://github.com/darkspadez/drakeydb/pull/9), branch
+`feat/phase4-4-stream-lww`, squash-merged as `c60dfdb` on 2026-09-24): the streaming LWW guard, so
+writes streamed between active peers no longer apply in plain arrival order. Full operator-facing
+writeup: the "Streaming LWW" section of [`docs/multi-master.md`](multi-master.md). Summary:
+
+- **Guard** (`multimaster_lww.{h,cc}`, new): decided once per link — peer mode on an active node
+  with `--multi_master_stream_lww` (default true) — and carried as `repl_lww_guard` through
+  `ConnectionContext`/`DbContext`/`Transaction`. An entry is compared only if it also carries a
+  non-zero mvcc (`LwwGuardActive`), so a DFLY link to a non-active peer fails open, and a classic
+  Redis/KeyDB link is never guarded (`ConsumeRedisStream` bypasses `JournalExecutor`; P7 revisits
+  this). `Transaction::ShouldDropForLww` runs under the key's own shard-thread lock and drops a
+  stale write: its callback never runs and its auto-journal is suppressed, so nothing re-forwards.
+  The compare is `MergeAccepts`'s own, so ties favor the stored side. `RunSquashedMultiCb` never
+  consults the veto and carries a fail-open `LOG(DFATAL)` tripwire instead.
+- **Classifier**: `ClassifyJournaledCommand`, a sorted constexpr table keyed on the JOURNALED name
+  — `SET`, `SETNX`, `GETSET`, `GETDEL`, `RESTORE` (single-key veto) and `MSET`, `DEL` (self-guarded)
+  — everything else is `kUnguarded`, including delta RMW (`INCR`/`APPEND`/`HSET`/…), since dropping
+  a delta loses it instead of reordering it. A registry-closure test and an emitted-name pin turn a
+  future drift in that vocabulary into a named failure.
+- **Per-key split**: `OpMSet` and `OpDelV2` compare each key against its own stored stamp and
+  apply/journal only the non-stale ones, in one transaction and one journal entry; an entirely
+  stale `MSET`/`DEL` writes and journals nothing.
+- **Receiver-side rewrites** (`ApplyLwwRewrites`, called from `JournalExecutor::Execute`, gated on
+  exactly `LwwGuardActive`): `SETNX`→`SET`, `GETSET`→`SET`, `GETDEL`→`DEL`, `RESTORE`→
+  `RESTORE … REPLACE`, so a recipe is never re-evaluated against the receiver's own value. The peer
+  full-sync journal-blob applier (`RdbLoaderBase::apply_lww_guard_`) now carries the same per-link
+  bit as the stable-sync executor.
+- **Stamp floors**: an applied write whose incoming stamp is older than the key's stored stamp S
+  commits one `origin_hash` tick below S (`FloorAppliedStamp`) instead of rewinding S; a LOCAL mint
+  is raised above the key's own stored stamp (`LocalMintFloor`, spec D3, capped at `kStampMask`).
+- **Expiry tombstones** (lazy and active expiry, the member-TTL reaper, derived deletes, `SPOP`, and
+  the merge-load synthetic tombstone): one `origin_hash` tick above the *expired value's own* stamp
+  (`ExpiryTombstoneFor`) instead of a reap-time mint, so a peer write made before or after the TTL
+  deadline is no longer dropped against this node's reap time. A value that never carried a stamp
+  erases with no tombstone (D-29). A guarded write whose absolute TTL has already elapsed on
+  arrival installs the same tombstone (`DbSlice::InstallAbsentKeyTombstone`).
+- **TTL-changing commands ship full key state on active nodes**: the `EXPIRE` family, `PERSIST`,
+  `GETEX`/`GAT`, `SET … KEEPTTL`, `PFMERGE`/`BITOP` into a TTL-carrying destination, and a client
+  `RESTORE` (now with an absolute TTL) journal `SET key value [PXAT abs] [STICK] [_MCFLAGS n]` for a
+  string or `RESTORE key <abs|0> dump REPLACE ABSTTL [STICK]` otherwise — never a bare
+  `PEXPIREAT`/`PERSIST`/`KEEPTTL` delta, which paired the author's stamp with the receiver's own
+  value. `PEXPIREAT` and `PERSIST` therefore left the guarded table. Non-active nodes stay
+  byte-identical to upstream at each of these sites.
+- **Other active-only fixes found along the way**: `DELEX` journals its result (`DEL`) instead of
+  its own name; `PFMERGE` writes only on the destination's shard (upstream writes a phantom copy on
+  every participating shard, D-25); a skipped `EXPIRE … NX/XX/GT/LT` no longer arms the key (the
+  arm leaked one `mvcc_unstamped_writes` per skipped call). One ungated fix: `SET`'s memcache-flags
+  journal pushed a dangling `string_view` (pre-existing on `main`; wire bytes unchanged).
+- **Observability**: `multimaster_lww_dropped` in `INFO replication` and
+  `dragonfly_multimaster_lww_dropped_total` in Prometheus, both on active nodes only. A bare
+  `INFO replication` used to skip the metrics pass, so its metrics-backed fields
+  (`mvcc_clock_ahead_ms`, `mvcc_unstamped_writes`, `mvcc_stale_epoch`) always read 0; the pass is
+  now gated on `IsActiveReplica()`, so a non-active node keeps upstream's fast path. The boot
+  limitations warning was rewritten to match.
+- **Wire and build**: `kDrakeydbReplVersion` 67 → 68 (and its pinned test), so a pre-P4-4 peer is
+  refused at handshake; no new RDB opcode. `detail/egress_throttle.cc` moved from `dragonfly_lib`
+  to `dfly_transaction` in `src/server/CMakeLists.txt` (a static-link ordering bug the new module
+  exposed in `mvcc_test`).
+- **Registered, not fixed** (`docs/ISSUE-REGISTER.md`): D-18 through D-31 (there is no D-17) and
+  U-9; D-4 marked resolved. The tombstone-lifecycle items among them (D-14, D-16,
+  D-20, D-27, D-29) are owned by a dedicated phase scheduled after P7, not by a "P4-5" or "PR-B"
+  as the register used to say. D-27 is the one with operator impact: a delta authored before a
+  key's TTL deadline but applied after it re-creates the key with no TTL, which breaks
+  `INCR; EXPIRE if ==1` rate limiters (mitigation: `EXPIRE k ttl NX` after every `INCR`).
+- **Tests**: C++ in `multi_master_test.cc`, `mvcc_test.cc` and `peer_replication_test.cc` (the
+  commit messages record falsification runs for most; the memcache-flags dangling-view pin could
+  not be falsified without a sanitizer); pytest `multimaster_test.py` `test_stream_lww_*`
+  (socket-level, `proxy.pause()`/`resume()` for deterministic arrival order) plus
+  `test_three_node_mesh_reconverges_after_kill_and_restart`, upgraded from mutual convergence to
+  newest-stamp-wins. One intended case could not be built: the `peer_mode` gate on a plain replica
+  of an active node — every `--active_replica` node issues `REPLICAOF` through peer mode, so there
+  is no non-peer link to test against.
+
+**P4-4's own exit gate on record was partial.** Its commit messages record only targeted runs:
+`peer_replication_test` and `rdb_test` green at the A10 stage; `multi_master_test` full suite
+182/183 passed (1 pre-existing unrelated skip) after the A12 review rounds; `multimaster_test.py`
+58, `multimaster_merge_test.py` 4 and `replication_test.py` 43 passed (21 deselected) at the A13
+stage; and the last run statement (TTL full-state journaling,
+fix round 1) lists `multi_master_test`, `generic_family_test`, `string_family_test`,
+`hll_family_test`, `bitops_family_test`, `mvcc_test` and the `multimaster_test.py` suite as green
+with no counts. The commits after it (PFMERGE, the final fix waves, the `EXPIRE` pre-check fixes)
+record no gate run, and no full `ctest -L DFLY` or `replication_specific_test.py` /
+`replication_resilience_test.py` / `cluster_test.py` sweep on the final head is recorded. The full
+Phase-4 exit gate is therefore re-run as P7-0 Task 0.2's baseline.
+
+Baseline gate results: see Task 0.2 (pending)
+
+<a id="phase-5"></a>
+
+## Phase 5 — Streaming LWW guard (superseded by P4-4)
 Command classifier + pre-exec compare/drop in `JournalExecutor`; `multimaster_lww_dropped`
 metric; `--multi_master_stream_lww` off = KeyDB-parity arrival order.
 **Verify:** pytest — concurrent conflicting SETs on A and B converge to the higher-mvcc value on
@@ -755,11 +850,15 @@ Superseded by P4-4 (see `docs/multi-master.md`): the compare this stub sketches 
 pre-exec, in `JournalExecutor`, instead runs inside the transaction, under each write's own key
 lock — left as-is above rather than rewritten, since this section predates that decision.
 
-## Phase 6 — Merge-on-full-sync LWW (implemented by P4-3, above; branch pending merge)
+<a id="phase-6"></a>
+
+## Phase 6 — Merge-on-full-sync LWW (implemented by P4-3, above; merged as PR #8)
 `mvcc-tstamp` per-key aux save/load; LWW hook at `rdb_load.cc:3238`.
 **Verify:** `rdb_test.cc` aux round-trip; pytest — node with newer local writes full-syncs from a
 peer holding older values → newer survive ("Active Replica Merges Database On Sync" parity);
 reconnect-merge.
+
+<a id="phase-7"></a>
 
 ## Phase 7 — KeyDB one-way onboarding
 Redis-path greeting adds `REPLCONF uuid` + `capa activeExpire` (KeyDB refuses active full sync
@@ -769,6 +868,34 @@ self-uuid drop, per-link monotonic mvcc dedup, apply-context from envelope); Key
 EXPIREMEMBER documented as unsupported.
 **Verify:** docker `eqalpha/keydb` (active-replica yes) + drakeydb: seed KeyDB incl. mid-sync
 writes → converge; drakeydb local writes unaffected; suite gated on image availability.
+
+**Corrections (2026-10-03).** The stub above was written before P4 and is wrong or stale in these
+respects (found during the Phase 7 design; the KeyDB line references are v6.3.4 and are carried
+from `docs/superpowers/ledgers/2026-10-03-phase7-keydb-onboarding/decisions.md` and
+`advisor-design.md`). The design spec is
+`docs/superpowers/specs/2026-10-03-phase7-keydb-onboarding-design.md`; the implementation plan is
+`docs/superpowers/plans/2026-10-03-phase7-keydb-onboarding.md`.
+
+- KeyDB does **not** refuse a replica without `capa activeExpire`; it only logs a deprecation
+  warning (`KeyDB/src/replication.cpp:1798-1803`). The `replication.cpp:1798` citation under "Key
+  verified architecture facts" above is stale for the same reason.
+- KeyDB's RREPLAY dedup is per **author uuid**, process-wide (`g_mapremote`), not per link.
+- `KEYDB.MVCCRESTORE` does not exist in v6.3.4's command table.
+- An active KeyDB never propagates expiry deletes (`db.cpp:1966-1985`), so a plain replica of one
+  has to run active expiry itself (ledger decision 13).
+- "Apply-context from envelope" cannot ride the squasher: `repl_mvcc` is copied once per batch
+  (`main_service.cc:1815-1816`, `multi_command_squasher.cc:114-115`), so RREPLAY commands dispatch
+  one by one, each with its own mvcc and origin (ledger decision 11).
+- **New Critical found during design:** drakeydb cannot complete a handshake with an *active*
+  KeyDB at all. KeyDB answers every `REPLCONF capa …` with `+OK active-replica`
+  (`replication.cpp:1740-1753`), and `Greet()` requires exactly `OK` via the strict-equality
+  `CheckRespIsSimpleReply` (`protocol_client.cc:433`, `replica.cc:432`, `:611`). P1's "inbound
+  KeyDB works" claim was validated against plain Redis only. Fixing this is P7-0.
+
+Owner scheduling decisions made alongside: the overdue upstream sync (`docs/UPSTREAM-SYNC.md`)
+lands as its own PR **after** P7, and a dedicated "tombstone-lifecycle" phase after P7 owns D-14,
+D-16, D-20, D-27 and D-29 (`docs/ISSUE-REGISTER.md`). The minimal fork-owned `drakeydb-ci.yml`
+that Phase 9 lists is pulled forward into P7-0 (ledger decision 17).
 
 ## Phase 8 — Mesh hardening + ops
 Reciprocal-connect UUID tiebreak; `--replica_quorum` serve-stale gating; reject
@@ -786,7 +913,7 @@ metrics; 4-node chaos pytest (random kills + seeder + convergence assert).
 | # | Risk | Mitigation |
 |---|---|---|
 | 1 | Serialize-once journal vs per-consumer filtering (ring-buffer partial replay must filter without reparsing) | `JournalItem.origin_idx` memory-side field; filter in live + `MaybePartialStreamLSNs` paths; C++ mixed-origin backlog test |
-| 2 | Upstream owns the deprecated varint / journal code | Version constant 67 (originally 65) dodges upstream VERs; `docs/UPSTREAM-SYNC.md` watchlist; multimaster pytest suite is the merge gate; framing diff is ~30 lines in one low-churn file |
+| 2 | Upstream owns the deprecated varint / journal code | Version constant 68 as of P4-4 (originally 65) dodges upstream VERs; `docs/UPSTREAM-SYNC.md` watchlist; multimaster pytest suite is the merge gate; framing diff is ~30 lines in one low-churn file |
 | 3 | LSN/partial-sync semantics across peers | Each peer pair is its own lineage; peer-mode `Replica` never adopts lineage / never `StartJournalAtOwnLSN`; cascaded flag mutually exclusive with active mode; per-peer restart partial-sync test |
 | 4 | Clock skew breaks LWW | Hybrid stamp absorbs small skew; handshake skew warning + metric; NTP documented as hard requirement |
 | 5 | Concurrent same-key RMW diverges (arrival order) | Same hole as KeyDB; loud docs; LWW guard covers state commands; recommend per-node key ownership for RMW |
