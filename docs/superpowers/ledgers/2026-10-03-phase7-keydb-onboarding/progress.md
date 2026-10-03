@@ -76,23 +76,26 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
   | `replication_config_test.py` | see triage (4 failed) |
   | `cluster_test.py::test_cluster_migrations_sequence` | 1 passed |
 
-- **Triage** (each failure re-run alone on the `main` snapshot):
-  - **Client-library (redis-py 8.1.0), not code — 8 tests:** `test_replicate_search_index_to_old_replica`,
-    `test_search`, `test_search_with_stream`, `test_xreadgroup_replication`, `test_rewrites`,
-    `test_save_with_replication`, `test_empty_hash_map_replicate_old_master`,
-    `test_empty_hashmap_loading_bug` all **pass with redis-py 5.3.1** and fail with 8.1.0. Gates use a
-    venv pinned to `redis>=5.2.1,<6` (`/root/drakey-venv-redis5`); upstream's requirements file is
-    left untouched.
-  - **Environment:** `test_ipv6_replication` (no IPv6).
-  - **Load-only:** `test_replication_timeout_on_full_sync` passes isolated.
-  - **Fail isolated, resource-bound upstream tests on a 4-core debug build** (timeouts, no code
-    signal): `test_replication_all[…-6-t_replicas5-…-20000]` ×4, `test_big_containers[16-30000]`,
-    `test_master_too_big`, `test_replicaof_reject_on_load`. Tracked as known-environmental for the
-    P7 gates; P7 must not add failures beyond this set.
-  - **Fork test hangs on `main` — Task 0.10:**
-    `multimaster_test.py::test_narrowed_window_admits_peer_during_winners_full_sync` fails 3/3
-    (incl. isolated): an `--active_replica --multi_master` node stops answering and does not exit
-    within 120 s of SIGTERM. Root-cause investigation in progress.
+- **Triage — every run-2 failure except IPv6 is the redis-py 8 client, not code.**
+  - redis-py 8.0 (released 2026-05-28) defaults asyncio clients to a 5 s `socket_timeout` with 10
+    retries on timeout, and changed several reply shapes. `tests/dragonfly/requirements.txt` was
+    `redis>=5.2.1`, so a fresh install got 8.1.0. Upstream already pins `redis>=5.2.1,<8.0.0`; the
+    fork adopted the identical line (`44a0cc0`), which resolves to redis-py 7.4.1.
+  - **Re-run alone on the `main` snapshot under the pin (redis-py 7.4.1): 14/14 pass** —
+    `test_replicate_search_index_to_old_replica`, `test_search`, `test_search_with_stream`,
+    `test_xreadgroup_replication`, `test_rewrites`, `test_save_with_replication`,
+    `test_empty_hash_map_replicate_old_master`, `test_empty_hashmap_loading_bug`,
+    `test_narrowed_window_admits_peer_during_winners_full_sync`, `test_replicaof_reject_on_load`,
+    `test_replication_timeout_on_full_sync`, `test_big_containers` (2), `test_master_too_big`, and
+    the whole `test_replication_all` (24 passed). The "resource-bound timeouts" seen first were
+    the same client timeout.
+  - **Task 0.10** (`test_narrowed_window_admits_peer_during_winners_full_sync` "hang"): not a server
+    bug. Its `DEBUG POPULATE 700000` takes ~30 s on this debug build; redis-py 8 re-sent it up to 10
+    times, the server ran every copy (~338 s of work), and teardown exceeded 120 s. Passes 4/4 on
+    redis-py 5.3.1, 1/1 on 7.4.1, 3/3 with `proactor_threads=4`. Evidence: backtraces show only
+    `populate_range` fibers; `cmdstat_debug:calls=11` for one client call.
+  - **Environment only:** `test_ipv6_replication` (no IPv6 in the container).
+  - **Gate venv:** `/root/drakey-venv-pinned` (redis-py 7.4.1, the pin's resolution, as CI gets).
 
 ## P7-1 … P7-4
 
