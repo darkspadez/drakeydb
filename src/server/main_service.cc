@@ -1647,7 +1647,9 @@ DispatchResult Service::DispatchCommand(facade::ParsedArgs args, facade::ParsedC
 
   if ((res != DispatchResult::OK) && (res != DispatchResult::OOM)) {
     cmd_cntx->SendError("Internal Error");
-    dfly_cntx->conn()->MarkForClose();
+    // A replicated apply (see VerifyCommandState) has no connection to close.
+    if (auto* conn = dfly_cntx->conn(); conn != nullptr)
+      conn->MarkForClose();
   }
 
   return res;

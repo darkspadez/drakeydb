@@ -1914,7 +1914,9 @@ error_code Replica::ParseReplicationHeader(base::IoBuf* io_buf, PSyncResponse* d
   std::string_view header;
   bool valid = false;
 
-  auto bad_header = [str]() {
+  // drakeydb: P7 -- by reference: `str` moves on to the second header line, and a copy of the first
+  // would view bytes the IoBuf has compacted over by then.
+  auto bad_header = [&str]() {
     LOG(ERROR) << "Bad replication header: " << str;
     return std::make_error_code(std::errc::illegal_byte_sequence);
   };
@@ -1958,8 +1960,11 @@ error_code Replica::ParseReplicationHeader(base::IoBuf* io_buf, PSyncResponse* d
     if (absl::ConsumePrefix(&token, "EOF:")) {
       // drakeydb: P7 -- the token's size is the master's to get wrong; refuse the header and
       // reconnect rather than abort.
-      if (token.size() != kRdbEofMarkSize)
-        return bad_header();
+      if (token.size() != kRdbEofMarkSize) {
+        LOG(ERROR) << "Bad replication header: the $EOF: token is " << token.size()
+                   << " bytes long, expected " << kRdbEofMarkSize;
+        return std::make_error_code(std::errc::illegal_byte_sequence);
+      }
       dest->fullsync.emplace<string>(token);
       VLOG(1) << "Token: " << token;
     } else {

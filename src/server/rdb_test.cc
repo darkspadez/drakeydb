@@ -5985,8 +5985,9 @@ TEST_F(RdbTest, LoaderSourceLimitShorterThanTheRdbIsAnError) {
   AppendString(&body, "cut-val");
   const std::string rdb = WrapInRdb(body);
 
-  for (size_t cut : {size_t{1}, size_t{4}, size_t{9}, rdb.size() - 9}) {
-    const size_t limit = rdb.size() - cut;
+  // The last two limits cannot even hold the 9-byte signature that the first read asks for.
+  for (size_t limit :
+       {rdb.size() - 1, rdb.size() - 4, rdb.size() - 9, size_t{9}, size_t{8}, size_t{0}}) {
     io::BytesSource src{io::Buffer(rdb)};
     RdbLoadContext load_context;
     auto ec = pp_->at(0)->Await([&]() -> std::error_code {

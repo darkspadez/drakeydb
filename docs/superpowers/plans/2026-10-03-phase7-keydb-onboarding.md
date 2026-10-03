@@ -520,10 +520,10 @@ local to each call).
   `HandleRreplay`), `replica_waker_.notify()`, `continue`. Process the envelope **before**
   `ConsumeInput` (its views point into `io_buf`) and let no `string_view` outlive the iteration.
   Keep `RREPLAY` out of the registry. Do not advance `repl_offs_` for synthetic `SELECT`s.
-  **Side finding, not fixed here** (the orchestrator registers it): `DispatchCommand` ends with
-  `dfly_cntx->conn()->MarkForClose()` when `InvokeCmd` returns `ERROR` after catching an exception
-  (`main_service.cc:1645-1647`, `:1744-1747`) — a null `conn()` on a replica apply context, the same
-  family as U-9 and U-10.
+  **Side finding, fixed in the P7-0 review round** (ISSUE-REGISTER U-12): `DispatchCommand` ended
+  with `dfly_cntx->conn()->MarkForClose()` when `InvokeCmd` returns `ERROR` after catching an
+  exception (`main_service.cc:1645-1647`, `:1744-1747`) — a null `conn()` on a replica apply context,
+  the same family as U-9 and U-10.
 - [ ] **Step 4: Run; falsify** each of these, recording each: (a) drop the pre-envelope flush: the
   fake master test ends with `a == 1`; (b) skip `repl_offs_ += total_read` on the envelope branch:
   `test_unwrap_keeps_offsets_exact` fails with the offsets apart; (c) remove the 65th-nesting

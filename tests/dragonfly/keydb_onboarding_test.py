@@ -6,6 +6,7 @@ they do whenever $KEYDB_SERVER_PATH is set but is not an executable.
 """
 
 import asyncio
+import functools
 
 import pytest
 import redis
@@ -85,7 +86,25 @@ async def write_during_full_sync(k):
     return live
 
 
+def retry_while_loading(check):
+    """Turns the replica's LOADING reply into a failed assertion, so assert_eventually polls again.
+
+    A node loading a full sync answers every command with -LOADING, which redis-py raises as a
+    BusyLoadingError: a ConnectionError, and assert_eventually retries only AssertionErrors. The
+    check hits that window whenever it polls while the sync's RDB is being loaded."""
+
+    @functools.wraps(check)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await check(*args, **kwargs)
+        except redis.exceptions.BusyLoadingError as e:
+            raise AssertionError(f"the node is still loading the full sync: {e}") from e
+
+    return wrapper
+
+
 @assert_eventually(times=300)
+@retry_while_loading
 async def assert_full_sync_arrived(c):
     """Peer mode reports its link up before the full sync's data is visible, so this polls."""
     assert await c.mget(list(PRE_STRINGS)) == list(PRE_STRINGS.values())
@@ -96,7 +115,13 @@ async def assert_full_sync_arrived(c):
 
 
 async def wait_for_peer_link(c):
-    """Waits until an --active_replica node shows its single peer link up and done syncing."""
+    """Waits until an --active_replica node shows its single peer link up and not syncing.
+
+    That is true as soon as the TCP connection is: a peer link only reports sync_in_progress once
+    the master's `$` header has arrived, which is after its `+FULLRESYNC` (the harness's KeyDB
+    streams the RDB diskless, so it sends the header when the transfer starts). So this can return
+    before the full sync has begun, and the node is then LOADING for all of it. The assert_* checks
+    below poll for the data and retry through that (retry_while_loading)."""
 
     @assert_eventually(times=300)
     async def link_up():
@@ -109,6 +134,7 @@ async def wait_for_peer_link(c):
 
 
 @assert_eventually(times=300)
+@retry_while_loading
 async def assert_ttl_and_db1_arrived(c, c1):
     """The TTL survived with its time left, and the key of db 1 is in db 1 (`c1` selects it)."""
     ttl = await c.ttl("ttl:key")
@@ -117,6 +143,7 @@ async def assert_ttl_and_db1_arrived(c, c1):
 
 
 @assert_eventually(times=300)
+@retry_while_loading
 async def assert_live_writes_arrived(c, live):
     """Every write made during the full sync is there, none lost and none applied twice."""
     values = await c.mget(list(live))
@@ -128,6 +155,7 @@ async def assert_live_writes_arrived(c, live):
 
 
 @assert_eventually(times=300)
+@retry_while_loading
 async def assert_keyspaces_match(c, k):
     """Everything in KeyDB's db 0 is on the replica too, the bulk keys included."""
     assert await c.dbsize() == await k.dbsize()
@@ -329,12 +357,29 @@ async def test_psync_bad_eof_token_size_does_not_abort_replica(
     df_factory: DflyInstanceFactory, tmp_path, token
 ):
     """`$EOF:` must be followed by exactly 40 bytes; any other size used to abort the process
-    (a CHECK in Replica::ParseReplicationHeader). It is now a bad header: the replica logs it and
-    reconnects."""
+    (a CHECK in Replica::ParseReplicationHeader). It is now a bad header: the replica logs the size
+    it got and reconnects."""
     async with FakeClassicMaster() as master:
         master.script_psync(full_resync_header() + b"$EOF:" + token + b"\r\n")
         node = await attach_and_watch_retries(df_factory, tmp_path, master)
-        await assert_replica_survived(node, master, r"Bad replication header: \$EOF:")
+        pattern = (
+            rf"Bad replication header: the \$EOF: token is {len(token)} bytes long, expected 40"
+        )
+        await assert_replica_survived(node, master, pattern)
+
+
+async def test_psync_bad_header_line_is_logged_as_received(
+    df_factory: DflyInstanceFactory, tmp_path
+):
+    """The replica logs the header line it refused, whole. The line is the second one, and longer
+    than the first (54 bytes): a log that kept a view of the first line (copied by value) would show
+    that many bytes of whatever the IoBuf holds by then, which is not this line. Both lines fit the
+    128-byte buffer the header is read into."""
+    line = b"not-a-dollar-line-" + b"x" * 47
+    async with FakeClassicMaster() as master:
+        master.script_psync(full_resync_header() + line + b"\r\n")
+        node = await attach_and_watch_retries(df_factory, tmp_path, master)
+        await assert_replica_survived(node, master, rf"Bad replication header: {line.decode()}$")
 
 
 # A full sync whose tail disagrees with its header is the master's malformed output. Each of these
@@ -390,11 +435,16 @@ SET_A = resp_command("SET", "a", "1")
 SET_B = resp_command("SET", "b", "2")
 SYNC_OFFSET = 1000
 
+# The second write of a scenario below comes this long after the first, by when the replica has read
+# the first alone and is waiting on the socket for more.
+SECOND_WRITE_DELAY_S = 0.5
+
 # The bytes a master streams right behind a correct full sync: (reply written in one write(), a
 # second write that follows it, the commands' total length). A disk-based master (`$<len>`, KeyDB's
 # default and plain Redis's) flushes what it buffered while producing the RDB right behind it.
 STREAM_BEHIND_FULL_SYNC = {
-    # Small RDB: the header, the RDB and the commands all arrive in the replica's first read.
+    # Small RDB: the header, the RDB and the commands are written together, so the commands start
+    # inside what the replica has already read (its first reads are 128 bytes).
     "disk": (
         disk_full_sync(rdb=MINIMAL_RDB, offset=SYNC_OFFSET, stream=SET_A + SET_B),
         b"",
@@ -411,6 +461,13 @@ STREAM_BEHIND_FULL_SYNC = {
         SET_B[11:],
         len(SET_A + SET_B),
     ),
+    # The loader ends up holding only the first 10 bytes of the closing EOF token: the rest of it,
+    # and the commands behind it, are still on the socket and must be read from there.
+    "diskless_token_split": (
+        diskless_full_sync(rdb=MINIMAL_RDB, offset=SYNC_OFFSET, tail=EOF_TOKEN[:10]),
+        EOF_TOKEN[10:] + SET_A + SET_B,
+        len(SET_A + SET_B),
+    ),
 }
 
 
@@ -419,27 +476,40 @@ async def test_psync_stream_bytes_behind_full_sync_are_applied(
     df_factory: DflyInstanceFactory, tmp_path, scenario
 ):
     """Replication stream bytes that arrive in the same write as the end of the full sync are not a
-    malformed tail: the replica applies them, in order, and counts them into its offset exactly.
+    malformed tail: the replica applies them, in order, and counts them into its offset exactly:
+    the ACKs, once they settle, never exceeded and finally equal the full sync's offset plus the
+    commands' length.
 
     Falsifying: with the old tail checks the replica aborts (CHECK on the bytes left over after
     the RDB); with the bytes dropped instead of handed to ConsumeRedisStream, "a" never arrives and
-    the acknowledged offset stays at the full sync's.
+    the acknowledged offset stays at the full sync's; with them counted twice, the offset overshoots.
     """
     reply, later_write, stream_len = STREAM_BEHIND_FULL_SYNC[scenario]
     async with FakeClassicMaster() as master:
-        master.script_psync(reply, stream=later_write)
-        node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"))
+        master.script_psync(reply, stream=later_write, stream_delay=SECOND_WRITE_DELAY_S)
+        # Frequent ACKs: the offset is checked over many of them, and settles sooner.
+        node = df_factory.create(
+            proactor_threads=2, dir=str(tmp_path / "df"), replication_acks_interval=100
+        )
         node.start()
         c = node.client()
         assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
 
         @assert_eventually(times=100)
+        @retry_while_loading
         async def applied():
             assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
             assert await c.get("a") == "1"
             assert await c.get("b") == "2"
 
         await applied()
-        assert await master.wait_for_ack(SYNC_OFFSET + stream_len), master.ack_offsets
+        # Exact, not "reached at some point": an offset counted twice would still show the
+        # expected value in an early ACK, so wait for the ACKs sent from now on to stop moving
+        # and check them all.
+        expected = SYNC_OFFSET + stream_len
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert max(master.ack_offsets) == expected, master.ack_offsets
+        assert master.ack_offsets[-1] == expected, master.ack_offsets
         assert master.connection_count == 1, "the replica reconnected: the full sync was refused"
         assert (await c.info("replication"))["master_link_status"] == "up"

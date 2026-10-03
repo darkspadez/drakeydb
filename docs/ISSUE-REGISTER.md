@@ -275,6 +275,78 @@ connection is never refused by the `TAKEN_OVER` gate, as at the restricted-comma
 it would drop the upstream's writes on a takeover that then fails back to `ACTIVE`. Still not
 filed upstream.
 
+**The cost of "allow":** `WaitReplicaFlowToCatchup` (`dflycmd.cc`) waits until the taking-over
+replica's acked LSN reaches `journal::GetLsn()`, and a cascaded node that keeps applying its
+master's stream keeps appending to its own journal, so that target moves. Under sustained upstream
+writes a `REPLTAKEOVER` whose old master is a cascaded node can therefore run out its timeout and
+answer `Takeover failed!` (`DflyCmd::TakeOver`). That follows from the code; it was not observed:
+the probe above kept writing throughout the takeover and `REPLTAKEOVER` still answered `OK` 5/5.
+Refusing the applies would avoid that wait, since nothing new reaches the journal, and is worse:
+a refused apply is dropped while the stream moves on. `Replica::ConsumeRedisStream` advances
+`repl_offs_` after every dispatch whatever its result, and the DFLY stable-sync path logs a `DFATAL`
+for a failed entry only while the node is `ACTIVE`. Once the takeover then fails back to `ACTIVE`,
+the node has lost writes its upstream believes were applied, and nothing re-sends them. A takeover
+that times out is loud and can be retried.
+
+### U-11. A classic full sync aborts the replica when stream bytes arrive with the end of the RDB
+
+**Where:** `Replica::InitiatePSync` after `RdbLoader::Load` — `CHECK_EQ(0u,
+loader.Leftover().size())`, `CHECK_EQ(snapshot_size, loader.bytes_read())` and
+`CHECK(ps.UnusedPrefix().empty())` on a `$<len>` sync; `CHECK(chained.UnusedPrefix().empty())` after
+the `$EOF:` token; `RdbLoader::Load`'s first `ReadAtLeast(bytes, 9)` ignores `source_limit_`.
+
+A disk-based classic master (KeyDB's default; Redis with `repl-diskless-sync no`) flushes the writes
+it buffered during its BGSAVE right behind the file. When the RDB's end lands in the loader's first
+(16 KB) read, that unclamped read swallows stream bytes and the `Leftover()` CHECK aborts the
+replica; even without the abort those writes and their offset were dropped. The neighbouring CHECKs
+abort on malformed tails, and an RDB longer than `$<len>` trips the helio `io.cc:143` DCHECK in a
+debug build.
+
+**How established:** live on the unmodified main build — plain KeyDB v6.3.4, disk-based sync, an
+`INCR` loop during the attach: `replica.cc:831] Check failed: 0u == loader.Leftover().size() (0 vs.
+2507)` in 4 of 8 runs. With a scripted master, deterministically `(0 vs. 46)` (disk) and
+`replica.cc:829 Check failed: chained.UnusedPrefix().empty()` (diskless); also `replica.cc:1910
+Check failed: kRdbEofMarkSize == token.size()` and `io.cc:143 … (0 vs. 8)`.
+
+**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.6, a0ee234): the loader's first read honors
+the source limit, the bytes behind a correct full sync go to `ConsumeRedisStream` and into
+`repl_offs_`, and every other tail disagreement is an error that reconnects. Tests
+`RdbTest.LoaderFirstReadHonorsTheSourceLimit`,
+`RdbTest.LoaderSourceLimitShorterThanTheRdbIsAnError`,
+`keydb_onboarding_test.py::test_psync_{stream_bytes_behind_full_sync_are_applied,
+full_sync_tail_mismatch_does_not_abort_replica,bad_eof_token_size_does_not_abort_replica}`. Not
+filed upstream.
+
+**Related, not changed:** a `$0` header (`+FULLRESYNC <id> <offset>` then `$0`) is not a full sync
+here. `InitiatePSync`'s `if (snapshot_size || token != nullptr)` (`replica.cc:759`) sends it to the
+else branch, "Re-established sync with Redis master", which is the partial-resync branch: nothing is
+flushed, so stale data stays, and the offset from the `+FULLRESYNC` line has already been adopted.
+Pre-existing, upstream's; P7-3 (classic partial PSYNC) takes over that branch and must tell a `$0`
+full sync from a partial resync.
+
+### U-12. `Service::DispatchCommand` closes a null connection when a handler throws on a replicated apply
+
+**Where:** `src/server/main_service.cc`, `Service::DispatchCommand`, after `InvokeCmd` —
+`cmd_cntx->SendError("Internal Error"); dfly_cntx->conn()->MarkForClose();`.
+
+`InvokeCmd` catches a `std::exception` thrown by a command handler, logs `Internal error, system
+probably unstable` and returns `DispatchResult::ERROR`, the only way to reach that block. A
+replicated apply (`JournalExecutor`; `Replica::ConsumeRedisStream`'s own context) has no connection
+(see U-9, U-10), so a handler that throws while applying turned an already-logged internal error
+into a SIGSEGV in `Connection::MarkForClose`.
+
+**How established:** deterministically in-process: `DflyEngineTest.
+ReplicatedApplyHandlerThrowNoConnNoCrash` replaces `ECHO`'s handler with one that throws
+`std::runtime_error` and applies `ECHO x` through a `JournalExecutor`; without the guard it dies
+with SIGSEGV in `facade::Connection::MarkForClose <- Service::DispatchCommand`. No production
+command throws deterministically, so a live trigger was not reproduced: it needs a `std::exception`
+thrown on a handler's coordinator side (a shard callback's `bad_alloc` becomes `OUT_OF_MEMORY` and
+its other exceptions abort, both in `Transaction::RunCallback`).
+
+**Status (2026-10-03): fixed in this fork** (P7-0 review fix round): the close requires `conn() !=
+nullptr`. The failed command is still dropped, logged and not retried, and the replication link
+stays up, so a replica that hits this diverges silently on that key. Not filed upstream.
+
 ---
 
 ## Part 2 — drakeydb deferred work

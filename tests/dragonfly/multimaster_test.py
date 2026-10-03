@@ -553,6 +553,14 @@ async def test_plain_replica_of_keydb_applies_stream_flushed_behind_full_sync(
     A plain KeyDB master takes an INCR loop while a plain drakeydb replica attaches, six times; once
     the loop stops, the replica's counter must equal KeyDB's exactly (a lost or repeated command
     shows) and the replica must never have called the tail malformed.
+
+    This is a smoke test against a live KeyDB, not a deterministic one: whether the RDB's end lands
+    in the loader's first read depends on timing. On the build without the fix the disk-based
+    variant aborted the replica (ISSUE-REGISTER U-11) in 4 of 8 runs; the diskless variant never did
+    in 8, which makes it the control (KeyDB streams only after the replica's first ACK there, so
+    there is nothing behind the RDB to over-read). The deterministic coverage is the fake-master
+    tests of keydb_onboarding_test.py (test_psync_stream_bytes_behind_full_sync_are_applied and the
+    malformed-tail tests).
     """
     keydb = keydb_server_factory(active_replica=False, repl_diskless_sync=diskless)
     node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"))

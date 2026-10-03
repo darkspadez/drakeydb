@@ -337,6 +337,30 @@ TEST_F(DflyEngineTest, ReplicatedApplyDuringTakeoverNoCrash) {
   EXPECT_THAT(Run({"get", "u10-key"}), "v");
 }
 
+// A handler that throws is answered with "Internal Error" and its connection is closed, but a
+// replicated apply context has no connection to close: the close used to dereference it.
+TEST_F(DflyEngineTest, ReplicatedApplyHandlerThrowNoConnNoCrash) {
+  auto handler = [](facade::CmdArgParser, CommandContext* cmd_cntx) {
+    cmd_cntx->SendOk();
+    throw std::runtime_error("handler failure");
+  };
+  std::move(*service_->mutable_registry()->Find("ECHO")).SetHandler(handler);
+
+  facade::DispatchResult result = facade::DispatchResult::OK;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        JournalExecutor executor(service_.get());
+        vector<string> args = {"ECHO", "x"};
+        journal::ParsedEntry::CmdData cmd_data;
+        cmd_data.Assign(args.begin(), args.end(), args.size());
+        result = executor.Execute(0, cmd_data);
+      })
+      .Join();
+
+  EXPECT_EQ(result, facade::DispatchResult::ERROR);
+  EXPECT_EQ(Run({"ping"}), "PONG");
+}
+
 TEST_F(DflyEngineTest, ScriptFlush) {
   auto resp = Run({"script", "load", "return 5"});
   EXPECT_THAT(resp, ArgType(RespExpr::STRING));

@@ -4,7 +4,8 @@
 > and the advisor's resolution of its forks (per-author dedup reservation, offset/watermark
 > coupling, the release-build perf bar, the full-sync tail). Branch
 > `feat/phase7-0-closeout-and-harness` off `origin/main` (`c60dfdb`); `src/` is unchanged since
-> except the P7-0 implementation commit `a0ee234` (Tasks 0.4-0.6 and 0.9, which also fixed U-10).
+> except the P7-0 implementation commit `a0ee234` (Tasks 0.4-0.6 and 0.9, which also fixed U-10)
+> and the review fix round that followed it (U-12, a log fix in `ParseReplicationHeader`).
 > The other commits since are ledger/doc commits and the test/CI harness (`5199f34`, `89414e5`).
 > Ships as five stacked sub-PRs — see [PR stack](#pr-stack).
 >
@@ -770,7 +771,8 @@ strictly more permissive; the write side is untouched.
 (`journal/executor.cc:34-42`). Fix: `&& conn_cntx->conn() != nullptr`, **ungated**. Test
 `EvalReplicatedApplyNoConnNoCrash`. The `TAKEN_OVER` branch of `VerifyCommandState` dereferenced
 `conn()` the same way (`main_service.cc:1430`); it was fixed alongside as ISSUE-REGISTER U-10
-(`a0ee234`).
+(`a0ee234`). So did `DispatchCommand`'s `MarkForClose()` after a handler threw, fixed in the review
+round that followed as U-12 (`ReplicatedApplyHandlerThrowNoConnNoCrash`).
 
 ### D-12. Throughput bar (decision 12)
 
@@ -929,6 +931,8 @@ still pass under if the feature were removed.
 | `test_classic_partial_psync_*` (exact INCR count, master `sync_partial_ok == 1`, `sync_full == 1`, `sync_partial_err == 0`), flag-off, mid-load drop, new-replid, KeyDB envelope variant, coalesced leftover | Fresh `io_buf` (lost bytes); `+0` offset; flag ignored |
 | `RdbKeyDbTest.*`, **all under `--active_replica`** (type 64 skip + next key unstamped, subexpire, aux once, bit-63 throttle, opcode 221 beats aux, each with a control key proving stamps are observable) | Not calling `settings.Reset()` (cron stamp leaks); making the aux branch first-wins or opcode 221 non-overwriting (precedence flips) |
 | `EvalReplicatedApplyNoConnNoCrash` | Removing the `conn() != nullptr` guard (null deref) |
+| `ReplicatedApplyDuringTakeoverNoCrash` | Removing the null-`conn()` allowance in the `TAKEN_OVER` branch (null deref) |
+| `ReplicatedApplyHandlerThrowNoConnNoCrash` (a stubbed `ECHO` handler that throws, applied through a `JournalExecutor`) | Removing the `conn() != nullptr` guard before `MarkForClose()` (SIGSEGV) |
 
 ## Byte-identity exceptions
 
@@ -939,7 +943,28 @@ observe changes only here:
 1. **Partial PSYNC** (flag-gated by `--classic_partial_psync`, default true): a reconnecting classic
    replica sends `PSYNC <id> <offset+1>` instead of `<id> -1`. The one real exception to the slogan;
    `=false` restores today's bytes.
-2. **U-9** (ungated): a null-`conn()` guard; crash fix, no wire effect.
+2. **Ungated crash, abort and refusal fixes** (P7-0). None changes a byte on the journal wire or in
+   RDB output; in each, upstream crashed, aborted or refused the link:
+   - **`+OK <suffix>` acceptance** (Task 0.4): a master that answers `REPLCONF capa` with `OK`, a
+     space and words (an active KeyDB's `+OK active-replica`) is accepted. Upstream refused the link
+     (`Bad response`, `REPLICAOF` failed). Any other reply is still refused.
+   - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
+     migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
+     a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a
+     behavior: a node being taken over keeps applying its own master's stream, which can make a
+     takeover time out under sustained upstream writes (ISSUE-REGISTER U-10 has the reasoning).
+   - **First-read clamp** (Task 0.6, `RdbLoader::Load`): applied only when the declared `$<len>` is
+     smaller than the loader's first-read buffer (16 KB), so the first read would otherwise overshoot
+     it. Upstream over-read the stream bytes behind the RDB and aborted. A source limit under 9
+     bytes, which cannot hold the RDB signature, is a wrong-signature error.
+   - **`EnsureReadInternal` guard**: an RDB that runs past its `$<len>` is an `rdb_file_corrupted`
+     error with a log line. Upstream tripped a helio `DCHECK` in a debug build and returned the same
+     error, without the line, in a release build.
+   - **Stream hand-off** (Task 0.6): the bytes behind a correct RDB, in either framing, are applied
+     as the start of the stream, only where upstream aborted on them (ISSUE-REGISTER U-11).
+   - **EOF-token size and tail errors** (Task 0.6): a `$EOF:` token that is not 40 bytes, and a tail
+     that disagrees with its header, are a logged error that reconnects. Upstream aborted on a
+     `CHECK`.
 3. **Loader** accepts KeyDB type 64 and subexpire aux, quiets noisy aux: strictly more permissive.
 4. **Full-sync tail** (ungated, Task 0.6): the loader's first read honors the source limit and the
    bytes behind a correct RDB — either framing — are applied as the start of the stream instead of
@@ -951,8 +976,8 @@ observe changes only here:
    `IsKeyDbOnlyCommand` are dropped and counted on the raw path instead of being dispatched as
    unknown commands. Reachable from a **non-active** KeyDB master (it sends `PEXPIREMEMBERAT` raw).
 6. **Reachable only from an active KeyDB** (the one master that answers `active-replica` and sends
-   RREPLAY; upstream cannot even complete that handshake): `+OK <suffix>` acceptance,
-   `REPLCONF capa activeExpire`, RREPLAY unwrap with its rewrites, EVAL stamping and dedup,
+   RREPLAY; upstream cannot even complete that handshake): `REPLCONF capa activeExpire`, RREPLAY
+   unwrap with its rewrites, EVAL stamping and dedup,
    `KEYDB.MVCCRESTORE` translation, replica active expiry (and its journaled expiry `DEL`s).
 7. **Observability** (additive; INFO is already outside byte identity, ISSUE-REGISTER D-5.1):
    classic INFO fields and Prometheus `_total` series render only when the master answered
@@ -993,12 +1018,12 @@ forwarding KeyDB masters double-applies deltas (`INCR`, `APPEND`, ...), and that
 | `src/server/replica_types.h` | `ReplicaSummary` classic fields | 1, 2, 3 |
 | `src/server/engine_shard.{h,cc}` | `replica_active_expiry_`, `expire_only` split (authorized exception to the "untouched" list; ~15 lines) | 1 |
 | `src/server/db_slice.cc` | One-line `ExpireIfNeeded` gate (`:2097-2098`) | 1 |
-| `src/server/main_service.cc` | U-9 one-liner (`:2459`) | 0 |
+| `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards | 0 |
 | `src/server/transaction.cc`, `src/server/multimaster_lww.cc` | Comments only (`:1628-1648` tripwire; `ApplyLwwRewrites` contract) | 2 |
 | `src/server/rdb_load.{h,cc}` | First-read clamp (0); type 64 skip, subexpire/aux handling, counters (4) | 0, 4 |
 | `src/server/server_family.cc`, `multi_master.{h,cc}`, `metrics.cc` | INFO fields and gating, peer line, boot warning, Prometheus (incl. the replica-side branch) | 1, 2, 3, 4 |
 | `src/server/CMakeLists.txt` | `classic_replay.cc` in `dragonfly_lib` (`:109-125`); `classic_replay_test` (`:200`, `:202-207`) | 0 |
-| `src/server/dragonfly_test.cc` | `EvalReplicatedApplyNoConnNoCrash` | 0 |
+| `src/server/dragonfly_test.cc` | `EvalReplicatedApplyNoConnNoCrash`, `ReplicatedApplyDuringTakeoverNoCrash`, `ReplicatedApplyHandlerThrowNoConnNoCrash` | 0 |
 | `tests/dragonfly/keydb_onboarding_test.py` **(new)**, `fake_classic_master.py` **(new)** | KeyDB and fake-master suites | 0-4 |
 | `tests/dragonfly/{instance,conftest,proxy}.py`, `tests/pytest.ini`, `keydb_harness_test.py`, `data/`, `tools/` | Harness, fixtures, marker, captures (delivered `5199f34`, `89414e5`); request capture (1) | 0, 1 |
 | `.github/workflows/drakeydb-ci.yml` **(new)** | KeyDB build + suite | 0 |

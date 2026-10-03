@@ -30,11 +30,12 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
 | 0.1 P4 close-out docs + U-8 live test | docs committed `a162d75`; review pending | U-8 withdrawn (live: 16/16 STORE destinations replicate) |
 | 0.2 Baseline full gate on main | ctest done; pytest re-run pending | see "Baseline gate" below |
 | 0.3 Spec + plan docs | in progress | |
-| 0.4 Greet accepts `+OK <suffix>` | pending | |
-| 0.5 U-9 EvalInternal null `conn()` | pending | |
-| 0.6 Graceful PSYNC CHECKs | pending | |
-| 0.7 KeyDB harness + smoke test | pending | |
-| 0.8 `drakeydb-ci.yml` | pending | |
+| 0.4 Greet accepts `+OK <suffix>` | done (`a0ee234`), review fixes pending commit | `task-0.4-report.md` |
+| 0.5 U-9 EvalInternal null `conn()` (+ U-10, and U-12 in the review round) | done (`a0ee234`), review fixes pending commit | `task-0.5-report.md` |
+| 0.6 Graceful PSYNC CHECKs and the full-sync tail | done (`a0ee234`), review fixes pending commit | `task-0.6-report.md`; ISSUE-REGISTER U-11 |
+| 0.7 KeyDB harness + smoke test | done (`5199f34`, `89414e5`) | `task-0.7-report.md` |
+| 0.8 `drakeydb-ci.yml` | done (`5199f34`, `89414e5`) | `task-0.7-report.md` |
+| 0.9 Reaper-resume test robust under load | done (`a0ee234`), review fixes pending commit | `task-0.9-report.md` |
 | Whole-branch review / adversarial / gate / PR | pending | |
 
 ### Live evidence recorded before any code change (debug build of `c60dfdb`)

@@ -56,8 +56,10 @@ class FakeClassicMaster:
     master gives for an unknown option; every other REPLCONF (listening-port, capa, ip-address)
     with +OK, except `REPLCONF ACK`, which is never answered. PSYNC/SYNC is answered by one write()
     of the bytes given to script_psync(), so coalescing on the wire is deterministic; the optional
-    stream bytes follow in a second write. Afterwards the connection stays open, still recording
-    requests, until the replica closes it or `close_after_psync` is set.
+    stream bytes follow in a second write, after `stream_delay` seconds if given (long enough for
+    the replica to read the first write alone: coalescing is deterministic only then). Afterwards
+    the connection stays open, still recording requests, until the replica closes it or
+    `close_after_psync` is set.
 
     Recorded: `connection_count` (every accepted connection), `requests` (every request as a list
     of words, all connections, in arrival order) and `psync_requests` (the PSYNC ones).
@@ -70,15 +72,17 @@ class FakeClassicMaster:
         self.requests = []
         self._psync_reply = diskless_full_sync()
         self._psync_stream = b""
+        self._stream_delay = 0
         self._close_after_psync = False
         self._server = None
         self._handler_tasks = set()
         self._writers = set()
 
-    def script_psync(self, reply, stream=b"", close_after_psync=False):
+    def script_psync(self, reply, stream=b"", close_after_psync=False, stream_delay=0):
         """Sets what every following PSYNC is answered with (see the class docstring)."""
         self._psync_reply = reply
         self._psync_stream = stream
+        self._stream_delay = stream_delay
         self._close_after_psync = close_after_psync
 
     @property
@@ -90,14 +94,21 @@ class FakeClassicMaster:
         """The offset of every `REPLCONF ACK <offset>` received, in arrival order."""
         return [int(r[2]) for r in self.requests if len(r) == 3 and r[:2] == ["REPLCONF", "ACK"]]
 
-    async def wait_for_ack(self, offset, timeout=30):
-        """Waits until the replica acknowledged exactly `offset`; returns whether it did."""
+    async def wait_for_settled_ack(self, since=0, repeats=3, timeout=30):
+        """Waits until the last `repeats` of the ACKs received after the first `since` ones carry
+        the same offset, i.e. the replica went `repeats - 1` ACK intervals without moving it, and
+        returns that offset (None on timeout). Pass `since=len(ack_offsets)` taken once the replica
+        is known to have applied everything, so that ACKs sent before that cannot settle it.
+
+        A test that checks an offset must wait for this: an ACK of the expected value may appear
+        early and be followed by a larger one, and checking `expected in ack_offsets` would pass."""
         deadline = asyncio.get_running_loop().time() + timeout
-        while offset not in self.ack_offsets:
-            if asyncio.get_running_loop().time() > deadline:
-                return False
+        while asyncio.get_running_loop().time() <= deadline:
+            offsets = self.ack_offsets[since:]
+            if len(offsets) >= repeats and len(set(offsets[-repeats:])) == 1:
+                return offsets[-1]
             await asyncio.sleep(0.05)
-        return True
+        return None
 
     async def wait_for_connections(self, count, timeout=30):
         """Waits until at least `count` connections were accepted; returns the actual number."""
@@ -184,6 +195,7 @@ class FakeClassicMaster:
             writer.write(self._psync_reply)
             await writer.drain()
             if self._psync_stream:
+                await asyncio.sleep(self._stream_delay)
                 writer.write(self._psync_stream)
             await writer.drain()
             return not self._close_after_psync
