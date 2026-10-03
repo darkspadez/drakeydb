@@ -1,0 +1,125 @@
+name: drakeydb-ci
+
+# Fork-owned checks that upstream's ci.yml does not run. Keep fork-only CI here so upstream merges
+# of ci.yml stay conflict free.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Replicates from a real KeyDB, which no other job has. KEYDB_REQUIRED=1 makes a missing KeyDB
+  # binary fail the tests instead of silently skipping them.
+  keydb-interop:
+    # Not on upstream or its forks, in case this workflow is ever merged back.
+    if: github.repository == 'darkspadez/drakeydb'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    permissions:
+      contents: read
+      packages: read
+      actions: write # To allow deleting an invalid deps cache
+
+    env:
+      KEYDB_VERSION: v6.3.4
+
+    # Same container as ci.yml's Debug g++ leg.
+    container:
+      image: ghcr.io/romange/ubuntu-dev:24
+      # Seems that docker by default prohibits running iouring syscalls
+      options: --security-opt seccomp=unconfined --sysctl "net.ipv6.conf.all.disable_ipv6=0"
+      volumes:
+        - /:/hostroot
+        - /mnt:/mnt
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Free disk space
+        run: |
+          df -h
+          rm -rf /hostroot/usr/share/dotnet
+          rm -rf /hostroot/usr/local/share/boost
+          rm -rf /hostroot/usr/local/lib/android
+          rm -rf /hostroot/opt/ghc
+          df -h
+
+      # Also needed on a cache hit below: keydb-server links these libraries dynamically.
+      - name: Install KeyDB dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential nasm autotools-dev autoconf libjemalloc-dev tcl tcl-dev uuid-dev \
+            libcurl4-openssl-dev libbz2-dev libzstd-dev liblz4-dev libsnappy-dev libssl-dev
+
+      - name: Restore KeyDB
+        id: keydb-cache
+        uses: actions/cache@v6
+        with:
+          # Workspace relative: actions/cache runs inside the container, where host paths do not exist.
+          path: keydb-bin/keydb-server
+          # Built against the container's libraries, so the container is part of the key.
+          key: keydb-${{ env.KEYDB_VERSION }}-${{ runner.os }}-ubuntu-dev-24
+
+      - name: Build KeyDB
+        if: steps.keydb-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "${KEYDB_VERSION}" https://github.com/Snapchat/KeyDB \
+            "${RUNNER_TEMP}/KeyDB"
+          make -C "${RUNNER_TEMP}/KeyDB" -j"$(nproc)" BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc
+          mkdir -p "${GITHUB_WORKSPACE}/keydb-bin"
+          cp "${RUNNER_TEMP}/KeyDB/src/keydb-server" "${GITHUB_WORKSPACE}/keydb-bin/keydb-server"
+
+      - name: Check KeyDB
+        run: |
+          "${GITHUB_WORKSPACE}/keydb-bin/keydb-server" --version
+
+      # The inputs match ci.yml's Debug g++ ubuntu-dev:24 leg (apart from the targets), so the two
+      # workflows share one ccache and one third-party deps cache. Change them together.
+      - name: Build drakeydb
+        uses: ./.github/actions/builder
+        with:
+          enable-ccache: 'true'
+          ccache-save: 'true'
+          enable-deps-cache: 'true'
+          build-type: Debug
+          cache-key-suffix: ubuntu-dev:24
+          ccache-max-size: 1G
+          c-compiler: gcc
+          cxx-compiler: g++
+          # -no-pie to disable address randomization so we could symbolize stacktraces
+          cxx-flags: -Werror -no-pie
+          sanitizers: NoSanitizers
+          with-aws: 'OFF'
+          targets: dragonfly
+
+      - name: Install Python test requirements
+        run: ${GITHUB_WORKSPACE}/.github/scripts/install-pytest-requirements.sh
+
+      - name: Run KeyDB interop and multi-master tests
+        run: |
+          export DRAGONFLY_PATH="${GITHUB_WORKSPACE}/build/dragonfly"
+          export KEYDB_SERVER_PATH="${GITHUB_WORKSPACE}/keydb-bin/keydb-server"
+          export KEYDB_REQUIRED=1
+          timeout 90m pytest tests/dragonfly/keydb_onboarding_test.py tests/dragonfly/multimaster_test.py \
+            -v --timeout=300 --color=yes --log-cli-level=INFO
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: keydb_interop_logs
+          path: /tmp/failed/*

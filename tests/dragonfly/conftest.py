@@ -25,7 +25,7 @@ import redis
 from redis import asyncio as aioredis
 
 from . import PortPicker
-from .instance import DflyInstance, DflyInstanceFactory, DflyParams, RedisServer
+from .instance import DflyInstance, DflyInstanceFactory, DflyParams, KeyDBServer, RedisServer
 from .proxy import Proxy
 from .utility import (
     DflySeederFactory,
@@ -629,3 +629,36 @@ def redis_local_server(port_picker) -> RedisServer:
     time.sleep(1)
     yield s
     s.stop()
+
+
+@pytest.fixture(scope="function")
+def keydb_server_factory(port_picker, df_log_dir) -> typing.Callable[..., KeyDBServer]:
+    """Creates started KeyDB servers via `create(**kwargs)`; all are stopped at teardown.
+
+    Without a keydb-server binary the test is skipped, unless KEYDB_REQUIRED=1 (gate and CI runs),
+    where a missing binary must fail instead of silently dropping the interop coverage.
+    """
+    if KeyDBServer.find_binary() is None:
+        reason = "keydb-server not found (set KEYDB_SERVER_PATH or add it to PATH)"
+        if os.environ.get("KEYDB_REQUIRED") == "1":
+            pytest.fail(reason, pytrace=False)
+        pytest.skip(reason)
+
+    servers = []
+
+    def create(start=True, **kwargs) -> KeyDBServer:
+        server = KeyDBServer(port_picker.get_available_port(), log_dir=df_log_dir, **kwargs)
+        servers.append(server)
+        if start:
+            server.start()
+        return server
+
+    yield create
+    for server in servers:
+        server.stop()
+
+
+@pytest.fixture(scope="function")
+def keydb_server(keydb_server_factory) -> KeyDBServer:
+    """One started KeyDB with the default config (active replica)."""
+    return keydb_server_factory()
