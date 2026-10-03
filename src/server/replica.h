@@ -284,6 +284,17 @@ class Replica : ProtocolClient {
   // (multi_master.h). Atomic: read from the INFO fiber via GetSummary(), written from the
   // replication fiber running Greet().
   std::atomic<int64_t> clock_skew_ms_{0};
+
+  // drakeydb: P7 -- true iff the master answered a `REPLCONF capa` of this connection's Greet()
+  // with the `active-replica` word (an active KeyDB does). Cleared at the top of every Greet().
+  // Only the replication fiber touches it.
+  bool master_active_replica_ = false;
+
+  // drakeydb: P7 -- replication stream bytes already read from the master but not yet applied: what
+  // follows a correct classic full sync (InitiatePSync), and the hand-off point for any later
+  // phase that over-reads. ConsumeRedisStream parses them before it reads the socket, so they are
+  // counted into repl_offs_ like any other stream byte. Only the replication fiber touches it.
+  std::string pending_stream_bytes_;
 };
 
 class RdbLoader;

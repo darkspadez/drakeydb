@@ -10,8 +10,9 @@ no home in the phase currently being worked on. Two parts:
   the phase that should close it.
 
 Add entries as they are found. Delete an entry only when it is filed upstream (Part 1, with the
-issue link recorded) or landed (Part 2). Every entry states how it was established, so a reader
-can tell a live-proven defect from a static argument.
+issue link recorded), landed (Part 2), or withdrawn (either part; keep a withdrawn entry for one
+phase as a record first). Every entry states how it was established, so a reader can tell a
+live-proven defect from a static argument.
 
 Related: [UPSTREAM-SYNC.md](UPSTREAM-SYNC.md) (merge workflow), [PLAN.md](PLAN.md) (phase plan).
 
@@ -183,7 +184,7 @@ in source.
 
 **Status:** not filed.
 
-### U-8. `GEORADIUS`/`GEORADIUSBYMEMBER`'s `STORE` destination never replicates
+### U-8. `GEORADIUS`/`GEORADIUSBYMEMBER`'s `STORE` destination never replicates -- withdrawn (not a bug)
 
 **Where:** `src/server/geo_family.cc:779,782` — both registered
 `CO::JOURNALED | CO::STORE_LAST_KEY | CO::NO_AUTOJOURNAL`, and the file has no `RecordJournal`
@@ -199,15 +200,17 @@ issuing node and never reaches any replica or peer, regardless of configuration.
 `WillAutoJournalVerbatim`/`NO_AUTOJOURNAL` audit that found the `SORT` defect. Not reproduced
 against a live replica.
 
-**Status:** not filed.
-
 **Status (2026-10-03): withdrawn — not a bug.** The static argument above missed that the
 `STORE` callback sets `zparams.journal_update = true` (`geo_family.cc:654`) and writes through
-`ZSetFamily::OpAdd`, which hand-journals the destination itself (`zset_family.cc:1963`, `:2053`).
-Live re-test (P7-0 Task 0.1, debug build of `c60dfdb`, `--proactor_threads 4` → 4 shards): after
-stable sync was confirmed with a marker key, 8 `GEORADIUS … STORE` and 8 `GEORADIUSBYMEMBER …
-STOREDIST` destinations written on the master all reached a plain replica byte-for-byte (16/16,
-`ZRANGE … WITHSCORES` digests equal). Kept here for one phase as a record, then delete.
+`ZSetFamily::OpAdd`, which hand-journals the destination itself: a bare `DEL` for an empty result
+(`zset_family.cc:1963`) and, for a non-empty one, `DEL` then `ZADD` (`:2053` opens the branch;
+`DEL` is recorded at `:2055`, `ZADD` at `:2072`). What does remain true of these commands is the
+`DEL` + `ZADD` split that D-21 registers — a different defect (a stale result merging into a newer
+destination), not a failure to replicate. Live re-test (P7-0 Task 0.1, debug build of `c60dfdb`,
+`--proactor_threads 4` → 4 shards): after stable sync was confirmed with a marker key, 8
+`GEORADIUS … STORE` and 8 `GEORADIUSBYMEMBER … STOREDIST` destinations written on the master all
+reached a plain replica byte-for-byte (16/16, `ZRANGE … WITHSCORES` digests equal). Kept here for
+one phase as a record, then delete.
 
 ### U-9. `EvalInternal`'s connection migration can null-deref on a classic replicated-apply link
 
@@ -235,10 +238,42 @@ classic links either way, but a classic upstream master is the most direct route
 `EVAL` reaching this exact branch via replication.
 
 **How established:** static reading of `EvalInternal`'s migration branch composed with
-`JournalExecutor`'s constructor; not reproduced against a live crash (would need a single-shard
-`EVAL` whose key lands on a different shard than the one that dispatches the replicated apply).
+`JournalExecutor`'s constructor; reproduced deterministically by P7-0 Task 0.5 (a `JournalExecutor`
+on thread 0 applying `EVAL "return redis.call('SET', KEYS[1], 'v')" 1 <key on another shard>`
+raised SIGSEGV in `Connection::RequestAsyncMigration` 3/3 on the unfixed build).
 
-**Status:** not filed.
+**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.5): the migration branch also requires
+`conn_cntx->conn() != nullptr` — migration is a latency optimisation, so skipping it is
+semantically neutral. Regression test `DflyEngineTest.EvalReplicatedApplyNoConnNoCrash`
+(`src/server/dragonfly_test.cc`). Still not filed upstream.
+
+### U-10. `VerifyCommandState`'s `TAKEN_OVER` branch dereferences a null `conn()` on a replicated apply
+
+**Where:** `src/server/main_service.cc`, `Service::VerifyCommandState`, `case
+GlobalState::TAKEN_OVER:` — `dfly_cntx.conn()->IsPrivileged() || ...`. The restricted-command check
+a few lines above guards the same call with `dfly_cntx.conn() != nullptr` ("no connection owner
+means the command is internal, therefore always permitted"); this branch does not.
+
+Every replicated apply dispatches through `Service::DispatchCommand` with a context whose `conn()`
+is `nullptr` (`JournalExecutor`; `Replica::ConsumeRedisStream`'s own bare `ConnectionContext`). A
+node in `TAKEN_OVER` that is still applying its own master's stream therefore crashes on the first
+applied command. `TAKEN_OVER` is set by `DFLY TAKEOVER` (`dflycmd.cc`) on the node a replica takes
+over, and a node that is itself a replica is only possible with cascaded replication
+(`--experimental_cascaded_partial_sync`, off by default; `ServerFamily::ReplConf` refuses to
+replicate a replica otherwise) — so reachable on any apply path (DFLY stable sync and a classic
+link alike) of a cascaded node whose upstream keeps writing during a `REPLTAKEOVER`.
+
+**How established:** live and in-process. Chain `master -> r1 -> r2`, `--proactor_threads 4
+--experimental_cascaded_partial_sync`, ~1 s of pipelined `APPEND`s on `master`, then `REPLTAKEOVER 10`
+on `r2`: `r1` died with SIGSEGV 4/4 on the unfixed build (stack `DflyShardReplica::StableSyncDflyReadFb
+-> ExecuteTx -> JournalExecutor::Execute -> Service::DispatchCommand`) and exited 0 with
+`REPLTAKEOVER` answering `OK` 5/5 after the fix. Deterministically, `DflyEngineTest.
+ReplicatedApplyDuringTakeoverNoCrash` crashes at `main_service.cc:1430` (gdb) without it.
+
+**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.5, same commit as U-9): a context with no
+connection is never refused by the `TAKEN_OVER` gate, as at the restricted-command check — refusing
+it would drop the upstream's writes on a takeover that then fails back to `ACTIVE`. Still not
+filed upstream.
 
 ---
 

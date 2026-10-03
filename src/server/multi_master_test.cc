@@ -10137,16 +10137,27 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
       << "the concurrent snapshot itself must have completed undisturbed";
 
   // The skip must be a deferral, not a permanent miss: with the consumer now unregistered, the
-  // very next reap call must clean "rs" up normally.
-  absl::SetFlag(&FLAGS_active_replica, true);
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
-    db_slice.DeleteExpiredStep(db_cntx, 100);
-  });
-  absl::SetFlag(&FLAGS_active_replica, false);
+  // reaper must clean "rs" up. One DeleteExpiredStep call is not guaranteed to get there: it stops
+  // at a one-millisecond quota that is wall time (ThisFiber::GetRunningTimeCycles), so a thread the
+  // OS deschedules for a millisecond -- routine on a loaded CI box -- ends a call before it reaches
+  // "rs"'s bucket, just as it can a production heartbeat tick, which resumes on the next tick.
+  // Do the same: a fresh quota per call (reset_time_quota) and a bounded number of calls. What is
+  // asserted is that the reaper does reach "rs" once the consumer is gone, not that one call does.
+  constexpr int kMaxReapCalls = 100;
+  int reap_calls = 0;
+  do {
+    absl::SetFlag(&FLAGS_active_replica, true);
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+      db_slice.DeleteExpiredStep(db_cntx, 100, {.reset_time_quota = true});
+    });
+    absl::SetFlag(&FLAGS_active_replica, false);
+    ++reap_calls;
+  } while (Run({"exists", "rs"}).GetInt() != 0 && reap_calls < kMaxReapCalls);
   EXPECT_EQ(Run({"exists", "rs"}).GetInt(), 0)
-      << "the reaper did not resume once the snapshot consumer unregistered";
+      << "the reaper did not resume once the snapshot consumer unregistered, in " << reap_calls
+      << " calls";
 }
 
 // drakeydb: P4-0 Task 2b, fix round 6 Critical 2 -- regression test for the race the coordinator

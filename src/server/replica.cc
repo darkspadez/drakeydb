@@ -30,6 +30,7 @@ extern "C" {
 #include "facade/redis_parser.h"
 #include "facade/reply_capture.h"
 #include "facade/socket_utils.h"
+#include "server/classic_replay.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/journal/executor.h"
@@ -391,8 +392,22 @@ error_code Replica::Greet() {
   // A reconnect attempt represents a new observation window. Clear the previous connection's
   // skew before the first operation can fail so INFO never reports data from an older handshake.
   clock_skew_ms_.store(0, std::memory_order_relaxed);
+  master_active_replica_ = false;
   ResetParser(RedisParser::Mode::CLIENT);
   VLOG(1) << "greeting message handling";
+  // drakeydb: an active KeyDB appends capability words to every `REPLCONF capa` reply
+  // ("+OK active-replica"), which the strict CheckRespIsSimpleReply("OK") refuses. Accept exactly
+  // "OK" or "OK <words>" for those replies only; every other reply keeps its strict check.
+  auto read_capa_reply = [this]() {
+    CapaReply capa;
+    if (LastResponseArgs().size() == 1 && LastResponseArgs()[0].type == RespExpr::STRING)
+      capa = ParseCapaReply(ToSV(LastResponseArgs()[0].GetBuf()));
+    if (capa.active_replica && !master_active_replica_) {
+      master_active_replica_ = true;
+      VLOG(1) << "Master " << server().Description() << " advertises active-replica";
+    }
+    return capa;
+  };
   // Corresponds to server.repl_state == REPL_STATE_CONNECTING state in redis
   RETURN_ON_ERR(SendCommandAndReadResponse("PING"));  // optional.
   // drakeydb D-7 (review round 2): a peer that is transiently LOADING (e.g. mid its own full
@@ -429,7 +444,7 @@ error_code Replica::Greet() {
 
   // Corresponds to server.repl_state == REPL_STATE_SEND_CAPA
   RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa eof capa psync2"));
-  PC_RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
+  PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok);
 
   // drakeydb: node identity exchange (KeyDB-compatible; KeyDB sends uuid right after its capa
   // batch). Clear the previous connection's identity before the exchange so an unsupported reply
@@ -608,7 +623,7 @@ error_code Replica::Greet() {
   PC_RETURN_ON_BAD_RESPONSE(CheckRespFirstTypes({RespExpr::STRING}));
 
   if (LastResponseArgs().size() == 1) {  // Redis
-    PC_RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
+    PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok);
   } else if (LastResponseArgs().size() >= 3) {  // it's dragonfly master.
     PC_RETURN_ON_BAD_RESPONSE(!HandleCapaDflyResp());
     if (auto ec = ConfigureDflyMaster(); ec)
@@ -714,6 +729,7 @@ std::error_code Replica::ConfigureDflyMaster() {
 
 error_code Replica::InitiatePSync() {
   base::IoBuf io_buf{128};
+  pending_stream_bytes_.clear();
 
   // Corresponds to server.repl_state == REPL_STATE_SEND_PSYNC
   string id("?");  // corresponds to null master id and null offset
@@ -815,24 +831,51 @@ error_code Replica::InitiatePSync() {
     RETURN_ON_ERR(ec);
     VLOG(1) << "full sync completed";
 
+    // drakeydb: P7 -- a full sync whose tail disagrees with its header (an EOF token that is short
+    // or wrong, an RDB that is not as long as declared) is the master's malformed output: an error
+    // that makes the replication fiber reconnect, never an abort. `cleanup` above removes the
+    // LOADING state on the way out.
+    auto bad_tail = [](string_view what) {
+      LOG(ERROR) << "Bad full sync tail from the master: " << what;
+      return std::make_error_code(errc::bad_message);
+    };
+    // Bytes behind a correct full sync are the start of the replication stream, not garbage: a
+    // master that sends the RDB as `$<len>` (disk-based sync) flushes the commands buffered while
+    // it was being produced right behind it, often in the same segment, and RdbLoader reads ahead
+    // of the RDB's end. They go to ConsumeRedisStream, which parses them before reading the socket.
+    auto keep_stream_bytes = [this](io::Bytes bytes) {
+      pending_stream_bytes_.append(facade::ToSV(bytes));
+    };
+
     if (token) {
       uint8_t buf[kRdbEofMarkSize];
       io::PrefixSource chained(loader.Leftover(), &ps);
       VLOG(1) << "Before reading from chained stream";
       io::Result<size_t> eof_res = chained.Read(io::MutableBytes{buf});
-      CHECK(eof_res && *eof_res == kRdbEofMarkSize);
+      if (!eof_res) {
+        LOG(ERROR) << "Failed to read the full sync EOF token: " << eof_res.error().message();
+        return eof_res.error();
+      }
+      if (*eof_res != kRdbEofMarkSize) {
+        return bad_tail(
+            StrCat("EOF token is ", *eof_res, " bytes long, expected ", kRdbEofMarkSize));
+      }
 
       VLOG(1) << "Comparing token " << ToSV(buf);
 
-      // TODO: handle gracefully...
-      CHECK_EQ(0, memcmp(token->data(), buf, kRdbEofMarkSize));
-      CHECK(chained.UnusedPrefix().empty());
+      if (memcmp(token->data(), buf, kRdbEofMarkSize) != 0)
+        return bad_tail("EOF token does not match the one in the header");
+      keep_stream_bytes(chained.UnusedPrefix());
     } else {
-      CHECK_EQ(0u, loader.Leftover().size());
-      CHECK_EQ(snapshot_size, loader.bytes_read());
+      // The loader never reads past the declared size (RdbLoader::set_source_limit), so what it
+      // did not consume of what it read is the declared RDB's missing end.
+      const size_t rdb_size = loader.bytes_read() - loader.Leftover().size();
+      if (rdb_size != snapshot_size) {
+        return bad_tail(
+            StrCat("RDB is ", rdb_size, " bytes long, the header said ", snapshot_size));
+      }
     }
-
-    CHECK(ps.UnusedPrefix().empty());
+    keep_stream_bytes(ps.UnusedPrefix());
     io_buf.ConsumeInput(io_buf.InputLen());
     TouchIoTime();
   } else {
@@ -1110,6 +1153,12 @@ error_code Replica::InitiateDflySync(std::optional<LastMasterSyncData> last_mast
 
 error_code Replica::ConsumeRedisStream() {
   base::IoBuf io_buf(128_KB);
+  // drakeydb: P7 -- stream bytes that arrived behind the full sync (see InitiatePSync) are parsed
+  // first, so they are applied, and counted into repl_offs_, as if just read from the socket.
+  if (!pending_stream_bytes_.empty()) {
+    io_buf.WriteAndCommit(pending_stream_bytes_.data(), pending_stream_bytes_.size());
+    std::string().swap(pending_stream_bytes_);
+  }
   ConnectionContext conn_context{nullptr, {}};
   conn_context.is_replicating = true;
   conn_context.journal_emulated = true;
@@ -1907,7 +1956,10 @@ error_code Replica::ParseReplicationHeader(base::IoBuf* io_buf, PSyncResponse* d
     std::string_view token = str.substr(1);
     VLOG(1) << "token: " << token;
     if (absl::ConsumePrefix(&token, "EOF:")) {
-      CHECK_EQ(kRdbEofMarkSize, token.size()) << token;
+      // drakeydb: P7 -- the token's size is the master's to get wrong; refuse the header and
+      // reconnect rather than abort.
+      if (token.size() != kRdbEofMarkSize)
+        return bad_header();
       dest->fullsync.emplace<string>(token);
       VLOG(1) << "Token: " << token;
     } else {
