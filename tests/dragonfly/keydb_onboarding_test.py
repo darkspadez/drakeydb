@@ -8,10 +8,19 @@ tests need no KeyDB.
 """
 
 import asyncio
+import contextlib
 import functools
+import json
+import logging
+import os
+import random
 import re
+import shutil
+import statistics
+import subprocess
 import time
 
+import psutil
 import pytest
 import redis
 from redis import asyncio as aioredis
@@ -27,6 +36,7 @@ from .fake_classic_master import (
     resp_command,
 )
 from .instance import DflyInstanceFactory, RedisServer
+from .replication_utils import get_metric_value
 from .utility import assert_eventually, skip_if_not_in_github, wait_available_async
 
 PRE_STRINGS = {f"pre:{i}": f"v{i}" for i in range(100)}
@@ -2336,3 +2346,484 @@ async def test_plain_replica_of_active_keydb_keeps_a_ttl_less_orphan_of_a_ttl_ke
         # The three orphans and the two markers; with --hz=0 also `swept`, which nothing deleted.
         assert await c.dbsize() == 5 + (1 if sweep == "access_only" else 0)
         assert master.connection_count == 1, "the replica reconnected"
+
+
+# Throughput: the RREPLAY path must keep up with KeyDB (spec D-12, owner decision 12).
+#
+# The release bar (DRAKEYDB_PERF=1, a release drakeydb on a quiet 4-cpu box) pins KeyDB's one
+# server thread, the replica under test and the load generator, which shares its cpu with this
+# test's light sampling, to cpus of their own, so that none of them takes time from another.
+KEYDB_CPUS = [0]
+REPLICA_CPUS = [1, 2]
+LOADER_CPUS = [3]
+
+KEYSPACE = 100_000  # redis-benchmark's `-r`: the number of keys a write can pick
+PERF_WINDOW_S = 30
+SMOKE_WINDOW_S = 10
+SMOKE_OPS_PER_S = 5000
+# The load is sampled once a second, and the steady window leaves out this many samples (seconds)
+# at both ends, where the load starts and stops.
+STEADY_TRIM = 2
+MB = 1 << 20
+
+
+def perf_mode():
+    """Whether to run the release bar of spec D-12 and not the functional smoke."""
+    return os.environ.get("DRAKEYDB_PERF", "").strip().lower() in ("1", "true", "yes")
+
+
+def pin_threads(pid, cpus, spread_proactors=False):
+    """Pins every thread of process `pid` to `cpus`.
+
+    helio pins Proactor<i> to one cpu of the mask its process starts with. With `spread_proactors`
+    each one keeps that single cpu (cpus[i % len(cpus)]), as it would under `taskset -c`."""
+    for tid in os.listdir(f"/proc/{pid}/task"):
+        mask = set(cpus)
+        with contextlib.suppress(FileNotFoundError, ProcessLookupError):  # a thread that exited
+            if spread_proactors:
+                with open(f"/proc/{pid}/task/{tid}/comm") as f:
+                    proactor = re.fullmatch(r"Proactor(\d+)", f.read().strip())
+                if proactor:
+                    mask = {cpus[int(proactor.group(1)) % len(cpus)]}
+            os.sched_setaffinity(int(tid), mask)
+
+
+@contextlib.contextmanager
+def driver_pinned_to(cpus):
+    """Pins the calling thread, which runs the test's event loop, to `cpus` for the block."""
+    before = os.sched_getaffinity(0)
+    os.sched_setaffinity(0, cpus)
+    try:
+        yield
+    finally:
+        os.sched_setaffinity(0, before)
+
+
+def cpu_seconds(pid):
+    times = psutil.Process(pid).cpu_times()
+    return times.user + times.system
+
+
+class BenchmarkLoad:
+    """The release bar's load: redis-benchmark's pipelined SETs and INCRs, as fast as KeyDB takes
+    them.
+
+    The spec's `redis-benchmark -P 100 -c 50 -t set,incr -r 100000` runs the two tests one after
+    the other, `-n` requests each. Here they run side by side, 25 connections each, so that the
+    whole window carries both. The window is the time between start() and stop(), which kills
+    them: redis-benchmark 7.0 has no duration, and an `-n` sized for one machine would make the
+    window as long as that machine is slow. KeyDB executes the commands it has read whole, so a
+    kill mid-pipeline leaves a clean stream.
+    """
+
+    def __init__(self, port, cpus):
+        self.port = port
+        self.cpus = cpus
+        self.procs = []
+
+    def start(self):
+        for test in ("set", "incr"):
+            command = ["redis-benchmark", "-p", str(self.port), "-P", "100", "-c", "25"]
+            command += ["-t", test, "-r", str(KEYSPACE), "-n", "2000000000", "-q"]
+            command = ["taskset", "-c", ",".join(map(str, self.cpus))] + command
+            self.procs.append(
+                subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            )
+
+    async def stop(self):
+        for proc in self.procs:
+            proc.terminate()
+        for proc in self.procs:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+    def cpu_seconds(self):
+        return sum(cpu_seconds(proc.pid) for proc in self.procs)
+
+
+class CappedLoad:
+    """The smoke's load: SETs and INCRs of the same keys, pipelined in batches over one connection
+    at about `rate` commands a second, which a debug build on a shared box can keep up with."""
+
+    BATCH = 100
+
+    def __init__(self, client, rate):
+        self.client = client
+        self.rate = rate
+        self.task = None
+
+    def start(self):
+        self.task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        period = self.BATCH / self.rate
+        next_at = time.monotonic()
+        while True:
+            pipe = self.client.pipeline(transaction=False)
+            for _ in range(self.BATCH // 2):
+                i = random.randrange(KEYSPACE)
+                pipe.set(f"key:{i:012d}", "xxx")
+                pipe.incr(f"counter:{i:012d}")
+            await pipe.execute()
+            next_at += period
+            await asyncio.sleep(max(0.0, next_at - time.monotonic()))
+
+    async def stop(self):
+        if self.task is not None:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
+
+    def cpu_seconds(self):
+        return 0.0  # runs inside this process
+
+
+class ReplicationProbe:
+    """Times the replication delay: every 100 ms it writes a marker key into KeyDB and polls the
+    replica, every millisecond, for the time until it can read it. Two INFOs a few milliseconds
+    apart resolve a lag only to a few hundred KB at the release bar's rate; this is the time a client
+    waits for a write, to a millisecond or two, which is what two replicas can be compared by. The
+    cost is ten writes and some hundreds of reads a second."""
+
+    GIVE_UP_S = 5.0
+
+    def __init__(self, master, replica, started):
+        self.master = master
+        self.replica = replica
+        self.started = started
+        self.delays = []  # (second of the window the marker was written at, delay in seconds)
+        self.task = None
+
+    def start(self):
+        self.task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        for n in range(1, 1 << 30):
+            key = f"marker:{n}"
+            await self.master.set(key, n)
+            written = time.monotonic()
+            while (
+                await self.replica.get(key) is None and time.monotonic() - written < self.GIVE_UP_S
+            ):
+                await asyncio.sleep(0.001)
+            self.delays.append((written - self.started, time.monotonic() - written))
+            await asyncio.sleep(0.1)
+
+    async def stop(self):
+        self.task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.task
+
+    def summary(self, first_s, last_s):
+        """The delays, in ms, of the markers written between `first_s` and `last_s` of the window."""
+        delays = sorted(1000 * d for at, d in self.delays if first_s <= at <= last_s)
+
+        def quantile(q):
+            return round(delays[min(len(delays) - 1, int(q * len(delays)))], 1)
+
+        return {"n": len(delays), "p50": quantile(0.5), "p99": quantile(0.99), "max": quantile(1)}
+
+
+async def take_sample(started, master, replica, cpu_sources):
+    """One reading of both servers, taken concurrently. Each time stamp is the middle of its own
+    request: under load a server can take milliseconds to answer."""
+
+    async def timed(request):
+        sent = time.monotonic()
+        reply = await request
+        return reply, (sent + time.monotonic()) / 2 - started
+
+    (m, tm), (stats, _), (r, tr) = await asyncio.gather(
+        timed(master.info("replication")),
+        timed(master.info("commandstats")),
+        timed(replica.info("replication")),
+    )
+    # KeyDB drops a replica whose output buffer outgrows its limit (256 MB by default), one that
+    # has fallen that far behind; INFO then has no offset.
+    assert (
+        r.get("master_link_status") == "up" and "slave_repl_offset" in r
+    ), f"the replica's link is down: {r}"
+    return {
+        "tm": tm,
+        "tr": tr,
+        "m": int(m["master_repl_offset"]),
+        "r": int(r["slave_repl_offset"]),
+        # An active KeyDB rewrites INCR into the INCRBY it replicates, and counts it as that.
+        "ops": sum(
+            stats.get(f"cmdstat_{name}", {}).get("calls", 0) for name in ("set", "incr", "incrby")
+        ),
+        # drakeydb counts the envelopes it applied; KeyDB has no such field.
+        "envelopes": r.get("rreplay_unwrapped"),
+        "cpu": {name: source() for name, source in cpu_sources.items()},
+    }
+
+
+def summarise(samples):
+    """The rates, lag and CPU use of one second-by-second series, over its steady window."""
+    # The two offsets are read within milliseconds of each other and the master's moves by
+    # megabytes a second, so a lag carries a noise of a few hundred KB at the release bar's rate (it
+    # can read below 0): far below the bounds, but too coarse to compare two replicas by. The
+    # replication delay of the probe (ReplicationProbe) is the finer measure for that.
+    lags = [sample["m"] - sample["r"] for sample in samples]
+
+    steady = samples[STEADY_TRIM:-STEADY_TRIM]
+    steady_lags = lags[STEADY_TRIM:-STEADY_TRIM]
+    first, last = steady[0], steady[-1]
+    master_s, replica_s = last["tm"] - first["tm"], last["tr"] - first["tr"]
+    offered = (last["ops"] - first["ops"]) / master_s
+    produced = (last["m"] - first["m"]) / master_s
+    assert offered > 0 and produced > 0, f"no load reached KeyDB: {first} {last}"
+    applied = (last["r"] - first["r"]) / replica_s
+    bytes_per_op = produced / offered
+    result = {
+        "offered_ops_per_s": round(offered),
+        "produce_bytes_per_s": round(produced),
+        "apply_bytes_per_s": round(applied),
+        "apply_ops_per_s": round(applied / bytes_per_op),  # at the master's bytes per command
+        "bytes_per_op": round(bytes_per_op, 1),
+        "ratio": round(applied / produced, 4),
+        "max_lag": max(steady_lags),
+        "median_lag": round(statistics.median(steady_lags)),
+        "lag_series": lags,
+        "cpu_pct": {
+            name: round(100 * (last["cpu"][name] - first["cpu"][name]) / master_s, 1)
+            for name in first["cpu"]
+        },
+    }
+    if last["envelopes"] is not None:
+        result["applied_envelopes_per_s"] = round(
+            (last["envelopes"] - first["envelopes"]) / replica_s
+        )
+    return result
+
+
+def bar_bounds(perf, produced):
+    """The bounds of spec D-12: the release bar under DRAKEYDB_PERF, else the smoke's loose ones."""
+    if perf:
+        return {"min_ratio": 0.95, "max_lag": max(2 * produced, 8 * MB), "max_drain_s": 2.0}
+    return {"min_ratio": 0.5, "max_lag": 32 * MB, "max_drain_s": 10.0}
+
+
+async def wait_drained(master, replica, stopped_at, give_up_s):
+    """Seconds from `stopped_at` until the replica holds everything KeyDB wrote, None if that takes
+    longer than `give_up_s`.
+
+    Polls every 50 ms for a poll with equal offsets that the next poll finds unchanged on the
+    master's side: KeyDB may still be working through what the generators sent, and an offset that
+    only met the master's on its way up does not count."""
+    equal_at = equal_offset = None
+    while time.monotonic() - stopped_at <= give_up_s:
+        polled_at = time.monotonic()
+        m = int((await master.info("replication"))["master_repl_offset"])
+        r = int((await replica.info("replication"))["slave_repl_offset"])
+        if equal_at is not None and m == equal_offset:
+            return equal_at - stopped_at
+        equal_at, equal_offset = (polled_at, m) if r == m else (None, None)
+        await asyncio.sleep(0.05)
+    return None
+
+
+@assert_eventually(times=300)
+@retry_while_loading
+async def assert_idle_synced(master, replica):
+    """The link is up, KeyDB lists the replica as online, and the replica is at the master's offset."""
+    link = await replica.info("replication")
+    assert link["master_link_status"] == "up", link
+    info = await master.info("replication")
+    assert info["slave0"]["state"] == "online", info
+    assert int(link["slave_repl_offset"]) == int(info["master_repl_offset"]), (link, info)
+
+
+async def assert_same_keys(master, replica):
+    """Both servers hold the same keys with the same values: the SET keys and the INCR counters
+    (their values are the number of INCRs each took), every one of the KEYSPACE names of each."""
+    assert await replica.dbsize() == await master.dbsize()
+    for prefix in ("key", "counter"):
+        for start in range(0, KEYSPACE, 1000):
+            names = [f"{prefix}:{i:012d}" for i in range(start, start + 1000)]
+            wanted, got = await master.mget(names), await replica.mget(names)
+            differ = [name for name, w, g in zip(names, wanted, got) if w != g]
+            assert not differ, f"{len(differ)} {prefix} keys differ here, e.g. {differ[:3]}"
+
+
+async def sync_counts(k):
+    """KeyDB's count of the full syncs and partial resyncs (granted, refused) it has served."""
+    stats = await k.info("stats")
+    return stats["sync_full"], stats["sync_partial_ok"], stats["sync_partial_err"]
+
+
+def record_throughput(name, result):
+    """Logs a run's numbers, and appends them as a JSON line to $DRAKEYDB_PERF_OUT when it is set."""
+    line = json.dumps({"test": name, **result})
+    logging.info("throughput %s", line)
+    if path := os.environ.get("DRAKEYDB_PERF_OUT"):
+        with open(path, "a") as f:
+            f.write(line + "\n")
+
+
+async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_kind, bar):
+    """Writes into an active KeyDB (a plain one for "drakeydb_raw") for a window of PERF_WINDOW_S
+    (SMOKE_WINDOW_S without DRAKEYDB_PERF), with a replica attached and idle-synced first:
+
+    - "drakeydb": a plain drakeydb replica, which unwraps every RREPLAY envelope (the path under test),
+    - "keydb": a second active KeyDB, the comparator of the bar,
+    - "drakeydb_raw": a plain drakeydb replica of the plain KeyDB, whose raw stream it squashes.
+
+    Samples both offsets once a second, checks that the link held, drains, and that the keys match.
+    With `bar` it also asserts the bounds of spec D-12. Returns the numbers.
+    """
+    perf = perf_mode()
+    if perf:
+        if (os.cpu_count() or 0) < 4:
+            pytest.fail("DRAKEYDB_PERF=1 is the 4-cpu release bar: this box has fewer cpus")
+        if shutil.which("redis-benchmark") is None:
+            pytest.fail("DRAKEYDB_PERF=1 needs redis-benchmark on PATH")
+
+    master = keydb_server_factory(active_replica=replica_kind != "drakeydb_raw")
+    async with contextlib.AsyncExitStack() as stack:
+        k = await stack.enter_async_context(master.client())
+        node = None
+        if replica_kind == "keydb":
+            follower = keydb_server_factory(active_replica=True)
+            replica_pid = follower.proc.pid
+            replica = await stack.enter_async_context(follower.client())
+            await replica.execute_command("REPLICAOF", "localhost", master.port)
+        else:
+            # The release bar runs drakeydb with its own defaults, not the harness's (a vmodule
+            # that turns VLOG(1) on and per-command latency tracking).
+            flags = {"latency_tracking": "false", "vmodule": ""} if perf else {}
+            node, replica = await attach_plain_replica(df_factory, tmp_path, master, **flags)
+            replica_pid = node.proc.pid
+        await assert_idle_synced(k, replica)
+        synced = await sync_counts(k)
+        assert synced[0] == 1, synced
+        reconnects = (
+            await get_metric_value(node, "dragonfly_replica_reconnect_count") if node else 0
+        )
+
+        if perf:
+            pin_threads(master.proc.pid, KEYDB_CPUS)
+            pin_threads(replica_pid, REPLICA_CPUS, spread_proactors=node is not None)
+            stack.enter_context(driver_pinned_to(LOADER_CPUS))
+            load, window = BenchmarkLoad(master.port, LOADER_CPUS), PERF_WINDOW_S
+        else:
+            load_client = await stack.enter_async_context(master.client())
+            load, window = CappedLoad(load_client, SMOKE_OPS_PER_S), SMOKE_WINDOW_S
+        cpu_sources = {
+            "keydb_master": lambda: cpu_seconds(master.proc.pid),
+            "replica": lambda: cpu_seconds(replica_pid),
+            "loader": load.cpu_seconds,
+        }
+
+        load_before = os.getloadavg()[0]
+        samples = []
+        probe = None
+        try:
+            load.start()
+            started = time.monotonic()
+            if perf:
+                probe = ReplicationProbe(k, replica, started)
+                probe.start()
+            for i in range(window + 1):
+                await asyncio.sleep(max(0.0, started + i - time.monotonic()))
+                samples.append(await take_sample(started, k, replica, cpu_sources))
+        finally:
+            if probe:
+                await probe.stop()
+            await load.stop()
+        stopped_at = time.monotonic()
+
+        result = summarise(samples)
+        if probe:
+            result["replication_delay_ms"] = probe.summary(STEADY_TRIM, window - STEADY_TRIM)
+        result["samples"] = [
+            [round(s["tm"], 3), round(s["tr"], 3), s["m"], s["r"], s["ops"]] for s in samples
+        ]
+        bounds = bar_bounds(perf, result["produce_bytes_per_s"])
+        result.update(replica=replica_kind, perf=perf, window_s=window, bounds=bounds)
+        result["loadavg_1m_before"] = load_before
+
+        # (1) The link held: no reconnect, and KeyDB served no other sync than the first.
+        link = await replica.info("replication")
+        assert link["master_link_status"] == "up", link
+        if node:
+            assert await get_metric_value(node, "dragonfly_replica_reconnect_count") == reconnects
+        assert await sync_counts(k) == synced, "KeyDB served another sync during the load"
+        assert (await k.info("replication"))["connected_slaves"] == 1
+
+        # The drain is timed before the bounds are asserted, so that a run that fails them still
+        # records all its numbers. It is waited for as long as the bound allows, or a minute when
+        # there are no bounds and only the numbers matter.
+        give_up_s = bounds["max_drain_s"] + 3 if bar else 60
+        drain_s = await wait_drained(k, replica, stopped_at, give_up_s)
+        result["drain_s"] = None if drain_s is None else round(drain_s, 3)
+        record_throughput(f"{replica_kind}:{'perf' if perf else 'smoke'}", result)
+
+        # (2) The replica kept up over the steady window, and (3) the lag drained in time.
+        if bar:
+            skipped = ("lag_series", "samples")
+            summary = {key: value for key, value in result.items() if key not in skipped}
+            assert result["ratio"] >= bounds["min_ratio"], summary
+            assert result["max_lag"] <= bounds["max_lag"], summary
+        assert drain_s is not None, f"not drained {give_up_s} s after the load stopped"
+        if bar:
+            assert drain_s <= bounds["max_drain_s"], result["drain_s"]
+
+        # Both hold the same keys.
+        await assert_same_keys(k, replica)
+        return result
+
+
+@pytest.mark.slow
+@pytest.mark.keydb
+async def test_keydb_onboarding_keeps_up_under_load(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """A plain replica of an active KeyDB keeps up with a write load that KeyDB takes at full speed
+    (owner decision 12, spec D-12). Per-command dispatch of the RREPLAY envelopes gives up the
+    squasher's batching, and this is the measurement that it still keeps up.
+
+    Over a window of pipelined SETs and INCRs, sampled once a second, minus the first and last 2 s:
+    the link never reconnects and KeyDB serves one full sync; the replica's offset advances at
+    least `min_ratio` as fast as the master's, and its lag never exceeds `max_lag`; within
+    `max_drain_s` of the load stopping the lag is 0; and both servers then hold the same keys, the
+    INCR counters included.
+
+    By default this is a smoke, to show the test and the plumbing work on a debug build or a shared
+    CI box: about 5000 writes a second from one asyncio connection, and loose bounds (ratio 0.5,
+    lag 32 MB, drain 10 s). It does not claim the bar. With DRAKEYDB_PERF=1 and a release
+    DRAGONFLY_PATH on a quiet 4-cpu box it is the bar: redis-benchmark at full speed (pinned, see
+    BenchmarkLoad) and a ratio of 0.95, a lag of at most max(2 s of the master's output, 8 MB) and
+    a drain within 2 s.
+
+    Falsifying: a 1 ms sleep per enveloped command in ClassicApplier::ApplyCommand caps the replica
+    at about 1000 commands a second, and the smoke's ratio assertion fails (0.18). Under
+    DRAKEYDB_PERF=1 the same replica falls so far behind that KeyDB drops it, when its output
+    buffer reaches the 256 MB limit, and the sampling reports the link down; a busy wait of 3 us
+    per command fails the bar's ratio instead (0.86).
+    """
+    await run_throughput(
+        df_factory, keydb_server_factory, tmp_path, replica_kind="drakeydb", bar=True
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.keydb
+@pytest.mark.skipif(
+    not perf_mode(), reason="the reference setups of the release bar: DRAKEYDB_PERF=1"
+)
+@pytest.mark.parametrize("replica_kind", ["keydb", "drakeydb_raw"])
+async def test_keydb_throughput_reference_setups(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, replica_kind
+):
+    """The numbers the release bar is judged against, under its load and pinning, and no bounds:
+    a second active KeyDB as the replica (drakeydb's lag must be within 1.5 times of its), and a
+    drakeydb replica of a plain KeyDB, whose raw stream the squasher batches (the reference the
+    envelope path pays against). They run apart from the drakeydb run, so that no replica takes
+    the cpus of another; the link, drain and key checks still hold."""
+    await run_throughput(
+        df_factory, keydb_server_factory, tmp_path, replica_kind=replica_kind, bar=False
+    )
