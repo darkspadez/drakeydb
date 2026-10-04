@@ -433,9 +433,47 @@ The same context reaches every handler that dereferences `conn()` without a chec
 a node that is a master: a peer-mode node, or with `--experimental_cascaded_partial_sync`; a plain
 replica refuses `REPLCONF` before it gets there), `QUIT`, `DFLY THREAD <n>`, and two that do not
 fail at the command: `MONITOR` leaves a null connection in the monitor list, which the next command
-of any client dereferences, and `SUBSCRIBE`/`PSUBSCRIBE` register the stream's context in the
-channel store (a context that is gone when the link ends), which the next client's `PUBLISH`
+of any client dereferences, and `SUBSCRIBE`/`SSUBSCRIBE`/`PSUBSCRIBE` register the stream's context
+in the channel store (a context that is gone when the link ends), which the next client's `PUBLISH`
 dereferences.
+
+The re-review of that fix found a third of the second kind, `WATCH`. `Service::Watch` registers a
+pointer to `exec_info.watched_dirty` of its context in each shard's watched-key table
+(`DbSlice::RegisterWatchedKey`), and only the connection's close, `UNWATCH`, `EXEC` or `RESET`
+unregisters it. On the classic stream that context is a stack local of `Replica::ConsumeRedisStream`,
+so once the stream ends, a write to the key (`DbSlice::PostUpdate`) or a `FLUSHDB`
+(`InvalidateDbWatches`) stores through a dangling pointer. A debug build does not notice the store
+(it lands in a dead fiber stack): the reviewer's `watch_probe.py`, run again for this fix on the
+build without the guard, left the process up through `REPLICAOF NO ONE`, a `SET` of the key and a
+`FLUSHALL`, raw and in an envelope. It is silent memory corruption, not a crash, which is why its
+test reads the registration itself.
+
+**What the guards also cover, and what they change besides the crash.**
+
+- A script. `redis.call` runs its command on the context of the `EVAL` (`CallFromScript`,
+  `main_service.cc`), which in a classic stream has no connection either, and `INFO`, `HELLO` and
+  `QUIT` are not `CO::NOSCRIPT`. The re-review probed `EVAL "return redis.call('INFO')" 0`, raw and
+  in an envelope (`eval_probe.py`): the replica survives, because the guards sit in the handlers,
+  and the script fails with an error that carries `No connection`. With the `Info` and `Hello`
+  guards removed the same scripts kill the replica with SIGSEGV (this follow-up's falsification).
+- The other contexts without a connection, `JournalExecutor` (a Dragonfly master's stream) and the
+  RDB-load search-aux path (`LoadSearchCommandFromAux`, a fixed `FT.CREATE` or `FT.SYNUPDATE`), run
+  on the same kind of context. The aux command name is not the wire's to choose, so nothing there
+  reaches a guarded handler today; the guards are what would keep it safe.
+- `REPLCONF` is guarded at the top of its handler, so every variant now replies `No connection`,
+  including those that never dereferenced the connection (`GETACK`, `ACK`, `UUID`, `PEER`, ...).
+  `REPLCONF GETACK *` is real stock traffic (a master asking for an ACK). What changes is the text
+  of a reply the stream discards: `Replicating a replica is unsupported` on a plain replica,
+  `syntax error` where the handler got past that refusal. Where it did, which is where `IsMaster()`
+  is true (a peer-mode node) or `--experimental_cascaded_partial_sync` is on for a non-active node,
+  every `GETACK` also logged `Error in receiving command, num args: 2` at ERROR, from the generic
+  error callback; that line is gone. The effect is log-only.
+- `CLIENT` has one guard, at the top of `ServerFamily::Client`, for every subcommand (it replaced
+  five per-subcommand guards). It therefore also refuses the subcommands that reached their
+  handlers without a crash (`LIST`, `PAUSE`, `UNPAUSE`, `TRACKING`, `CACHING`, `MIGRATE`, `HELP`)
+  and turns the syntax error of a malformed or unknown one into `No connection`. No stock master
+  propagates `CLIENT`, and it is `CO::NOSCRIPT`, so only a hostile or broken master can send it.
+  `CLIENT SETINFO` keeps the guard upstream gave it.
 
 **How established:** the review's probe, and two throwaway probes as a gtest (each case in its own
 process, on the apply context of the stream, before the fix): 47 commands inside envelopes, then 31
@@ -443,19 +481,27 @@ dispatched raw, which also reaches what an envelope skips, such as `REPLCONF`. `
 `CLIENT` subcommands, `AUTH`, `HELLO`, `QUIT`, `REPLCONF listening-port|capa` and `DFLY THREAD 1`
 die with SIGSEGV; `MONITOR` and `SUBSCRIBE` die on the next client command (`DispatchMonitor`, the
 channel store's `Borrow()`); every other probed command (`CLIENT
-LIST`, `PAUSE`, `TRACKING`, `CACHING` and `MIGRATE` among them) did not.
+LIST`, `PAUSE`, `TRACKING`, `CACHING` and `MIGRATE` among them) did not. The re-review's probes
+(`watch_probe.py`, `eval_probe.py`) found `WATCH` and the script path; `WATCH` is pinned by the
+registration it leaves in `DbTable::watched_keys`, which the test counts across every shard and db.
 
-**Status (2026-10-04): fixed in this fork** (P7-1 review fix round, owner decision 26): each of the
-handlers above replies `No connection` (the error `CLIENT SETINFO` already gives) when its context
-has no connection, and `QUIT` replies `OK` and has nothing to close. The failed command is dropped
-and, inside an envelope, counted in `classic_apply_errors`; the link stays up and the commands
-around it apply. One `// drakeydb: U-15` hunk per handler: nine in `server_family.cc` (a shared
-`ReplyIfNoConnection`), and one each in `main_service.cc` (`Quit`, `Monitor`, `Subscribe`,
-`PSubscribe`) and `dflycmd.cc` (`DFLY THREAD`). The last two files are beyond what owner decision 26
-named. Tests `ClassicNoConnectionTest.*` (one case per handler, `classic_replay_test.cc`),
-`ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver` and
-`.InfoInAnEnvelopeIsAnApplyErrorNotACrash`, and
-`keydb_onboarding_test.py::test_classic_stream_info_command_does_not_abort` (`raw`, `in_envelope`).
+**Status (2026-10-04): fixed in this fork** (P7-1 review fix round, owner decision 26; `WATCH` and
+the `CLIENT` consolidation in the re-review follow-up): each of the handlers above replies `No
+connection` (the error `CLIENT SETINFO` already gives) when its context has no connection, and
+`QUIT` replies `OK` and has nothing to close. The failed command is dropped and, inside an envelope,
+counted in `classic_apply_errors`; the link stays up and the commands around it apply. Eleven
+`// drakeydb: U-15` guards, over a shared `ReplyIfNoConnection` in `server_family.cc`: five in
+`server_family.cc` (`ServerFamily::Client`, once for every subcommand, then `Auth`, `Info`, `Hello`
+and `ReplConf`), five in `main_service.cc` (`Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch`)
+and one in `dflycmd.cc` (`DFLY THREAD`). The last two files are beyond what owner decision 26 named.
+The first fix had fourteen guards: the `CLIENT` consolidation removed the five per-subcommand ones
+and added one. Tests `ClassicNoConnectionTest.*` (one case per guarded handler, plus `Watch`, three
+`EVAL` cases, `REPLCONF GETACK` and the `CLIENT` subcommands that never crashed;
+`classic_replay_test.cc`), `ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver`,
+`.ReplicatedWatchLeavesNoRegistrationBehind`, `.InfoInAnEnvelopeIsAnApplyErrorNotACrash` and
+`.EvalOfAConnectionCommandInAnEnvelopeIsAnApplyErrorNotACrash`, and
+`keydb_onboarding_test.py::test_classic_stream_info_command_does_not_abort` and
+`::test_classic_stream_eval_of_a_connection_command_does_not_abort` (each `raw`, `in_envelope`).
 Pre-existing in upstream Dragonfly; not filed upstream. On the byte-identity exception list (spec,
 item 2).
 
@@ -466,9 +512,48 @@ probed. `GetEmulatedShardInfo` needs a design decision, not a guard: it answers 
 client connected to. `DFLY FLOW` (`SetupFlowConnection`) dereferences it only once the master replid
 matches and a sync session in the preparation state is found, which only a real replica connection
 of this node creates, so a stream could hit it only inside that window, with a replid and a session
-id it has to guess. The class could be closed in one place instead, by the dispatcher refusing
-connection-bound commands for a context without a connection, which needs a flag that marks them;
-that is a design change and was left out.
+id it has to guess.
+
+**A stream-boundary filter was considered and rejected.** The class could be closed once, by the
+dispatcher or `ConsumeRedisStream` refusing connection-bound commands for a context without a
+connection. It does not hold up:
+
+- No existing `CO::` or ACL flag marks the set. `SELECT` and `PING` are `acl::CONNECTION` and stock
+  masters propagate them; `REPLCONF` is `CO::ADMIN` and is streamed as `GETACK`; `INFO` carries only
+  `CO::LOADING`.
+- `EVAL` bodies bypass a filter on the command name: `redis.call` reaches the handler through
+  `CallFromScript`.
+- `JournalExecutor` and the RDB-load search-aux path never pass through the stream boundary.
+- `VerifyCommandState` would skip `RecordLatency` and log an unthrottled WARNING per refused command.
+
+So the per-handler guards stay; any new upstream handler that dereferences `conn()` is a new U-15,
+caught by `ClassicNoConnectionTest` only if a case is added.
+
+### U-16. A blocking command in a classic stream stalls the link and the replica's shutdown
+
+**Where:** `Replica::ConsumeRedisStream` (`src/server/replica.cc`), the dispatch of a raw command on
+the apply context (`service_.DispatchCommand`, the context U-15 describes).
+
+The replication fiber applies what the master streams by dispatching it itself. A blocking command
+with no timeout, `BLPOP q 0`, parks that fiber until something pushes to `q`; on a replica nothing
+can, because the only writer is the stream the fiber has stopped reading. The link stays `up`, no
+later command applies, and the paths that stop the link (`REPLICAOF NO ONE`, shutdown) do not
+complete. Where exactly they wait was not traced.
+
+It needs a hostile or broken master: Redis and KeyDB propagate the effect of a satisfied blocking
+pop (`LPOP`, `RPOP`, ...), never the blocking command, so a conforming master does not send `BLPOP`.
+Pre-existing in upstream Dragonfly (the dispatch is upstream's), not specific to drakeydb's classic
+support.
+
+**How established:** the P7-1 re-review's probe, `blpop_probe.py` (a scripted master: a valid diskless
+full sync, then `SET a 1`, `BLPOP q 0`, `SET b 2`): `a` arrives, `b` does not,
+`master_link_status` stays `up`, `REPLICAOF NO ONE` gets no reply within 10 s, and SIGTERM did not
+stop the process within about 40 s. Not re-run for this entry; only `BLPOP` was probed, not the
+other blocking commands.
+
+**Status (2026-10-04): open, out of P7 scope.** Not fixed, not filed upstream, no code written.
+Candidate fix: refuse blocking commands (`CO::BLOCKING`) on replicated contexts, or give them zero
+timeout semantics (try once, never wait). **Owner:** after P7, with the upstream sync.
 
 ---
 

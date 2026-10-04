@@ -447,3 +447,122 @@ which needs a flag on the command table: a design change, recorded as such in th
 4. **M-6 is open until Task 3.1**: `keydb_cmds_dropped` can over-count a raw drop across a partial resync.
 5. **`ClassicTotalSeries` and `ClassicLinkFields` now disagree on purpose**: the series follow a node-wide flag,
    INFO a per-link one. A later task adding a series must pick the right one.
+
+## Re-review follow-up (P7-1 U-15, second round)
+
+Base: HEAD `d0f8d0b` on `feat/phase7-1-rreplay-unwrap`; nothing committed, `helio/` untouched. Brief items I-A
+(`WATCH`), the optional `CLIENT` consolidation, m-1 to m-5. Scratch (good copies of every touched file, the raw
+output of each falsification) is in the orchestrator's scratchpad under `p71r/`.
+
+### What changed
+
+| File | Change |
+|---|---|
+| `src/server/main_service.cc` | `Service::Watch`: `// drakeydb: U-15` guard at the top, `if (cmd_cntx->conn() == nullptr) return cmd_cntx->SendError("No connection");`, the idiom of `Subscribe`, `PSubscribe` and `Monitor`. |
+| `src/server/server_family.cc` | The five per-subcommand guards (`ClientSetName`, `ClientGetName`, `ClientInfo`, `ClientId`, `ClientKill`) are gone; one `ReplyIfNoConnection` guard at the top of `ServerFamily::Client`. Those five handlers are upstream's again, byte for byte. `ReplyIfNoConnection` stays (still used by `Client`, `Auth`, `Info`, `Hello`, `ReplConf`). |
+| `src/server/classic_replay_test.cc` | Fixture: `DispatchRaw(link, wire)` (the raw dispatch the parameterized test did inline; returns the error text or `nullopt`) and `WatchedKeyCount()`. New `ClassicNoConnectionTest` cases `Watch`, `ClientList`, `ClientPause`, `ClientHelp`, `ReplconfGetack`, `EvalInfo`, `EvalHello`, `EvalQuit`; new `ClassicApplyFamilyTest.ReplicatedWatchLeavesNoRegistrationBehind` and `.EvalOfAConnectionCommandInAnEnvelopeIsAnApplyErrorNotACrash`. |
+| `tests/dragonfly/keydb_onboarding_test.py` | `test_classic_stream_eval_of_a_connection_command_does_not_abort[raw\|in_envelope]` (m-2); `wait_for_synced_link`'s docstring (m-3, docstring only). |
+| `docs/ISSUE-REGISTER.md` | U-15: `WATCH`, the script path, `JournalExecutor` and the search-aux path, the `REPLCONF` and `CLIENT` top-of-handler effects (m-2), the rejected stream-boundary filter with its four reasons (m-4), exact guard counts, test list. New **U-16** (m-5), open, out of P7 scope, no code. |
+| `docs/UPSTREAM-SYNC.md` | `server_family.cc` and `main_service.cc` rows: exact counts, the new guard sites, the extra tests to re-run (m-1). |
+| `docs/superpowers/specs/2026-10-03-phase7-keydb-onboarding-design.md` | Byte-identity item 2 (U-15 bullet: `WATCH`, `SSUBSCRIBE`, `EVAL` bodies, `JournalExecutor` and the search-aux path, the `REPLCONF` and `CLIENT` effects); D-15 row; file map (m-2). |
+
+### Design notes
+
+- **`WATCH`.** On the classic stream the context is a stack local of `ConsumeRedisStream`. `Service::Watch` puts
+  `&exec_info.watched_dirty` in each shard's `DbTable::watched_keys`, and only `OnConnectionClose`, `UNWATCH`,
+  `EXEC` or `RESET` take it out. A write to the key (`DbSlice::PostUpdate`) or a `FLUSHDB`
+  (`InvalidateDbWatches`) stores `true` through it after the stream is gone.
+- **The debug build shows no crash for it.** The reviewer's `watch_probe.py`, run on the unmodified `d0f8d0b`
+  binary (`python watch_probe.py <binary> 36210 watch_raw|watch_env`): both modes print `REPLICAOF NO ONE: OK` and
+  `after writes to k: process exit code: None` after 20 rounds of `SET k` and `FLUSHALL`. So the test does not wait
+  for a crash: `DbTable::watched_keys` is a public member and `DbSlice::databases()` is public, so
+  `WatchedKeyCount()` sums `watched_keys.size()` over every db of every shard with `RunBriefInParallel`. No new
+  hook. A control in the same test shows a real client's `WATCH` is counted (1) and `UNWATCH` clears it (0), so a
+  count of 0 after the link means something.
+- **`CLIENT` consolidation.** `ReplyIfNoConnection` at the top of `ServerFamily::Client` runs before the
+  subcommand is even parsed, so a subcommand upstream adds later is covered too. It refuses everything on a
+  context without a connection, including the subcommands that never crashed (`LIST`, `PAUSE`, `UNPAUSE`,
+  `TRACKING`, `CACHING`, `MIGRATE`, `HELP`, unknown ones, a malformed `SETINFO`). `CLIENT PAUSE` is the one with an
+  effect: it reached `ClientPauseCmd` on the null context (no crash, per the audit) and so could freeze a
+  replica's clients for a time the master named; now it cannot. `CLIENT SETINFO` keeps upstream's own guard, which
+  is unreachable for a null connection now and left alone.
+- **Counts.** Guards: 14 became 11 (`server_family.cc` 9 became 5, `main_service.cc` 4 became 5, `dflycmd.cc` 1);
+  `// drakeydb: U-15` markers: 12 (those 11 plus the helper). Against `558312e` (before Task 1.3) `git diff`
+  shows 8 hunks in `server_family.cc` (2 of Task 1.3, 6 of U-15), 5 in `main_service.cc` (U-9, U-10 and U-12 are
+  older, so 8 drakeydb null-`conn()` hunks there), 1 in `dflycmd.cc`. The row's "three additive hunks" was stale:
+  `8865c43` did add a third (the `classic_master_active` computation in `GetMetrics`), but the fix round removed it,
+  so Task 1.3 leaves two at HEAD, the two the row listed. The row now says two.
+- **`EVAL` bodies.** `redis.call` calls `DispatchCommand` with the `EVAL`'s own `CommandContext`
+  (`CallFromScript`), so the null connection reaches the same handlers. Raw, the script's error is the reply of
+  the `EVAL` (`@user_script:2: -ERR No connection`); in an envelope it is one `classic_apply_errors` and a log
+  line `did not apply and is skipped: EVAL: ... -ERR No connection` (`eval_probe.py` output on the new binary:
+  raw `a = 1 | b = 2`, `{'master_link_status': 'up'}`; env `rreplay_unwrapped: 3, classic_apply_errors: 2`). A
+  script's `QUIT` replies `OK`: no error, not counted. The pytest asserts `classic_apply_errors == 2` (the `INFO`
+  and the `HELLO`) and `rreplay_unwrapped == 3` for the envelope case, and the exact settled ACK for both.
+- **U-16** is from the reviewer's `blpop.out`; not re-run (a hung process that needs a kill), only `BLPOP` was
+  probed, and the register says so.
+- **`REPLCONF` wording.** Verified in the code, not guessed: `REPLCONF GETACK *` falls to the last `else` of the
+  option loop and `err_cb`, which logs `Error in receiving command, num args: 2` at ERROR, but only past the
+  `Replicating a replica is unsupported` refusal, i.e. where `IsMaster()` or `--experimental_cascaded_partial_sync`
+  holds. `ReplconfGetack` pins the new text: with the `ReplConf` guard off the case gets `syntax error` (the test
+  node is a master).
+
+### Falsification
+
+Every build below is `cd /home/user/drakeydb/build-dbg && nice ninja -j3 classic_replay_test` (plus `dragonfly`
+for the pytest one) with the named guard deleted from the source, the case run in its own process
+(`./classic_replay_test --gtest_filter='U15/ClassicNoConnectionTest.*/<Case>'`), then the source restored and
+`cmp`-ed against the good copy.
+
+| Removed | Test | Result without it |
+|---|---|---|
+| `Service::Watch` guard | `./classic_replay_test --gtest_filter='*Watch*'` | `ReplicatedWatchLeavesNoRegistrationBehind` fails at four lines: `DispatchRaw(link, Resp({"WATCH", "k"}))` `Expected: value has substring "No connection"  Actual: (nullopt), which is not engaged`; `link.apply_errors() Which is: 0` vs 1; `WatchedKeyCount() Which is: 2` vs 0, once while the link lives and **again after it is gone** (the dangling registrations: `k`, `k2`). `.../Watch`: `Value of: error.has_value()  Actual: false  Expected: true`. 2 FAILED, no crash. |
+| `ServerFamily::Client` guard | each `Client*` case, own process | `ClientSetName`, `ClientGetName`, `ClientInfo`, `ClientId`, `ClientKill`: exit 139, `*** SIGSEGV received` (`facade::Connection::SetName <- ClientSetName <- ServerFamily::Client` for the first). `ClientList`, `ClientPause`, `ClientHelp`: exit 1, `Value of: error.has_value()  Actual: false  Expected: true` (they got a normal reply). |
+| `Info`, `Hello`, `ReplConf` guards (one build) | `EvalInfo`, `EvalHello`, `Info`, `Hello`, `ReplconfListeningPort`, `EvalOfAConnectionCommandInAnEnvelope...` | exit 139 each. `ReplconfGetack`: exit 1, `Value of: *error  Expected: has substring "No connection"  Actual: "syntax error"`. `EvalQuit` still passes (its guard, `Quit`, was not removed in this build). |
+| the same three, pytest | `pytest keydb_onboarding_test.py -k "eval_of_a_connection_command or info_command_does_not_abort"` | `4 failed, 56 deselected, 4 errors in 32.96s`: the four fail because the process is gone (`ConnectionRefusedError` from `c.get("b")`), and each teardown reports `Dragonfly did not terminate gracefully, exit code -11`. The `info` pair fails too, as it should: the `Info` guard is the one both tests share. |
+| `Service::Quit` guard | `EvalQuit`, `Quit` | exit 139, `*** SIGSEGV received`, both. |
+
+Not done: the `ClientList`, `ClientPause`, `ClientHelp` cases were falsified only by removing the `Client` guard
+(they have no guard of their own), the `Auth`, `Info`, `Hello` and `ReplConf` guards only in the one combined
+build, as in the first round. `SSUBSCRIBE` shares `Subscribe`'s guard and `ClassicNoConnectionTest.Ssubscribe`
+existed already.
+
+### Results (final, debug build, gcc, `nice ninja -j3 dragonfly classic_replay_test multi_test server_family_test multi_master_test`, no warnings)
+
+- `./classic_replay_test`: `[  PASSED  ] 66 tests.` (56 before: 8 new cases, 2 new tests).
+- `./multi_test` (it has the `WATCH` tests): `[  PASSED  ] 67 tests.`
+- `./multi_master_test`: `[  PASSED  ] 222 tests.`
+- `./server_family_test`: 43 passed, 1 failed, `ServerFamilyTest.GetTcpSocketInfoIPv6` (no IPv6 in the sandbox, as in the first round).
+- `flock /tmp/drakey-pytest.lock /root/drakey-venv-pinned/bin/python -m pytest tests/dragonfly/keydb_onboarding_test.py
+  -k "info or no_conn or eval or synced"` with `KEYDB_SERVER_PATH=<scratchpad>/KeyDB/src/keydb-server KEYDB_REQUIRED=1
+  DRAGONFLY_PATH=/home/user/drakeydb/build-dbg/dragonfly`: 11 passed, 49 deselected. (`-k synced` matches no test
+  name: `wait_for_synced_link` is a helper, so the `test_scripted_*` tests that use it ran only in the whole-file run.)
+- The whole file, same environment: `60 passed in 115.37s` (58 before, 2 new).
+- `pre-commit run --files <the 8 changed files>`: the first run's clang-format wrapped one line of
+  `classic_replay_test.cc` (added by a script, not through the editor hook); the second run: `pyflakes`, `trim
+  trailing whitespace`, `fix end of files`, `check python ast`, `Clang formatting`, `black` all Passed and no file
+  changed. After that the three touched `.cc` files were touched and rebuilt (`dragonfly classic_replay_test`, log
+  has no `warning`), and `./classic_replay_test` (66 passed) and the `-k` subset (11 passed) were run again on that
+  build. The whole-file run (60 passed) was on the build before the one-line reformat of the test file, which does
+  not touch the `dragonfly` binary.
+
+### Not done / not verified
+
+- U-16 was not re-run, and nothing but `BLPOP` was ever probed for it.
+- No release, ASAN or UBSAN build; the full `ctest -L DFLY` and `replication_test.py` were not run.
+- The `WATCH` dangling store itself is not observed (no crash in a debug build, as the brief expected); the test pins the
+  registration, which is the precondition of the store. An ASAN build would see the store.
+- The `peer` branch of `wait_for_synced_link` was only re-documented, not changed (m-3): it can pass before the RDB has
+  loaded, which stays harmless only while the fake master writes the whole full sync at once.
+
+### Open risks
+
+1. **Behavior change for `REPLCONF` and `CLIENT` on a null context** beyond the crashes: every `REPLCONF` variant and every
+   `CLIENT` subcommand now replies `No connection`. Log-only for stock traffic (`REPLCONF GETACK *`); `CLIENT` is not sent by a
+   stock master. The spec and U-15 say so.
+2. **Any new upstream handler that registers or dereferences a stream-context pointer is a new U-15** (the filter was rejected,
+   U-15 lists why). `WATCH` was found by a reviewer, not by the audit, which looked only for `conn()` dereferences: the class
+   is "state that outlives the stream's stack frame", wider than "null connection". Other handlers that store the context's
+   address (blocking commands: U-16) were not audited for it in this round.
+3. **`ClassicNoConnectionTest` crash cases take the whole binary down** when a guard is missing, by design; run one case per process
+   to tell which.

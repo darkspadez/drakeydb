@@ -1040,7 +1040,7 @@ still pass under if the feature were removed.
 | `ClassicReplayTest.ParseRreplayEnvelope*` (incl. the golden captures); `ClassicApplyFamilyTest.*` (unwrap, db, skips, self, malformed, nested to 64, depth-65 leaves the 64th consumed, an inner with zero or two commands, or with an array, nil array or nil for a name, malformed, known-command error counted) | Dropping the 65th-nesting refusal; applying inner `PING`; accepting a second inner command; the `NONE` builder (no `classic_apply_errors`) |
 | `ClassicApplyFamilyTest.RunningFalseBeforeDispatchReturnsNotConsumed*`, `.RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope`, `.RejectedDispatchCountsBytesDoesNotAdvance`, `.ReplayAfterCommitBeforeCountIsDeduped` | Checking `running()` after the first dispatch; checking it before every inner dispatch; `Commit` on a rejected dispatch; deferring `Commit` past the return |
 | `test_classic_stream_command_with_an_array_for_a_name_does_not_abort[empty_array\|nil_array\|behind_a_queued_command]` (fake master: a valid sync, then `*0\r\n` or `*-1\r\n`, with a raw command queued ahead of it in the last case, then `SET a 1`: replica alive, `a == 1`, settled ACK exact, the warning logged; U-14) | Dropping the U-14 guard in `ConsumeRedisStream`: SIGABRT (`std::bad_variant_access` out of `RespExpr::GetView`) |
-| `test_classic_stream_info_command_does_not_abort[raw\|in_envelope]` (fake master: a valid sync, then `SET a 1`, `INFO` raw or inside an envelope, `SET b 2`: replica alive, `a == 1`, `b == 2`, settled ACK exact; in an envelope also `classic_apply_errors == 1` and the logged reason; U-15); `ClassicNoConnectionTest.*` (one case per guarded handler, dispatched raw on the stream's context: the reply is `No connection`, `OK` for `QUIT`); `ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver`, `.InfoInAnEnvelopeIsAnApplyErrorNotACrash` | Removing the `ServerFamily::Info` guard: the replica process dies (SIGSEGV or SIGABRT) and `b` never arrives; removing the guard of a handler: that case dies, one at a time under `--gtest_filter`; removing the `MONITOR` or `SUBSCRIBE` guard: the next client command or `PUBLISH` dies |
+| `test_classic_stream_info_command_does_not_abort[raw\|in_envelope]` (fake master: a valid sync, then `SET a 1`, `INFO` raw or inside an envelope, `SET b 2`: replica alive, `a == 1`, `b == 2`, settled ACK exact; in an envelope also `classic_apply_errors == 1` and the logged reason; U-15); `ClassicNoConnectionTest.*` (one case per guarded handler, dispatched raw on the stream's context: the reply is `No connection`, `OK` for `QUIT`; also `WATCH`, `REPLCONF GETACK`, `CLIENT LIST|PAUSE|HELP` and an `EVAL` of `INFO`, `HELLO` and `QUIT`); `ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver`, `.InfoInAnEnvelopeIsAnApplyErrorNotACrash`, `.EvalOfAConnectionCommandInAnEnvelopeIsAnApplyErrorNotACrash`, `.ReplicatedWatchLeavesNoRegistrationBehind` (counts `DbTable::watched_keys` across every shard and db, with a control that a real client's `WATCH` is counted); `test_classic_stream_eval_of_a_connection_command_does_not_abort[raw\|in_envelope]` (fake master: `SET a 1`, `EVAL` of `INFO`, `HELLO 3` and `QUIT`, `SET b 2`: replica alive, settled ACK exact, in an envelope `classic_apply_errors == 2`) | Removing the `ServerFamily::Info` guard: the replica process dies (SIGSEGV or SIGABRT) and `b` never arrives; removing the guard of a handler: that case dies, one at a time under `--gtest_filter`; removing the `MONITOR` or `SUBSCRIBE` guard: the next client command or `PUBLISH` dies; removing the `ServerFamily::Client` guard: the five `CLIENT` cases die and `LIST`, `PAUSE`, `HELP` get a reply instead of `No connection`; removing the `Watch` guard: the stream's `WATCH` is accepted and the registration outlives the link (no crash in a debug build, so the test reads the count); removing the `Info` or `Hello` guard: the `EVAL` cases and the pytest die; removing the `ReplConf` guard: `GETACK` replies `syntax error` |
 | `test_plain_replica_unwraps_keydb_rreplay`, `..._nested_...`, `test_unwrap_offsets_exact`; `test_keydb_active_live_write_during_full_sync[plain_replica\|peer_mode]` (no longer `xfail`) | Skipping `repl_offs_ +=` (offset lags); removing unwrap (no keys; the live-write test goes back to strict-xfail) |
 | `test_unwrap_flushes_raw_batch_before_envelope` (fake master: raw `SET a 1`, envelope `SET a 2`) | Removing the pre-envelope flush (final `a == 1`) |
 | `test_unwrap_selected_db_is_the_one_the_raw_commands_after_it_run_in` (fake master: an envelope in db 2, then a raw `SET c` and a 3-argument envelope, then an envelope in db 0 and a raw `SET g`) | Giving the applier a connection context of its own: `c` lands in db 0 |
@@ -1096,13 +1096,32 @@ observe changes only here:
      `std::bad_variant_access` out of `RespExpr::GetView` and terminates the process. It is now
      skipped like `MULTI`/`EXEC`, with a rate-limited warning, its bytes counted exactly. Ungated:
      it is reachable from any classic master, not only a KeyDB one.
-   - **U-15** (P7-1 Task 1.3 review round): a connection-oriented command (`INFO`, `CLIENT
-     SETNAME|GETNAME|INFO|ID|KILL`, `AUTH`, `HELLO`, `REPLCONF`, `QUIT`, `DFLY THREAD`, `MONITOR`,
-     `SUBSCRIBE`, `PSUBSCRIBE`) in a classic master's stream, raw or inside an envelope. The apply
-     context has no connection, and upstream dereferenced the null `conn()`: SIGSEGV at once, or
-     (`MONITOR`, `SUBSCRIBE`) at the next client command. Each now replies `No connection` and the
-     stream carries on (`QUIT` replies `OK`). Ungated; the guards live in `server_family.cc`,
-     `main_service.cc` and `dflycmd.cc`. ISSUE-REGISTER U-15 lists what was left (cluster mode).
+   - **U-15** (P7-1 Task 1.3 review round and its re-review): a connection-oriented command (`INFO`,
+     `CLIENT SETNAME|GETNAME|INFO|ID|KILL`, `AUTH`, `HELLO`, `REPLCONF`, `QUIT`, `DFLY THREAD`,
+     `MONITOR`, `SUBSCRIBE`, `SSUBSCRIBE`, `PSUBSCRIBE`, `WATCH`) in a classic master's stream, raw or
+     inside an envelope. The apply context has no connection, and upstream dereferenced the null
+     `conn()`: SIGSEGV at once, or (`MONITOR`, `SUBSCRIBE`) at the next client command, or (`WATCH`)
+     a store through a dangling pointer into the dead stream context when the key is next written or
+     its db flushed, which a debug build does not notice. Each now replies `No connection` and the
+     stream carries on (`QUIT` replies `OK`). The same guards cover an `EVAL` body, because
+     `redis.call` runs its command on the context of the `EVAL` (`CallFromScript`) and `INFO`,
+     `HELLO` and `QUIT` are not `NOSCRIPT`, and the other two places that apply on a context without
+     a connection, `JournalExecutor` and the RDB-load search-aux path (`LoadSearchCommandFromAux`,
+     whose command name is fixed, so nothing there reaches a guarded handler today). Ungated; the
+     guards live in `server_family.cc`, `main_service.cc` and `dflycmd.cc`. Two guards reach beyond the
+     commands that crashed; what a stock master can observe of it is log-only:
+     - `REPLCONF` is guarded at the top of its handler, so every variant now replies `No
+       connection`, including `REPLCONF GETACK *`, which is real stock traffic. The text of the
+       discarded reply changes (`Replicating a replica is unsupported` on a plain replica, `syntax
+       error` past that refusal). Where `IsMaster()` is true (a peer-mode node), or
+       `--experimental_cascaded_partial_sync` is on for a non-active node, the `LOG(ERROR) "Error in
+       receiving command"` that every `GETACK` used to write also disappears.
+     - `CLIENT` has one guard for every subcommand, so `LIST`, `PAUSE`, `UNPAUSE`, `TRACKING`,
+       `CACHING`, `MIGRATE`, `HELP` and an unknown one are refused too. No stock master propagates
+       `CLIENT`, and it is `NOSCRIPT`.
+
+     ISSUE-REGISTER U-15 lists what was left (cluster mode) and why a filter at the stream boundary
+     was rejected.
    - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
      migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
      a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a
@@ -1170,11 +1189,11 @@ forwarding KeyDB masters double-applies deltas (`INCR`, `APPEND`, ...), and that
 | `src/server/replica_types.h` | `ReplicaSummary` classic fields | 1, 2, 3 |
 | `src/server/engine_shard.{h,cc}` | `replica_active_expiry_`, `expire_only` split (authorized exception to the "untouched" list; ~15 lines) | 1 |
 | `src/server/db_slice.cc` | One-line `ExpireIfNeeded` gate (`:2097-2098`) | 1 |
-| `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards (0); U-15 guards in `Quit`, `Monitor`, `Subscribe`, `PSubscribe` (1, review round) | 0, 1 |
+| `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards (0); U-15 guards in `Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch` (1, review round and re-review) | 0, 1 |
 | `src/server/dflycmd.cc` | U-15 null-`conn()` guard in `DFLY THREAD` (review round) | 1 |
 | `src/server/transaction.cc`, `src/server/multimaster_lww.cc` | Comments only (`:1628-1648` tripwire; `ApplyLwwRewrites` contract) | 2 |
 | `src/server/rdb_load.{h,cc}` | First-read clamp (0); type 64 skip, subexpire/aux handling, counters (4) | 0, 4 |
-| `src/server/server_family.cc`, `multi_master.{h,cc}`, `metrics.cc` | INFO fields and gating, peer line, boot warning, Prometheus (incl. the replica-side branch); U-15 guards in `server_family.cc` (1) | 1, 2, 3, 4 |
+| `src/server/server_family.cc`, `multi_master.{h,cc}`, `metrics.cc` | INFO fields and gating, peer line, boot warning, Prometheus (incl. the replica-side branch); U-15 guards in `ServerFamily::Client`, `Auth`, `Info`, `Hello`, `ReplConf` (1) | 1, 2, 3, 4 |
 | `src/server/CMakeLists.txt` | `classic_replay.cc` in `dragonfly_lib` (`:109-125`); `classic_replay_test` (`:200`, `:202-207`) | 0 |
 | `src/server/dragonfly_test.cc` | `EvalReplicatedApplyNoConnNoCrash`, `ReplicatedApplyDuringTakeoverNoCrash`, `ReplicatedApplyHandlerThrowNoConnNoCrash` | 0 |
 | `tests/dragonfly/keydb_onboarding_test.py` **(new)**, `fake_classic_master.py` **(new)** | KeyDB and fake-master suites | 0-4 |

@@ -2051,6 +2051,11 @@ void Service::Multi(CmdArgParser, CommandContext* cmd_cntx) {
 }
 
 void Service::Watch(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- a replicated apply has no connection to watch for: the shards would keep a
+  // pointer to the dirty flag of the apply context, which is gone when the link ends, and the next
+  // write to the key or FLUSHDB would store through it.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
   auto* cntx = cmd_cntx->server_conn_cntx();
   auto& exec_info = cntx->conn_state.exec_info;
 

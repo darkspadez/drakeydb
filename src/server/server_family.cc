@@ -418,9 +418,6 @@ bool ReplyIfNoConnection(CommandContext* cmd_cntx) {
 }
 
 void ClientSetName(facade::ParsedArgs args, CommandContext* cmd_cntx) {
-  // drakeydb: U-15
-  if (ReplyIfNoConnection(cmd_cntx))
-    return;
   if (args.size() == 1) {
     cmd_cntx->conn()->SetName(string{args[0]});
     return cmd_cntx->rb()->SendOk();
@@ -429,9 +426,6 @@ void ClientSetName(facade::ParsedArgs args, CommandContext* cmd_cntx) {
 }
 
 void ClientGetName(facade::ParsedArgs args, CommandContext* cmd_cntx) {
-  // drakeydb: U-15
-  if (ReplyIfNoConnection(cmd_cntx))
-    return;
   if (!args.empty()) {
     return cmd_cntx->SendError(facade::kSyntaxErr);
   }
@@ -444,9 +438,6 @@ void ClientGetName(facade::ParsedArgs args, CommandContext* cmd_cntx) {
 }
 
 void ClientInfo(facade::ParsedArgs args, CommandContext* cmd_cntx) {
-  // drakeydb: U-15
-  if (ReplyIfNoConnection(cmd_cntx))
-    return;
   if (!args.empty()) {
     return cmd_cntx->SendError(facade::kSyntaxErr);
   }
@@ -683,9 +674,6 @@ void ClientSetInfo(facade::ParsedArgs args, CommandContext* cmd_cntx) {
 }
 
 void ClientId(facade::ParsedArgs args, CommandContext* cmd_cntx) {
-  // drakeydb: U-15
-  if (ReplyIfNoConnection(cmd_cntx))
-    return;
   if (args.size() != 0) {
     return cmd_cntx->SendError(kSyntaxErr);
   }
@@ -695,9 +683,6 @@ void ClientId(facade::ParsedArgs args, CommandContext* cmd_cntx) {
 
 void ClientKill(facade::ParsedArgs args, absl::Span<facade::Listener*> listeners,
                 ServerFamily* server_family, CommandContext* cmd_cntx) {
-  // drakeydb: U-15
-  if (ReplyIfNoConnection(cmd_cntx))
-    return;
   std::function<bool(facade::Connection * conn)> evaluator;
 
   if (args.size() == 1) {
@@ -2303,6 +2288,10 @@ void ClientHelp(SinkReplyBuilder* builder) {
 }
 
 void ServerFamily::Client(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- every subcommand is about the caller's own connection. No stock master
+  // propagates CLIENT and it is NOSCRIPT, so refusing all of them here costs no real traffic.
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   string sub_cmd = absl::AsciiStrToUpper(parser.Next<string_view>());
   facade::ParsedArgs sub_args = parser.UnparsedArgs();
   auto* builder = cmd_cntx->rb();

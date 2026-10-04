@@ -691,6 +691,37 @@ class ClassicApplyFamilyTest : public BaseFamilyTest {
       return nullopt;
     return string(value.GetView());
   }
+
+  // Dispatches the command in `wire` on the context of `link` the way the raw path of
+  // Replica::ConsumeRedisStream does. Returns the text of the error it replied, or nullopt if it
+  // did not reply one.
+  optional<string> DispatchRaw(Link& link, string_view wire) {
+    facade::CapturingReplyBuilder rb{facade::ReplyMode::ONLY_ERR};
+    Wire parsed = Wire::FromBytes(wire);
+    CommandContext cmd;
+    cmd.Init(&rb, &link.cntx);
+    facade::FillBackedArgs(parsed.args, &cmd);
+    service_->DispatchCommand(facade::ParsedArgs{cmd}, &cmd, facade::AsyncPreference::ONLY_SYNC);
+
+    facade::CapturingReplyBuilder::Payload reply = rb.Take();
+    auto error = facade::CapturingReplyBuilder::TryExtractError(reply);
+    if (!error.has_value())
+      return nullopt;
+    return string(error->first);
+  }
+
+  // The number of keys with a WATCH registered, in any db of any shard.
+  size_t WatchedKeyCount() {
+    atomic_size_t count = 0;
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      for (const auto& db :
+           namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id()).databases()) {
+        if (db != nullptr)
+          count += db->watched_keys.size();
+      }
+    });
+    return count;
+  }
 };
 
 TEST_F(ClassicApplyFamilyTest, AppliesInnerCommandInEnvelopeDb) {
@@ -1362,18 +1393,10 @@ class ClassicNoConnectionTest : public ClassicApplyFamilyTest,
 
 TEST_P(ClassicNoConnectionTest, ReplicatedApplyOfAConnectionCommandIsAnErrorNotACrash) {
   OnLink([&](Link& link) {
-    facade::CapturingReplyBuilder rb{facade::ReplyMode::ONLY_ERR};
-    Wire parsed = Wire::FromBytes(GetParam().wire);
-    CommandContext cmd;
-    cmd.Init(&rb, &link.cntx);
-    facade::FillBackedArgs(parsed.args, &cmd);
-    service_->DispatchCommand(facade::ParsedArgs{cmd}, &cmd, facade::AsyncPreference::ONLY_SYNC);
-
-    facade::CapturingReplyBuilder::Payload reply = rb.Take();
-    auto error = facade::CapturingReplyBuilder::TryExtractError(reply);
+    optional<string> error = DispatchRaw(link, GetParam().wire);
     if (GetParam().replies_error) {
       ASSERT_TRUE(error.has_value());
-      EXPECT_THAT(string(error->first), testing::HasSubstr("No connection"));
+      EXPECT_THAT(*error, testing::HasSubstr("No connection"));
     } else {
       EXPECT_FALSE(error.has_value());
     }
@@ -1390,18 +1413,32 @@ INSTANTIATE_TEST_SUITE_P(
         NoConnectionCase{"ClientInfo", Resp({"CLIENT", "INFO"})},
         NoConnectionCase{"ClientId", Resp({"CLIENT", "ID"})},
         NoConnectionCase{"ClientKill", Resp({"CLIENT", "KILL", "ID", "99999"})},
+        // The subcommands that never dereferenced the connection are refused by the one guard of
+        // CLIENT too.
+        NoConnectionCase{"ClientList", Resp({"CLIENT", "LIST"})},
+        NoConnectionCase{"ClientPause", Resp({"CLIENT", "PAUSE", "1"})},
+        NoConnectionCase{"ClientHelp", Resp({"CLIENT", "HELP"})},
         NoConnectionCase{"Auth", Resp({"AUTH", "secret"})},
         NoConnectionCase{"AuthUser", Resp({"AUTH", "user", "secret"})},
         NoConnectionCase{"Hello", Resp({"HELLO", "2"})},
         NoConnectionCase{"HelloSetName", Resp({"HELLO", "3", "SETNAME", "x"})},
         NoConnectionCase{"ReplconfListeningPort", Resp({"REPLCONF", "LISTENING-PORT", "6380"})},
         NoConnectionCase{"ReplconfCapaDragonfly", Resp({"REPLCONF", "CAPA", "dragonfly"})},
+        // Real stock traffic: the guard sits at the top of the handler, so this one, which never
+        // crashed, is refused too.
+        NoConnectionCase{"ReplconfGetack", Resp({"REPLCONF", "GETACK", "*"})},
         NoConnectionCase{"Quit", Resp({"QUIT"}), false},
         NoConnectionCase{"Monitor", Resp({"MONITOR"})},
         NoConnectionCase{"Subscribe", Resp({"SUBSCRIBE", "c"})},
         NoConnectionCase{"Ssubscribe", Resp({"SSUBSCRIBE", "c"})},
         NoConnectionCase{"Psubscribe", Resp({"PSUBSCRIBE", "c*"})},
-        NoConnectionCase{"DflyThread", Resp({"DFLY", "THREAD", "1"})}),
+        NoConnectionCase{"Watch", Resp({"WATCH", "k"})},
+        NoConnectionCase{"DflyThread", Resp({"DFLY", "THREAD", "1"})},
+        // A script's redis.call runs the command on the context of the EVAL, a null one here
+        // (CallFromScript). Its error is the script's error, which carries the handler's text.
+        NoConnectionCase{"EvalInfo", Resp({"EVAL", "return redis.call('INFO')", "0"})},
+        NoConnectionCase{"EvalHello", Resp({"EVAL", "return redis.call('HELLO', '3')", "0"})},
+        NoConnectionCase{"EvalQuit", Resp({"EVAL", "return redis.call('QUIT')", "0"}), false}),
     [](const testing::TestParamInfo<NoConnectionCase>& info) { return string(info.param.name); });
 
 // What a replicated MONITOR or SUBSCRIBE would leave behind is worse than the failed command: a
@@ -1444,6 +1481,58 @@ TEST_F(ClassicApplyFamilyTest, InfoInAnEnvelopeIsAnApplyErrorNotACrash) {
 
   EXPECT_EQ(Get("before"), "v");
   EXPECT_EQ(Get("after"), "v");
+}
+
+// A script's redis.call runs on the context of its EVAL (CallFromScript), so the stream's EVAL of
+// INFO or HELLO reaches the same handlers as the raw command. The EVAL is a command that did not
+// apply, counted; a QUIT in a script has nothing to close and applies. The commands around apply.
+TEST_F(ClassicApplyFamilyTest, EvalOfAConnectionCommandInAnEnvelopeIsAnApplyErrorNotACrash) {
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "before", "v"}))),
+              EnvelopeResult::kConsumed);
+    for (const char* body : {"return redis.call('INFO')", "return redis.call('HELLO', '3')"})
+      EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"EVAL", body, "0"}))),
+                EnvelopeResult::kConsumed)
+          << body;
+    EXPECT_EQ(link.apply_errors(), 2u);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"EVAL", "return redis.call('QUIT')", "0"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 2u);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "after", "v"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 2u);
+    EXPECT_EQ(link.unwrapped(), 5u);
+  });
+
+  EXPECT_EQ(Get("before"), "v");
+  EXPECT_EQ(Get("after"), "v");
+}
+
+// WATCH puts a pointer to the dirty flag of its connection in the shards and drops it only when the
+// connection closes, or on UNWATCH, EXEC and RESET. The context of a replicated apply is a local of
+// the stream loop and is gone when the link ends, so a WATCH it kept would have the next write to
+// the key, or a FLUSHDB, store through a dangling pointer (ISSUE-REGISTER U-15). A debug build
+// stores into the dead stack without a sound, so the test looks at the registration itself.
+TEST_F(ClassicApplyFamilyTest, ReplicatedWatchLeavesNoRegistrationBehind) {
+  // The count does see a registration.
+  EXPECT_EQ(Run({"watch", "control"}), "OK");
+  EXPECT_EQ(WatchedKeyCount(), 1u);
+  EXPECT_EQ(Run({"unwatch"}), "OK");
+  EXPECT_EQ(WatchedKeyCount(), 0u);
+
+  OnLink([&](Link& link) {
+    EXPECT_THAT(DispatchRaw(link, Resp({"WATCH", "k"})),
+                testing::Optional(testing::HasSubstr("No connection")));
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"WATCH", "k", "k2"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 1u);
+    EXPECT_EQ(WatchedKeyCount(), 0u);
+  });
+
+  // The link is gone: nothing is left for a write or a flush to store through.
+  EXPECT_EQ(WatchedKeyCount(), 0u);
+  EXPECT_EQ(Run({"set", "k", "v"}), "OK");
+  EXPECT_EQ(Run({"flushdb"}), "OK");
 }
 
 }  // namespace dfly

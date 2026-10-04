@@ -910,6 +910,67 @@ async def test_classic_stream_info_command_does_not_abort(
         assert node.find_in_logs(r"did not apply and is skipped: INFO: .*No connection")
 
 
+EVAL_OF_CONNECTION_COMMANDS = [
+    "return redis.call('INFO')",
+    "return redis.call('HELLO', '3')",
+    "return redis.call('QUIT')",
+]
+
+
+@pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
+async def test_classic_stream_eval_of_a_connection_command_does_not_abort(
+    df_factory: DflyInstanceFactory, tmp_path, scenario
+):
+    """The guards of ISSUE-REGISTER U-15 also cover a script: `redis.call` runs its command on the
+    context of the EVAL, which in a classic stream has no connection either, and INFO, HELLO and
+    QUIT are not NOSCRIPT. An EVAL of INFO or HELLO is an error the stream discards (a script error
+    that carries the handler's `No connection`), an EVAL of QUIT has nothing to close and applies,
+    and the replica stays up with the offset exact. Inside an envelope the two failed scripts also
+    show as `classic_apply_errors`.
+
+    Falsifying: with the INFO or HELLO guard removed the replica process dies as it runs the
+    script (SIGSEGV out of ServerFamily::Info or Hello), so `b` never arrives.
+    """
+    wrap = resp_command if scenario == "raw" else rreplay
+    stream = SET_A
+    for body in EVAL_OF_CONNECTION_COMMANDS:
+        stream += wrap("EVAL", body, "0")
+    stream += SET_B
+    async with FakeClassicMaster() as master:
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET), stream=stream, stream_delay=SECOND_WRITE_DELAY_S
+        )
+        node = df_factory.create(
+            proactor_threads=2, dir=str(tmp_path / "df"), replication_acks_interval=100
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("b") == "2"
+
+        await applied()
+        assert await c.get("a") == "1"
+        expected = SYNC_OFFSET + len(stream)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert max(master.ack_offsets) == expected, master.ack_offsets
+        assert master.connection_count == 1, "the replica reconnected"
+        info = await c.info("replication")
+        assert info["master_link_status"] == "up", info
+        if scenario == "in_envelope":
+            assert info["classic_apply_errors"] == 2, info
+            assert info["rreplay_unwrapped"] == len(EVAL_OF_CONNECTION_COMMANDS), info
+
+    node.stop()
+    if scenario == "in_envelope":
+        assert node.find_in_logs(r"did not apply and is skipped: EVAL: .*No connection")
+
+
 @pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
 async def test_unwrap_flushes_raw_batch_before_envelope(
     df_factory: DflyInstanceFactory, tmp_path, peer_mode
@@ -1337,12 +1398,17 @@ ZERO_COUNTERS = dict.fromkeys(CLASSIC_COUNTERS, 0)
 
 async def wait_for_synced_link(node, c, peer_mode):
     """Waits until the link to a scripted master (a diskless full sync at SYNC_OFFSET) is up and its
-    full sync is over, so that what INFO then says is settled.
+    full sync looks over, so that what INFO then says is settled.
 
     `link_status` is `up` as soon as the socket is, before `+FULLRESYNC` is parsed, so that alone
-    is not enough: the link must also not be syncing, and show the offset the sync ended at (the
-    plain block's `slave_repl_offset` appears with the finished sync, a peer line's `repl_offset`
-    is the stream offset)."""
+    is not enough: the link must also not be syncing, and show the offset the sync ended at.
+
+    The two branches do not prove the same. The plain block's `slave_repl_offset` is printed only
+    once the sync is done (`R_SYNC_OK`), so that branch does wait for the RDB. A peer line's
+    `repl_offset` is the stream offset `repl_offs_`, which `Replica::ParseReplicationHeader` sets as
+    it parses `+FULLRESYNC`: before the `$EOF:` line is read and before `R_SYNCING` is set. So the
+    peer branch can pass before the RDB has loaded. That is harmless here only because the scripted
+    master writes the whole full sync at once; the check does not show that the RDB is in."""
 
     @assert_eventually(times=100)
     @retry_while_loading
