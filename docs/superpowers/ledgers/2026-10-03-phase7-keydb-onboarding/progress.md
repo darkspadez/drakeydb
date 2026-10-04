@@ -146,8 +146,8 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
   (`:705-709`) — a short startup load can finish between the two calls — and P7-0's loader edits
   are inert for startup loads (`source_limit_ == SIZE_MAX`). Local interleaved 5x each, PR binary
   vs `main` binary: 10/10 passed. The session's GitHub integration cannot re-run jobs (403); the
-  owner was asked to re-run once from the Actions tab. `large-tests-arm` and `fuzz-pr` sit queued
-  with no runner, as on darkspadez/drakeydb#9.
+  owner re-ran it once from the Actions tab: **passed** (attempt 2, 06:22Z), confirming the race.
+  `large-tests-arm` and `fuzz-pr` sit queued with no runner, as on darkspadez/drakeydb#9.
 
 ## P7-1 … P7-4
 
