@@ -134,6 +134,42 @@ async def wait_for_peer_link(c):
     await link_up()
 
 
+def running_node_log_lines(node, pattern):
+    """The distinct lines a running node has logged that match `pattern`. find_in_logs wants the
+    node stopped; WARNING and ERROR lines are flushed as they are logged, so these can be polled
+    for. glog writes a line to the file of its severity and to those of every lower one, so the
+    same line comes from several files: each is returned once."""
+    matcher = re.compile(pattern)
+    lines = set()
+    for path in node.log_files:
+        with open(path) as log:
+            lines.update(line for line in log if matcher.search(line))
+    return lines
+
+
+# glog lines start with their severity letter, so these also pin that the lines are loud (W, E).
+# drakeydb: P7-0 interim -- removed by P7-1 Task 1.2, with attach_to_keydb and the xfails using it.
+ACTIVE_KEYDB_REFUSAL_ERROR = (
+    r"^E\d{4} .*Master localhost:\d+ advertises active-replica: this build cannot apply its "
+    r"RREPLAY stream yet \(Phase 7, P7-1\); refusing the link"
+)
+
+
+async def attach_to_keydb(c, node, keydb):
+    """REPLICAOF `keydb`, asserting that it is accepted. The refusal of an active KeyDB fails the
+    assertion, so that the strict xfails of the tests that attach to one accept that refusal and
+    nothing else. REPLICAOF answers any failed handshake with 'replication cancelled': what makes
+    this the refusal is the ERROR the node logged before it replied."""
+    try:
+        assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+    except redis.exceptions.ResponseError as e:
+        if "replication cancelled" in str(e) and running_node_log_lines(
+            node, ACTIVE_KEYDB_REFUSAL_ERROR
+        ):
+            raise AssertionError(f"REPLICAOF was refused: {e}") from e
+        raise
+
+
 @assert_eventually(times=300)
 @retry_while_loading
 async def assert_ttl_and_db1_arrived(c, c1):
@@ -220,6 +256,12 @@ async def test_keydb_plain_master_full_sync_and_stream(
 
 
 @pytest.mark.keydb
+# drakeydb: P7-0 interim. Until P7-1 Task 1.2 can apply what an active KeyDB streams, Greet()
+# refuses the link (test_active_keydb_link_refused_until_p7_1), so this fails on the REPLICAOF. The
+# strict xfail turns the day the refusal goes away into a failing run: P7-1 Task 1.2 removes both.
+@pytest.mark.xfail(
+    strict=True, raises=AssertionError, reason="active KeyDB refused until P7-1 Task 1.2"
+)
 async def test_keydb_active_handshake_and_full_sync(
     df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
 ):
@@ -238,7 +280,7 @@ async def test_keydb_active_handshake_and_full_sync(
 
     async with keydb.client() as k:
         await seed_before_attach(keydb)
-        assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+        await attach_to_keydb(c, node, keydb)
         await wait_available_async(c)
         info = await c.info("replication")
         assert info["role"] == "slave" and info["master_link_status"] == "up", info
@@ -248,6 +290,10 @@ async def test_keydb_active_handshake_and_full_sync(
 
 
 @pytest.mark.keydb
+# drakeydb: P7-0 interim, as for test_keydb_active_handshake_and_full_sync.
+@pytest.mark.xfail(
+    strict=True, raises=AssertionError, reason="active KeyDB refused until P7-1 Task 1.2"
+)
 async def test_keydb_active_handshake_peer_mode(
     df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
 ):
@@ -260,7 +306,7 @@ async def test_keydb_active_handshake_peer_mode(
 
     async with keydb.client() as k:
         await seed_before_attach(keydb)
-        assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+        await attach_to_keydb(c, node, keydb)
         await wait_for_peer_link(c)
         await assert_full_sync_arrived(c)
         await assert_ttl_and_db1_arrived(c, c1)
@@ -268,11 +314,12 @@ async def test_keydb_active_handshake_peer_mode(
 
 
 @pytest.mark.keydb
-# drakeydb: strict xfail until P7-1 Task 1.2 unwraps RREPLAY envelopes; a pass then fails the run so
-# the marker cannot outlive the fix. Only an AssertionError (the writes never arrive) is the expected
-# failure: a crash or a connection error fails the test.
+# drakeydb: strict xfail until P7-1 Task 1.2, which lifts the refusal of active KeyDB masters
+# (test_active_keydb_link_refused_until_p7_1) and unwraps RREPLAY envelopes; a pass then fails the
+# run so the marker cannot outlive the fix. Only an AssertionError (the REPLICAOF is refused, or
+# the writes never arrive) is the expected failure: a crash or a connection error fails the test.
 @pytest.mark.xfail(
-    strict=True, raises=AssertionError, reason="needs RREPLAY unwrap (P7-1 Task 1.2)"
+    strict=True, raises=AssertionError, reason="active KeyDB refused until P7-1 Task 1.2"
 )
 @pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
 async def test_keydb_active_live_write_during_full_sync(
@@ -283,8 +330,8 @@ async def test_keydb_active_live_write_during_full_sync(
 
     An active KeyDB wraps everything it streams in an RREPLAY envelope, including what it queued
     behind the RDB for a syncing replica (tests/dragonfly/data/README.md has the captured bytes), so
-    the replica can only apply these writes once it unwraps the envelope (Task 1.2). Until then the
-    full sync lands and these writes are dropped.
+    the replica can only apply these writes once it unwraps the envelope (Task 1.2). Until then it
+    refuses the link, rather than sync and drop them.
     """
     keydb = keydb_server_factory(active_replica=True)
     args = {"active_replica": "true"} if peer_mode else {}
@@ -294,7 +341,7 @@ async def test_keydb_active_live_write_during_full_sync(
 
     async with keydb.client() as k:
         await seed_before_attach(keydb)
-        assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+        await attach_to_keydb(c, node, keydb)
         live = await write_during_full_sync(k)
         if peer_mode:
             await wait_for_peer_link(c)
@@ -307,61 +354,118 @@ async def test_keydb_active_live_write_during_full_sync(
         await assert_keydb_saw_one_full_sync(k)
 
 
-def running_node_logged(node, pattern):
-    """Whether a running node has logged a line matching `pattern`. find_in_logs wants the node
-    stopped; WARNING and ERROR lines are flushed as they are logged, so these can be polled for."""
-    matcher = re.compile(pattern)
-    for path in node.log_files:
-        with open(path) as log:
-            if any(matcher.search(line) for line in log):
-                return True
-    return False
-
-
-# glog lines start with their severity letter, so these also pin that the lines are loud (W, E).
-ACTIVE_MASTER_WARNING = (
-    r"^W\d{4} .*advertises active-replica: this build applies its full sync but NOT its"
-)
 RREPLAY_DROP_ERROR = (
-    r"^E\d{4} .*Dropping RREPLAY envelopes from an active KeyDB master \(unsupported until P7-1\); "
+    r"^E\d{4} .*Dropping RREPLAY envelopes from 127\.0\.0\.1:\d+ \(unsupported until P7-1\); "
     r"[1-9]\d* dropped so far"
 )
+GREET_FAILED_WARNING = r"^W\d{4} .*Error greeting localhost:\d+ "
+BAD_CAPA_RESPONSE = r'Bad response to "REPLCONF capa'
+
+# A replica whose handshake failed reconnects after the replication fiber's sleep of
+# RECONNECT_PERIOD_S, so the attempts of a window T are at least that far apart, and KeyDB counts at
+# most T / RECONNECT_PERIOD_S + 1 of them (one more is slack). A slow machine only makes fewer.
+RECONNECT_PERIOD_S = 0.5
+RETRY_WINDOW_S = 3
+
+
+def replica_links(info, peer_mode):
+    """The replication links a node reports: one per `masterN` block in peer mode, the one of a
+    plain replica, none for a node that is not replicating. Each is a dict of what both report:
+    `sync_in_progress`, and `node_uuid` (None until the handshake has got as far as the master's
+    identity). Not the link's status: that is whether the TCP connection is open, so it reads `up`
+    for the moment every attempt takes to be refused."""
+    if peer_mode:
+        blocks = [info[f"master{i}"] for i in range(int(info["connected_masters"]))]
+        return [
+            {"sync_in_progress": b["sync_in_progress"], "node_uuid": b.get("node_uuid")}
+            for b in blocks
+        ]
+    if info["role"] != "slave":
+        return []
+    return [
+        {
+            "sync_in_progress": info["master_sync_in_progress"],
+            "node_uuid": info.get("master_node_uuid"),
+        }
+    ]
 
 
 @pytest.mark.keydb
-async def test_active_keydb_stream_drop_is_logged(
-    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+@pytest.mark.parametrize("via_flag", [False, True], ids=["replicaof_command", "replicaof_flag"])
+async def test_active_keydb_link_refused_until_p7_1(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, peer_mode, via_flag
 ):
-    """Until P7-1 unwraps RREPLAY, a replica of an active KeyDB loses every write streamed after
-    its full sync (it drops the envelope as an unknown command), and says so: a WARNING at the
-    handshake and an ERROR that counts the dropped envelopes. Without them the link looks healthy
-    while the data diverges. P7-1 deletes this test together with the drop."""
+    """Until P7-1 can apply what an active KeyDB streams (it wraps every write in an RREPLAY
+    envelope), a replica of one refuses the link at the handshake, instead of syncing and then
+    silently dropping every write while reporting itself up and caught up.
+
+    The refusal is an error like any other handshake failure: REPLICAOF fails (with the generic
+    'replication cancelled') and leaves no link behind; a node started with --replicaof keeps
+    trying on the usual 500ms reconnect, no tighter. Either way the node logs the refusal once, as
+    an ERROR. The master never sees a PSYNC, so it never forks an RDB for the replica or lists it.
+    P7-1 Task 1.2 removes the refusal and this test.
+
+    Falsifying: without the refusal the handshake succeeds and the link syncs: REPLICAOF is
+    accepted, no ERROR is logged and KeyDB counts a full sync.
+    """
     keydb = keydb_server_factory(active_replica=True)
-    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"))
-    node.start()
-    c = node.client()
+    args = {"active_replica": "true"} if peer_mode else {}
+    if via_flag:
+        args["replicaof"] = f"localhost:{keydb.port}"
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"), **args)
+
+    async def connections_received(k):
+        return int((await k.info("stats"))["total_connections_received"])
 
     async with keydb.client() as k:
         await k.set("pre:key", "v")
-        assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
-        await wait_available_async(c)
+        connections_before = await connections_received(k)
+        node.start()
+        c = node.client()
+        if not via_flag:
+            with pytest.raises(redis.exceptions.ResponseError, match="replication cancelled"):
+                await c.execute_command(f"REPLICAOF localhost {keydb.port}")
 
         @assert_eventually(times=100)
-        async def replica_online():
-            slave = (await k.info("replication")).get("slave0")
-            assert slave is not None and slave["state"] == "online", slave
+        async def refusal_logged():
+            logged = running_node_log_lines(node, ACTIVE_KEYDB_REFUSAL_ERROR)
+            assert logged, "the refusal is not logged"
 
-        await replica_online()
+        await refusal_logged()
         await k.set("post:key", "streamed")
 
-        @assert_eventually(times=100)
-        async def drop_logged():
-            logged = running_node_logged(node, RREPLAY_DROP_ERROR)
-            assert logged, "the dropped writes are not logged"
+        # Watch a window: KeyDB never lists the replica, and the node's link never gets past the
+        # capa step (no master uuid, no sync). Only a --replicaof node still has a link, a failing
+        # one it retries.
+        loop = asyncio.get_running_loop()
+        window_start = loop.time()
+        attempts_at_start = await connections_received(k) - connections_before
+        while loop.time() < window_start + RETRY_WINDOW_S:
+            master = await k.info("replication")
+            assert master["connected_slaves"] == 0 and "slave0" not in master, master
+            links = replica_links(await c.info("replication"), peer_mode)
+            assert len(links) == (1 if via_flag else 0), links
+            assert all(link == {"sync_in_progress": 0, "node_uuid": None} for link in links), links
+            await asyncio.sleep(0.1)
+        window = loop.time() - window_start
+        attempts = await connections_received(k) - connections_before - attempts_at_start
 
-        await drop_logged()
-        node.stop()
-        assert node.find_in_logs(ACTIVE_MASTER_WARNING), "no log line warning about the master"
+        # Neither the data from before the attach nor the write after it arrived.
+        assert await c.get("pre:key") is None
+        assert await c.get("post:key") is None
+        if via_flag:
+            assert 2 <= attempts <= window / RECONNECT_PERIOD_S + 2, (attempts, window)
+        else:
+            assert attempts == 0, "a refused REPLICAOF must not leave a retry loop behind"
+        stats = await k.info("stats")
+        assert stats["sync_full"] == 0 and stats["sync_partial_ok"] == 0, stats
+
+    node.stop()
+    # Once, not once per attempt; and the refusal is a decision, not a malformed capa reply.
+    assert len(set(node.find_in_logs(ACTIVE_KEYDB_REFUSAL_ERROR))) == 1
+    assert not node.find_in_logs(BAD_CAPA_RESPONSE)
+    assert len(set(node.find_in_logs(GREET_FAILED_WARNING))) == (1 if via_flag else 0)
 
 
 async def attach_and_watch_retries(df_factory, tmp_path, master, retries=3):
@@ -578,3 +682,105 @@ async def test_psync_stream_bytes_behind_full_sync_are_applied(
         assert master.ack_offsets[-1] == expected, master.ack_offsets
         assert master.connection_count == 1, "the replica reconnected: the full sync was refused"
         assert (await c.info("replication"))["master_link_status"] == "up"
+
+
+# An empty command name: a valid RESP array of one empty bulk string. Any classic master's stream
+# bytes can say it, so the replica must take it as the unknown command it is.
+EMPTY_COMMAND_NAME = b"*1\r\n$0\r\n\r\n"
+
+# What follows a valid sync, by how the master's writes split: (the PSYNC reply, the stream that
+# follows it in a second write, after SECOND_WRITE_DELAY_S). `behind_rdb` has the stream in the same
+# write as the RDB's end, so the replica starts the stable sync with those bytes already read.
+EMPTY_NAME_SCENARIOS = {
+    "diskless_later_write": (diskless_full_sync(offset=SYNC_OFFSET), EMPTY_COMMAND_NAME + SET_A),
+    "disk_later_write": (
+        disk_full_sync(rdb=MINIMAL_RDB, offset=SYNC_OFFSET),
+        EMPTY_COMMAND_NAME + SET_A,
+    ),
+    "disk_behind_rdb": (
+        disk_full_sync(rdb=MINIMAL_RDB, offset=SYNC_OFFSET, stream=EMPTY_COMMAND_NAME + SET_A),
+        b"",
+    ),
+}
+
+
+@pytest.mark.parametrize("scenario", list(EMPTY_NAME_SCENARIOS))
+async def test_classic_stream_empty_command_name_does_not_abort(
+    df_factory: DflyInstanceFactory, tmp_path, scenario
+):
+    """`*1\\r\\n$0\\r\\n\\r\\n` in the replication stream used to abort the replica (ISSUE-REGISTER
+    U-13): Replica::ConsumeRedisStream read the first byte of the command name before checking that
+    there is one (an assertion in a debug build, a 1-byte out-of-bounds read in a release one). It
+    is an unknown command now: dropped like any other, its bytes counted into the offset, the
+    commands after it applied.
+
+    Falsifying: with the check removed, the replica process dies of SIGABRT (`i < size()` in
+    absl/types/span.h) as it reads the empty name.
+    """
+    reply, later_write = EMPTY_NAME_SCENARIOS[scenario]
+    async with FakeClassicMaster() as master:
+        master.script_psync(reply, stream=later_write, stream_delay=SECOND_WRITE_DELAY_S)
+        node = df_factory.create(
+            proactor_threads=2, dir=str(tmp_path / "df"), replication_acks_interval=100
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("a") == "1"
+
+        await applied()
+        expected = SYNC_OFFSET + len(EMPTY_COMMAND_NAME + SET_A)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert max(master.ack_offsets) == expected, master.ack_offsets
+        assert master.connection_count == 1, "the replica reconnected"
+        assert (await c.info("replication"))["master_link_status"] == "up"
+
+
+async def test_classic_stream_rreplay_is_dropped_and_logged_until_p7_1(
+    df_factory: DflyInstanceFactory, tmp_path
+):
+    """An RREPLAY envelope from a master that did not advertise active-replica (so the handshake
+    did not refuse it) is dropped as an unknown command, and loudly: an ERROR that counts the
+    dropped envelopes, since otherwise the link looks healthy while the data diverges. The offset
+    still counts its bytes, and the commands after it are applied. P7-1 Task 1.2 replaces this test
+    with one that applies the envelope's command.
+
+    Falsifying: with the ERROR in Replica::ConsumeRedisStream removed, nothing is logged."""
+    envelope = resp_command("RREPLAY", "b1198d29-cb88-4110-922a-a6c99bd08471", SET_A, "0", "1")
+    async with FakeClassicMaster() as master:
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET),
+            stream=envelope + SET_B,
+            stream_delay=SECOND_WRITE_DELAY_S,
+        )
+        node = df_factory.create(
+            proactor_threads=2, dir=str(tmp_path / "df"), replication_acks_interval=100
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("b") == "2"
+
+        await applied()
+        assert await c.get("a") is None, "the envelope's command was applied"
+
+        @assert_eventually(times=100)
+        async def drop_logged():
+            assert running_node_log_lines(node, RREPLAY_DROP_ERROR), "the drop is not logged"
+
+        await drop_logged()
+        expected = SYNC_OFFSET + len(envelope + SET_B)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert max(master.ack_offsets) == expected, master.ack_offsets

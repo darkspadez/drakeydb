@@ -5,9 +5,11 @@
 > coupling, the release-build perf bar, the full-sync tail). Branch
 > `feat/phase7-0-closeout-and-harness` off `origin/main` (`c60dfdb`); `src/` is unchanged since
 > except the P7-0 implementation (Tasks 0.4-0.6 and 0.9, which also fixed U-10), the review fix round
-> that followed it (U-12, a log fix in `ParseReplicationHeader`) and the whole-branch review's loud
-> log lines for the RREPLAY envelopes a build without P7-1 drops (`replica.cc`). The other commits
-> since are ledger/doc commits and the test/CI harness (Tasks 0.7, 0.8).
+> that followed it (U-12, a log fix in `ParseReplicationHeader`), the whole-branch review's loud
+> log lines for the RREPLAY envelopes a build without P7-1 drops (`replica.cc`) and the adversarial
+> pass's two fixes: the refusal of active-KeyDB links until P7-1 (decision 23, D-2) and U-13 (an
+> empty command name in a classic stream). The other commits since are ledger/doc commits and the
+> test/CI harness (Tasks 0.7, 0.8).
 > Ships as five stacked sub-PRs — see [PR stack](#pr-stack).
 >
 > This is the next numbered phase: Phase 5 was superseded by P4-4, Phase 6 was delivered by P4-3,
@@ -323,6 +325,21 @@ bad response. Every other `CheckRespIsSimpleReply("OK")` in `Greet()` is unchang
 - A master that does not answer `active-replica` — plain Redis, Valkey, stock Dragonfly, drakeydb,
   a non-active KeyDB — sees a handshake **byte-identical to today**; no extra command is sent.
   `keydb-fastsync-save` is parsed and ignored: drakeydb never sends `capa keydb-fastsync`.
+- **Interim refusal (P7-0 only; decision 23, the adversarial pass's C1).** With the suffix accepted
+  but RREPLAY not yet unwrapped, a link to an active KeyDB would connect, full-sync, report itself
+  up (KeyDB even reports the replica caught up) and drop every streamed write. So until P7-1,
+  `Greet()` **refuses** a link whose capa reply advertises `active-replica`, **after** the reply
+  parsed (`ParseCapaReply` still accepts the suffix; the refusal is a logged policy, not a parse
+  failure), at both capa sites: `LOG_EVERY_T(ERROR, 60)` ("advertises active-replica: this build
+  cannot apply its RREPLAY stream yet (Phase 7, P7-1); refusing the link") and
+  `std::errc::protocol_not_supported`, which takes the existing failed-handshake paths: `REPLICAOF`
+  fails with `replication cancelled` (what every failed `Greet()` gives; the ERROR says why) and
+  leaves no link, and a `--replicaof` link retries on the usual 500 ms reconnect (the retry's
+  per-attempt WARNING is rate-limited like the peer refusals). It happens before `REPLCONF UUID` and
+  `PSYNC`, so the master never forks an RDB for the replica or lists it. The refusal is marked
+  `// drakeydb: P7-0 interim` in `replica.cc`; **P7-1 Task 1.2 removes it** together with the three
+  strict `xfail`s that pin it. `ConsumeRedisStream` keeps a defensive ERROR for an RREPLAY from a
+  master that did not advertise `active-replica`, until Task 1.2's unwrap replaces it.
 
 ### D-3. Unwrapping RREPLAY (B.1)
 
@@ -910,8 +927,12 @@ still pass under if the feature were removed.
 
 | Test | Falsify by |
 |---|---|
-| `ClassicReplayTest.ParseCapaReply*`; `test_greet_accepts_keydb_active_replica_capa_reply` (both Greet sites, proxy) | Reverting `Greet()` to strict `OK`: `REPLICAOF` fails with `Bad response ... "+OK active-replica\r\n"` |
-| `test_keydb_active_handshake_and_full_sync` (real KeyDB) | Same revert |
+| `ClassicReplayTest.ParseCapaReply*`; `test_greet_accepts_capa_reply_with_capability_words` (both Greet sites, proxy; `+OK keydb-fastsync-save` and an unknown word) | Reverting `Greet()` to strict `OK`: `REPLICAOF` fails with `Bad response ... "+OK keydb-fastsync-save\r\n"` |
+| `test_greet_refuses_active_replica_capa_reply` (both Greet sites, proxy; `+OK active-replica` with and without `keydb-fastsync-save`; P7-0 interim, removed by Task 1.2) | Removing the refusal: `REPLICAOF` is accepted, the full sync lands, no ERROR is logged |
+| `test_active_keydb_link_refused_until_p7_1` (real KeyDB; plain and peer node, `REPLICAOF` and `--replicaof`: `replication cancelled` and no link left behind / retries bounded by the 500 ms cadence, the ERROR logged once, KeyDB never lists the replica and counts no sync, no key arrives; P7-0 interim, removed by Task 1.2) | Removing the refusal; `LOG_EVERY_T` back to `LOG` (one ERROR per attempt); un-quieting the retry WARNING; the reconnect sleep cut to 50 ms (attempts bound) |
+| `test_keydb_active_handshake_and_full_sync`, `test_keydb_active_handshake_peer_mode` (real KeyDB; **strict `xfail`** until Task 1.2: the `REPLICAOF` is refused, the failure is the refusal's `AssertionError` and nothing else) | Removing the refusal: the strict `xfail` XPASSes and fails the run |
+| `test_classic_stream_empty_command_name_does_not_abort[diskless_later_write\|disk_later_write\|disk_behind_rdb]` (fake master: a valid sync, then `*1\r\n$0\r\n\r\n`, then `SET a 1`: replica alive, `a == 1`, settled ACK exact; U-13) | Dropping the `!cmd.empty()` guard in `ConsumeRedisStream`: SIGABRT (`i < size()`, `absl/types/span.h`) |
+| `test_classic_stream_rreplay_is_dropped_and_logged_until_p7_1` (fake master that did not advertise `active-replica`; Task 1.2 replaces it) | Removing the defensive drop ERROR: nothing is logged |
 | `test_psync_stream_bytes_behind_full_sync_are_applied` (fake master: `$<len>` + RDB + raw `SET a 1` in one `write()`; the `$EOF:` framing too): `a == 1`, offsets exact; `test_psync_*_token_mismatch*` and `*_length_*` reconnect | Unclamped first read (`CHECK`/reconnect loop, `a` never set); dropping the hand-off (`a == 0`); counting the hand-off twice (offsets apart) |
 | `ClassicReplayTest.ParseRreplayEnvelope*` (incl. the golden captures); `ClassicApplyFamilyTest.*` (unwrap, db, skips, self, malformed, nested to 64, depth-65 leaves the 64th consumed, an inner with zero or two commands malformed, known-command error counted) | Dropping the 65th-nesting refusal; applying inner `PING`; accepting a second inner command; the `NONE` builder (no `classic_apply_errors`) |
 | `ClassicApplyFamilyTest.RunningFalseBeforeDispatchReturnsNotConsumed*`, `.RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope`, `.RejectedDispatchCountsBytesDoesNotAdvance`, `.ReplayAfterCommitBeforeCountIsDeduped` | Checking `running()` after the first dispatch; checking it before every inner dispatch; `Commit` on a rejected dispatch; deferring `Commit` past the return |
@@ -952,8 +973,14 @@ observe changes only here:
 2. **Ungated crash, abort and refusal fixes** (P7-0). None changes a byte on the journal wire or in
    RDB output; in each, upstream crashed, aborted or refused the link:
    - **`+OK <suffix>` acceptance** (Task 0.4): a master that answers `REPLCONF capa` with `OK`, a
-     space and words (an active KeyDB's `+OK active-replica`) is accepted. Upstream refused the link
-     (`Bad response`, `REPLICAOF` failed). Any other reply is still refused.
+     space and words (`+OK keydb-fastsync-save`) is accepted. Upstream refused the link (`Bad
+     response`, `REPLICAOF` failed). Any other reply is still refused. An active KeyDB's `+OK
+     active-replica` parses the same way but is refused by policy until P7-1 (D-2, decision 23), so
+     P7-0 alone changes nothing for it.
+   - **U-13** (this round): an empty command name (`*1\r\n$0\r\n\r\n`) in a classic master's
+     stream. Upstream read the first byte of the empty name (`replica.cc`, `ConsumeRedisStream`):
+     SIGABRT in a debug build, a 1-byte out-of-bounds read in a release one. It is now dispatched
+     as the unknown command it is and its bytes are counted exactly.
    - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
      migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
      a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a
@@ -997,7 +1024,7 @@ rebased onto `origin/main` after the predecessor squash-merges; each PR is opene
 
 | PR | Branch | Scope |
 |---|---|---|
-| **P7-0** | `feat/phase7-0-closeout-and-harness` | P4 close-out docs (U-8 withdrawn), baseline gate on unmodified main, this spec and plan, `Greet()` accepts `+OK <suffix>`, U-9, graceful PSYNC `CHECK`s and the full-sync tail hand-off (Task 0.6), KeyDB harness + fake classic master + smoke tests (done), `drakeydb-ci.yml` (done), a load-robust reaper-resume test (Task 0.9) |
+| **P7-0** | `feat/phase7-0-closeout-and-harness` | P4 close-out docs (U-8 withdrawn), baseline gate on unmodified main, this spec and plan, `Greet()` accepts `+OK <suffix>` but refuses active-KeyDB links until P7-1 (decision 23), U-9, U-13, graceful PSYNC `CHECK`s and the full-sync tail hand-off (Task 0.6), KeyDB harness + fake classic master + smoke tests (done), `drakeydb-ci.yml` (done), a load-robust reaper-resume test (Task 0.9) |
 | **P7-1** | `feat/phase7-1-rreplay-unwrap` | Envelope parse, unwrap in `ConsumeRedisStream`, KeyDB-only/unknown drop and counters, `capa activeExpire` + replica active expiry, throughput bar (conditional micro-batch task) |
 | **P7-2** | `feat/phase7-2-author-stamps-dedup-guard` | Author map and cap, per-command stamps, author dedup (reservation), guard ON + classic rewrites, EVAL stamping, skew estimate, D-1 closed, `KEYDB.MVCCRESTORE` applied (decision 22) |
 | **P7-3** | `feat/phase7-3-classic-partial-psync` | `--classic_partial_psync`, leftover hand-off, peer partial skips merge |

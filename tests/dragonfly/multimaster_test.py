@@ -464,24 +464,25 @@ CAPA_SITE_IDS = ["capa_eof", "capa_dragonfly"]
 @pytest.mark.parametrize("capa_request", CAPA_SITES, ids=CAPA_SITE_IDS)
 @pytest.mark.parametrize(
     "capa_reply",
-    [b"+OK active-replica\r\n", b"+OK active-replica keydb-fastsync-save\r\n"],
-    ids=["active", "active_fastsync"],
+    [b"+OK keydb-fastsync-save\r\n", b"+OK some-future-word keydb-fastsync-save\r\n"],
+    ids=["fastsync", "unknown_word"],
 )
-async def test_greet_accepts_keydb_active_replica_capa_reply(
+async def test_greet_accepts_capa_reply_with_capability_words(
     df_factory: DflyInstanceFactory, redis_server, proxy_factory, tmp_path, capa_request, capa_reply
 ):
-    """An active KeyDB answers every `REPLCONF capa ...` with `+OK active-replica` (and possibly
-    ` keydb-fastsync-save`), and Replica::Greet() must take that as an OK at both capa sites:
-    `REPLCONF capa eof capa psync2` and the Redis branch of `REPLCONF capa dragonfly`.
+    """A KeyDB appends capability words to its `REPLCONF capa ...` replies (`+OK
+    keydb-fastsync-save`; an active one also says `active-replica`, which Greet() refuses until
+    P7-1: test_greet_refuses_active_replica_capa_reply), and Replica::Greet() must take `OK <words>`
+    as an OK at both capa sites: `REPLCONF capa eof capa psync2` and the Redis branch of
+    `REPLCONF capa dragonfly`.
 
     A proxy in front of a real Redis master overrides the reply to one capa command (the override
     only ever hits the first matching reply, hence one site per case); everything else the master
-    says is untouched, so the full sync is a real one. The real-KeyDB twin of this test is
-    keydb_onboarding_test.py::test_keydb_active_handshake_and_full_sync.
+    says is untouched, so the full sync is a real one.
 
     Falsifying: with Greet() back on the strict CheckRespIsSimpleReply("OK") at either site,
     REPLICAOF raises "replication cancelled" and the log names `Bad response to "REPLCONF capa
-    ...": "+OK active-replica\\r\\n"`.
+    ...": "+OK keydb-fastsync-save\\r\\n"`.
     """
     import redis.asyncio as aioredis
 
@@ -514,6 +515,54 @@ async def test_greet_accepts_keydb_active_replica_capa_reply(
         await r.aclose()
 
 
+# drakeydb: P7-0 interim -- removed by P7-1 Task 1.2 (glog starts a line with its severity letter).
+ACTIVE_REPLICA_REFUSAL_ERROR = (
+    r"^E\d{4} .*Master localhost:\d+ advertises active-replica: this build cannot apply its "
+    r"RREPLAY stream yet \(Phase 7, P7-1\); refusing the link"
+)
+
+
+@pytest.mark.parametrize("capa_request", CAPA_SITES, ids=CAPA_SITE_IDS)
+@pytest.mark.parametrize(
+    "capa_reply",
+    [b"+OK active-replica\r\n", b"+OK active-replica keydb-fastsync-save\r\n"],
+    ids=["active", "active_fastsync"],
+)
+async def test_greet_refuses_active_replica_capa_reply(
+    df_factory: DflyInstanceFactory, redis_server, proxy_factory, tmp_path, capa_request, capa_reply
+):
+    """A master that advertises `active-replica` in a capa reply streams RREPLAY envelopes, which
+    this build cannot unwrap until P7-1. Greet() parses such a reply fine (the words after `OK` are
+    accepted, test_greet_accepts_capa_reply_with_capability_words) and refuses the link anyway, at
+    both capa sites, with an ERROR that says why: REPLICAOF fails, and nothing is synced or kept.
+    P7-1 Task 1.2 removes the refusal and this test. The real-KeyDB twin is
+    keydb_onboarding_test.py::test_active_keydb_link_refused_until_p7_1.
+
+    Falsifying: without the refusal REPLICAOF is accepted, the full sync lands and no ERROR is
+    logged.
+    """
+    import redis.asyncio as aioredis
+
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "plain"))
+    node.start()
+    c = node.client()
+    r = aioredis.Redis(port=redis_server.port, decode_responses=True)
+    proxy = await proxy_factory(redis_server.port)
+    try:
+        await r.set("seeded", "v")
+        await proxy.override_next_response(capa_request, capa_reply)
+        with pytest.raises(redis.exceptions.ResponseError, match="replication cancelled"):
+            await c.execute_command(f"REPLICAOF localhost {proxy.port}")
+        info = await c.info("replication")
+        assert info["role"] == "master", info
+        assert await c.get("seeded") is None
+    finally:
+        await r.aclose()
+    node.stop()
+    assert len(set(node.find_in_logs(ACTIVE_REPLICA_REFUSAL_ERROR))) == 1
+    assert not node.find_in_logs(r'Bad response to "REPLCONF capa')
+
+
 @pytest.mark.parametrize("capa_request", CAPA_SITES, ids=CAPA_SITE_IDS)
 @pytest.mark.parametrize(
     "bad_reply",
@@ -523,7 +572,7 @@ async def test_greet_accepts_keydb_active_replica_capa_reply(
 async def test_greet_still_refuses_malformed_capa_reply(
     df_factory: DflyInstanceFactory, redis_server, proxy_factory, tmp_path, capa_request, bad_reply
 ):
-    """The suffix tolerance of test_greet_accepts_keydb_active_replica_capa_reply is exactly `OK`
+    """The suffix tolerance of test_greet_accepts_capa_reply_with_capability_words is exactly `OK`
     or `OK <words>`: any other capa reply is still a bad response that refuses the link.
 
     Falsifying: with ParseCapaReply no longer requiring a space after "OK" (classic_replay.cc),

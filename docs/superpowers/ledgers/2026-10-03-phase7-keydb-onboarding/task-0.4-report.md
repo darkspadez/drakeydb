@@ -170,6 +170,12 @@ E               redis.exceptions.BusyLoadingError: Dragonfly is loading the data
 
 ## Whole-branch review fix round: I-1, an active-KeyDB link must not drop its stream silently
 
+> **Superseded (2026-10-04, decision 23):** the adversarial pass found that loud is not enough, so
+> `Greet()` now refuses an active-KeyDB link until P7-1 instead of warning and syncing. The
+> `Greet()` WARNING and `test_active_keydb_stream_drop_is_logged` below are gone; the
+> `ConsumeRedisStream` drop log stays as a defence for a master that did not advertise
+> `active-replica`. What this section records is what that round did.
+
 Until P7-1, a link to an active KeyDB connects and loads the full sync, but `ConsumeRedisStream`
 dispatches every RREPLAY-wrapped write as an unknown command and drops it, and the link keeps
 reporting `up`. The round makes that loud, with no change in behavior:

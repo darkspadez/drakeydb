@@ -291,7 +291,8 @@ class Replica : ProtocolClient {
   // Replica's own thread and before the replication fiber starts, and from the replication fiber
   // after that, so the two never overlap. It is set by the capa reply, which is not the last step
   // of Greet(): after a failed Greet() it may be stale. Read it only once R_GREETED is set in
-  // state_mask_ (P7-1 renders INFO from it, and must do so).
+  // state_mask_ (P7-1 renders INFO from it, and must do so). Until P7-1 Greet() refuses such a
+  // master, so it is never set on a greeted link.
   bool master_active_replica_ = false;
 
   // drakeydb: P7 -- replication stream bytes already read from the master but not yet applied: what

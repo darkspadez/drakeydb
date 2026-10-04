@@ -218,7 +218,10 @@ case-sensitive; later tokens space-separated, unknown words ignored).
 - [x] **Step 1: Failing tests.** `ClassicReplayTest.ParseCapaReplyAcceptsOkAndSuffixes` (`OK`,
   `OK active-replica`, `OK keydb-fastsync-save`, `OK active-replica keydb-fastsync-save`, extra
   spaces) and `ClassicReplayTest.ParseCapaReplyRejectsNonOk` (`OKAY`, `ok`, `ERR`, empty,
-  `OKactive-replica`). Pytest `test_greet_accepts_keydb_active_replica_capa_reply`, two halves,
+  `OKactive-replica`). Pytest `test_greet_accepts_keydb_active_replica_capa_reply` (renamed
+  `test_greet_accepts_capa_reply_with_capability_words` and re-pointed at non-active suffixes by
+  decision 23, which refuses `active-replica` until P7-1; `test_greet_refuses_active_replica_capa_reply`
+  now holds the active replies), two halves,
   each with its own `proxy_factory` proxy in front of the `redis_server` fixture master and a plain
   drakeydb replica: half A overrides the reply to `REPLCONF capa eof` with `+OK active-replica\r\n`
   (site `replica.cc:432`); half B overrides the reply to `REPLCONF capa dragonfly` (site `:611`).
@@ -357,8 +360,10 @@ stream-prefix buffer, which `ConsumeRedisStream` parses before its first socket 
 
 **Residuals.** The live write during a full sync against an *active* KeyDB is covered by
 `test_keydb_active_live_write_during_full_sync[plain_replica|peer_mode]`. It fails until RREPLAY is
-unwrapped, so it carries a **strict `xfail`** (`reason="needs RREPLAY unwrap (P7-1 Task 1.2)"`) and
-**Task 1.2 removes the marker** — a pass with the marker still on fails the run. `_wait_ready`
+unwrapped, so it carries a **strict `xfail`** (`reason="active KeyDB refused until P7-1 Task 1.2"`,
+since decision 23 it fails at the refused `REPLICAOF`; `test_keydb_active_handshake_and_full_sync`
+and `_peer_mode` carry the same marker) and **Task 1.2 removes all three markers** — a pass with a
+marker still on fails the run. `_wait_ready`
 compares `process_id` with the `Popen` pid, so a `KEYDB_SERVER_PATH` wrapper script that forks the
 real server is refused; `rdb-key-save-delay` is a v6.3.4 config; the tests read `INFO replication`'s
 `slave0.state` and `INFO stats` `sync_*` as v6.3.4 prints them.
@@ -498,8 +503,8 @@ of control commands, and a defined outcome when the link is cancelled (spec D-3 
 "Cancellation and offsets").
 **Files:** Modify `src/server/classic_replay.{h,cc}` (`ClassicApplier`, `ClassicLinkStats`),
 `src/server/replica.{h,cc}`; Test `src/server/classic_replay_test.cc`,
-`tests/dragonfly/keydb_onboarding_test.py` (remove the strict `xfail` from
-`test_keydb_active_live_write_during_full_sync`).
+`tests/dragonfly/keydb_onboarding_test.py` (remove the three strict `xfail`s, see Step 4b),
+`tests/dragonfly/multimaster_test.py`.
 **Interfaces:** `ClassicApplier` (constructed with `Service*`, `ConnectionContext*`, a link-owned
 `facade::CapturingReplyBuilder{ReplyMode::ONLY_ERR}` — **not** the `NONE` builder, which records
 nothing while `InvokeCmd` consumes `last_error_` itself, `main_service.cc:1740`, `:1750` — self
@@ -531,7 +536,7 @@ local to each call).
   drakeydb `slave_repl_offset` equals KeyDB `master_repl_offset`, through cron `PING` and `GETACK`
   envelopes), and the already-written
   `test_keydb_active_live_write_during_full_sync[plain_replica|peer_mode]` with its `xfail` marker
-  removed. Fake master: `test_unwrap_flushes_raw_batch_before_envelope` (raw `SET a 1`, then
+  removed (and the two handshake tests', Step 4b). Fake master: `test_unwrap_flushes_raw_batch_before_envelope` (raw `SET a 1`, then
   envelope `SET a 2`, then wait for idle: `a == 2`).
 - [ ] **Step 2: Run, observe failure** (today the keys never arrive; offsets advance past
   dropped envelopes; with the marker removed the live-write tests fail).
@@ -556,17 +561,40 @@ local to each call).
   before every inner dispatch: `RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope` fails;
   (f) accept a second inner command: the two-commands case of `MalformedEnvelopeSkippedAndCounted`
   fails; (g) use the `NONE` builder: `KnownCommandErrorReplyCounted` fails.
-- [ ] **Step 4b: Remove the P7-0 stopgap** (the whole-branch review's I-1): until this task, a
-  build drops every RREPLAY envelope, so `Greet()` logs a `WARNING` when the master answers
-  `active-replica` ("... applies its full sync but NOT its RREPLAY stream yet ...") and
-  `ConsumeRedisStream` keeps an `rreplay_dropped` counter with a `LOG_EVERY_T(ERROR, 30)` per
-  dropped envelope. Delete both, and delete `test_active_keydb_stream_drop_is_logged` (or turn it
-  into a test that the unwrapped writes arrive and nothing is logged as dropped).
+- [ ] **Step 4b: Remove the P7-0 interim refusal** (decision 23; the whole-branch review's I-1 and
+  the adversarial pass's C1). Until this task `Greet()` refuses a master whose capa reply advertises
+  `active-replica`, because the stream it would then apply is RREPLAY-wrapped. Find every piece
+  with `grep -rn "P7-0 interim" src tests` and remove it:
+  - `replica.cc`: the `refuse_active_replica_master` lambda and its two call sites in `Greet()`
+    (after `read_capa_reply()` at the `REPLCONF capa eof capa psync2` site and at the Redis branch of
+    `REPLCONF capa dragonfly`), the `protocol_not_supported` clause of the quiet-greeting condition
+    in `MainReplicationFb`, and, with the unwrap now in place, the defensive `rreplay_dropped`
+    counter and its `LOG_EVERY_T(ERROR, 30)` in `ConsumeRedisStream`. Keep `ParseCapaReply` and
+    `master_active_replica_` (Task 1.4 reads it); update the member's comment (it is set on a
+    greeted link again).
+  - `keydb_onboarding_test.py`: remove the strict `xfail` (and its comment) from
+    `test_keydb_active_handshake_and_full_sync`, `test_keydb_active_handshake_peer_mode` and
+    `test_keydb_active_live_write_during_full_sync`; delete `test_active_keydb_link_refused_until_p7_1`
+    and its helpers (`ACTIVE_KEYDB_REFUSAL_ERROR`, `attach_to_keydb` back to a plain `assert await
+    c.execute_command(...) == "OK"`, `replica_links`, `RECONNECT_PERIOD_S`/`RETRY_WINDOW_S`,
+    `GREET_FAILED_WARNING`, `BAD_CAPA_RESPONSE`; `running_node_log_lines` stays if still used); delete
+    `test_classic_stream_rreplay_is_dropped_and_logged_until_p7_1` and `RREPLAY_DROP_ERROR` (the
+    unwrap tests of Step 1 replace them). Keep `test_classic_stream_empty_command_name_does_not_abort`
+    (U-13 is permanent).
+  - `multimaster_test.py`: delete `test_greet_refuses_active_replica_capa_reply` and
+    `ACTIVE_REPLICA_REFUSAL_ERROR`, and add the active replies (`+OK active-replica`, `+OK
+    active-replica keydb-fastsync-save`) back to the parameters of
+    `test_greet_accepts_capa_reply_with_capability_words` (renaming it back to
+    `test_greet_accepts_keydb_active_replica_capa_reply` if preferred).
+  - **Falsify:** with the refusal left in, the three formerly strict-xfail tests fail at their
+    `REPLICAOF` (`replication cancelled`, the ERROR in the log), and the active replies of the proxy
+    test are refused. Record both.
 - [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; run both suites; pre-commit; commit
   `feat: unwrap RREPLAY envelopes on classic replication links (P7)`.
 
 **Done:** every KeyDB-written key type reaches a plain replica; offsets exact; mixed streams
-ordered; cancellation leaves a resumable offset; the strict `xfail` is gone and both
+ordered; cancellation leaves a resumable offset; the three strict `xfail`s and the active-KeyDB
+refusal are gone, `test_keydb_active_handshake_and_full_sync`, `_peer_mode` and both
 `test_keydb_active_live_write_during_full_sync` variants pass.
 
 ### Task 1.3: KeyDB-only and unknown commands, per-link counters, INFO and Prometheus
@@ -649,7 +677,8 @@ INFO and the `activeExpire` decision read it only once `R_GREETED` is set in `st
   proxy sees exactly one, as its own `REPLCONF`, after the first capa reply).
 - [ ] **Step 2: Run, observe failure** (no keys expire; the KeyDB warning is logged).
 - [ ] **Step 3: Implement** per spec D-9 and D-2: record `master_active_replica_` from both capa
-  replies (OR); send `REPLCONF capa activeExpire` right after the `:432` check when set, parse its
+  replies (OR; the P7-0 refusal at that site is already gone, Task 1.2 Step 4b); send `REPLCONF capa
+  activeExpire` right after the `:432` check when set, parse its
   reply leniently; `SetShardStates`'s sibling sets/clears the shard flag at `:272-273` / `:383-385`
   and after each **successful** `Greet()` (a failed one neither sets nor clears it), and only for
   the node's main `replica_` link (`!slot_range_`): cluster `ADDREPLICAOF` replicas run the same

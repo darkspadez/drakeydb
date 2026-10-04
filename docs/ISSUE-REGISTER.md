@@ -355,6 +355,29 @@ its other exceptions abort, both in `Transaction::RunCallback`).
 nullptr`. The failed command is still dropped, logged and not retried, and the replication link
 stays up, so a replica that hits this diverges silently on that key. Not filed upstream.
 
+### U-13. An empty command name in a classic stream aborts the replica
+
+**Where:** `Replica::ConsumeRedisStream` (`src/server/replica.cc`), the debug dump of a command whose
+name starts with `\r`: `LastResponseArgs()[0].GetBuf()[0] == '\r'`, evaluated for every command
+that is not `MULTI`/`EXEC`, before the check that the name has a first byte.
+
+The stream bytes `*1\r\n$0\r\n\r\n` are a valid RESP array of one empty bulk string: a command with
+an empty name. The parser accepts it and the read of its first byte is out of bounds: SIGABRT in a
+debug build (`absl/types/span.h:335` `assert(false && "i < size()")`), a 1-byte out-of-bounds read
+in a release one. Any classic master, plain Redis and Valkey included, can send it in its replication
+stream, so it is reachable from a malformed or hostile master after any valid sync.
+
+**How established:** a scripted master (an adversarial pass over P7-0): a valid diskless or disk full
+sync, then `*1\r\n$0\r\n\r\n`, then `SET a 1` aborts the debug replica with SIGABRT in
+`Span<>::operator[]` called from `Replica::ConsumeRedisStream`.
+
+**Status (2026-10-04): fixed in this fork** (P7-0): the dump requires a non-empty name, so the empty
+name is dispatched as the unknown command it is (dropped, counted in `unknown_cmds`, its bytes counted
+into `repl_offs_` exactly) and the commands after it apply. Tests
+`keydb_onboarding_test.py::test_classic_stream_empty_command_name_does_not_abort[diskless_later_write,
+disk_later_write,disk_behind_rdb]`. Pre-existing in upstream Dragonfly; not filed upstream. On the
+byte-identity exception list (spec, item 2).
+
 ---
 
 ## Part 2 — drakeydb deferred work

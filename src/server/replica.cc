@@ -315,10 +315,15 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
         // resource_unavailable_try_again is the peer-is-loading refusal (the PING check just
         // above that one in Greet()) -- both are expected to clear themselves within a retry or
         // two, so they stay in this quiet bucket alongside the other two peer-identity refusals.
-        if (IsPeerMode() &&
-            (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use ||
-             ec == std::errc::device_or_resource_busy ||
-             ec == std::errc::resource_unavailable_try_again)) {
+        // drakeydb: P7-0 interim -- removed by P7-1 Task 1.2. protocol_not_supported is the
+        // active-KeyDB refusal (refuse_active_replica_master in Greet() below): permanent for as
+        // long as the master stays active, and already logged by Greet(), so it is quiet in every
+        // mode instead of one WARNING per 500ms reconnect.
+        if (ec == std::errc::protocol_not_supported ||
+            (IsPeerMode() &&
+             (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use ||
+              ec == std::errc::device_or_resource_busy ||
+              ec == std::errc::resource_unavailable_try_again))) {
           LOG_EVERY_T(WARNING, 60)
               << "Error greeting " << server().Description() << " (phase: " << GetCurrentPhase()
               << "): " << ec << " " << ec.message() << ", socket state: " + SockInfo();
@@ -402,15 +407,20 @@ error_code Replica::Greet() {
     CapaReply capa;
     if (LastResponseArgs().size() == 1 && LastResponseArgs()[0].type == RespExpr::STRING)
       capa = ParseCapaReply(ToSV(LastResponseArgs()[0].GetBuf()));
-    if (capa.active_replica && !master_active_replica_) {
+    if (capa.active_replica)
       master_active_replica_ = true;
-      // Once per link: the flag is cleared at the top of every Greet(). Loud on purpose, because
-      // the link otherwise looks healthy while ConsumeRedisStream drops what the master streams.
-      LOG(WARNING) << "Master " << server().Description()
-                   << " advertises active-replica: this build applies its full sync but NOT its "
-                      "RREPLAY stream yet; writes after the sync are dropped (Phase 7, P7-1)";
-    }
     return capa;
+  };
+  // drakeydb: P7-0 interim -- removed by P7-1 Task 1.2. An active KeyDB wraps every write it
+  // streams in RREPLAY, which ConsumeRedisStream cannot unwrap yet: the link would sync, report
+  // "up" and then silently drop every write. So the link is refused, after the capa reply parsed
+  // fine (the suffix is accepted, this is a policy). The refusal is a handshake error like any
+  // other: REPLICAOF fails with it, a background link retries on the usual 500ms reconnect.
+  auto refuse_active_replica_master = [this]() {
+    LOG_EVERY_T(ERROR, 60) << "Master " << server().Description()
+                           << " advertises active-replica: this build cannot apply its RREPLAY "
+                              "stream yet (Phase 7, P7-1); refusing the link";
+    return std::make_error_code(std::errc::protocol_not_supported);
   };
   // Corresponds to server.repl_state == REPL_STATE_CONNECTING state in redis
   RETURN_ON_ERR(SendCommandAndReadResponse("PING"));  // optional.
@@ -449,6 +459,8 @@ error_code Replica::Greet() {
   // Corresponds to server.repl_state == REPL_STATE_SEND_CAPA
   RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa eof capa psync2"));
   PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok);
+  if (master_active_replica_)
+    return refuse_active_replica_master();
 
   // drakeydb: node identity exchange (KeyDB-compatible; KeyDB sends uuid right after its capa
   // batch). Clear the previous connection's identity before the exchange so an unsupported reply
@@ -628,6 +640,8 @@ error_code Replica::Greet() {
 
   if (LastResponseArgs().size() == 1) {  // Redis
     PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok);
+    if (master_active_replica_)
+      return refuse_active_replica_master();
   } else if (LastResponseArgs().size() >= 3) {  // it's dragonfly master.
     PC_RETURN_ON_BAD_RESPONSE(!HandleCapaDflyResp());
     if (auto ec = ConfigureDflyMaster(); ec)
@@ -1251,20 +1265,24 @@ error_code Replica::ConsumeRedisStream() {
         VLOG(2) << "Got command " << absl::CHexEscape(cmd)
                 << "\n consumed: " << response->total_read;
 
-        if (LastResponseArgs()[0].GetBuf()[0] == '\r') {
+        // drakeydb: U-13 -- an empty command name (`*1\r\n$0\r\n\r\n`) is a valid RESP array, and
+        // reading its first byte is out of bounds. It is an unknown command like any other below.
+        if (!cmd.empty() && LastResponseArgs()[0].GetBuf()[0] == '\r') {
           for (const auto& arg : LastResponseArgs()) {
             LOG(INFO) << absl::CHexEscape(ToSV(arg.GetBuf()));
           }
         }
 
         // drakeydb: P7-0 -- an active KeyDB wraps every write it streams in RREPLAY, which this
-        // build cannot unwrap until P7-1: the dispatch below drops it as an unknown command. Say
-        // so, since nothing else does and the link keeps reporting "up" while the data diverges.
+        // build cannot unwrap until P7-1: the dispatch below drops it as an unknown command.
+        // Greet() refuses a master that advertises active-replica, so this is the defence for one
+        // that sends RREPLAY anyway. Say so, since nothing else does and the link keeps reporting
+        // "up" while the data diverges.
         if (absl::EqualsIgnoreCase(cmd, "RREPLAY")) {
           ++rreplay_dropped;
-          LOG_EVERY_T(ERROR, 30) << "Dropping RREPLAY envelopes from an active KeyDB master "
-                                    "(unsupported until P7-1); "
-                                 << rreplay_dropped << " dropped so far";
+          LOG_EVERY_T(ERROR, 30) << "Dropping RREPLAY envelopes from " << server().Description()
+                                 << " (unsupported until P7-1); " << rreplay_dropped
+                                 << " dropped so far";
         }
 
         CommandContext* ctx = &ctx_pool[batch.size()];
