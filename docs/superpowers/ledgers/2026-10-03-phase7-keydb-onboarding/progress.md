@@ -43,6 +43,7 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
 | 0.10 `test_narrowed_window_admits_peer_during_winners_full_sync` "hang" (ledger-only, not a plan task) | done, no code change: not a server bug | redis-py 8 re-sent a 30 s `DEBUG POPULATE` up to 10 times; resolved by the pin (`44a0cc0`), recorded in `b11594d`; see the triage below |
 | Whole-branch review fix round (I-1, I-2, M-1 ... M-8) | done: `bcd101d` | the RREPLAY-drop log lines and `test_active_keydb_stream_drop_is_logged` (I-1; the test is replaced by the next row's refusal), docs status, the xfail `raises=`, stable references in the register, the `keydb` marker, `// drakeydb:` markers and UPSTREAM-SYNC watchlist rows, U-11 retry note, the malformed-input carve-out |
 | Adversarial pass fixes: C1 (decision 23) and M2 (U-13) | applied, awaiting commit | **C1:** `Greet()` refuses a master that advertises `active-replica` until P7-1 (`replica.cc`, `// drakeydb: P7-0 interim`; `std::errc::protocol_not_supported`, quiet retry WARNING); `test_active_keydb_stream_drop_is_logged` replaced by `test_active_keydb_link_refused_until_p7_1` (plain/peer x `REPLICAOF`/`--replicaof`), the two handshake tests and the live-write test are strict-xfail on the refusal, the proxy capa test split into accept-suffix and refuse-active; P7-1 Task 1.2 Step 4b removes all of it. **M2 = U-13:** an empty command name in a classic stream aborted the replica (`ConsumeRedisStream`'s `GetBuf()[0]`); guarded, `test_classic_stream_empty_command_name_does_not_abort`. Spec D-2/D-15/byte-identity list, plan Tasks 1.2/1.4, UPSTREAM-SYNC row updated |
+| Opus review minors of `0b411a1` (M1-M5) | applied, awaiting commit | **M1:** a refused `REPLICAOF` replies with the reason (`Replica::Start()` returns `GenericError{protocol_not_supported, "master advertises active-replica; unsupported until P7-1"}`; before this every failed `Greet()` reached the client as `replication cancelled`), in plain and peer mode and `ADDREPLICAOF`; decision 23 / spec D-2 reworded (the ERROR log stays rate-limited). **M2:** the refusal also clears `master_node_uuid`, `master_clock_ms` and `clock_skew_ms_` and calls `ReleasePeerIdentityClaim()` (the first capa site is before the uuid exchange that cleared them, so a link that was up kept its old uuid in INFO and, in peer mode, its UUID admission); `test_refused_active_master_leaves_no_stale_identity` (fake master, plain/peer; `FakeClassicMaster` gained `script_uuid`, `script_capa_reply`, `drop_connections`). **M3:** the retry-WARNING count matches only the refusal (`REFUSED_GREET_WARNING`), so a `node.stop()` that interrupts a retry cannot add a line. **M4:** `ActiveKeyDBRefused(AssertionError)`, `raises=` of the three strict xfails. **M5:** spec D-2 wording ("before `PSYNC`, and before UUID at the first capa site"), the peer-mode already-attached `OK`, 100-column rewraps (plan, U-13). Falsified: M1 (11 of 14 selected tests fail), M2 clears (both variants), M2 claim release (peer variant); the evidence is in the round's report |
 | Opus review of the fixes / gate / PR | pending | |
 
 ### Live evidence recorded before any code change (debug build of `c60dfdb`)
@@ -103,6 +104,34 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
     `populate_range` fibers; `cmdstat_debug:calls=11` for one client call.
   - **Environment only:** `test_ipv6_replication` (no IPv6 in the container).
   - **Gate venv:** `/root/drakey-venv-pinned` (redis-py 7.4.1, the pin's resolution, as CI gets).
+
+### P7-0 gate — debug build of `0b411a1` (full `ninja`, no warnings)
+
+- **`ctest -L DFLY -j2`: 88/89 passed** in 246 s (`classic_replay_test` is the new 89th). The one
+  failure is `ServerFamilyTest.GetTcpSocketInfoIPv6` — environment (no IPv6), same as baseline.
+- **pytest** (`/root/drakey-venv-pinned`, `KEYDB_REQUIRED=1`, snapshot of the `0b411a1` binary):
+
+  | Suite | Result |
+  |---|---|
+  | `keydb_onboarding_test.py` | 23 passed, 4 xfailed (strict, P7-1 removes them) |
+  | `keydb_harness_test.py` | 21 passed |
+  | `multimaster_test.py` | 76 passed, 1 failed (see below) |
+  | `multimaster_merge_test.py` | 4 passed |
+  | `redis_replication_test.py` | 12 passed, 7 deselected |
+  | `replication_test.py` | 43 passed, 21 deselected |
+
+- **`test_simultaneous_reciprocal_replicaof_converges` is a pre-existing flake on `main`, not a
+  P7-0 regression.** It requires the reciprocal-connect tiebreak race to *fire* in at least one of
+  5 attempts (log evidence), and the handshake-only race window rarely opens on this box. A first
+  sequential comparison looked like a regression (P7-0 binary 2/5 pass while a compile ran, `main`
+  5/5 afterwards), so it was re-run interleaved under identical load: **P7-0 binary 5/8 pass,
+  `main` binary 2/8 pass.** Follow-up (out of P7 scope): make the positive tiebreak coverage
+  deterministic — e.g. a flag-gated hold inside `Replica::Greet` before `REPLCONF capa dragonfly`
+  so both sides overlap, or split convergence (always) from a forced-overlap direction test — and
+  keep it falsifiable by swapping `ShouldRefuseReciprocalPeer`'s operands.
+- After the gate, the Opus review of `0b411a1` (approve; minors M1–M5) was applied in the next
+  commit; its touched suites were re-run (see that row in the table above) and the gate's
+  `ctest` + the replication-path suites are re-run on the PR head before the PR is opened.
 
 ## P7-1 … P7-4
 

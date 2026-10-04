@@ -536,8 +536,9 @@ local to each call).
   drakeydb `slave_repl_offset` equals KeyDB `master_repl_offset`, through cron `PING` and `GETACK`
   envelopes), and the already-written
   `test_keydb_active_live_write_during_full_sync[plain_replica|peer_mode]` with its `xfail` marker
-  removed (and the two handshake tests', Step 4b). Fake master: `test_unwrap_flushes_raw_batch_before_envelope` (raw `SET a 1`, then
-  envelope `SET a 2`, then wait for idle: `a == 2`).
+  removed (and the two handshake tests', Step 4b). Fake master:
+  `test_unwrap_flushes_raw_batch_before_envelope` (raw `SET a 1`, then envelope `SET a 2`, then
+  wait for idle: `a == 2`).
 - [ ] **Step 2: Run, observe failure** (today the keys never arrive; offsets advance past
   dropped envelopes; with the marker removed the live-write tests fail).
 - [ ] **Step 3: Implement** `ClassicApplier` and the stream hook: refactor the batch-dispatch block
@@ -566,28 +567,33 @@ local to each call).
   `active-replica`, because the stream it would then apply is RREPLAY-wrapped. Find every piece
   with `grep -rn "P7-0 interim" src tests` and remove it:
   - `replica.cc`: the `refuse_active_replica_master` lambda and its two call sites in `Greet()`
-    (after `read_capa_reply()` at the `REPLCONF capa eof capa psync2` site and at the Redis branch of
-    `REPLCONF capa dragonfly`), the `protocol_not_supported` clause of the quiet-greeting condition
-    in `MainReplicationFb`, and, with the unwrap now in place, the defensive `rreplay_dropped`
-    counter and its `LOG_EVERY_T(ERROR, 30)` in `ConsumeRedisStream`. Keep `ParseCapaReply` and
-    `master_active_replica_` (Task 1.4 reads it); update the member's comment (it is set on a
-    greeted link again).
+    (after `read_capa_reply()` at the `REPLCONF capa eof capa psync2` site and at the Redis branch
+    of `REPLCONF capa dragonfly`), the `protocol_not_supported` clause of the quiet-greeting
+    condition in `MainReplicationFb`, the `protocol_not_supported` block of `Replica::Start()` that
+    gives the refusal's reason in the `REPLICAOF` reply, and, with the unwrap now in place, the
+    defensive `rreplay_dropped` counter and its `LOG_EVERY_T(ERROR, 30)` in `ConsumeRedisStream`.
+    Keep `ParseCapaReply` and `master_active_replica_` (Task 1.4 reads it); update the member's
+    comment (it is set on a greeted link again).
   - `keydb_onboarding_test.py`: remove the strict `xfail` (and its comment) from
     `test_keydb_active_handshake_and_full_sync`, `test_keydb_active_handshake_peer_mode` and
-    `test_keydb_active_live_write_during_full_sync`; delete `test_active_keydb_link_refused_until_p7_1`
-    and its helpers (`ACTIVE_KEYDB_REFUSAL_ERROR`, `attach_to_keydb` back to a plain `assert await
-    c.execute_command(...) == "OK"`, `replica_links`, `RECONNECT_PERIOD_S`/`RETRY_WINDOW_S`,
-    `GREET_FAILED_WARNING`, `BAD_CAPA_RESPONSE`; `running_node_log_lines` stays if still used); delete
-    `test_classic_stream_rreplay_is_dropped_and_logged_until_p7_1` and `RREPLAY_DROP_ERROR` (the
-    unwrap tests of Step 1 replace them). Keep `test_classic_stream_empty_command_name_does_not_abort`
-    (U-13 is permanent).
-  - `multimaster_test.py`: delete `test_greet_refuses_active_replica_capa_reply` and
-    `ACTIVE_REPLICA_REFUSAL_ERROR`, and add the active replies (`+OK active-replica`, `+OK
-    active-replica keydb-fastsync-save`) back to the parameters of
+    `test_keydb_active_live_write_during_full_sync`; delete
+    `test_active_keydb_link_refused_until_p7_1`,
+    `test_refused_active_master_leaves_no_stale_identity` and their helpers
+    (`ACTIVE_KEYDB_REFUSAL_ERROR`, `ACTIVE_KEYDB_REFUSAL_REPLY`, `ActiveKeyDBRefused`,
+    `attach_to_keydb` back to a plain `assert await c.execute_command(...) == "OK"` (its `node`
+    argument is gone for good), `replica_links`, `RECONNECT_PERIOD_S`/`RETRY_WINDOW_S`,
+    `REFUSED_GREET_WARNING`, `BAD_CAPA_RESPONSE`; `running_node_log_lines` stays if still used;
+    `script_uuid`, `script_capa_reply` and `drop_connections` of `fake_classic_master.py` may stay);
+    delete `test_classic_stream_rreplay_is_dropped_and_logged_until_p7_1` and `RREPLAY_DROP_ERROR`
+    (the unwrap tests of Step 1 replace them). Keep
+    `test_classic_stream_empty_command_name_does_not_abort` (U-13 is permanent).
+  - `multimaster_test.py`: delete `test_greet_refuses_active_replica_capa_reply`,
+    `ACTIVE_REPLICA_REFUSAL_ERROR` and `ACTIVE_REPLICA_REFUSAL_REPLY`, and add the active replies
+    (`+OK active-replica`, `+OK active-replica keydb-fastsync-save`) back to the parameters of
     `test_greet_accepts_capa_reply_with_capability_words` (renaming it back to
     `test_greet_accepts_keydb_active_replica_capa_reply` if preferred).
   - **Falsify:** with the refusal left in, the three formerly strict-xfail tests fail at their
-    `REPLICAOF` (`replication cancelled`, the ERROR in the log), and the active replies of the proxy
+    `REPLICAOF` (the reason in the reply, the ERROR in the log), and the active replies of the proxy
     test are refused. Record both.
 - [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; run both suites; pre-commit; commit
   `feat: unwrap RREPLAY envelopes on classic replication links (P7)`.

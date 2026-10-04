@@ -520,6 +520,8 @@ ACTIVE_REPLICA_REFUSAL_ERROR = (
     r"^E\d{4} .*Master localhost:\d+ advertises active-replica: this build cannot apply its "
     r"RREPLAY stream yet \(Phase 7, P7-1\); refusing the link"
 )
+# The reason a refused REPLICAOF replies with (Replica::Start).
+ACTIVE_REPLICA_REFUSAL_REPLY = "master advertises active-replica; unsupported until P7-1"
 
 
 @pytest.mark.parametrize("capa_request", CAPA_SITES, ids=CAPA_SITE_IDS)
@@ -534,12 +536,13 @@ async def test_greet_refuses_active_replica_capa_reply(
     """A master that advertises `active-replica` in a capa reply streams RREPLAY envelopes, which
     this build cannot unwrap until P7-1. Greet() parses such a reply fine (the words after `OK` are
     accepted, test_greet_accepts_capa_reply_with_capability_words) and refuses the link anyway, at
-    both capa sites, with an ERROR that says why: REPLICAOF fails, and nothing is synced or kept.
-    P7-1 Task 1.2 removes the refusal and this test. The real-KeyDB twin is
-    keydb_onboarding_test.py::test_active_keydb_link_refused_until_p7_1.
+    both capa sites, with an ERROR that says why: REPLICAOF fails, with the reason in its reply, and
+    nothing is synced or kept. P7-1 Task 1.2 removes the refusal and this test. The real-KeyDB twin
+    is keydb_onboarding_test.py::test_active_keydb_link_refused_until_p7_1.
 
     Falsifying: without the refusal REPLICAOF is accepted, the full sync lands and no ERROR is
-    logged.
+    logged. Without Replica::Start() giving the reason, REPLICAOF fails with the bare 'replication
+    cancelled'.
     """
     import redis.asyncio as aioredis
 
@@ -551,7 +554,9 @@ async def test_greet_refuses_active_replica_capa_reply(
     try:
         await r.set("seeded", "v")
         await proxy.override_next_response(capa_request, capa_reply)
-        with pytest.raises(redis.exceptions.ResponseError, match="replication cancelled"):
+        with pytest.raises(
+            redis.exceptions.ResponseError, match=re.escape(ACTIVE_REPLICA_REFUSAL_REPLY)
+        ):
             await c.execute_command(f"REPLICAOF localhost {proxy.port}")
         info = await c.info("replication")
         assert info["role"] == "master", info

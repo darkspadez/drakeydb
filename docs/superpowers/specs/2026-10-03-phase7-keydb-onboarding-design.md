@@ -333,13 +333,21 @@ bad response. Every other `CheckRespIsSimpleReply("OK")` in `Greet()` is unchang
   failure), at both capa sites: `LOG_EVERY_T(ERROR, 60)` ("advertises active-replica: this build
   cannot apply its RREPLAY stream yet (Phase 7, P7-1); refusing the link") and
   `std::errc::protocol_not_supported`, which takes the existing failed-handshake paths: `REPLICAOF`
-  fails with `replication cancelled` (what every failed `Greet()` gives; the ERROR says why) and
-  leaves no link, and a `--replicaof` link retries on the usual 500 ms reconnect (the retry's
-  per-attempt WARNING is rate-limited like the peer refusals). It happens before `REPLCONF UUID` and
-  `PSYNC`, so the master never forks an RDB for the replica or lists it. The refusal is marked
-  `// drakeydb: P7-0 interim` in `replica.cc`; **P7-1 Task 1.2 removes it** together with the three
-  strict `xfail`s that pin it. `ConsumeRedisStream` keeps a defensive ERROR for an RREPLAY from a
-  master that did not advertise `active-replica`, until Task 1.2's unwrap replaces it.
+  fails **with the reason in the reply** (`-ERR Protocol not supported: master advertises
+  active-replica; unsupported until P7-1`, built by `Replica::Start()`, which every `REPLICAOF`
+  path sends as it is; the ERROR log is rate-limited, so the reply is where each attempt's reason
+  shows) and leaves no link, and a `--replicaof` link retries on the usual 500 ms reconnect (the
+  retry's per-attempt WARNING is rate-limited like the peer refusals). It happens before `PSYNC`
+  (and before `REPLCONF UUID` at the first capa site, which is the only one a real KeyDB reaches),
+  so the master never forks an RDB for the replica or lists it. The refused link has no master: the
+  refusal clears the uuid and clock an earlier greeting of the same `Replica` recorded (the first
+  capa site comes before the identity exchange that clears them) and, in peer mode, gives the UUID
+  admission back. In peer mode a `REPLICAOF` to an endpoint that is already attached (one attached
+  by `--replicaof` and being refused in the background) answers `OK`, the existing "already
+  attached" short-circuit that makes no handshake, while that link keeps being refused. The refusal
+  is marked `// drakeydb: P7-0 interim` in `replica.cc`; **P7-1 Task 1.2 removes it** together with
+  the three strict `xfail`s that pin it. `ConsumeRedisStream` keeps a defensive ERROR for an RREPLAY
+  from a master that did not advertise `active-replica`, until Task 1.2's unwrap replaces it.
 
 ### D-3. Unwrapping RREPLAY (B.1)
 
@@ -929,8 +937,9 @@ still pass under if the feature were removed.
 |---|---|
 | `ClassicReplayTest.ParseCapaReply*`; `test_greet_accepts_capa_reply_with_capability_words` (both Greet sites, proxy; `+OK keydb-fastsync-save` and an unknown word) | Reverting `Greet()` to strict `OK`: `REPLICAOF` fails with `Bad response ... "+OK keydb-fastsync-save\r\n"` |
 | `test_greet_refuses_active_replica_capa_reply` (both Greet sites, proxy; `+OK active-replica` with and without `keydb-fastsync-save`; P7-0 interim, removed by Task 1.2) | Removing the refusal: `REPLICAOF` is accepted, the full sync lands, no ERROR is logged |
-| `test_active_keydb_link_refused_until_p7_1` (real KeyDB; plain and peer node, `REPLICAOF` and `--replicaof`: `replication cancelled` and no link left behind / retries bounded by the 500 ms cadence, the ERROR logged once, KeyDB never lists the replica and counts no sync, no key arrives; P7-0 interim, removed by Task 1.2) | Removing the refusal; `LOG_EVERY_T` back to `LOG` (one ERROR per attempt); un-quieting the retry WARNING; the reconnect sleep cut to 50 ms (attempts bound) |
-| `test_keydb_active_handshake_and_full_sync`, `test_keydb_active_handshake_peer_mode` (real KeyDB; **strict `xfail`** until Task 1.2: the `REPLICAOF` is refused, the failure is the refusal's `AssertionError` and nothing else) | Removing the refusal: the strict `xfail` XPASSes and fails the run |
+| `test_active_keydb_link_refused_until_p7_1` (real KeyDB; plain and peer node, `REPLICAOF` and `--replicaof`: the reason in the reply and no link left behind / retries bounded by the 500 ms cadence, the ERROR logged once, KeyDB never lists the replica and counts no sync, no key arrives; P7-0 interim, removed by Task 1.2) | Removing the refusal; `Start()` giving the reason (bare `replication cancelled`); `LOG_EVERY_T` back to `LOG` (one ERROR per attempt); un-quieting the retry WARNING; the reconnect sleep cut to 50 ms (attempts bound) |
+| `test_refused_active_master_leaves_no_stale_identity` (fake master that is first not active, with a uuid, then answers every capa `+OK active-replica` and drops the link; plain and peer node: INFO shows no master uuid while the refusals go on, no PSYNC; the reason in the reply of a repeated `REPLICAOF` (plain) / `OK` for the attached endpoint (peer); a second master with the same uuid is admitted; P7-0 interim, removed by Task 1.2) | Dropping the clears in the refusal: the old uuid stays in INFO; dropping its `ReleasePeerIdentityClaim()`: the peer node's `REPLICAOF` of the second master fails as a duplicate |
+| `test_keydb_active_handshake_and_full_sync`, `test_keydb_active_handshake_peer_mode` (real KeyDB; **strict `xfail`** until Task 1.2: the `REPLICAOF` is refused, the failure is `ActiveKeyDBRefused` (the refusal's reason in the reply) and nothing else) | Removing the refusal: the strict `xfail` XPASSes and fails the run |
 | `test_classic_stream_empty_command_name_does_not_abort[diskless_later_write\|disk_later_write\|disk_behind_rdb]` (fake master: a valid sync, then `*1\r\n$0\r\n\r\n`, then `SET a 1`: replica alive, `a == 1`, settled ACK exact; U-13) | Dropping the `!cmd.empty()` guard in `ConsumeRedisStream`: SIGABRT (`i < size()`, `absl/types/span.h`) |
 | `test_classic_stream_rreplay_is_dropped_and_logged_until_p7_1` (fake master that did not advertise `active-replica`; Task 1.2 replaces it) | Removing the defensive drop ERROR: nothing is logged |
 | `test_psync_stream_bytes_behind_full_sync_are_applied` (fake master: `$<len>` + RDB + raw `SET a 1` in one `write()`; the `$EOF:` framing too): `a == 1`, offsets exact; `test_psync_*_token_mismatch*` and `*_length_*` reconnect | Unclamped first read (`CHECK`/reconnect loop, `a` never set); dropping the hand-off (`a == 0`); counting the hand-off twice (offsets apart) |

@@ -166,6 +166,14 @@ GenericError Replica::Start() {
   // string-only GenericError (see LastGreetEc()'s own doc comment, replica.h) -- this is the one
   // place a blocking Start() caller can recover the specific errc.
   last_greet_ec_ = ec;
+  // drakeydb: P7-0 interim -- removed by P7-1 Task 1.2. The refusal of an active-KeyDB master
+  // (refuse_active_replica_master in Greet()) is a decision, not a failure to reach the master:
+  // fail with its reason, which check_connection_error below would reduce to a bare cancellation.
+  if (ec == std::errc::protocol_not_supported && exec_st_.IsRunning()) {
+    CloseSocket();
+    exec_st_.ReportCancelError();
+    return GenericError{ec, "master advertises active-replica; unsupported until P7-1"};
+  }
   RETURN_ON_ERR(check_connection_error(ec, "could not greet master "));
 
   return {};
@@ -415,8 +423,15 @@ error_code Replica::Greet() {
   // streams in RREPLAY, which ConsumeRedisStream cannot unwrap yet: the link would sync, report
   // "up" and then silently drop every write. So the link is refused, after the capa reply parsed
   // fine (the suffix is accepted, this is a policy). The refusal is a handshake error like any
-  // other: REPLICAOF fails with it, a background link retries on the usual 500ms reconnect.
+  // other: REPLICAOF fails with it (Start() above gives the reason), a background link retries on
+  // the usual 500ms reconnect. A refused link has no master: what an earlier greeting of this
+  // Replica learned about it must not stay in INFO, and its peer-mode UUID admission must not stay
+  // claimed -- the first capa site is reached before the identity exchange below clears either.
   auto refuse_active_replica_master = [this]() {
+    master_context_.master_node_uuid.clear();
+    master_context_.master_clock_ms = 0;
+    clock_skew_ms_.store(0, std::memory_order_relaxed);
+    ReleasePeerIdentityClaim();
     LOG_EVERY_T(ERROR, 60) << "Master " << server().Description()
                            << " advertises active-replica: this build cannot apply its RREPLAY "
                               "stream yet (Phase 7, P7-1); refusing the link";

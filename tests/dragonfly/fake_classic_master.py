@@ -53,13 +53,14 @@ class FakeClassicMaster:
     """Listens on `port` (0: any free one, read it back from `.port` after start()).
 
     Answers PING with +PONG; REPLCONF UUID, DRAKEY-VERSION and PEER with the error a pre-fork
-    master gives for an unknown option; every other REPLCONF (listening-port, capa, ip-address)
-    with +OK, except `REPLCONF ACK`, which is never answered. PSYNC/SYNC is answered by one write()
-    of the bytes given to script_psync(), so coalescing on the wire is deterministic; the optional
-    stream bytes follow in a second write, after `stream_delay` seconds if given (long enough for
-    the replica to read the first write alone: coalescing is deterministic only then). Afterwards
-    the connection stays open, still recording requests, until the replica closes it or
-    `close_after_psync` is set.
+    master gives for an unknown option (REPLCONF UUID with a bare `+<uuid>`, as KeyDB does, after
+    script_uuid()); every other REPLCONF (listening-port, capa, ip-address) with +OK (every capa
+    one with what script_capa_reply() set), except `REPLCONF ACK`, which is never answered.
+    PSYNC/SYNC is answered by one write() of the bytes given to script_psync(), so coalescing on
+    the wire is deterministic; the optional stream bytes follow in a second write, after
+    `stream_delay` seconds if given (long enough for the replica to read the first write alone:
+    coalescing is deterministic only then). Afterwards the connection stays open, still recording
+    requests, until the replica closes it or `close_after_psync` is set.
 
     Recorded: `connection_count` (every accepted connection), `requests` (every request as a list
     of words, all connections, in arrival order) and `psync_requests` (the PSYNC ones).
@@ -74,6 +75,8 @@ class FakeClassicMaster:
         self._psync_stream = b""
         self._stream_delay = 0
         self._close_after_psync = False
+        self._uuid = None
+        self._capa_reply = b"+OK\r\n"
         self._server = None
         self._handler_tasks = set()
         self._writers = set()
@@ -84,6 +87,20 @@ class FakeClassicMaster:
         self._psync_stream = stream
         self._stream_delay = stream_delay
         self._close_after_psync = close_after_psync
+
+    def script_uuid(self, uuid):
+        """Makes every following `REPLCONF UUID` be answered with `+<uuid>`, like a KeyDB does."""
+        self._uuid = uuid
+
+    def script_capa_reply(self, reply):
+        """Sets the reply (a complete RESP line) to every following `REPLCONF capa ...`, e.g.
+        b"+OK active-replica\\r\\n" for what an active KeyDB says."""
+        self._capa_reply = reply
+
+    async def drop_connections(self):
+        """Closes every open connection, as a master that went away does, and keeps listening."""
+        for writer in list(self._writers):
+            writer.close()
 
     @property
     def psync_requests(self):
@@ -187,8 +204,12 @@ class FakeClassicMaster:
             option = request[1].upper() if len(request) > 1 else ""
             if option == "ACK":
                 return True
-            if option in ("UUID", "DRAKEY-VERSION", "PEER"):
+            if option == "UUID" and self._uuid is not None:
+                writer.write(b"+" + self._uuid.encode() + b"\r\n")
+            elif option in ("UUID", "DRAKEY-VERSION", "PEER"):
                 writer.write(b"-ERR Unrecognized REPLCONF option: " + option.encode() + b"\r\n")
+            elif option == "CAPA":
+                writer.write(self._capa_reply)
             else:
                 writer.write(b"+OK\r\n")
         elif name in ("PSYNC", "SYNC"):

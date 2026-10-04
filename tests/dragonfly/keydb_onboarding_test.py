@@ -148,25 +148,30 @@ def running_node_log_lines(node, pattern):
 
 
 # glog lines start with their severity letter, so these also pin that the lines are loud (W, E).
-# drakeydb: P7-0 interim -- removed by P7-1 Task 1.2, with attach_to_keydb and the xfails using it.
+# drakeydb: P7-0 interim -- removed by P7-1 Task 1.2, with ActiveKeyDBRefused, attach_to_keydb and
+# the xfails using them.
 ACTIVE_KEYDB_REFUSAL_ERROR = (
     r"^E\d{4} .*Master localhost:\d+ advertises active-replica: this build cannot apply its "
     r"RREPLAY stream yet \(Phase 7, P7-1\); refusing the link"
 )
+# The reason a refused REPLICAOF replies with (Replica::Start).
+ACTIVE_KEYDB_REFUSAL_REPLY = "master advertises active-replica; unsupported until P7-1"
 
 
-async def attach_to_keydb(c, node, keydb):
-    """REPLICAOF `keydb`, asserting that it is accepted. The refusal of an active KeyDB fails the
-    assertion, so that the strict xfails of the tests that attach to one accept that refusal and
-    nothing else. REPLICAOF answers any failed handshake with 'replication cancelled': what makes
-    this the refusal is the ERROR the node logged before it replied."""
+class ActiveKeyDBRefused(AssertionError):
+    """REPLICAOF was refused because its master is an active KeyDB. An AssertionError, so that it
+    fails the test attaching to one, and a class of its own, so that the strict xfails of those
+    tests (raises=) accept this failure and no other."""
+
+
+async def attach_to_keydb(c, keydb):
+    """REPLICAOF `keydb`, asserting that it is accepted. The refusal of an active KeyDB (the reply
+    says why) raises ActiveKeyDBRefused; any other failure propagates as it is."""
     try:
         assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
     except redis.exceptions.ResponseError as e:
-        if "replication cancelled" in str(e) and running_node_log_lines(
-            node, ACTIVE_KEYDB_REFUSAL_ERROR
-        ):
-            raise AssertionError(f"REPLICAOF was refused: {e}") from e
+        if ACTIVE_KEYDB_REFUSAL_REPLY in str(e):
+            raise ActiveKeyDBRefused(f"REPLICAOF was refused: {e}") from e
         raise
 
 
@@ -260,7 +265,7 @@ async def test_keydb_plain_master_full_sync_and_stream(
 # refuses the link (test_active_keydb_link_refused_until_p7_1), so this fails on the REPLICAOF. The
 # strict xfail turns the day the refusal goes away into a failing run: P7-1 Task 1.2 removes both.
 @pytest.mark.xfail(
-    strict=True, raises=AssertionError, reason="active KeyDB refused until P7-1 Task 1.2"
+    strict=True, raises=ActiveKeyDBRefused, reason="active KeyDB refused until P7-1 Task 1.2"
 )
 async def test_keydb_active_handshake_and_full_sync(
     df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
@@ -280,7 +285,7 @@ async def test_keydb_active_handshake_and_full_sync(
 
     async with keydb.client() as k:
         await seed_before_attach(keydb)
-        await attach_to_keydb(c, node, keydb)
+        await attach_to_keydb(c, keydb)
         await wait_available_async(c)
         info = await c.info("replication")
         assert info["role"] == "slave" and info["master_link_status"] == "up", info
@@ -292,7 +297,7 @@ async def test_keydb_active_handshake_and_full_sync(
 @pytest.mark.keydb
 # drakeydb: P7-0 interim, as for test_keydb_active_handshake_and_full_sync.
 @pytest.mark.xfail(
-    strict=True, raises=AssertionError, reason="active KeyDB refused until P7-1 Task 1.2"
+    strict=True, raises=ActiveKeyDBRefused, reason="active KeyDB refused until P7-1 Task 1.2"
 )
 async def test_keydb_active_handshake_peer_mode(
     df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
@@ -306,7 +311,7 @@ async def test_keydb_active_handshake_peer_mode(
 
     async with keydb.client() as k:
         await seed_before_attach(keydb)
-        await attach_to_keydb(c, node, keydb)
+        await attach_to_keydb(c, keydb)
         await wait_for_peer_link(c)
         await assert_full_sync_arrived(c)
         await assert_ttl_and_db1_arrived(c, c1)
@@ -316,10 +321,10 @@ async def test_keydb_active_handshake_peer_mode(
 @pytest.mark.keydb
 # drakeydb: strict xfail until P7-1 Task 1.2, which lifts the refusal of active KeyDB masters
 # (test_active_keydb_link_refused_until_p7_1) and unwraps RREPLAY envelopes; a pass then fails the
-# run so the marker cannot outlive the fix. Only an AssertionError (the REPLICAOF is refused, or
-# the writes never arrive) is the expected failure: a crash or a connection error fails the test.
+# run so the marker cannot outlive the fix. Only the refusal of the REPLICAOF (ActiveKeyDBRefused)
+# is the expected failure: writes that never arrive, a crash or a connection error fail the test.
 @pytest.mark.xfail(
-    strict=True, raises=AssertionError, reason="active KeyDB refused until P7-1 Task 1.2"
+    strict=True, raises=ActiveKeyDBRefused, reason="active KeyDB refused until P7-1 Task 1.2"
 )
 @pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
 async def test_keydb_active_live_write_during_full_sync(
@@ -341,7 +346,7 @@ async def test_keydb_active_live_write_during_full_sync(
 
     async with keydb.client() as k:
         await seed_before_attach(keydb)
-        await attach_to_keydb(c, node, keydb)
+        await attach_to_keydb(c, keydb)
         live = await write_during_full_sync(k)
         if peer_mode:
             await wait_for_peer_link(c)
@@ -358,7 +363,9 @@ RREPLAY_DROP_ERROR = (
     r"^E\d{4} .*Dropping RREPLAY envelopes from 127\.0\.0\.1:\d+ \(unsupported until P7-1\); "
     r"[1-9]\d* dropped so far"
 )
-GREET_FAILED_WARNING = r"^W\d{4} .*Error greeting localhost:\d+ "
+# Only the refusal's: stopping the node can interrupt a retry mid-handshake, and that failure is
+# logged by the same line, but loudly and with another reason.
+REFUSED_GREET_WARNING = r"^W\d{4} .*Error greeting localhost:\d+ .*Protocol not supported"
 BAD_CAPA_RESPONSE = r'Bad response to "REPLCONF capa'
 
 # A replica whose handshake failed reconnects after the replication fiber's sleep of
@@ -400,14 +407,16 @@ async def test_active_keydb_link_refused_until_p7_1(
     envelope), a replica of one refuses the link at the handshake, instead of syncing and then
     silently dropping every write while reporting itself up and caught up.
 
-    The refusal is an error like any other handshake failure: REPLICAOF fails (with the generic
-    'replication cancelled') and leaves no link behind; a node started with --replicaof keeps
-    trying on the usual 500ms reconnect, no tighter. Either way the node logs the refusal once, as
-    an ERROR. The master never sees a PSYNC, so it never forks an RDB for the replica or lists it.
-    P7-1 Task 1.2 removes the refusal and this test.
+    The refusal is an error like any other handshake failure: REPLICAOF fails, with the reason in
+    its reply, and leaves no link behind; a node started with --replicaof keeps trying on the usual
+    500ms reconnect, no tighter. Either way the node logs the refusal once, as an ERROR (rate
+    limited: the reply is where each REPLICAOF gets its reason). The master never sees a PSYNC, so
+    it never forks an RDB for the replica or lists it. P7-1 Task 1.2 removes the refusal and this
+    test.
 
     Falsifying: without the refusal the handshake succeeds and the link syncs: REPLICAOF is
-    accepted, no ERROR is logged and KeyDB counts a full sync.
+    accepted, no ERROR is logged and KeyDB counts a full sync. Without Replica::Start() giving the
+    reason, REPLICAOF fails with the bare 'replication cancelled'.
     """
     keydb = keydb_server_factory(active_replica=True)
     args = {"active_replica": "true"} if peer_mode else {}
@@ -424,7 +433,9 @@ async def test_active_keydb_link_refused_until_p7_1(
         node.start()
         c = node.client()
         if not via_flag:
-            with pytest.raises(redis.exceptions.ResponseError, match="replication cancelled"):
+            with pytest.raises(
+                redis.exceptions.ResponseError, match=re.escape(ACTIVE_KEYDB_REFUSAL_REPLY)
+            ):
                 await c.execute_command(f"REPLICAOF localhost {keydb.port}")
 
         @assert_eventually(times=100)
@@ -465,7 +476,82 @@ async def test_active_keydb_link_refused_until_p7_1(
     # Once, not once per attempt; and the refusal is a decision, not a malformed capa reply.
     assert len(set(node.find_in_logs(ACTIVE_KEYDB_REFUSAL_ERROR))) == 1
     assert not node.find_in_logs(BAD_CAPA_RESPONSE)
-    assert len(set(node.find_in_logs(GREET_FAILED_WARNING))) == (1 if via_flag else 0)
+    assert len(set(node.find_in_logs(REFUSED_GREET_WARNING))) == (1 if via_flag else 0)
+
+
+# drakeydb: P7-0 interim -- removed by P7-1 Task 1.2, with the refusal it tests (Replica::Greet).
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+async def test_refused_active_master_leaves_no_stale_identity(
+    df_factory: DflyInstanceFactory, tmp_path, peer_mode
+):
+    """A link that was up and is then refused, because its master has become an active KeyDB,
+    reports no master identity, and a peer link gives its UUID admission back.
+
+    A scripted master answers like a KeyDB that is not active (`+OK` to the capa commands, a bare
+    `+<uuid>` to REPLCONF UUID) until the node's link is up with that uuid; then it answers every
+    capa command `+OK active-replica` and drops the connection. The reconnect is refused at the
+    first capa site, which is before the uuid exchange that would have cleared the previous
+    connection's identity (the only site a real KeyDB reaches: it answers every capa this way).
+    From then on the node retries, is refused every time and sends no PSYNC.
+
+    Then the node is pointed at the refused master again, which fails with the reason in the reply
+    (a peer node already has that endpoint attached, which it answers OK without a handshake: the
+    link stays refused) and at a second master presenting the same uuid. A peer node admits only
+    one link per uuid, so that works only if the refused link gave its admission back.
+
+    Falsifying: without the clears in refuse_active_replica_master (replica.cc) INFO keeps the old
+    uuid; without its ReleasePeerIdentityClaim() the peer node's REPLICAOF of the second master
+    fails as a duplicate ('replication cancelled').
+    """
+    uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    args = {"active_replica": "true"} if peer_mode else {}
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"), **args)
+    node.start()
+    c = node.client()
+
+    async def link_uuids():
+        return [link["node_uuid"] for link in replica_links(await c.info("replication"), peer_mode)]
+
+    @assert_eventually(times=100)
+    @retry_while_loading
+    async def link_identified():
+        assert await link_uuids() == [uuid]
+
+    async with FakeClassicMaster() as master, FakeClassicMaster() as other:
+        master.script_uuid(uuid)
+        other.script_uuid(uuid)
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+        await link_identified()
+        assert len(master.psync_requests) == 1
+
+        master.script_capa_reply(b"+OK active-replica\r\n")
+        await master.drop_connections()
+
+        @assert_eventually(times=100)
+        async def identity_gone():
+            assert await link_uuids() == [None]
+
+        await identity_gone()
+        # Not a moment between two greetings: the refusals go on, and the identity stays gone.
+        attempts = master.connection_count
+        for _ in range(15):
+            assert await link_uuids() == [None]
+            await asyncio.sleep(0.1)
+        assert master.connection_count > attempts, "the node stopped retrying the refused master"
+        assert len(master.psync_requests) == 1, "a refused link must not get as far as a PSYNC"
+
+        if peer_mode:
+            assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+        else:
+            with pytest.raises(
+                redis.exceptions.ResponseError, match=re.escape(ACTIVE_KEYDB_REFUSAL_REPLY)
+            ):
+                await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}")
+        assert await link_uuids() == [None]
+
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {other.port}") == "OK"
+        await link_identified()
+        assert len(other.psync_requests) == 1
 
 
 async def attach_and_watch_retries(df_factory, tmp_path, master, retries=3):
