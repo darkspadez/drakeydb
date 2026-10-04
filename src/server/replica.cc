@@ -166,14 +166,6 @@ GenericError Replica::Start() {
   // string-only GenericError (see LastGreetEc()'s own doc comment, replica.h) -- this is the one
   // place a blocking Start() caller can recover the specific errc.
   last_greet_ec_ = ec;
-  // drakeydb: P7-0 interim -- removed by P7-1 Task 1.2. The refusal of an active-KeyDB master
-  // (refuse_active_replica_master in Greet()) is a decision, not a failure to reach the master:
-  // fail with its reason, which check_connection_error below would reduce to a bare cancellation.
-  if (ec == std::errc::protocol_not_supported && exec_st_.IsRunning()) {
-    CloseSocket();
-    exec_st_.ReportCancelError();
-    return GenericError{ec, "master advertises active-replica; unsupported until P7-1"};
-  }
   RETURN_ON_ERR(check_connection_error(ec, "could not greet master "));
 
   return {};
@@ -323,15 +315,10 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
         // resource_unavailable_try_again is the peer-is-loading refusal (the PING check just
         // above that one in Greet()) -- both are expected to clear themselves within a retry or
         // two, so they stay in this quiet bucket alongside the other two peer-identity refusals.
-        // drakeydb: P7-0 interim -- removed by P7-1 Task 1.2. protocol_not_supported is the
-        // active-KeyDB refusal (refuse_active_replica_master in Greet() below): permanent for as
-        // long as the master stays active, and already logged by Greet(), so it is quiet in every
-        // mode instead of one WARNING per 500ms reconnect.
-        if (ec == std::errc::protocol_not_supported ||
-            (IsPeerMode() &&
-             (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use ||
-              ec == std::errc::device_or_resource_busy ||
-              ec == std::errc::resource_unavailable_try_again))) {
+        if (IsPeerMode() &&
+            (ec == std::errc::operation_not_permitted || ec == std::errc::address_in_use ||
+             ec == std::errc::device_or_resource_busy ||
+             ec == std::errc::resource_unavailable_try_again)) {
           LOG_EVERY_T(WARNING, 60)
               << "Error greeting " << server().Description() << " (phase: " << GetCurrentPhase()
               << "): " << ec << " " << ec.message() << ", socket state: " + SockInfo();
@@ -419,24 +406,6 @@ error_code Replica::Greet() {
       master_active_replica_ = true;
     return capa;
   };
-  // drakeydb: P7-0 interim -- removed by P7-1 Task 1.2. An active KeyDB wraps every write it
-  // streams in RREPLAY, which ConsumeRedisStream cannot unwrap yet: the link would sync, report
-  // "up" and then silently drop every write. So the link is refused, after the capa reply parsed
-  // fine (the suffix is accepted, this is a policy). The refusal is a handshake error like any
-  // other: REPLICAOF fails with it (Start() above gives the reason), a background link retries on
-  // the usual 500ms reconnect. A refused link has no master: what an earlier greeting of this
-  // Replica learned about it must not stay in INFO, and its peer-mode UUID admission must not stay
-  // claimed -- the first capa site is reached before the identity exchange below clears either.
-  auto refuse_active_replica_master = [this]() {
-    master_context_.master_node_uuid.clear();
-    master_context_.master_clock_ms = 0;
-    clock_skew_ms_.store(0, std::memory_order_relaxed);
-    ReleasePeerIdentityClaim();
-    LOG_EVERY_T(ERROR, 60) << "Master " << server().Description()
-                           << " advertises active-replica: this build cannot apply its RREPLAY "
-                              "stream yet (Phase 7, P7-1); refusing the link";
-    return std::make_error_code(std::errc::protocol_not_supported);
-  };
   // Corresponds to server.repl_state == REPL_STATE_CONNECTING state in redis
   RETURN_ON_ERR(SendCommandAndReadResponse("PING"));  // optional.
   // drakeydb D-7 (review round 2): a peer that is transiently LOADING (e.g. mid its own full
@@ -474,8 +443,6 @@ error_code Replica::Greet() {
   // Corresponds to server.repl_state == REPL_STATE_SEND_CAPA
   RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa eof capa psync2"));
   PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok);
-  if (master_active_replica_)
-    return refuse_active_replica_master();
 
   // drakeydb: node identity exchange (KeyDB-compatible; KeyDB sends uuid right after its capa
   // batch). Clear the previous connection's identity before the exchange so an unsupported reply
@@ -655,8 +622,6 @@ error_code Replica::Greet() {
 
   if (LastResponseArgs().size() == 1) {  // Redis
     PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok);
-    if (master_active_replica_)
-      return refuse_active_replica_master();
   } else if (LastResponseArgs().size() >= 3) {  // it's dragonfly master.
     PC_RETURN_ON_BAD_RESPONSE(!HandleCapaDflyResp());
     if (auto ec = ConfigureDflyMaster(); ec)
@@ -1207,6 +1172,13 @@ error_code Replica::ConsumeRedisStream() {
 
   // we never reply back on the commands.
   facade::CapturingReplyBuilder null_builder{facade::ReplyMode::NONE};
+  // drakeydb: P7-1 -- an active KeyDB wraps every command it streams in an RREPLAY envelope. Those
+  // are not batched like the raw commands: the applier unwraps each one and dispatches its command
+  // on its own, in the envelope's db. It shares conn_context with the raw path, so the two stay in
+  // step on the selected db, as KeyDB's own master client is.
+  ClassicApplier classic_applier(&service_, &conn_context, service_.server_family().node_uuid(),
+                                 server().Description(), &classic_stats_,
+                                 [this] { return exec_st_.IsRunning(); });
   ResetParser(RedisParser::Mode::SERVER);
 
   // Master waits for this command in order to start sending replication stream.
@@ -1247,7 +1219,51 @@ error_code Replica::ConsumeRedisStream() {
   batch.reserve(max_batch);
 
   std::vector<CommandContext> ctx_pool(max_batch);
-  uint64_t rreplay_dropped = 0;
+
+  // Dispatches what is queued, in order, and counts each command's bytes once it has run. A link
+  // that stops half way leaves the rest unapplied and uncounted.
+  auto flush_batch = [&] {
+    if (batch.empty())
+      return;
+
+    // Chain the commands together so that the squasher can process them in one go.
+    for (size_t i = 0; i + 1 < batch.size(); ++i) {
+      batch[i].cmd->next = batch[i + 1].cmd;
+    }
+    batch.back().cmd->next = nullptr;
+    size_t idx = 0;
+    while (idx < batch.size() && exec_st_.IsRunning()) {
+      // Try dispatching the batch of commands - if the batch didn't process any commands than
+      // fall back to dispatching the first command in the batch synchronously.
+      auto dispatch_batch = [&](size_t idx) {
+        size_t processed =
+            service_.DispatchSquashedBatch(batch[idx].cmd, batch.size() - idx, &conn_context);
+        if (processed > 0) {
+          return processed;
+        }
+        auto* cmd = batch[idx].cmd;
+        service_.DispatchCommand(facade::ParsedArgs{*cmd}, cmd, facade::AsyncPreference::ONLY_SYNC);
+        return size_t{1};
+      };
+
+      size_t processed = dispatch_batch(idx);
+
+      for (size_t i = idx; i < idx + processed; ++i) {
+        // Squashing may run a command as a suspended coroutine instead of to completion;
+        // resuming it here is what lets it finish before its context is recycled.
+        auto* cmd = batch[i].cmd;
+        if (cmd->IsDeferredReply()) {
+          cmd->SendReply();
+        }
+        repl_offs_ += batch[i].AckBytes();
+      }
+
+      idx += processed;
+      replica_waker_.notify();
+    }
+
+    batch.clear();
+  };
 
   while (exec_st_.IsRunning()) {
     // Skipped commands (MULTI/EXEC/PING) may drain buffered data without I/O or dispatch, so
@@ -1271,6 +1287,23 @@ error_code Replica::ConsumeRedisStream() {
     bool queued = false;
 
     if (!last_args.empty()) {
+      // drakeydb: P7-1 -- an RREPLAY envelope is applied by the classic applier, not queued.
+      if (ClassicApplier::IsRreplay(last_args[0])) {
+        // It must not overtake the raw commands queued before it.
+        flush_batch();
+        // A link that stopped during the flush leaves the envelope untouched, so repl_offs_ is the
+        // first command that was not applied: where a partial resync resumes.
+        if (!exec_st_.IsRunning())
+          break;
+        // The envelope's arguments view io_buf, so it is applied before ConsumeInput below.
+        if (classic_applier.HandleRreplay(last_args) == EnvelopeResult::kNotConsumed)
+          break;
+        io_buf.ConsumeInput(response->left_in_buffer);
+        repl_offs_ += response->total_read;
+        replica_waker_.notify();
+        continue;
+      }
+
       auto cmd = last_args[0].GetView();
 
       // Valkey and Redis may send MULTI and EXEC as part of their replication commands.
@@ -1286,18 +1319,6 @@ error_code Replica::ConsumeRedisStream() {
           for (const auto& arg : LastResponseArgs()) {
             LOG(INFO) << absl::CHexEscape(ToSV(arg.GetBuf()));
           }
-        }
-
-        // drakeydb: P7-0 -- an active KeyDB wraps every write it streams in RREPLAY, which this
-        // build cannot unwrap until P7-1: the dispatch below drops it as an unknown command.
-        // Greet() refuses a master that advertises active-replica, so this is the defence for one
-        // that sends RREPLAY anyway. Say so, since nothing else does and the link keeps reporting
-        // "up" while the data diverges.
-        if (absl::EqualsIgnoreCase(cmd, "RREPLAY")) {
-          ++rreplay_dropped;
-          LOG_EVERY_T(ERROR, 30) << "Dropping RREPLAY envelopes from " << server().Description()
-                                 << " (unsupported until P7-1); " << rreplay_dropped
-                                 << " dropped so far";
         }
 
         CommandContext* ctx = &ctx_pool[batch.size()];
@@ -1325,46 +1346,8 @@ error_code Replica::ConsumeRedisStream() {
 
     // Dispatch when the read buffer is drained or the batch is full, and drain the whole
     // batch before reading from the socket again.
-    if ((io_buf.InputLen() == 0 || batch.size() >= max_batch) && !batch.empty()) {
-      // Chain the commands together so that the squasher can process them in one go.
-      for (size_t i = 0; i + 1 < batch.size(); ++i) {
-        batch[i].cmd->next = batch[i + 1].cmd;
-      }
-      batch.back().cmd->next = nullptr;
-      size_t idx = 0;
-      while (idx < batch.size() && exec_st_.IsRunning()) {
-        // Try dispatching the batch of commands - if the batch didn't process any commands than
-        // fall back to dispatching the first command in the batch synchronously.
-        auto dispatch_batch = [&](size_t idx) {
-          size_t processed =
-              service_.DispatchSquashedBatch(batch[idx].cmd, batch.size() - idx, &conn_context);
-          if (processed > 0) {
-            return processed;
-          }
-          auto* cmd = batch[idx].cmd;
-          service_.DispatchCommand(facade::ParsedArgs{*cmd}, cmd,
-                                   facade::AsyncPreference::ONLY_SYNC);
-          return size_t{1};
-        };
-
-        size_t processed = dispatch_batch(idx);
-
-        for (size_t i = idx; i < idx + processed; ++i) {
-          // Squashing may run a command as a suspended coroutine instead of to completion;
-          // resuming it here is what lets it finish before its context is recycled.
-          auto* cmd = batch[i].cmd;
-          if (cmd->IsDeferredReply()) {
-            cmd->SendReply();
-          }
-          repl_offs_ += batch[i].AckBytes();
-        }
-
-        idx += processed;
-        replica_waker_.notify();
-      }
-
-      batch.clear();
-    }
+    if (io_buf.InputLen() == 0 || batch.size() >= max_batch)
+      flush_batch();
   }
 
   DCHECK(exec_st_.IsError());

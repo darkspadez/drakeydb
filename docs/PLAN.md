@@ -939,8 +939,8 @@ the top, or the Non-goals list at the end. The design spec is
   `CheckRespIsSimpleReply` (`protocol_client.cc:433`, `replica.cc:432`, `:611`). P1's "inbound
   KeyDB works" claim (the "P1 KeyDB interop" note near the top) was validated against plain Redis
   only. P7-0 parses the reply, but its adversarial pass found that an accepted link would drop
-  every streamed write, so P7-0 refuses active-KeyDB links until P7-1 unwraps RREPLAY (ledger
-  decision 23).
+  every streamed write, so P7-0 refused active-KeyDB links until P7-1 unwrapped RREPLAY (ledger
+  decision 23; P7-1 Task 1.2 lifted the refusal).
 
 Owner scheduling decisions made alongside: the overdue upstream sync (`docs/UPSTREAM-SYNC.md`)
 lands as its own PR **after** P7, and a dedicated "tombstone-lifecycle" phase after P7 owns D-14,

@@ -13,6 +13,7 @@
 #include "facade/facade_types.h"
 #include "facade/redis_parser.h"
 #include "io/io_buf.h"
+#include "server/classic_replay.h"
 #include "server/cluster/cluster_defs.h"
 #include "server/execution_state.h"
 #include "server/journal/tx_executor.h"
@@ -291,9 +292,12 @@ class Replica : ProtocolClient {
   // Replica's own thread and before the replication fiber starts, and from the replication fiber
   // after that, so the two never overlap. It is set by the capa reply, which is not the last step
   // of Greet(): after a failed Greet() it may be stale. Read it only once R_GREETED is set in
-  // state_mask_ (P7-1 renders INFO from it, and must do so). Until P7-1 Greet() refuses such a
-  // master, so it is never set on a greeted link.
+  // state_mask_ (INFO and the activeExpire decision read it, and must do so).
   bool master_active_replica_ = false;
+
+  // drakeydb: P7 -- what ConsumeRedisStream's ClassicApplier counted over this Replica's life
+  // (RREPLAY envelopes unwrapped, malformed, self-authored, commands that did not apply).
+  ClassicLinkStats classic_stats_;
 
   // drakeydb: P7 -- replication stream bytes already read from the master but not yet applied: what
   // follows a correct classic full sync (InitiatePSync), and the hand-off point for any later

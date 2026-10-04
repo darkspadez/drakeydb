@@ -3,9 +3,27 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
+
+#include "facade/resp_expr.h"
+#include "server/common_types.h"
+
+namespace facade {
+class CapturingReplyBuilder;
+}  // namespace facade
 
 namespace dfly {
+
+class CommandContext;
+class ConnectionContext;
+class Service;
 
 // What a classic (Redis-protocol) master said in reply to a `REPLCONF capa ...` command. A stock
 // master answers `+OK`; an active KeyDB appends capability words to every capa reply
@@ -20,5 +38,133 @@ struct CapaReply {
 // token is exactly "OK" (case-sensitive, as before the suffix was tolerated); the words after it
 // are separated by spaces and unknown ones are ignored.
 CapaReply ParseCapaReply(std::string_view simple_string);
+
+// An active KeyDB wraps every command it streams to a replica in
+//   *5 RREPLAY <uuid of the writing node> <the command, RESP encoded> <db> <mvcc>
+// (tests/dragonfly/data/README.md has real captures). A node that forwards what it replays wraps
+// the envelope it received once more, so the inner command may itself be an envelope.
+struct RreplayEnvelope {
+  // The author, normalized to lowercase: it keys the author maps, and the normalized form is not a
+  // view of the wire bytes.
+  std::string uuid;
+  // The wrapped command's RESP bytes. Views the buffer the envelope was parsed from, so it must
+  // not outlive the stream loop iteration that read it.
+  std::string_view inner;
+  // Absent in KeyDB's 3-argument form: the inner command then runs in the db already selected.
+  std::optional<DbIndex> db;
+  // The author's MVCC clock when it minted the envelope; 0 when absent, which KeyDB never
+  // deduplicates.
+  uint64_t mvcc = 0;
+};
+
+enum class RreplayParse { kOk, kBadArity, kBadUuid, kBadDb, kBadMvcc };
+
+// Validates `args` (the parsed `RREPLAY ...` command, name included) the way KeyDB's
+// replicaReplayCommand does (replication.cpp:5389-5433) and fills `out` on kOk: at least three
+// arguments (the command name, the uuid, the inner command, a string), a uuid KeyDB's uuid_parse
+// takes (case-insensitive), an optional decimal db with 0 <= db < --dbnum, an optional decimal
+// unsigned 64-bit mvcc. Arguments past the fifth are ignored, as KeyDB ignores them. The checks run
+// in that order and the first failure names the result; `out` is unspecified after a failure.
+RreplayParse ParseRreplayEnvelope(const facade::RespVec& args, RreplayEnvelope* out);
+
+// Counters of one classic link. Relaxed atomics: the replication fiber bumps them, an INFO fiber
+// on another thread reads them.
+struct ClassicLinkStats {
+  // Envelope layers (a forwarded envelope is two) that parsed, were not the node's own, and whose
+  // inner command was taken apart: the layer's command was applied, skipped as a control command,
+  // or rejected by the dispatcher.
+  std::atomic<uint64_t> rreplay_unwrapped{0};
+  // Envelope layers that were not well formed (RreplayParse), whose inner bytes were not exactly
+  // one command, or that nested deeper than ClassicApplier::kMaxNesting. Skipped, never a
+  // disconnect: the bytes cannot be recovered by reconnecting.
+  std::atomic<uint64_t> rreplay_malformed{0};
+  // Envelopes authored by this node, which came back around a mesh; dropped.
+  std::atomic<uint64_t> rreplay_self_dropped{0};
+  // Inner commands that did not apply: the dispatcher rejected them before they ran (unknown
+  // command, wrong arity, out of memory) or they ran and replied an error (WRONGTYPE after a
+  // divergence, ...).
+  std::atomic<uint64_t> classic_apply_errors{0};
+};
+
+enum class EnvelopeResult {
+  // The envelope is dealt with, whatever came of it: the stream offset advances past its bytes.
+  kConsumed,
+  // Nothing was dispatched or counted, the link is stopping: the offset must not advance, so that
+  // a partial resync resumes at this envelope.
+  kNotConsumed,
+};
+
+// Applies the RREPLAY envelopes of a classic link's stream, one command at a time. Socket-free:
+// Replica::ConsumeRedisStream feeds it the parsed `RREPLAY ...` command and owns the offsets.
+//
+// Each envelope holds one command, which is dispatched on its own with its own db, instead of
+// riding the raw stream's squashed batches (a batch has one apply context, and the envelope's db,
+// and later its mvcc and author, belong to one command). Control commands KeyDB wraps like data
+// (PING, REPLCONF GETACK, MULTI, EXEC) are skipped: the db travels in the envelope and a
+// transaction is one envelope per command, which the server applies one by one as it does for a
+// raw MULTI/EXEC. Nothing here is a disconnect or a CHECK: an envelope that cannot be applied is
+// counted, warned about at a limited rate and skipped (owner decision 14).
+class ClassicApplier {
+ public:
+  // KeyDB's REPLAY_MAX_NESTING: the 64th wrapping applies, the 65th is malformed.
+  static constexpr unsigned kMaxNesting = 64;
+
+  // `cntx` is the stream's apply context: no connection, is_replicating, journal_emulated. The
+  // applier keeps the context's selected db in step with the envelopes, as KeyDB's master client
+  // keeps its own. `self_uuid` is this node's normalized uuid, whose envelopes are dropped.
+  // `link` names the master in logs. `running` tells whether the link is still running.
+  ClassicApplier(Service* service, ConnectionContext* cntx, std::string self_uuid, std::string link,
+                 ClassicLinkStats* stats, std::function<bool()> running);
+  ~ClassicApplier();
+
+  ClassicApplier(const ClassicApplier&) = delete;
+  ClassicApplier& operator=(const ClassicApplier&) = delete;
+
+  // Whether a command of the stream is an envelope (a case-insensitive RREPLAY).
+  static bool IsRreplay(const facade::RespExpr& name);
+
+  // Applies the envelope `args` (the whole `RREPLAY ...` command) found at nesting level `depth`
+  // (1: straight off the stream), and every envelope nested in it. `args`, and the buffer its
+  // views point into, must stay valid for the call.
+  //
+  // `running()` is asked once, for the outermost envelope (depth 1), before anything is
+  // dispatched, and the whole tree then runs to completion: a cancelled link neither applies half
+  // an envelope nor loses the end of one, and the offset it resumes from names an envelope that
+  // either applied whole or did not start. Anything else counts as consumed.
+  EnvelopeResult HandleRreplay(const facade::RespVec& args, unsigned depth = 1);
+
+ private:
+  // Parses `bytes` as exactly one command. False for none, a partial one, or bytes behind it.
+  static bool ParseSingleCommand(std::string_view bytes, facade::RespVec* args);
+
+  // Runs the unwrapped command. Control commands are skipped, everything else is dispatched in
+  // `db` (the db of the innermost envelope that has one, else the one already selected).
+  void ApplyCommand(const facade::RespVec& args, std::optional<DbIndex> db);
+
+  // Dispatches the already filled `cmd` and returns the text of its failure, if it failed: the
+  // dispatcher rejected it, or it replied an error.
+  std::optional<std::string> Dispatch(CommandContext* cmd);
+
+  // Selects `db` for the context. The first use of a db dispatches a real SELECT (so its tables
+  // exist on every shard, as JournalExecutor::SelectDb does); later uses only set the index.
+  bool SelectDb(DbIndex db);
+
+  void NoteMalformed(std::string_view why, unsigned depth);
+  void NoteApplyError(std::string_view command, std::string_view error);
+
+  Service* service_;
+  ConnectionContext* cntx_;
+  std::string self_uuid_;
+  std::string link_;
+  ClassicLinkStats* stats_;
+  std::function<bool()> running_;
+
+  // The replies to the envelopes' commands: errors only. `ReplyMode::NONE` records nothing, and
+  // the dispatcher consumes the builder's last error itself (InvokeCmd), so a command that failed
+  // would be invisible after it returned.
+  std::unique_ptr<facade::CapturingReplyBuilder> reply_;
+
+  std::vector<bool> ensured_dbs_;
+};
 
 }  // namespace dfly

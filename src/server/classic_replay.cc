@@ -3,8 +3,25 @@
 
 #include "server/classic_replay.h"
 
+#include <absl/flags/flag.h>
+#include <absl/strings/ascii.h>
+#include <absl/strings/escaping.h>
 #include <absl/strings/match.h>
+#include <absl/strings/numbers.h>
+#include <absl/strings/str_cat.h>
 #include <absl/strings/str_split.h>
+
+#include <algorithm>
+#include <array>
+#include <limits>
+
+#include "base/logging.h"
+#include "facade/redis_parser.h"
+#include "facade/reply_capture.h"
+#include "server/conn_context.h"
+#include "server/generic_family.h"
+#include "server/main_service.h"
+#include "server/node_identity.h"
 
 namespace dfly {
 
@@ -26,6 +43,227 @@ CapaReply ParseCapaReply(string_view simple_string) {
       reply.keydb_fastsync_save = true;
   }
   return reply;
+}
+
+namespace {
+
+// A non-negative decimal that fits 64 bits: digits only, so no sign, space or suffix (absl's
+// SimpleAtoi would take all of them).
+bool ParseUnsignedDecimal(string_view text, uint64_t* value) {
+  if (text.empty() || !all_of(text.begin(), text.end(), absl::ascii_isdigit))
+    return false;
+  return absl::SimpleAtoi(text, value);
+}
+
+string_view RreplayParseName(RreplayParse parse) {
+  switch (parse) {
+    case RreplayParse::kOk:
+      return "well formed";
+    case RreplayParse::kBadArity:
+      return "too few arguments, or an inner command that is not a string";
+    case RreplayParse::kBadUuid:
+      return "the author uuid is not a uuid";
+    case RreplayParse::kBadDb:
+      return "the db is not a number below --dbnum";
+    case RreplayParse::kBadMvcc:
+      return "the mvcc is not an unsigned number";
+  }
+  return "unknown";
+}
+
+// What KeyDB wraps in an envelope like a write, but that is not data: its liveness PING, the
+// GETACK its master asks for, and the MULTI/EXEC of a transaction. The db travels in the envelope,
+// and the commands of a transaction are applied one by one, as for a raw MULTI/EXEC.
+bool IsControlCommand(string_view name) {
+  for (string_view control : {"MULTI", "EXEC", "PING", "REPLCONF", "SELECT"}) {
+    if (absl::EqualsIgnoreCase(name, control))
+      return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+RreplayParse ParseRreplayEnvelope(const facade::RespVec& args, RreplayEnvelope* out) {
+  using facade::RespExpr;
+
+  // args[0] is the command name: KeyDB's argc >= 3 is the name, the uuid and the inner command.
+  if (args.size() < 3)
+    return RreplayParse::kBadArity;
+  if (args[1].type != RespExpr::STRING || !IsValidNodeUuid(args[1].GetView()))
+    return RreplayParse::kBadUuid;
+  // KeyDB's "Expected command buffer arg2". The enum has no value of its own for it, and a server
+  // parser only yields strings, so only a hand-built vector gets here.
+  if (args[2].type != RespExpr::STRING)
+    return RreplayParse::kBadArity;
+
+  std::optional<DbIndex> db;
+  if (args.size() >= 4) {
+    uint64_t value = 0;
+    if (args[3].type != RespExpr::STRING || !ParseUnsignedDecimal(args[3].GetView(), &value) ||
+        value >= absl::GetFlag(FLAGS_dbnum)) {
+      return RreplayParse::kBadDb;
+    }
+    db = static_cast<DbIndex>(value);
+  }
+
+  uint64_t mvcc = 0;
+  if (args.size() >= 5 &&
+      (args[4].type != RespExpr::STRING || !ParseUnsignedDecimal(args[4].GetView(), &mvcc))) {
+    return RreplayParse::kBadMvcc;
+  }
+
+  out->uuid = NormalizeNodeUuid(args[1].GetView());
+  out->inner = args[2].GetView();
+  out->db = db;
+  out->mvcc = mvcc;
+  return RreplayParse::kOk;
+}
+
+ClassicApplier::ClassicApplier(Service* service, ConnectionContext* cntx, string self_uuid,
+                               string link, ClassicLinkStats* stats, function<bool()> running)
+    : service_(service),
+      cntx_(cntx),
+      self_uuid_(std::move(self_uuid)),
+      link_(std::move(link)),
+      stats_(stats),
+      running_(std::move(running)),
+      reply_(make_unique<facade::CapturingReplyBuilder>(facade::ReplyMode::ONLY_ERR)) {
+}
+
+ClassicApplier::~ClassicApplier() = default;
+
+bool ClassicApplier::IsRreplay(const facade::RespExpr& name) {
+  return name.type == facade::RespExpr::STRING && absl::EqualsIgnoreCase(name.GetView(), "RREPLAY");
+}
+
+EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsigned depth) {
+  // Nested envelopes are unwrapped in a loop, not by recursion: a fiber's stack is 40 KB in a
+  // release build, and 64 levels of a frame holding a parser and an envelope would not fit it.
+  // Each layer's views point at the bytes of the stream buffer, not into the vector they were
+  // parsed into, so `inner_args` can be reused for the next layer.
+  facade::RespVec inner_args;
+  const facade::RespVec* current = &args;
+  std::optional<DbIndex> db;
+  uint64_t layers = 0;
+
+  for (;; ++depth) {
+    if (depth > kMaxNesting) {
+      NoteMalformed(absl::StrCat("nested deeper than ", kMaxNesting, " envelopes"), depth);
+      break;
+    }
+
+    RreplayEnvelope env;
+    if (RreplayParse parse = ParseRreplayEnvelope(*current, &env); parse != RreplayParse::kOk) {
+      NoteMalformed(RreplayParseName(parse), depth);
+      break;
+    }
+
+    if (env.uuid == self_uuid_) {
+      stats_->rreplay_self_dropped.fetch_add(1, memory_order_relaxed);
+      break;
+    }
+
+    // The point of no return: from the first dispatch of the outermost envelope on, the whole
+    // tree is applied, whatever happens to the link. Nothing above has touched the context.
+    if (depth == 1 && !running_())
+      return EnvelopeResult::kNotConsumed;
+
+    // The innermost envelope that carries a db decides the db of the command it wraps.
+    if (env.db)
+      db = env.db;
+
+    if (!ParseSingleCommand(env.inner, &inner_args)) {
+      NoteMalformed("the inner command is not exactly one command", depth);
+      break;
+    }
+    ++layers;
+
+    if (!IsRreplay(inner_args[0])) {
+      ApplyCommand(inner_args, db);
+      break;
+    }
+    current = &inner_args;
+  }
+
+  stats_->rreplay_unwrapped.fetch_add(layers, memory_order_relaxed);
+  return EnvelopeResult::kConsumed;
+}
+
+bool ClassicApplier::ParseSingleCommand(string_view bytes, facade::RespVec* args) {
+  if (bytes.empty())
+    return false;
+
+  // No array or string in the bytes can be longer than the bytes.
+  const uint32_t limit =
+      static_cast<uint32_t>(min<size_t>(bytes.size(), numeric_limits<uint32_t>::max()));
+  facade::RedisParser parser(facade::RedisParser::Mode::SERVER, limit, limit);
+  uint32_t consumed = 0;
+  facade::RedisParser::Result result = parser.Parse(
+      facade::RedisParser::Buffer{reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()},
+      &consumed, args);
+  return result == facade::RedisParser::OK && consumed == bytes.size() && !args->empty();
+}
+
+void ClassicApplier::ApplyCommand(const facade::RespVec& args, optional<DbIndex> db) {
+  const string_view name = args[0].GetView();
+  if (IsControlCommand(name))
+    return;
+
+  if (db && !SelectDb(*db))
+    return;
+
+  CommandContext cmd;
+  cmd.Init(reply_.get(), cntx_);
+  facade::FillBackedArgs(args, &cmd);
+  if (optional<string> error = Dispatch(&cmd); error)
+    NoteApplyError(name, *error);
+}
+
+optional<string> ClassicApplier::Dispatch(CommandContext* cmd) {
+  facade::DispatchResult result =
+      service_->DispatchCommand(facade::ParsedArgs{*cmd}, cmd, facade::AsyncPreference::ONLY_SYNC);
+  facade::CapturingReplyBuilder::Payload reply = reply_->Take();
+  if (auto error = facade::CapturingReplyBuilder::TryExtractError(reply); error)
+    return string(error->first);
+  if (result != facade::DispatchResult::OK)
+    return "the command was not dispatched";
+  return nullopt;
+}
+
+bool ClassicApplier::SelectDb(DbIndex db) {
+  if (ensured_dbs_.size() <= db)
+    ensured_dbs_.resize(db + 1);
+
+  if (ensured_dbs_[db]) {
+    cntx_->conn_state.db_index = db;
+    return true;
+  }
+
+  CommandContext select;
+  select.Init(reply_.get(), cntx_);
+  const string index = absl::StrCat(db);
+  const array<string_view, 2> parts = {"SELECT", index};
+  select.Assign(parts.begin(), parts.end(), parts.size());
+  if (optional<string> error = Dispatch(&select); error) {
+    NoteApplyError("SELECT", *error);
+    return false;
+  }
+  ensured_dbs_[db] = true;
+  return true;
+}
+
+void ClassicApplier::NoteMalformed(string_view why, unsigned depth) {
+  stats_->rreplay_malformed.fetch_add(1, memory_order_relaxed);
+  LOG_EVERY_T(WARNING, 60) << "Skipping a malformed RREPLAY envelope from " << link_
+                           << " (nesting level " << depth << "): " << why;
+}
+
+void ClassicApplier::NoteApplyError(string_view command, string_view error) {
+  stats_->classic_apply_errors.fetch_add(1, memory_order_relaxed);
+  LOG_EVERY_T(WARNING, 10) << "A command of an RREPLAY envelope from " << link_
+                           << " did not apply and is skipped: "
+                           << absl::CHexEscape(command.substr(0, 32)) << ": " << error;
 }
 
 }  // namespace dfly
