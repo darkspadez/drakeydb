@@ -397,3 +397,157 @@ the tests: after `cat build-dbg/drakeydb > /dev/null` the same case passes, and 
    the large-keyspace and low-`--hz` cases, but its description to operators must not promise convergence.
 3. The 60 s window and the unshifted clock are my choices (Task 2.8 gives the reasons); both are one constant or one line to
    change if the owner prefers otherwise.
+
+## Decision 31 round
+
+Base: HEAD `8eeba7c` (ledger decisions 24 amended, 27 amended, 29, 30 and 31 recorded). Not committed. Round brief: the
+Opus re-review of `e8f28b7..425eeb9` (one Important, three Minor, two Nit) and the owner's decisions 24, 27, 29 to 31. The
+product code is unchanged (`git diff -- src` is the one test file); `helio/` was not touched. Scratch (the good copies, the
+raw falsification output) is in the orchestrator's scratchpad under `p71b/`.
+
+### What changed
+
+| File | Change |
+|---|---|
+| spec D-9 | The affected-class list is an **outcome-per-class table** (loss, orphan, source missing, converges, not affected) with the mirror case kept and its outcome stated; a bullet for the **orphan as the interim limitation of decision 31**; the equivalences qualified (the transient part equals upstream's default, the orphan does not: Redis, Valkey and Dragonfly masters stream an expiry `DEL`; KeyDB active replicas and drakeydb peers share it); B and C converge for the orphan class; the Task 2.8 account says **outermost layer** (decision 30) and carries the corrected **`m - 1`** reasoning and citations; "what it leaves open" names the sweep **and** client reads and describes Task 2.9. |
+| spec D-15, PR stack, P7-1 PR text, file map, risk 14 | The new and renamed tests with their observed falsifications; Task 2.8's rows (`m - 1`, outermost layer); Task 2.9's rows; the P7-2 PR row; the P7-1 PR description lists the orphan; the file-map rows for Task 2.9; risk 14. |
+| `docs/PLAN.md` | The Task 1.4 bullet carries the table in prose, the mirror case (Minor 2: "only when" is gone), the qualified equivalences and the Task 2.8 + 2.9 closure. |
+| plan | Task 2.8: outermost layer's time and why, `NestedEnvelopeUsesTheOutermostLayersTime`, the `m - 1` edge with the mint-point reasoning, "what it leaves open" points to Task 2.9, the flips (under 2.8 alone only the two `access_only` envelope cases, plus the orphan test's `access_only` case), the open question is replaced by Task 2.9. **New Task 2.9 "Sweep clock and read-path hide"** (decision 29): goal, files, interfaces, Step 0 audit, failing tests, falsifications, done line. The P7-1 PR text, the P7-2 gate line and Task 4.4's docs line follow. |
+| `docs/ISSUE-REGISTER.md` | **D-32**, in Part 2 (Part 1 is upstream bugs; D-31 was the last D id): the orphan on a plain replica of an active KeyDB. Status interim, owner decision 31; owner P7-2 Tasks 2.8 + 2.9. |
+| `docs/UPSTREAM-SYNC.md` | The renamed test in the `db_slice.cc` row. |
+| `src/server/classic_replay_test.cc` | `ReplicaActiveExpiryTest.EveryCommandClassOfTheWindowSeesNoKey` is **renamed `EveryCommandClassOfTheWindowHasItsDocumentedOutcome`** (its assertions are the outcome table now) and gains `PTTL == -1` on every recreated key, `SET .. XX` (nil, no key: a loss), `SET .. XX KEEPTTL` (nil, no key: converges) and `SET .. KEEPTTL` (recreated, no TTL); the `NX` row is dropped. New `.MoversAndStoresSeeTheDueSourceAsMissing` (75 tests in the binary, from 74). |
+| `tests/dragonfly/keydb_onboarding_test.py` | New `test_plain_replica_of_active_keydb_keeps_a_ttl_less_orphan_of_a_ttl_keeping_write[sweep\|access_only]`, next to the counter test; new `test_fake_master_send_stream_lands_behind_the_scripted_stream`; nit 2 in `test_replica_active_expiry_follows_the_master_of_every_reconnect` (95 tests in the file, from 92). |
+| `tests/dragonfly/fake_classic_master.py` | Nit 1: `_stream_writer` is set after the scripted stream's delayed write. |
+
+### Decisions made inside the brief
+
+1. **The `NX` row is dropped, not relabelled.** A failed `SET NX` is never propagated (`server.cpp:4624` gates propagation on
+   `dirty`, `t_string.cpp:104-109` returns before the dataset changes), so no replica ever applies the case the old row
+   asserted ("succeeds where the master's failed"). A relabelled row would assert only that the replica reads a due key as
+   absent, which every other row already does, and would look like a pin of the wire claim, which a replica-side test cannot
+   pin. The justification is in the test's comment and in D-9, which says what makes `NX` unaffected is on the master's wire.
+2. **`SET .. XX KEEPTTL` is classified "converges"**, not "loss": the replica finds no key, but the master's key kept `E` and
+   is gone at it. It is in the test (nil, no key) and the table. The brief did not name it.
+3. **The source-missing class is split by what it was missing**, after reading the real semantics: KeyDB's `RENAME` and `COPY`
+   carry the source's deadline to the destination (`db.cpp:1507-1511`, `:1651`, `:1687-1688`), so the master's destination
+   is gone at `E` and the replica converges unless it had a destination of its own, which it keeps stale (`RENAME`) or
+   loses to an empty STORE result. A moved element (`LMOVE`, `SMOVE`) and a computed result (STORE family) carry no
+   deadline: lost for good. The live-destination rows are a second gtest, `MoversAndStoresSeeTheDueSourceAsMissing`, so the
+   claim is pinned and not argued. The commands in a row that no test runs (`RENAMENX`, `RPOPLPUSH`, `SINTERSTORE`,
+   `SDIFFSTORE`, `ZUNIONSTORE`, `ZINTERSTORE`, `SORT .. STORE`, `HSETNX`, `HINCRBY`, `INCRBYFLOAT`, `RPUSH`, `ZADD`) are
+   named in D-9 as argued from the same rule.
+4. **Task 2.9's advance is a forward-only maximum**, not the plain store of the brief's cost line ("one relaxed store per
+   envelope"): decision 29 says "the largest plausible outermost envelope time", and a smaller plausible stamp after a larger
+   one must not move the sweep back (it would re-hide keys). It is one relaxed load and a store only when larger; no CAS,
+   there is one writer. The cost line says so.
+5. **Task 2.9's advance sits after the self-author check** (a self-authored layer is dropped, and its stamp is not the
+   master's), after `running()` (an envelope that is not consumed is not applied and will be redelivered) and before the
+   control-command skip in `ApplyCommand`, as the brief requires.
+
+### Disagreements and findings, with evidence
+
+1. **The reviewer's "so `m >= t_decision`" holds only up to the cache's lag, and the decision does not read the clock the
+   brief assumed.** The feed mints the mvcc after the command (`replicationFeedSlavesCore`, `replication.cpp:652`; decoding
+   `keydb_v6.3.4_rreplay_stream.bin`: counter 1 on segments 0-2 and 8-12, 0 on the cron `ping`, segment 13, which never went
+   through `call()`, so there are two mints per command) from the **cached** `g_pserver->mstime` (a time thread, `server.cpp:7331`,
+   refreshes it in a loop with a 100 ns sleep). The expiry decision reads the **live** `mstime()` (`db.cpp:2063`): the
+   cached-time branch tests `serverTL->fixed_time_expire` (`db.cpp:2058`; the field is `server.h:2193`, in
+   `redisServerThreadVars`), but `call()` increments `g_pserver->fixed_time_expire` (`server.cpp:4520`; `server.h:2338`, in
+   `redisServer`) and decrements the thread-local one (`:4721`), so the branch is not in effect inside `call()` (it is only
+   inside `blocked.cpp:599`, serving blocked clients). The source says KeyDB's own comment ("a reference time that does not
+   change", `db.cpp:2051-2057`) is not what the code does. `m - 1` stays the right choice, argued as parity with KeyDB's own
+   predicate (`m - 1 >= E` is `m > E`) at the best stand-in the wire has, which removes the `m == E` mismatch; it can add the
+   opposite one only for a cache that trailed the clock across `E`, the same sub-millisecond residual. The spec and plan say
+   exactly that, not "strictly safer". Also corrected: the old text said the mvcc is minted at the start of `call()`, which is
+   only the first of the two mints; and "the envelope's mvcc ms are exactly the clock the deadline was computed from" now says
+   live clock for the deadline, cached copy for the mvcc, equal to the millisecond in both captures.
+2. **`SCAN`/`KEYS` (`ScanCb`, `generic_family.cc:814`) call `ExpireIfNeeded` directly**, so the brief's hide in `FindInternal`
+   does not cover them: a client's `SCAN` on the replica deletes a due key the stream clock has not reached, on the local
+   clock. Task 2.9 lists it as staying local (D-9, Step 0) and raises it as **an open question for the owner** (one more
+   upstream hunk to hide there too). The insert-time GC (`db_slice.cc:258`) runs on the inserting transaction's clock, the
+   author's for an enveloped insert, so it is consistent.
+3. **Task 2.4 (P7-2) changes two rows of the table.** It rewrites `SET .. XX` and `NX` to a plain `SET` for every enveloped
+   command (plan Task 2.4), so from then on `SET .. XX` converges, and `SET .. XX KEEPTTL` (rewritten to `SET .. KEEPTTL`)
+   becomes an orphan until Tasks 2.8 and 2.9. D-9 says so. Derived from the plan text, not run.
+4. **The orphan pytest flips in its `access_only` case under Task 2.8 alone**, which the brief's "under 2.8 alone only the
+   `--hz=0` / `access_only` envelope cases flip" does not enumerate for a test it did not yet have: the writes find their keys
+   live at the author's time, and the first client read deletes them. Both cases flip under 2.8 + 2.9. Derived, not run.
+5. **The mirror case's outcome** (the commands that create the key on the master apply to the stale one, computed from the old
+   value, and the old deadline takes the key away shortly after) is argued, not run: the fixture cannot make a replica clock
+   run behind. Decision 27 closes it for an enveloped command with a plausible stamp, by the same argument.
+6. **Nit 2 has no failing form.** `reconnect_to` returns after the replica's PSYNC request is seen; by then the new keys
+   have already arrived. Three probe runs with a print at the old check's position: `PROBE dbsize right after reconnect_to: 51
+   c:keep exists: 1` each time, so the old `assert_dbsize(c, 51)` was matching the new keys here, not the old phase's.
+   The window (the check running before the resync's flush) exists but was not hit; the fix closes it, and the following
+   `assert_dbsize(c, 1)` would have caught a real failure either way. No mutation can make the old and the new check differ
+   observably, so none is claimed.
+
+### Falsification
+
+**M1: a flagged replica serves a due key as live, on every path** (`db_slice.cc`, the gate of `DbSlice::ExpireIfNeeded` becomes
+`owner_->IsReplica() && (owner_->ReplicaActiveExpiry() || !absl::GetFlag(FLAGS_replica_delete_expired))`; the good copy `cp`-ed back
+afterwards, `git diff --quiet -- src/server/db_slice.cc` true, `dragonfly` and `classic_replay_test` rebuilt from it: `nice
+ninja -C build-dbg -j3 dragonfly classic_replay_test`, `ninja -n` then "no work to do"). Commands: that build, `cat
+build-dbg/classic_replay_test build-dbg/drakeydb > /dev/null`, `build-dbg/classic_replay_test --gtest_filter='ReplicaActiveExpiry*'`,
+then `KEYDB_SERVER_PATH=<scratchpad>/KeyDB/src/keydb-server KEYDB_REQUIRED=1 DRAGONFLY_PATH=/home/user/drakeydb/build-dbg/dragonfly flock
+/tmp/drakey-pytest.lock /root/drakey-venv-pinned/bin/python -m pytest tests/dragonfly/keydb_onboarding_test.py -k orphan -v`.
+
+- gtests: `ReapsExpiredKeysButNeverEvicts`, `BypassesReplicaDeleteExpiredFlag` and `ARefreshThatArrivesAfterTheDeadlineFindsNoKey`
+  fail as in the earlier round, the controls pass. `EveryCommandClassOfTheWindowHasItsDocumentedOutcome` prints **25 failed
+  expectations**, among them the new rows (`Run({"set", "s:xx", "new", "xx"})` expected nil, actual `OK`; `Run({"set",
+  "s:xx_keepttl", ...})` likewise, and its `exists` 1) and the old ones (`expire`, `pexpire`, `expireat`, `pexpireat` and
+  `persist` reply 1, `getex` returns `'5'`, `incr` 6, `append` 2 and `'5x'`, `setrange` 4 and `'x555'`, `hlen`, `llen` and `scard`
+  2), and then **the process aborts** at the first `PTTL` of a recreated key: `generic_family.cc:1389] Check failed: ttl_ms > 0
+  (-900 vs. 0)` (`OpTtl`'s `DCHECK_GT(ttl_ms, 0)`, "otherwise FindReadOnly would return null": the invariant the gate
+  mutation breaks). The assertions run in an order that gets the value failures out before the abort. Run alone,
+  `MoversAndStoresSeeTheDueSourceAsMissing` fails **12 expectations** (`rename` replies `OK`, `copy` 1, `lmove` `'a'`, `smove` 1,
+  `sunionstore` 1, `exists` 4 where 0; then `rename` onto the live destination `OK` and `get s:old` nil where `"old"`, `lmove`
+  `'a'` and `llen lmove:over_dst` 2 where 1, `sunionstore` 1 and `exists union:over_dst` 1 where 0).
+- pytest: `[sweep]` fails with `AssertionError: DBSIZE is 5: the sweep did not delete the due keys` (nothing deletes them, so the
+  setup fails before the late commands); `[access_only]` with `AssertionError: c is '6': the replica applied INCR to the old
+  key`. The first version of the test asserted `PTTL` before the value; under M1 that killed the replica process
+  (`Dragonfly did not terminate gracefully, exit code -6`, then a `ConnectionRefusedError`; presumably the same `OpTtl` `DCHECK`
+  as in the gtest, but that run's log was overwritten by later runs, so it is not confirmed), so the value is asserted first.
+
+**Nit 1.** `fake_classic_master.py` restored to HEAD (`git checkout --`), `pytest -k send_stream`: `Failed: DID NOT RAISE
+AssertionError` at `with pytest.raises(AssertionError, match="no replica is in the replication stream")` (the early
+`send_stream()` was accepted); then the fix copied back (`cmp` clean) and it passes.
+
+**Nit 2.** See finding 6: no failing form.
+
+### Results (debug build, rebuilt from the restored sources after the last mutation)
+
+- `build-dbg/classic_replay_test --gtest_filter='ReplicaActiveExpiry*'`: `[  PASSED  ] 9 tests.`; the whole binary: `[  PASSED  ] 75 tests.`
+- `keydb_onboarding_test.py -k "expir or deadline or orphan or reconnect"` (real KeyDB, `KEYDB_REQUIRED=1`): `34 passed`; the whole
+  file: `95 passed in 234.84s`.
+- **5 runs under load.** Three busy loops (`while :; do :; done`, three of four cores at about 91%, `loadavg` 1.63 to 2.83 over the runs)
+  and `-k "orphan or send_stream or reconnect"` five times: `4 passed` each time (28 to 29 s); `classic_replay_test
+  --gtest_filter='ReplicaActiveExpiryTest.*' --gtest_repeat=5` under the same loops (`loadavg 2.56`): `9 tests` passed five times.
+  The loops were killed afterwards (checked with `top`). An earlier attempt of the pytest loop ran nothing (it used `/usr/bin/time`,
+  which this box does not have) and is not counted.
+- `pre-commit run --files <the changed files>`: see the end of this section.
+
+### Not done / not verified
+
+- **Task 2.9 is a plan, not code.** None of its seam exists. Every test name, flip and falsification in it is a prediction
+  derived from reading `RetireExpiredAndEvict`, `FindInternal`, `HandleRreplay` and the decision-24 pytests; none was run, and
+  the claims that four of the ten decision-24 pytests flip (and that the orphan test flips) are derived. Under Task 2.8 the
+  `m - 1` is likewise a plan.
+- The orphan was reproduced with a fake master (the reviewer's script, then the pytest), not with a real KeyDB end to end; Task
+  2.9 plans a real-KeyDB rate-limiter test behind a pausing proxy.
+- The mirror-case outcome and the `SET .. XX` / `NX` rewrite interplay (findings 3 and 5) are argued.
+- `progress.md`, the ledger's `decisions.md` (binding) and the `docs/multi-master.md` operator page were not touched; no
+  release, ASAN or UBSAN build; `multi_master_test`, `redis_replication_test.py`, `keydb_harness_test.py`, `replication_test.py`
+  were not rerun (no product source changed).
+
+### Open risks
+
+1. Until P7-2 the P7-1 behaviour has a permanent orphan (decision 31). The PR description must say so; the register entry D-32
+   and D-9 do.
+2. Task 2.9's hide bounds the staleness it buys: a due key lingers up to one ping period (10 s by default), 60 s with the link
+   down, and `SCAN`/`KEYS` bypass it unless the owner extends it (finding 2).
+3. `m - 1` shifts every reader of an enveloped transaction's time by a millisecond (a relative TTL is anchored one millisecond
+   early; an active KeyDB streams none).
+4. The KeyDB fixed-time quirk (finding 1) means KeyDB's own decisions inside one command are on the live clock, not a fixed one,
+   so a command that opens the same key twice can see two different answers across a deadline on the master itself; nothing
+   here depends on it, but it is a reason not to over-read "the master's decision".

@@ -110,8 +110,9 @@ class FakeClassicMaster:
 
     async def send_stream(self, data):
         """Writes `data` into the replication stream of the connection that was last answered a
-        PSYNC, behind whatever script_psync() wrote there, as a live master streams a command that
-        was just run. The caller owns the timing: nothing is written until it is called."""
+        PSYNC, behind whatever script_psync() wrote there (the scripted stream, once its delay has
+        passed, included), as a live master streams a command that was just run. The caller owns
+        the timing: nothing is written until it is called."""
         writer = self._stream_writer
         assert writer is not None, "no replica is in the replication stream yet"
         writer.write(data)
@@ -243,10 +244,12 @@ class FakeClassicMaster:
         elif name in ("PSYNC", "SYNC"):
             writer.write(self._psync_reply)
             await writer.drain()
-            self._stream_writer = writer
             if self._psync_stream:
                 await asyncio.sleep(self._stream_delay)
                 writer.write(self._psync_stream)
+            # Only now: a send_stream() during the delay above would land ahead of the scripted
+            # stream, and the caller asked for it to come behind it.
+            self._stream_writer = writer
             await writer.drain()
             return not self._close_after_psync
         else:

@@ -1537,3 +1537,57 @@ table, never observing `EXISTS`/`GET`.
 
 **Owner:** open; pre-existing upstream shape (`DelMutable`-then-`Add` for `REPLACE` predates
 drakeydb's own MVCC/LWW work), not introduced by P4-4. Registered only, not fixed. **From:** P4-4.
+
+### D-32. A TTL-keeping write the master ran before a key's deadline leaves a permanent TTL-less
+orphan on a plain replica of an active KeyDB
+
+**Where:** `DbSlice::ExpireIfNeeded` (`db_slice.cc`) and the heartbeat sweep, both opened for a
+plain replica whose master said `active-replica` (P7-1 Task 1.4, spec D-9, ledger decision 13). An
+active KeyDB never streams an expiry `DEL` (`db.cpp:1980`), so such a replica expires keys itself,
+on its own clock, and the two disagree about a key whenever a command crosses a deadline in
+flight:
+
+1. The master holds `c` with a deadline `E`. At `Tm < E` it runs a write that keeps the TTL when
+   the key exists and creates the key when it does not: `INCR` (streamed as `INCRBY c 1`),
+   `APPEND`, `SETRANGE`, `HSET`, `HSETNX`, `SADD`, `LPUSH`, `SET .. KEEPTTL`, ... On the master `c`
+   keeps `E`.
+2. The command reaches the replica at or after `E` on the replica's clock (the stream's lag plus
+   the clocks' skew). The replica has deleted `c` by then, in the sweep or at the first access.
+3. The write finds no key and creates one from nothing, with no TTL.
+4. The master's `c` expires at `E`, and nothing is streamed for it. The replica's `c` stays for
+   ever: the sweep has no TTL to act on and DBSIZE never moves.
+
+**Reproduced** (the reviewer's script, `orphan.py`; now the pytest below): a fake master saying
+`active-replica` streams `SET c 5 PXAT E`, `HSET h f 1` with `PEXPIREAT h E` and `SET kt old PXAT
+E`, and a second past `E` the enveloped `INCRBY c 1`, `HSET h g 2` and `SET kt new KEEPTTL`,
+stamped before `E`. After them the replica has `c`, `h` and `kt` with `pttl -1`, and DBSIZE stays
+5 for 3 s (the pytest checks 2 s). A rate limiter (`INCR`, then `EXPIRE` only when the value is 1) meets it at a window
+rollover on a hot key. A counter whose `EXPIRE` is streamed right behind the `INCR` is not
+orphaned (the `PEXPIREAT` gives the recreated key a TTL), and `SET .. NX` is not affected (a failed
+one is never propagated, `server.cpp:4624`, `t_string.cpp:104-109`). A TTL refresh, `SET .. XX`
+with no expiry and the movers and STORE commands lose data rather than orphan it; spec D-9 has the
+outcome per class.
+
+**Scope.** A Redis, Valkey or Dragonfly master streams an expiry `DEL` (`RecordExpiryBlocking`,
+`db_slice.cc:2159`), which removes the recreated key, so the same replica behaviour is transient
+under them. KeyDB's own *active* replicas (`expireIfNeeded` falls through to the delete,
+`db.cpp:2101`) and drakeydb peers (`PassesPeerEchoFilter` drops `kEntryFlagExpired`) share the
+orphan. Options B (copy KeyDB's plain replica) and C (sweep only) of ledger decision 24 would not
+orphan it, since the write lands on the stale object and goes with it at the reap; they were
+rejected as wider for every other class. A full resync (a `REPLICAOF` again, or a reconnect that
+falls back to one) rebuilds the replica from the master's snapshot and drops the orphans.
+
+**How established:** the live fake-master run above against the P7-1 build, and now the pytest
+`test_plain_replica_of_active_keydb_keeps_a_ttl_less_orphan_of_a_ttl_keeping_write[sweep|access_only]`
+and `ReplicaActiveExpiryTest.EveryCommandClassOfTheWindowHasItsDocumentedOutcome` (`PTTL == -1` on
+every recreated key), both falsified by serving due keys as live (`task-1.4-report.md`, "Decision
+31 round"). Not reproduced against a real KeyDB end to end: the stream's forms are the captured
+ones (`tests/dragonfly/data/README.md`), and Task 2.9 adds a real-KeyDB rate-limiter test.
+
+**Status:** interim, owner decision 31: documented in P7-1 (spec D-9, this entry, the P7-1 PR
+description), not fixed there. **Owner:** P7-2 Tasks 2.8 and 2.9 (plan): the write then runs at its
+author's time, before `E`, on a key the sweep, on the stream clock, has not deleted, so it finds the
+key with its TTL, and the two pytests flip. They close it while the link is healthy; it stays open
+while the stream is more than 60 s behind the local clock (the floor) or a stamp is unusable (the
+local clock is kept). Delete this entry when Task 2.9 lands. **From:** P7-1 (Task 1.4; found by the
+Opus re-review of `425eeb9`).

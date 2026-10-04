@@ -1868,6 +1868,15 @@ async def test_replica_active_expiry_follows_the_master_of_every_reconnect(
         assert await c.dbsize() == EXPIRING_KEYS + 1, "a replica of a plain master expired keys"
 
         await reconnect_to(3000, "c", active=True)
+
+        @assert_eventually(times=200)
+        @retry_while_loading
+        async def resynced_keys_arrived():
+            # The last key of the stream: the full sync has flushed the keys of the phase before
+            # (which are as many, so the size alone cannot tell) and the new ones are in.
+            assert await c.exists("c:keep") == 1
+
+        await resynced_keys_arrived()
         await assert_dbsize(c, EXPIRING_KEYS + 1)
         await assert_dbsize(c, 1)  # and the next greet sets it again
         assert master.connection_count == 3, "one connection per phase"
@@ -2036,6 +2045,33 @@ async def test_keydb_is_told_the_replica_expires_keys_itself(
     await synchronized()
     log = keydb.log_text()
     assert "does not support active expiration" not in log, log
+
+
+async def test_fake_master_send_stream_lands_behind_the_scripted_stream():
+    """`FakeClassicMaster.send_stream()` writes behind the stream `script_psync()` scripted: while
+    that stream is still waiting out its `stream_delay`, no replica is in the stream yet, and the
+    call is refused instead of landing ahead of it. Once the scripted stream is written, what
+    `send_stream()` sends follows it. No drakeydb is involved: the client is a bare socket.
+
+    Falsifying: with the stream writer set before the delay, the first `send_stream()` is accepted
+    and its bytes reach the client ahead of the scripted ones.
+    """
+    async with FakeClassicMaster() as master:
+        master.script_psync(b"+REPLY\r\n", stream=b"SCRIPTED", stream_delay=0.5)
+        reader, writer = await asyncio.open_connection("127.0.0.1", master.port)
+        try:
+            writer.write(b"PSYNC ? -1\r\n")
+            await writer.drain()
+            assert await reader.readline() == b"+REPLY\r\n"
+
+            with pytest.raises(AssertionError, match="no replica is in the replication stream"):
+                await master.send_stream(b"EARLY")
+
+            assert await asyncio.wait_for(reader.readexactly(8), 5) == b"SCRIPTED"
+            await master.send_stream(b"LATE")
+            assert await asyncio.wait_for(reader.readexactly(4), 5) == b"LATE"
+        finally:
+            writer.close()
 
 
 # The window of owner decision 24 (option A), scripted with the commands an active KeyDB streams:
@@ -2213,4 +2249,90 @@ async def test_plain_replica_of_active_keydb_recomputes_a_counter_from_nothing_a
         value = await c.get("c")
         assert value == "1", f"c is {value!r}: the replica computed it from a due key"
         assert 0 < await c.pttl("c") <= 60_000
+        assert master.connection_count == 1, "the replica reconnected"
+
+
+@pytest.mark.parametrize("sweep", ["sweep", "access_only"])
+async def test_plain_replica_of_active_keydb_keeps_a_ttl_less_orphan_of_a_ttl_keeping_write(
+    df_factory: DflyInstanceFactory, tmp_path, sweep
+):
+    """Pins the permanent orphan of owner decision 24, option A, which decision 31 keeps as a known
+    interim limitation of P7-1 (spec D-9, ISSUE-REGISTER D-32). The master set `c` (a string), `h`
+    (a hash) and `kt` (a string) to expire at a deadline 3 s ahead. Later, 300 ms before that
+    deadline, it ran a write that keeps the TTL on each of them (`INCR c`, streamed as `INCRBY c 1`;
+    `HSET h g 2`; `SET kt new KEEPTTL`), so on the master all three still expire at the deadline,
+    and an active KeyDB never streams a DEL for that. The replica applies the writes a second after
+    the deadline, when it has deleted the keys (the sweep did, or with --hz=0 the access that
+    applies the write does): each write finds no key and creates one, with no TTL. Nothing ever
+    removes it. The test reads `PTTL == -1` on all three, and that they are all still there 2 s
+    later with the sweep running, as DBSIZE (which reads no key) shows by counting them. `swept` is
+    the control for that: a key with the same deadline that nothing touches, which the sweep has
+    deleted by then; with --hz=0 it is still in the table.
+
+    The writes are enveloped, as an active KeyDB streams them. A counter that is followed by
+    `PEXPIREAT` (a rate limiter's window start) hides the orphan, which is why the counter test
+    above streams one; here there is none.
+
+    Decisions 27 and 29 (plan Tasks 2.8 and 2.9, P7-2) flip it: the writes run at their author's
+    time, before the deadline, on keys the sweep has not deleted because it runs on the stream
+    clock, so they find `c`, `h` and `kt` with their TTL, keep it, and the keys are deleted at the
+    deadline.
+
+    Falsifying: a replica that serves a due key as live (`ExpireIfNeeded` returns it) applies the
+    writes to the old keys, which keep their TTL: no orphan. With --hz=0 that is `c` at "6"; with
+    the sweep the setup fails first, as nothing deletes the due keys.
+    """
+    async with FakeClassicMaster() as master:
+        node, c = await attach_to_stream_live(df_factory, tmp_path, master, sweep)
+        t0 = now_ms()
+        deadline = t0 + WINDOW_TTL_MS
+
+        def streamed(at, *command):
+            return stream_command("envelope", *command, master_ms=at)
+
+        await stream_and_wait_applied(
+            master,
+            c,
+            "marker:set",
+            streamed(t0, "SET", "c", 5, "PXAT", deadline),
+            streamed(t0, "HSET", "h", "f", 1),
+            streamed(t0, "PEXPIREAT", "h", deadline),
+            streamed(t0, "SET", "kt", "old", "PXAT", deadline),
+            streamed(t0, "SET", "swept", "v", "PXAT", deadline),
+        )
+        await sleep_until_ms(deadline + WINDOW_PAST_MS)
+        if sweep == "access_only":
+            size = await c.dbsize()
+            assert size == 4 + 1, f"the four keys and a marker should be there, DBSIZE is {size}"
+        else:
+
+            @assert_eventually(times=100)
+            async def swept_by_the_sweep():
+                size = await c.dbsize()
+                assert size == 1, f"DBSIZE is {size}: the sweep did not delete the due keys"
+
+            await swept_by_the_sweep()
+
+        at = deadline - 300
+        await stream_and_wait_applied(
+            master,
+            c,
+            "marker:late",
+            streamed(at, "INCRBY", "c", 1),
+            streamed(at, "HSET", "h", "g", 2),
+            streamed(at, "SET", "kt", "new", "KEEPTTL"),
+        )
+        value = await c.get("c")
+        assert value == "1", f"c is {value!r}: the replica applied INCR to the old key"
+        assert await c.hlen("h") == 1
+        assert await c.get("kt") == "new"
+        for key in ("c", "h", "kt"):
+            pttl = await c.pttl(key)
+            assert pttl == -1, f"{key} has a TTL ({pttl} ms): the replica did not recreate it"
+
+        for _ in range(20):  # for 2 s
+            assert await c.exists("c", "h", "kt") == 3, "an orphan was removed"
+            await asyncio.sleep(0.1)
+        # The three orphans and the two markers; with --hz=0 also `swept`, which nothing deleted.
+        assert await c.dbsize() == 5 + (1 if sweep == "access_only" else 0)
         assert master.connection_count == 1, "the replica reconnected"

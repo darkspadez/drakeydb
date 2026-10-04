@@ -1699,12 +1699,17 @@ TEST_F(ReplicaActiveExpiryTest, ControlARefreshBeforeTheDeadlineKeepsTheKey) {
   EXPECT_EQ(Run({"get", "k"}), "v");
 }
 
-// Every class of command that decision 24 lists as affected, run after the deadline against a key
-// that expired meanwhile: it sees no key, as it would have for a key that never existed. The
-// master, which ran each of them before the deadline, saw the key and replied (and changed) other
-// than what is asserted here. The last group is the commands that are not affected: they replace
-// the key or remove it, so both sides end with the same data.
-TEST_F(ReplicaActiveExpiryTest, EveryCommandClassOfTheWindowSeesNoKey) {
+// What each class of command does on a replica that has deleted a due key, run after the deadline
+// against a key that expired meanwhile (spec D-9, owner decisions 24 and 31). The master ran each
+// of them before the deadline, saw the key, and replied (and holds) other than what is asserted
+// here; an active KeyDB never streams the expiry's DEL, so nothing corrects the replica afterwards.
+// The groups are the outcomes of the spec's table: a loss (the command finds no key; the master's
+// key outlives the deadline), an orphan (the command creates a key with no TTL; the master's key
+// keeps its deadline and is gone at it), a missing source (the movers and STORE commands, in the
+// next test), and the commands that converge. A conditional SET .. NX is not a row: a failed one is
+// not propagated by KeyDB (server.cpp:4624 gates propagation on the dataset having changed,
+// t_string.cpp:104-109 returns before it does), so it never reaches a replica as it failed.
+TEST_F(ReplicaActiveExpiryTest, EveryCommandClassOfTheWindowHasItsDocumentedOutcome) {
   SetReplicaMode(/*replica=*/true, /*active_expiry=*/true);
 
   const uint64_t far_ms = GetCurrentTimeMs() + 100000000;
@@ -1722,33 +1727,40 @@ TEST_F(ReplicaActiveExpiryTest, EveryCommandClassOfTheWindowSeesNoKey) {
   };
   for (string_view key :
        {"s:expire", "s:pexpire", "s:expireat", "s:pexpireat", "s:persist", "s:getex", "s:incr",
-        "s:append", "s:rename", "s:copy", "s:nx", "s:set", "s:del"}) {
+        "s:append", "s:xx", "s:xx_keepttl", "s:keepttl", "s:set", "s:del"}) {
     expiring_string(key);
   }
   expiring_string("s:setrange", "5555");
   expiring({"hset", "h", "f", "1"}, "h");
   expiring({"rpush", "l", "a"}, "l");
   expiring({"sadd", "st", "a"}, "st");
-  expiring({"rpush", "lmove:src", "a"}, "lmove:src");
-  expiring({"sadd", "smove:src", "a"}, "smove:src");
-  expiring({"sadd", "union:src", "a"}, "union:src");
   AdvanceTime(1000);
-  ASSERT_EQ(DbSize(), 20);  // all due, none deleted yet
+  ASSERT_EQ(DbSize(), 17);  // all due, none deleted yet
 
-  // TTL refreshes are no-ops, and the key is lost (for good after a PERSIST).
+  // Loss: TTL refreshes are no-ops, and the key is gone (for good after a PERSIST), while the
+  // master's lives on with the TTL it was given, or none. So is a SET .. XX, which the master
+  // applied to its live key: it replaced the value and dropped the TTL.
   EXPECT_EQ(CheckedInt({"expire", "s:expire", "60"}), 0);
   EXPECT_EQ(CheckedInt({"pexpire", "s:pexpire", "60000"}), 0);
   EXPECT_EQ(CheckedInt({"expireat", "s:expireat", far_sec_str}), 0);
   EXPECT_EQ(CheckedInt({"pexpireat", "s:pexpireat", far_ms_str}), 0);
   EXPECT_EQ(CheckedInt({"persist", "s:persist"}), 0);
   EXPECT_THAT(Run({"getex", "s:getex", "persist"}), ArgType(RespExpr::NIL));
+  EXPECT_THAT(Run({"set", "s:xx", "new", "xx"}), ArgType(RespExpr::NIL));
   for (string_view key :
-       {"s:expire", "s:pexpire", "s:expireat", "s:pexpireat", "s:persist", "s:getex"}) {
+       {"s:expire", "s:pexpire", "s:expireat", "s:pexpireat", "s:persist", "s:getex", "s:xx"}) {
     EXPECT_EQ(CheckedInt({"exists", key}), 0) << key;
   }
 
-  // Read-then-write commands compute from nothing. The master replied, and holds, 6 after INCR,
-  // "5x" after APPEND, "x555" (length 4) after SETRANGE, and a hash, a list and a set of two.
+  // Converges: SET .. XX KEEPTTL finds no key too, but the master's key keeps its deadline and is
+  // gone at it, so the two end alike.
+  EXPECT_THAT(Run({"set", "s:xx_keepttl", "new", "xx", "keepttl"}), ArgType(RespExpr::NIL));
+  EXPECT_EQ(CheckedInt({"exists", "s:xx_keepttl"}), 0);
+
+  // Orphan: a write that keeps the TTL computes from nothing and creates the key with none. The
+  // master replied, and holds, 6 after INCR, "5x" after APPEND, "x555" (length 4) after SETRANGE,
+  // a hash, a list and a set of two, and "new" after SET .. KEEPTTL; all of them with the deadline
+  // the replica no longer has, so they are gone from the master at it and stay on the replica.
   EXPECT_EQ(CheckedInt({"incr", "s:incr"}), 1);
   EXPECT_EQ(CheckedInt({"append", "s:append", "x"}), 1);
   EXPECT_EQ(Run({"get", "s:append"}), "x");
@@ -1760,8 +1772,50 @@ TEST_F(ReplicaActiveExpiryTest, EveryCommandClassOfTheWindowSeesNoKey) {
   EXPECT_EQ(CheckedInt({"llen", "l"}), 1);
   EXPECT_EQ(CheckedInt({"sadd", "st", "b"}), 1);
   EXPECT_EQ(CheckedInt({"scard", "st"}), 1);
+  EXPECT_EQ(Run({"set", "s:keepttl", "new", "keepttl"}), "OK");
+  EXPECT_EQ(Run({"get", "s:keepttl"}), "new");
+  for (string_view key : {"s:incr", "s:append", "s:setrange", "h", "l", "st", "s:keepttl"}) {
+    EXPECT_EQ(CheckedInt({"pttl", key}), -1) << key << " was recreated with a TTL";
+  }
 
-  // Movers and STORE commands see their source as missing.
+  // Converges: a plain SET replaces the key, with no TTL on the master either; DEL removes it.
+  EXPECT_EQ(Run({"set", "s:set", "new"}), "OK");
+  EXPECT_EQ(Run({"get", "s:set"}), "new");
+  EXPECT_EQ(CheckedInt({"pttl", "s:set"}), -1);
+  EXPECT_EQ(CheckedInt({"del", "s:del"}), 0);
+  EXPECT_EQ(CheckedInt({"exists", "s:del"}), 0);
+}
+
+// The movers and the STORE family, with the due key as their source (spec D-9, "source missing").
+// The master moved or combined a live source, so the destination it holds is not what the replica
+// computes from nothing: a mover or a STORE reads the source as missing, and what lands in the
+// destination is lost. Where the destination already existed the replica leaves it as it was
+// (RENAME) or empties it (SUNIONSTORE, whose result is empty), and the master's holds the source's
+// data; with no destination, the replica has none. RENAME and COPY carry the source's deadline to
+// the destination, so on the master it is gone at it all the same; a moved element (LMOVE, SMOVE)
+// or a computed result (STORE) has no deadline there, and the difference stays.
+TEST_F(ReplicaActiveExpiryTest, MoversAndStoresSeeTheDueSourceAsMissing) {
+  SetReplicaMode(/*replica=*/true, /*active_expiry=*/true);
+
+  auto expiring = [&](initializer_list<string_view> create, string_view key) {
+    ASSERT_GT(CheckedInt(create), 0) << key;
+    ASSERT_EQ(CheckedInt({"pexpire", key, "100"}), 1) << key;
+  };
+  ASSERT_EQ(Run({"set", "s:rename", "5", "PX", "100"}), "OK");
+  ASSERT_EQ(Run({"set", "s:copy", "5", "PX", "100"}), "OK");
+  ASSERT_EQ(Run({"set", "s:rename_over", "5", "PX", "100"}), "OK");
+  ASSERT_EQ(Run({"set", "s:old", "old"}), "OK");  // the live destination of RENAME
+  expiring({"rpush", "lmove:src", "a"}, "lmove:src");
+  expiring({"rpush", "lmove:over_src", "a"}, "lmove:over_src");
+  ASSERT_EQ(CheckedInt({"rpush", "lmove:over_dst", "z"}), 1);
+  expiring({"sadd", "smove:src", "a"}, "smove:src");
+  expiring({"sadd", "union:src", "a"}, "union:src");
+  expiring({"sadd", "union:over_src", "a"}, "union:over_src");
+  ASSERT_EQ(CheckedInt({"sadd", "union:over_dst", "z"}), 1);
+  AdvanceTime(1000);
+  ASSERT_EQ(DbSize(), 11);  // eight due, three live, none deleted yet
+
+  // With no destination: the source is missing, and none is created.
   EXPECT_THAT(Run({"rename", "s:rename", "s:renamed"}), ErrArg("no such key"));
   EXPECT_EQ(CheckedInt({"copy", "s:copy", "s:copied"}), 0);
   EXPECT_THAT(Run({"lmove", "lmove:src", "lmove:dst", "left", "left"}), ArgType(RespExpr::NIL));
@@ -1770,15 +1824,15 @@ TEST_F(ReplicaActiveExpiryTest, EveryCommandClassOfTheWindowSeesNoKey) {
   EXPECT_EQ(CheckedInt({"exists", "s:renamed", "s:copied", "lmove:dst", "smove:dst", "union:dst"}),
             0);
 
-  // A conditional SET succeeds where the master's replied nil.
-  EXPECT_EQ(Run({"set", "s:nx", "new", "nx"}), "OK");
-  EXPECT_EQ(Run({"get", "s:nx"}), "new");
-
-  // Not affected: a plain SET replaces the key, DEL removes it.
-  EXPECT_EQ(Run({"set", "s:set", "new"}), "OK");
-  EXPECT_EQ(Run({"get", "s:set"}), "new");
-  EXPECT_EQ(CheckedInt({"del", "s:del"}), 0);
-  EXPECT_EQ(CheckedInt({"exists", "s:del"}), 0);
+  // With a live destination: RENAME leaves it as it was, LMOVE does not push to it and
+  // SUNIONSTORE of a missing source empties it (the master holds the source's data in all three).
+  EXPECT_THAT(Run({"rename", "s:rename_over", "s:old"}), ErrArg("no such key"));
+  EXPECT_EQ(Run({"get", "s:old"}), "old");
+  EXPECT_THAT(Run({"lmove", "lmove:over_src", "lmove:over_dst", "left", "left"}),
+              ArgType(RespExpr::NIL));
+  EXPECT_EQ(CheckedInt({"llen", "lmove:over_dst"}), 1);
+  EXPECT_EQ(CheckedInt({"sunionstore", "union:over_dst", "union:over_src"}), 0);
+  EXPECT_EQ(CheckedInt({"exists", "union:over_dst"}), 0);
 }
 
 }  // namespace dfly
