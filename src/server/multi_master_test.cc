@@ -9696,6 +9696,16 @@ class ReaperJournalFamilyTest : public ActiveReplicaFamilyTest {
     absl::SetFlag(&FLAGS_num_shards, 1);
   }
 
+  // drakeydb: P7-0 -- one DeleteExpiredStep call is not guaranteed to reach the key a test is
+  // about: it stops at a one-millisecond quota that is wall time (ThisFiber::GetRunningTimeCycles),
+  // so a thread the OS deschedules for a millisecond -- routine on a loaded CI box -- ends a call
+  // before it reaches the key's bucket, just as it can a production heartbeat tick, which resumes
+  // on the next tick. Tests that assert a reap do the same: a fresh quota per call
+  // (reset_time_quota) and up to kMaxReapCalls calls, stopping once the asserted state holds. What
+  // they assert is that the reaper reaches the key, not that one call does. A call made while a
+  // snapshot consumer is registered must NOT reap, and is still made exactly once.
+  static constexpr int kMaxReapCalls = 100;
+
   void DeleteReapedContainerForTest(DbSlice& db_slice, const DbContext& cntx, string_view key) {
     PrimeTable* table = db_slice.GetTables(cntx.db_index);
     auto it = table->Find(key);
@@ -9738,17 +9748,22 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteCarriesDerivedFlag) {
 
   // Drive the reaper the same way engine_shard.cc's heartbeat does (see
   // generic_family_test.cc's KeyspaceNotificationNoAtomicSectionOnExpiry for the same pattern
-  // applied to whole-key expiry).
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
-    db_slice.DeleteExpiredStep(db_cntx, 100);
-  });
+  // applied to whole-key expiry), call by call until it reaches "rs" (see kMaxReapCalls).
+  int reap_calls = 0;
+  do {
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+      db_slice.DeleteExpiredStep(db_cntx, 100, {.reset_time_quota = true});
+    });
+    ++reap_calls;
+  } while (Run({"exists", "rs"}).GetInt() != 0 && reap_calls < kMaxReapCalls);
 
   pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
 
   // Guard against a vacuous pass: the set must have actually been cleaned up by the reaper.
-  EXPECT_EQ(Run({"exists", "rs"}).GetInt(), 0);
+  EXPECT_EQ(Run({"exists", "rs"}).GetInt(), 0)
+      << "the reaper did not reap rs in " << reap_calls << " calls";
 
   const CapturedEntry* del = LastDel(consumer.entries);
   ASSERT_NE(nullptr, del);
@@ -9804,16 +9819,23 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteEarnsATombstone) {
 
   AdvanceTime(1100);
 
+  // Call by call until the reaper reaches "rs-tomb" (see kMaxReapCalls); each call reads the stamp
+  // right after itself, so `tomb` ends up holding the read made right after the reap.
   std::optional<MvccStamp> tomb;
-  shard_set->RunBriefInParallel([&](EngineShard* shard) {
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
-    db_slice.DeleteExpiredStep(db_cntx, 100);
-    tomb = db_slice.GetMvcc(0, "rs-tomb");
-  });
+  int reap_calls = 0;
+  do {
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+      db_slice.DeleteExpiredStep(db_cntx, 100, {.reset_time_quota = true});
+      tomb = db_slice.GetMvcc(0, "rs-tomb");
+    });
+    ++reap_calls;
+  } while (Run({"exists", "rs-tomb"}).GetInt() != 0 && reap_calls < kMaxReapCalls);
 
   // Guard against a vacuous pass: the container must have actually been reaped.
-  EXPECT_EQ(Run({"exists", "rs-tomb"}).GetInt(), 0);
+  EXPECT_EQ(Run({"exists", "rs-tomb"}).GetInt(), 0)
+      << "the reaper did not reap rs-tomb in " << reap_calls << " calls";
 
   ASSERT_TRUE(tomb.has_value())
       << "the reaper's derived DEL must earn a tombstone, not leave the slot absent";
@@ -9840,18 +9862,25 @@ TEST_F(ReaperJournalFamilyTest, LocalOnlyReaperDoesNotJournalNamespaceBlindDelet
   AdvanceTime(1100);
   consumer.entries.clear();
 
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
-    Namespace& ns = namespaces->GetDefaultNamespace();
-    DbSlice& db_slice = ns.GetDbSlice(shard->shard_id());
-    DbContext cntx{&ns, 0, TEST_current_time_ms};
-    journal::DisableFlushGuard guard(shard->journal());
-    db_slice.DeleteExpiredStep(cntx, 100000,
-                               {.ensure_member_reaping = true, .journal_deletions = false});
-  });
+  // Call by call until the reaper reaches "local-only-reap" (see kMaxReapCalls).
+  int reap_calls = 0;
+  do {
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      Namespace& ns = namespaces->GetDefaultNamespace();
+      DbSlice& db_slice = ns.GetDbSlice(shard->shard_id());
+      DbContext cntx{&ns, 0, TEST_current_time_ms};
+      journal::DisableFlushGuard guard(shard->journal());
+      db_slice.DeleteExpiredStep(
+          cntx, 100000,
+          {.ensure_member_reaping = true, .journal_deletions = false, .reset_time_quota = true});
+    });
+    ++reap_calls;
+  } while (Run({"exists", "local-only-reap"}).GetInt() != 0 && reap_calls < kMaxReapCalls);
 
   pp_->at(0)->LaunchFiber([&] { journal::UnregisterConsumer(consumer_id); }).Join();
 
-  EXPECT_EQ(Run({"exists", "local-only-reap"}).GetInt(), 0);
+  EXPECT_EQ(Run({"exists", "local-only-reap"}).GetInt(), 0)
+      << "the reaper did not reap local-only-reap in " << reap_calls << " calls";
   EXPECT_EQ(LastDel(consumer.entries), nullptr)
       << "a namespace-local reap cannot emit a wire DEL without namespace identity";
 }
@@ -9925,15 +9954,21 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperCoversSetWithNotYetDueWholeKey
   ASSERT_EQ(Run({"expire", "s2", "100"}).GetInt(), 1);  // whole-key TTL, far from due
   AdvanceTime(1100);                                    // only the member TTL elapses
 
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
-    db_slice.DeleteExpiredStep(db_cntx, 100000);
-  });
+  // Call by call until the reaper reaches "s2" (see kMaxReapCalls).
+  int reap_calls = 0;
+  do {
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+      db_slice.DeleteExpiredStep(db_cntx, 100000, {.reset_time_quota = true});
+    });
+    ++reap_calls;
+  } while (Run({"exists", "s2"}).GetInt() != 0 && reap_calls < kMaxReapCalls);
 
   EXPECT_EQ(Run({"exists", "s2"}).GetInt(), 0)
       << "a set with a not-yet-due whole-key TTL was never walked by the member reaper -- "
-         "Critical 1's fix did not close the gap";
+         "Critical 1's fix did not close the gap ("
+      << reap_calls << " calls)";
 }
 
 // drakeydb: P4-0 Task 2b, fix round 6 Critical 1 -- same shape on hashes (the coordinator's own
@@ -9946,15 +9981,22 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperCoversHashWithNotYetDueWholeKe
   ASSERT_EQ(Run({"expire", "h2", "100"}).GetInt(), 1);  // whole-key TTL, far from due
   AdvanceTime(1100);
 
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
-    db_slice.DeleteExpiredStep(db_cntx, 100000);
-  });
+  // Call by call until the reaper reaches "h2" (see kMaxReapCalls). HLEN reports the container's
+  // upper-bound size and never expires a field itself, so only the reaper can bring it to 1.
+  int reap_calls = 0;
+  do {
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+      db_slice.DeleteExpiredStep(db_cntx, 100000, {.reset_time_quota = true});
+    });
+    ++reap_calls;
+  } while (Run({"hlen", "h2"}).GetInt() != 1 && reap_calls < kMaxReapCalls);
 
   EXPECT_EQ(Run({"hlen", "h2"}).GetInt(), 1)
       << "a hash with a not-yet-due whole-key TTL was never walked by the member reaper -- "
-         "Critical 1's fix did not close the gap";
+         "Critical 1's fix did not close the gap ("
+      << reap_calls << " calls)";
   EXPECT_EQ(Run({"hget", "h2", "keep"}), "v2");
   EXPECT_GT(Run({"ttl", "h2"}).GetInt(), 0)
       << "the surviving container's whole-key TTL must be untouched by the member walk";
@@ -10137,13 +10179,9 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotBlockOnConcurrentBgsave
       << "the concurrent snapshot itself must have completed undisturbed";
 
   // The skip must be a deferral, not a permanent miss: with the consumer now unregistered, the
-  // reaper must clean "rs" up. One DeleteExpiredStep call is not guaranteed to get there: it stops
-  // at a one-millisecond quota that is wall time (ThisFiber::GetRunningTimeCycles), so a thread the
-  // OS deschedules for a millisecond -- routine on a loaded CI box -- ends a call before it reaches
-  // "rs"'s bucket, just as it can a production heartbeat tick, which resumes on the next tick.
-  // Do the same: a fresh quota per call (reset_time_quota) and a bounded number of calls. What is
-  // asserted is that the reaper does reach "rs" once the consumer is gone, not that one call does.
-  constexpr int kMaxReapCalls = 100;
+  // reaper must clean "rs" up -- call by call until it reaches "rs" (see kMaxReapCalls for why one
+  // call is not guaranteed to). What is asserted is that the reaper does reach "rs" once the
+  // consumer is gone, not that one call does.
   int reap_calls = 0;
   do {
     absl::SetFlag(&FLAGS_active_replica, true);
@@ -10268,18 +10306,25 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperSkipsContainerDuringConcurrent
   // (see the reload comment below), so the reloaded hash no longer reports
   // HasMemberExpiration() and the reaper's gate (db_slice.cc) skips it outright; the assertion
   // held whether or not DeleteExpiredStep did anything. Here, before any reload has happened,
-  // the only thing that can have reaped "bighash" down to kFields / 2 is this explicit
-  // DeleteExpiredStep call itself -- the skip above was a deferral, not a permanent miss, and
-  // this is what actually distinguishes that from a stuck/broken resume.
-  absl::SetFlag(&FLAGS_active_replica, true);
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
-    db_slice.DeleteExpiredStep(db_cntx, 100000);
-  });
-  absl::SetFlag(&FLAGS_active_replica, false);
+  // the only thing that can have reaped "bighash" down to kFields / 2 is these explicit
+  // DeleteExpiredStep calls themselves -- active mode is off between them, and HLEN reports the
+  // upper-bound size without expiring anything -- so the skip above was a deferral, not a
+  // permanent miss, and this is what actually distinguishes that from a stuck/broken resume.
+  // Call by call until the reaper gets there (see kMaxReapCalls).
+  int reap_calls = 0;
+  do {
+    absl::SetFlag(&FLAGS_active_replica, true);
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+      db_slice.DeleteExpiredStep(db_cntx, 100000, {.reset_time_quota = true});
+    });
+    absl::SetFlag(&FLAGS_active_replica, false);
+    ++reap_calls;
+  } while (Run({"hlen", "bighash"}).GetInt() != kFields / 2 && reap_calls < kMaxReapCalls);
   ASSERT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields / 2)
-      << "the reaper must resume and reap the due fields once the snapshot consumer unregisters";
+      << "the reaper must resume and reap the due fields once the snapshot consumer unregisters ("
+      << reap_calls << " calls)";
 
   // The concurrently-serialized container must remain internally consistent: a subsequent,
   // ordinary save+reload exercises the real save path again and would surface any corruption
@@ -10374,43 +10419,54 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperReconcilesMemoryAccounting) {
 
   size_t before = GetMetrics().db_stats[0].obj_memory_usage;
 
-  // Elevated so the manual call below completes the whole reap in its own single pass instead of
-  // being bounded by the ambient default (300, db_slice.cc's ABSL_FLAG) -- unrelated to the
-  // active_replica toggle above, which is what actually prevents the heartbeat from racing it.
+  // Elevated so whichever manual call below reaches "bighash" completes the whole reap in its own
+  // single pass instead of being bounded by the ambient default (300, db_slice.cc's ABSL_FLAG) --
+  // unrelated to the active_replica toggle above, which is what actually prevents the heartbeat
+  // from racing it.
   const uint32_t saved_walk_budget = absl::GetFlag(FLAGS_reaper_member_walk_budget);
   absl::SetFlag(&FLAGS_reaper_member_walk_budget, 100000);
   absl::Cleanup restore_walk_budget = [saved_walk_budget] {
     absl::SetFlag(&FLAGS_reaper_member_walk_budget, saved_walk_budget);
   };
 
+  // Call by call until the reaper reaches "bighash" (see kMaxReapCalls), summing what each call
+  // reports: the assertion below is that the bytes the reaper reports match what it reconciled,
+  // over however many calls it took. HLEN reports the upper-bound size and never expires a field
+  // itself, so checking it between calls changes nothing the measurement covers.
   size_t reported_deleted_bytes = 0;
-  shard_set->RunBriefInParallel([&](EngineShard* shard) {
-    // drakeydb: fix round 3 (R6) -- the flag toggle lives INSIDE this dispatched callback, not
-    // around the RunBriefInParallel call (a first attempt at that placement, verified
-    // insufficient by repeated runs: still 1 of 30 failures, task-10-report.md fix round 3).
-    // RunBriefInParallel's own dispatch to this shard's fiber queue is itself a yield/scheduling
-    // point from the calling (main test) fiber's perspective -- toggling the flag before that
-    // dispatch leaves a window, between the toggle and this callback actually starting to run on
-    // the shard's own thread, where the background heartbeat (also on this thread) could already
-    // be scheduled and win the race with active_replica now true. Toggling here, immediately
-    // before and after the one call that needs it, with no yield point anywhere in between (this
-    // callback's only statement that could yield is the DeleteExpiredStep call itself, and its
-    // container walk was already established to be non-preempting -- see the P4-0 Task 2b
-    // comments a few dozen lines up in db_slice.cc), removes that specific window.
-    absl::SetFlag(&FLAGS_active_replica, true);
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
-    // count=100000 bounds the outer prime-table traversal, not the reaper's own per-container
-    // walk -- see this test's comment above for why that distinction matters here.
-    reported_deleted_bytes = db_slice.DeleteExpiredStep(db_cntx, 100000).deleted_bytes;
-    absl::SetFlag(&FLAGS_active_replica, false);
-  });
+  int reap_calls = 0;
+  do {
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      // drakeydb: fix round 3 (R6) -- the flag toggle lives INSIDE this dispatched callback, not
+      // around the RunBriefInParallel call (a first attempt at that placement, verified
+      // insufficient by repeated runs: still 1 of 30 failures, task-10-report.md fix round 3).
+      // RunBriefInParallel's own dispatch to this shard's fiber queue is itself a yield/scheduling
+      // point from the calling (main test) fiber's perspective -- toggling the flag before that
+      // dispatch leaves a window, between the toggle and this callback actually starting to run
+      // on the shard's own thread, where the background heartbeat (also on this thread) could
+      // already be scheduled and win the race with active_replica now true. Toggling here,
+      // immediately before and after the one call that needs it, with no yield point anywhere in
+      // between (this callback's only statement that could yield is the DeleteExpiredStep call
+      // itself, and its container walk was already established to be non-preempting -- see the
+      // P4-0 Task 2b comments a few dozen lines up in db_slice.cc), removes that specific window.
+      absl::SetFlag(&FLAGS_active_replica, true);
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+      // count=100000 bounds the outer prime-table traversal, not the reaper's own per-container
+      // walk -- see this test's comment above for why that distinction matters here.
+      reported_deleted_bytes +=
+          db_slice.DeleteExpiredStep(db_cntx, 100000, {.reset_time_quota = true}).deleted_bytes;
+      absl::SetFlag(&FLAGS_active_replica, false);
+    });
+    ++reap_calls;
+  } while (Run({"hlen", "bighash"}).GetInt() != kFields / 2 && reap_calls < kMaxReapCalls);
 
   size_t after = GetMetrics().db_stats[0].obj_memory_usage;
 
   // Guard against a vacuous pass: half the fields must actually be gone (a real partial reap,
   // not a no-op), and the container must have survived (the other half remains).
-  ASSERT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields / 2);
+  ASSERT_EQ(Run({"hlen", "bighash"}).GetInt(), kFields / 2)
+      << "the reaper did not reap bighash's due fields in " << reap_calls << " calls";
   EXPECT_LT(after, before) << "reaping half the fields shrank the container's MallocUsed(), but "
                               "obj_memory_usage was not correspondingly reconciled";
   EXPECT_EQ(reported_deleted_bytes, before - after)
@@ -10432,12 +10488,21 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperRefreshesHashSearchIndex) {
 
   Run({"hexpire", "reaper-doc:1", "1", "FIELDS", "1", "tag"});
   AdvanceTime(1100);
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
-    Namespace& ns = namespaces->GetDefaultNamespace();
-    DbSlice& db_slice = ns.GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&ns, 0, TEST_current_time_ms};
-    db_slice.DeleteExpiredStep(db_cntx, 100000);
-  });
+  // Call by call until the reaper reaches the document (see kMaxReapCalls). The loop watches HLEN,
+  // not HGET: HLEN reports the upper-bound size and never expires a field itself, while an HGET of
+  // "tag" could expire it on the read path and leave the index for the reaper to never refresh.
+  int reap_calls = 0;
+  do {
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      Namespace& ns = namespaces->GetDefaultNamespace();
+      DbSlice& db_slice = ns.GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&ns, 0, TEST_current_time_ms};
+      db_slice.DeleteExpiredStep(db_cntx, 100000, {.reset_time_quota = true});
+    });
+    ++reap_calls;
+  } while (Run({"hlen", "reaper-doc:1"}).GetInt() != 1 && reap_calls < kMaxReapCalls);
+  ASSERT_EQ(Run({"hlen", "reaper-doc:1"}).GetInt(), 1)
+      << "the reaper did not reap the expired field in " << reap_calls << " calls";
 
   EXPECT_EQ(Run({"hget", "reaper-doc:1", "keep"}), "alive");
   EXPECT_THAT(Run({"hget", "reaper-doc:1", "tag"}), ArgType(RespExpr::NIL));
@@ -10464,15 +10529,22 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDoesNotSpuriouslyAbortWatch) {
 
   EXPECT_EQ(Run({"watch", "ws"}), "OK");
 
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
-    db_slice.DeleteExpiredStep(db_cntx, 100000);
-  });
+  // Call by call until the reaper reaches "ws" (see kMaxReapCalls); the WATCH stays armed across
+  // every call. SCARD reports the upper-bound size and never expires a member itself.
+  int reap_calls = 0;
+  do {
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+      db_slice.DeleteExpiredStep(db_cntx, 100000, {.reset_time_quota = true});
+    });
+    ++reap_calls;
+  } while (Run({"scard", "ws"}).GetInt() != 1 && reap_calls < kMaxReapCalls);
 
   // Guard against a vacuous pass: the reaper must have actually walked/shrunk "ws" (a real
   // partial reap -- "keep" survives, "gone" doesn't), not merely left it untouched.
-  ASSERT_EQ(Run({"scard", "ws"}).GetInt(), 1);
+  ASSERT_EQ(Run({"scard", "ws"}).GetInt(), 1)
+      << "the reaper did not reap ws's expired member in " << reap_calls << " calls";
 
   Run({"multi"});
   Run({"get", "unrelated-key"});
@@ -10506,17 +10578,23 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperClearedFlagSurvivesRdbRoundTri
   AdvanceTime(1100);
 
   // Drive the reaper directly, matching the real heartbeat's call, with a budget large enough
-  // to finish in one pass -- so this call reports (and acts on) a complete, clean pass.
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
-    db_slice.DeleteExpiredStep(db_cntx, 100000);
-  });
+  // to finish in one pass -- so the call that reaches "rdbhash" reports (and acts on) a complete,
+  // clean pass. Call by call until one does (see kMaxReapCalls).
+  int reap_calls = 0;
+  do {
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+      db_slice.DeleteExpiredStep(db_cntx, 100000, {.reset_time_quota = true});
+    });
+    ++reap_calls;
+  } while (Run({"hlen", "rdbhash"}).GetInt() != 1 && reap_calls < kMaxReapCalls);
 
   // Guard against a vacuous pass: "gone" must actually be gone, "keep" must survive -- a real
   // partial reap, and (since there is no live member TTL left anywhere in the container) one
   // that should have cleared the sticky flag.
-  ASSERT_EQ(Run({"hlen", "rdbhash"}).GetInt(), 1);
+  ASSERT_EQ(Run({"hlen", "rdbhash"}).GetInt(), 1)
+      << "the reaper did not reap rdbhash's expired field in " << reap_calls << " calls";
   ASSERT_EQ(Run({"hget", "rdbhash", "keep"}), "v1");
 
   ASSERT_EQ(Run({"debug", "reload"}), "OK");
@@ -10541,16 +10619,22 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperUnclearedFlagPreservesTtlAcros
   Run({"fieldexpire", "rdbhash2", "1000", "later"});  // stays live for a long time
   AdvanceTime(1100);  // "soon" now due; "later" still has ~998s left
 
-  shard_set->RunBriefInParallel([](EngineShard* shard) {
-    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
-    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
-    db_slice.DeleteExpiredStep(db_cntx, 100000);
-  });
+  // Call by call until the reaper reaches "rdbhash2" (see kMaxReapCalls).
+  int reap_calls = 0;
+  do {
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+      db_slice.DeleteExpiredStep(db_cntx, 100000, {.reset_time_quota = true});
+    });
+    ++reap_calls;
+  } while (Run({"hlen", "rdbhash2"}).GetInt() != 1 && reap_calls < kMaxReapCalls);
 
   // Guard against a vacuous pass: "soon" must actually be gone (a real, complete pass ran), but
   // "later" must survive WITH its TTL still armed -- this is the case that must leave the sticky
   // flag set, since one live member TTL remains.
-  ASSERT_EQ(Run({"hlen", "rdbhash2"}).GetInt(), 1);
+  ASSERT_EQ(Run({"hlen", "rdbhash2"}).GetInt(), 1)
+      << "the reaper did not reap rdbhash2's due field in " << reap_calls << " calls";
   ASSERT_GT(Run({"fieldttl", "rdbhash2", "later"}).GetInt(), 0)
       << "guard against a vacuous pass: later's TTL must still be armed before the round "
          "trip";
