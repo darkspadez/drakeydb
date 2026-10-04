@@ -1316,6 +1316,12 @@ authored strictly before `D` drop it outright instead of re-creating the key: th
 expired at `D` on every node anyway, author included, so a delta timestamped before `D` describes
 a value that no longer exists anywhere once `D` passes.
 
+**Related: D-32.** The same mechanism reaches a node that applies a classic master's stream. D-32 is
+its instance on a plain replica of an active KeyDB (the replica's own sweep passes the deadline and
+KeyDB never streams the `DEL`), which P7-2 Task 2.9 closes. It does not close this entry's peers:
+a drakeydb peer, one attached to an active KeyDB through a classic peer link included, sweeps and
+serves reads on its local clock, so this entry owns that share of the orphan after Task 2.9.
+
 This is not new with P4-4: deltas have always applied in plain arrival order against each
 node's own, independently-timed expiry: the streaming guard on
 `SET`/`SETNX`/`GETSET`/`GETDEL`/`RESTORE`/`MSET`/`DEL` is what is new here, not the underlying
@@ -1565,17 +1571,34 @@ stamped before `E`. After them the replica has `c`, `h` and `kt` with `pttl -1`,
 rollover on a hot key. A counter whose `EXPIRE` is streamed right behind the `INCR` is not
 orphaned (the `PEXPIREAT` gives the recreated key a TTL), and `SET .. NX` is not affected (a failed
 one is never propagated, `server.cpp:4624`, `t_string.cpp:104-109`). A TTL refresh, `SET .. XX`
-with no expiry and the movers and STORE commands lose data rather than orphan it; spec D-9 has the
-outcome per class.
+with no expiry and the movers and STORE commands lose data rather than orphan it: a refresh that
+sets a deadline only until that deadline, `PERSIST`, `SET .. XX` without an expiry, a moved element
+and a STORE result for good. `RENAME` and `COPY` onto a **live** `dst` leave a **permanent** stale
+key: the master's `RENAME` gives `dst` the source's deadline `E` (`db.cpp:1507-1511`) and the key is
+gone there at `E`, while the replica's `RENAME` finds no source, fails and keeps its old `dst`,
+which stays for ever unless it carries a TTL of its own. Spec D-9 has the outcome per class.
 
 **Scope.** A Redis, Valkey or Dragonfly master streams an expiry `DEL` (`RecordExpiryBlocking`,
 `db_slice.cc:2159`), which removes the recreated key, so the same replica behaviour is transient
 under them. KeyDB's own *active* replicas (`expireIfNeeded` falls through to the delete,
 `db.cpp:2101`) and drakeydb peers (`PassesPeerEchoFilter` drops `kEntryFlagExpired`) share the
-orphan. Options B (copy KeyDB's plain replica) and C (sweep only) of ledger decision 24 would not
-orphan it, since the write lands on the stale object and goes with it at the reap; they were
-rejected as wider for every other class. A full resync (a `REPLICAOF` again, or a reconnect that
-falls back to one) rebuilds the replica from the master's snapshot and drops the orphans.
+orphan. Options B (copy KeyDB's plain replica) and C (sweep only) of ledger decision 24 do not
+reliably avoid it either. Under C the replica's own sweep usually reaps the due key first, and the
+late write recreates it with no TTL, the same orphan. B converges only when the write lands before
+KeyDB's slow reap (seconds to tens of minutes), the write then going with the stale object. They
+were rejected as wider for every other class. A full resync (a `REPLICAOF` again, or a reconnect
+that falls back to one) rebuilds the replica from the master's snapshot and drops the orphans.
+
+**Related: D-27.** D-27 is the same mechanism between drakeydb peers: an unguarded delta that keeps
+the TTL when the key exists and creates the key when it does not, authored before a deadline and
+applied after it, re-creates the key with no TTL. This entry is its instance on a plain replica of
+an active KeyDB, where the deadline is passed by the replica's own sweep and an active KeyDB never
+streams the `DEL` that would clean up. Task 2.9 closes only that instance: a plain replica's main
+link publishes the stream clock and runs the replica sweep (`ApplyReplicaActiveExpiry` returns for a
+peer-mode or non-main link). A drakeydb peer, a classic peer link to an active KeyDB included, still
+sweeps and serves reads on its local clock, so its share of the orphan stays open under D-27, whose
+owner is the tombstone-lifecycle phase. Task 2.8 narrows it there too (an enveloped command runs at
+its author's time), but only for a key the local sweep has not yet deleted.
 
 **How established:** the live fake-master run above against the P7-1 build, and now the pytest
 `test_plain_replica_of_active_keydb_keeps_a_ttl_less_orphan_of_a_ttl_keeping_write[sweep|access_only]`
@@ -1589,5 +1612,7 @@ description), not fixed there. **Owner:** P7-2 Tasks 2.8 and 2.9 (plan): the wri
 author's time, before `E`, on a key the sweep, on the stream clock, has not deleted, so it finds the
 key with its TTL, and the two pytests flip. They close it while the link is healthy; it stays open
 while the stream is more than 60 s behind the local clock (the floor) or a stamp is unusable (the
-local clock is kept). Delete this entry when Task 2.9 lands. **From:** P7-1 (Task 1.4; found by the
+local clock is kept). They close it for a plain replica only: when Task 2.9 lands this entry is
+narrowed, not deleted. The plain-replica part is deleted (landed, per the register's rule) and the
+peer and classic-peer share moves to D-27, which says so. **From:** P7-1 (Task 1.4; found by the
 Opus re-review of `425eeb9`).
