@@ -355,6 +355,15 @@ Repeats of the timing-sensitive tests (pass rates):
    PSYNCs it asserts on.
 10. `docs/UPSTREAM-SYNC.md` and `docs/PLAN.md` were updated as described; the spec's D-2 "interim refusal"
     paragraph and the plan's checkboxes are the orchestrator's to fold.
+11. **mvcc is stricter than KeyDB's** (recorded after the re-review of `f469879`; spec D-3 says so too).
+    KeyDB parses it with a bare `strtoull` (`getUnsignedLongLongFromObject`, `object.cpp:743-769`): `-5`
+    (wraps to 2^64-5), `12abc` and an overflowing number (`ULLONG_MAX`) are accepted, and `-5` poisons
+    KeyDB's own per-author dedup watermark. `ParseUnsignedDecimal` takes digits only within 64 bits
+    (`kBadMvcc` otherwise), deliberately, to keep P7-2's watermark sane. Unreachable from a real KeyDB
+    (canonical decimals). The code is unchanged.
+12. **db accepts a leading zero, KeyDB's does not** (same record). KeyDB's db parse is `string2ll`
+    (`util.c:385`), which refuses `03`; drakeydb accepts it (since Task 1.1). Unreachable from a real
+    KeyDB. The code is unchanged.
 
 ## Not done / not verified
 
@@ -500,7 +509,8 @@ accepts `-5` as an mvcc.** `getUnsignedLongLongFromObject` (`object.cpp:743-769`
 `-5` wraps to 2^64-5, `12abc` and an overflowing number are accepted, and the command is applied. The
 author's watermark then became 2^64-5, so every later envelope of that author with an mvcc was
 dropped by KeyDB's dedup. drakeydb's `ParseUnsignedDecimal` is stricter (digits only, fits 64 bits)
-and rejects those as `kBadMvcc`. Not changed here (D-1.4 says "u64"); P7-2's dedup is safer for it.
+and rejects those as `kBadMvcc`. Not changed here (D-1.4 says "u64"); P7-2's dedup is safer for it
+(deviations 11 and 12 above record it, with the db one).
 
 ### Record only (no code)
 
@@ -515,6 +525,16 @@ and rejects those as `kBadMvcc`. Not changed here (D-1.4 says "u64"); P7-2's ded
   `IsApplied`/`Advance` of D-5 (an outer level advances after its inner returned `kConsumed`, a
   `kNotConsumed` inner advances nothing): the loop keeps no per-level state today, and
   `kNotConsumed` is only ever returned at depth 1 before anything ran.
+  *Added after the re-review of `f469879`:* that last clause is P7-1 only. P7-2's leaf `Reserve` may
+  return `kCancelled` (a link stopping while it waits behind another link's in-flight envelope) after
+  the layers' dbs were selected, because the fix round moved the selection into validation (D-3.3),
+  ahead of the leaf. That is allowed: a `kNotConsumed` may leave the context's selected db moved,
+  since selecting is idempotent and replayable (on resume the same envelope is re-read and its layers
+  select the same dbs in the same order before anything is dispatched, so the moved db is the state
+  the resumed stream recreates, also if P7-3 keeps the selected db across a partial resync). A design
+  call of the review of the fix round (orchestrator and reviewer), not an owner decision, and not in
+  `decisions.md`. Spec D-5 and the contract of `EnvelopeResult::kNotConsumed` now say it, and the
+  P7-2 plan has a test for it (`CancelledReserveAfterSelectIsNotConsumedAndReplaysInTheSameDb`).
 - **m8.** `test_stopping_the_link_while_envelopes_stream_is_clean` is a liveness test: it passes with
   the unwrap removed, so it is not falsified coverage of D-5's cancellation. P7-3 must cover
   `kNotConsumed` at stream level (a stop landing between the loop's check and the applier's, which
@@ -559,3 +579,121 @@ and rejects those as `kBadMvcc`. Not changed here (D-1.4 says "u64"); P7-2's ded
 - In cluster mode a failing synthetic `SELECT` is now attempted once per layer that carries the db
   (`ensured_dbs_` is only set on success), not once per envelope: a few extra counted failures for
   a nested envelope in db > 0. Not measured.
+
+## Follow-up round (re-review of `f469879`)
+
+Same branch, HEAD `f469879`, still uncommitted. One test added (gtest 25 became 26), no behavior
+change in `classic_replay.cc` (two comments). Scratch material (good copies of the sources, build
+logs) is in the orchestrator's scratchpad under `impl-p71b/`.
+
+### What changed, per item
+
+1. **D-5 contradiction (docs, plus the header contract).** Resolution (a), a design call of the review
+   of the fix round (orchestrator and reviewer): a `kCancelled` after a layer's db was selected is
+   allowed, because selecting is idempotent and replayable. Spec D-5: `SelectDb` dropped from the
+   `kApply` row (it says the dbs were selected during validation, D-3.3, before the leaf's `Reserve`);
+   `kCancelled` is "no command was dispatched and nothing was counted; the selected db may have
+   moved"; a new paragraph states the rule with its rationale (also valid if P7-3 keeps the selected db
+   across a partial resync, and the synthetic `SELECT` of a first selection is no stream command);
+   I1 now has two not-consumed outcomes and puts the point of no return for *dispatching and counting*
+   at the leaf's first dispatch. D-3.2 lost its "point of no return" wording the same way (it said
+   nothing could stop the tree after the check, which contradicted D-5's `Reserve`). The header's
+   `kNotConsumed` comment is the weaker statement that holds in P7-1 (nothing is selected either, as
+   `running()` is asked first) and in P7-2 (the leaf's reservation may cancel after a select,
+   harmlessly). The m7 record above carries the point; the P7-2 plan task got the one-clause
+   reconciliation and a test name (`CancelledReserveAfterSelectIsNotConsumedAndReplaysInTheSameDb`).
+2. **Minor 1, the failed `SelectDb` path.** New
+   `ClassicApplyFamilyTest.FailedSelectSkipsTheCommandUnlessADeeperLayerSelects`. It pins what the spec
+   says: a failed select is one `classic_apply_errors` per attempt (the skipped command is not counted a
+   second time), `rreplay_malformed` stays 0, `db_index` is unchanged, `rreplay_unwrapped` counts every
+   layer. Cases: (a) own db 3 fails (twice: a failed select is not remembered as one that worked);
+   (b) outer 3 fails, inner 0 applies in db 0; (c) outer 0, inner 3 fails: skipped; (d) outer 3, inner
+   without a db: skipped (inherits the failure); (e) a later envelope without a db applies where the
+   context is. **The brief's `cluster_mode=emulated` does not make `SELECT 3` fail.** `Select` refuses
+   db > 0 on `IsClusterEnabled()` (`generic_family.cc:3117`), the real cluster mode only; the first
+   version of the test in `emulated` mode ran against a SELECT that succeeded (`classic_apply_errors`
+   0 vs 1, `db_index` 3 vs 0, the "skipped" keys applied in db 3, `dbsize` 1 vs 2). The test
+   therefore sets `cluster_mode=yes` (`absl::FlagSaver` plus `ResetService()`, the idiom of
+   `MultiTest.SquashShardLocalMultiKey` and the cluster tests) and
+   gives the node a one-node `DFLYCLUSTER CONFIG` that owns every slot, so that the test's own `GET`s
+   are not redirected. The applier's context is a replicating one and is not checked for slot
+   ownership (`main_service.cc:1283`). Spec D-3 and D-15 say "real cluster" now. The suite also passes
+   shuffled, three iterations (`--gtest_shuffle --gtest_repeat=3`), so the cluster mode does not leak.
+3. **Minor 2, stale comments.** `classic_replay.cc` (point of no return): "from the first dispatch or
+   select of the outermost envelope on", matching the header. `classic_replay.h` `HandleRreplay`:
+   `running()` is asked **at most** once, only for depth 1, and only for a layer that is well formed up
+   to its db (`kOk` or `kBadMvcc`); a layer that fails before its db (arity, uuid, db) touches nothing
+   and is consumed without asking, and a call that starts deeper than 1 never asks (all read from
+   `HandleRreplay`: the check is `depth == 1 && !running_()` inside the `kOk || kBadMvcc` branch).
+4. **Minor 3, two deviations recorded** in spec D-3 (after the validation paragraph) and above as
+   deviations 11 and 12: the bare `strtoull` of KeyDB's mvcc (`object.cpp:743-769`, read again from
+   the KeyDB tree: it fails only when the result is 0 and either `errno` is set or no digit was read,
+   so `-5`, `12abc` and overflow pass) against the strict digits-only `kBadMvcc`, and `string2ll`
+   (`util.c:385`: a leading zero is refused) against our `03`. Code unchanged.
+5. **Nits.** `docs/ISSUE-REGISTER.md` U-14: the paragraph with the 116-column line (117 by the
+   brief's count) and the status paragraph (two 101-column lines) are rewrapped to 100; no wording
+   changed.
+   `keydb_onboarding_test.py`: the comment on `ARRAY_NAME_SCENARIOS` no longer says the bytes are
+   "acknowledged with that command's": the batch flushes as soon as the read drains, so the deferral
+   cannot be observed, and the comment now says what the assertions pin, the exact total. I checked
+   that claim instead of weakening it blindly (falsification below).
+6. **Plan Task 3.1.** New hazard (i) "the stream's selected db must survive a partial resync", with
+   the Redis rationale, a failing test (a `redis_server` 7.0.15 master writing in db 3, link drop,
+   `+CONTINUE`, further writes with no fresh `SELECT` land in db 3 on drakeydb; it first asserts through
+   the proxy that the resumed bytes hold no `SELECT`, so it cannot pass vacuously; a plain
+   `redis_server` replica is the control; a KeyDB variant), an implementation note (persist it on the
+   `Replica` where `repl_offs_` is committed, not at the drop, and re-select it through `SelectDb` on
+   `+CONTINUE`) and a falsification (start the resumed context in db 0). The letter is (i), not (h):
+   spec D-8's hazard (h) is Task 0.6's. Spec D-3 "Selected db" says P7-3 must persist it, and D-8 and
+   D-15 list the hazard and the test. **No Redis source tree exists on the dev box** (only the
+   `redis-server` 7.0.15 binary), so the citations are KeyDB's, a Redis fork: `replicationCacheMaster` /
+   `replicationResurrectCachedMaster` (`replication.cpp:4322`, `:4450`; `resetClient` does not touch
+   `c->db`), `replicaseldb` (Redis: `slaveseldb`) fed at `:476`, reset to -1 at a full-sync attach
+   (`:874`) and a promotion (`:4054`). For Redis 7.0.15 it stays a hypothesis the P7-3 test confirms,
+   and the spec and the plan say so, but I also observed it by hand on the local `redis-server`
+   7.0.15 (a probe in `impl-p71b/redis/`, not a repo test; two redis-servers on ports 17101/17102,
+   `--repl-diskless-sync-delay 0`): `SET a 1` in db 3, `CLIENT KILL TYPE replica`, `SET b 2` in db 3,
+   and the replica reconnected with `sync_full:1 sync_partial_ok:1` and holds `b` in db 3 (db 0 has
+   none). A raw `PSYNC <replid> <offset+1>` taken at the offset before `SET b 2` was answered
+   `b'+CONTINUE\r\n*3\r\n$3\r\nset\r\n$1\r\nb\r\n$1\r\n2\r\n'`: no `SELECT` in the resumed bytes.
+
+### Falsification
+
+gtest, `cd /home/user/drakeydb/build-dbg && nice ninja -j3 classic_replay_test && ./classic_replay_test`;
+each change made to `classic_replay.cc` alone, observed, then restored from a saved copy and diffed
+(identical) before the next:
+
+| Change | Observed (F1, F2 and F4: only `FailedSelectSkipsTheCommandUnlessADeeperLayerSelects` fails, 25 pass; F3 was run with that test's filter) |
+|---|---|
+| F1: the leaf without its `db_selected` guard (`ApplyCommand(inner_args)` unconditionally) | `classic_replay_test.cc:758`: `CheckedInt({"dbsize"})` 6 vs 2; `:762` `Get(key)` is `"1"` instead of `nullopt` for `own_db`, `own_db_again`, `inner_db3`, `no_inner_db` (the skipped commands applied in db 0) |
+| F2: a failed select sticks for the deeper layers (`db_selected = db_selected && SelectDb(...)`, still dispatching it) | `:758` dbsize 1 vs 2; `:759` `Get("inner_db0")` is `nullopt` instead of `"1"` |
+| F3: `ensured_dbs_[db] = true` before the `SELECT` is dispatched (a failed select remembered as ensured) | SIGSEGV on the fiber of a shard (`LockTable::Size <- DbSlice::CheckLock <- Transaction::ScheduleInShard`): the retry "selects" db 3 without having activated it (my reading of the stack) and the `SET` runs there. Dies instead of failing |
+| F4: a layer without a db resets the failure (`db_selected = env.db ? SelectDb(*env.db) : true`) | `:758` dbsize 3 vs 2; `:762` `Get("no_inner_db")` is `"1"` |
+
+pytest, the deferral claim of item 5. The line `batch.back().deferred_ack_bytes +=
+response->total_read;` of `replica.cc` removed, `nice ninja -j3 dragonfly`, `flock /tmp/drakey-pytest.lock env
+DRAGONFLY_PATH=/home/user/drakeydb/build-dbg/dragonfly /root/drakey-venv-pinned/bin/python -m pytest
+tests/dragonfly/keydb_onboarding_test.py -k array_for_a_name -q`: `empty_array` and `nil_array` pass,
+`behind_a_queued_command` fails: `assert 1054 == 1058` (`settled == expected`, short by the 4 bytes of
+`*0\r\n`). Restored from a saved copy (identical, `git status` shows `replica.cc` unmodified),
+`dragonfly` rebuilt, the three cases pass again (3 passed in 4.4 s).
+
+### Final results (debug build, gcc 13.3, `nice ninja -j3 dragonfly classic_replay_test`)
+
+- `./build-dbg/classic_replay_test`: `[  PASSED  ] 26 tests.`; with `--gtest_shuffle --gtest_repeat=3`:
+  26 tests each, all passed.
+- `keydb_onboarding_test.py -k array_for_a_name` against the rebuilt `dragonfly`: 3 passed in 4.4 s.
+  The rest of that file, `redis_replication_test.py` and `multimaster_test.py` were not rerun: this
+  round changed two comments in `classic_replay.{h,cc}`, a test comment in the pytest file, and no
+  executable line outside the new gtest.
+- `pre-commit run --files <the eight changed files>`: `pyflakes`, `trim trailing whitespace`, `fix end
+  of files`, `check python ast`, `Clang formatting`, `black` all Passed; the three C++ files are
+  byte-identical to the copies that were tested.
+
+### Not done / not verified
+
+- No release, ASAN or UBSAN build.
+- Redis 7.0.15's handling of the selected db across `+CONTINUE` was observed once by hand (item 6),
+  not by a repo test: P7-3's test is where it is pinned. The KeyDB citations are by reading.
+- The new gtest runs in real cluster mode with a one-node config; the emulated mode is not covered
+  because it cannot make `SELECT` fail.

@@ -93,8 +93,12 @@ struct ClassicLinkStats {
 enum class EnvelopeResult {
   // The envelope is dealt with, whatever came of it: the stream offset advances past its bytes.
   kConsumed,
-  // Nothing was dispatched, selected or counted, the link is stopping: the offset must not
-  // advance, so that a partial resync resumes at this envelope.
+  // No command was dispatched and nothing was counted, the link is stopping: the offset must not
+  // advance, so that a partial resync resumes at this envelope. The context's selected db may have
+  // moved, and that is harmless: selecting is idempotent, and the resumed stream reads this
+  // envelope again and its layers select the same dbs in the same order before anything is
+  // dispatched. Today nothing has been selected either, as running() is asked first; the dedup
+  // reservation of the leaf (P7-2) may cancel after a layer selected its db.
   kNotConsumed,
 };
 
@@ -140,10 +144,13 @@ class ClassicApplier {
   // (1: straight off the stream), and every envelope nested in it. `args`, and the buffer its
   // views point into, must stay valid for the call.
   //
-  // `running()` is asked once, for the outermost envelope (depth 1), before anything is
-  // dispatched or selected, and the whole tree then runs to completion: a cancelled link neither
-  // applies half an envelope nor loses the end of one, and the offset it resumes from names an
-  // envelope that either applied whole or did not start. Anything else counts as consumed.
+  // `running()` is asked at most once, and only for the outermost envelope (depth 1): when its
+  // layer is well formed up to its db (RreplayParse kOk or kBadMvcc), before anything is dispatched
+  // or selected. A layer that fails before its db (arity, uuid, db) touches nothing and is
+  // consumed without asking, and a call that starts deeper than 1 never asks. Once it answered
+  // true the whole tree runs to completion: a cancelled link neither applies half an envelope nor
+  // loses the end of one, and the offset it resumes from names an envelope that either applied
+  // whole or did not start. Only a false answer yields kNotConsumed; everything else is consumed.
   EnvelopeResult HandleRreplay(const facade::RespVec& args, unsigned depth = 1);
 
  private:

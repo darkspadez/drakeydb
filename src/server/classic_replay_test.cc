@@ -5,7 +5,9 @@
 
 #include <absl/cleanup/cleanup.h>
 #include <absl/flags/flag.h>
+#include <absl/flags/reflection.h>
 #include <absl/strings/str_cat.h>
+#include <absl/strings/substitute.h>
 
 #include <initializer_list>
 #include <limits>
@@ -695,6 +697,69 @@ TEST_F(ClassicApplyFamilyTest, DbIsSelectedBeforeTheAuthorAndInnerChecks) {
     EXPECT_EQ(Get(key, db), "1") << key;
     EXPECT_EQ(Get(key, 0), nullopt) << key;
   }
+}
+
+// A db that cannot be selected (a cluster node has db 0 only: `SELECT 3` replies an error) leaves
+// the layer that asked with no db to run in: its command is skipped and the failed SELECT counted,
+// once per attempt. The selected db stays where it was, and a deeper layer that selects a db of its
+// own takes over, the last select winning as it does for KeyDB's master client.
+TEST_F(ClassicApplyFamilyTest, FailedSelectSkipsTheCommandUnlessADeeperLayerSelects) {
+  // SELECT refuses db > 0 in a real cluster only (`IsClusterEnabled()`), not in the emulated one.
+  absl::FlagSaver flag_saver;
+  SetTestFlag("cluster_mode", "yes");
+  ResetService();
+  // The node owns every slot, so that the test's own reads are not redirected. The applier's
+  // context is a replicating one and is not checked for ownership.
+  const string config = absl::Substitute(
+      R"json([{"slot_ranges": [{"start": 0, "end": 16383}],
+               "master": {"id": "$0", "ip": "10.0.0.1", "port": 7000, "health": "online"},
+               "replicas": []}])json",
+      Run({"cluster", "myid"}).GetString());
+  ASSERT_EQ(RunPrivileged({"dflycluster", "config", config}), "OK");
+
+  OnLink([&](Link& link) {
+    uint64_t errors = 0, unwrapped = 0;
+    // Applies `wire`, which has `layers` envelope layers and asks for `failed_selects` dbs that
+    // cannot be selected.
+    auto apply = [&](string_view what, const string& wire, unsigned layers,
+                     unsigned failed_selects) {
+      EXPECT_EQ(link.Apply(wire), EnvelopeResult::kConsumed) << what;
+      errors += failed_selects;
+      unwrapped += layers;
+      EXPECT_EQ(link.apply_errors(), errors) << what;
+      EXPECT_EQ(link.unwrapped(), unwrapped) << what;
+      EXPECT_EQ(link.malformed(), 0u) << what;
+      EXPECT_EQ(link.cntx.conn_state.db_index, 0u) << what;  // a failed select moves nothing
+    };
+
+    // The envelope's own db cannot be selected: no command, one counted error.
+    apply("own db", Envelope(kAuthorA, Resp({"SET", "own_db", "1"}), "3"), 1, 1);
+    // A failed SELECT is not remembered as one that worked: the next try fails and counts again.
+    apply("own db again", Envelope(kAuthorA, Resp({"SET", "own_db_again", "1"}), "3"), 1, 1);
+
+    // Outer db 3 fails, the inner layer selects db 0 and applies there.
+    apply("outer db 3, inner db 0",
+          Envelope(kAuthorB, Envelope(kAuthorA, Resp({"SET", "inner_db0", "1"}), "0"), "3"), 2, 1);
+
+    // Outer db 0 selects, the inner layer's db 3 fails: the command has no db and is skipped.
+    apply("outer db 0, inner db 3",
+          Envelope(kAuthorB, Envelope(kAuthorA, Resp({"SET", "inner_db3", "1"}), "3"), "0"), 2, 1);
+
+    // An inner layer without a db inherits the failure of the outer one.
+    apply("outer db 3, inner without a db",
+          Envelope(kAuthorB, Resp({"RREPLAY", kAuthorA, Resp({"SET", "no_inner_db", "1"})}), "3"),
+          2, 1);
+
+    // The skip lasts for the envelope that asked: a later one without a db runs where the context
+    // is.
+    apply("no db", Resp({"RREPLAY", kAuthorA, Resp({"SET", "no_db", "1"})}), 1, 0);
+  });
+
+  EXPECT_EQ(CheckedInt({"dbsize"}), 2);
+  EXPECT_EQ(Get("inner_db0"), "1");
+  EXPECT_EQ(Get("no_db"), "1");
+  for (string_view key : {"own_db", "own_db_again", "inner_db3", "no_inner_db"})
+    EXPECT_EQ(Get(key), nullopt) << key;
 }
 
 TEST_F(ClassicApplyFamilyTest, DropsSelfAuthoredEnvelope) {

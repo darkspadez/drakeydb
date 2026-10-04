@@ -161,9 +161,8 @@ EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsign
     const RreplayParse parse = ParseRreplayEnvelope(*current, &env);
 
     if (parse == RreplayParse::kOk || parse == RreplayParse::kBadMvcc) {
-      // The point of no return: from the first dispatch of the outermost envelope on (selecting a
-      // db for the first time is one), the whole tree is applied, whatever happens to the link.
-      // Nothing above has touched the context.
+      // The point of no return: from the first dispatch or select of the outermost envelope on, the
+      // whole tree is applied, whatever happens to the link. Nothing above has touched the context.
       if (depth == 1 && !running_())
         return EnvelopeResult::kNotConsumed;
 

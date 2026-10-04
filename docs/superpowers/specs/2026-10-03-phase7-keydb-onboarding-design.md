@@ -379,6 +379,15 @@ inner is a string; optional db is an integer with `0 <= db < FLAGS_dbnum` (`gene
 optional mvcc is a `u64`. uuid is compared and keyed in **normalized lowercase** form
 (`NormalizeNodeUuid`), including the self-uuid check.
 
+Two deliberate deviations from KeyDB's number parsing, neither reachable from a real KeyDB, whose
+values are canonical decimals: **mvcc.** KeyDB reads it with a bare `strtoull`
+(`getUnsignedLongLongFromObject`, `object.cpp:743-769`), which takes `-5` (wrapped to 2^64-5),
+`12abc` and an overflowing number (`ULLONG_MAX`); `-5` then poisons KeyDB's own per-author dedup
+watermark, which every later envelope of that author falls below. drakeydb accepts digits only,
+within 64 bits (`kBadMvcc` otherwise), so that P7-2's watermark stays sane. **db.** KeyDB reads it
+with `string2ll`, which refuses a leading zero (`03`); drakeydb accepts `03`, as it does for any
+db it parses (Task 1.1). The code keeps both.
+
 `ClassicApplier::HandleRreplay(args, depth = 1)` (testable without a socket) returns
 `EnvelopeResult::{kConsumed, kNotConsumed}`; `IsRreplay(const RespExpr&)` is the stream loop's
 predicate. At each level:
@@ -392,11 +401,12 @@ predicate. At each level:
 2. **Cancellation, depth 1 only.** For a layer that parsed `kOk`, or failed only on its mvcc
    (step 3 selects its db), `running()` is checked **once**, before the outermost envelope touches
    the context at all: its db is selected (a first selection dispatches a synthetic `SELECT`) and
-   its commands are dispatched. False returns `kNotConsumed` with nothing touched. After that point
-   of no return the whole envelope tree runs to completion (D-5): `DispatchCommand(ONLY_SYNC)`
-   returns only after a command ran or was rejected before running, so no "cancelled
-   mid-dispatch, may not have run" state exists. A layer that failed an earlier check selects
-   nothing and is consumed without the check.
+   its commands are dispatched. False returns `kNotConsumed` with nothing touched. After this check
+   the whole envelope tree runs to completion (D-5), save one exit: the leaf's `Reserve` may still
+   return `kCancelled`, before it dispatches anything. `DispatchCommand(ONLY_SYNC)` returns only
+   after a command ran or was rejected before running, so no "cancelled mid-dispatch, may not have
+   run" state exists. A layer that failed an earlier check selects nothing and is consumed without
+   the check.
 3. **Db, then self, then nesting** — KeyDB's order in `replicaReplayCommand`
    (`replication.cpp:5416`, `:5435`, `:5442`). The layer's db, if it has one, is **selected as the
    layer is validated** (`SelectDb`, below), before the author is looked at and whatever the inner
@@ -437,9 +447,24 @@ mirroring `JournalExecutor::SelectDb` (`journal/executor.cc:85-100`: first use d
 well, so the innermost layer that has a db decides the leaf's, and an inner without one inherits.
 One deviation, harmless against real KeyDB: KeyDB would run a wrapped `SELECT n` and move the db to
 `n`, while step 5 skips it; KeyDB never wraps one, as the db travels in the envelope. If a
-`SelectDb` fails (counted in `classic_apply_errors`; a cluster-mode `SELECT` to db > 0 does), the
-leaf of the layer that asked is skipped unless a deeper layer selects another db. Synthetic
+`SelectDb` fails (counted in `classic_apply_errors`; a `SELECT` to db > 0 does in a real cluster,
+`--cluster_mode=yes`, but not in `emulated`: `generic_family.cc:3117` tests `IsClusterEnabled()`),
+the leaf of the layer that asked is skipped unless a deeper layer selects another db. Synthetic
 `SELECT`s are not stream bytes and never touch `repl_offs_`.
+
+The selected db is state of the *stream*, not of one connection. A Redis replica keeps its cached
+master client, and with it the db, across a partial resync, and the master's backlog after the
+resume point carries no `SELECT` unless its db changed (KeyDB, from the same code: the cached master
+survives `replicationCacheMaster`/`replicationResurrectCachedMaster`, `replication.cpp:4322`,
+`:4450`, and `resetClient` leaves its db alone; `replicaseldb`, Redis's `slaveseldb`, makes the
+master feed a `SELECT` when it differs from the command's db, `:476`, and is reset to -1 only when a
+replica attaches for a full sync, `:874`, or the node turns master, `:4054`). **P7-3 must persist
+the selected db across a `+CONTINUE`** (D-8, hazard (i)) and re-select it on the resumed link: a
+context that restarts in db 0 applies the resumed writes in the wrong db. Observed by hand, once,
+on `redis-server` 7.0.15 (no Redis source tree is at hand): after a write in db 3 and a killed
+replica link, a further write in db 3 reaches `PSYNC <replid> <offset+1>` as `+CONTINUE` and a bare
+`set`, with no `SELECT`, and a `redis-server` replica ends with the key in db 3 and
+`sync_partial_ok:1`. P7-3's test is what pins it in the tree.
 
 **Dispatch** is per command, `DispatchCommand(ParsedArgs{*cmd}, cmd, ONLY_SYNC)` on a
 `CommandContext` built with `FillBackedArgs`. Its reply builder is a link-owned
@@ -550,14 +575,27 @@ envelope's author and mvcc; one reservation per envelope tree, never held across
 the `running()` check of D-3.2 has passed, then `Reserve`:
 
 - `kDrop`: consumed, `rreplay_deduped++`.
-- `kCancelled`: **not** consumed — nothing was dispatched, nothing is touched.
-- `kApply`: `SelectDb`, rewrites (D-4.3), `DispatchCommand`. `DispatchResult::OK` is `Commit`; OK
+- `kCancelled`: **not** consumed — no command was dispatched and nothing was counted; the selected
+  db may have moved (below).
+- `kApply`: rewrites (D-4.3), `DispatchCommand`. Every layer's db was already selected, while the
+  layer was validated (D-3.3), before this leaf's `Reserve`. `DispatchResult::OK` is `Commit`; OK
   includes "ran and replied an error such as `WRONGTYPE`" (KeyDB parity: its `commandsExecuted++`
   either way). `ERROR` / `OOM` — rejected before the command ran (`VerifyCommandState`,
   `main_service.cc:1589-1610`; `PrepareTransaction`, `:1628-1632`; the `DENYOOM` gate,
   `:1721-1724`) or reported OOM by the command itself — is `Release` plus `classic_apply_errors++`
   and a `LOG_EVERY_T`: the envelope is still **consumed** (the offset advances, the link does not
   stall) but the watermark does not move.
+
+**A `kCancelled` after a layer's db was selected is allowed.** KeyDB v6.3.4 always sends the db, so
+by the time the leaf reserves, its layers have selected theirs (D-3.3), and the cancelled envelope
+leaves the context's selected db moved. That is harmless because selecting is idempotent and
+replayable: on resume the same envelope is re-read, and its layers select the same dbs in the same
+order before anything is dispatched, so the moved db is exactly the state the resumed stream
+recreates. It holds even if P7-3 keeps the context's selected db across a partial resync (D-3
+"Selected db"): a layer that selects overwrites it, and an envelope with no db in any layer selected
+nothing. The synthetic `SELECT` a first selection dispatches is no stream command (it only makes the
+db's tables exist, as `JournalExecutor::SelectDb` does), so "no command was dispatched" holds.
+`kNotConsumed` means: no command was dispatched, nothing was counted, the offset stays.
 
 **Outer levels** hold no reservation: they take the `IsApplied` early-out (the one KeyDB has) and
 otherwise recurse. An inner result of `kConsumed` — *including a deduped inner*: KeyDB parity, the
@@ -568,13 +606,15 @@ drop, an unknown-command drop, a rejected or type-64 `KEYDB.MVCCRESTORE`) are co
 or self-authored envelope; a malformed inner of a nested envelope does not advance itself but its
 outer still does (D-3.6).
 
-**Cancellation and offsets (I1).** The only not-consumed outcome is `running()` being false before
-the outermost envelope's first touch of the context (D-3.2): checked **once** per outermost
-envelope — the point of no return — after which the whole tree finishes unconditionally
-(`Reserve`'s `running` callback only matters until that first dispatch). `Commit`/`Advance` run
-*before* `repl_offs_ += total_read`, so a resume offset never covers an envelope whose watermark was
-not recorded; a link cancelled between the two resumes at the old offset and the replayed envelope
-is deduped. A
+**Cancellation and offsets (I1).** There are two not-consumed outcomes, both before the first
+command of the envelope is dispatched: `running()` being false before the outermost envelope's
+first touch of the context (D-3.2), checked **once** per outermost envelope; and a leaf `Reserve`
+that returns `kCancelled`, which may follow the layers' db selections (the rule above). The point of
+no return for *dispatching and counting* is the leaf's first dispatch, after which the whole tree
+finishes unconditionally (`Reserve`'s `running` callback only matters until it).
+`Commit`/`Advance` run *before* `repl_offs_ += total_read`, so a resume offset never covers an
+envelope whose watermark was not recorded; a link cancelled between the two resumes at the old
+offset and the replayed envelope is deduped. A
 rejected-before-run envelope counts its bytes but leaves the watermark alone, so the same envelope
 replayed by another link, or by a partial resync, still applies once.
 
@@ -743,7 +783,9 @@ restart, or a new `Replica` object, means a full resync.
 - Hazards, each with a catching test (D-15): (a) leftover after CONTINUE; (b) off-by-one PSYNC
   offset; (c) deferred MULTI/EXEC bytes; (d) envelope bytes; (e) parser `INPUT_PENDING` across
   reads; (f) mid-load drop must FULLRESYNC; (g) header overwrite on a malformed FULLRESYNC; (h)
-  stream bytes behind the RDB of a full sync (Task 0.6, the same buffer).
+  stream bytes behind the RDB of a full sync (Task 0.6, the same buffer); (i) the stream's selected
+  db must survive the resume (D-3 "Selected db"): the backlog after the resume point carries no
+  `SELECT`, so a context that restarts in db 0 applies the resumed writes there.
 
 ### D-9. Active expiry on plain replicas of an active KeyDB (decision 13)
 
@@ -973,6 +1015,7 @@ still pass under if the feature were removed.
 | `test_unwrap_flushes_raw_batch_before_envelope` (fake master: raw `SET a 1`, envelope `SET a 2`) | Removing the pre-envelope flush (final `a == 1`) |
 | `test_unwrap_selected_db_is_the_one_the_raw_commands_after_it_run_in` (fake master: an envelope in db 2, then a raw `SET c` and a 3-argument envelope, then an envelope in db 0 and a raw `SET g`) | Giving the applier a connection context of its own: `c` lands in db 0 |
 | `ClassicApplyFamilyTest.DbIsSelectedBeforeTheAuthorAndInnerChecks`, `.SkipsInnerControlCommands` (a control, self-authored, bad-mvcc, malformed-inner and over-nested layer each leave their db selected; arity, uuid and db failures do not) | Selecting the db after the self check, or only for a well-formed layer, or after the nesting check; `ParseRreplayEnvelope` not handing back the db of a bad mvcc |
+| `ClassicApplyFamilyTest.FailedSelectSkipsTheCommandUnlessADeeperLayerSelects` (**real** cluster mode, `cluster_mode=yes` with a one-node config: `SELECT 3` fails there, not in `emulated`; own db, outer 3 / inner 0, outer 0 / inner 3, inner without a db, a later envelope without a db: one `classic_apply_errors` per failed select, `db_index` unchanged, only the commands that had a db applied) | Running the leaf without the `db_selected` guard (the skipped keys land in db 0); a failure that stays sticky for a deeper layer (`inner_db0` missing); a layer without a db resetting the failure (`no_inner_db` applied); remembering a failed `SELECT` as ensured (the retry runs in an unactivated db: SIGSEGV) |
 | `test_keydb_only_commands_dropped_with_counters` | `IsKeyDbOnlyCommand` returning false (counter lands in `classic_unknown_cmds_dropped`) |
 | `test_info_and_metrics_show_classic_counters`; `..._absent_for_stock_master` (INFO/`/metrics` for a Redis master with all counters zero equal upstream's: no classic field); `test_active_replica_boot_warning_names_keydb_drops` | Rendering unconditionally (the stock-master test fails); omitting the replica-side Prometheus branch |
 | `test_greet_sends_capa_active_expire_only_after_active_replica_reply` (KeyDB log lacks "does not support active expiration"; Redis capture shows no send) | Never sending it (the KeyDB warning appears) |
@@ -990,7 +1033,7 @@ still pass under if the feature were removed.
 | `ClassicApplyFamilyTest.MvccRestore*` (stamp is own mvcc + author hash; a stale restore loses to a newer local write; plain link applies verbatim and unstamped; a non-DF, non-64 type leaves the resident key and counts `keydb_mvccrestore_failed`; a type-64 payload counts `keydb_cmds_dropped`) | Envelope mvcc; guard bit off; pre-checks removed (D-31 deletes the key) |
 | `test_keydb_mvccrestore_from_keydb_mesh_merge_applies` (KeyDB B with a peer and a plain drakeydb attached merge-syncs from KeyDB A: keys and TTLs arrive; the peer keeps a newer local write, the plain replica takes A's) | Envelope mvcc or guard off (the peer takes A's stale value); `INVALID_EXPIRE` passthrough (TTL-less keys gain a TTL); no translation (keys never arrive) |
 | `test_keydb_mvccrestore_unloadable_payload_skipped_and_counted` (fake master) | Removing the pre-checks (resident key deleted); not counting; counting type 64 as a failure |
-| `test_classic_partial_psync_*` (exact INCR count, master `sync_partial_ok == 1`, `sync_full == 1`, `sync_partial_err == 0`), flag-off, mid-load drop, new-replid, KeyDB envelope variant, coalesced leftover | Fresh `io_buf` (lost bytes); `+0` offset; flag ignored |
+| `test_classic_partial_psync_*` (exact INCR count, master `sync_partial_ok == 1`, `sync_full == 1`, `sync_partial_err == 0`), flag-off, mid-load drop, new-replid, KeyDB envelope variant, coalesced leftover, selected db across the resume (writes in db 3, drop, `+CONTINUE`, more writes with no fresh `SELECT`: all in db 3) | Fresh `io_buf` (lost bytes); `+0` offset; flag ignored; the apply context restarted in db 0 on `+CONTINUE` (the resumed writes land in db 0) |
 | `RdbKeyDbTest.*`, **all under `--active_replica`** (type 64 skip + next key unstamped, subexpire, aux once, bit-63 throttle, opcode 221 beats aux, each with a control key proving stamps are observable) | Not calling `settings.Reset()` (cron stamp leaks); making the aux branch first-wins or opcode 221 non-overwriting (precedence flips) |
 | `EvalReplicatedApplyNoConnNoCrash` | Removing the `conn() != nullptr` guard (null deref) |
 | `ReplicatedApplyDuringTakeoverNoCrash` | Removing the null-`conn()` allowance in the `TAKEN_OVER` branch (null deref) |

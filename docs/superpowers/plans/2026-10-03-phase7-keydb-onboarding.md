@@ -853,7 +853,9 @@ Test `src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test
 `last_seen_ms` among `inflight == 0`. The applier holds an RAII reservation, so every exit of the
 leaf commits or releases. The exact protocol is spec D-5: one reservation per envelope tree on the
 innermost level only; outer levels read `IsApplied` and `Advance`; `running()` is checked once per
-outermost envelope (the point of no return); `Commit`/`Advance` happen **before** `repl_offs_ +=`;
+outermost envelope, and a leaf `Reserve` may still return `kCancelled` afterwards, with the layers'
+dbs already selected (spec D-5: harmless, the resumed envelope selects them again);
+`Commit`/`Advance` happen **before** `repl_offs_ +=`;
 `ERROR`/`OOM` is `Release` plus `classic_apply_errors` and still consumed.
 - [ ] **Step 1: Failing tests.** `AuthorDedupTest.*` (two fibers on `pp_->at(0)` / `pp_->at(1)`):
   `ConcurrentSameEnvelopeAppliesOnce` (the dispatch stub sleeps 10 ms before `Commit`: exactly one
@@ -864,6 +866,9 @@ outermost envelope (the point of no return); `Commit`/`Advance` happen **before*
   `NestedOuterAdvancesWhenInnerDeduped`, `AdvancesAfterSkippedInner`,
   `DoesNotAdvanceWhenMalformedOrSelf`, `Depth65MalformedStillAdvancesOuter`,
   `RunningFalseBeforeDispatchReturnsNotConsumedNoAdvance`,
+  `CancelledReserveAfterSelectIsNotConsumedAndReplaysInTheSameDb` (a link that waits on another
+  link's in-flight envelope in db 3 and is cancelled: `kNotConsumed`, no command dispatched, no
+  counter moved, no advance; then the same bytes applied on a fresh context land in db 3),
   `RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope` (now also asserting the commit),
   `RejectedDispatchCountsBytesDoesNotAdvance` (a wrong-arity `SET k`, rejected before it runs:
   `classic_apply_errors == 1`, `applied` unchanged, the envelope consumed, and a well-formed
@@ -1127,7 +1132,20 @@ over (spec D-10) — or on `+CONTINUE`; **cleared where `ParseReplicationHeader`
 `+FULLRESYNC`**, `replica.cc:1880-1889`); the `Replica` stream-prefix buffer **from Task 0.6**
 (filled by `InitiatePSync`, drained into `ConsumeRedisStream`'s `io_buf`), to which this task adds
 only the `+CONTINUE` producer; counters `classic_psync_partial_ok`,
-`classic_psync_partial_fallback`.
+`classic_psync_partial_fallback`; the stream's selected db (`conn_state.db_index` of the apply
+context `ConsumeRedisStream` builds, spec D-3 "Selected db"), kept on the `Replica` so that it
+survives a `+CONTINUE`.
+**Hazards:** (a)-(g) below (spec D-8's (h), the bytes behind a full sync's RDB, is Task 0.6's), and
+**(i) the stream's selected db must survive a partial resync.** Redis keeps the replica's cached
+master client, and with it its db, across a partial resync, and the master's backlog after the
+resume point carries no `SELECT` unless its `slaveseldb` changed. KeyDB's code, a Redis fork, shows
+it: `replicationCacheMaster` / `replicationResurrectCachedMaster` (`replication.cpp:4322`,
+`:4450`), and `replicaseldb`, fed at `:476` and reset to -1 only at a full-sync attach (`:874`) or a
+promotion (`:4054`). No Redis source tree is available on the dev box, so for 7.0.15 this is a
+hypothesis the test below confirms; it was also observed once by hand on the local `redis-server`
+7.0.15 (a write in db 3 after the link was killed came back after `+CONTINUE` as a bare `set`, no
+`SELECT`, and the `redis-server` replica kept it in db 3). A replica that restarts its apply
+context in db 0 would apply the resumed writes in the wrong db.
 - [ ] **Step 1: Failing tests** against `redis_server` (7.0.15), real KeyDB and the fake master,
   each asserting master `sync_partial_ok`/`sync_full`/`sync_partial_err` (`server.cpp:6017-6019` for
   KeyDB) and **exact** value counts: (a) leftover after `CONTINUE` — fake master sends
@@ -1139,18 +1157,30 @@ only the `+CONTINUE` producer; counters `classic_psync_partial_ok`,
   larger than the read buffer straddling the drop; (f) mid-load drop — large dataset, drop during
   `master_sync_in_progress:1`: `sync_full == 2`, `sync_partial_ok == 0`, dataset equal; (g)
   malformed `+FULLRESYNC` second line via the fake master then a reconnect: the next request is a
-  full `PSYNC ? -1`/`<id> -1`, never a stale offset; plus new-replid `+CONTINUE <newid>` adoption,
-  `--classic_partial_psync=false` (each reconnect is a full resync) and
-  `classic_psync_partial_fallback` when FULLRESYNC answers a partial request.
+  full `PSYNC ? -1`/`<id> -1`, never a stale offset; (i) selected db across the resume — a
+  `redis_server` 7.0.15 master, a writer in db 3 (`SELECT 3`, `SET a 1`), `Proxy.drop_connection()`,
+  more writes in db 3 on the master (no fresh `SELECT`), `+CONTINUE`: `a` and the later keys are all
+  in db 3 on drakeydb and in no other db, `sync_partial_ok == 1`. Written as a hypothesis the test
+  confirms: it first asserts through the proxy that the resumed bytes hold **no** `SELECT` (else it
+  would pass vacuously), and a plain `redis_server` replica of the same master is the control (its
+  keys are in db 3 too). A KeyDB active variant (raw commands behind an envelope in db 3); plus
+  new-replid `+CONTINUE <newid>` adoption, `--classic_partial_psync=false` (each reconnect is a
+  full resync) and `classic_psync_partial_fallback` when FULLRESYNC answers a partial request.
 - [ ] **Step 2: Run, observe failure** (today every reconnect sends `-1`).
 - [ ] **Step 3: Implement** spec D-8: request `offs = (flag && !master_repl_id.empty() &&
   classic_stable_reached_) ? repl_offs_ + 1 : -1`; `+CONTINUE [<newid>]` consumes its line, adopts
   `<newid>`, keeps `repl_offs_`, skips LOADING/loader/flush/merge, sets `R_SYNC_OK`; put the bytes
   behind the `+CONTINUE` line into the Task 0.6 stream-prefix buffer; verify `REPLCONF ACK 0` after
-  a partial is harmless against both masters (else send the real offset).
+  a partial is harmless against both masters (else send the real offset). Persist the selected db
+  on the `Replica` at the point where `repl_offs_` is committed (after a batch flush and after an
+  envelope), not when the link drops, so that it always names the db at the offset the link resumes
+  from (a queued raw `SELECT` is not applied, and not counted, yet); a `+CONTINUE` re-selects it
+  through the applier's `SelectDb` (the db's tables must exist) before the first resumed command,
+  and a full sync starts again in db 0.
 - [ ] **Step 4: Run; falsify** each hazard separately and record: use a fresh `io_buf` (a); send
   `repl_offs_` instead of `+ 1` (b); count deferred MULTI/EXEC bytes early (c); do not clear
-  `classic_stable_reached_` at the FULLRESYNC parse (g); ignore the flag (flag-off test).
+  `classic_stable_reached_` at the FULLRESYNC parse (g); ignore the flag (flag-off test); start the
+  resumed apply context in db 0 (i: the resumed keys land in db 0).
   Run the leftover and offset tests x10 for a pass rate.
 - [ ] **Step 5:** `replication_test.py` unchanged-green; pre-commit; commit
   `feat: resume classic replication links with a partial PSYNC (P7)`.

@@ -795,8 +795,10 @@ async def test_classic_stream_empty_command_name_does_not_abort(
 
 # Valid RESP whose command has an array where its name should be: `*0\r\n` and `*-1\r\n`. The
 # stream that follows a valid sync, by where such a command sits: first (nothing is queued before
-# it), or behind a raw command that is still waiting in the batch (its bytes are acknowledged with
-# that command's).
+# it, so its bytes are counted at once), or behind a raw command that is still waiting in the batch
+# (its bytes are deferred onto that command's entry). The batch is flushed as soon as the read
+# drains, so the test cannot see the deferral; it pins the outcome: the offset the master settles on
+# is the exact length of the stream, the skipped bytes neither dropped nor counted twice.
 ARRAY_NAME_SCENARIOS = {
     "empty_array": b"*0\r\n" + SET_A,
     "nil_array": b"*-1\r\n" + SET_A,
