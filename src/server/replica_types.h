@@ -11,6 +11,17 @@
 
 namespace dfly {
 
+// drakeydb: P7 -- what a classic link's ClassicApplier (classic_replay.h) has counted, as plain
+// numbers for a summary. ClassicLinkStats::Snapshot() fills it.
+struct ClassicLinkCounts {
+  uint64_t rreplay_unwrapped = 0;
+  uint64_t rreplay_malformed = 0;
+  uint64_t rreplay_self_dropped = 0;
+  uint64_t keydb_cmds_dropped = 0;
+  uint64_t classic_unknown_cmds_dropped = 0;
+  uint64_t classic_apply_errors = 0;
+};
+
 struct ReplicaSummary {
   std::string host;
   uint16_t port;
@@ -36,6 +47,14 @@ struct ReplicaSummary {
   // clock echo; see Replica::GetSummary() / multi_master.h's ComputeClockSkewMs. 0 when the peer
   // never sent a clock (pre-exchange, or a plain Redis/old KeyDB master).
   int64_t clock_skew_ms = 0;
+
+  // drakeydb: P7 -- the link is to a classic (Redis protocol) master, as of its last completed
+  // handshake, and that master answered `REPLCONF capa` with `active-replica` (an active KeyDB);
+  // the latter only while the link is greeted. With the link's counters they decide whether INFO
+  // and /metrics show the classic fields (ClassicLinkShown in classic_replay.h).
+  bool classic_link = false;
+  bool master_active_replica = false;
+  ClassicLinkCounts classic;
 };
 
 struct LastMasterSyncData {

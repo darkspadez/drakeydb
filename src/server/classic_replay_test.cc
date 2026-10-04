@@ -14,6 +14,8 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "base/gtest.h"
 #include "facade/facade_test.h"
@@ -421,6 +423,167 @@ TEST(ClassicReplayTest, IsRreplayIsCaseInsensitiveAndNeedsAString) {
   EXPECT_FALSE(ClassicApplier::IsRreplay(number));
 }
 
+// Every command spelling a KeyDB-only check must decide on, with or without a case, as it stands in
+// a stream. `KEYDB.MVCCRESTORE` is the one KEYDB.* command that is not dropped: it carries data
+// (spec D-7a, decision 22).
+TEST(ClassicReplayTest, IsKeyDbOnlyCommandTable) {
+  struct Case {
+    vector<string_view> words;
+    bool only;
+  };
+  const vector<Case> cases = {
+      {{"PEXPIREMEMBERAT", "s", "m", "1791058571443"}, true},
+      {{"EXPIREMEMBER", "s", "m", "100"}, true},
+      {{"EXPIREMEMBERAT", "s", "m", "1791058571"}, true},
+      {{"KEYDB.CRON", "job", "single", "1000", "return 1"}, true},
+      {{"KEYDB.HRENAME", "h", "a", "b"}, true},
+      {{"KEYDB.NHSET", "k", "a", "1"}, true},
+      {{"KEYDB.NHGET", "k", "a"}, true},
+      {{"KEYDB.MEXISTS", "k", "a", "b"}, true},
+      // An envelope is unwrapped, never dispatched.
+      {{"RREPLAY", kUuid, "x", "0", "1"}, true},
+      // Without case: KeyDB's own cron PING is in lower case, and nothing says these are not.
+      {{"pexpirememberat", "s", "m", "1"}, true},
+      {{"ExpireMember", "s", "m", "100"}, true},
+      {{"keydb.cron", "job", "single", "1000", "return 1"}, true},
+      {{"KeyDb.NhGet", "k", "a"}, true},
+      {{"rreplay", kUuid, "x"}, true},
+      // PERSIST is standard with a key, and KeyDB-only with a key and a subkey.
+      {{"PERSIST", "k", "m"}, true},
+      {{"persist", "k", "m"}, true},
+      {{"PERSIST", "k"}, false},
+      {{"persist", "k"}, false},
+      {{"PERSIST"}, false},
+      {{"PERSIST", "k", "m", "x"}, false},
+      // Applied, not dropped.
+      {{"KEYDB.MVCCRESTORE", "k", "1", "0", "payload"}, false},
+      {{"keydb.mvccrestore", "k", "1", "0", "payload"}, false},
+      // Near misses: the names are matched whole.
+      {{"KEYDB.CRONX", "job"}, false},
+      {{"KEYDB.CRO", "job"}, false},
+      {{"KEYDB.", "job"}, false},
+      {{"KEYDB", "job"}, false},
+      {{"KEYDB.HGET", "h", "a"}, false},
+      {{"EXPIREMEMBERS", "s", "m", "100"}, false},
+      {{"EXPIREMEMBE", "s", "m", "100"}, false},
+      {{"PEXPIREMEMBER", "s", "m", "100"}, false},
+      {{"RREPLAYX", kUuid, "x"}, false},
+      {{"EXPIRE", "k", "100"}, false},
+      {{"PEXPIREAT", "k", "1791058571443"}, false},
+      {{"HEXPIRE", "h", "100", "FIELDS", "1", "f"}, false},
+      {{"SET", "k", "v"}, false},
+      {{"PING"}, false},
+      {{""}, false},
+  };
+  for (const Case& c : cases) {
+    string bytes = absl::StrCat("*", c.words.size(), "\r\n");
+    for (string_view word : c.words)
+      absl::StrAppend(&bytes, "$", word.size(), "\r\n", word, "\r\n");
+    Wire wire = Wire::FromBytes(bytes);
+    EXPECT_EQ(IsKeyDbOnlyCommand(wire.args), c.only) << c.words[0] << " / " << c.words.size();
+  }
+
+  // No name to read: not KeyDB-only, and not a crash.
+  EXPECT_FALSE(IsKeyDbOnlyCommand(RespVec{}));
+  Wire numeric{"PEXPIREMEMBERAT", "s", "m", "1"};
+  numeric.args[0].type = RespExpr::INT64;
+  numeric.args[0].u = int64_t{5};
+  EXPECT_FALSE(IsKeyDbOnlyCommand(numeric.args));
+}
+
+namespace {
+
+ClassicLinkCounts Counts(uint64_t unwrapped, uint64_t malformed, uint64_t self, uint64_t keydb,
+                         uint64_t unknown, uint64_t errors) {
+  ClassicLinkCounts counts;
+  counts.rreplay_unwrapped = unwrapped;
+  counts.rreplay_malformed = malformed;
+  counts.rreplay_self_dropped = self;
+  counts.keydb_cmds_dropped = keydb;
+  counts.classic_unknown_cmds_dropped = unknown;
+  counts.classic_apply_errors = errors;
+  return counts;
+}
+
+// The names and values of `fields`, in order.
+vector<pair<string, uint64_t>> NamesAndValues(const vector<ClassicCounterValue>& fields) {
+  vector<pair<string, uint64_t>> out;
+  for (const ClassicCounterValue& field : fields)
+    out.emplace_back(string(field.name), field.value);
+  return out;
+}
+
+ReplicaSummary ClassicLink(bool active, const ClassicLinkCounts& counts) {
+  ReplicaSummary link{};
+  link.classic_link = true;
+  link.master_active_replica = active;
+  link.classic = counts;
+  return link;
+}
+
+}  // namespace
+
+// A classic field is shown for a classic link whose master answered active-replica, or whose own
+// counter moved: with a stock master and every counter zero INFO stays what upstream prints.
+TEST(ClassicReplayTest, ClassicLinkFieldsFollowTheRenderPredicate) {
+  using Fields = vector<pair<string, uint64_t>>;
+
+  // An active KeyDB master: every counter, in the order of spec D-13, zeros included.
+  ReplicaSummary active = ClassicLink(true, Counts(7, 0, 1, 2, 3, 4));
+  EXPECT_TRUE(ClassicLinkShown(active));
+  EXPECT_EQ(NamesAndValues(ClassicLinkFields(active)), (Fields{{"rreplay_unwrapped", 7},
+                                                               {"rreplay_malformed", 0},
+                                                               {"rreplay_self_dropped", 1},
+                                                               {"keydb_cmds_dropped", 2},
+                                                               {"classic_unknown_cmds_dropped", 3},
+                                                               {"classic_apply_errors", 4}}));
+  EXPECT_EQ(NamesAndValues(ClassicLinkFields(ClassicLink(true, Counts(0, 0, 0, 0, 0, 0)))).size(),
+            6u);
+
+  // Any other master with every counter zero: nothing.
+  ReplicaSummary stock = ClassicLink(false, Counts(0, 0, 0, 0, 0, 0));
+  EXPECT_FALSE(ClassicLinkShown(stock));
+  EXPECT_TRUE(ClassicLinkFields(stock).empty());
+
+  // ... with a counter that moved (a non-active KeyDB sending a raw PEXPIREMEMBERAT): that counter
+  // only, and the link is shown.
+  ReplicaSummary moved = ClassicLink(false, Counts(0, 0, 0, 3, 0, 0));
+  EXPECT_TRUE(ClassicLinkShown(moved));
+  EXPECT_EQ(NamesAndValues(ClassicLinkFields(moved)), (Fields{{"keydb_cmds_dropped", 3}}));
+  moved = ClassicLink(false, Counts(0, 2, 0, 0, 0, 9));
+  EXPECT_EQ(NamesAndValues(ClassicLinkFields(moved)),
+            (Fields{{"rreplay_malformed", 2}, {"classic_apply_errors", 9}}));
+
+  // A link that is not classic (a DFLY master) shows nothing, whatever its summary holds.
+  ReplicaSummary dfly = active;
+  dfly.classic_link = false;
+  EXPECT_FALSE(ClassicLinkShown(dfly));
+  EXPECT_TRUE(ClassicLinkFields(dfly).empty());
+  EXPECT_FALSE(ClassicMasterActive(dfly));
+  EXPECT_TRUE(ClassicMasterActive(active));
+  EXPECT_FALSE(ClassicMasterActive(stock));
+
+  // Every field carries a help text.
+  for (const ClassicCounterValue& field : ClassicLinkFields(active))
+    EXPECT_FALSE(field.help.empty()) << field.name;
+}
+
+TEST(ClassicReplayTest, ClassicTotalSeriesFollowTheRenderPredicate) {
+  using Fields = vector<pair<string, uint64_t>>;
+
+  EXPECT_TRUE(ClassicTotalSeries(Counts(0, 0, 0, 0, 0, 0), false).empty());
+  EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(0, 0, 0, 0, 0, 0), true)).size(), 6u);
+  EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(5, 0, 0, 0, 2, 0), false)),
+            (Fields{{"rreplay_unwrapped", 5}, {"classic_unknown_cmds_dropped", 2}}));
+  EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(5, 0, 0, 0, 2, 0), true)),
+            (Fields{{"rreplay_unwrapped", 5},
+                    {"rreplay_malformed", 0},
+                    {"rreplay_self_dropped", 0},
+                    {"keydb_cmds_dropped", 0},
+                    {"classic_unknown_cmds_dropped", 2},
+                    {"classic_apply_errors", 0}}));
+}
+
 namespace {
 
 constexpr string_view kSelfUuid = "00000000-0000-4000-8000-000000000001";
@@ -474,6 +637,12 @@ class ClassicApplyFamilyTest : public BaseFamilyTest {
     }
     uint64_t apply_errors() const {
       return stats.classic_apply_errors.load();
+    }
+    uint64_t keydb_dropped() const {
+      return stats.keydb_cmds_dropped.load();
+    }
+    uint64_t unknown_dropped() const {
+      return stats.classic_unknown_cmds_dropped.load();
     }
 
     ConnectionContext cntx;
@@ -909,21 +1078,191 @@ TEST_F(ClassicApplyFamilyTest, KnownCommandErrorReplyCounted) {
   EXPECT_EQ(Run({"hget", "h", "f"}), "v");
 }
 
-// The dispatcher rejects these before the command runs; they are consumed all the same.
+// The dispatcher rejects this before the command runs; it is consumed all the same.
 TEST_F(ClassicApplyFamilyTest, RejectedDispatchCountsAndConsumes) {
   OnLink([&](Link& link) {
     EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k"}))), EnvelopeResult::kConsumed);
     EXPECT_EQ(link.apply_errors(), 1u);
-    // An unknown command is rejected the same way (a later task gives it a counter of its own).
-    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"NOSUCHCMD", "x"}))), EnvelopeResult::kConsumed);
-    EXPECT_EQ(link.apply_errors(), 2u);
-    EXPECT_EQ(link.unwrapped(), 2u);
+    EXPECT_EQ(link.unwrapped(), 1u);
     EXPECT_EQ(link.malformed(), 0u);
+    EXPECT_EQ(link.unknown_dropped(), 0u);  // a known command with the wrong arity is no unknown
 
     EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "v"}))), EnvelopeResult::kConsumed);
-    EXPECT_EQ(link.apply_errors(), 2u);
+    EXPECT_EQ(link.apply_errors(), 1u);
   });
   EXPECT_EQ(Get("k"), "v");
+}
+
+// What an active KeyDB wraps that drakeydb has no equivalent of is skipped, counted and warned
+// about, and never reaches the dispatcher: `PERSIST k m` would be an arity error, the others
+// unknown commands. A layer that is dropped was still taken apart, so it is unwrapped.
+TEST_F(ClassicApplyFamilyTest, KeyDbOnlyDroppedAndCounted) {
+  Run({"set", "k", "v"});
+  Run({"expire", "k", "100"});
+
+  OnLink([&](Link& link) {
+    const vector<string> commands = {
+        Resp({"PEXPIREMEMBERAT", "s", "m", "1791058571443"}),
+        Resp({"EXPIREMEMBER", "s", "m", "100"}),
+        Resp({"EXPIREMEMBERAT", "s", "m", "1791058571"}),
+        Resp({"PERSIST", "k", "m"}),
+        Resp({"KEYDB.CRON", "job", "single", "100000", "return 1"}),
+        Resp({"KEYDB.HRENAME", "h", "a", "b"}),
+        Resp({"KEYDB.NHSET", "k", "a", "1"}),
+        Resp({"KEYDB.NHGET", "k", "a"}),
+        Resp({"KEYDB.MEXISTS", "k", "a", "b"}),
+        Resp({"pexpirememberat", "s", "m", "1791058571443"}),
+    };
+    uint64_t dropped = 0;
+    for (const string& command : commands) {
+      EXPECT_EQ(link.Apply(Envelope(kAuthorA, command, "3")), EnvelopeResult::kConsumed) << command;
+      EXPECT_EQ(link.keydb_dropped(), ++dropped) << command;
+    }
+    EXPECT_EQ(link.unwrapped(), dropped);
+    EXPECT_EQ(link.unknown_dropped(), 0u);  // not unknown: they are KeyDB's
+    EXPECT_EQ(link.apply_errors(), 0u);     // and never dispatched
+    EXPECT_EQ(link.malformed(), 0u);
+
+    // `PERSIST k m` did not clear the TTL of `k`, which `PERSIST k` (a standard command) does.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"PERSIST", "k"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.keydb_dropped(), dropped);
+    EXPECT_EQ(link.apply_errors(), 0u);
+
+    // The stream carries on.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "after", "v"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.unwrapped(), dropped + 2);
+  });
+
+  EXPECT_THAT(service_->UknownCmdMap(), testing::IsEmpty());  // none went to the dispatcher
+  EXPECT_EQ(CheckedInt({"ttl", "k"}), -1);                    // from PERSIST k, not PERSIST k m
+  EXPECT_EQ(Get("after"), "v");
+  EXPECT_EQ(CheckedInt({"dbsize"}), 2);
+}
+
+// A command this server has no command for is counted and not dispatched: dispatched, it would
+// only fill the error builder and upstream's `unknown_` accounting with a command that is not the
+// operator's to fix.
+TEST_F(ClassicApplyFamilyTest, UnknownInnerCommandCountedNotDispatched) {
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"NOSUCHCMD", "x"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.unknown_dropped(), 1u);
+    EXPECT_EQ(link.apply_errors(), 0u);
+    EXPECT_EQ(link.keydb_dropped(), 0u);
+    EXPECT_EQ(link.unwrapped(), 1u);
+    EXPECT_EQ(link.malformed(), 0u);
+
+    // Without case, as the dispatcher reads a name, and a subcommand: `ACL <nothing>` is a command,
+    // `ACL NOSUCHSUB` is not.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"nosuchcmd2"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"ACL", "NOSUCHSUB"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.unknown_dropped(), 3u);
+    EXPECT_EQ(link.apply_errors(), 0u);
+
+    // A known command is no unknown one, whether it applies or the dispatcher rejects it.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "v"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.unknown_dropped(), 3u);
+    EXPECT_EQ(link.apply_errors(), 1u);
+    EXPECT_EQ(link.unwrapped(), 5u);
+  });
+
+  EXPECT_THAT(service_->UknownCmdMap(), testing::IsEmpty());
+  EXPECT_EQ(Get("k"), "v");
+}
+
+// KEYDB.MVCCRESTORE is data, not a KeyDB-only command to drop (decision 22): Task 2.6 of P7-2
+// translates and applies it. Until then drakeydb does not know it, and it is counted as an unknown
+// command, never in keydb_cmds_dropped, whose operators would read it as a loss they accepted.
+TEST_F(ClassicApplyFamilyTest, KeyDbMvccRestoreCountedUnknownUntilItIsApplied) {
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "1878060925646274561",
+                                                  "-1", "not a dump payload"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.unknown_dropped(), 1u);
+    EXPECT_EQ(link.keydb_dropped(), 0u);
+    EXPECT_EQ(link.apply_errors(), 0u);
+    EXPECT_EQ(link.unwrapped(), 1u);
+  });
+
+  EXPECT_EQ(CheckedInt({"dbsize"}), 0);
+}
+
+// KeyDB selects the db of a layer before it knows what the layer holds, and so does the applier:
+// a KeyDB-only or an unknown command leaves the db its layers selected, and the next command with
+// no db of its own runs there.
+TEST_F(ClassicApplyFamilyTest, KeyDbOnlyAndUnknownLeavesKeepTheSelectedDb) {
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"EXPIREMEMBER", "s", "m", "100"}), "3")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.keydb_dropped(), 1u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 3u);
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, Resp({"SET", "after_keydb_only", "v"})})),
+              EnvelopeResult::kConsumed);
+
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"NOSUCHCMD", "x"}), "5")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.unknown_dropped(), 1u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 5u);
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, Resp({"SET", "after_unknown", "v"})})),
+              EnvelopeResult::kConsumed);
+
+    // Nested: the innermost layer that has a db decides, whatever its command turns out to be.
+    EXPECT_EQ(
+        link.Apply(Envelope(
+            kAuthorB, Envelope(kAuthorA, Resp({"KEYDB.CRON", "j", "single", "9"}), "7"), "2")),
+        EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.keydb_dropped(), 2u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 7u);
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, Resp({"SET", "after_nested", "v"})})),
+              EnvelopeResult::kConsumed);
+
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+
+  EXPECT_EQ(Get("after_keydb_only", 3), "v");
+  EXPECT_EQ(Get("after_unknown", 5), "v");
+  EXPECT_EQ(Get("after_nested", 7), "v");
+  for (string_view key : {"after_keydb_only", "after_unknown", "after_nested"})
+    EXPECT_EQ(Get(key, 0), nullopt) << key;
+}
+
+// Every bump of a link's counter is also one of the process-wide totals that /metrics exports, so
+// a link that is gone leaves its counts behind. The totals are the whole process's, hence deltas.
+TEST_F(ClassicApplyFamilyTest, CountsAlsoFeedTheProcessWideTotals) {
+  const ClassicLinkCounts before = ClassicTotals().Snapshot();
+
+  ClassicLinkCounts link_counts;
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "v"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"EXPIREMEMBER", "s", "m", "100"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"NOSUCHCMD"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kSelfUuid, Resp({"SET", "k", "v"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", "not-a-uuid", Resp({"SET", "k", "v"})})),
+              EnvelopeResult::kConsumed);
+    link_counts = link.stats.Snapshot();
+  });
+
+  EXPECT_EQ(link_counts.rreplay_unwrapped, 4u);
+  EXPECT_EQ(link_counts.rreplay_malformed, 1u);
+  EXPECT_EQ(link_counts.rreplay_self_dropped, 1u);
+  EXPECT_EQ(link_counts.keydb_cmds_dropped, 1u);
+  EXPECT_EQ(link_counts.classic_unknown_cmds_dropped, 1u);
+  EXPECT_EQ(link_counts.classic_apply_errors, 1u);
+
+  const ClassicLinkCounts after = ClassicTotals().Snapshot();
+  EXPECT_EQ(after.rreplay_unwrapped - before.rreplay_unwrapped, link_counts.rreplay_unwrapped);
+  EXPECT_EQ(after.rreplay_malformed - before.rreplay_malformed, link_counts.rreplay_malformed);
+  EXPECT_EQ(after.rreplay_self_dropped - before.rreplay_self_dropped,
+            link_counts.rreplay_self_dropped);
+  EXPECT_EQ(after.keydb_cmds_dropped - before.keydb_cmds_dropped, link_counts.keydb_cmds_dropped);
+  EXPECT_EQ(after.classic_unknown_cmds_dropped - before.classic_unknown_cmds_dropped,
+            link_counts.classic_unknown_cmds_dropped);
+  EXPECT_EQ(after.classic_apply_errors - before.classic_apply_errors,
+            link_counts.classic_apply_errors);
 }
 
 // A link that is not running at the outermost envelope has nothing touched: not a dispatch, not the

@@ -625,7 +625,10 @@ counter is nonzero; process-wide counters use the same predicate.
   `PERSIST k` vs `PERSIST k m`, mixed case, `KEYDB.MVCCRESTORE` **not** matched);
   `ClassicApplyFamilyTest.KeyDbOnlyDroppedAndCounted`, `.UnknownInnerCommandCountedNotDispatched`;
   `MultiMasterFamilyTest.RenderPeerReplicationInfoShowsClassicFieldsOnlyForClassicLinks` and
-  `.OmitsClassicFieldsWhenMasterNotActiveAndCountersZero` (pure render; includes `repl_offset=`).
+  `.OmitsClassicFieldsWhenMasterNotActiveAndCountersZero` (pure render; includes `repl_offset=`;
+  built as `PeerReplicationInfo.ShowsClassicFieldsOnlyForClassicLinks` and
+  `.OmitsClassicFieldsWhenMasterNotActiveAndCountersZero`, plain `TEST`s: a pure render needs no
+  service).
   Pytest: `test_keydb_only_commands_dropped_with_counters` (KeyDB `SADD s a b` + `EXPIREMEMBER s a
   100`, `KEYDB.CRON ...`, and a normal key: the normal key syncs, `keydb_cmds_dropped >= 1`,
   `rreplay_unwrapped` increments, drakeydb stays up); `test_info_and_metrics_show_classic_counters`

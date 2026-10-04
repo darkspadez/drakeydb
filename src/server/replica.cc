@@ -643,6 +643,7 @@ error_code Replica::Greet() {
   // mesh bring-up, not a race at all -- lost a 50/50 uuid coin flip. A no-op outside peer mode.
   if (peer_mode_ && peer_mode_->identity_claims)
     peer_mode_->identity_claims->MarkEstablished(client_id_);
+  classic_master_ = !HasDflyMaster();
   return error_code{};
 }
 
@@ -1317,7 +1318,11 @@ error_code Replica::ConsumeRedisStream() {
       // Valkey and Redis may send MULTI and EXEC as part of their replication commands.
       // Dragonfly disallows some commands, such as SELECT, inside of MULTI/EXEC, so here we
       // simply ignore MULTI/EXEC and execute their inner commands individually.
-      if (!absl::EqualsIgnoreCase(cmd, "MULTI") && !absl::EqualsIgnoreCase(cmd, "EXEC")) {
+      if (!absl::EqualsIgnoreCase(cmd, "MULTI") && !absl::EqualsIgnoreCase(cmd, "EXEC") &&
+          // drakeydb: P7-1 -- a KeyDB-only command (a non-active KeyDB streams PEXPIREMEMBERAT
+          // raw) is dropped and counted like one inside an envelope. Nothing else is checked on
+          // this path: an unknown raw command keeps upstream's accounting.
+          !classic_applier.SkipKeyDbOnly(last_args)) {
         VLOG(2) << "Got command " << absl::CHexEscape(cmd)
                 << "\n consumed: " << response->total_read;
 
@@ -2072,6 +2077,12 @@ auto Replica::GetSummary() const -> Summary {
     res.psync_successes = psync_successes_;
     res.psync_attempts = psync_attempts_;
     res.passed_full_sync = passed_full_sync_;
+    // drakeydb: P7 -- master_active_replica_ is only meaningful once the handshake is done (see its
+    // declaration).
+    res.classic_link = classic_master_;
+    res.master_active_replica =
+        classic_master_ && (state_mask_ & R_GREETED) && master_active_replica_;
+    res.classic = classic_stats_.Snapshot();
     return res;
   };
 

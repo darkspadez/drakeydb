@@ -291,10 +291,14 @@ class Replica : ProtocolClient {
   // Not atomic: Greet() runs from Replica::Start in the REPLICAOF caller's fiber, on this
   // Replica's own thread and before the replication fiber starts, and from the replication fiber
   // after that, so the two never overlap. It is set by the capa reply, which is not the last step
-  // of Greet(): after a failed Greet() it may be stale. Nothing reads it yet: Task 1.3 (INFO) and
-  // Task 1.4 (the activeExpire decision) will, and must do so only once R_GREETED is set in
-  // state_mask_.
+  // of Greet(): after a failed Greet() it may be stale. So GetSummary() (INFO, /metrics) reads it,
+  // and Task 1.4 (the activeExpire decision) will, only once R_GREETED is set in state_mask_.
   bool master_active_replica_ = false;
+
+  // drakeydb: P7 -- the last Greet() that completed found a classic (Redis protocol) master, not a
+  // DFLY one. Unlike master_active_replica_ it is not cleared when a reconnect starts, so that a
+  // link that is down keeps showing the counters it has (ClassicLinkShown). Same threads as above.
+  bool classic_master_ = false;
 
   // drakeydb: P7 -- what ConsumeRedisStream's ClassicApplier counted over this Replica's life
   // (RREPLAY envelopes unwrapped, malformed, self-authored, commands that did not apply).

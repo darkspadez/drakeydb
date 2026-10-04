@@ -680,8 +680,12 @@ standard), `KEYDB.CRON`, `KEYDB.HRENAME`, `KEYDB.NHSET`, `KEYDB.NHGET`, `KEYDB.M
 `RREPLAY` (never dispatched as a command). **`KEYDB.MVCCRESTORE` is not on this list: it is
 applied (D-7a).**
 
-Inside envelopes, a command with `FindCmd == nullptr` is counted `classic_unknown_cmds_dropped`
-with its own rate-limited warning instead of being dispatched into a `NONE` builder. On the raw
+Inside envelopes, a command the dispatcher has no entry for (`CommandRegistry::FindExtended`, the
+dispatcher's own lookup, which reads `ACL <sub>` as one name; not `FindCmd`) is counted
+`classic_unknown_cmds_dropped` with its own rate-limited warning instead of being dispatched into
+the error builder. The check runs after the layers' dbs were selected (D-3.3), so a KeyDB-only or
+unknown leaf still leaves the db its layers selected, as KeyDB selects before it knows the
+command. On the raw
 path (a non-active KeyDB sends `PEXPIREMEMBERAT` raw) only the KeyDB-only check runs; raw-path
 unknowns stay on upstream's `unknown_*` accounting so the squashed hot path gains no second registry
 lookup. Member TTLs are documented as lost; native conversion is a registered follow-up.
@@ -933,6 +937,19 @@ replica-side branch (`:486-489`); otherwise the series would be missing exactly 
 onboard from KeyDB. With a stock Redis master and every counter zero, INFO and `/metrics` are
 byte-for-byte upstream's.
 
+As built (P7-1 Task 1.3): the predicate is per field. A link to an active KeyDB shows every
+counter, zeros included; any other classic link shows only the counters that moved (a non-active
+KeyDB sending `PEXPIREMEMBERAT` raw shows `keydb_cmds_dropped` alone), and on a peer line
+`repl_offset` follows whenever any field is shown. `master_active_replica` is read only while the
+link is greeted (`R_GREETED`); `classic_link` is the protocol of the last completed handshake and
+survives a disconnect. The `<name>_total` series are the process-wide sums (`ClassicTotals()`,
+bumped with every per-link counter, so a link that went away leaves its counts), emitted at one
+place in `Metrics::Print` after the replica/master branches, which covers both and a node that was
+promoted with counters still nonzero; `Metrics::classic_master_active` carries the "some link has
+an active KeyDB master" half of the predicate, computed in `GetMetrics` from the replica and peer
+summaries. The `multimaster_*` process-wide INFO counters named above arrive with the tasks that
+count them (P7-2, P7-4); Task 1.3 has none to render there.
+
 **Clock skew.** KeyDB answers `REPLCONF UUID` with a bare `+<uuid>` (D-1.1), so the handshake clock
 echo that feeds `clock_skew_ms` for DFLY peers is absent and the field stays 0 ("no sample"). A
 classic link derives an estimate from the stream instead (Task 2.7): for a depth-1 envelope with
@@ -1016,8 +1033,9 @@ still pass under if the feature were removed.
 | `test_unwrap_selected_db_is_the_one_the_raw_commands_after_it_run_in` (fake master: an envelope in db 2, then a raw `SET c` and a 3-argument envelope, then an envelope in db 0 and a raw `SET g`) | Giving the applier a connection context of its own: `c` lands in db 0 |
 | `ClassicApplyFamilyTest.DbIsSelectedBeforeTheAuthorAndInnerChecks`, `.SkipsInnerControlCommands` (a control, self-authored, bad-mvcc, malformed-inner and over-nested layer each leave their db selected; arity, uuid and db failures do not) | Selecting the db after the self check, or only for a well-formed layer, or after the nesting check; `ParseRreplayEnvelope` not handing back the db of a bad mvcc |
 | `ClassicApplyFamilyTest.FailedSelectSkipsTheCommandUnlessADeeperLayerSelects` (**real** cluster mode, `cluster_mode=yes` with a one-node config: `SELECT 3` fails there, not in `emulated`; own db, outer 3 / inner 0, outer 0 / inner 3, inner without a db, a later envelope without a db: one `classic_apply_errors` per failed select, `db_index` unchanged, only the commands that had a db applied) | Running the leaf without the `db_selected` guard (the skipped keys land in db 0); a failure that stays sticky for a deeper layer (`inner_db0` missing); a layer without a db resetting the failure (`no_inner_db` applied); remembering a failed `SELECT` as ensured (the retry runs in an unactivated db: SIGSEGV) |
-| `test_keydb_only_commands_dropped_with_counters` | `IsKeyDbOnlyCommand` returning false (counter lands in `classic_unknown_cmds_dropped`) |
-| `test_info_and_metrics_show_classic_counters`; `..._absent_for_stock_master` (INFO/`/metrics` for a Redis master with all counters zero equal upstream's: no classic field); `test_active_replica_boot_warning_names_keydb_drops` | Rendering unconditionally (the stock-master test fails); omitting the replica-side Prometheus branch |
+| `test_keydb_only_commands_dropped_with_counters` (real KeyDB: `EXPIREMEMBER` and `KEYDB.CRON` dropped, `keydb_cmds_dropped == 2`, the set whole, no unknown or apply error); `ClassicReplayTest.IsKeyDbOnlyCommandTable`; `ClassicApplyFamilyTest.KeyDbOnlyDroppedAndCounted`, `.UnknownInnerCommandCountedNotDispatched`, `.KeyDbMvccRestoreCountedUnknownUntilItIsApplied` (decision 22: `classic_unknown_cmds_dropped`, never `keydb_cmds_dropped`), `.KeyDbOnlyAndUnknownLeavesKeepTheSelectedDb`, `.CountsAlsoFeedTheProcessWideTotals` | `IsKeyDbOnlyCommand` returning false (counter lands in `classic_unknown_cmds_dropped`); also matching `KEYDB.MVCCRESTORE`; `PERSIST` without the arity check; no pre-dispatch unknown check (the command reaches the dispatcher, `unknown_` is filled); a dropped command resetting the db; `Count` not feeding the totals |
+| `test_info_and_metrics_show_classic_counters[plain_replica\|peer_mode]` (real KeyDB), `test_scripted_active_master_exact_classic_counters`, `test_scripted_quiet_active_master_shows_zero_counters`, `test_scripted_stock_master_raw_keydb_only_command_shows_only_that_counter` (exact counts, INFO and `/metrics`; the raw path); `PeerReplicationInfo.ShowsClassicFieldsOnlyForClassicLinks`, `.OmitsClassicFieldsWhenMasterNotActiveAndCountersZero`; `ClassicReplayTest.ClassicLinkFieldsFollowTheRenderPredicate`, `.ClassicTotalSeriesFollowTheRenderPredicate` | Omitting the INFO branch (plain) or the peer-line branch; omitting the replica-side Prometheus branch (the plain replica has no series); ignoring `master_active_replica` (a quiet active KeyDB shows nothing); removing the raw-path check |
+| `test_info_and_metrics_absent_for_stock_master`, `..._absent_for_keydb_that_is_not_active[plain_replica\|peer_mode]`, `..._have_no_classic_fields_between_dfly_nodes[plain_replica\|peer_mode]` (no classic field or series, and the link's block ends where it did: `psync_successes`, `clock_skew_ms`); `test_active_replica_boot_warning_names_keydb_drops` | Rendering unconditionally (the stock-master and DFLY tests fail); removing the sentence from the boot warning |
 | `test_greet_sends_capa_active_expire_only_after_active_replica_reply` (KeyDB log lacks "does not support active expiration"; Redis capture shows no send) | Never sending it (the KeyDB warning appears) |
 | `test_plain_replica_of_active_keydb_expires_keys` (+ Redis control with `DEBUG SET-ACTIVE-EXPIRE 0`: replica must not expire) | Not setting the shard flag (DBSIZE stays N) |
 | `test_keydb_onboarding_keeps_up_under_load` (`slow`; release bar under `DRAKEYDB_PERF=1`, smoke otherwise) | n/a measurement; control = per-command path made artificially slow must fail the smoke's ratio |

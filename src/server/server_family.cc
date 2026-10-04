@@ -55,6 +55,7 @@ extern "C" {
 #include "server/acl/acl_commands_def.h"
 #include "server/acl/user_registry.h"
 #include "server/blocking_controller.h"
+#include "server/classic_replay.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/debugcmd.h"
@@ -2693,6 +2694,17 @@ Metrics ServerFamily::GetMetrics(Namespace* ns, const MetricsCollectOpts& opts) 
     result.replica_side_info = GetReplicaSummary();
   }
 
+  // drakeydb: P7 -- whether a classic link of this node has an active KeyDB for master: with the
+  // counters' own values, what decides if /metrics exports the classic series (metrics.cc).
+  if (result.replica_side_info) {
+    const Metrics::ReplicaInfo& info = *result.replica_side_info;
+    result.classic_master_active =
+        ClassicMasterActive(info.summary) || rng::any_of(info.cl_repl_summary, ClassicMasterActive);
+  } else if (IsActiveReplica()) {
+    for (const ReplicaSummary& peer : peers_->Summaries())
+      result.classic_master_active = result.classic_master_active || ClassicMasterActive(peer);
+  }
+
   {
     util::fb2::LockGuard lk{loading_stats_mu_};
     result.loading_stats = loading_stats_;
@@ -3180,6 +3192,10 @@ string ServerFamily::FormatInfoMetrics(
         append("slave_read_only", 1);
         append("psync_attempts", rinfo.psync_attempts);
         append("psync_successes", rinfo.psync_successes);
+        // drakeydb: P7 -- a classic link to an active KeyDB (or whose counters moved), only: a
+        // stock master's INFO stays what upstream prints.
+        for (const ClassicCounterValue& field : ClassicLinkFields(rinfo))
+          append(field.name, field.value);
       };
 
       const auto& info = *m.replica_side_info;

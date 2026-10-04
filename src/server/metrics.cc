@@ -14,6 +14,7 @@
 #include "facade/dragonfly_listener.h"
 #include "facade/reply_builder.h"
 #include "io/proc_reader.h"
+#include "server/classic_replay.h"
 #include "server/cluster_support.h"
 #include "server/command_registry.h"
 #include "server/dflycmd.h"
@@ -525,6 +526,15 @@ void Metrics::Print(uint64_t uptime, const CommandRegistry* registry, DflyCmd* d
                         &replication_lag_metrics);
     }
     absl::StrAppend(&resp->body(), replication_lag_metrics);
+  }
+
+  // drakeydb: P7 -- the process-wide totals of the classic link counters, `<name>_total`. A stock
+  // master leaves every one at zero and shows none of them, a plain replica of an active KeyDB
+  // shows them all (it never reaches the master-side branch above: this one serves both).
+  for (const ClassicCounterValue& series :
+       ClassicTotalSeries(ClassicTotals().Snapshot(), m.classic_master_active)) {
+    AppendMetricWithoutLabels(StrCat(series.name, "_total"), series.help, series.value,
+                              MetricType::COUNTER, &resp->body());
   }
 
   AppendMetricWithoutLabels("fiber_switch_total", "", m.fiber_switch_cnt, MetricType::COUNTER,

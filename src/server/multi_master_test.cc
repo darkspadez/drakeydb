@@ -411,6 +411,83 @@ TEST(PeerReplicationInfo, RendersCountsAndPeerLines) {
             RenderPeerReplicationInfo({}, false, true));
 }
 
+namespace {
+
+ReplicaSummary PeerLine(std::string host, uint16_t port) {
+  ReplicaSummary p{};
+  p.host = std::move(host);
+  p.port = port;
+  p.master_link_established = true;
+  p.master_last_io_sec = 1;
+  p.master_node_uuid = "01234567-89ab-4cde-8f01-23456789abcd";
+  return p;
+}
+
+}  // namespace
+
+// drakeydb: P7 -- a peer link to a classic master that answered active-replica (an active KeyDB)
+// shows its counters and its stream offset; a DFLY peer never does.
+TEST(PeerReplicationInfo, ShowsClassicFieldsOnlyForClassicLinks) {
+  ReplicaSummary keydb = PeerLine("keydb", 6379);
+  keydb.classic_link = true;
+  keydb.master_active_replica = true;
+  keydb.repl_offset_sum = 1234;
+  keydb.classic.rreplay_unwrapped = 7;
+  keydb.classic.rreplay_self_dropped = 1;
+  keydb.classic.keydb_cmds_dropped = 2;
+  keydb.classic.classic_unknown_cmds_dropped = 3;
+  keydb.classic.classic_apply_errors = 4;
+
+  // A DFLY peer whose summary holds the same numbers (it cannot, but the fields are not read).
+  ReplicaSummary dfly = keydb;
+  dfly.host = "dfly";
+  dfly.classic_link = false;
+
+  EXPECT_EQ(
+      "active_replica:1\r\nmulti_master:1\r\nconnected_masters:2\r\n"
+      "master0:host=keydb,port=6379,link_status=up,last_io_seconds_ago=1,sync_in_progress=0,"
+      "node_uuid=01234567-89ab-4cde-8f01-23456789abcd,clock_skew_ms=0,"
+      "rreplay_unwrapped=7,rreplay_malformed=0,rreplay_self_dropped=1,keydb_cmds_dropped=2,"
+      "classic_unknown_cmds_dropped=3,classic_apply_errors=4,repl_offset=1234\r\n"
+      "master1:host=dfly,port=6379,link_status=up,last_io_seconds_ago=1,sync_in_progress=0,"
+      "node_uuid=01234567-89ab-4cde-8f01-23456789abcd,clock_skew_ms=0\r\n",
+      RenderPeerReplicationInfo({keydb, dfly}, true, true));
+
+  // The peer lines are for a privileged viewer only, the counters with them.
+  EXPECT_EQ("active_replica:1\r\nmulti_master:1\r\nconnected_masters:2\r\n",
+            RenderPeerReplicationInfo({keydb, dfly}, true, false));
+}
+
+// A classic link whose master did not answer active-replica, with every counter zero, renders as
+// a link always did, so a node attached to a stock master prints what upstream does; a counter
+// that moved brings the link in, that counter alone.
+TEST(PeerReplicationInfo, OmitsClassicFieldsWhenMasterNotActiveAndCountersZero) {
+  const std::string kHeader = "active_replica:1\r\nmulti_master:0\r\nconnected_masters:1\r\n";
+  const std::string kLine =
+      "master0:host=redis,port=6379,link_status=up,last_io_seconds_ago=1,sync_in_progress=0,"
+      "node_uuid=01234567-89ab-4cde-8f01-23456789abcd,clock_skew_ms=0";
+
+  ReplicaSummary stock = PeerLine("redis", 6379);
+  stock.classic_link = true;
+  stock.repl_offset_sum = 99;  // not shown either
+  EXPECT_EQ(kHeader + kLine + "\r\n", RenderPeerReplicationInfo({stock}, false, true));
+
+  // Not an active KeyDB, but a raw PEXPIREMEMBERAT was dropped: that counter and the offset.
+  stock.classic.keydb_cmds_dropped = 3;
+  EXPECT_EQ(kHeader + kLine + ",keydb_cmds_dropped=3,repl_offset=99\r\n",
+            RenderPeerReplicationInfo({stock}, false, true));
+
+  // An active KeyDB that has not sent anything yet: every counter, zeros included.
+  ReplicaSummary quiet = PeerLine("redis", 6379);
+  quiet.classic_link = true;
+  quiet.master_active_replica = true;
+  EXPECT_EQ(kHeader + kLine +
+                ",rreplay_unwrapped=0,rreplay_malformed=0,rreplay_self_dropped=0,"
+                "keydb_cmds_dropped=0,classic_unknown_cmds_dropped=0,classic_apply_errors=0,"
+                "repl_offset=0\r\n",
+            RenderPeerReplicationInfo({quiet}, false, true));
+}
+
 TEST(ClockSkew, ComputesSignedSkewAndThreshold) {
   // Peer's clock ahead of ours -> positive skew.
   EXPECT_EQ(ComputeClockSkewMs(/* local_ms= */ 1'000, /* peer_ms= */ 1'500), 500);

@@ -13,11 +13,13 @@
 
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <limits>
 
 #include "base/logging.h"
 #include "facade/redis_parser.h"
 #include "facade/reply_capture.h"
+#include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/generic_family.h"
 #include "server/main_service.h"
@@ -71,6 +73,57 @@ string_view RreplayParseName(RreplayParse parse) {
   return "unknown";
 }
 
+// The counters of a classic link in the order INFO shows them (spec D-13), with what the two
+// halves of their rendering need: where each lives in the atomics of a link and in a summary, and
+// the help text of the /metrics series.
+struct ClassicCounterDef {
+  string_view name;
+  string_view help;
+  atomic<uint64_t> ClassicLinkStats::*stat;
+  uint64_t ClassicLinkCounts::*count;
+};
+
+constexpr ClassicCounterDef kClassicCounters[] = {
+    {"rreplay_unwrapped", "RREPLAY envelope layers taken apart on classic replication links.",
+     &ClassicLinkStats::rreplay_unwrapped, &ClassicLinkCounts::rreplay_unwrapped},
+    {"rreplay_malformed", "RREPLAY envelope layers skipped as malformed on classic links.",
+     &ClassicLinkStats::rreplay_malformed, &ClassicLinkCounts::rreplay_malformed},
+    {"rreplay_self_dropped",
+     "RREPLAY envelopes authored by this node that came back around a mesh, dropped.",
+     &ClassicLinkStats::rreplay_self_dropped, &ClassicLinkCounts::rreplay_self_dropped},
+    {"keydb_cmds_dropped",
+     "KeyDB-only commands (member expiry, KEYDB.CRON, ...) dropped on classic links.",
+     &ClassicLinkStats::keydb_cmds_dropped, &ClassicLinkCounts::keydb_cmds_dropped},
+    {"classic_unknown_cmds_dropped",
+     "Commands inside RREPLAY envelopes this server has no command for, dropped.",
+     &ClassicLinkStats::classic_unknown_cmds_dropped,
+     &ClassicLinkCounts::classic_unknown_cmds_dropped},
+    {"classic_apply_errors",
+     "Commands inside RREPLAY envelopes that did not apply: rejected, or replied an error.",
+     &ClassicLinkStats::classic_apply_errors, &ClassicLinkCounts::classic_apply_errors},
+};
+
+// The commands only a KeyDB has (spec D-7), besides `PERSIST key subkey`. KEYDB.MVCCRESTORE is not
+// among them: it is applied (D-7a).
+constexpr string_view kKeyDbOnlyCommands[] = {"PEXPIREMEMBERAT", "EXPIREMEMBER",  "EXPIREMEMBERAT",
+                                              "KEYDB.CRON",      "KEYDB.HRENAME", "KEYDB.NHSET",
+                                              "KEYDB.NHGET",     "KEYDB.MEXISTS", "RREPLAY"};
+
+bool AnyCounterMoved(const ClassicLinkCounts& counts) {
+  return any_of(begin(kClassicCounters), end(kClassicCounters),
+                [&counts](const ClassicCounterDef& def) { return counts.*def.count != 0; });
+}
+
+// The counters of `counts` worth showing: all of them, or only the nonzero ones.
+vector<ClassicCounterValue> CounterValues(const ClassicLinkCounts& counts, bool show_zeros) {
+  vector<ClassicCounterValue> out;
+  for (const ClassicCounterDef& def : kClassicCounters) {
+    if (show_zeros || counts.*def.count != 0)
+      out.push_back({def.name, def.help, counts.*def.count});
+  }
+  return out;
+}
+
 // What KeyDB wraps in an envelope like a write, but that is not data: its liveness PING, the
 // GETACK its master asks for, and the MULTI/EXEC of a transaction. The db travels in the envelope,
 // and the commands of a transaction are applied one by one, as for a raw MULTI/EXEC.
@@ -120,6 +173,65 @@ RreplayParse ParseRreplayEnvelope(const facade::RespVec& args, RreplayEnvelope* 
   out->db = db;
   out->mvcc = mvcc;
   return RreplayParse::kOk;
+}
+
+bool IsKeyDbOnlyCommand(const facade::RespVec& args) {
+  if (args.empty() || args[0].type != facade::RespExpr::STRING)
+    return false;
+
+  // The raw path of the stream asks this of every command it queues: EqualsIgnoreCase compares
+  // the lengths first, so the names of the stream's ordinary commands cost a few comparisons.
+  const string_view name = args[0].GetView();
+  for (string_view only : kKeyDbOnlyCommands) {
+    if (absl::EqualsIgnoreCase(name, only))
+      return true;
+  }
+  // `PERSIST key` is a standard command; KeyDB's `PERSIST key subkey` removes a member's TTL.
+  return args.size() == 3 && absl::EqualsIgnoreCase(name, "PERSIST");
+}
+
+ClassicLinkCounts ClassicLinkStats::Snapshot() const {
+  ClassicLinkCounts counts;
+  for (const ClassicCounterDef& def : kClassicCounters)
+    counts.*def.count = (this->*def.stat).load(memory_order_relaxed);
+  return counts;
+}
+
+ClassicLinkStats& ClassicTotals() {
+  static ClassicLinkStats totals;
+  return totals;
+}
+
+bool ClassicLinkShown(const ReplicaSummary& link) {
+  return link.classic_link && (link.master_active_replica || AnyCounterMoved(link.classic));
+}
+
+vector<ClassicCounterValue> ClassicLinkFields(const ReplicaSummary& link) {
+  if (!ClassicLinkShown(link))
+    return {};
+  return CounterValues(link.classic, ClassicMasterActive(link));
+}
+
+vector<ClassicCounterValue> ClassicTotalSeries(const ClassicLinkCounts& totals,
+                                               bool any_master_active) {
+  return CounterValues(totals, any_master_active);
+}
+
+bool ClassicApplier::SkipKeyDbOnly(const facade::RespVec& args) {
+  if (!IsKeyDbOnlyCommand(args))
+    return false;
+
+  Count(&ClassicLinkStats::keydb_cmds_dropped);
+  LOG_EVERY_T(WARNING, 60) << "Dropping a KeyDB-only command from " << link_ << ": "
+                           << absl::CHexEscape(args[0].GetView().substr(0, 32))
+                           << " (KeyDB member TTLs and cron jobs have no equivalent here); the "
+                              "drops are counted in keydb_cmds_dropped";
+  return true;
+}
+
+void ClassicApplier::Count(atomic<uint64_t> ClassicLinkStats::*counter, uint64_t n) {
+  (stats_->*counter).fetch_add(n, memory_order_relaxed);
+  (ClassicTotals().*counter).fetch_add(n, memory_order_relaxed);
 }
 
 ClassicApplier::ClassicApplier(Service* service, ConnectionContext* cntx, string self_uuid,
@@ -176,7 +288,7 @@ EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsign
     }
 
     if (env.uuid == self_uuid_) {
-      stats_->rreplay_self_dropped.fetch_add(1, memory_order_relaxed);
+      Count(&ClassicLinkStats::rreplay_self_dropped);
       break;
     }
 
@@ -199,7 +311,7 @@ EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsign
     current = &inner_args;
   }
 
-  stats_->rreplay_unwrapped.fetch_add(layers, memory_order_relaxed);
+  Count(&ClassicLinkStats::rreplay_unwrapped, layers);
   return EnvelopeResult::kConsumed;
 }
 
@@ -224,12 +336,24 @@ bool ClassicApplier::ParseSingleCommand(string_view bytes, facade::RespVec* args
 
 void ClassicApplier::ApplyCommand(const facade::RespVec& args) {
   const string_view name = args[0].GetView();
-  if (IsControlCommand(name))
+  if (IsControlCommand(name) || SkipKeyDbOnly(args))
     return;
 
   CommandContext cmd;
   cmd.Init(reply_.get(), cntx_);
   facade::FillBackedArgs(args, &cmd);
+  // The dispatcher would reject a command it has no entry for as an unknown one, into the error
+  // builder and upstream's `unknown_` accounting. Inside an envelope it is a command of a KeyDB
+  // (KEYDB.MVCCRESTORE until P7-2 applies it, or one a newer KeyDB added), so it is counted on its
+  // own. The lookup is the dispatcher's, which reads `ACL <sub>` as one name.
+  if (service_->mutable_registry()->FindExtended(facade::ParsedArgs{cmd}).first == nullptr) {
+    Count(&ClassicLinkStats::classic_unknown_cmds_dropped);
+    LOG_EVERY_T(WARNING, 60) << "Dropping a command of an RREPLAY envelope from " << link_
+                             << " that this server has no command for: "
+                             << absl::CHexEscape(name.substr(0, 32))
+                             << "; the drops are counted in classic_unknown_cmds_dropped";
+    return;
+  }
   if (optional<string> error = Dispatch(&cmd); error)
     NoteApplyError(name, *error);
 }
@@ -268,13 +392,13 @@ bool ClassicApplier::SelectDb(DbIndex db) {
 }
 
 void ClassicApplier::NoteMalformed(string_view why, unsigned depth) {
-  stats_->rreplay_malformed.fetch_add(1, memory_order_relaxed);
+  Count(&ClassicLinkStats::rreplay_malformed);
   LOG_EVERY_T(WARNING, 60) << "Skipping a malformed RREPLAY envelope from " << link_
                            << " (nesting level " << depth << "): " << why;
 }
 
 void ClassicApplier::NoteApplyError(string_view command, string_view error) {
-  stats_->classic_apply_errors.fetch_add(1, memory_order_relaxed);
+  Count(&ClassicLinkStats::classic_apply_errors);
   LOG_EVERY_T(WARNING, 10) << "A command of an RREPLAY envelope from " << link_
                            << " did not apply and is skipped: "
                            << absl::CHexEscape(command.substr(0, 32)) << ": " << error;

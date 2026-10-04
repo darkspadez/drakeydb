@@ -103,6 +103,11 @@ struct Metrics {
   uint32_t tx_queue_len = 0;
   uint32_t worker_fiber_count = 0;
   uint32_t blocked_tasks = 0;
+  // drakeydb: P7 -- some classic link of this node (its replica link, or one of its peer links) has
+  // a master that answered active-replica. Set by ServerFamily::GetMetrics, read by Print(). It
+  // sits here because it fits the padding that follows blocked_tasks: Merge()'s and
+  // InitFromThread()'s size checks stay as they are.
+  bool classic_master_active = false;
   size_t worker_fiber_stack_size = 0;
 
   size_t lsn_buffer_size = 0;

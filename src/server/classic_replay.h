@@ -14,6 +14,7 @@
 
 #include "facade/resp_expr.h"
 #include "server/common_types.h"
+#include "server/replica_types.h"
 
 namespace facade {
 class CapturingReplyBuilder;
@@ -71,12 +72,21 @@ enum class RreplayParse { kOk, kBadArity, kBadUuid, kBadDb, kBadMvcc };
 // that has moved its client's db.
 RreplayParse ParseRreplayEnvelope(const facade::RespVec& args, RreplayEnvelope* out);
 
+// Whether `args` (a command of the stream, name included) is one only a KeyDB has, whose effect
+// drakeydb cannot represent: the member expiry commands (PEXPIREMEMBERAT, which is the form KeyDB
+// propagates, EXPIREMEMBER, EXPIREMEMBERAT, and PERSIST with a subkey, three arguments; plain
+// `PERSIST key` is a standard command), the five KEYDB.CRON/HRENAME/NHSET/NHGET/MEXISTS commands,
+// and RREPLAY (an envelope is unwrapped, never dispatched). KEYDB.MVCCRESTORE is not one of them:
+// it carries data, and is applied (spec D-7a). Names are matched without case. False for a command
+// whose name is not a string.
+bool IsKeyDbOnlyCommand(const facade::RespVec& args);
+
 // Counters of one classic link. Relaxed atomics: the replication fiber bumps them, an INFO fiber
-// on another thread reads them.
+// on another thread reads them. Every bump also feeds the process-wide totals (ClassicTotals).
 struct ClassicLinkStats {
   // Envelope layers (a forwarded envelope is two) that parsed, were not the node's own, and whose
-  // inner command was taken apart: the layer's command was applied, skipped as a control command,
-  // or rejected by the dispatcher.
+  // inner command was taken apart: the layer's command was applied, skipped as a control or
+  // KeyDB-only command, dropped as unknown, or rejected by the dispatcher.
   std::atomic<uint64_t> rreplay_unwrapped{0};
   // Envelope layers that were not well formed (RreplayParse), whose inner bytes were not exactly
   // one command, or that nested deeper than ClassicApplier::kMaxNesting. Skipped, never a
@@ -84,11 +94,52 @@ struct ClassicLinkStats {
   std::atomic<uint64_t> rreplay_malformed{0};
   // Envelopes authored by this node, which came back around a mesh; dropped.
   std::atomic<uint64_t> rreplay_self_dropped{0};
-  // Inner commands that did not apply: the dispatcher rejected them before they ran (unknown
-  // command, wrong arity, out of memory) or they ran and replied an error (WRONGTYPE after a
-  // divergence, ...).
+  // KeyDB-only commands (IsKeyDbOnlyCommand), skipped, on the raw stream and inside envelopes.
+  std::atomic<uint64_t> keydb_cmds_dropped{0};
+  // Commands inside an envelope that this server has no command for, skipped before dispatch. Raw
+  // commands of the stream are not counted here: an unknown raw command keeps upstream's
+  // accounting (the `unknown_` lines of INFO commandstats).
+  std::atomic<uint64_t> classic_unknown_cmds_dropped{0};
+  // Inner commands that did not apply: the dispatcher rejected them before they ran (wrong arity,
+  // out of memory, ...) or they ran and replied an error (WRONGTYPE after a divergence, ...).
   std::atomic<uint64_t> classic_apply_errors{0};
+
+  ClassicLinkCounts Snapshot() const;
 };
+
+// The sum of the counters of every classic link this process has had, which /metrics exports (a
+// Prometheus counter must not fall when a link goes away). Process-wide mutable state, but only
+// relaxed, monotonic atomics, as multimaster_lww_dropped is: a link's fiber and the fiber that
+// renders INFO or /metrics run on different threads, and a per-thread ServerState::Stats would
+// not follow a link (nor merge for a Replica that is gone).
+ClassicLinkStats& ClassicTotals();
+
+// A counter as INFO and /metrics show it. `name` and `help` point at static strings.
+struct ClassicCounterValue {
+  std::string_view name;
+  std::string_view help;
+  uint64_t value;
+};
+
+// Whether INFO shows the classic fields of `link`, the counters and (on a peer line) repl_offset:
+// only for a classic link whose master answered active-replica or whose counters have moved, so
+// that a stock master's INFO stays what upstream prints (spec D-13).
+bool ClassicLinkShown(const ReplicaSummary& link);
+
+// Whether `link` is a classic link to an active KeyDB.
+inline bool ClassicMasterActive(const ReplicaSummary& link) {
+  return link.classic_link && link.master_active_replica;
+}
+
+// The counters INFO shows for `link`, in the order of spec D-13: all of them when its master is an
+// active KeyDB, else only the nonzero ones; none unless ClassicLinkShown.
+std::vector<ClassicCounterValue> ClassicLinkFields(const ReplicaSummary& link);
+
+// The process-wide series /metrics shows, as `<name>_total`: from `totals` (ClassicTotals().
+// Snapshot()), all of them when some link of the node has an active KeyDB master, else only the
+// nonzero ones.
+std::vector<ClassicCounterValue> ClassicTotalSeries(const ClassicLinkCounts& totals,
+                                                    bool any_master_active);
 
 enum class EnvelopeResult {
   // The envelope is dealt with, whatever came of it: the stream offset advances past its bytes.
@@ -140,6 +191,10 @@ class ClassicApplier {
   // Whether a command of the stream is an envelope (a case-insensitive RREPLAY).
   static bool IsRreplay(const facade::RespExpr& name);
 
+  // Drops `args`, a command of the stream, if IsKeyDbOnlyCommand: counts it in keydb_cmds_dropped
+  // and warns at a limited rate. True if it was dropped. The raw path of the stream asks it too.
+  bool SkipKeyDbOnly(const facade::RespVec& args);
+
   // Applies the envelope `args` (the whole `RREPLAY ...` command) found at nesting level `depth`
   // (1: straight off the stream), and every envelope nested in it. `args`, and the buffer its
   // views point into, must stay valid for the call.
@@ -160,7 +215,8 @@ class ClassicApplier {
   static bool ParseSingleCommand(std::string_view bytes, facade::RespVec* args);
 
   // Runs the unwrapped command, `args[0]` of which is a string, in the db the context has
-  // selected. Control commands are skipped.
+  // selected. Control commands and KeyDB-only ones are skipped, and so is a command this server
+  // has none for (counted, and not dispatched into the error builder).
   void ApplyCommand(const facade::RespVec& args);
 
   // Dispatches the already filled `cmd` and returns the text of its failure, if it failed: the
@@ -174,6 +230,9 @@ class ClassicApplier {
 
   void NoteMalformed(std::string_view why, unsigned depth);
   void NoteApplyError(std::string_view command, std::string_view error);
+
+  // Adds `n` to `counter` of this link and of the process-wide totals.
+  void Count(std::atomic<uint64_t> ClassicLinkStats::*counter, uint64_t n = 1);
 
   Service* service_;
   ConnectionContext* cntx_;

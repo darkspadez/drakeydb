@@ -12,6 +12,7 @@ import functools
 
 import pytest
 import redis
+from redis import asyncio as aioredis
 
 from .fake_classic_master import (
     EOF_TOKEN,
@@ -1067,3 +1068,409 @@ async def test_unwrap_applies_envelope_larger_than_the_read_buffer(
         assert settled == expected, master.ack_offsets
         assert max(master.ack_offsets) == expected, master.ack_offsets
         assert master.connection_count == 1, "the replica reconnected"
+
+
+# The counters of a classic link, in the order INFO shows them, as /metrics names them (the series
+# is `dragonfly_<name>_total`).
+CLASSIC_COUNTERS = [
+    "rreplay_unwrapped",
+    "rreplay_malformed",
+    "rreplay_self_dropped",
+    "keydb_cmds_dropped",
+    "classic_unknown_cmds_dropped",
+    "classic_apply_errors",
+]
+
+
+def classic_fields(info, peer_mode):
+    """The classic counters of the one link `info` (INFO replication) reports, in INFO's order: the
+    `key:value` lines of a plain replica, the `,key=value` pairs of the master0 line in peer mode.
+    """
+    link = info["master0"] if peer_mode else info
+    return {name: link[name] for name in link if name in CLASSIC_COUNTERS}
+
+
+def classic_series(metrics):
+    """The classic series of a /metrics scrape (`DflyInstance.metrics()`): name to value."""
+    series = {}
+    for name in CLASSIC_COUNTERS:
+        family = metrics.get(f"dragonfly_{name}")
+        if family is not None:
+            assert family.type == "counter", family
+            (sample,) = family.samples
+            assert sample.name == f"dragonfly_{name}_total", sample
+            series[name] = sample.value
+    return series
+
+
+@pytest.mark.keydb
+async def test_keydb_only_commands_dropped_with_counters(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """What an active KeyDB streams that drakeydb has no equivalent of is dropped and counted, and
+    everything around it still applies: a member TTL (`EXPIREMEMBER`, which KeyDB streams as
+    `PEXPIREMEMBERAT`) and a cron job (`KEYDB.CRON`) between a set and a plain key.
+
+    The set arrives whole, without the member's TTL, `keydb_cmds_dropped` is exactly the two
+    commands, none of them is an unknown command or an apply error, and the replica stays up.
+
+    Falsifying: with IsKeyDbOnlyCommand returning false the two commands land in
+    `classic_unknown_cmds_dropped` and `keydb_cmds_dropped` stays 0 (they are not dispatched
+    either way: an unknown command is skipped before the dispatcher).
+    """
+    keydb = keydb_server_factory(active_replica=True)
+    node, c = await attach_plain_replica(df_factory, tmp_path, keydb)
+
+    async with keydb.client() as k:
+        await k.sadd("s", "a", "b")
+        await k.execute_command("EXPIREMEMBER", "s", "a", 100)
+        await k.execute_command("KEYDB.CRON", "job", "single", 3_600_000, "return 1")
+        await k.set("normal", "v")
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def arrived():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("normal") == "v"
+
+        await arrived()
+        assert await c.smembers("s") == {"a", "b"}
+        info = await c.info("replication")
+        assert info["keydb_cmds_dropped"] == 2, info
+        assert info["rreplay_unwrapped"] >= 4, info  # SADD, EXPIREMEMBER, KEYDB.CRON, SET, PINGs
+        assert info["classic_unknown_cmds_dropped"] == 0, info
+        assert info["classic_apply_errors"] == 0, info
+        assert info["rreplay_malformed"] == 0, info
+        assert info["master_link_status"] == "up", info
+        await assert_keydb_saw_one_full_sync(k)
+
+
+@pytest.mark.keydb
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+async def test_info_and_metrics_show_classic_counters(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, peer_mode
+):
+    """A classic link to an active KeyDB shows all its counters in INFO replication, in the link's
+    own block (`key:value` lines of a plain replica, the master0 line with a `repl_offset` in peer
+    mode), and /metrics exports them as `dragonfly_<name>_total`, on a plain replica too (which
+    never reaches the master-side branch of the metrics).
+
+    Falsifying: omitting the INFO branch leaves no field; omitting the replica-side /metrics
+    branch leaves a plain replica without the series (a peer node has them in the master-side
+    one).
+    """
+    keydb = keydb_server_factory(active_replica=True)
+    args = {"active_replica": "true"} if peer_mode else {}
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"), **args)
+    node.start()
+    c = node.client()
+    assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+    if peer_mode:
+        await wait_for_peer_link(c)
+    else:
+        await wait_available_async(c)
+
+    async with keydb.client() as k:
+        await k.sadd("s", "a")
+        await k.execute_command("EXPIREMEMBER", "s", "a", 100)
+        await k.set("normal", "v")
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def arrived():
+            assert await c.get("normal") == "v"
+
+        await arrived()
+
+    info = await c.info("replication")
+    fields = classic_fields(info, peer_mode)
+    assert list(fields) == CLASSIC_COUNTERS, info
+    assert fields["keydb_cmds_dropped"] == 1, fields
+    assert fields["rreplay_unwrapped"] >= 3, fields  # SADD, EXPIREMEMBER, SET, and KeyDB's PINGs
+    if peer_mode:
+        assert info["master0"]["repl_offset"] > 0, info
+
+    series = classic_series(await node.metrics())
+    assert list(series) == CLASSIC_COUNTERS, series
+    assert series["keydb_cmds_dropped"] == 1, series
+    for name in CLASSIC_COUNTERS:  # the process-wide sum is never behind the link's own count
+        assert series[name] >= fields[name], (name, series, fields)
+
+
+async def attach_scripted_master(df_factory, tmp_path, master, peer_mode):
+    """A node (a peer node if `peer_mode`) replicating from `master`, with its client."""
+    args = {"active_replica": "true"} if peer_mode else {}
+    node = df_factory.create(
+        proactor_threads=2, dir=str(tmp_path / "df"), replication_acks_interval=100, **args
+    )
+    node.start()
+    c = node.client()
+    assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+    return node, c
+
+
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+async def test_scripted_active_master_exact_classic_counters(
+    df_factory: DflyInstanceFactory, tmp_path, peer_mode
+):
+    """The exact counters of a master that says `active-replica`, in INFO and /metrics, for a
+    stream with every outcome: an applied envelope, a member-expiry envelope and a raw one (both
+    KeyDB-only), an unknown command and a `KEYDB.MVCCRESTORE` (which is applied only from P7-2: it
+    is an unknown command here, never a KeyDB-only one, decision 22), a wrong-arity `SET`, a
+    malformed envelope, and a raw command.
+
+    5 envelopes were taken apart (the malformed one was not), so rreplay_unwrapped is 5, and the
+    link is shown whole, zeros included.
+
+    Falsifying: a KeyDB-only check that also took KEYDB.MVCCRESTORE puts it in keydb_cmds_dropped
+    (3, with unknown 1); one that took nothing leaves keydb_cmds_dropped 0 and unknown 3.
+    """
+    stream = b"".join(
+        [
+            rreplay("SET", "a", 1, mvcc=1),
+            rreplay("EXPIREMEMBER", "s", "m", 100, mvcc=2),
+            resp_command("PEXPIREMEMBERAT", "s", "m", 1791058571443),
+            rreplay("NOSUCHCMD", "x", mvcc=3),
+            rreplay("KEYDB.MVCCRESTORE", "k", 1878060925646274561, -1, "payload", mvcc=4),
+            rreplay("SET", "wrong-arity", mvcc=5),
+            resp_command("RREPLAY", "not-a-uuid", resp_command("SET", "bad", 1), 0, 6),
+            resp_command("SET", "b", 2),
+        ]
+    )
+    async with FakeClassicMaster() as master:
+        master.script_capa_reply(b"+OK active-replica\r\n")
+        if peer_mode:
+            master.script_uuid("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET, tail=EOF_TOKEN + stream))
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("b") == "2"
+
+        await applied()
+        assert await c.get("a") == "1"
+        assert await c.dbsize() == 2  # a, b
+        expected = SYNC_OFFSET + len(stream)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+
+        info = await c.info("replication")
+        assert classic_fields(info, peer_mode) == {
+            "rreplay_unwrapped": 5,
+            "rreplay_malformed": 1,
+            "rreplay_self_dropped": 0,
+            "keydb_cmds_dropped": 2,
+            "classic_unknown_cmds_dropped": 2,
+            "classic_apply_errors": 1,
+        }, info
+        assert list(classic_fields(info, peer_mode)) == CLASSIC_COUNTERS
+        if peer_mode:
+            assert info["master0"]["repl_offset"] == expected, info
+        assert classic_series(await node.metrics()) == {
+            "rreplay_unwrapped": 5,
+            "rreplay_malformed": 1,
+            "rreplay_self_dropped": 0,
+            "keydb_cmds_dropped": 2,
+            "classic_unknown_cmds_dropped": 2,
+            "classic_apply_errors": 1,
+        }
+
+
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+async def test_scripted_quiet_active_master_shows_zero_counters(
+    df_factory: DflyInstanceFactory, tmp_path, peer_mode
+):
+    """A master that says `active-replica` shows its link whole from the start: six zeros, and in
+    peer mode the offset, before a single envelope has arrived.
+
+    Falsifying: showing only the counters that moved leaves INFO and /metrics empty here.
+    """
+    async with FakeClassicMaster() as master:
+        master.script_capa_reply(b"+OK active-replica\r\n")
+        if peer_mode:
+            master.script_uuid("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET))
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def linked():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            info = await c.info("replication")
+            link = info["master0"] if peer_mode else info
+            assert link["master_link_status" if not peer_mode else "link_status"] == "up", info
+
+        await linked()
+        info = await c.info("replication")
+        assert classic_fields(info, peer_mode) == dict.fromkeys(CLASSIC_COUNTERS, 0), info
+        if peer_mode:
+            assert info["master0"]["repl_offset"] == SYNC_OFFSET, info
+        assert classic_series(await node.metrics()) == dict.fromkeys(CLASSIC_COUNTERS, 0)
+
+
+async def test_scripted_stock_master_raw_keydb_only_command_shows_only_that_counter(
+    df_factory: DflyInstanceFactory, tmp_path
+):
+    """A master that did not say `active-replica` (a plain KeyDB streams `PEXPIREMEMBERAT` raw) has
+    its KeyDB-only command dropped and counted on the raw path as well, its bytes counted into the
+    offset, and the commands around it applied. Its link shows only the counter that moved, and
+    /metrics only that series: nothing else of a stock master's INFO changes.
+
+    An unknown raw command is not this task's to count: it stays on upstream's accounting, so
+    `classic_unknown_cmds_dropped` stays out of both.
+
+    Falsifying: without the raw-path check the command reaches the dispatcher (an unknown
+    command), `keydb_cmds_dropped` stays 0 and no field is shown.
+    """
+    stream = (
+        resp_command("SET", "a", 1)
+        + resp_command("PEXPIREMEMBERAT", "s", "m", 1791058571443)
+        + resp_command("NOSUCHRAWCMD", "x")
+        + resp_command("pexpirememberat", "s", "m", 1791058571443)
+        + resp_command("SET", "b", 2)
+    )
+    async with FakeClassicMaster() as master:
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET, tail=EOF_TOKEN + stream))
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode=False)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("b") == "2"
+
+        await applied()
+        assert await c.get("a") == "1"
+        expected = SYNC_OFFSET + len(stream)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert master.connection_count == 1, "the replica reconnected"
+
+        info = await c.info("replication")
+        assert classic_fields(info, False) == {"keydb_cmds_dropped": 2}, info
+        assert classic_series(await node.metrics()) == {"keydb_cmds_dropped": 2}
+        stats = await c.info("commandstats")
+        assert any(name.lower() == "unknown_nosuchrawcmd" for name in stats), stats
+
+
+async def write_and_wait(master_client, c):
+    """Writes a few keys of different kinds to a master, and waits until a replica has them."""
+    await master_client.set("stock:str", "v")
+    await master_client.incr("stock:counter")
+    await master_client.hset("stock:hash", mapping={"f": "1"})
+    await master_client.set("stock:last", "done")
+
+    @assert_eventually(times=300)
+    @retry_while_loading
+    async def arrived():
+        assert await c.get("stock:last") == "done"
+        assert await c.get("stock:counter") == "1"
+        assert await c.hgetall("stock:hash") == {"f": "1"}
+
+    await arrived()
+
+
+async def assert_no_classic_fields(node, c, peer_mode, has_master=True):
+    """Neither INFO replication nor /metrics shows a classic field or series.
+
+    Where the node has a master, the link's block also ends where it did before the classic fields
+    existed: the plain replica's with `psync_successes`, a peer line with `clock_skew_ms`."""
+    info = await c.info("replication")
+    link = info["master0"] if peer_mode else info
+    for name in CLASSIC_COUNTERS + ["repl_offset"]:
+        assert name not in link, (name, info)
+    assert classic_series(await node.metrics()) == {}
+    assert not any("rreplay" in name or "classic" in name or "keydb" in name for name in link), link
+    if has_master:
+        assert list(link)[-1] == ("clock_skew_ms" if peer_mode else "psync_successes"), link
+
+
+async def test_info_and_metrics_absent_for_stock_master(
+    df_factory: DflyInstanceFactory, redis_server, tmp_path
+):
+    """A plain Redis master, every counter zero: INFO replication and /metrics have no classic
+    field and no classic series, exactly as before this feature.
+
+    Falsifying: rendering the classic fields (or the series) unconditionally shows six zeros.
+    """
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"))
+    node.start()
+    c = node.client()
+    assert await c.execute_command(f"REPLICAOF localhost {redis_server.port}") == "OK"
+    await wait_available_async(c)
+    async with aioredis.Redis(port=redis_server.port, decode_responses=True) as master:
+        await write_and_wait(master, c)
+    info = await c.info("replication")
+    assert info["role"] == "slave" and info["master_link_status"] == "up", info
+    await assert_no_classic_fields(node, c, peer_mode=False)
+
+
+@pytest.mark.keydb
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+async def test_info_and_metrics_absent_for_keydb_that_is_not_active(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, peer_mode
+):
+    """The same for a KeyDB that is not an active replica (it streams raw commands, no envelope),
+    on a plain replica and on a peer node."""
+    keydb = keydb_server_factory(active_replica=False)
+    args = {"active_replica": "true"} if peer_mode else {}
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"), **args)
+    node.start()
+    c = node.client()
+    assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+    if peer_mode:
+        await wait_for_peer_link(c)
+    else:
+        await wait_available_async(c)
+    async with keydb.client() as k:
+        await write_and_wait(k, c)
+    await assert_no_classic_fields(node, c, peer_mode)
+
+
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+async def test_info_and_metrics_have_no_classic_fields_between_dfly_nodes(
+    df_factory: DflyInstanceFactory, tmp_path, peer_mode
+):
+    """A DFLY-to-DFLY link, plain or between two peer nodes, shows no classic field on either
+    node, and neither node exports a classic series.
+
+    Falsifying: rendering for every link that is not marked classic shows the zeros here.
+    """
+    args = {"active_replica": "true"} if peer_mode else {}
+    master = df_factory.create(proactor_threads=2, dir=str(tmp_path / "master"), **args)
+    replica = df_factory.create(proactor_threads=2, dir=str(tmp_path / "replica"), **args)
+    df_factory.start_all([master, replica])
+    cm, cr = master.client(), replica.client()
+    assert await cr.execute_command(f"REPLICAOF localhost {master.port}") == "OK"
+    if peer_mode:
+        await wait_for_peer_link(cr)
+    else:
+        await wait_available_async(cr)
+    await write_and_wait(cm, cr)
+    await assert_no_classic_fields(replica, cr, peer_mode)
+    await assert_no_classic_fields(master, cm, False, has_master=False)
+
+
+async def test_active_replica_boot_warning_names_keydb_drops(
+    df_factory: DflyInstanceFactory, tmp_path
+):
+    """An --active_replica node warns at boot that KeyDB member TTLs and cron jobs are dropped on
+    onboarding, among its known limitations; a node that is not active prints no such warning.
+
+    Falsifying: leaving the sentence out of the warning (multi_master.cc) fails the first check.
+    """
+    active = df_factory.create(
+        proactor_threads=2, dir=str(tmp_path / "active"), active_replica="true"
+    )
+    plain = df_factory.create(proactor_threads=2, dir=str(tmp_path / "plain"))
+    df_factory.start_all([active, plain])
+    await wait_available_async(active.client())
+    await wait_available_async(plain.client())
+    active.stop()
+    plain.stop()
+    sentence = r"KeyDB member TTLs and cron jobs are dropped on onboarding"
+    assert active.find_in_logs(sentence), "the boot limitations warning does not name the drops"
+    assert not plain.find_in_logs(sentence)
