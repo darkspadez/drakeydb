@@ -948,6 +948,16 @@ the author's `repl_origin_idx` with `repl_lww_guard = false` for that dispatch, 
 dirtied the dataset (`server.cpp:4618-4648`) — a failed NX/XX returns before `dirty++`
 (`t_string.cpp:104-108`), `MSETNX` returns 0 before `setKey` (`:556-563`) — so every conditional on
 the wire already succeeded on its author.
+**Residual (spec D-9).** The rewrites are **not** gated on `LwwGuardActive`: they run on every
+envelope link, so plain links are affected, and `SET k v XX KEEPTTL` becomes `SET k v KEEPTTL` there
+too. On a flagged plain replica that turns a converging case into an orphan wherever the key is
+missing when the command arrives: the unrewritten `XX` would fail and leave the key absent until
+the master's own expiry, where `KEEPTTL` recreates it with no TTL. Tasks 2.8 and 2.9 close it while
+the link is healthy (the key is found, with its TTL); it stays open where they fall back (a stamp
+more than 60 s from the local clock, a stream more than 60 s behind) and on a peer link (D-27). Not
+changed here: keeping `XX KEEPTTL` whole on plain links would need a link-kind parameter on
+`ClassicApplyRewrites` and a second column in its table, for a case the next tasks close, and a
+peer link needs the strip for the guard; revisit if the review asks.
 - [ ] **Step 1: Failing tests.** `ClassicReplayTest.ClassicApplyRewrites*` (table-driven, incl. `NX
   KEEPTTL`, `XX KEEPTTL`, `NX GET`, lower case, `MSETNX`; non-SET and unrelated args untouched);
   `ClassicApplyFamilyTest.StaleKeyDbSetLosesToNewerLocalWrite`, `.NxSetAppliesAsGuardedSet`,
@@ -1147,17 +1157,29 @@ every exit (early return and error included), and the others extend it.
   has the same layout; the `- 1` is the 1 ms edge, below) when `mvcc != 0` and `mvcc >> 20` is
   within `kMaxEnvelopeTimeSkewMs = 60'000` of `now_ms`, either way, inclusive; else 0, which means
   "keep the local clock". `OBJ_MVCC_INVALID` (all ones) and any stamp with bit 63 set fall outside
-  the window by themselves, and a usable stamp is never 0 after the shift.
+  the window by themselves, and a usable stamp is never 0 after the shift. The window is tested as
+  `ms + 60'000 >= now_ms && ms <= now_ms + 60'000`, never with `now_ms - 60'000` on the unsigned
+  clock, which wraps below 60 s.
 - `ConnectionContext::repl_time_ms` (0: none): per command, unlike `repl_origin_idx` and
-  `repl_lww_guard`, which are per link. `ClassicApplier::ApplyCommand` gains the envelope's mvcc
-  (the **outermost** layer's: the depth-1 envelope the whole tree arrived in, which
-  `HandleRreplay` keeps while it unwraps; Task 2.2's author and stamp stay the innermost's) and
-  sets it from `EnvelopeTimeMs(mvcc, GetCurrentTimeMs())`. **Why the outermost (decision 30):**
-  the outermost layer is the master's. A master that forwards what it replayed wraps the original
-  author's envelope in its own, whose mvcc it minted on its own clock when it ran the command and
-  decided expiry there, so its replica is to hold what it holds; the author's clock decided
-  nothing on this keyspace (the nested capture shows the two clocks differ). With `multi-master-
-  no-forward yes` there is one layer and the two coincide. A fallback of a non-zero mvcc is a
+  `repl_lww_guard`, which are per link. The time is evaluated **once** per envelope tree, in
+  `HandleRreplay` at depth 1: `EnvelopeTimeMs(outer_mvcc, GetCurrentTimeMs())` of the **outermost**
+  layer (the depth-1 envelope the whole tree arrived in), taken once the layer has parsed (`kOk`),
+  `running()` has said yes and the self-author check has passed, and before `ParseSingleCommand`
+  (the point Task 2.9's stream-clock advance uses too). `env` is re-declared per layer in the loop
+  (`classic_replay.cc:283`), so the depth-1 mvcc needs a variable of its own that outlives it;
+  Task 2.2's author and stamp stay the innermost's, the last iteration's.
+  `ClassicApplier::ApplyCommand` gains the resulting time, not an mvcc, and sets the field from it:
+  it reads neither the clock nor an mvcc. **Why once:** Task 2.9 feeds the same number to the
+  stream clock. Two evaluations read the local clock twice and can disagree at the 60 s edge: the
+  advance sees a stamp 60'001 ms ahead as implausible, and the apply, a read later, sees it 59'999
+  ahead and plausible, so the command runs past the stream clock and Task 2.9's hide fires on the
+  command's own read. With one value the command's time is at or below the clock its envelope has
+  just advanced, by construction. **Why the outermost (decision 30):** the outermost layer is the
+  master's. A master that forwards what it replayed wraps the original author's envelope in its own,
+  whose mvcc it minted on its own clock when it ran the command and decided expiry there, so its
+  replica is to hold what it holds; the author's clock decided nothing on this keyspace (the nested
+  capture shows the two clocks differ). With `multi-master- no-forward yes` there is one layer and
+  the two coincide. A fallback of a non-zero mvcc, at that one evaluation, is a
   `LOG_EVERY_T(WARNING, 60)` naming the link, the stamp's ms and the local clock, and no counter:
   D-13's six counters are pinned by exact-equality tests in INFO and /metrics, and a seventh is a
   follow-up the owner can ask for. `SELECT` (the first use of a db) is not a data command and keeps
@@ -1245,29 +1267,30 @@ every exit (early return and error included), and the others extend it.
   `.PeerStampStaysTheEnvelopeMvccWhenTheTimeFallsBack` (a stamp whose ms is 61 s off: the time is
   local, `StampOf(key)` is still `{envelope mvcc, author hash}`).
   `ClassicReplayTest.EnvelopeTimeMs*` (table: 0, all ones, bit 63, now, +-59'999, +-60'000 and
-  +-60'001 ms, the counter bits ignored; a usable stamp gives its milliseconds less one) and a direct `Transaction` test that `InitTxTime()` after
-  `SetReplTime(ms)` keeps `ms` (the retry; `transaction.h` needs a `friend` for it, like
-  `ReplicaActiveExpiryTest`). Pytests, in the file's window section (the flips):
+  +-60'001 ms, the counter bits ignored, a `now_ms` below 60'000 so that the window cannot wrap; a
+  usable stamp gives its milliseconds less one) and a direct `Transaction` test that
+  `InitTxTime()` after `SetReplTime(ms)` keeps `ms` (the retry; `transaction.h` needs a `friend` for
+  it, like `ReplicaActiveExpiryTest`). Pytests, in the file's window section (the flips):
   `test_plain_replica_of_active_keydb_loses_a_ttl_refresh_that_arrives_after_the_deadline[envelope-access_only]`
   now expects `exists k == 1` and `0 < pttl k <= 60_000`, and its `raw` and `envelope-sweep` cases
   keep expecting absence;
   `test_plain_replica_of_active_keydb_recomputes_a_counter_from_nothing_after_the_deadline[envelope_applied_before_the_deadline-access_only]`
   now expects `"6"`, and the other five cases keep `"1"` (the `-sweep` one because the sweep deleted
   `c` at the replica's `E`). Under this task alone, only the two `--hz=0` / `access_only` envelope
-  cases flip, and no `-sweep` one does (Task 2.9 flips the other two of the four). The orphan
-  pytest (`..._keeps_a_ttl_less_orphan_of_a_ttl_keeping_write`) flips in its `access_only` case
-  only: the writes find their keys live at the author's time, so nothing is recreated; it now
-  expects the three keys in DBSIZE after the late commands and none of them after the first
-  client read (the read runs on the local clock and deletes them). Its `sweep` case stays. New pytest
+  cases flip, and no `-sweep` one does (Task 2.9 flips the other two of the four). The orphan pytest
+  (`..._keeps_a_ttl_less_orphan_of_a_ttl_keeping_write`) flips in its `access_only` case only: the
+  writes find their keys live at the author's time, so nothing is recreated; it now expects the
+  three keys in DBSIZE after the late commands and none of them after the first client read (the
+  read runs on the local clock and deletes them). Its `sweep` case stays. New pytest
   `test_plain_replica_honours_an_envelope_time_only_within_a_minute_of_its_own` (fake master,
   `--hz=0`, crafted mvcc values; the exact edges are the gtest table's). A key due locally, then a
   `PEXPIREAT` whose envelope says the master applied it 45 s ago (before the deadline): honoured,
-  the key survives; 75 s ago: falls back to the local clock, the key is gone; mvcc 0: local, gone.
-  A key still live locally (deadline 30 s ahead) and a `PEXPIREAT` stamped 45 s in the future:
-  honoured, so the key is due at that time and gone; stamped 75 s ahead: local, the key survives.
-  A `peer_mode` variant once Tasks 2.2 and 2.4 are in the same branch. Under Task 2.9 the crafted
-  stamps also move the stream clock: re-run it there (a stamp 45 s ahead moves the sweep clock
-  45 s ahead, which is what the case already asserts of the key).
+  the key survives; 75 s ago: falls back to the local clock, the key is gone; mvcc 0: local, gone. A
+  key still live locally (deadline 30 s ahead) and a `PEXPIREAT` stamped 45 s in the future:
+  honoured, so the key is due at that time and gone; stamped 75 s ahead: local, the key survives. A
+  `peer_mode` variant once Tasks 2.2 and 2.4 are in the same branch. Under Task 2.9 the crafted
+  stamps also move the stream clock: re-run it there (a stamp 45 s ahead moves the sweep clock 45 s
+  ahead, which is what the case already asserts of the key).
 - [ ] **Step 2: Run, observe failure** (the flipped cases and the crafted ones fail on the P7-1
   behaviour; the controls and the raw cases pass).
 - [ ] **Step 3: Implement** as above; document `repl_time_ms` in `conn_context.h` beside
@@ -1283,7 +1306,11 @@ every exit (early return and error included), and the others extend it.
   pytest cases fail), and then one side only (the other side's cases fail); (h) the innermost
   layer's time (`NestedEnvelopeUsesTheOutermostLayersTime`); (i) `EnvelopeTimeMs` without its `- 1`
   (`EnvelopeTimeOfTheDeadlineIsLive`, `RelativeTtlIsAnchoredOnTheEnvelopeTime` and the `EnvelopeTimeMs*`
-  table fail). Record that the `raw` and `-sweep` pytest cases pass under the change and under its
+  table fail); (j) the window tested with `now_ms - 60'000` (the small-`now_ms` table row fails);
+  (k) **a review item, not a falsification:** `ApplyCommand` evaluating `EnvelopeTimeMs` itself, a
+  second read of the clock (a test's mocked clock gives both reads the same value, so no test can
+  tell; the single evaluation is a comment at its site, and the Task 2.9 review checks it).
+  Record that the `raw` and `-sweep` pytest cases pass under the change and under its
   reversal alike: they pin what the change must not touch (the raw clock, the sweep's residual,
   which Task 2.9 then closes), not the change itself.
 - [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; the whole of `classic_replay_test`,
@@ -1303,24 +1330,27 @@ wrong reason.
 
 ### Task 2.9: Sweep clock and read-path hide (decisions 29 and 30)
 
-**Goal:** On a flagged plain replica, the heartbeat sweep and a client's read of a due key judge a
-deadline on the clock the master has reached, the **stream clock**, not on the replica's own. A
+**Goal:** On a flagged plain replica, the heartbeat sweep and a client's read of a due key (a
+`SCAN`, `KEYS` or `RANDOMKEY` too, owner decision 33) judge a deadline on the clock the master has
+reached, the **stream clock**, not on the replica's own. A
 command the master ran before a deadline and the replica has not applied yet then still finds the
 key, whatever the lag, and the option-A orphan (decision 31, ISSUE-REGISTER D-32) closes while the
 link is healthy. Spec D-9 has the window and what this closes and leaves; read it first. Decision
 30 applies: the clock is the **outermost** layer's, as in Task 2.8.
-**Files:** Modify `src/server/classic_replay.{h,cc}` (the clock, `SweepClockMs`, the applier's
-`publish_clock`, the advance), `src/server/replica.{h,cc}` (`publish_clock` at the applier's
-construction, the reset in `ApplyReplicaActiveExpiry`, the floor warning in `RedisStreamAcksFb`,
-the lag in `GetSummary`), `src/server/replica_types.h`, `src/server/server_family.cc` (one INFO
-line), `src/server/engine_shard.cc` (the sweep's clock, `:885`), `src/server/db_slice.cc` (the
-hide, `:947-953`), `docs/UPSTREAM-SYNC.md`; Test `src/server/classic_replay_test.cc`,
-`tests/dragonfly/keydb_onboarding_test.py`. About nine hunks, two of them in files upstream edits
-often (`engine_shard.cc`, `db_slice.cc`). **Cost:** one relaxed load per envelope (and a relaxed
-store when the stamp is larger), one load per heartbeat tick, one load per read of a due key on a
-flagged replica.
-**Depends on:** Task 2.8 (`EnvelopeTimeMs`: its 60 s window and the `m - 1`, the outermost layer's
-mvcc, so that the apply time and the stream clock agree) and Task 1.4 (the flag).
+**Files:** Modify `src/server/classic_replay.{h,cc}` (the clock, `SweepClockMs`,
+`StreamClockHides`, the applier's `publish_clock`, the advance), `src/server/replica.{h,cc}`
+(`publish_clock` at the applier's construction, the reset in `ApplyReplicaActiveExpiry`, the floor
+warning in `RedisStreamAcksFb`, the lag in `GetSummary`), `src/server/replica_types.h`,
+`src/server/server_family.cc` (one INFO line), `src/server/engine_shard.cc` (the sweep's clock,
+`:885`), `src/server/db_slice.cc` (the hide, `:947-953`), `src/server/generic_family.cc` (the
+`ScanCb` hide, `:814`), `docs/UPSTREAM-SYNC.md`; Test `src/server/classic_replay_test.cc`,
+`tests/dragonfly/keydb_onboarding_test.py`. About ten hunks, three of them in files upstream edits
+often (`engine_shard.cc`, `db_slice.cc`, `generic_family.cc`). **Cost:** one relaxed load per
+envelope (and a relaxed store when the stamp is larger), one load per heartbeat tick, one load per
+read of a due key on a flagged replica, `SCAN` and `KEYS` visits included.
+**Depends on:** Task 2.8 (`EnvelopeTimeMs`: its 60 s window and the `m - 1`, evaluated once for the
+outermost layer at depth 1, so that the apply time and the stream clock are the same number) and
+Task 1.4 (the flag).
 **Interfaces:**
 - **The clock.** A process-wide `std::atomic<uint64_t> stream_ms` in `classic_replay.cc`, beside
   `active_keydb_master_seen` (0: no stamp yet), with `StreamClockMs()`, `AdvanceStreamClockMs(ms)`
@@ -1330,37 +1360,66 @@ mvcc, so that the apply time and the stream clock agree) and Task 1.4 (the flag)
   `bool publish_clock` at construction, which `Replica` sets from `main_link_ && !IsPeerMode()`
   (the predicate `ApplyReplicaActiveExpiry` already uses, factored into one `PublishesStreamClock()`
   so the warning below reads the same); an `ADDREPLICAOF` link and a peer link never publish.
-- **The advance** is in `HandleRreplay`, at depth 1 only, once the layer has parsed (`kOk`) and
-  `running()` has said yes, after the self-author check (a self-authored layer is dropped, and its
-  stamp is not the master's) and before anything is selected or dispatched: when
-  `EnvelopeTimeMs(env.mvcc, GetCurrentTimeMs())` is non-zero, `AdvanceStreamClockMs` takes it (the
-  outermost layer's stamp, less one, through Task 2.8's 60 s window). It is **not** in
+- **The advance** is in `HandleRreplay`, at depth 1 only, at the point where Task 2.8 evaluates
+  `EnvelopeTimeMs` once: the layer has parsed (`kOk`), `running()` has said yes and the self-author
+  check has passed (a self-authored layer is dropped, and its stamp is not the master's), and
+  neither `ParseSingleCommand` nor `ApplyCommand` has run. It is **not** "before anything is
+  selected": `SelectDb` already ran for the layer's db, before the self check
+  (`classic_replay.cc:293` against `:301`, as KeyDB selects before it looks at the author), and a
+  `SELECT` is no data command. When that one value (the outermost layer's stamp, less one, through
+  Task 2.8's 60 s window) is non-zero and the applier publishes, `AdvanceStreamClockMs` takes it,
+  and it is the time `ApplyCommand` runs the command at; it is not evaluated again here, since two
+  reads of the clock can disagree at the window's edge (Task 2.8). It is **not** in
   `ApplyCommand`, which returns early for `PING`, `MULTI`, `EXEC`, `REPLCONF`, `SELECT` and for
   KeyDB-only commands: KeyDB wraps its periodic `PING` in an envelope with an mvcc (segment 13 of
   `tests/dragonfly/data/README.md`, `repl-ping-replica-period`, 10 s by default,
   `config.cpp:2920`) and that envelope is the clock's heartbeat on a quiet master.
 - **The reset** is `ResetStreamClock()` in `Replica::ApplyReplicaActiveExpiry`, after its early
-  return for a peer-mode or non-main link, so wherever the flag is applied: the top of
-  `MainReplicationFb`, after every successful in-loop `Greet()`, and at the end with `false`. A new
-  master, or the same one after a reconnect, starts without a clock, and the sweep is on the local
-  one until its first stamp.
+  return for a peer-mode or non-main link, and only when the master is not the one the clock last
+  advanced under, or the flag is cleared: the main link records the master's identity
+  (`MasterContext::master_node_uuid` and `master_repl_id`, `replica.h:37-45`) beside the clock, and
+  each call, from the top of `MainReplicationFb` and after every successful in-loop `Greet()`,
+  compares it, while the call with `false` at the end always resets. It is **not** reset on every
+  `Greet()`: a reconnect to the same master, and a `+CONTINUE` resume (Task 3.1), continue the same
+  stream, so its last stamp is still the best known clock, and the 60 s floor, not a reset, bounds a
+  long outage (a reset would put the sweep on the local clock while the backlog the master queued is
+  yet to be applied, the window this task closes). A new master starts without a clock, and the
+  sweep is on the local one until its first stamp.
 - **The sweep clock.** `uint64_t SweepClockMs(uint64_t stream_ms, uint64_t now_ms)` (pure, so a
-  gtest can table-drive it): `stream_ms ? max(stream_ms, now_ms - kStreamClockFloorMs) : now_ms`,
-  `kStreamClockFloorMs = 60'000`; an overload without `stream_ms` reads the atomic.
+  gtest can table-drive it): `stream_ms ? max(stream_ms, floor) : now_ms` with `floor = now_ms >
+  kStreamClockFloorMs ? now_ms - kStreamClockFloorMs : 0`, `kStreamClockFloorMs = 60'000`; an
+  overload without `stream_ms` reads the atomic. The guard is not cosmetic: `now_ms` is unsigned, a
+  bare `now_ms - 60'000` wraps on a clock below 60 s (a test's mock time, a node whose clock was
+  just set) to a floor near 2^64, and the sweep would then delete every key that has a TTL.
   `EngineShard::RetireExpiredAndEvict` uses it for `db_cntx.time_now_ms` on a flagged shard
   (`engine_shard.cc:885`, which reads `GetCurrentTimeMs()` once and keeps it for a shard that is
   not flagged). `DeleteExpiredStep` compares `E <= S` there, the same `>=` as everywhere.
-- **The read-path hide.** In `DbSlice::FindInternal`, at the expiry block (`db_slice.cc:947-953`),
-  before `ExpireIfNeeded`: when `stats_mode == UpdateStatsMode::kReadStats` and
-  `owner_->ReplicaActiveExpiry()`, and the key is due at the transaction's time
-  (`cntx.time_now_ms >= expire`) and `stream_ms` is set and `SweepClockMs(now) < expire`, the key
-  is **hidden**: return `OpStatus::KEY_NOTFOUND`, count a miss like any other, and leave the entry
-  in the table. The mutable path (`AddOrFindInternal` through `kMutableStats`) is unchanged: a
-  hide there would collide with inserts (the key would be reported absent and then inserted over
-  its own entry). An enveloped command with a plausible stamp never reaches the hide: its time is
-  the stamp less one, which is at or below the `stream_ms` the same envelope has just advanced, so
-  the key is due on `S` whenever it is due on `T`. `DbSlice::ExpireAllIfNeeded` (`DFLY EXPIRE`,
-  `dflycmd.cc:650`) stays on the local clock; say so in a comment there.
+- **The read-path hide.** One predicate, `bool StreamClockHides(uint64_t time_now_ms, uint64_t
+  expire_ms)` in `classic_replay.{h,cc}` (fork-only, so each upstream hunk is one call): the key is
+  due at `time_now_ms` (`time_now_ms >= expire_ms`), `stream_ms` is set and
+  `SweepClockMs(GetCurrentTimeMs()) < expire_ms`. (Its `stream_ms` test is redundant for a command
+  that runs at or before the local clock, which is every one but an enveloped command of a link
+  that does not publish, with a stamp ahead of the clock; see falsification (k).) In
+  `DbSlice::FindInternal`, at the expiry block (`db_slice.cc:947-953`), before `ExpireIfNeeded`:
+  when `stats_mode == UpdateStatsMode::kReadStats`, `owner_->ReplicaActiveExpiry()` and
+  `StreamClockHides(cntx.time_now_ms, expire)`, the key is **hidden**: return
+  `OpStatus::KEY_NOTFOUND`, count a miss like any other, and leave the entry in the table. The
+  mutable path (`AddOrFindInternal` through `kMutableStats`) is unchanged: a hide there would
+  collide with inserts (the key would be reported absent and then inserted over its own entry). An
+  enveloped command of the publishing link with a plausible stamp never reaches the hide: its time
+  is the stamp less one, the very value its envelope has just advanced `stream_ms` to (Task 2.8's
+  single evaluation), so the key is due on `S` whenever it is due on `T`; a command of an
+  `ADDREPLICAOF` link can reach it, and sees what it saw before, no key, with the entry left in the
+  table. **`ScanCb` hides too (owner decision 33):** in `ScanCb` (`generic_family.cc:814`), before
+  its `ExpireIfNeeded`, when `op_args.shard->ReplicaActiveExpiry()` and
+  `StreamClockHides(op_args.db_cntx.time_now_ms, expire)`, `return false`: the key is neither
+  returned nor deleted. `ScanCb` is the callback of `OpScan`, reached by `SCAN` and `KEYS`
+  (`ScanGeneric`), by `RANDOMKEY` (`RandomKey`'s own `OpScan` calls, `:3394`) and by `RM`
+  (`OpScanAndDelete`), always with a hand-built `OpArgs` and no transaction, so its time is the
+  local clock at the start of the scan. Without the hide a monitoring `SCAN` or `KEYS` deletes a key
+  that is due locally but not yet on the stream clock, and brings the orphan back for it.
+  `DbSlice::ExpireAllIfNeeded` (`DFLY EXPIRE`, `dflycmd.cc:650`) stays on the local clock; say so in
+  a comment there.
 - **INFO.** `ReplicaSummary::stream_clock_lag_ms` (`std::optional<int64_t>`, set by
   `Replica::GetSummary` for the main link of a flagged replica: `now - SweepClockMs(now)`; 0 before
   the first stamp, at most 60'000, negative when the master's clock runs ahead) and one line in
@@ -1370,23 +1429,23 @@ mvcc, so that the apply time and the stream clock agree) and Task 1.4 (the flag)
   `LOG_EVERY_T(WARNING, 60)` naming the link and the silence: due keys are then being deleted on the
   local clock less 60 s. No Prometheus series: it is a gauge, and decision 15 mirrors counters.
 - **Bounds, said in the code and in the docs.** A due key can linger, hidden, for up to one ping
-  period (10 s by default), 60 s with the link down. The keys of an `ADDREPLICAOF` link on the same
-  shard are judged on the main link's clock. `SCAN`/`KEYS` (`ScanCb`, `generic_family.cc:814`)
-  call `ExpireIfNeeded` themselves and keep deleting a due key on the transaction's clock; the
-  insert-time GC (`db_slice.cc:258`) runs on the inserting transaction's, the author's for an
-  enveloped insert.
+  period (10 s by default), 60 s with the link down, and `SCAN`/`KEYS`/`RANDOMKEY` skip it for as
+  long (decision 33). The keys of an `ADDREPLICAOF` link on the same shard are judged on the main
+  link's clock. The insert-time GC (`db_slice.cc:258`) runs on the inserting transaction's clock,
+  the author's for an enveloped insert, and `DFLY EXPIRE` on the local one.
 - [ ] **Step 0: Audit the readers of the expiry decision** and record the table in
   `task-2.9-report.md`: every caller of `ExpireIfNeeded` and every expiry decision outside it, and
   which clock each runs on and what it does to a hidden key. Known at the time of writing:
   `FindInternal` (the hide), `DeleteExpiredStep` through the heartbeat (the sweep clock),
-  `ExpireAllIfNeeded` (local), `ScanCb` (the transaction's), the insert GC (the inserting
-  transaction's), `blocking_controller.cc:156` (Task 2.8's list). **Open question for the owner
-  (not part of decision 29, not scheduled):** whether `ScanCb` should hide too, one more upstream
-  hunk (`generic_family.cc`). Without it, a client's `SCAN` or `KEYS` on the replica deletes a due
-  key the stream clock has not reached, on the local clock, and reopens the window for that key.
+  `ExpireAllIfNeeded` (local), `ScanCb` (the hide, decision 33: one more upstream hunk in
+  `generic_family.cc`; a scan has no transaction, so its time is the local clock), the insert GC
+  (the inserting transaction's), `blocking_controller.cc:156` (Task 2.8's list). Without the
+  `ScanCb` hide, a client's `SCAN` or `KEYS` on the replica deletes a due key the stream clock has
+  not reached, on the local clock, and reopens the window for that key.
 - [ ] **Step 1: Failing tests.** gtests in `ClassicReplayTest`: `.SweepClock*` (table: no stamp
   gives the local clock; a clock within 60 s of now is kept, exactly 60'000 behind included; older
-  gives `now - 60 s`; a clock ahead of now is kept). In `ClassicApplyFamilyTest`, with a publishing
+  gives `now - 60 s`; a clock ahead of now is kept; a `now` below 60'000 gives the stamp, not a
+  wrapped floor). In `ClassicApplyFamilyTest`, with a publishing
   applier and the clock reset in the fixture's `SetUp` and `TearDown` (it is process-wide; assert it
   is 0 at the start, as `ReplicaActiveExpiryTest` does for its flags):
   `.StreamClockFollowsAnEnvelopedPing` (an enveloped `PING`, which is skipped as a control command,
@@ -1395,95 +1454,113 @@ mvcc, so that the apply time and the stream clock agree) and Task 1.4 (the flag)
   stamp after a larger one changes nothing), `.StreamClockOfANestIsTheOutermostLayers` (outer 60 s
   ahead of inner: the outer's), `.StreamClockIsLeftAloneByAnEnvelopeThatIsNotConsumed`
   (`running()` false: `kNotConsumed`, nothing moved), `.StreamClockIsLeftAloneByANonPublishingApplier`
-  (`publish_clock` false). In `ReplicaActiveExpiryTest` (the fixture of Task 1.4, `--hz 0`, heartbeats
-  run by hand): `.TheSweepWaitsForTheStreamClockButNotBeyondTheFloor` (keys `PX 100`, a clock
-  published at the creation time: `AdvanceTime(1000)` and many heartbeats reap nothing; then
-  `AdvanceTime(61'000)`, the floor passes the clock, and they reap),
-  `.ReadsHideADueKeyUntilTheStreamClockReachesIt` (`GET`, `EXISTS` and `TTL` find nothing, `misses`
-  rises, DBSIZE does not drop; publish a clock past the deadline and the next read deletes the key
-  and DBSIZE drops), `.TheHideLeavesTheMutablePathAlone` (a `SET` over a hidden key replies `OK`,
-  `GET` returns it and DBSIZE counts one entry). Pytests in the window section (fake master,
-  `attach_to_stream_live`, deadline `E` 3 s ahead of the stream's write, marker keys, the due key
-  never read before the step that reads it, default `--hz` unless said):
-  `test_plain_replica_sweeps_on_the_stream_clock_that_an_enveloped_ping_moves` (a) (enveloped `SET
-  k v PXAT E` at `t0`; a second past `E`, DBSIZE still counts `k` (the clock is `t0 - 1`, behind
-  the deadline), for a full second; then an enveloped `ping` stamped `E + 500 ms`: DBSIZE drops to
-  the marker within 5 s);
+  (`publish_clock` false), `.StreamClockIsLeftAloneByASelfAuthoredEnvelope` (this node's own uuid
+  at depth 1: dropped and counted in `rreplay_self_dropped`, nothing moved). In
+  `ReplicaActiveExpiryTest` (the fixture of Task 1.4, `--hz 0`, heartbeats run by hand):
+  `.TheSweepWaitsForTheStreamClockButNotBeyondTheFloor` (keys `PX 100`, a clock published at the
+  creation time: `AdvanceTime(1000)` and many heartbeats reap nothing; then `AdvanceTime(61'000)`,
+  the floor passes the clock, and they reap), `.ReadsHideADueKeyUntilTheStreamClockReachesIt`
+  (`GET`, `EXISTS` and `TTL` find nothing, `misses` rises, DBSIZE does not drop; publish a clock
+  past the deadline and the next read deletes the key and DBSIZE drops),
+  `.TheHideLeavesTheMutablePathAlone` (a `SET` over a hidden key replies `OK`, `GET` returns it and
+  DBSIZE counts one entry), `.ScansHideADueKeyUntilTheStreamClockReachesIt` (decision 33, the same
+  set-up: `SCAN 0`, `KEYS *` and `RANDOMKEY` neither return the due key nor delete it, and DBSIZE
+  does not drop; publish a clock past the deadline and the next `SCAN` deletes it and DBSIZE drops).
+  Pytests in the window section (fake master, `attach_to_stream_live`, deadline `E` 3 s ahead of the
+  stream's write, marker keys, the due key never read before the step that reads it, default `--hz`
+  unless said): `test_plain_replica_sweeps_on_the_stream_clock_that_an_enveloped_ping_moves` (a)
+  (enveloped `SET k v PXAT E` at `t0`; a second past `E`, DBSIZE still counts `k` (the clock is `t0
+  - 1`, behind the deadline), for a full second; then an enveloped `ping` stamped `E + 500 ms`:
+  DBSIZE drops to the marker within 5 s);
   `test_plain_replica_hides_a_due_key_from_clients_until_the_stream_clock_reaches_it` (b) (same
-  set-up; `GET k` is nil, `EXISTS` 0, `TTL` -2 and DBSIZE does not drop; then an enveloped
-  `PEXPIREAT k <now + 60 s>` stamped `E - 300 ms`: `GET k` is `v` and `PTTL` is in `(0, 60000]`);
-  `test_plain_replica_stream_clock_ignores_a_stamp_outside_a_minute_of_its_own` (d) ((a)'s
-  set-up, but the `ping` is stamped `E + 90 s`: the key is still counted a second later; then a
-  `ping` at `E + 500 ms` deletes it);
-  `test_plain_replica_stream_clock_follows_the_outermost_envelope` (e) (an envelope of node A,
-  stamped `E + 500 ms`, wrapping one of node B stamped `E - 300 ms`, around `SET other 1`: the key
-  goes, `other` is set);
-  `test_plain_replica_reports_the_stream_clock_lag` (f) (INFO: `replica_stream_clock_lag_ms` is 0
-  before any envelope; after a `ping` stamped 5 s ago it is at least 5000 and grows by about the
-  time that passes; after one stamped 59 s ago and 2 s more it is at most 60'000 and the floor
-  warning is in the log (`find_in_logs`); after the master drops the link and a new greet it is 0
-  again; a fake master that does not say `active-replica` shows no such field);
+  set-up; `GET k` is nil, `EXISTS` 0, `TTL` -2, `KEYS *` and `SCAN 0` list and delete nothing, and
+  DBSIZE does not drop; then an enveloped `PEXPIREAT k <now + 60 s>` stamped `E - 300 ms`: `GET k`
+  is `v` and `PTTL` is in `(0, 60000]`);
+  `test_plain_replica_stream_clock_ignores_a_stamp_outside_a_minute_of_its_own` (d) ((a)'s set-up,
+  but the `ping` is stamped `E + 90 s`: the key is still counted a second later; then a `ping` at `E
+  + 500 ms` deletes it); `test_plain_replica_stream_clock_follows_the_outermost_envelope` (e) (an
+  envelope of node A, stamped `E + 500 ms`, wrapping one of node B stamped `E - 300 ms`, around `SET
+  other 1`: the key goes, `other` is set); `test_plain_replica_reports_the_stream_clock_lag` (f)
+  (INFO: `replica_stream_clock_lag_ms` is 0 before any envelope; a first `ping` stamped 59 s ago and
+  2 s more: at most 60'000, and the floor warning is in the log (`find_in_logs`); this comes first
+  because the clock only moves forward, so a smaller stamp after a larger one would change nothing
+  and the warning could not fire; then a `ping` stamped 5 s ago moves it forward: at least 5000,
+  growing by about the time that passes; the same master dropping the link and greeting again keeps
+  it (no reset on a reconnect); a second fake master, with another uuid and replication id, resets
+  it to 0; a fake master that does not say `active-replica` shows no such field);
   `test_plain_replica_of_active_keydb_survives_a_rate_limiter_window_rollover` (g) (real KeyDB,
   `repl_ping_replica_period=1`, behind a proxy that holds the link across the deadline: `INCR rl`
-  and `EXPIRE rl 3`, a second `INCR rl` at 2.3 s while the proxy is paused, the proxy resumed at
-  4.5 s: once the next `PING` has passed, `EXISTS rl` is 0 on the replica as on KeyDB). The flips:
+  and `EXPIRE rl 3`, a second `INCR rl` at 2.3 s while the proxy is paused, the proxy resumed at 4.5
+  s: once the next `PING` has passed, `EXISTS rl` is 0 on the replica as on KeyDB). The flips:
   `loses_a_ttl_refresh[envelope-sweep]` and `[envelope-access_only]` (`k` survives, `0 < pttl <=
   60000`), and `recomputes[envelope_applied_before_the_deadline-sweep]` and `[-access_only]`
-  (`"6"`), four of the ten; the other six keep their values. The `envelope_applied_after_the_deadline`
-  docstring changes: its `"1"` now holds because the author's time, and the stream clock the same
-  envelope advances, are past the deadline, so the key is due on every clock, not because the
-  sweep deleted it first. The orphan pytest flips in both its cases: `c`, `h` and `kt` keep their
-  TTL and are gone at the deadline, so it now streams a `ping` stamped after it and expects them
-  to go; its docstring says the decision-31 limitation is closed. **Harness:**
-  `test_plain_replica_of_active_keydb_expires_keys` needs `repl_ping_replica_period=1` on its
-  KeyDB: its 10 s budget against a 10 s ping would not see the clock move.
+  (`"6"`), four of the ten; the other six keep their values. The
+  `envelope_applied_after_the_deadline` docstring changes: its `"1"` now holds because the author's
+  time, and the stream clock the same envelope advances, are past the deadline, so the key is due on
+  every clock, not because the sweep deleted it first. The orphan pytest flips in both its cases:
+  `c`, `h` and `kt` keep their TTL and are gone at the deadline, so it now streams a `ping` stamped
+  after it and expects them to go; its docstring says the decision-31 limitation is closed.
+  **Harness:** `test_plain_replica_of_active_keydb_expires_keys` needs `repl_ping_replica_period=1`
+  on its KeyDB: its 10 s budget against a 10 s ping would not see the clock move.
 - [ ] **Step 2: Run, observe failure** (the sweep deletes at the replica's own deadline, so (a),
-  (d), (e), the hide tests, the four flips and the orphan pytest fail; the controls, the `raw` and
-  `envelope_applied_after_the_deadline` cases and the `StreamClock*` tests that need no clock pass or
-  do not link until the symbols exist).
+  (d), (e), the hide and scan tests, the four flips and the orphan pytest fail; the controls, the
+  `raw` and `envelope_applied_after_the_deadline` cases and the `StreamClock*` tests that need no
+  clock pass or do not link until the symbols exist).
 - [ ] **Step 3: Implement** as above; document the clock, its single writer and its reset beside
   `active_keydb_master_seen`, and the hide at its hunk (why `kReadStats` only, why the entry stays,
-  that `ExpireAllIfNeeded` and `ScanCb` do not hide).
+  that `ExpireAllIfNeeded` does not hide and `ScanCb` does, and why).
 - [ ] **Step 4: Falsify**, one at a time, restore and rebuild from the restored sources, record
-  verbatim: (a) the sweep on the local clock (the sweep gtest's first half, (a), the two `-sweep`
-  flips and the orphan pytest fail); (b) the advance in `ApplyCommand` after the control-command
-  return, so `PING` is not recorded ((a) never sees the key go, `.StreamClockFollowsAnEnvelopedPing`
-  fails); (c) no floor (`TheSweepWaitsForTheStreamClockButNotBeyondTheFloor`'s second half); (d) the
-  hide on the mutable path too (`TheHideLeavesTheMutablePathAlone` fails or the entry is
-  duplicated); (e) the innermost layer's stamp ((e), `StreamClockOfANestIsTheOutermostLayers`); (f)
-  no window on the advance ((d), `StreamClockIgnoresStampsOutsideTheWindow`); (g) a plain store
-  instead of a forward-only one (`StreamClockOnlyMovesForward`); (h) no reset ((f)'s reconnect
-  step); (i) `publish_clock` always true (`StreamClockIsLeftAloneByANonPublishingApplier`); (j) the
-  advance before the `running()` check (`...NotConsumed`); (k) the hide without the `stream_ms`
-  test, or on `kMutableStats` alone, whichever the first run shows to differ; (l) INFO field
-  unrendered ((f)). Record that the `raw` pytest cases pass under the change and under its reversal
-  alike: they pin what it must not touch (a raw command publishes nothing and keeps the local
-  clock).
+  verbatim: (a) the sweep on the local clock (the sweep gtest's first half, pytests (a), (b) and
+  (g), the two `-sweep` flips and the orphan pytest fail; the hide gtests run no sweep and pass);
+  (b) the advance in `ApplyCommand` after the control-command return, so `PING` is not recorded ((a)
+  never sees the key go, `.StreamClockFollowsAnEnvelopedPing` fails); (c) no floor
+  (`TheSweepWaitsForTheStreamClockButNotBeyondTheFloor`'s second half), and the floor without its
+  underflow guard (the small-`now` `SweepClock*` row); (d) the hide on the mutable path too
+  (`TheHideLeavesTheMutablePathAlone` fails or the entry is duplicated); (e) the innermost layer's
+  stamp ((e), `StreamClockOfANestIsTheOutermostLayers`); (f) no window on the advance ((d),
+  `StreamClockIgnoresStampsOutsideTheWindow`); (g) a plain store instead of a forward-only one
+  (`StreamClockOnlyMovesForward`); (h) no reset on a new master ((f)'s second-master step), and a
+  reset on every `Greet()` ((f)'s same-master reconnect step); (i) `publish_clock` always true
+  (`StreamClockIsLeftAloneByANonPublishingApplier`); (j) the advance before the `running()` check
+  (`...NotConsumed`); (k) **redundant by construction: record that, and do not count it as a
+  falsification.** The hide without the `stream_ms` test is an equivalent mutant for every command
+  that runs at or before the local clock (with no stamp `SweepClockMs` is `now`, and `S(now) < E` is
+  already false for a key due at `T <= now`), and the hide on `kMutableStats` alone is (d)'s mirror,
+  which `ReadsHideADueKeyUntilTheStreamClockReachesIt` and `TheHideLeavesTheMutablePathAlone`
+  already fail; (l) INFO field unrendered ((f)); (m) the hide removed from `ScanCb`
+  (`ScansHideADueKeyUntilTheStreamClockReachesIt`: `KEYS` returns the key, or `SCAN` deletes it and
+  DBSIZE drops; pytest (b)'s scans likewise); (n) the advance before the self-author check
+  (`StreamClockIsLeftAloneByASelfAuthoredEnvelope`). Record that the `raw` pytest cases pass under
+  the change and under its reversal alike: they pin what it must not touch (a raw command publishes
+  nothing and keeps the local clock).
 - [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; the whole of `classic_replay_test`,
   `keydb_onboarding_test.py` (real KeyDB, `KEYDB_REQUIRED=1`), `multi_master_test` and
   `replication_test.py -k expir` (the heartbeat and `FindInternal` are shared); the new pytests five
-  times under three busy loops. `docs/UPSTREAM-SYNC.md` rows for `engine_shard.cc` and
-  `db_slice.cc` (one hunk each; the hide's hazard is an upstream edit to `FindInternal`'s expiry
-  block, and the test to re-run is `ReplicaActiveExpiryTest.ReadsHideADueKeyUntilTheStreamClockReachesIt`);
-  delete ISSUE-REGISTER D-32 (landed, per the register's rule) and update D-9's "until Tasks 2.8
-  and 2.9 land" wording; pre-commit; commit
+  times under three busy loops. `docs/UPSTREAM-SYNC.md` rows for `engine_shard.cc`, `db_slice.cc`
+  and `generic_family.cc` (one hunk each; the hide's hazard is an upstream edit to `FindInternal`'s
+  expiry block or to `ScanCb`'s expiry call, both of which upstream main has already restructured,
+  and the `db_slice.cc` and `generic_family.cc` rows already say how; the tests to re-run are
+  `ReplicaActiveExpiryTest.ReadsHideADueKeyUntilTheStreamClockReachesIt` and
+  `.ScansHideADueKeyUntilTheStreamClockReachesIt`); narrow ISSUE-REGISTER D-32 as its Status says
+  (the plain-replica part has landed and goes, per the register's rule; the peer and classic-peer
+  share moves to D-27) and update D-9's "until Tasks 2.8 and 2.9 land" wording; pre-commit; commit
   `feat: sweep and hide due keys on the stream clock of a plain replica (P7)`.
 
 **Done:** on a flagged plain replica a due key stays until the stream the master wrote has reached
 its deadline (or 60 s have passed without a stamp), clients see it as absent meanwhile, the pings of
 an idle master keep the clock moving, the orphan of a TTL-keeping write is gone and its pytest
-flipped, and what stays on the local clock (`DFLY EXPIRE`, `SCAN`/`KEYS`) and the lingering bound
-are written down.
+flipped, `SCAN`/`KEYS`/`RANDOMKEY` neither return nor delete a hidden key, and what stays on the
+local clock (`DFLY EXPIRE`, the insert-time GC) and the lingering bound are written down.
 
 ### P7-2 gate and PR
 
 - [ ] Whole-branch review, adversarial pass (briefed only to refute the no-forward and convergence
   claims, the dedup reservation's exactly-once claim and the account of what Tasks 2.8 and 2.9 leave
-  open: the `SCAN`/`KEYS` and `DFLY EXPIRE` paths on the local clock, a hidden key lingering up to
-  a ping period, the `ADDREPLICAOF` keys on the main link's clock), fix loops. Gate and PR as in
-  P7-0. The PR description names what the stream clock costs: a due key can linger, hidden, for up
-  to one `repl-ping-replica-period` (60 s with the link down), and says ISSUE-REGISTER D-32 is
-  landed.
+  open: the `DFLY EXPIRE` and insert-time GC paths on the local clock, a hidden key lingering up to
+  a ping period (scans skip it too), the `ADDREPLICAOF` keys on the main link's clock), fix loops.
+  Gate and PR as in P7-0. The PR description names what the stream clock costs: a due key can
+  linger, hidden, for up to one `repl-ping-replica-period` (60 s with the link down), and says
+  ISSUE-REGISTER D-32 is narrowed to the peer share, which D-27 carries.
 
 ---
 
@@ -1507,8 +1584,8 @@ only the `+CONTINUE` producer; counters `classic_psync_partial_ok`,
 context `ConsumeRedisStream` builds, spec D-3 "Selected db"), kept on the `Replica` so that it
 survives a `+CONTINUE`.
 **Hazards:** (a)-(g) below (spec D-8's (h), the bytes behind a full sync's RDB, is Task 0.6's),
-**(i) the stream's selected db must survive a partial resync**, and (j) below. Redis keeps the
-replica's cached master client, and with it its db, across a partial resync, and the master's
+**(i) the stream's selected db must survive a partial resync**, and (j) and (k) below. Redis keeps
+the replica's cached master client, and with it its db, across a partial resync, and the master's
 backlog after the resume point carries no `SELECT` unless its `slaveseldb` changed. KeyDB's code, a
 Redis fork, shows it: `replicationCacheMaster` / `replicationResurrectCachedMaster`
 (`replication.cpp:4322`, `:4450`), and `replicaseldb`, fed at `:476` and reset to -1 only at a
@@ -1529,6 +1606,13 @@ drops are exact (an envelope counts and advances together, and a stopped link re
 `kNotConsumed` before it counts). Options for this task: **count at flush time** (carry the tally on
 the batch entry next to `deferred_ack_bytes`, and count it where `repl_offs_` advances), or **accept
 and document** that `keydb_cmds_dropped` counts commands seen, at least once across a resync.
+**(k) A `+CONTINUE` resume must not reset the stream clock** (Task 2.9, `stream_ms`; spec D-9). A
+resumed link continues the stream it left, so the last stamp it applied is still the best known
+clock of that master, and `ResetStreamClock()` belongs to a new master identity (its uuid or
+replication id) or a cleared flag, not to a `Greet()` or a resume. A resume that reset it would put
+the sweep back on the local clock while the backlog the master queued during the outage is yet to
+be applied: the window Task 2.9 closes, reopened exactly after an outage. The 60 s floor, not a
+reset, bounds a long one.
 - [ ] **Step 1: Failing tests** against `redis_server` (7.0.15), real KeyDB and the fake master,
   each asserting master `sync_partial_ok`/`sync_full`/`sync_partial_err` (`server.cpp:6017-6019` for
   KeyDB) and **exact** value counts: (a) leftover after `CONTINUE` — fake master sends
@@ -1548,7 +1632,11 @@ and document** that `keydb_cmds_dropped` counts commands seen, at least once acr
   would pass vacuously), and a plain `redis_server` replica of the same master is the control (its
   keys are in db 3 too). A KeyDB active variant (raw commands behind an envelope in db 3); plus
   new-replid `+CONTINUE <newid>` adoption, `--classic_partial_psync=false` (each reconnect is a
-  full resync) and `classic_psync_partial_fallback` when FULLRESYNC answers a partial request.
+  full resync) and `classic_psync_partial_fallback` when FULLRESYNC answers a partial request; and
+  (k) the stream clock across the resume — a fake master saying `active-replica`, an enveloped
+  `ping` stamped 5 s ago, `Proxy.drop_connection()`, `+CONTINUE <same id>`: INFO's
+  `replica_stream_clock_lag_ms` is at least 5000 plus the outage once the link is back and before
+  any new envelope, never 0.
 - [ ] **Step 2: Run, observe failure** (today every reconnect sends `-1`).
 - [ ] **Step 3: Implement** spec D-8: request `offs = (flag && !master_repl_id.empty() &&
   classic_stable_reached_) ? repl_offs_ + 1 : -1`; `+CONTINUE [<newid>]` consumes its line, adopts
@@ -1559,11 +1647,14 @@ and document** that `keydb_cmds_dropped` counts commands seen, at least once acr
   envelope), not when the link drops, so that it always names the db at the offset the link resumes
   from (a queued raw `SELECT` is not applied, and not counted, yet); a `+CONTINUE` re-selects it
   through the applier's `SelectDb` (the db's tables must exist) before the first resumed command,
-  and a full sync starts again in db 0.
+  and a full sync starts again in db 0. A `+CONTINUE` does not touch the stream clock (hazard (k)):
+  `ApplyReplicaActiveExpiry`'s identity check, which a resume of the same master passes unchanged,
+  stays the only reset.
 - [ ] **Step 4: Run; falsify** each hazard separately and record: use a fresh `io_buf` (a); send
   `repl_offs_` instead of `+ 1` (b); count deferred MULTI/EXEC bytes early (c); do not clear
   `classic_stable_reached_` at the FULLRESYNC parse (g); ignore the flag (flag-off test); start the
-  resumed apply context in db 0 (i: the resumed keys land in db 0).
+  resumed apply context in db 0 (i: the resumed keys land in db 0); reset the stream clock on the
+  `+CONTINUE` path (k: the lag reads 0 after the resume).
   Run the leftover and offset tests x10 for a pass rate.
 - [ ] **Step 5:** `replication_test.py` unchanged-green; pre-commit; commit
   `feat: resume classic replication links with a partial PSYNC (P7)`.
