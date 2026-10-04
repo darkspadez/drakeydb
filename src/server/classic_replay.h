@@ -109,10 +109,21 @@ struct ClassicLinkStats {
 
 // The sum of the counters of every classic link this process has had, which /metrics exports (a
 // Prometheus counter must not fall when a link goes away). Process-wide mutable state, but only
-// relaxed, monotonic atomics, as multimaster_lww_dropped is: a link's fiber and the fiber that
-// renders INFO or /metrics run on different threads, and a per-thread ServerState::Stats would
-// not follow a link (nor merge for a Replica that is gone).
+// relaxed, monotonic atomics, kept out of ServerState::Stats on purpose (spec D-13, D-1.13: that
+// struct is per thread and its size is static_asserted): a link's fiber and the fiber that renders
+// INFO or /metrics run on different threads, and a per-thread counter would not follow a link (nor
+// merge for a Replica that is gone).
 ClassicLinkStats& ClassicTotals();
+
+// Records that a master which answered `active-replica` (an active KeyDB) has completed a handshake
+// with this process: Replica::Greet calls it. It is never undone. With a counter's own value it
+// decides whether /metrics exports a classic series (ClassicTotalSeries), so that the series do not
+// come and go with a link that reconnects or is removed, and rendering them takes no look at the
+// links (spec D-13, owner decision 25). Same kind of state as ClassicTotals: one relaxed atomic.
+void NoteActiveKeyDbMaster();
+
+// Whether NoteActiveKeyDbMaster was called since this process started.
+bool ActiveKeyDbMasterSeen();
 
 // A counter as INFO and /metrics show it. `name` and `help` point at static strings.
 struct ClassicCounterValue {
@@ -122,8 +133,9 @@ struct ClassicCounterValue {
 };
 
 // Whether INFO shows the classic fields of `link`, the counters and (on a peer line) repl_offset:
-// only for a classic link whose master answered active-replica or whose counters have moved, so
-// that a stock master's INFO stays what upstream prints (spec D-13).
+// only for a classic link whose master answered active-replica (at a completed handshake, see
+// ReplicaSummary) or whose counters have moved, so that a stock master's INFO stays what upstream
+// prints (spec D-13).
 bool ClassicLinkShown(const ReplicaSummary& link);
 
 // Whether `link` is a classic link to an active KeyDB.
@@ -132,14 +144,16 @@ inline bool ClassicMasterActive(const ReplicaSummary& link) {
 }
 
 // The counters INFO shows for `link`, in the order of spec D-13: all of them when its master is an
-// active KeyDB, else only the nonzero ones; none unless ClassicLinkShown.
+// active KeyDB, else only the nonzero ones. Empty exactly when !ClassicLinkShown: a shown link
+// always has a field to show, as an active master shows all and any other has a counter that moved.
 std::vector<ClassicCounterValue> ClassicLinkFields(const ReplicaSummary& link);
 
 // The process-wide series /metrics shows, as `<name>_total`: from `totals` (ClassicTotals().
-// Snapshot()), all of them when some link of the node has an active KeyDB master, else only the
-// nonzero ones.
+// Snapshot()), all of them once an active KeyDB master has been seen (`active_master_seen`, which
+// is ActiveKeyDbMasterSeen() in production), else only the nonzero ones. Deliberately not per link,
+// unlike ClassicLinkFields (spec D-13, owner decision 25).
 std::vector<ClassicCounterValue> ClassicTotalSeries(const ClassicLinkCounts& totals,
-                                                    bool any_master_active);
+                                                    bool active_master_seen);
 
 enum class EnvelopeResult {
   // The envelope is dealt with, whatever came of it: the stream offset advances past its bytes.

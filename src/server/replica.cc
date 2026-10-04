@@ -644,6 +644,10 @@ error_code Replica::Greet() {
   if (peer_mode_ && peer_mode_->identity_claims)
     peer_mode_->identity_claims->MarkEstablished(client_id_);
   classic_master_ = !HasDflyMaster();
+  if (classic_master_ && master_active_replica_) {
+    classic_master_was_active_ = true;
+    NoteActiveKeyDbMaster();
+  }
   return error_code{};
 }
 
@@ -2077,11 +2081,11 @@ auto Replica::GetSummary() const -> Summary {
     res.psync_successes = psync_successes_;
     res.psync_attempts = psync_attempts_;
     res.passed_full_sync = passed_full_sync_;
-    // drakeydb: P7 -- master_active_replica_ is only meaningful once the handshake is done (see its
-    // declaration).
+    // drakeydb: P7 -- INFO's view of the link: the protocol of the last completed Greet(), and
+    // whether any of them found an active master (see classic_master_was_active_), so that a link
+    // that is down keeps the fields it showed.
     res.classic_link = classic_master_;
-    res.master_active_replica =
-        classic_master_ && (state_mask_ & R_GREETED) && master_active_replica_;
+    res.master_active_replica = classic_master_ && classic_master_was_active_;
     res.classic = classic_stats_.Snapshot();
     return res;
   };

@@ -927,9 +927,10 @@ ones.
 **Where they render — a stock master keeps upstream's INFO.** A classic field renders only for a
 classic link whose master answered `active-replica` **or** whose own counter is nonzero
 (`ReplicaSummary` gains `classic_link` and `master_active_replica` for that). Process-wide counters
-use the same predicate (any link `master_active_replica`, or the counter nonzero; the loader
-counters can be nonzero when onboarding from a **non-active** KeyDB, which also holds cron jobs and
-member TTLs): beside `multimaster_lww_dropped` in the active-node block
+use a node-wide predicate (an active KeyDB master has completed a handshake since boot, or the
+counter is nonzero; the loader counters can be nonzero when onboarding from a **non-active**
+KeyDB, which also holds cron jobs and member TTLs; the series' predicate is decision 25, below):
+beside `multimaster_lww_dropped` in the active-node block
 (`server_family.cc:3138-3162`) and in the plain-replica block after the per-link fields. In
 Prometheus a plain replica never reaches the master-side branch where
 `multimaster_lww_dropped_total` lives (`metrics.cc:511-518`), so the mirrors are also emitted in the
@@ -937,18 +938,29 @@ replica-side branch (`:486-489`); otherwise the series would be missing exactly 
 onboard from KeyDB. With a stock Redis master and every counter zero, INFO and `/metrics` are
 byte-for-byte upstream's.
 
-As built (P7-1 Task 1.3): the predicate is per field. A link to an active KeyDB shows every
-counter, zeros included; any other classic link shows only the counters that moved (a non-active
-KeyDB sending `PEXPIREMEMBERAT` raw shows `keydb_cmds_dropped` alone), and on a peer line
-`repl_offset` follows whenever any field is shown. `master_active_replica` is read only while the
-link is greeted (`R_GREETED`); `classic_link` is the protocol of the last completed handshake and
-survives a disconnect. The `<name>_total` series are the process-wide sums (`ClassicTotals()`,
-bumped with every per-link counter, so a link that went away leaves its counts), emitted at one
-place in `Metrics::Print` after the replica/master branches, which covers both and a node that was
-promoted with counters still nonzero; `Metrics::classic_master_active` carries the "some link has
-an active KeyDB master" half of the predicate, computed in `GetMetrics` from the replica and peer
-summaries. The `multimaster_*` process-wide INFO counters named above arrive with the tasks that
-count them (P7-2, P7-4); Task 1.3 has none to render there.
+As built (P7-1 Task 1.3, with its review round): INFO's predicate is per field. A link to an active
+KeyDB shows every counter, zeros included, whatever its state; any other classic link shows only the
+counters that moved (a non-active KeyDB sending `PEXPIREMEMBERAT` raw shows `keydb_cmds_dropped`
+alone), and on a peer line `repl_offset` follows whenever any field is shown. "Active" sticks per
+link: `ReplicaSummary::master_active_replica` is set once a completed `Greet()` of that `Replica`
+found `active-replica` in a capa reply (`Replica::classic_master_was_active_`) and is never cleared
+for that `Replica`, so a link that is down, or reconnecting with a handshake that fails, keeps its
+zero fields. `classic_link` is the protocol of the last completed handshake and survives a
+disconnect likewise. The per-Greet `Replica::master_active_replica_` (cleared at every `Greet()`,
+read only once `R_GREETED` is set) is what Task 1.4's expiry decision uses; INFO does not read it.
+
+**The `<name>_total` series deliberately deviate from the per-link wording above (owner decision
+25).** They are the process-wide sums (`ClassicTotals()`, bumped with every per-link counter, so a
+link that went away leaves its counts), emitted at one place in `Metrics::Print` after the
+replica/master branches, which covers both and a node that was promoted with counters still
+nonzero. A series renders when a process-wide sticky flag is set (`NoteActiveKeyDbMaster()`, called
+by `Replica::Greet()` when a classic master that answered `active-replica` completes a handshake,
+never cleared; `ActiveKeyDbMasterSeen()`), or when its own total is nonzero. So the zero series do
+not come and go with a link, and `/metrics` does not look at the links: the first version computed
+"some link has an active KeyDB master" per scrape, a hop to every peer thread under
+`PeerReplicationManager::mu_`, and only to decide this. The `multimaster_*` process-wide INFO
+counters named above arrive with the tasks that count them (P7-2, P7-4); Task 1.3 has none to
+render there.
 
 **Clock skew.** KeyDB answers `REPLCONF UUID` with a bare `+<uuid>` (D-1.1), so the handshake clock
 echo that feeds `clock_skew_ms` for DFLY peers is absent and the field stays 0 ("no sample"). A
@@ -1028,6 +1040,7 @@ still pass under if the feature were removed.
 | `ClassicReplayTest.ParseRreplayEnvelope*` (incl. the golden captures); `ClassicApplyFamilyTest.*` (unwrap, db, skips, self, malformed, nested to 64, depth-65 leaves the 64th consumed, an inner with zero or two commands, or with an array, nil array or nil for a name, malformed, known-command error counted) | Dropping the 65th-nesting refusal; applying inner `PING`; accepting a second inner command; the `NONE` builder (no `classic_apply_errors`) |
 | `ClassicApplyFamilyTest.RunningFalseBeforeDispatchReturnsNotConsumed*`, `.RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope`, `.RejectedDispatchCountsBytesDoesNotAdvance`, `.ReplayAfterCommitBeforeCountIsDeduped` | Checking `running()` after the first dispatch; checking it before every inner dispatch; `Commit` on a rejected dispatch; deferring `Commit` past the return |
 | `test_classic_stream_command_with_an_array_for_a_name_does_not_abort[empty_array\|nil_array\|behind_a_queued_command]` (fake master: a valid sync, then `*0\r\n` or `*-1\r\n`, with a raw command queued ahead of it in the last case, then `SET a 1`: replica alive, `a == 1`, settled ACK exact, the warning logged; U-14) | Dropping the U-14 guard in `ConsumeRedisStream`: SIGABRT (`std::bad_variant_access` out of `RespExpr::GetView`) |
+| `test_classic_stream_info_command_does_not_abort[raw\|in_envelope]` (fake master: a valid sync, then `SET a 1`, `INFO` raw or inside an envelope, `SET b 2`: replica alive, `a == 1`, `b == 2`, settled ACK exact; in an envelope also `classic_apply_errors == 1` and the logged reason; U-15); `ClassicNoConnectionTest.*` (one case per guarded handler, dispatched raw on the stream's context: the reply is `No connection`, `OK` for `QUIT`); `ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver`, `.InfoInAnEnvelopeIsAnApplyErrorNotACrash` | Removing the `ServerFamily::Info` guard: the replica process dies (SIGSEGV or SIGABRT) and `b` never arrives; removing the guard of a handler: that case dies, one at a time under `--gtest_filter`; removing the `MONITOR` or `SUBSCRIBE` guard: the next client command or `PUBLISH` dies |
 | `test_plain_replica_unwraps_keydb_rreplay`, `..._nested_...`, `test_unwrap_offsets_exact`; `test_keydb_active_live_write_during_full_sync[plain_replica\|peer_mode]` (no longer `xfail`) | Skipping `repl_offs_ +=` (offset lags); removing unwrap (no keys; the live-write test goes back to strict-xfail) |
 | `test_unwrap_flushes_raw_batch_before_envelope` (fake master: raw `SET a 1`, envelope `SET a 2`) | Removing the pre-envelope flush (final `a == 1`) |
 | `test_unwrap_selected_db_is_the_one_the_raw_commands_after_it_run_in` (fake master: an envelope in db 2, then a raw `SET c` and a 3-argument envelope, then an envelope in db 0 and a raw `SET g`) | Giving the applier a connection context of its own: `c` lands in db 0 |
@@ -1035,6 +1048,7 @@ still pass under if the feature were removed.
 | `ClassicApplyFamilyTest.FailedSelectSkipsTheCommandUnlessADeeperLayerSelects` (**real** cluster mode, `cluster_mode=yes` with a one-node config: `SELECT 3` fails there, not in `emulated`; own db, outer 3 / inner 0, outer 0 / inner 3, inner without a db, a later envelope without a db: one `classic_apply_errors` per failed select, `db_index` unchanged, only the commands that had a db applied) | Running the leaf without the `db_selected` guard (the skipped keys land in db 0); a failure that stays sticky for a deeper layer (`inner_db0` missing); a layer without a db resetting the failure (`no_inner_db` applied); remembering a failed `SELECT` as ensured (the retry runs in an unactivated db: SIGSEGV) |
 | `test_keydb_only_commands_dropped_with_counters` (real KeyDB: `EXPIREMEMBER` and `KEYDB.CRON` dropped, `keydb_cmds_dropped == 2`, the set whole, no unknown or apply error); `ClassicReplayTest.IsKeyDbOnlyCommandTable`; `ClassicApplyFamilyTest.KeyDbOnlyDroppedAndCounted`, `.UnknownInnerCommandCountedNotDispatched`, `.KeyDbMvccRestoreCountedUnknownUntilItIsApplied` (decision 22: `classic_unknown_cmds_dropped`, never `keydb_cmds_dropped`), `.KeyDbOnlyAndUnknownLeavesKeepTheSelectedDb`, `.CountsAlsoFeedTheProcessWideTotals` | `IsKeyDbOnlyCommand` returning false (counter lands in `classic_unknown_cmds_dropped`); also matching `KEYDB.MVCCRESTORE`; `PERSIST` without the arity check; no pre-dispatch unknown check (the command reaches the dispatcher, `unknown_` is filled); a dropped command resetting the db; `Count` not feeding the totals |
 | `test_info_and_metrics_show_classic_counters[plain_replica\|peer_mode]` (real KeyDB), `test_scripted_active_master_exact_classic_counters`, `test_scripted_quiet_active_master_shows_zero_counters`, `test_scripted_stock_master_raw_keydb_only_command_shows_only_that_counter` (exact counts, INFO and `/metrics`; the raw path); `PeerReplicationInfo.ShowsClassicFieldsOnlyForClassicLinks`, `.OmitsClassicFieldsWhenMasterNotActiveAndCountersZero`; `ClassicReplayTest.ClassicLinkFieldsFollowTheRenderPredicate`, `.ClassicTotalSeriesFollowTheRenderPredicate` | Omitting the INFO branch (plain) or the peer-line branch; omitting the replica-side Prometheus branch (the plain replica has no series); ignoring `master_active_replica` (a quiet active KeyDB shows nothing); removing the raw-path check |
+| `test_scripted_active_master_down_link_keeps_zero_counters[plain_replica\|peer_mode]x[master_gone\|greet_fails]` (fake master that says `active-replica`: after a full sync the master goes away, or answers every capa with an error; INFO still shows the six zeros, and in peer mode the offset; D-13 "shown whatever its state"); `test_scripted_active_master_series_outlive_the_link[plain_replica\|peer_mode]` (`REPLICAOF NO ONE` / `REMOVE`: the six zero series stay; decision 25); `ClassicReplayTest.ActiveKeyDbMasterSeenSticksOnceNoted` | Reading `active-replica` only while the link is greeted (the down link shows nothing); clearing the per-link flag at the top of `Greet()` (`greet_fails` shows nothing); not calling `NoteActiveKeyDbMaster()` in `Greet()`, or computing the series' gate per scrape from the node's links (no series once the link is gone) |
 | `test_info_and_metrics_absent_for_stock_master`, `..._absent_for_keydb_that_is_not_active[plain_replica\|peer_mode]`, `..._have_no_classic_fields_between_dfly_nodes[plain_replica\|peer_mode]` (no classic field or series, and the link's block ends where it did: `psync_successes`, `clock_skew_ms`); `test_active_replica_boot_warning_names_keydb_drops` | Rendering unconditionally (the stock-master and DFLY tests fail); removing the sentence from the boot warning |
 | `test_greet_sends_capa_active_expire_only_after_active_replica_reply` (KeyDB log lacks "does not support active expiration"; Redis capture shows no send) | Never sending it (the KeyDB warning appears) |
 | `test_plain_replica_of_active_keydb_expires_keys` (+ Redis control with `DEBUG SET-ACTIVE-EXPIRE 0`: replica must not expire) | Not setting the shard flag (DBSIZE stays N) |
@@ -1082,6 +1096,13 @@ observe changes only here:
      `std::bad_variant_access` out of `RespExpr::GetView` and terminates the process. It is now
      skipped like `MULTI`/`EXEC`, with a rate-limited warning, its bytes counted exactly. Ungated:
      it is reachable from any classic master, not only a KeyDB one.
+   - **U-15** (P7-1 Task 1.3 review round): a connection-oriented command (`INFO`, `CLIENT
+     SETNAME|GETNAME|INFO|ID|KILL`, `AUTH`, `HELLO`, `REPLCONF`, `QUIT`, `DFLY THREAD`, `MONITOR`,
+     `SUBSCRIBE`, `PSUBSCRIBE`) in a classic master's stream, raw or inside an envelope. The apply
+     context has no connection, and upstream dereferenced the null `conn()`: SIGSEGV at once, or
+     (`MONITOR`, `SUBSCRIBE`) at the next client command. Each now replies `No connection` and the
+     stream carries on (`QUIT` replies `OK`). Ungated; the guards live in `server_family.cc`,
+     `main_service.cc` and `dflycmd.cc`. ISSUE-REGISTER U-15 lists what was left (cluster mode).
    - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
      migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
      a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a
@@ -1149,10 +1170,11 @@ forwarding KeyDB masters double-applies deltas (`INCR`, `APPEND`, ...), and that
 | `src/server/replica_types.h` | `ReplicaSummary` classic fields | 1, 2, 3 |
 | `src/server/engine_shard.{h,cc}` | `replica_active_expiry_`, `expire_only` split (authorized exception to the "untouched" list; ~15 lines) | 1 |
 | `src/server/db_slice.cc` | One-line `ExpireIfNeeded` gate (`:2097-2098`) | 1 |
-| `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards | 0 |
+| `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards (0); U-15 guards in `Quit`, `Monitor`, `Subscribe`, `PSubscribe` (1, review round) | 0, 1 |
+| `src/server/dflycmd.cc` | U-15 null-`conn()` guard in `DFLY THREAD` (review round) | 1 |
 | `src/server/transaction.cc`, `src/server/multimaster_lww.cc` | Comments only (`:1628-1648` tripwire; `ApplyLwwRewrites` contract) | 2 |
 | `src/server/rdb_load.{h,cc}` | First-read clamp (0); type 64 skip, subexpire/aux handling, counters (4) | 0, 4 |
-| `src/server/server_family.cc`, `multi_master.{h,cc}`, `metrics.cc` | INFO fields and gating, peer line, boot warning, Prometheus (incl. the replica-side branch) | 1, 2, 3, 4 |
+| `src/server/server_family.cc`, `multi_master.{h,cc}`, `metrics.cc` | INFO fields and gating, peer line, boot warning, Prometheus (incl. the replica-side branch); U-15 guards in `server_family.cc` (1) | 1, 2, 3, 4 |
 | `src/server/CMakeLists.txt` | `classic_replay.cc` in `dragonfly_lib` (`:109-125`); `classic_replay_test` (`:200`, `:202-207`) | 0 |
 | `src/server/dragonfly_test.cc` | `EvalReplicatedApplyNoConnNoCrash`, `ReplicatedApplyDuringTakeoverNoCrash`, `ReplicatedApplyHandlerThrowNoConnNoCrash` | 0 |
 | `tests/dragonfly/keydb_onboarding_test.py` **(new)**, `fake_classic_master.py` **(new)** | KeyDB and fake-master suites | 0-4 |

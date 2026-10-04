@@ -406,7 +406,21 @@ std::optional<cron::cronexpr> InferSnapshotCronExpr() {
   return std::nullopt;
 }
 
+// drakeydb: U-15 -- a replicated apply (Replica::ConsumeRedisStream, JournalExecutor) runs its
+// commands in a context with no connection. A command that works on the client's own connection
+// has nothing to work on there: it replies the error ClientSetInfo already gives, and the stream,
+// which discards replies, carries on. Returns true if it replied.
+bool ReplyIfNoConnection(CommandContext* cmd_cntx) {
+  if (cmd_cntx->conn() != nullptr)
+    return false;
+  cmd_cntx->SendError("No connection");
+  return true;
+}
+
 void ClientSetName(facade::ParsedArgs args, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   if (args.size() == 1) {
     cmd_cntx->conn()->SetName(string{args[0]});
     return cmd_cntx->rb()->SendOk();
@@ -415,6 +429,9 @@ void ClientSetName(facade::ParsedArgs args, CommandContext* cmd_cntx) {
 }
 
 void ClientGetName(facade::ParsedArgs args, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   if (!args.empty()) {
     return cmd_cntx->SendError(facade::kSyntaxErr);
   }
@@ -427,6 +444,9 @@ void ClientGetName(facade::ParsedArgs args, CommandContext* cmd_cntx) {
 }
 
 void ClientInfo(facade::ParsedArgs args, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   if (!args.empty()) {
     return cmd_cntx->SendError(facade::kSyntaxErr);
   }
@@ -663,6 +683,9 @@ void ClientSetInfo(facade::ParsedArgs args, CommandContext* cmd_cntx) {
 }
 
 void ClientId(facade::ParsedArgs args, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   if (args.size() != 0) {
     return cmd_cntx->SendError(kSyntaxErr);
   }
@@ -672,6 +695,9 @@ void ClientId(facade::ParsedArgs args, CommandContext* cmd_cntx) {
 
 void ClientKill(facade::ParsedArgs args, absl::Span<facade::Listener*> listeners,
                 ServerFamily* server_family, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   std::function<bool(facade::Connection * conn)> evaluator;
 
   if (args.size() == 1) {
@@ -2175,6 +2201,9 @@ bool ServerFamily::DoAuth(ConnectionContext* cntx, std::string_view username,
 }
 
 void ServerFamily::Auth(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   if (parser.HasAtLeast(3)) {
     return cmd_cntx->SendError(kSyntaxErr);
   }
@@ -2692,17 +2721,6 @@ Metrics ServerFamily::GetMetrics(Namespace* ns, const MetricsCollectOpts& opts) 
 
   if (!IsMaster()) {
     result.replica_side_info = GetReplicaSummary();
-  }
-
-  // drakeydb: P7 -- whether a classic link of this node has an active KeyDB for master: with the
-  // counters' own values, what decides if /metrics exports the classic series (metrics.cc).
-  if (result.replica_side_info) {
-    const Metrics::ReplicaInfo& info = *result.replica_side_info;
-    result.classic_master_active =
-        ClassicMasterActive(info.summary) || rng::any_of(info.cl_repl_summary, ClassicMasterActive);
-  } else if (IsActiveReplica()) {
-    for (const ReplicaSummary& peer : peers_->Summaries())
-      result.classic_master_active = result.classic_master_active || ClassicMasterActive(peer);
   }
 
   {
@@ -3372,6 +3390,9 @@ string ServerFamily::FormatInfoMetrics(
 }
 
 void ServerFamily::Info(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   std::vector<std::string> sections;
   bool need_metrics{false};  // Save time - do not fetch metrics if we don't need them.
   // Start with nothing; each requested section enables what it needs (default INFO below).
@@ -3444,6 +3465,9 @@ void ServerFamily::Info(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void ServerFamily::Hello(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   facade::ParsedArgs args = parser.UnparsedArgs();
   // If no arguments are provided default to RESP2.
   bool is_resp3 = false;
@@ -3811,6 +3835,9 @@ std::string ServerFamily::GetLineageId() const {
 }
 
 void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   facade::ParsedArgs args = parser.UnparsedArgs();
   auto* builder = cmd_cntx->rb();
 

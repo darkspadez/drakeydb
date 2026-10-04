@@ -213,8 +213,9 @@ std::string RenderPeerReplicationInfo(const std::vector<ReplicaSummary>& peers, 
     absl::StrAppend(&out, ",clock_skew_ms=", p.clock_skew_ms);
     // drakeydb: P7 -- a classic link to an active KeyDB (or whose counters moved) also shows what
     // it counted and how far into the master's stream it is; a stock master's line stays as it was.
-    if (ClassicLinkShown(p)) {
-      for (const ClassicCounterValue& field : ClassicLinkFields(p))
+    // ClassicLinkFields is empty exactly for a link that is not shown.
+    if (const auto fields = ClassicLinkFields(p); !fields.empty()) {
+      for (const ClassicCounterValue& field : fields)
         absl::StrAppend(&out, ",", field.name, "=", field.value);
       absl::StrAppend(&out, ",repl_offset=", p.repl_offset_sum);
     }

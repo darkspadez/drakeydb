@@ -1138,17 +1138,29 @@ only the `+CONTINUE` producer; counters `classic_psync_partial_ok`,
 `classic_psync_partial_fallback`; the stream's selected db (`conn_state.db_index` of the apply
 context `ConsumeRedisStream` builds, spec D-3 "Selected db"), kept on the `Replica` so that it
 survives a `+CONTINUE`.
-**Hazards:** (a)-(g) below (spec D-8's (h), the bytes behind a full sync's RDB, is Task 0.6's), and
-**(i) the stream's selected db must survive a partial resync.** Redis keeps the replica's cached
-master client, and with it its db, across a partial resync, and the master's backlog after the
-resume point carries no `SELECT` unless its `slaveseldb` changed. KeyDB's code, a Redis fork, shows
-it: `replicationCacheMaster` / `replicationResurrectCachedMaster` (`replication.cpp:4322`,
-`:4450`), and `replicaseldb`, fed at `:476` and reset to -1 only at a full-sync attach (`:874`) or a
-promotion (`:4054`). No Redis source tree is available on the dev box, so for 7.0.15 this is a
-hypothesis the test below confirms; it was also observed once by hand on the local `redis-server`
-7.0.15 (a write in db 3 after the link was killed came back after `+CONTINUE` as a bare `set`, no
-`SELECT`, and the `redis-server` replica kept it in db 3). A replica that restarts its apply
-context in db 0 would apply the resumed writes in the wrong db.
+**Hazards:** (a)-(g) below (spec D-8's (h), the bytes behind a full sync's RDB, is Task 0.6's),
+**(i) the stream's selected db must survive a partial resync**, and (j) below. Redis keeps the
+replica's cached master client, and with it its db, across a partial resync, and the master's
+backlog after the resume point carries no `SELECT` unless its `slaveseldb` changed. KeyDB's code, a
+Redis fork, shows it: `replicationCacheMaster` / `replicationResurrectCachedMaster`
+(`replication.cpp:4322`, `:4450`), and `replicaseldb`, fed at `:476` and reset to -1 only at a
+full-sync attach (`:874`) or a promotion (`:4054`). No Redis source tree is available on the dev
+box, so for 7.0.15 this is a hypothesis the test below confirms; it was also observed once by hand
+on the local `redis-server` 7.0.15 (a write in db 3 after the link was killed came back after
+`+CONTINUE` as a bare `set`, no `SELECT`, and the `redis-server` replica kept it in db 3). A replica
+that restarts its apply context in db 0 would apply the resumed writes in the wrong db.
+**(j) A raw KeyDB-only command can be counted twice across a partial resync** (found by the Task 1.3
+review, M-6; record only until this task). The raw path of `ConsumeRedisStream` counts a dropped
+KeyDB-only command (`ClassicApplier::SkipKeyDbOnly`, `keydb_cmds_dropped` and the process-wide
+total) when it is *read*, but its bytes reach `repl_offs_` only with the batch: while commands are
+queued ahead of it they are deferred onto the batch's last entry (`deferred_ack_bytes`,
+`replica.cc:~1321-1325` and `~1355`). If the link stops before the flush counts them, `repl_offs_`
+stops short of the dropped command, and the partial resync (`PSYNC <replid> <repl_offs_ + 1>`)
+replays it and counts it again. The counters are monotonic, so the overcount stays. Envelope-borne
+drops are exact (an envelope counts and advances together, and a stopped link returns
+`kNotConsumed` before it counts). Options for this task: **count at flush time** (carry the tally on
+the batch entry next to `deferred_ack_bytes`, and count it where `repl_offs_` advances), or **accept
+and document** that `keydb_cmds_dropped` counts commands seen, at least once across a resync.
 - [ ] **Step 1: Failing tests** against `redis_server` (7.0.15), real KeyDB and the fake master,
   each asserting master `sync_partial_ok`/`sync_full`/`sync_partial_err` (`server.cpp:6017-6019` for
   KeyDB) and **exact** value counts: (a) leftover after `CONTINUE` — fake master sends

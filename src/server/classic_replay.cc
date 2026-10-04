@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <array>
-#include <iterator>
 #include <limits>
 
 #include "base/logging.h"
@@ -104,14 +103,18 @@ constexpr ClassicCounterDef kClassicCounters[] = {
 };
 
 // The commands only a KeyDB has (spec D-7), besides `PERSIST key subkey`. KEYDB.MVCCRESTORE is not
-// among them: it is applied (D-7a).
+// among them: it is applied (D-7a). RREPLAY is listed because D-7 says so, but nothing reaches it
+// today: the stream loop and HandleRreplay take an envelope apart before they ask this question.
 constexpr string_view kKeyDbOnlyCommands[] = {"PEXPIREMEMBERAT", "EXPIREMEMBER",  "EXPIREMEMBERAT",
                                               "KEYDB.CRON",      "KEYDB.HRENAME", "KEYDB.NHSET",
                                               "KEYDB.NHGET",     "KEYDB.MEXISTS", "RREPLAY"};
 
+// Set by NoteActiveKeyDbMaster, never cleared.
+atomic<bool> active_keydb_master_seen{false};
+
 bool AnyCounterMoved(const ClassicLinkCounts& counts) {
-  return any_of(begin(kClassicCounters), end(kClassicCounters),
-                [&counts](const ClassicCounterDef& def) { return counts.*def.count != 0; });
+  return ranges::any_of(kClassicCounters,
+                        [&counts](const ClassicCounterDef& def) { return counts.*def.count != 0; });
 }
 
 // The counters of `counts` worth showing: all of them, or only the nonzero ones.
@@ -202,6 +205,14 @@ ClassicLinkStats& ClassicTotals() {
   return totals;
 }
 
+void NoteActiveKeyDbMaster() {
+  active_keydb_master_seen.store(true, memory_order_relaxed);
+}
+
+bool ActiveKeyDbMasterSeen() {
+  return active_keydb_master_seen.load(memory_order_relaxed);
+}
+
 bool ClassicLinkShown(const ReplicaSummary& link) {
   return link.classic_link && (link.master_active_replica || AnyCounterMoved(link.classic));
 }
@@ -213,8 +224,8 @@ vector<ClassicCounterValue> ClassicLinkFields(const ReplicaSummary& link) {
 }
 
 vector<ClassicCounterValue> ClassicTotalSeries(const ClassicLinkCounts& totals,
-                                               bool any_master_active) {
-  return CounterValues(totals, any_master_active);
+                                               bool active_master_seen) {
+  return CounterValues(totals, active_master_seen);
 }
 
 bool ClassicApplier::SkipKeyDbOnly(const facade::RespVec& args) {

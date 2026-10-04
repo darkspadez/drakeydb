@@ -655,6 +655,8 @@ async def test_psync_full_sync_tail_mismatch_does_not_abort_replica(
 SET_A = resp_command("SET", "a", "1")
 SET_B = resp_command("SET", "b", "2")
 SYNC_OFFSET = 1000
+# The uuid a scripted master answers `REPLCONF UUID` with, which a peer node needs of its master.
+SCRIPTED_PEER_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 # The second write of a scenario below comes this long after the first, by when the replica has read
 # the first alone and is waiting on the socket for more.
@@ -857,6 +859,57 @@ def rreplay(*command, uuid="b1198d29-cb88-4110-922a-a6c99bd08471", db=0, mvcc=1)
     return resp_command("RREPLAY", uuid, resp_command(*command), db, mvcc)
 
 
+@pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
+async def test_classic_stream_info_command_does_not_abort(
+    df_factory: DflyInstanceFactory, tmp_path, scenario
+):
+    """An `INFO` in the replication stream, raw or inside an RREPLAY envelope, used to kill the
+    replica (ISSUE-REGISTER U-15): ServerFamily::Info asks its connection whether it is privileged
+    and for its TLS certificate, and a replicated apply has no connection (a null `conn()`). It is
+    an error reply now, which the stream discards: the replica stays up, the offset the master
+    settles on is the exact length of the stream, and the commands around it apply. Inside an
+    envelope the failure also shows as a `classic_apply_errors`.
+
+    Falsifying: with the guard removed the replica process dies as it reads the command (SIGSEGV
+    or SIGABRT out of ServerFamily::Info), so `a` or `b` never arrives.
+    """
+    info_command = resp_command("INFO") if scenario == "raw" else rreplay("INFO")
+    stream = SET_A + info_command + SET_B
+    async with FakeClassicMaster() as master:
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET), stream=stream, stream_delay=SECOND_WRITE_DELAY_S
+        )
+        node = df_factory.create(
+            proactor_threads=2, dir=str(tmp_path / "df"), replication_acks_interval=100
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("b") == "2"
+
+        await applied()
+        assert await c.get("a") == "1"
+        expected = SYNC_OFFSET + len(stream)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert max(master.ack_offsets) == expected, master.ack_offsets
+        assert master.connection_count == 1, "the replica reconnected"
+        info = await c.info("replication")
+        assert info["master_link_status"] == "up", info
+        if scenario == "in_envelope":
+            assert info["classic_apply_errors"] == 1, info
+            assert info["rreplay_unwrapped"] == 1, info
+
+    node.stop()
+    if scenario == "in_envelope":
+        assert node.find_in_logs(r"did not apply and is skipped: INFO: .*No connection")
+
+
 @pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
 async def test_unwrap_flushes_raw_batch_before_envelope(
     df_factory: DflyInstanceFactory, tmp_path, peer_mode
@@ -878,7 +931,7 @@ async def test_unwrap_flushes_raw_batch_before_envelope(
     args = {"active_replica": "true"} if peer_mode else {}
     async with FakeClassicMaster() as master:
         if peer_mode:
-            master.script_uuid("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+            master.script_uuid(SCRIPTED_PEER_UUID)
         master.script_psync(
             diskless_full_sync(offset=SYNC_OFFSET, tail=EOF_TOKEN + stream),
             stream=marker,
@@ -1240,7 +1293,7 @@ async def test_scripted_active_master_exact_classic_counters(
     async with FakeClassicMaster() as master:
         master.script_capa_reply(b"+OK active-replica\r\n")
         if peer_mode:
-            master.script_uuid("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+            master.script_uuid(SCRIPTED_PEER_UUID)
         master.script_psync(diskless_full_sync(offset=SYNC_OFFSET, tail=EOF_TOKEN + stream))
         node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
 
@@ -1279,6 +1332,35 @@ async def test_scripted_active_master_exact_classic_counters(
         }
 
 
+ZERO_COUNTERS = dict.fromkeys(CLASSIC_COUNTERS, 0)
+
+
+async def wait_for_synced_link(node, c, peer_mode):
+    """Waits until the link to a scripted master (a diskless full sync at SYNC_OFFSET) is up and its
+    full sync is over, so that what INFO then says is settled.
+
+    `link_status` is `up` as soon as the socket is, before `+FULLRESYNC` is parsed, so that alone
+    is not enough: the link must also not be syncing, and show the offset the sync ended at (the
+    plain block's `slave_repl_offset` appears with the finished sync, a peer line's `repl_offset`
+    is the stream offset)."""
+
+    @assert_eventually(times=100)
+    @retry_while_loading
+    async def synced():
+        assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+        info = await c.info("replication")
+        if peer_mode:
+            link = info["master0"]
+            assert link["link_status"] == "up" and link["sync_in_progress"] == 0, info
+            assert link.get("repl_offset") == SYNC_OFFSET, info
+        else:
+            assert info["master_link_status"] == "up", info
+            assert info["master_sync_in_progress"] == 0, info
+            assert info.get("slave_repl_offset") == SYNC_OFFSET, info
+
+    await synced()
+
+
 @pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
 async def test_scripted_quiet_active_master_shows_zero_counters(
     df_factory: DflyInstanceFactory, tmp_path, peer_mode
@@ -1291,24 +1373,95 @@ async def test_scripted_quiet_active_master_shows_zero_counters(
     async with FakeClassicMaster() as master:
         master.script_capa_reply(b"+OK active-replica\r\n")
         if peer_mode:
-            master.script_uuid("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+            master.script_uuid(SCRIPTED_PEER_UUID)
         master.script_psync(diskless_full_sync(offset=SYNC_OFFSET))
         node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+        await wait_for_synced_link(node, c, peer_mode)
 
-        @assert_eventually(times=100)
-        @retry_while_loading
-        async def linked():
-            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
-            info = await c.info("replication")
-            link = info["master0"] if peer_mode else info
-            assert link["master_link_status" if not peer_mode else "link_status"] == "up", info
-
-        await linked()
         info = await c.info("replication")
-        assert classic_fields(info, peer_mode) == dict.fromkeys(CLASSIC_COUNTERS, 0), info
+        assert classic_fields(info, peer_mode) == ZERO_COUNTERS, info
         if peer_mode:
             assert info["master0"]["repl_offset"] == SYNC_OFFSET, info
-        assert classic_series(await node.metrics()) == dict.fromkeys(CLASSIC_COUNTERS, 0)
+        assert classic_series(await node.metrics()) == ZERO_COUNTERS
+
+
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+@pytest.mark.parametrize("outage", ["master_gone", "greet_fails"])
+async def test_scripted_active_master_down_link_keeps_zero_counters(
+    df_factory: DflyInstanceFactory, tmp_path, peer_mode, outage
+):
+    """The link to an active KeyDB is shown whatever its state: while it is down, or reconnecting
+    with a handshake that does not complete, INFO still shows its six zeros (and in peer mode the
+    offset), as it did while the link was up.
+
+    `master_gone`: the master closes every connection and its listener, so every reconnect is
+    refused and the link is `down`. `greet_fails`: the master stays up but answers every `REPLCONF
+    capa` with an error, so each reconnect fails its handshake (no second PSYNC arrives).
+
+    Falsifying: reading the master's `active-replica` answer only while the link is greeted (as
+    the first version did) leaves the link without a single field here.
+    """
+    async with FakeClassicMaster() as master:
+        master.script_capa_reply(b"+OK active-replica\r\n")
+        if peer_mode:
+            master.script_uuid(SCRIPTED_PEER_UUID)
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET))
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+        await wait_for_synced_link(node, c, peer_mode)
+        assert classic_fields(await c.info("replication"), peer_mode) == ZERO_COUNTERS
+
+        connections = master.connection_count
+        if outage == "master_gone":
+            await master.close()
+
+            @assert_eventually(times=100)
+            async def down():
+                info = await c.info("replication")
+                link = info["master0"] if peer_mode else info
+                assert link["link_status" if peer_mode else "master_link_status"] == "down", info
+
+            await down()
+        else:
+            master.script_capa_reply(b"-ERR capa refused\r\n")
+            await master.drop_connections()
+            # Two attempts after the drop: the first handshake failed before the second began.
+            assert await master.wait_for_connections(connections + 2) >= connections + 2
+            assert len(master.psync_requests) == 1, master.psync_requests
+
+        assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+        info = await c.info("replication")
+        assert classic_fields(info, peer_mode) == ZERO_COUNTERS, info
+        if peer_mode:
+            assert info["master0"]["repl_offset"] == SYNC_OFFSET, info
+
+
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+async def test_scripted_active_master_series_outlive_the_link(
+    df_factory: DflyInstanceFactory, tmp_path, peer_mode
+):
+    """Once a master that says `active-replica` has completed a handshake, /metrics exports the six
+    classic series (zeros included) for the rest of the process's life: removing the link does not
+    take them away, whatever the links of the node say afterwards (owner decision 25).
+
+    Falsifying: deciding it per scrape from the node's links (as the first version did) leaves no
+    series once the link is gone.
+    """
+    async with FakeClassicMaster() as master:
+        master.script_capa_reply(b"+OK active-replica\r\n")
+        if peer_mode:
+            master.script_uuid(SCRIPTED_PEER_UUID)
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET))
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+        await wait_for_synced_link(node, c, peer_mode)
+        assert classic_series(await node.metrics()) == ZERO_COUNTERS
+
+        if peer_mode:
+            assert await c.execute_command(f"REPLICAOF REMOVE 127.0.0.1 {master.port}") == "OK"
+            assert (await c.info("replication"))["connected_masters"] == 0
+        else:
+            assert await c.execute_command("REPLICAOF NO ONE") == "OK"
+            assert (await c.info("replication"))["role"] == "master"
+        assert classic_series(await node.metrics()) == ZERO_COUNTERS
 
 
 async def test_scripted_stock_master_raw_keydb_only_command_shows_only_that_counter(

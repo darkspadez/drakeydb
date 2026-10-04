@@ -1996,7 +1996,9 @@ void Service::Quit(CmdArgParser, CommandContext* cmd_cntx) {
 
   auto* cntx = cmd_cntx->server_conn_cntx();
   DeactivateMonitoring(cntx);
-  cmd_cntx->conn()->MarkForClose();
+  // drakeydb: U-15 -- a replicated apply has no connection to close (see DispatchCommand, U-12).
+  if (auto* conn = cmd_cntx->conn(); conn != nullptr)
+    conn->MarkForClose();
 }
 
 void Service::Reset(CmdArgParser, CommandContext* cmd_cntx) {
@@ -2734,6 +2736,10 @@ void Service::Publish(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void Service::Subscribe(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- a replicated apply has no connection to subscribe: the channel store would
+  // keep a subscriber it cannot reach, and the first PUBLISH of a client would dereference it.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
   bool sharded = cmd_cntx->cid()->IsShardedPubSub();
   if (!sharded && IsClusterEnabled())
     return cmd_cntx->SendError("SUBSCRIBE is not supported in cluster mode yet");
@@ -2759,6 +2765,9 @@ void Service::Unsubscribe(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void Service::PSubscribe(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- see Subscribe.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
 
   if (IsClusterEnabled()) {
@@ -2814,6 +2823,10 @@ void Service::PubsubNumSub(ParsedArgs channels, SinkReplyBuilder* builder) {
 }
 
 void Service::Monitor(CmdArgParser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- a replicated apply has no connection to monitor with: the monitor list would
+  // keep a null connection and the next command of any client would dereference it.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
   VLOG(1) << "starting monitor on this connection: "
           << cmd_cntx->server_conn_cntx()->conn()->GetClientId();
   // we are registering the current connection for all threads so they will be aware of

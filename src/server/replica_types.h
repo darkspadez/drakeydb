@@ -49,9 +49,10 @@ struct ReplicaSummary {
   int64_t clock_skew_ms = 0;
 
   // drakeydb: P7 -- the link is to a classic (Redis protocol) master, as of its last completed
-  // handshake, and that master answered `REPLCONF capa` with `active-replica` (an active KeyDB);
-  // the latter only while the link is greeted. With the link's counters they decide whether INFO
-  // and /metrics show the classic fields (ClassicLinkShown in classic_replay.h).
+  // handshake, and a master of this link answered `REPLCONF capa` with `active-replica` (an active
+  // KeyDB) at a completed handshake. The latter sticks: it stays set while the link is down or
+  // reconnecting. With the link's counters they decide whether INFO shows the classic fields
+  // (ClassicLinkShown in classic_replay.h).
   bool classic_link = false;
   bool master_active_replica = false;
   ClassicLinkCounts classic;

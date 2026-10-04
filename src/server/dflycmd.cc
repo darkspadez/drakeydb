@@ -268,6 +268,9 @@ void DflyCmd::Thread(CmdArgParser parser, CommandContext* cmd_cntx) {
   if (num_thread < pool->size()) {
     if (int(num_thread) != ProactorBase::me()->GetPoolIndex()) {
       auto* conn = cmd_cntx->conn();
+      // drakeydb: U-15 -- a replicated apply has no connection to migrate.
+      if (conn == nullptr)
+        return cmd_cntx->SendError("No connection");
       if (!conn->Migrate(pool->at(num_thread))) {
         // Listener::PreShutdown() triggered
         if (conn->socket()->IsOpen()) {

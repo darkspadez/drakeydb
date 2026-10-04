@@ -409,6 +409,67 @@ and is left to U-13's path, an unknown command. Tests
 (`empty_array`, `nil_array`, `behind_a_queued_command`). Pre-existing in upstream Dragonfly; not
 filed upstream. On the byte-identity exception list (spec, item 2).
 
+### U-15. A connection command in a classic stream dereferences a null `conn()`
+
+**Where:** `ServerFamily::Info` (`src/server/server_family.cc`): `cmd_cntx->conn()->IsPrivileged()`
+and `->GetTlsCertInfo()`, the first thing it does with the connection once it has collected the
+metrics.
+
+`Replica::ConsumeRedisStream` builds its apply context as `ConnectionContext{nullptr, {}}` (U-9,
+U-10, U-12 are the same context) and dispatches whatever the master streams through
+`Service::DispatchCommand` or the squasher. Nothing on that path refuses a command that is about the
+client's own connection: `VerifyCommandState` takes a context without an owner for an internal one
+and permits everything, and ACL validation is skipped. So `INFO` (read-only, so the squasher runs it
+standalone: `ServerFamily::Info <- CommandId::Invoke <- MultiCommandSquasher::ExecuteStandalone`)
+kills the replica with SIGSEGV. Any classic master, plain Redis and Valkey included, can put
+`*1\r\n$4\r\nINFO\r\n` in its stream, so it is reachable from a malformed or hostile master after
+any valid sync, raw or inside an RREPLAY envelope (`INFO` is a known command, so it passes the
+unknown-command check). Found by the P7-1 Task 1.3 review (O-1), whose probe was a scripted master:
+a valid full sync, then `SET a 1`, `INFO`, `SET b 2`.
+
+The same context reaches every handler that dereferences `conn()` without a check. The audit
+(`task-1.3-report.md`, "U-15 audit") found, besides `INFO`: `CLIENT SETNAME`, `GETNAME`, `INFO`,
+`ID` and `KILL`, `AUTH`, `HELLO`, `REPLCONF` (its `capa dragonfly` and `listening-port` options, on
+a node that is a master: a peer-mode node, or with `--experimental_cascaded_partial_sync`; a plain
+replica refuses `REPLCONF` before it gets there), `QUIT`, `DFLY THREAD <n>`, and two that do not
+fail at the command: `MONITOR` leaves a null connection in the monitor list, which the next command
+of any client dereferences, and `SUBSCRIBE`/`PSUBSCRIBE` register the stream's context in the
+channel store (a context that is gone when the link ends), which the next client's `PUBLISH`
+dereferences.
+
+**How established:** the review's probe, and two throwaway probes as a gtest (each case in its own
+process, on the apply context of the stream, before the fix): 47 commands inside envelopes, then 31
+dispatched raw, which also reaches what an envelope skips, such as `REPLCONF`. `INFO`, the five
+`CLIENT` subcommands, `AUTH`, `HELLO`, `QUIT`, `REPLCONF listening-port|capa` and `DFLY THREAD 1`
+die with SIGSEGV; `MONITOR` and `SUBSCRIBE` die on the next client command (`DispatchMonitor`, the
+channel store's `Borrow()`); every other probed command (`CLIENT
+LIST`, `PAUSE`, `TRACKING`, `CACHING` and `MIGRATE` among them) did not.
+
+**Status (2026-10-04): fixed in this fork** (P7-1 review fix round, owner decision 26): each of the
+handlers above replies `No connection` (the error `CLIENT SETINFO` already gives) when its context
+has no connection, and `QUIT` replies `OK` and has nothing to close. The failed command is dropped
+and, inside an envelope, counted in `classic_apply_errors`; the link stays up and the commands
+around it apply. One `// drakeydb: U-15` hunk per handler: nine in `server_family.cc` (a shared
+`ReplyIfNoConnection`), and one each in `main_service.cc` (`Quit`, `Monitor`, `Subscribe`,
+`PSubscribe`) and `dflycmd.cc` (`DFLY THREAD`). The last two files are beyond what owner decision 26
+named. Tests `ClassicNoConnectionTest.*` (one case per handler, `classic_replay_test.cc`),
+`ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver` and
+`.InfoInAnEnvelopeIsAnApplyErrorNotACrash`, and
+`keydb_onboarding_test.py::test_classic_stream_info_command_does_not_abort` (`raw`, `in_envelope`).
+Pre-existing in upstream Dragonfly; not filed upstream. On the byte-identity exception list (spec,
+item 2).
+
+**Not changed, follow-up:** `DFLYCLUSTER FLOW` (`ClusterFamily::DflyMigrateFlow`) and, under
+`--cluster_mode=emulated`, `CLUSTER SLOTS|SHARDS|NODES` (`ClusterFamily::GetEmulatedShardInfo`)
+dereference `conn()` too, but only with cluster mode on, which is not the default; they were not
+probed. `GetEmulatedShardInfo` needs a design decision, not a guard: it answers with the address the
+client connected to. `DFLY FLOW` (`SetupFlowConnection`) dereferences it only once the master replid
+matches and a sync session in the preparation state is found, which only a real replica connection
+of this node creates, so a stream could hit it only inside that window, with a replid and a session
+id it has to guess. The class could be closed in one place instead, by the dispatcher refusing
+connection-bound commands for a context without a connection, which needs a flag that marks them;
+that is a design change and was left out.
+
 ---
 
 ## Part 2 — drakeydb deferred work

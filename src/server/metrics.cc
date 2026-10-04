@@ -529,10 +529,11 @@ void Metrics::Print(uint64_t uptime, const CommandRegistry* registry, DflyCmd* d
   }
 
   // drakeydb: P7 -- the process-wide totals of the classic link counters, `<name>_total`. A stock
-  // master leaves every one at zero and shows none of them, a plain replica of an active KeyDB
-  // shows them all (it never reaches the master-side branch above: this one serves both).
+  // master leaves every one at zero and shows none of them; once an active KeyDB master has
+  // completed a handshake with this process they all show, a plain replica's included (it never
+  // reaches the master-side branch above: this one serves both).
   for (const ClassicCounterValue& series :
-       ClassicTotalSeries(ClassicTotals().Snapshot(), m.classic_master_active)) {
+       ClassicTotalSeries(ClassicTotals().Snapshot(), ActiveKeyDbMasterSeen())) {
     AppendMetricWithoutLabels(StrCat(series.name, "_total"), series.help, series.value,
                               MetricType::COUNTER, &resp->body());
   }

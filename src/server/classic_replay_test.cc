@@ -20,6 +20,7 @@
 #include "base/gtest.h"
 #include "facade/facade_test.h"
 #include "facade/redis_parser.h"
+#include "facade/reply_capture.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/generic_family.h"
@@ -584,6 +585,16 @@ TEST(ClassicReplayTest, ClassicTotalSeriesFollowTheRenderPredicate) {
                     {"classic_apply_errors", 0}}));
 }
 
+// The process-wide flag Replica::Greet sets once an active KeyDB master has completed a handshake.
+// Its state before this call is not asserted: it lives as long as the process, and another test, or
+// a repeat, may have set it. There is no way to clear it, which is the point.
+TEST(ClassicReplayTest, ActiveKeyDbMasterSeenSticksOnceNoted) {
+  NoteActiveKeyDbMaster();
+  EXPECT_TRUE(ActiveKeyDbMasterSeen());
+  NoteActiveKeyDbMaster();
+  EXPECT_TRUE(ActiveKeyDbMasterSeen());
+}
+
 namespace {
 
 constexpr string_view kSelfUuid = "00000000-0000-4000-8000-000000000001";
@@ -1105,7 +1116,6 @@ TEST_F(ClassicApplyFamilyTest, KeyDbOnlyDroppedAndCounted) {
         Resp({"PEXPIREMEMBERAT", "s", "m", "1791058571443"}),
         Resp({"EXPIREMEMBER", "s", "m", "100"}),
         Resp({"EXPIREMEMBERAT", "s", "m", "1791058571"}),
-        Resp({"PERSIST", "k", "m"}),
         Resp({"KEYDB.CRON", "job", "single", "100000", "return 1"}),
         Resp({"KEYDB.HRENAME", "h", "a", "b"}),
         Resp({"KEYDB.NHSET", "k", "a", "1"}),
@@ -1118,12 +1128,21 @@ TEST_F(ClassicApplyFamilyTest, KeyDbOnlyDroppedAndCounted) {
       EXPECT_EQ(link.Apply(Envelope(kAuthorA, command, "3")), EnvelopeResult::kConsumed) << command;
       EXPECT_EQ(link.keydb_dropped(), ++dropped) << command;
     }
+
+    // `PERSIST k m`, in db 0 where `k` is. What pins that it is dropped is the counters: it was
+    // counted as dropped, and not as an apply error, which is what it would be if it were
+    // dispatched (Dragonfly's PERSIST takes one argument). The TTL cannot tell the two apart:
+    // dispatched, the arity error leaves it too, so it is not asserted for this command.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"PERSIST", "k", "m"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.keydb_dropped(), ++dropped);
+
     EXPECT_EQ(link.unwrapped(), dropped);
     EXPECT_EQ(link.unknown_dropped(), 0u);  // not unknown: they are KeyDB's
     EXPECT_EQ(link.apply_errors(), 0u);     // and never dispatched
     EXPECT_EQ(link.malformed(), 0u);
 
-    // `PERSIST k m` did not clear the TTL of `k`, which `PERSIST k` (a standard command) does.
+    // `PERSIST k`, a standard command, is applied and clears the TTL of `k`.
     EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"PERSIST", "k"}))), EnvelopeResult::kConsumed);
     EXPECT_EQ(link.keydb_dropped(), dropped);
     EXPECT_EQ(link.apply_errors(), 0u);
@@ -1135,7 +1154,7 @@ TEST_F(ClassicApplyFamilyTest, KeyDbOnlyDroppedAndCounted) {
   });
 
   EXPECT_THAT(service_->UknownCmdMap(), testing::IsEmpty());  // none went to the dispatcher
-  EXPECT_EQ(CheckedInt({"ttl", "k"}), -1);                    // from PERSIST k, not PERSIST k m
+  EXPECT_EQ(CheckedInt({"ttl", "k"}), -1);                    // `PERSIST k` was not dropped
   EXPECT_EQ(Get("after"), "v");
   EXPECT_EQ(CheckedInt({"dbsize"}), 2);
 }
@@ -1325,6 +1344,106 @@ TEST_F(ClassicApplyFamilyTest, RunningFalseDuringFirstDispatchStillConsumesWhole
       [&running_calls] { return running_calls.fetch_add(1) == 0; });
 
   EXPECT_EQ(Get("k", 3), "v");
+}
+
+// A command that works on its own connection, dispatched the way the raw path of
+// Replica::ConsumeRedisStream does, on a context with no connection. Each of them used to
+// dereference a null Connection* (ISSUE-REGISTER U-15) and kill the process, so a case is a crash
+// when the guard of its handler is gone: run one at a time (--gtest_filter) to tell which.
+struct NoConnectionCase {
+  const char* name;
+  string wire;
+  // QUIT has nothing to close and says OK; every other command replies "No connection".
+  bool replies_error = true;
+};
+
+class ClassicNoConnectionTest : public ClassicApplyFamilyTest,
+                                public testing::WithParamInterface<NoConnectionCase> {};
+
+TEST_P(ClassicNoConnectionTest, ReplicatedApplyOfAConnectionCommandIsAnErrorNotACrash) {
+  OnLink([&](Link& link) {
+    facade::CapturingReplyBuilder rb{facade::ReplyMode::ONLY_ERR};
+    Wire parsed = Wire::FromBytes(GetParam().wire);
+    CommandContext cmd;
+    cmd.Init(&rb, &link.cntx);
+    facade::FillBackedArgs(parsed.args, &cmd);
+    service_->DispatchCommand(facade::ParsedArgs{cmd}, &cmd, facade::AsyncPreference::ONLY_SYNC);
+
+    facade::CapturingReplyBuilder::Payload reply = rb.Take();
+    auto error = facade::CapturingReplyBuilder::TryExtractError(reply);
+    if (GetParam().replies_error) {
+      ASSERT_TRUE(error.has_value());
+      EXPECT_THAT(string(error->first), testing::HasSubstr("No connection"));
+    } else {
+      EXPECT_FALSE(error.has_value());
+    }
+  });
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    U15, ClassicNoConnectionTest,
+    testing::Values(
+        NoConnectionCase{"Info", Resp({"INFO"})},
+        NoConnectionCase{"InfoSection", Resp({"INFO", "commandstats"})},
+        NoConnectionCase{"ClientSetName", Resp({"CLIENT", "SETNAME", "x"})},
+        NoConnectionCase{"ClientGetName", Resp({"CLIENT", "GETNAME"})},
+        NoConnectionCase{"ClientInfo", Resp({"CLIENT", "INFO"})},
+        NoConnectionCase{"ClientId", Resp({"CLIENT", "ID"})},
+        NoConnectionCase{"ClientKill", Resp({"CLIENT", "KILL", "ID", "99999"})},
+        NoConnectionCase{"Auth", Resp({"AUTH", "secret"})},
+        NoConnectionCase{"AuthUser", Resp({"AUTH", "user", "secret"})},
+        NoConnectionCase{"Hello", Resp({"HELLO", "2"})},
+        NoConnectionCase{"HelloSetName", Resp({"HELLO", "3", "SETNAME", "x"})},
+        NoConnectionCase{"ReplconfListeningPort", Resp({"REPLCONF", "LISTENING-PORT", "6380"})},
+        NoConnectionCase{"ReplconfCapaDragonfly", Resp({"REPLCONF", "CAPA", "dragonfly"})},
+        NoConnectionCase{"Quit", Resp({"QUIT"}), false},
+        NoConnectionCase{"Monitor", Resp({"MONITOR"})},
+        NoConnectionCase{"Subscribe", Resp({"SUBSCRIBE", "c"})},
+        NoConnectionCase{"Ssubscribe", Resp({"SSUBSCRIBE", "c"})},
+        NoConnectionCase{"Psubscribe", Resp({"PSUBSCRIBE", "c*"})},
+        NoConnectionCase{"DflyThread", Resp({"DFLY", "THREAD", "1"})}),
+    [](const testing::TestParamInfo<NoConnectionCase>& info) { return string(info.param.name); });
+
+// What a replicated MONITOR or SUBSCRIBE would leave behind is worse than the failed command: a
+// null connection in the monitor list, and a context that is gone in the channel store, which the
+// next client's command or PUBLISH dereferences. Neither is registered now, so the clients go on.
+TEST_F(ClassicApplyFamilyTest, ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver) {
+  OnLink([&](Link& link) {
+    const vector<string> commands = {Resp({"MONITOR"}), Resp({"SUBSCRIBE", "c"}),
+                                     Resp({"PSUBSCRIBE", "c*"})};
+    for (const string& command : commands)
+      EXPECT_EQ(link.Apply(Envelope(kAuthorA, command)), EnvelopeResult::kConsumed) << command;
+    EXPECT_EQ(link.unwrapped(), commands.size());
+    EXPECT_EQ(link.apply_errors(), commands.size());  // each one failed, none applied
+
+    // The stream's context is not a monitor, so what follows applies.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "after", "v"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), commands.size());
+  });
+
+  EXPECT_EQ(Get("after"), "v");
+  EXPECT_EQ(Run({"set", "k", "v"}), "OK");  // would dereference a null monitor connection
+  EXPECT_EQ(CheckedInt({"publish", "c", "m"}), 0);
+  EXPECT_EQ(CheckedInt({"publish", "c1", "m"}), 0);  // nobody holds a subscription
+}
+
+// INFO inside an envelope, as the stream carries it: a command that did not apply, counted, and
+// the commands around it applied.
+TEST_F(ClassicApplyFamilyTest, InfoInAnEnvelopeIsAnApplyErrorNotACrash) {
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "before", "v"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"INFO"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 1u);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "after", "v"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 1u);
+    EXPECT_EQ(link.unwrapped(), 3u);
+  });
+
+  EXPECT_EQ(Get("before"), "v");
+  EXPECT_EQ(Get("after"), "v");
 }
 
 }  // namespace dfly
