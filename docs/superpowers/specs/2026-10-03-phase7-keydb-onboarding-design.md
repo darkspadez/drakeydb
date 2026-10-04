@@ -389,12 +389,22 @@ predicate. At each level:
    envelope, a livelock. Operators with a nonzero `rreplay_malformed` re-run `REPLICAOF` to force a
    full resync. Malformed is per level (clarification of decision 14): a malformed inner of a nested
    envelope advances nothing itself, and the enclosing level still advances (step 6).
-2. **Self.** uuid equals self: `rreplay_self_dropped++`, skip (`kConsumed`), no advance.
-3. **Cancellation, depth 1 only.** `running()` is checked **once**, before the outermost
-   envelope's first dispatch of any kind (a synthetic `SELECT` is a dispatch): false returns
-   `kNotConsumed` with nothing touched. After that point of no return the whole envelope tree runs
-   to completion (D-5): `DispatchCommand(ONLY_SYNC)` returns only after a command ran or was
-   rejected before running, so no "cancelled mid-dispatch, may not have run" state exists.
+2. **Cancellation, depth 1 only.** For a layer that parsed `kOk`, or failed only on its mvcc
+   (step 3 selects its db), `running()` is checked **once**, before the outermost envelope touches
+   the context at all: its db is selected (a first selection dispatches a synthetic `SELECT`) and
+   its commands are dispatched. False returns `kNotConsumed` with nothing touched. After that point
+   of no return the whole envelope tree runs to completion (D-5): `DispatchCommand(ONLY_SYNC)`
+   returns only after a command ran or was rejected before running, so no "cancelled
+   mid-dispatch, may not have run" state exists. A layer that failed an earlier check selects
+   nothing and is consumed without the check.
+3. **Db, then self, then nesting** — KeyDB's order in `replicaReplayCommand`
+   (`replication.cpp:5416`, `:5435`, `:5442`). The layer's db, if it has one, is **selected as the
+   layer is validated** (`SelectDb`, below), before the author is looked at and whatever the inner
+   command turns out to be: a self-authored envelope, a control command, an inner that is not one
+   command, a nesting overflow and an mvcc that fails to parse (KeyDB reads it after the db) have
+   all moved the stream's selected db. A layer that fails the arity, uuid or db check has not.
+   Then uuid equals self: `rreplay_self_dropped++`, skip (`kConsumed`), no advance. Then a layer
+   deeper than 64 is malformed (step 1's counter and warning).
 4. **Dedup early-out** (D-5). At every level `IsApplied(uuid, mvcc)` drops the envelope
    before its inner is parsed (`rreplay_deduped++`, `kConsumed`): a cheap read. It does not close
    the race between two links, which can pass it together; the *leaf's* reservation does (step 5).
@@ -402,22 +412,34 @@ predicate. At each level:
    `catCommandForAofAndActiveReplication` emits one, `aof.cpp:682-726`). Parse it with a
    `RedisParser(Mode::SERVER)` local to the call — one per nesting depth by construction, never the
    link's `parser_` — so no parser state is shared between levels or envelopes and there is nothing
-   to recreate after an error. An empty inner, a partial command, or bytes after the command are
-   malformed (step 1) and nothing is applied. Then, by class: `MULTI`/`EXEC`/`PING`/`REPLCONF`/
-   `SELECT` skip (the db travels in the envelope); `RREPLAY` recurses with `depth + 1`, malformed at
-   65; KeyDB-only commands drop and count (D-7); `KEYDB.MVCCRESTORE` is translated to a `RESTORE`
-   first (D-7a); `FindCmd == nullptr` counts `classic_unknown_cmds_dropped`; anything else is a leaf
-   and dispatches with the apply context (D-4) under a reservation (D-5).
+   to recreate after an error. An empty inner, a partial command, bytes after the command, or a
+   command whose name is not a string (`*0\r\n`, `*-1\r\n`, `*1\r\n$-1\r\n`: valid RESP that parses
+   to an array, a nil array, a nil; U-14) are malformed (step 1) and nothing is applied. Then, by
+   class: `MULTI`/`EXEC`/`PING`/`REPLCONF`/`SELECT` skip (the db travels in the envelope);
+   `RREPLAY` recurses with `depth + 1`, malformed at 65; KeyDB-only commands drop and count (D-7);
+   `KEYDB.MVCCRESTORE` is translated to a `RESTORE` first (D-7a); `FindCmd == nullptr` counts
+   `classic_unknown_cmds_dropped`; anything else is a leaf and dispatches with the apply context
+   (D-4) under a reservation (D-5).
 6. **Advance.** An envelope whose command was handled advances its own author's watermark (D-5):
    after a skipped command, after a dispatched one that was not rejected (`Commit`), and after a
    nested inner that returned `kConsumed` — deduped or not. At depth 64 a malformed 65th level
    (step 1) returns `kConsumed`, so the 64th level still advances. A `kNotConsumed` inner makes this
    level `kNotConsumed` and advances nothing.
 
-**Inner db.** The envelope db applies to the inner command through a `SelectDb` helper mirroring
-`JournalExecutor::SelectDb` (`journal/executor.cc:85-100`: first use dispatches a real `SELECT` so
-the `DbTable` exists, later uses set `conn_state.db_index`). Synthetic `SELECT`s are not stream
-bytes, never touch `repl_offs_`, and — being dispatches — come after the cancellation check.
+**Selected db.** The stream's apply context has one selected db (`conn_state.db_index`), shared by
+the raw commands and the envelopes, as KeyDB's master client has one: `replicaReplayCommand`
+selects each layer's db on its client while it validates the layer (`:5416`), carries it down to
+the client that runs the inner command (`:5468`) and back up afterwards (`:5478`, `:5488`), so
+the db a stream ends a layer in is the one the next command without a db runs in — a raw command
+and the 3-argument `RREPLAY` (no db) alike. drakeydb selects in step 3 through a `SelectDb` helper
+mirroring `JournalExecutor::SelectDb` (`journal/executor.cc:85-100`: first use dispatches a real
+`SELECT` so the `DbTable` exists, later uses set `conn_state.db_index`); a nested layer selects as
+well, so the innermost layer that has a db decides the leaf's, and an inner without one inherits.
+One deviation, harmless against real KeyDB: KeyDB would run a wrapped `SELECT n` and move the db to
+`n`, while step 5 skips it; KeyDB never wraps one, as the db travels in the envelope. If a
+`SelectDb` fails (counted in `classic_apply_errors`; a cluster-mode `SELECT` to db > 0 does), the
+leaf of the layer that asked is skipped unless a deeper layer selects another db. Synthetic
+`SELECT`s are not stream bytes and never touch `repl_offs_`.
 
 **Dispatch** is per command, `DispatchCommand(ParsedArgs{*cmd}, cmd, ONLY_SYNC)` on a
 `CommandContext` built with `FillBackedArgs`. Its reply builder is a link-owned
@@ -525,7 +547,7 @@ topology, so the reservation is **per author and on the innermost dispatched lev
 
 **Leaf** (an inner command that is not itself an `RREPLAY`, reserved under the *innermost*
 envelope's author and mvcc; one reservation per envelope tree, never held across the recursion):
-the `running()` check of D-3.3 has passed, then `Reserve`:
+the `running()` check of D-3.2 has passed, then `Reserve`:
 
 - `kDrop`: consumed, `rreplay_deduped++`.
 - `kCancelled`: **not** consumed — nothing was dispatched, nothing is touched.
@@ -547,11 +569,12 @@ or self-authored envelope; a malformed inner of a nested envelope does not advan
 outer still does (D-3.6).
 
 **Cancellation and offsets (I1).** The only not-consumed outcome is `running()` being false before
-the outermost envelope's first dispatch (D-3.3): checked **once** per outermost envelope — the
-point of no return — after which the whole tree finishes unconditionally (`Reserve`'s `running`
-callback only matters until that first dispatch). `Commit`/`Advance` run *before* `repl_offs_ +=
-total_read`, so a resume offset never covers an envelope whose watermark was not recorded; a link
-cancelled between the two resumes at the old offset and the replayed envelope is deduped. A
+the outermost envelope's first touch of the context (D-3.2): checked **once** per outermost
+envelope — the point of no return — after which the whole tree finishes unconditionally
+(`Reserve`'s `running` callback only matters until that first dispatch). `Commit`/`Advance` run
+*before* `repl_offs_ += total_read`, so a resume offset never covers an envelope whose watermark was
+not recorded; a link cancelled between the two resumes at the old offset and the replayed envelope
+is deduped. A
 rejected-before-run envelope counts its bytes but leaves the watermark alone, so the same envelope
 replayed by another link, or by a partial resync, still applies once.
 
@@ -943,10 +966,13 @@ still pass under if the feature were removed.
 | `test_classic_stream_empty_command_name_does_not_abort[diskless_later_write\|disk_later_write\|disk_behind_rdb]` (fake master: a valid sync, then `*1\r\n$0\r\n\r\n`, then `SET a 1`: replica alive, `a == 1`, settled ACK exact; U-13) | Dropping the `!cmd.empty()` guard in `ConsumeRedisStream`: SIGABRT (`i < size()`, `absl/types/span.h`) |
 | `test_classic_stream_rreplay_is_dropped_and_logged_until_p7_1` (fake master that did not advertise `active-replica`; Task 1.2 replaces it) | Removing the defensive drop ERROR: nothing is logged |
 | `test_psync_stream_bytes_behind_full_sync_are_applied` (fake master: `$<len>` + RDB + raw `SET a 1` in one `write()`; the `$EOF:` framing too): `a == 1`, offsets exact; `test_psync_*_token_mismatch*` and `*_length_*` reconnect | Unclamped first read (`CHECK`/reconnect loop, `a` never set); dropping the hand-off (`a == 0`); counting the hand-off twice (offsets apart) |
-| `ClassicReplayTest.ParseRreplayEnvelope*` (incl. the golden captures); `ClassicApplyFamilyTest.*` (unwrap, db, skips, self, malformed, nested to 64, depth-65 leaves the 64th consumed, an inner with zero or two commands malformed, known-command error counted) | Dropping the 65th-nesting refusal; applying inner `PING`; accepting a second inner command; the `NONE` builder (no `classic_apply_errors`) |
+| `ClassicReplayTest.ParseRreplayEnvelope*` (incl. the golden captures); `ClassicApplyFamilyTest.*` (unwrap, db, skips, self, malformed, nested to 64, depth-65 leaves the 64th consumed, an inner with zero or two commands, or with an array, nil array or nil for a name, malformed, known-command error counted) | Dropping the 65th-nesting refusal; applying inner `PING`; accepting a second inner command; the `NONE` builder (no `classic_apply_errors`) |
 | `ClassicApplyFamilyTest.RunningFalseBeforeDispatchReturnsNotConsumed*`, `.RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope`, `.RejectedDispatchCountsBytesDoesNotAdvance`, `.ReplayAfterCommitBeforeCountIsDeduped` | Checking `running()` after the first dispatch; checking it before every inner dispatch; `Commit` on a rejected dispatch; deferring `Commit` past the return |
+| `test_classic_stream_command_with_an_array_for_a_name_does_not_abort[empty_array\|nil_array\|behind_a_queued_command]` (fake master: a valid sync, then `*0\r\n` or `*-1\r\n`, with a raw command queued ahead of it in the last case, then `SET a 1`: replica alive, `a == 1`, settled ACK exact, the warning logged; U-14) | Dropping the U-14 guard in `ConsumeRedisStream`: SIGABRT (`std::bad_variant_access` out of `RespExpr::GetView`) |
 | `test_plain_replica_unwraps_keydb_rreplay`, `..._nested_...`, `test_unwrap_offsets_exact`; `test_keydb_active_live_write_during_full_sync[plain_replica\|peer_mode]` (no longer `xfail`) | Skipping `repl_offs_ +=` (offset lags); removing unwrap (no keys; the live-write test goes back to strict-xfail) |
 | `test_unwrap_flushes_raw_batch_before_envelope` (fake master: raw `SET a 1`, envelope `SET a 2`) | Removing the pre-envelope flush (final `a == 1`) |
+| `test_unwrap_selected_db_is_the_one_the_raw_commands_after_it_run_in` (fake master: an envelope in db 2, then a raw `SET c` and a 3-argument envelope, then an envelope in db 0 and a raw `SET g`) | Giving the applier a connection context of its own: `c` lands in db 0 |
+| `ClassicApplyFamilyTest.DbIsSelectedBeforeTheAuthorAndInnerChecks`, `.SkipsInnerControlCommands` (a control, self-authored, bad-mvcc, malformed-inner and over-nested layer each leave their db selected; arity, uuid and db failures do not) | Selecting the db after the self check, or only for a well-formed layer, or after the nesting check; `ParseRreplayEnvelope` not handing back the db of a bad mvcc |
 | `test_keydb_only_commands_dropped_with_counters` | `IsKeyDbOnlyCommand` returning false (counter lands in `classic_unknown_cmds_dropped`) |
 | `test_info_and_metrics_show_classic_counters`; `..._absent_for_stock_master` (INFO/`/metrics` for a Redis master with all counters zero equal upstream's: no classic field); `test_active_replica_boot_warning_names_keydb_drops` | Rendering unconditionally (the stock-master test fails); omitting the replica-side Prometheus branch |
 | `test_greet_sends_capa_active_expire_only_after_active_replica_reply` (KeyDB log lacks "does not support active expiration"; Redis capture shows no send) | Never sending it (the KeyDB warning appears) |
@@ -990,6 +1016,11 @@ observe changes only here:
      stream. Upstream read the first byte of the empty name (`replica.cc`, `ConsumeRedisStream`):
      SIGABRT in a debug build, a 1-byte out-of-bounds read in a release one. It is now dispatched
      as the unknown command it is and its bytes are counted exactly.
+   - **U-14** (P7-1 review round): a command whose name is an array, `*0\r\n` or `*-1\r\n`, in a
+     classic master's stream. Upstream read the name as a string, which throws
+     `std::bad_variant_access` out of `RespExpr::GetView` and terminates the process. It is now
+     skipped like `MULTI`/`EXEC`, with a rate-limited warning, its bytes counted exactly. Ungated:
+     it is reachable from any classic master, not only a KeyDB one.
    - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
      migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
      a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a

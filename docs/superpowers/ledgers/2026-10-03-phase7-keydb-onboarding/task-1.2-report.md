@@ -400,3 +400,162 @@ Repeats of the timing-sensitive tests (pass rates):
 `pre-commit run --files <the source, test and doc files above>` at the end of the task: `pyflakes`,
 `trim trailing whitespace`, `fix end of files`, `check python ast`, `Clang formatting`, `black` all Passed
 (the first pass reformatted one C++ file; the second was clean, and the tree was rebuilt and the gtest rerun).
+
+## Review fix round (Opus review of `c419ead`)
+
+Same branch, HEAD `1d7b324`, still uncommitted. Findings C1, m1, m2, m4, m6, m9 fixed; m3, m5, m7, m8
+recorded below (no code). Scratch material (probes, falsified binaries, outputs) is in the
+orchestrator's scratchpad under `impl-p71/`.
+
+### What changed, per finding
+
+| Finding | Change |
+|---|---|
+| **C1** (inner `*0` / `*-1` aborts the replica) | `ClassicApplier::ParseSingleCommand` returns false unless the first element is a `STRING`, so the layer is `rreplay_malformed` and skipped (decision 14). The parser gives `*0` an `ARRAY`, `*-1` a `NIL_ARRAY` and `*1\r\n$-1\r\n` a `NIL` with an empty buffer (`redis_parser.cc:330`, `:334`, `:381-383`); all three fall under the rule. Before the fix `*0` and `*-1` aborted (`bad_variant_access` in `ApplyCommand`) and the nil name was dispatched as an unknown command with an empty name (a `classic_apply_errors`, not a malformed layer). |
+| **C1** (raw `*0` / `*-1`, upstream) | `replica.cc`, one `// drakeydb: U-14` hunk: a command whose first element is an `ARRAY` or `NIL_ARRAY` is skipped with `LOG_EVERY_T(WARNING, 60)` ("Skipping a command without a name from <master>") and falls through to the existing not-queued bookkeeping, so its bytes are counted exactly (at once, or deferred onto the batch ahead of it). The hunk turns `if (!last_args.empty())` into an `else if`. A raw nil *string* name (`*1\r\n$-1\r\n`) does not crash (it reads as an empty name) and stays on U-13's path (dispatched as an unknown command), so only what crashed changed. Registered as **U-14** in `docs/ISSUE-REGISTER.md`, listed in the spec's byte-identity exceptions (item 2, after U-13) and in the `replica.cc` row of `docs/UPSTREAM-SYNC.md` (U-13 was there). |
+| **m1** (sticky db) | KeyDB's order, read from `replication.cpp` and then checked against a real KeyDB (below): arity (`:5389`), uuid (`:5398`), arg2 (`:5406`), then **db parsed, range-checked and `selectDb`'d (`:5416`)**, then mvcc (`:5427`), then self (`:5435`), then nesting `FPush` (`:5442`). So a bad mvcc *after a good db leaves the db selected*, and a failure before the db does not. `HandleRreplay` now selects the db of every layer that is `kOk` or `kBadMvcc` right after the depth-1 `running()` check and before the self check; the leaf runs in whatever the context has selected (`ApplyCommand` lost its db parameter), and a failed `SelectDb` skips the leaf unless a deeper layer selects another db (the old "innermost db decides" semantics, kept). `ParseRreplayEnvelope` hands back `out->db` on `kBadMvcc` (the one failure after the db was taken). The nesting check moved after the self check, as in KeyDB (`:5435` then `:5442`): a 65th layer selects its db before it is refused, and a self-authored 65th layer is a self drop, not an overflow. |
+| m1 (consequence) | The `running()` check now precedes the db select, so it precedes the self check too: a self-authored depth-1 envelope (or one with a bad mvcc and a db) on a stopping link returns `kNotConsumed` instead of being consumed. Nothing is touched, and the replayed envelope is dropped again after the resume. |
+| m1 (text) | `classic_replay.h` class comment, `replica.cc` comment at the applier's construction (it now says what is true), spec D-3 steps 2-3 rewritten (cancellation is now step 2, "db, then self, then nesting" step 3; the two `D-3.3` references in D-5 became `D-3.2`), spec "Inner db" became "Selected db", spec D-15 rows added. |
+| **m2** | `test_unwrap_selected_db_is_the_one_the_raw_commands_after_it_run_in` (scripted master). |
+| **m4** | `replica.h`: "Nothing reads it yet: Task 1.3 (INFO) and Task 1.4 (the activeExpire decision) will, and must do so only once R_GREETED is set". `docs/PLAN.md` `replica.h/.cc` row: P7-1 (Task 1.2) delivers the unwrap and the U-14 skip; `capa activeExpire` stays future. |
+| **m6** | "would not fit it" became "could exceed it" (unmeasured). |
+| **m9** | `DCHECK_GE(depth, 1u)` at the top of `HandleRreplay`. Exercised once with a temporary gtest calling `Apply(..., 0)`: `Check failed: depth >= 1u (0 vs. 1)`, SIGABRT; the temporary test was removed (a permanent death test is unsafe next to the proactor threads of `BaseFamilyTest`). |
+
+### Tests added or changed
+
+gtest (`classic_replay_test.cc`), 24 became 25 tests:
+
+- `ClassicApplyFamilyTest.MalformedEnvelopeSkippedAndCounted`: three inner cases added, `*0\r\n`, `*-1\r\n`, `*1\r\n$-1\r\n`, each consumed with `rreplay_malformed` +1.
+- `ClassicApplyFamilyTest.SkipsInnerControlCommands`: pinned the old behaviour (`db_index` stays 0); now each control envelope carries db 3, the context ends in 3 (not 5: the inner `SELECT 5` is not dispatched), and a 3-argument `SET` afterwards lands in db 3 and nowhere else.
+- **New** `ClassicApplyFamilyTest.DbIsSelectedBeforeTheAuthorAndInnerChecks`: self-authored envelope in db 3 then a 3-argument envelope (applies in db 3: the case the brief asked for); bad mvcc after a good db; inner that is not a command; inner `*0`; arity, uuid and db failures leave the db alone; nested self-authored inner; nested bad-mvcc inner; the 65th layer.
+- `ClassicApplyFamilyTest.RunningFalseBeforeDispatchReturnsNotConsumed`: a self-authored and a bad-mvcc envelope with a db are `kNotConsumed` and leave `db_index` 0; an envelope that fails before its db is consumed.
+- `ClassicReplayTest.ParseRreplayEnvelopeChecksInKeyDbOrder`: `kBadMvcc` hands back the db.
+
+pytest (`keydb_onboarding_test.py`), four new cases (the file now collects 36):
+
+- **New** `test_classic_stream_command_with_an_array_for_a_name_does_not_abort[empty_array|nil_array|behind_a_queued_command]` (raw `*0`, raw `*-1`, and a raw `*0` behind a queued raw command, which takes the deferred-ACK path): replica alive, keys applied, settled ACK exact, one connection, the warning logged.
+- **New** `test_unwrap_selected_db_is_the_one_the_raw_commands_after_it_run_in` (m2): envelope in db 2, raw `SET c`, 3-argument envelope `SET d`, envelope in db 0, raw `SET g`: e, c, d in db 2; f, g in db 0; exact ACKs.
+- `test_unwrap_skips_malformed_envelopes_without_disconnect`: an inner `*0` added (mvcc values renumbered to stay increasing).
+
+### Falsification (each against the change it guards; observed, then restored and diffed against a saved copy)
+
+gtest, `cd /home/user/drakeydb/build-dbg && nice ninja -j3 classic_replay_test && ./classic_replay_test --gtest_filter=<..>`:
+
+| Change reverted | Filter | Observed |
+|---|---|---|
+| F1: `ParseSingleCommand` without the `STRING` check | `ClassicApplyFamilyTest.MalformedEnvelopeSkippedAndCounted` | exit 134; `std::__throw_bad_variant_access <- std::get <- RespExpr::GetBuf <- RespExpr::GetView <- ClassicApplier::ApplyCommand <- ClassicApplier::HandleRreplay` |
+| F1b: check weakened to reject only `ARRAY`/`NIL_ARRAY` | same | `inner nil name`: `link.malformed()` 14 vs `++expected` 15, and later `apply_errors()` 1 vs 0, `unwrapped()` 2 vs 1 (the nil name was dispatched as an unknown command) |
+| F2e: db selected after the self check (and so not for `kBadMvcc`) | all | only `DbIsSelectedBeforeTheAuthorAndInnerChecks` fails: `db_index` 0 vs 3 (self-authored), 0 vs 4 (bad mvcc), 2 vs 8 and 2 vs 9 (nested), `after_self` and the others land in db 0 |
+| F2b: `ParseRreplayEnvelope` does not hand back the db on `kBadMvcc` | all | `ParseRreplayEnvelopeChecksInKeyDbOrder` (`env.db.has_value()` false) and `DbIsSelectedBeforeTheAuthorAndInnerChecks` (`db_index` 3 vs 4, 2 vs 9) |
+| F2c: nesting check back before the parse and select | all | `DbIsSelectedBeforeTheAuthorAndInnerChecks`: `db_index` 1 vs 10 for the 65th layer |
+| F2d: `running()` checked after the select | all | `RunningFalseBeforeDispatchReturnsNotConsumed`: `db_index` 3 vs 0 (three places) |
+| Whole round reverted: `classic_replay.{h,cc}` from `HEAD` with the new tests | one test per run | `ParseRreplayEnvelopeChecksInKeyDbOrder` fails (`classic_replay_test.cc:403`); `SkipsInnerControlCommands` fails (three expectations); `DbIsSelected...` fails then aborts (`bad_variant_access`); `RunningFalse...` fails (five expectations); `MalformedEnvelope...` aborts, exit 134 |
+
+pytest, `cd /home/user/drakeydb && DRAGONFLY_PATH=<copy of the binary> KEYDB_SERVER_PATH=... KEYDB_REQUIRED=1 flock /tmp/drakey-pytest.lock /root/drakey-venv-pinned/bin/python -m pytest tests/dragonfly/keydb_onboarding_test.py -k "array_for_a_name or malformed_envelopes or selected_db" -q`:
+
+| Binary | Observed |
+|---|---|
+| `HEAD` sources (before this round) | 4 failed, 1 passed, 4 teardown errors. Failures: `ConnectionRefusedError ... Connect call failed` on the replica's port (the process died) for the three U-14 cases and for `test_unwrap_skips_malformed_envelopes_without_disconnect`; each teardown: `Dragonfly did not terminate gracefully, exit code -6`. The m2 test passed: `HEAD` already shared the context, so it is a regression pin, falsified below. |
+| the U-14 hunk of `replica.cc` removed alone | the three U-14 cases fail (process dead, exit -6); the malformed-envelopes test passes (the applier fix is intact) |
+| the `STRING` check of `ParseSingleCommand` removed alone | `test_unwrap_skips_malformed_envelopes_without_disconnect` fails (process dead, exit -6); the three U-14 cases pass |
+| the applier given a `ConnectionContext` of its own in `ConsumeRedisStream` | `test_unwrap_selected_db_is_the_one_the_raw_commands_after_it_run_in` fails: `AssertionError: c is not in db 2` |
+
+Probes (reviewer's `probe.py`, copied to `impl-p71/` with the binary path and log directory made
+configurable, plus a `raw_nil_array` case): on the `HEAD` binary `empty_array`, `nil_array`,
+`raw_empty_array` and `raw_nil_array` die with SIGABRT (rc -6); `nil_name` survives as an unknown
+command. On the fixed binary all six cases are alive on one connection, the follow-up key applied, the
+settled ACK equal to the bytes sent (`control` 1139, `empty_array` 1115, `nil_array` 1116, `nil_name`
+1120, `raw_empty_array` 1035, `raw_nil_array` 1036). The probes cannot read the counters (no INFO
+reader until Task 1.3): the gtests pin them.
+
+### The sticky-db rules against a real KeyDB
+
+`impl-p71/db_order.py` sends one scripted stream (fake classic master, `FakeClassicMaster` with the
+stream built at PSYNC time from the uuid the replica announced) to a real KeyDB 6.3.4 active replica
+and to drakeydb, and compares the db each trailing raw probe `SET p_<case> v` lands in. A fresh author
+per case, so that KeyDB's per-author mvcc watermark cannot drop an envelope. Probe db by case:
+
+| Case | KeyDB 6.3.4 | drakeydb `HEAD` | drakeydb now |
+|---|---|---|---|
+| control (`PING`) envelope, db 3 | 3 | 0 | 3 |
+| self-authored, db 4 | 4 | 0 | 4 |
+| bad mvcc (`abc`) after db 5 | 5 | 0 | 5 |
+| unknown inner command, db 6 | 6 | 6 | 6 |
+| bad uuid with db 7 / db 99 / uuid only | 6 / 6 / 6 | 6 / 6 / 6 | 6 / 6 / 6 |
+| 3-argument envelope (key lands in) | db 6 | db 6 | db 6 |
+| nested: self-authored inner in db 8 under db 2 | 8 | 6 | 8 |
+| nested: bad-mvcc inner in db 9 under db 2 | 9 | 6 | 9 |
+| 65th layer in db 10 under 64 layers in db 1 | 10 | 6 | 10 |
+| wrapped `SELECT 5` in an envelope in db 3 | **5** | 6 | **3** |
+| envelope in db 0 | 0 | 0 | 0 |
+
+Identical but for the wrapped `SELECT` (KeyDB's `cFake` runs it and `selectDb(c, cFake->db->id)`
+hands db 5 up, `:5478`/`:5488`; the applier skips it, spec D-3 step 5; KeyDB never wraps a SELECT, the
+db travels in the envelope). The keys of the commands that must not run (`s_self`, `s_badmvcc`,
+`s_u`, `s_baddb`, `s_nself`, `s_nbad`, `s_deep`) exist in no db on either side.
+
+A side observation, from the first run of that script (which used `-5` for the bad mvcc): **KeyDB
+accepts `-5` as an mvcc.** `getUnsignedLongLongFromObject` (`object.cpp:743-769`) is a bare
+`strtoull`: it rejects only an argument with no digits at all (and a zero result with `errno`), so
+`-5` wraps to 2^64-5, `12abc` and an overflowing number are accepted, and the command is applied. The
+author's watermark then became 2^64-5, so every later envelope of that author with an mvcc was
+dropped by KeyDB's dedup. drakeydb's `ParseUnsignedDecimal` is stricter (digits only, fits 64 bits)
+and rejects those as `kBadMvcc`. Not changed here (D-1.4 says "u64"); P7-2's dedup is safer for it.
+
+### Record only (no code)
+
+- **m3.** The inner `RedisParser` logs unthrottled for a bad envelope: `Unexpected format`
+  (`redis_parser.cc:271`), `Failed to parse len` (`:299`), `Multibulk len is too large` (`:320`).
+  A known deviation from "warned about at a limited rate"; the file is upstream's and is not touched.
+  The gtest run shows one (`E ... Failed to parse len x x\r\n`). A bad-envelope flood is a log flood.
+- **m5.** Per-envelope allocations stay: a fresh `RespVec` (`inner_args`), the 36-character uuid
+  string plus its lowercase temporary, a `CommandContext` per command. Deferred to Task 1.5's
+  measurement (a reusable member `RespVec` and context are the first thing to try).
+- **m7.** P7-2 needs an explicit per-level `(uuid, mvcc)` stack in `HandleRreplay` for the bottom-up
+  `IsApplied`/`Advance` of D-5 (an outer level advances after its inner returned `kConsumed`, a
+  `kNotConsumed` inner advances nothing): the loop keeps no per-level state today, and
+  `kNotConsumed` is only ever returned at depth 1 before anything ran.
+- **m8.** `test_stopping_the_link_while_envelopes_stream_is_clean` is a liveness test: it passes with
+  the unwrap removed, so it is not falsified coverage of D-5's cancellation. P7-3 must cover
+  `kNotConsumed` at stream level (a stop landing between the loop's check and the applier's, which
+  cannot be reached today: no yield sits between them).
+
+### Final results (debug build, gcc 13.3, `nice ninja -j3 dragonfly classic_replay_test`, no warnings)
+
+- `./build-dbg/classic_replay_test`: `[  PASSED  ] 25 tests.`
+- `keydb_onboarding_test.py` (real KeyDB, `KEYDB_REQUIRED=1`): 36 passed in 83.6 s.
+- `redis_replication_test.py`: 12 passed, 7 deselected (the repo's `-m "not large"`) in 61.7 s.
+- `multimaster_test.py -k "greet or capa or classic or keydb"`: 18 passed, 59 deselected in 28.2 s.
+- Probes (6 cases) as above; `drip.py` at `CHUNK=1 SPLIT=0`, `CHUNK=1 SPLIT=60`: alive, settled ACK
+  7110 == expected, max 7110. A second dripped stream with raw and inner `*0`/`*-1`/nil-name commands
+  (`drip2.py`, `CHUNK=1 SPLIT=0`, `CHUNK=1 SPLIT=7`, `CHUNK=2 SPLIT=31`, `CHUNK=3 SPLIT=31`): alive,
+  settled ACK 1637 == expected.
+- `pre-commit run --files <the ten changed files>`: all hooks passed (clang-format left only my own
+  lines to reformat; no existing line moved).
+
+### Notes, disagreements and what this round supersedes
+
+1. **The brief's m1 wording was extended once:** "for each layer that parses `kOk`" also covers
+   `kBadMvcc`, because KeyDB reads the mvcc after it selected the db (`:5416` before `:5427`) and the
+   live run shows it (`bad_mvcc` row). The brief did ask for this to be verified and matched.
+2. The cancellation/self ordering of spec D-3 changed as a consequence of m1 (see the table); this
+   is a spec edit the brief allowed ("if its wording says otherwise, update the spec text").
+3. **Superseded in this report's earlier sections:** the design note "The db is sticky ... the
+   innermost envelope that carries a db decides" (every layer selects as it is validated; the
+   innermost still decides the leaf's db), the `SkipsInnerControlCommands` row of the gtest table
+   (`db_index` stays 0), and open risk 3 (sticky db shared with the raw path: still true, and now
+   pinned by a test and checked against KeyDB).
+4. U-14's raw guard skips the command, where U-13's dispatches the empty name as an unknown command:
+   an array head cannot be dispatched (`FillBackedArgs` would throw on it too).
+5. A wrapped `SELECT` is the one deviation from KeyDB's master-client db (above).
+
+### Not done / not verified
+
+- No release, ASAN or UBSAN build; the "nothing on the path depends on the build type" claim of U-14
+  is by reading, the abort itself was observed in the debug build only.
+- The KeyDB differential is by one scripted stream against KeyDB 6.3.4 only, and stays a scratchpad
+  script (`db_order.py`), not a test in the tree: it needs a KeyDB and the stream is built from the
+  announced uuid. Its rows are pinned in the gtest and the scripted-master pytest instead.
+- In cluster mode a failing synthetic `SELECT` is now attempted once per layer that carries the db
+  (`ensured_dbs_` is only set on success), not once per envelope: a few extra counted failures for
+  a nested envelope in db > 0. Not measured.

@@ -378,6 +378,37 @@ counted into `repl_offs_` exactly) and the commands after it apply. Tests
 `diskless_later_write`, `disk_later_write` and `disk_behind_rdb` cases). Pre-existing in upstream
 Dragonfly; not filed upstream. On the byte-identity exception list (spec, item 2).
 
+### U-14. A command whose name is an array in a classic stream aborts the replica
+
+**Where:** `Replica::ConsumeRedisStream` (`src/server/replica.cc`): `auto cmd =
+last_args[0].GetView();`, reached for every command that is not an RREPLAY envelope.
+
+The stream bytes `*0\r\n` and `*-1\r\n` are valid RESP: an empty array and a nil array. The
+`RedisParser` in server mode accepts both and yields a one-element vector whose only element is an
+`ARRAY` (`*0`) or a `NIL_ARRAY` (`*-1`), not a string. `RespExpr::GetView()` is `std::get<Buffer>`
+on that element, which throws `std::bad_variant_access`; nothing on the replication fiber catches
+it, so the process terminates (`std::terminate`; observed in a debug build, and nothing on the
+path depends on the build type). Any classic master, plain Redis and Valkey included, can send it in its replication
+stream, so it is reachable from a malformed or hostile master after any valid sync. Same family as
+U-13 (a stream command whose name is not a readable string), found by the P7-1 review.
+
+**How established:** a scripted master (the P7-1 review's probe): a valid diskless full sync, then
+`*0\r\n` (or `*-1\r\n`), then `SET after 1` aborts the debug replica with SIGABRT,
+`std::__throw_bad_variant_access <- RespExpr::GetView <- Replica::ConsumeRedisStream`. Inside an
+RREPLAY envelope the same bytes as the inner command took the same abort in `ClassicApplier::
+ApplyCommand` until the applier required a string name (P7-1 fix round); that half is ours, not
+upstream's.
+
+**Status (2026-10-04): fixed in this fork** (P7-1 review fix round): such a command is skipped,
+like `MULTI`/`EXEC`, with a rate-limited warning (`Skipping a command without a name from <master>`),
+its bytes counted into `repl_offs_` exactly (immediately, or with the batch ahead of it when one is
+queued) and the commands around it applied. The guard is one `// drakeydb: U-14` hunk ahead of the
+queuing branch. A nil *string* name (`*1\r\n$-1\r\n`) does not crash (it reads as the empty name) and
+is left to U-13's path, an unknown command. Tests
+`keydb_onboarding_test.py::test_classic_stream_command_with_an_array_for_a_name_does_not_abort`
+(`empty_array`, `nil_array`, `behind_a_queued_command`). Pre-existing in upstream Dragonfly; not
+filed upstream. On the byte-identity exception list (spec, item 2).
+
 ---
 
 ## Part 2 — drakeydb deferred work

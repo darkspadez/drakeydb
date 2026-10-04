@@ -64,7 +64,11 @@ enum class RreplayParse { kOk, kBadArity, kBadUuid, kBadDb, kBadMvcc };
 // arguments (the command name, the uuid, the inner command, a string), a uuid KeyDB's uuid_parse
 // takes (case-insensitive), an optional decimal db with 0 <= db < --dbnum, an optional decimal
 // unsigned 64-bit mvcc. Arguments past the fifth are ignored, as KeyDB ignores them. The checks run
-// in that order and the first failure names the result; `out` is unspecified after a failure.
+// in that order and the first failure names the result.
+//
+// `out` is unspecified after a failure, except `out->db` after kBadMvcc: KeyDB selects the db as it
+// validates it (:5416), before it reads the mvcc (:5427), so that is the one failure of a layer
+// that has moved its client's db.
 RreplayParse ParseRreplayEnvelope(const facade::RespVec& args, RreplayEnvelope* out);
 
 // Counters of one classic link. Relaxed atomics: the replication fiber bumps them, an INFO fiber
@@ -89,8 +93,8 @@ struct ClassicLinkStats {
 enum class EnvelopeResult {
   // The envelope is dealt with, whatever came of it: the stream offset advances past its bytes.
   kConsumed,
-  // Nothing was dispatched or counted, the link is stopping: the offset must not advance, so that
-  // a partial resync resumes at this envelope.
+  // Nothing was dispatched, selected or counted, the link is stopping: the offset must not
+  // advance, so that a partial resync resumes at this envelope.
   kNotConsumed,
 };
 
@@ -104,14 +108,23 @@ enum class EnvelopeResult {
 // transaction is one envelope per command, which the server applies one by one as it does for a
 // raw MULTI/EXEC. Nothing here is a disconnect or a CHECK: an envelope that cannot be applied is
 // counted, warned about at a limited rate and skipped (owner decision 14).
+//
+// The context's selected db moves as KeyDB's master client's does. replicaReplayCommand selects the
+// db of every layer as it validates it (replication.cpp:5416), before it looks at the author
+// (:5435) or the inner command, and the commands of the stream run in the db that was last
+// selected. So a layer that is well formed up to its db selects it, whatever follows: a
+// self-authored layer, a control command, an inner that is not a command, and a bad mvcc included.
+// A layer without a db (the 3-argument form) selects nothing, and a layer that fails earlier has
+// not moved it. The one difference is a wrapped SELECT, which is skipped here and would move
+// KeyDB's client; KeyDB never wraps one.
 class ClassicApplier {
  public:
   // KeyDB's REPLAY_MAX_NESTING: the 64th wrapping applies, the 65th is malformed.
   static constexpr unsigned kMaxNesting = 64;
 
-  // `cntx` is the stream's apply context: no connection, is_replicating, journal_emulated. The
-  // applier keeps the context's selected db in step with the envelopes, as KeyDB's master client
-  // keeps its own. `self_uuid` is this node's normalized uuid, whose envelopes are dropped.
+  // `cntx` is the stream's apply context: no connection, is_replicating, journal_emulated. Its
+  // selected db is the one the envelopes move (see the class comment) and the raw commands of the
+  // stream run in. `self_uuid` is this node's normalized uuid, whose envelopes are dropped.
   // `link` names the master in logs. `running` tells whether the link is still running.
   ClassicApplier(Service* service, ConnectionContext* cntx, std::string self_uuid, std::string link,
                  ClassicLinkStats* stats, std::function<bool()> running);
@@ -128,25 +141,28 @@ class ClassicApplier {
   // views point into, must stay valid for the call.
   //
   // `running()` is asked once, for the outermost envelope (depth 1), before anything is
-  // dispatched, and the whole tree then runs to completion: a cancelled link neither applies half
-  // an envelope nor loses the end of one, and the offset it resumes from names an envelope that
-  // either applied whole or did not start. Anything else counts as consumed.
+  // dispatched or selected, and the whole tree then runs to completion: a cancelled link neither
+  // applies half an envelope nor loses the end of one, and the offset it resumes from names an
+  // envelope that either applied whole or did not start. Anything else counts as consumed.
   EnvelopeResult HandleRreplay(const facade::RespVec& args, unsigned depth = 1);
 
  private:
-  // Parses `bytes` as exactly one command. False for none, a partial one, or bytes behind it.
+  // Parses `bytes` as exactly one command. False for none, a partial one, bytes behind it, or a
+  // name that is not a string: `*0\r\n`, `*-1\r\n` and `*1\r\n$-1\r\n` are valid RESP and parse
+  // to an array, a nil array and a nil, none of which is a command to name or dispatch.
   static bool ParseSingleCommand(std::string_view bytes, facade::RespVec* args);
 
-  // Runs the unwrapped command. Control commands are skipped, everything else is dispatched in
-  // `db` (the db of the innermost envelope that has one, else the one already selected).
-  void ApplyCommand(const facade::RespVec& args, std::optional<DbIndex> db);
+  // Runs the unwrapped command, `args[0]` of which is a string, in the db the context has
+  // selected. Control commands are skipped.
+  void ApplyCommand(const facade::RespVec& args);
 
   // Dispatches the already filled `cmd` and returns the text of its failure, if it failed: the
   // dispatcher rejected it, or it replied an error.
   std::optional<std::string> Dispatch(CommandContext* cmd);
 
   // Selects `db` for the context. The first use of a db dispatches a real SELECT (so its tables
-  // exist on every shard, as JournalExecutor::SelectDb does); later uses only set the index.
+  // exist on every shard, as JournalExecutor::SelectDb does); later uses only set the index. False
+  // if that SELECT failed (counted): the selected db is then unchanged.
   bool SelectDb(DbIndex db);
 
   void NoteMalformed(std::string_view why, unsigned depth);

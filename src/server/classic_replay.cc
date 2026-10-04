@@ -110,6 +110,8 @@ RreplayParse ParseRreplayEnvelope(const facade::RespVec& args, RreplayEnvelope* 
   uint64_t mvcc = 0;
   if (args.size() >= 5 &&
       (args[4].type != RespExpr::STRING || !ParseUnsignedDecimal(args[4].GetView(), &mvcc))) {
+    // KeyDB has selected the db by now (replication.cpp:5416), so the caller needs it.
+    out->db = db;
     return RreplayParse::kBadMvcc;
   }
 
@@ -138,23 +140,38 @@ bool ClassicApplier::IsRreplay(const facade::RespExpr& name) {
 }
 
 EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsigned depth) {
+  DCHECK_GE(depth, 1u);
+
   // Nested envelopes are unwrapped in a loop, not by recursion: a fiber's stack is 40 KB in a
-  // release build, and 64 levels of a frame holding a parser and an envelope would not fit it.
+  // release build, and 64 levels of a frame holding a parser and an envelope could exceed it.
   // Each layer's views point at the bytes of the stream buffer, not into the vector they were
   // parsed into, so `inner_args` can be reused for the next layer.
   facade::RespVec inner_args;
   const facade::RespVec* current = &args;
-  std::optional<DbIndex> db;
+  // False once the db of a layer could not be selected, until a deeper layer selects one: the
+  // command then has no db to run in and is skipped.
+  bool db_selected = true;
   uint64_t layers = 0;
 
   for (;; ++depth) {
-    if (depth > kMaxNesting) {
-      NoteMalformed(absl::StrCat("nested deeper than ", kMaxNesting, " envelopes"), depth);
-      break;
+    // KeyDB's order (replicaReplayCommand): validate the layer, select its db, look at its author,
+    // count its nesting. Its mvcc is validated after the db is selected, so a bad one leaves the db
+    // selected.
+    RreplayEnvelope env;
+    const RreplayParse parse = ParseRreplayEnvelope(*current, &env);
+
+    if (parse == RreplayParse::kOk || parse == RreplayParse::kBadMvcc) {
+      // The point of no return: from the first dispatch of the outermost envelope on (selecting a
+      // db for the first time is one), the whole tree is applied, whatever happens to the link.
+      // Nothing above has touched the context.
+      if (depth == 1 && !running_())
+        return EnvelopeResult::kNotConsumed;
+
+      if (env.db)
+        db_selected = SelectDb(*env.db);
     }
 
-    RreplayEnvelope env;
-    if (RreplayParse parse = ParseRreplayEnvelope(*current, &env); parse != RreplayParse::kOk) {
+    if (parse != RreplayParse::kOk) {
       NoteMalformed(RreplayParseName(parse), depth);
       break;
     }
@@ -164,14 +181,10 @@ EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsign
       break;
     }
 
-    // The point of no return: from the first dispatch of the outermost envelope on, the whole
-    // tree is applied, whatever happens to the link. Nothing above has touched the context.
-    if (depth == 1 && !running_())
-      return EnvelopeResult::kNotConsumed;
-
-    // The innermost envelope that carries a db decides the db of the command it wraps.
-    if (env.db)
-      db = env.db;
+    if (depth > kMaxNesting) {
+      NoteMalformed(absl::StrCat("nested deeper than ", kMaxNesting, " envelopes"), depth);
+      break;
+    }
 
     if (!ParseSingleCommand(env.inner, &inner_args)) {
       NoteMalformed("the inner command is not exactly one command", depth);
@@ -180,7 +193,8 @@ EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsign
     ++layers;
 
     if (!IsRreplay(inner_args[0])) {
-      ApplyCommand(inner_args, db);
+      if (db_selected)
+        ApplyCommand(inner_args);
       break;
     }
     current = &inner_args;
@@ -202,15 +216,16 @@ bool ClassicApplier::ParseSingleCommand(string_view bytes, facade::RespVec* args
   facade::RedisParser::Result result = parser.Parse(
       facade::RedisParser::Buffer{reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()},
       &consumed, args);
-  return result == facade::RedisParser::OK && consumed == bytes.size() && !args->empty();
+  if (result != facade::RedisParser::OK || consumed != bytes.size() || args->empty())
+    return false;
+  // `*0`, `*-1` and `*1 $-1` are one RESP value each, and their first element is an array or a nil,
+  // which has no name to read.
+  return args->front().type == facade::RespExpr::STRING;
 }
 
-void ClassicApplier::ApplyCommand(const facade::RespVec& args, optional<DbIndex> db) {
+void ClassicApplier::ApplyCommand(const facade::RespVec& args) {
   const string_view name = args[0].GetView();
   if (IsControlCommand(name))
-    return;
-
-  if (db && !SelectDb(*db))
     return;
 
   CommandContext cmd;

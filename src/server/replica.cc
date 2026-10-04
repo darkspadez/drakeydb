@@ -1174,8 +1174,9 @@ error_code Replica::ConsumeRedisStream() {
   facade::CapturingReplyBuilder null_builder{facade::ReplyMode::NONE};
   // drakeydb: P7-1 -- an active KeyDB wraps every command it streams in an RREPLAY envelope. Those
   // are not batched like the raw commands: the applier unwraps each one and dispatches its command
-  // on its own, in the envelope's db. It shares conn_context with the raw path, so the two stay in
-  // step on the selected db, as KeyDB's own master client is.
+  // on its own, in the envelope's db. It shares conn_context with the raw path, so the db an
+  // envelope selects is the one a raw command after it runs in, as for KeyDB's own master client
+  // (see ClassicApplier).
   ClassicApplier classic_applier(&service_, &conn_context, service_.server_family().node_uuid(),
                                  server().Description(), &classic_stats_,
                                  [this] { return exec_st_.IsRunning(); });
@@ -1286,7 +1287,14 @@ error_code Replica::ConsumeRedisStream() {
     const auto& last_args = LastResponseArgs();
     bool queued = false;
 
-    if (!last_args.empty()) {
+    // drakeydb: U-14 -- `*0\r\n` and `*-1\r\n` are valid RESP too, and parse to a lone array or nil
+    // array, which has no name: reading it as a string throws std::bad_variant_access and the
+    // process terminates. It is skipped like MULTI/EXEC below, its bytes counted.
+    if (!last_args.empty() &&
+        (last_args[0].type == RespExpr::ARRAY || last_args[0].type == RespExpr::NIL_ARRAY)) {
+      LOG_EVERY_T(WARNING, 60) << "Skipping a command without a name from "
+                               << server().Description();
+    } else if (!last_args.empty()) {
       // drakeydb: P7-1 -- an RREPLAY envelope is applied by the classic applier, not queued.
       if (ClassicApplier::IsRreplay(last_args[0])) {
         // It must not overtake the raw commands queued before it.

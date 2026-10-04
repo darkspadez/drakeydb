@@ -793,6 +793,62 @@ async def test_classic_stream_empty_command_name_does_not_abort(
         assert (await c.info("replication"))["master_link_status"] == "up"
 
 
+# Valid RESP whose command has an array where its name should be: `*0\r\n` and `*-1\r\n`. The
+# stream that follows a valid sync, by where such a command sits: first (nothing is queued before
+# it), or behind a raw command that is still waiting in the batch (its bytes are acknowledged with
+# that command's).
+ARRAY_NAME_SCENARIOS = {
+    "empty_array": b"*0\r\n" + SET_A,
+    "nil_array": b"*-1\r\n" + SET_A,
+    "behind_a_queued_command": SET_B + b"*0\r\n" + SET_A,
+}
+
+
+@pytest.mark.parametrize("scenario", list(ARRAY_NAME_SCENARIOS))
+async def test_classic_stream_command_with_an_array_for_a_name_does_not_abort(
+    df_factory: DflyInstanceFactory, tmp_path, scenario
+):
+    """`*0\\r\\n` and `*-1\\r\\n` in the replication stream used to abort the replica (ISSUE-REGISTER
+    U-14): they parse to a lone array, not a string, and Replica::ConsumeRedisStream read the string
+    of the command's name (std::bad_variant_access, which terminates). Such a command is skipped
+    now, with a warning, its bytes counted into the offset exactly, and the commands around it
+    applied.
+
+    Falsifying: with the check removed, the replica process dies of SIGABRT (an uncaught
+    std::bad_variant_access out of RespExpr::GetView) as it reads the command.
+    """
+    stream = ARRAY_NAME_SCENARIOS[scenario]
+    async with FakeClassicMaster() as master:
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET), stream=stream, stream_delay=SECOND_WRITE_DELAY_S
+        )
+        node = df_factory.create(
+            proactor_threads=2, dir=str(tmp_path / "df"), replication_acks_interval=100
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("a") == "1"
+
+        await applied()
+        if scenario == "behind_a_queued_command":
+            assert await c.get("b") == "2"
+        expected = SYNC_OFFSET + len(stream)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert max(master.ack_offsets) == expected, master.ack_offsets
+        assert master.connection_count == 1, "the replica reconnected"
+        assert (await c.info("replication"))["master_link_status"] == "up"
+
+    node.stop()
+    assert node.find_in_logs(r"Skipping a command without a name from 127\.0\.0\.1:\d+")
+
+
 def rreplay(*command, uuid="b1198d29-cb88-4110-922a-a6c99bd08471", db=0, mvcc=1):
     """The RREPLAY envelope an active KeyDB wraps `command` in."""
     return resp_command("RREPLAY", uuid, resp_command(*command), db, mvcc)
@@ -848,6 +904,57 @@ async def test_unwrap_flushes_raw_batch_before_envelope(
         assert master.connection_count == 1, "the replica reconnected"
 
 
+async def test_unwrap_selected_db_is_the_one_the_raw_commands_after_it_run_in(
+    df_factory: DflyInstanceFactory, tmp_path
+):
+    """An envelope's db is the stream's selected db, as for KeyDB's own master client: a raw command
+    after an envelope in db 2 runs in db 2, so does an envelope without a db (KeyDB's 3-argument
+    form), until the next envelope selects another db.
+
+    The stream is `RREPLAY ... SET e 1 2 1`, raw `SET c 1`, 3-argument `RREPLAY ... SET d 1`, then
+    `RREPLAY ... SET f 1 0 2` and raw `SET g 1`: e, c and d belong in db 2, f and g in db 0, and
+    the offsets are exact.
+
+    Falsifying: with the applier given a connection context of its own (not the one the raw
+    commands use), the raw `SET c` lands in db 0 ("c is not in db 2").
+    """
+    uuid = "b1198d29-cb88-4110-922a-a6c99bd08471"
+    stream = (
+        rreplay("SET", "e", 1, db=2, mvcc=1)
+        + resp_command("SET", "c", 1)
+        + resp_command("RREPLAY", uuid, resp_command("SET", "d", 1))
+        + rreplay("SET", "f", 1, db=0, mvcc=2)
+        + resp_command("SET", "g", 1)
+    )
+    async with FakeClassicMaster() as master:
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET, tail=EOF_TOKEN + stream))
+        node = df_factory.create(
+            proactor_threads=2, dir=str(tmp_path / "df"), replication_acks_interval=100
+        )
+        node.start()
+        c, c2 = node.client(), node.client(db=2)
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("g") == "1"
+
+        await applied()
+        for key in ("e", "c", "d"):
+            assert await c2.get(key) == "1", f"{key} is not in db 2"
+            assert await c.get(key) is None, f"{key} is in db 0"
+        for key in ("f", "g"):
+            assert await c.get(key) == "1", f"{key} is not in db 0"
+            assert await c2.get(key) is None, f"{key} is in db 2"
+        expected = SYNC_OFFSET + len(stream)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert max(master.ack_offsets) == expected, master.ack_offsets
+        assert master.connection_count == 1, "the replica reconnected"
+
+
 async def test_unwrap_skips_malformed_envelopes_without_disconnect(
     df_factory: DflyInstanceFactory, tmp_path
 ):
@@ -855,12 +962,14 @@ async def test_unwrap_skips_malformed_envelopes_without_disconnect(
     the stream carries on: never a disconnect (a reconnect would be sent the same bytes again).
 
     The stream holds a bad uuid, a bad db, an inner that is two commands, an inner that is not a
-    command, an unknown inner command, an inner PING and an inner SELECT (nothing applies), among
-    envelopes and a raw command that do apply, one of them in db 3.
+    command, an inner `*0` (valid RESP, but an array for a name: U-14), an unknown inner command,
+    an inner PING and an inner SELECT (nothing applies), among envelopes and a raw command that do
+    apply, one of them in db 3.
 
     Falsifying: a replica that disconnects on a malformed envelope reconnects (the master sees a
     second connection and the offsets restart); one that accepts a second inner command applies
-    "x" and "y".
+    "x" and "y"; one that does not check an inner command's name is a string aborts (SIGABRT, an
+    uncaught std::bad_variant_access) at the `*0`.
     """
     uuid = "b1198d29-cb88-4110-922a-a6c99bd08471"
     two_commands = resp_command("SET", "x", 1) + resp_command("SET", "y", 1)
@@ -871,12 +980,13 @@ async def test_unwrap_skips_malformed_envelopes_without_disconnect(
             resp_command("RREPLAY", uuid, two_commands, 0, 3),
             resp_command("RREPLAY", uuid, b"not a command", 0, 4),
             resp_command("RREPLAY", uuid, b"", 0, 5),
-            rreplay("NOSUCHCOMMAND", "z", mvcc=6),
-            rreplay("PING", mvcc=7),
-            rreplay("SELECT", 5, mvcc=8),
-            rreplay("SET", "good", 1, mvcc=9),
+            resp_command("RREPLAY", uuid, b"*0\r\n", 0, 6),
+            rreplay("NOSUCHCOMMAND", "z", mvcc=7),
+            rreplay("PING", mvcc=8),
+            rreplay("SELECT", 5, mvcc=9),
+            rreplay("SET", "good", 1, mvcc=10),
             resp_command("SET", "raw", 1),
-            rreplay("SET", "in3", 1, db=3, mvcc=10),
+            rreplay("SET", "in3", 1, db=3, mvcc=11),
         ]
     )
     async with FakeClassicMaster() as master:

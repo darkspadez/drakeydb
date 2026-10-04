@@ -394,6 +394,14 @@ TEST(ClassicReplayTest, ParseRreplayEnvelopeChecksInKeyDbOrder) {
   EXPECT_EQ(ParseRreplayEnvelope(bad_uuid_and_db.args, &env), RreplayParse::kBadUuid);
   Wire bad_db_and_mvcc{"RREPLAY", kUuid, "x", "99", "-1"};
   EXPECT_EQ(ParseRreplayEnvelope(bad_db_and_mvcc.args, &env), RreplayParse::kBadDb);
+
+  // KeyDB selects the db (replication.cpp:5416) before it reads the mvcc (:5427), so a bad mvcc
+  // is the one failure that hands the db back.
+  Wire good_db_bad_mvcc{"RREPLAY", kUuid, "x", "7", "-1"};
+  env.db.reset();
+  EXPECT_EQ(ParseRreplayEnvelope(good_db_bad_mvcc.args, &env), RreplayParse::kBadMvcc);
+  ASSERT_TRUE(env.db.has_value());
+  EXPECT_EQ(*env.db, 7u);
 }
 
 TEST(ClassicReplayTest, IsRreplayIsCaseInsensitiveAndNeedsAString) {
@@ -582,25 +590,111 @@ TEST_F(ClassicApplyFamilyTest, SkipsInnerControlCommands) {
   CountCalls("REPLCONF", &replconfs);
 
   OnLink([&](Link& link) {
-    // Each carries db 3, which a dispatch would select. The names are matched without case: KeyDB's
+    // Each carries db 3. KeyDB selects the db of an envelope whatever it wraps, so the context ends
+    // in db 3, but the commands are not dispatched. The names are matched without case: KeyDB's
     // cron PING is in lower case.
     for (const string& command : {Resp({"ping"}), Resp({"PING"}), Resp({"REPLCONF", "GETACK", "*"}),
                                   Resp({"MULTI"}), Resp({"Exec"}), Resp({"SELECT", "5"})}) {
       EXPECT_EQ(link.Apply(Envelope(kAuthorA, command, "3")), EnvelopeResult::kConsumed) << command;
     }
-    EXPECT_EQ(link.cntx.conn_state.db_index, 0u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 3u);  // not 5: the SELECT inside was not dispatched
     EXPECT_FALSE(link.cntx.conn_state.exec_info.IsCollecting());
     EXPECT_EQ(link.apply_errors(), 0u);  // an EXEC dispatched with no MULTI would be one
     EXPECT_EQ(link.unwrapped(), 6u);
 
-    // Had the MULTI run, this would only be queued.
-    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "after", "v"}))),
+    // Had the MULTI run, this would only be queued. It has no db, and runs in the one the control
+    // commands selected.
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, Resp({"SET", "after", "v"})})),
               EnvelopeResult::kConsumed);
   });
 
   EXPECT_EQ(pings.load(), 0);
   EXPECT_EQ(replconfs.load(), 0);
-  EXPECT_EQ(Get("after"), "v");
+  EXPECT_EQ(Get("after", 3), "v");
+  EXPECT_EQ(Get("after", 0), nullopt);
+  EXPECT_EQ(Get("after", 5), nullopt);
+}
+
+// KeyDB's replicaReplayCommand selects the db of a layer as it validates it (replication.cpp:5416),
+// before the author (:5435) and the inner command are looked at, and the master client stays there:
+// whatever the layer then turns out to be, the next command without a db of its own runs in it.
+TEST_F(ClassicApplyFamilyTest, DbIsSelectedBeforeTheAuthorAndInnerChecks) {
+  const string kSet = Resp({"SET", "x", "1"});
+  // The next command with no db of its own, in whatever db the context is in.
+  auto next = [&](Link& link, string_view key) {
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, Resp({"SET", key, "1"})})),
+              EnvelopeResult::kConsumed);
+  };
+
+  OnLink([&](Link& link) {
+    // Authored by this node: dropped, after its db was selected.
+    EXPECT_EQ(link.Apply(Envelope(kSelfUuid, kSet, "3")), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.self_dropped(), 1u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 3u);
+    next(link, "after_self");
+
+    // A bad mvcc is read after the db.
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, kSet, "4", "-5"})), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.malformed(), 1u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 4u);
+    next(link, "after_bad_mvcc");
+
+    // An inner that is not a command, then one that is not even a string-named command.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, "not a command", "5")), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.malformed(), 2u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 5u);
+    next(link, "after_not_a_command");
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, "*0\r\n", "6")), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.malformed(), 3u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 6u);
+    next(link, "after_empty_array");
+
+    // A layer that fails before its db is taken has not selected it: the uuid, the arity and the
+    // db itself are checked first.
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", "not-a-uuid", kSet, "7", "7"})),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA})), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, kSet, "16", "7"})), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.malformed(), 6u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 6u);
+
+    // Nested, the layers select one after the other and the context is left in the last one's db: a
+    // self-authored inner layer, an inner with a bad mvcc.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Envelope(kSelfUuid, kSet, "8"), "2")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.self_dropped(), 2u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 8u);
+    next(link, "after_nested_self");
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"RREPLAY", kAuthorB, kSet, "9", "-5"}), "2")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.malformed(), 7u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 9u);
+    next(link, "after_nested_bad_mvcc");
+
+    // The layer past the nesting limit (the 65th) is validated and selected before its depth is
+    // counted: a malformed layer all the same.
+    string wire = Envelope(kAuthorA, kSet, "10");
+    for (unsigned i = 1; i <= ClassicApplier::kMaxNesting; ++i)
+      wire = Envelope(kAuthorB, wire, "1");
+    EXPECT_EQ(link.Apply(wire), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.malformed(), 8u);
+    EXPECT_EQ(link.cntx.conn_state.db_index, 10u);
+    next(link, "after_too_deep");
+
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+
+  EXPECT_EQ(Get("x", 0), nullopt);  // no inner command ran
+  for (const auto& [key, db] : vector<pair<string_view, unsigned>>{{"after_self", 3},
+                                                                   {"after_bad_mvcc", 4},
+                                                                   {"after_not_a_command", 5},
+                                                                   {"after_empty_array", 6},
+                                                                   {"after_nested_self", 8},
+                                                                   {"after_nested_bad_mvcc", 9},
+                                                                   {"after_too_deep", 10}}) {
+    EXPECT_EQ(Get(key, db), "1") << key;
+    EXPECT_EQ(Get(key, 0), nullopt) << key;
+  }
 }
 
 TEST_F(ClassicApplyFamilyTest, DropsSelfAuthoredEnvelope) {
@@ -646,6 +740,11 @@ TEST_F(ClassicApplyFamilyTest, MalformedEnvelopeSkippedAndCounted) {
       {"not RESP", Envelope(kAuthorA, "*x\r\n")},
       {"huge array", Envelope(kAuthorA, "*99999999\r\n$3\r\nSET\r\n")},
       {"huge string", Envelope(kAuthorA, "*1\r\n$99999999\r\nSET\r\n")},
+      // Valid RESP, but an array, a nil array and a nil where a command's name goes (U-14): there
+      // is no name to read, and the parser holds no string there.
+      {"inner empty array", Envelope(kAuthorA, "*0\r\n")},
+      {"inner nil array", Envelope(kAuthorA, "*-1\r\n")},
+      {"inner nil name", Envelope(kAuthorA, "*1\r\n$-1\r\n")},
   };
   // Every way the inner command can be cut short.
   for (size_t len = 0; len < kSet.size(); ++len)
@@ -778,6 +877,21 @@ TEST_F(ClassicApplyFamilyTest, RunningFalseBeforeDispatchReturnsNotConsumed) {
 
         EXPECT_EQ(link.Apply(Nest(3, Resp({"SET", "k", "v"}))), EnvelopeResult::kNotConsumed);
         EXPECT_EQ(link.unwrapped(), 0u);
+
+        // The db of an envelope is a touch too, even when the envelope is then dropped or rejected:
+        // the self-authored one and the one with a bad mvcc wait for the link, and the context has
+        // not moved. One that fails before its db is taken touches nothing and is consumed.
+        EXPECT_EQ(link.Apply(Envelope(kSelfUuid, Resp({"SET", "k", "v"}), "3")),
+                  EnvelopeResult::kNotConsumed);
+        EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, Resp({"SET", "k", "v"}), "3", "-5"})),
+                  EnvelopeResult::kNotConsumed);
+        EXPECT_EQ(link.cntx.conn_state.db_index, 0u);
+        EXPECT_EQ(link.self_dropped(), 0u);
+        EXPECT_EQ(link.malformed(), 0u);
+        EXPECT_EQ(link.Apply(Resp({"RREPLAY", "not-a-uuid", Resp({"SET", "k", "v"}), "3", "7"})),
+                  EnvelopeResult::kConsumed);
+        EXPECT_EQ(link.malformed(), 1u);
+        EXPECT_EQ(link.cntx.conn_state.db_index, 0u);
 
         // Only the outermost envelope asks: a layer applied from a depth below 1 does not.
         EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k2", "v2"})), 2),
