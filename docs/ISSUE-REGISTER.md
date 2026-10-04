@@ -1616,3 +1616,58 @@ local clock is kept). They close it for a plain replica only: when Task 2.9 land
 narrowed, not deleted. The plain-replica part is deleted (landed, per the register's rule) and the
 peer and classic-peer share moves to D-27, which says so. **From:** P7-1 (Task 1.4; found by the
 Opus re-review of `425eeb9`).
+
+### D-33. `SORT .. STORE` of a missing or unsortable source aborted the server -- resolved
+
+**Where:** `SortGeneric`'s fetch hops (`src/server/generic_family.cc`). P4-0 (`1b6a2e82`) made the
+fetch callback return `fetch_result.status()`, so that a failed single-shard SORT is not
+auto-journaled (`LogAutoJournalOnShard` skips a non-OK result). On a transaction of more than one
+shard `Transaction::RunCallback` does `CHECK_EQ(OpStatus::OK, result)` on every hop
+(`transaction.cc:771`, a `CHECK`, so release builds too). With `STORE`'s destination on another
+shard than the source, a source that is missing (`KEY_NOTFOUND`), of the wrong type (`WRONG_TYPE`)
+or holds elements a numeric sort cannot convert (`INVALID_NUMERIC_RESULT`) killed the server:
+`Check failed: OpStatus::OK == result (0 vs. 2)`, `0 vs. 8`, `0 vs. 17`. Reachable by any client, by
+any classic master's stream (raw or inside an RREPLAY envelope; the replica runs the SORT like a
+client does) and by the D-9 window, where a due source is a missing one on a flagged replica. With
+the destination on the source's shard there was no abort, but a missing source replied an empty
+array and left `dst` as it was, where Redis and KeyDB delete it and reply `:0`
+(`sort.cpp:575-586`).
+
+**Fixed in P7-1 by `1404897` (ledger decision 32):**
+
+1. A multi-shard hop returns `OK` (`GetUniqueShardCnt() == 1 ? fetch_result.status() : OK`); the
+   failure reaches `SortGeneric` through `fetch_result` either way. A single-shard SORT keeps
+   returning it.
+2. `SortStoreNothing` (upstream main has the function with the same two call sites; only this
+   fork's `OpStore` takes the extra `source_deleted_by_fetch`): a missing source, or one the
+   unsorted fetch's own lazy member expiry emptied, with STORE deletes `dst`, whatever its type or
+   TTL, and replies `:0`, as Redis and KeyDB do. The delete is hand-journaled as `DEL dst`, on one
+   shard too, and only when there was a `dst`.
+3. A wrong-type or non-numeric source replies its error and leaves `dst` alone, as Redis and KeyDB
+   do (both errors come before the destination is touched, `sort.cpp:281-284`, `:515`).
+
+**Residual, not fixed:** on one shard a failing STORE (WRONGTYPE, non-numeric) still journals its
+verbatim `SORT`. Measured on the P7-1 build (a one-shard master with one replica, the replica's
+`slave_repl_offset` before and after each command): `SORT <string> STORE dst`, the same with `BY
+nosort`, and `SORT <list of words> STORE dst` each advance it by 1, `SORT <missing> STORE dst`
+by 1 with no `dst` to delete and by 2 with one (`DEL dst`, then the `SORT`), while `GET` and the
+same two failing SORTs without STORE advance it by 0. By reading, the fetch hop is not the last hop
+of a STORE form: the empty concluding hop is `OK`, and that is the one whose result
+`LogAutoJournalOnShard` sees. A replica replays the entry, gets the same error and leaves `dst`
+alone, so nothing diverges; it costs one journal entry per failed command. Across shards SORT
+stays `CO::NO_AUTOJOURNAL` and the two failures journal nothing (pinned by
+`CrossShardStoreOfMissingSourceJournalsDestinationDelete`, `multi_master_test.cc`).
+
+**How established:** the abort was reproduced on `main`'s binary by the Opus review of `2bdf3d7`
+(ledger decision 32; not re-run here). The fix is pinned by `GenericFamilyTest.SortStoreOf*`
+(2 shards, `dst` on and off the source's shard, seven option forms, `BY nosort` and `BY` pattern
+included), the journal tests `CrossShardStoreOfMissingSourceJournalsDestinationDelete` and
+`SameShardStoreOfMissingSourceJournalsDestinationDeleteBeforeSort` (`multi_master_test.cc`), and the
+classic-stream pytest
+`test_classic_stream_sort_store_of_an_unsortable_source_does_not_abort`. Each of the fix's parts is
+falsified (`task-1.4b-report.md`, "Decision 32 (SORT .. STORE)"): the hop returning the failure
+aborts with the three statuses above, the empty-array reply fails every missing-source test, and
+`source_deleted_by_fetch=false` drops the same-shard `DEL dst`.
+
+**Owner:** none (resolved; the residual is journal noise, not divergence). **From:** P4-0
+(`1b6a2e82`); found by the Opus review of `2bdf3d7` (C1), fixed in P7-1.

@@ -899,7 +899,7 @@ and that function interleaves expiry (`DeleteExpiredStep`) with eviction
     |---|---|---|---|
     | **Loss** | TTL refreshes: `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` (all arrive as `PEXPIREAT <ms>`), `PERSIST`, `GETEX` (as `PEXPIREAT` or `PERSIST`); and `SET .. XX` with no expiry | No key: the refresh is a no-op, the `XX` fails | The key lives on with the new deadline, or with none after `PERSIST` or `SET XX`: lost on the replica for good |
     | **Orphan** | TTL-keeping writes, every command that creates the key when it is absent and leaves its TTL alone when it is there: `INCR` (arrives as `INCRBY`), `INCRBYFLOAT`, `APPEND`, `SETRANGE`, `HSET`, `HSETNX`, `HINCRBY`, `SADD`, `LPUSH`, `RPUSH`, `ZADD`, `SET .. KEEPTTL`, ... | The key is created from nothing **with no TTL**, and nothing ever removes it | The key keeps `E` and is gone at it; an active KeyDB never streams that `DEL`. A permanent orphan on the replica (decision 31) |
-    | **Source missing** | The movers and the STORE family, with the due key as a source: `RENAME`, `RENAMENX`, `COPY`, `LMOVE`, `RPOPLPUSH`, `SMOVE`, `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`, `ZUNIONSTORE`, `ZINTERSTORE`, `SORT .. STORE` | The source is missing: `RENAME` replies `no such key` (an enveloped one is a `classic_apply_errors`), `COPY` 0, `LMOVE` nil, `SMOVE` 0, and a STORE command computes from nothing, so an empty result removes an existing destination. Nothing reaches the destination otherwise | The destination holds the source's data. `RENAME` and `COPY` carry the source's deadline `E` to it (`db.cpp:1507-1511`, `:1651`, `:1687-1688`), so it is gone from the master at `E`: the replica converges if it had no destination, and keeps a stale one if it had. A moved element (`LMOVE`, `SMOVE`) or a computed result (STORE) has no deadline there: lost on the replica for good |
+    | **Source missing** | The movers and the STORE family, with the due key as a source: `RENAME`, `RENAMENX`, `COPY`, `LMOVE`, `RPOPLPUSH`, `SMOVE`, `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`, `ZUNIONSTORE`, `ZINTERSTORE`, `SORT .. STORE` | The source is missing: `RENAME` replies `no such key` (an enveloped one is a `classic_apply_errors`), `COPY` 0, `LMOVE` nil, `SMOVE` 0, `SORT .. STORE` deletes an existing destination and replies 0 (the due source is a missing one, and an empty STORE result deletes the destination, as in Redis, `sort.cpp:580`; before decision 32 it replied an empty array and kept the destination, and aborted the replica when the destination was on another shard), and every other STORE command computes from nothing, so an empty result removes an existing destination. Nothing reaches the destination otherwise | The destination holds the source's data. `RENAME` and `COPY` carry the source's deadline `E` to it (`db.cpp:1507-1511`, `:1651`, `:1687-1688`), so it is gone from the master at `E`: the replica converges if it had no destination, and keeps a stale one if it had. A moved element (`LMOVE`, `SMOVE`) or a computed result (STORE) has no deadline there: lost on the replica for good |
     | **Converges** | A plain `SET` (replaces the key and its TTL), `DEL`, and `SET .. XX KEEPTTL` | The key is replaced or absent | The same, or (`XX KEEPTTL`) the key kept with `E` and gone at it |
     | **Not affected** | `SET .. NX`, `MSETNX` | Never arrives | A failed `SET NX` is not propagated: KeyDB propagates only commands that changed the dataset (`server.cpp:4624`; `t_string.cpp:104-109` returns before it changes) |
 
@@ -909,7 +909,9 @@ and that function interleaves expiry (`DeleteExpiredStep`) with eviction
     KEEPTTL`, `INCR`, `APPEND`, `SETRANGE`, `HSET`, `LPUSH`, `SADD`, `SET .. KEEPTTL`, `SET`, `DEL`,
     and, with no destination, `RENAME`, `COPY`, `LMOVE`, `SMOVE` and `SUNIONSTORE`, plus `RENAME`,
     `LMOVE` and `SUNIONSTORE` onto a live destination. The other names in a row are argued from the
-    same rule and not run. `SET .. NX` is not a row of a test: what makes it unaffected is on the
+    same rule and not run, except `SORT .. STORE`, which `GenericFamilyTest.SortStoreOf*` runs
+    against a missing source, not a due one (decision 32). `SET .. NX` is not a row of a test:
+    what makes it unaffected is on the
     master's wire, which the replica cannot show. In the mirror case a `SET .. NX` that did succeed
     on the master fails against the stale key here. Task 2.4 (P7-2) rewrites `SET .. XX` to a plain
     `SET` for every enveloped command, which is its effect on the master: from then on `SET .. XX`
@@ -1341,6 +1343,16 @@ observe changes only here:
    - **EOF-token size and tail errors** (Task 0.6): a `$EOF:` token that is not 40 bytes, and a tail
      that disagrees with its header, are a logged error that reconnects. Upstream aborted on a
      `CHECK`.
+   - **`SORT .. STORE`** (P7-1 review round, decision 32, ISSUE-REGISTER D-33). The one fix of
+     this item that adds a journal entry. Against the fork's `main` its behaviour changes only where
+     `main` aborted or replied wrongly. A source that is missing, or a set emptied by its own member
+     expiry, used to abort the server when `STORE`'s destination was on another shard (a P4-0
+     regression: a hop returned its failure status into a `CHECK`, and a wrong-type or non-numeric
+     source aborted the same way) and to reply an empty array and keep the destination when it was
+     not. It now deletes the destination and replies 0, as Redis does, and journals a `DEL <dst>`
+     for a destination that was there (upstream main's `OpStore` journals the same entry). A
+     wrong-type or non-numeric source replies the error it always did and leaves the destination
+     alone, and no line of the success path changes. Ungated.
 3. **Loader** accepts KeyDB type 64 and subexpire aux, quiets noisy aux: strictly more permissive.
 4. **Raw-path KeyDB-only drop** (ungated, D-7): `PEXPIREMEMBERAT` and the rest of
    `IsKeyDbOnlyCommand` are dropped and counted on the raw path instead of being dispatched as
