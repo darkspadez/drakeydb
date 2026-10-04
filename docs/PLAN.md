@@ -296,7 +296,7 @@ tiering, and `--experimental_cascaded_partial_sync`.
 | `transaction.cc` (~1622-1663) | `LogJournalOnShard` reads origin/mvcc from context (default self + clock tick) |
 | `tx_base.cc` (~55-70) | manual `RecordJournal` helpers read origin context; expiry `DEL` sets entry-flag bit0; collection-derived `DEL` sets bit1 |
 | `conn_context.h` (~352) | += `repl_origin_id` (u32), `repl_mvcc` (u64) |
-| `replica.h/.cc` | P1 (done): greeting adds `REPLCONF UUID`. **P2 (done):** `ReplicaPeerMode{SyncGate*, PeerRegistry*, PeerIdentityClaims*}` trailing ctor param, `IsPeerMode()`; guards the `SetShardStates` flip (both directions in `MainReplicationFb`), a `SyncGate::Lease` around full sync, and the flush skip in `InitiateDflySync`/`InitiatePSync` (the latter also adds `SetOverrideExistingKeys(true)`; the DF path already had it set), plus self/duplicate UUID refusal, live claim release, and `PeerRegistry::AddOrGet`. **P7-1 (Task 1.2):** `ConsumeRedisStream` hands RREPLAY envelopes to `ClassicApplier` (`classic_replay.h`) instead of queuing them, and skips a raw command whose name is an array (U-14). **P7-1 (Task 1.3):** a raw KeyDB-only command is dropped and counted (`classic_applier.SkipKeyDbOnly`), and `GetSummary()` fills the classic-link fields of `ReplicaSummary`. P7 (future): `capa activeExpire` on the redis path |
+| `replica.h/.cc` | P1 (done): greeting adds `REPLCONF UUID`. **P2 (done):** `ReplicaPeerMode{SyncGate*, PeerRegistry*, PeerIdentityClaims*}` trailing ctor param, `IsPeerMode()`; guards the `SetShardStates` flip (both directions in `MainReplicationFb`), a `SyncGate::Lease` around full sync, and the flush skip in `InitiateDflySync`/`InitiatePSync` (the latter also adds `SetOverrideExistingKeys(true)`; the DF path already had it set), plus self/duplicate UUID refusal, live claim release, and `PeerRegistry::AddOrGet`. **P7-1 (Task 1.2):** `ConsumeRedisStream` hands RREPLAY envelopes to `ClassicApplier` (`classic_replay.h`) instead of queuing them, and skips a raw command whose name is an array (U-14). **P7-1 (Task 1.3):** a raw KeyDB-only command is dropped and counted (`classic_applier.SkipKeyDbOnly`), and `GetSummary()` fills the classic-link fields of `ReplicaSummary`. **P7-1 (Task 1.4):** `Greet()` sends `REPLCONF capa activeExpire` once, after an `active-replica` capa reply, and the main link applies the shards' replica active expiry flag (`ApplyReplicaActiveExpiry`, `SetMainLink`) |
 | `dflycmd.cc` | **P2 (done):** `DflyCmd::TakeOver` refuses on an active node. **P3 (done):** `CreateSyncSession` stores the consumer's uuid, `DRAKEY-VERSION` and peer flag in `ReplicaInfo` (`dflycmd.cc:801-808`); the admission refusal itself (version below `kDrakeydbReplVersion`, 68 since P4-4; a peer consumer without a UUID) lives in `ServerFamily::ReplConf` (`server_family.cc:3841`), master-side only |
 | `debugcmd.cc` | **P4-1 (done):** additive `DEBUG MVCC [<key> \| VERIFY]` debug subcommand |
 | `server_family.cc` | P1 (done): additive `REPLCONF UUID` case. **P2 (done):** `peers_` member; `ReplicaOfInternal` delegates to `ReplicaOfActive` (`PeerReplicationManager`) when active (replace-vs-append by `--multi_master`, `REPLICAOF REMOVE <h> <p>`, NO ONE clears all); `ReplConf` refuses all replication consumers on an active node (single choke point; P3 replaces it with peer admission); `REPLTAKEOVER` refused; INFO block appended after `master_replid`; `Shutdown`/`PauseReplication` route through `peers_`; `--replicaof` now parses a comma-separated peer list (`ParseOneReplicaOf`) and, in active mode, `Init` loads the node's own snapshot before attaching peers |
@@ -929,7 +929,15 @@ the top, or the Non-goals list at the end. The design spec is
   payload drakeydb cannot load is skipped and counted (`keydb_mvccrestore_failed`); the Non-goals
   list below no longer lists it. Spec D-7a.
 - An active KeyDB never propagates expiry deletes (`db.cpp:1966-1985`), so a plain replica of one
-  has to run active expiry itself (ledger decision 13).
+  has to run active expiry itself (ledger decision 13). Built in P7-1 Task 1.4 (spec D-9): the
+  node's main link sets a per-shard flag after a successful greet with an `active-replica` master,
+  which opens the heartbeat's expiry sweep and the read-path gate on a replica, never eviction, and
+  sends `REPLCONF capa activeExpire`. **Lag window (owner decision 24, accepted, no grace flag):**
+  a replica that expires on its own clock can expire a key before a TTL extension (`EXPIRE`,
+  `PEXPIREAT`, `PERSIST`) for it arrives; the extension is then a no-op there while the key lives
+  on in KeyDB, forever after a `PERSIST`. Stream lag and clock skew widen it, and KeyDB's own plain
+  replicas share it. Operators get it in the "Onboarding from KeyDB" section of
+  `docs/multi-master.md` that P7-4 adds; until then spec D-9 is where it is written down.
 - "Apply-context from envelope" cannot ride the squasher: `repl_mvcc` is copied once per batch
   (`main_service.cc:1815-1816`, `multi_command_squasher.cc:114-115`), so RREPLAY commands dispatch
   one by one, each with its own mvcc and origin (ledger decision 11).

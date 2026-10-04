@@ -9,6 +9,7 @@ tests need no KeyDB.
 
 import asyncio
 import functools
+import re
 
 import pytest
 import redis
@@ -24,8 +25,8 @@ from .fake_classic_master import (
     full_resync_header,
     resp_command,
 )
-from .instance import DflyInstanceFactory
-from .utility import assert_eventually, wait_available_async
+from .instance import DflyInstanceFactory, RedisServer
+from .utility import assert_eventually, skip_if_not_in_github, wait_available_async
 
 PRE_STRINGS = {f"pre:{i}": f"v{i}" for i in range(100)}
 
@@ -1693,3 +1694,191 @@ async def test_active_replica_boot_warning_names_keydb_drops(
     sentence = r"KeyDB member TTLs and cron jobs are dropped on onboarding"
     assert active.find_in_logs(sentence), "the boot limitations warning does not name the drops"
     assert not plain.find_in_logs(sentence)
+
+
+# Keys that expire while a plain replica is attached: EXPIRING_KEYS with a TTL that is short but
+# leaves the replica time to receive them, one without a TTL and one with a long one.
+EXPIRING_KEYS = 50
+EXPIRE_TTL_MS = 3000
+
+
+async def write_expiring_keys(client):
+    for i in range(EXPIRING_KEYS):
+        await client.set(f"exp:{i}", "v", px=EXPIRE_TTL_MS)
+    await client.set("keep", "v")
+    await client.set("long", "v", ex=1000)
+
+
+@assert_eventually(times=100)
+@retry_while_loading
+async def assert_dbsize(c, expected):
+    """Polls DBSIZE, which counts entries and reads no key: asking for an expired key would delete
+    it (a replica with --replica_delete_expired, KeyDB and Redis all do), and so hide what the
+    sweep did or did not do."""
+    assert await c.dbsize() == expected
+
+
+@pytest.mark.keydb
+@pytest.mark.parametrize("slots", ["", " 0 16383"], ids=["plain", "with_slot_range"])
+async def test_plain_replica_of_active_keydb_expires_keys(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, slots
+):
+    """A plain replica of an active KeyDB expires keys itself (decision 13, spec D-9): KeyDB, told
+    by `REPLCONF capa activeExpire` that its replica does, streams no DEL for a key that expired.
+    The replica's DBSIZE, polled without ever reading a key, goes from the full keyspace to the two
+    keys that did not expire, after KeyDB's own has. The test harness starts the replica with
+    --replica_delete_expired=false, so the read-path gate is open only because of the link.
+
+    `with_slot_range` attaches with `REPLICAOF <host> <port> 0 16383`: the node's main link then
+    has a slot range, and still drives the flag (the marker, not `!slot_range_`, decides).
+
+    Falsifying: with the shard flag never set, the replica's DBSIZE stays at the full keyspace
+    while KeyDB's is down to two. With a link that only counts when it has no slot range, the
+    `with_slot_range` case fails the same way.
+    """
+    keydb = keydb_server_factory(active_replica=True)
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"))
+    node.start()
+    c = node.client()
+    assert await c.execute_command(f"REPLICAOF localhost {keydb.port}{slots}") == "OK"
+    await wait_available_async(c)
+
+    async with keydb.client() as k:
+        await write_expiring_keys(k)
+        await assert_dbsize(c, EXPIRING_KEYS + 2)  # they did arrive, before any of them is due
+
+        # KeyDB drops its own expired keys, and the replica is expected to do the same.
+        await assert_dbsize(k, 2)
+        await assert_dbsize(c, 2)
+        assert await c.get("keep") == "v"
+        assert await c.get("long") == "v"
+        info = await c.info("replication")
+        assert info["role"] == "slave" and info["master_link_status"] == "up", info
+
+
+async def test_plain_replica_of_plain_redis_never_expires_on_its_own(
+    df_factory: DflyInstanceFactory, port_picker, df_log_dir, tmp_path
+):
+    """The control of the test above: a replica of a master that does not say `active-replica` is
+    never made to expire keys on its own. A Redis master with its active expiry turned off
+    (`DEBUG SET-ACTIVE-EXPIRE 0`, which needs `enable-debug-command yes`, hence a Redis 7 of its
+    own) propagates no DEL either, so the replica's DBSIZE stays at the full keyspace well past the
+    TTL; reading an expired key on the master, which expires it lazily and propagates the DEL,
+    then brings it down by exactly that key, so the link was live all along. No key is read on the
+    replica, nor on the master before that.
+
+    Falsifying: with the shard flag set for any master (or `activeExpire` taken to mean it is),
+    the replica's DBSIZE falls to two while Redis still holds every key.
+    """
+    master = RedisServer(port_picker.get_available_port(), log_dir=df_log_dir)
+    try:
+        master.start(redis7=True, **{"enable-debug-command": "yes"})
+    except FileNotFoundError:
+        skip_if_not_in_github()
+        raise
+    try:
+        async with aioredis.Redis(port=master.port, decode_responses=True) as r:
+
+            for _ in range(100):
+                try:
+                    await r.ping()
+                    break
+                except redis.exceptions.ConnectionError:
+                    await asyncio.sleep(0.1)
+            else:
+                pytest.fail("the Redis master did not come up")
+            assert await r.execute_command("DEBUG", "SET-ACTIVE-EXPIRE", "0") == "OK"
+
+            node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"))
+            node.start()
+            c = node.client()
+            assert await c.execute_command(f"REPLICAOF localhost {master.port}") == "OK"
+            await wait_available_async(c)
+
+            await write_expiring_keys(r)
+            await assert_dbsize(c, EXPIRING_KEYS + 2)
+            await asyncio.sleep(EXPIRE_TTL_MS / 1000 + 2)  # well past every TTL
+            assert await r.dbsize() == EXPIRING_KEYS + 2, "Redis expired a key it was not asked to"
+            assert await c.dbsize() == EXPIRING_KEYS + 2
+
+            assert await r.get("exp:0") is None  # lazy expiry on the master, which propagates a DEL
+            await assert_dbsize(c, EXPIRING_KEYS + 1)
+    finally:
+        master.stop()
+
+
+def capa_requests(master):
+    """The REPLCONF capa requests the scripted master got, in order."""
+    return [r for r in master.requests if r[:2] == ["REPLCONF", "capa"]]
+
+
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+@pytest.mark.parametrize(
+    "reveals,reveal_request",
+    [
+        (None, None),
+        ("both", ["REPLCONF", "capa", "eof", "capa", "psync2"]),
+        ("eof", ["REPLCONF", "capa", "eof", "capa", "psync2"]),
+        ("dragonfly", ["REPLCONF", "capa", "dragonfly"]),
+    ],
+    ids=["never", "both_sites", "first_site_only", "second_site_only"],
+)
+async def test_greet_sends_capa_active_expire_only_after_active_replica_reply(
+    df_factory: DflyInstanceFactory, tmp_path, peer_mode, reveals, reveal_request
+):
+    """A master that never answers `active-replica` gets the handshake it always got: no `REPLCONF
+    capa activeExpire` (spec D-2, byte identity for stock masters). One that does, at either of the
+    two `REPLCONF capa` replies, gets it exactly once per handshake, as its own command right after
+    the request whose reply revealed it. Peer links send it too.
+
+    Falsifying: sending it unconditionally fails `never`; sending it from only one site fails the
+    other site's case; sending it at every capa reply that says `active-replica` fails the
+    `both_sites` count.
+    """
+    async with FakeClassicMaster() as master:
+        if reveals == "both":
+            master.script_capa_reply(b"+OK active-replica\r\n")
+        elif reveals:
+            master.script_capa_reply(b"+OK active-replica\r\n", only_for=reveals)
+        if peer_mode:
+            master.script_uuid(SCRIPTED_PEER_UUID)
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET))
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+
+        @assert_eventually(times=100)
+        async def handshake_is_over():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert master.psync_requests
+
+        await handshake_is_over()
+        active_expire = ["REPLCONF", "capa", "activeExpire"]
+        capas = capa_requests(master)
+        assert master.connection_count == 1, "the replica reconnected"
+        if reveal_request is None:
+            assert active_expire not in capas, capas
+        else:
+            assert capas.count(active_expire) == 1, capas
+            at = master.requests.index(reveal_request)
+            assert master.requests[at + 1] == active_expire, master.requests
+
+
+@pytest.mark.keydb
+async def test_keydb_is_told_the_replica_expires_keys_itself(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """A real active KeyDB logs `Warning: replica ... does not support active expiration` once a
+    replica that never sent `capa activeExpire` comes online. After the full sync of a plain
+    replica of ours, its log has the line for a finished synchronization and not that warning.
+
+    Falsifying: with `REPLCONF capa activeExpire` not sent, the warning is in the log.
+    """
+    keydb = keydb_server_factory(active_replica=True)
+    node, c = await attach_plain_replica(df_factory, tmp_path, keydb)
+
+    @assert_eventually(times=100)
+    async def synchronized():
+        assert re.search(r"Synchronization with replica \S+ succeeded", keydb.log_text())
+
+    await synchronized()
+    log = keydb.log_text()
+    assert "does not support active expiration" not in log, log

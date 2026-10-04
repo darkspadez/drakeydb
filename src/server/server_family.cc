@@ -3679,6 +3679,7 @@ void ServerFamily::ReplicaOfInternal(facade::ParsedArgs args, CommandContext* cm
 
   auto new_replica = make_shared<Replica>(replicaof_args->host, replicaof_args->port, &service_,
                                           master_replid(), replicaof_args->slot_range);
+  new_replica->SetMainLink();  // drakeydb: P7 -- AddReplicaOf's links stay unmarked.
   GenericError ec;
   switch (on_error) {
     case ActionOnConnectionFail::kReturnOnError:

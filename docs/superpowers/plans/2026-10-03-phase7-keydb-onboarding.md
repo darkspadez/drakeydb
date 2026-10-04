@@ -703,6 +703,18 @@ INFO and the `activeExpire` decision read it only once `R_GREETED` is set in `st
 
 **Done:** control passes (Redis replica still never self-expires); non-KeyDB handshakes unchanged.
 
+**As built (the design check's corrections win over the text above; spec D-9 and D-2 have the full
+account):** no `expire_only` parameter and no `proxy.py` change. `Heartbeat` gates on `!IsReplica() ||
+replica_active_expiry_` and `RetireExpiredAndEvict` keeps `eviction_goal` at 0 on a replica; the
+flag is applied by `Replica::ApplyReplicaActiveExpiry` for the main link only (`Replica::
+SetMainLink()`, set by `ServerFamily::ReplicaOfInternal`; not `!slot_range_`); `REPLCONF capa
+activeExpire` goes out once per `Greet()` after the first `active-replica` reply at either capa
+site; the tests are `ReplicaActiveExpiryTest.*` (`classic_replay_test.cc`) and, in
+`keydb_onboarding_test.py`, `test_plain_replica_of_active_keydb_expires_keys[plain|with_slot_range]`,
+`test_plain_replica_of_plain_redis_never_expires_on_its_own` (its own Redis 7),
+`test_greet_sends_capa_active_expire_only_after_active_replica_reply` (`FakeClassicMaster.requests`)
+and `test_keydb_is_told_the_replica_expires_keys_itself` (the KeyDB log). Ledger `task-1.4-report.md`.
+
 ### Task 1.5: Throughput — "must keep up with KeyDB"
 
 **Goal:** Measure, on **release builds**, whether per-command dispatch keeps up; record the numbers

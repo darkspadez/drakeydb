@@ -844,7 +844,10 @@ void EngineShard::Heartbeat() {
     }
   }
 
-  if (!IsReplica()) {  // Never run expiry/evictions on replica.
+  // Never run expiry/evictions on replica.
+  // drakeydb: P7 -- except the expiry sweep, when the replica has to expire keys itself (D-9).
+  // Eviction stays off, see RetireExpiredAndEvict.
+  if (!IsReplica() || replica_active_expiry_) {
     RetireExpiredAndEvict();
   }
 
@@ -882,7 +885,10 @@ void EngineShard::RetireExpiredAndEvict() {
   db_cntx.time_now_ms = GetCurrentTimeMs();
 
   size_t deleted_bytes = 0;
-  size_t eviction_goal = GetFlag(FLAGS_enable_heartbeat_eviction) ? CalculateEvictionBytes() : 0;
+  // drakeydb: P7 -- never on a replica: FreeMemWithEvictionStepAtomic DCHECKs against it, and
+  // CalculateEvictionBytes advances eviction_state_. A replica gets here only to expire keys.
+  size_t eviction_goal =
+      (!IsReplica() && GetFlag(FLAGS_enable_heartbeat_eviction)) ? CalculateEvictionBytes() : 0;
 
   // Accumulate keyspace notification events per-db during the atomic section; send after.
   vector<vector<string>> per_db_events(db_slice.db_array_size());

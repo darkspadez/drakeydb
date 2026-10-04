@@ -20,11 +20,14 @@ namespace dfly {
 
 class EngineShardSet;
 class Namespace;
+class ReplicaActiveExpiryTest;
 class TieredStorage;
 class ShardDocIndices;
 
 class EngineShard {
   friend class EngineShardSet;
+  // drakeydb: P7 -- drives Heartbeat() directly (classic_replay_test.cc).
+  friend class ReplicaActiveExpiryTest;
 
  public:
   struct Stats {
@@ -161,6 +164,17 @@ class EngineShard {
 
   bool IsReplica() const {
     return is_replica_;
+  }
+
+  // drakeydb: P7 -- a replica of an active KeyDB expires keys itself (spec D-9): the master sends
+  // no DEL for them. Opens the heartbeat's expiry sweep and the replica gate of
+  // DbSlice::ExpireIfNeeded, never eviction. Set per shard from Replica (replica.cc), read here.
+  void SetReplicaActiveExpiry(bool enabled) {
+    replica_active_expiry_ = enabled;
+  }
+
+  bool ReplicaActiveExpiry() const {
+    return replica_active_expiry_;
   }
 
   const Transaction* GetContTx() const {
@@ -325,6 +339,7 @@ class EngineShard {
 
   // Become passive if replica: don't automatially evict expired items.
   bool is_replica_ = false;
+  bool replica_active_expiry_ = false;  // drakeydb: P7, see SetReplicaActiveExpiry.
   bool journal_ = false;
 
   // Precise tracking of used memory by persistent shard local values and structures

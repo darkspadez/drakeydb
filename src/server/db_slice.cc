@@ -2094,8 +2094,10 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
 
   // Never do expiration if expiration is disabled, or on replicas unless replica_delete_expired
   // is enabled (which allows replicas to proactively delete expired keys on the read path).
+  // drakeydb: P7 -- or the replica expires keys itself (a plain replica of an active KeyDB).
   if (int64_t(cntx.time_now_ms) < expire_time || !expire_allowed_ ||
-      (owner_->IsReplica() && !absl::GetFlag(FLAGS_replica_delete_expired))) {
+      (owner_->IsReplica() && !owner_->ReplicaActiveExpiry() &&
+       !absl::GetFlag(FLAGS_replica_delete_expired))) {
     return it;
   }
 

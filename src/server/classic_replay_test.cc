@@ -22,10 +22,16 @@
 #include "facade/redis_parser.h"
 #include "facade/reply_capture.h"
 #include "server/command_registry.h"
+#include "server/common.h"
 #include "server/conn_context.h"
+#include "server/engine_shard.h"
+#include "server/engine_shard_set.h"
 #include "server/generic_family.h"
 #include "server/namespaces.h"
 #include "server/test_utils.h"
+
+ABSL_DECLARE_FLAG(int32_t, hz);
+ABSL_DECLARE_FLAG(bool, replica_delete_expired);
 
 namespace dfly {
 
@@ -1533,6 +1539,128 @@ TEST_F(ClassicApplyFamilyTest, ReplicatedWatchLeavesNoRegistrationBehind) {
   EXPECT_EQ(WatchedKeyCount(), 0u);
   EXPECT_EQ(Run({"set", "k", "v"}), "OK");
   EXPECT_EQ(Run({"flushdb"}), "OK");
+}
+
+// A plain replica of an active KeyDB expires keys itself, because that master propagates no DEL for
+// them (spec D-9, decision 13). The shards' replica active expiry flag is what lets the heartbeat
+// sweep run on a replica, and it opens the read-path gate of DbSlice::ExpireIfNeeded too; it never
+// opens eviction. The fixture runs the heartbeats itself (EngineShard::Heartbeat is private to its
+// friend), with the periodic one off, so that only they act, and sets the shards' state directly:
+// SetReplica alone leaves ServerState::is_master true, so commands still run.
+class ReplicaActiveExpiryTest : public BaseFamilyTest {
+ protected:
+  static constexpr unsigned kPlainKeys = 100;
+  static constexpr unsigned kTtlKeys = 100;
+  static constexpr int kHeartbeatRounds = 200;
+
+  void SetUp() override {
+    absl::SetFlag(&FLAGS_hz, 0);
+    BaseFamilyTest::SetUp();
+    shard_set->TEST_EnableCacheMode();
+  }
+
+  // kPlainKeys keys without a TTL and kTtlKeys that are due once time moves on, all with values
+  // that are not inlined, so that heartbeat eviction has something to take.
+  void Populate() {
+    const string value(1000, '.');
+    for (unsigned i = 0; i < kPlainKeys; ++i)
+      ASSERT_EQ(Run({"set", absl::StrCat("plain:", i), value}), "OK");
+    for (unsigned i = 0; i < kTtlKeys; ++i)
+      ASSERT_EQ(Run({"set", absl::StrCat("ttl:", i), value, "PX", "100"}), "OK");
+    ASSERT_EQ(DbSize(), kPlainKeys + kTtlKeys);
+    AdvanceTime(1000);
+  }
+
+  void SetReplicaMode(bool replica, bool active_expiry) {
+    shard_set->RunBriefInParallel([=](EngineShard* shard) {
+      shard->SetReplica(replica);
+      shard->SetReplicaActiveExpiry(active_expiry);
+    });
+  }
+
+  // A usage far over the limit: a master's heartbeat evicts to get under it.
+  void ApplyMemoryPressure() {
+    max_memory_limit = 1000;
+  }
+
+  void RunHeartbeats() {
+    shard_set->pool()->AwaitFiberOnAll([](unsigned, util::ProactorBase*) {
+      if (EngineShard* shard = EngineShard::tlocal(); shard != nullptr)
+        shard->Heartbeat();
+    });
+  }
+
+  // DBSIZE counts entries and reads no key, so an expired key is not deleted by asking.
+  int64_t DbSize() {
+    return CheckedInt({"dbsize"});
+  }
+
+  // Runs heartbeats until the keys with a TTL are gone from the table, or gives up.
+  void RunHeartbeatsUntilReaped() {
+    for (int i = 0; i < kHeartbeatRounds && DbSize() != kPlainKeys; ++i)
+      RunHeartbeats();
+  }
+};
+
+TEST_F(ReplicaActiveExpiryTest, ReapsExpiredKeysButNeverEvicts) {
+  Populate();
+  SetReplicaMode(/*replica=*/true, /*active_expiry=*/true);
+  ApplyMemoryPressure();
+
+  RunHeartbeatsUntilReaped();
+  EXPECT_EQ(DbSize(), kPlainKeys);
+
+  // The pressure stays on: keep running heartbeats, and nothing else leaves the table.
+  for (int i = 0; i < 20; ++i)
+    RunHeartbeats();
+  EXPECT_EQ(DbSize(), kPlainKeys);
+  EXPECT_EQ(GetMetrics().events.evicted_keys, 0u);
+  EXPECT_EQ(CheckedInt({"exists", "plain:0", "plain:50", "plain:99"}), 3);
+}
+
+// The control of the one above: the same data and pressure on a shard that is not a replica does
+// evict, so "never evicts" above is the replica's doing and not an inert setup.
+TEST_F(ReplicaActiveExpiryTest, ControlAMasterHeartbeatUnderTheSamePressureEvicts) {
+  Populate();
+  ApplyMemoryPressure();
+
+  RunHeartbeats();
+  EXPECT_GT(GetMetrics().events.evicted_keys, 0u);
+}
+
+TEST_F(ReplicaActiveExpiryTest, ReapsNothingWithoutTheFlag) {
+  Populate();
+  SetReplicaMode(/*replica=*/true, /*active_expiry=*/false);
+
+  for (int i = 0; i < 50; ++i)
+    RunHeartbeats();
+  EXPECT_EQ(DbSize(), kPlainKeys + kTtlKeys);
+}
+
+// --replica_delete_expired=false is how a replica is told never to delete an expired key; a replica
+// that expires keys itself does, in the sweep and on the read path.
+TEST_F(ReplicaActiveExpiryTest, BypassesReplicaDeleteExpiredFlag) {
+  absl::SetFlag(&FLAGS_replica_delete_expired, false);
+  Populate();
+  SetReplicaMode(/*replica=*/true, /*active_expiry=*/true);
+
+  // The read path: an expired key is deleted by the read that finds it.
+  EXPECT_THAT(Run({"get", "ttl:0"}), ArgType(RespExpr::NIL));
+  EXPECT_EQ(DbSize(), kPlainKeys + kTtlKeys - 1);
+
+  RunHeartbeatsUntilReaped();
+  EXPECT_EQ(DbSize(), kPlainKeys);
+}
+
+TEST_F(ReplicaActiveExpiryTest, ControlWithoutTheFlagAReplicaThatDeletesNothingServesExpiredKeys) {
+  absl::SetFlag(&FLAGS_replica_delete_expired, false);
+  Populate();
+  SetReplicaMode(/*replica=*/true, /*active_expiry=*/false);
+
+  EXPECT_EQ(Run({"get", "ttl:0"}), string(1000, '.'));  // served as live
+  for (int i = 0; i < 50; ++i)
+    RunHeartbeats();
+  EXPECT_EQ(DbSize(), kPlainKeys + kTtlKeys);
 }
 
 }  // namespace dfly

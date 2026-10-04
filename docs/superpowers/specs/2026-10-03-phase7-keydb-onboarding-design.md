@@ -316,12 +316,15 @@ bad response. Every other `CheckRespIsSimpleReply("OK")` in `Greet()` is unchang
   set by the capa reply, which is not the last step of `Greet()`, so after a **failed** `Greet()` it
   may be stale: anything that reads it (INFO, D-9, activeExpire) does so only once `R_GREETED` is set
   in `state_mask_`.
-- **`capa activeExpire`.** Immediately after the first capa reply (`replica.cc:431-432`) reveals
-  `active-replica`, send `REPLCONF capa activeExpire` as its **own** command. KeyDB answers
-  `+OK active-replica` again; this reply is parsed leniently (warn once, continue) — the master
-  already showed it is active, so expiry (D-9) does not depend on the acknowledgement. Sent on plain
-  **and** peer links: a peer link's node already runs active expiry (`!IsReplica()`, heartbeat),
-  and a plain link's node implements it via D-9, so the capability is advertised only where true.
+- **`capa activeExpire`.** Immediately after the first capa reply that reveals `active-replica`,
+  at either of the two capa sites, send `REPLCONF capa activeExpire` as its **own** command, **once
+  per `Greet()`** (a lambda in `Greet()` with its own sent bit). KeyDB answers `+OK active-replica`
+  again; this reply is parsed leniently (`ParseCapaReply(...).ok`, a warning once otherwise,
+  continue) — the master already showed it is active, so expiry (D-9) does not depend on the
+  acknowledgement; a transport error still fails the `Greet()` like any other command's. Sent on
+  plain **and** peer links: a peer link's node already runs active expiry (`!IsReplica()`,
+  heartbeat), and a plain link's node implements it via D-9, so the capability is advertised only
+  where true. A peer link sends it but never touches the shard flag (D-9).
 - A master that does not answer `active-replica` — plain Redis, Valkey, stock Dragonfly, drakeydb,
   a non-active KeyDB — sees a handshake **byte-identical to today**; no extra command is sent.
   `keydb-fastsync-save` is parsed and ignored: drakeydb never sends `capa keydb-fastsync`.
@@ -793,39 +796,60 @@ restart, or a new `Replica` object, means a full resync.
 
 ### D-9. Active expiry on plain replicas of an active KeyDB (decision 13)
 
-A plain replica whose master answered `active-replica` runs active expiry itself. Today
-`EngineShard::Heartbeat` runs `RetireExpiredAndEvict` only when `!IsReplica()`
-(`engine_shard.cc:847`), and that function interleaves expiry (`DeleteExpiredStep`, `:942`) with
-eviction (`FreeMemWithEvictionStepAtomic`, `:964`). The split:
+A plain replica whose master answered `active-replica` runs active expiry itself. `EngineShard::
+Heartbeat` runs `RetireExpiredAndEvict` only when `!IsReplica()` (upstream's `engine_shard.cc`),
+and that function interleaves expiry (`DeleteExpiredStep`) with eviction
+(`FreeMemWithEvictionStepAtomic`). As built (Task 1.4, `ReplicaActiveExpiryTest`):
 
-- New per-shard flag `replica_active_expiry_` on `EngineShard` (`engine_shard.h`, beside
-  `is_replica_` at `:327`) with `SetReplicaActiveExpiry(bool)`. `Heartbeat` becomes
-  `if (!IsReplica()) RetireExpiredAndEvict(); else if (replica_active_expiry_)
-  RetireExpiredAndEvict(/*expire_only=*/true);`. With `expire_only`, `eviction_goal` is forced to 0:
-  eviction never runs on a replica, so `FreeMemWithEvictionStepAtomic`'s
-  `DCHECK(!owner_->IsReplica())` (`db_slice.cc:2681`) is never reached and stays as is. The
-  extra-namespace and rotating-db sweeps are already `IsActiveReplica()`-gated, so a non-active
-  replica skips them.
-- **A second gate must open too.** `DbSlice::ExpireIfNeeded` returns without deleting when
-  `owner_->IsReplica() && !FLAGS_replica_delete_expired` (`db_slice.cc:2097-2098`); the sweep calls
-  it (`:2574`). The gate becomes `IsReplica() && !owner_->ReplicaActiveExpiry() &&
-  !FLAGS_replica_delete_expired`. Defaults are unchanged.
-- The flag follows `master_active_replica_` (D-2) and is applied **only after a successful
-  `Greet()`** (one that fails midway neither sets nor clears it). `Start()`'s `Greet()` runs before
-  `MainReplicationFb` flips shards to replica mode (`replica.cc:272-273`), so the fiber applies the
-  recorded value right after `SetShardStates(true)` and again after every later successful
-  `Greet()` (a master that stops advertising `active-replica` clears it). It is cleared where shards
-  leave replica mode (`SetShardStates(false)`, `:383-385`). Peer-mode links never flip shards to
-  replica (`:272`), so they are unaffected: those nodes already expire. Cluster `ADDREPLICAOF`
-  replicas run the same `MainReplicationFb` and `SetShardStates`, so shard state is last-writer-wins
-  across them; the expiry flag is therefore applied and cleared only by the node's main `replica_`
-  link (`!slot_range_`), and replica active expiry through a cluster-replica link is unsupported
-  (documented).
-- Deletions journal when a journal exists (`journal_deletions = true`, flagged
-  `kEntryFlagExpired`), so a DFLY sub-replica of this replica converges. With a **plain Redis**
-  master the flag is never set: the replica still never expires on its own.
+- **The seam.** New per-shard flag `replica_active_expiry_` on `EngineShard` (`engine_shard.h`,
+  beside `is_replica_`), `SetReplicaActiveExpiry(bool)` / `ReplicaActiveExpiry()`. `Heartbeat` gates
+  on `!IsReplica() || replica_active_expiry_`. There is no `expire_only` parameter:
+  `RetireExpiredAndEvict` derives `eviction_goal = (!IsReplica() && FLAGS_enable_heartbeat_eviction)
+  ? CalculateEvictionBytes() : 0`, so on a replica neither `FreeMemWithEvictionStepAtomic` (whose
+  `DCHECK(!owner_->IsReplica())` stays as it is and is unreachable) nor `CalculateEvictionBytes`
+  (which advances `eviction_state_`) runs. The extra-namespace and rotating-db sweeps, and the
+  member-TTL reaper, are gated on `IsActiveReplica()`, a boot flag, so a plain replica skips them.
+  Every other replica gate stays: the insert path's eviction and `apply_memory_limit`
+  (`db_slice.cc`), and `rdb_load.cc`'s.
+- **A second gate opens too.** `DbSlice::ExpireIfNeeded` returns without deleting when `owner_->
+  IsReplica() && !FLAGS_replica_delete_expired`; the sweep calls it. The gate becomes `IsReplica() &&
+  !owner_->ReplicaActiveExpiry() && !FLAGS_replica_delete_expired`. Defaults are unchanged. With the
+  flag on, the read path deletes on such a replica too, whatever `--replica_delete_expired` says
+  (KeyDB's read path on a replica only hides an expired key, `expireIfNeeded` returns 1; it is
+  KeyDB's sweep, `expireOwnKeys`, that deletes there).
+  Without the flag, `--replica_delete_expired=false` leaves an expired key **served as live**; with
+  it true (the production default) the read path deletes it and journals the delete.
+- **Who sets it.** The flag follows `master_active_replica_` (D-2), through one helper,
+  `Replica::ApplyReplicaActiveExpiry(bool)`, which mirrors `SetShardStates` and does nothing for a
+  peer-mode link (those nodes never leave master mode and already expire) or for a link that is not
+  the node's **main** link. The main link is marked by `Replica::SetMainLink()`, called by
+  `ServerFamily::ReplicaOfInternal` on `replica_` and never by `AddReplicaOf`. It is not `!slot_
+  range_`: `REPLICAOF <host> <port> <start> <end>` gives the main link a slot range too (pinned by
+  the `with_slot_range` pytest case). An `ADDREPLICAOF` link therefore never drives the flag
+  (it shares `SetShardStates`, last writer wins), and replica active expiry through one is
+  unsupported.
+- **Where it is applied.** `Start()`'s `Greet()` runs before `MainReplicationFb` flips the shards to
+  replica mode, so the fiber applies the recorded value right after `SetShardStates(true)` (only if
+  `R_GREETED`: a `--replicaof` link is greeted by the fiber instead) and after every later
+  successful `Greet()` (a master that stops advertising `active-replica` clears it), and clears it
+  with `SetShardStates(false)`. A **failed** `Greet()` neither sets nor clears it. The window that
+  leaves is documented: a KeyDB replaced by a plain Redis at the same host:port keeps expiring on its
+  own until the first successful `Greet()` clears it, and a full resync follows, so nothing lasts
+  (KeyDB's own replica behaves alike: `mi->isActive` is only rewritten by `parseMasterCapa`).
+- **Journaling.** Deletions journal only when the shard has a journal: on a plain replica that is
+  under `--experimental_cascaded_partial_sync` with a sub-replica, where the sub-replica gets the
+  expiry `DEL` (flagged `kEntryFlagExpired`); the peer echo filter applies only in peer mode. No code
+  beyond the existing path. With a **plain Redis** master the flag is never set: the replica still
+  never expires on its own.
 - A replica with `--replica_delete_expired=false` that onboards from an active KeyDB expires anyway;
   the master will never send the DEL. Documented.
+- **The lag window (owner decision 24).** A replica that expires on its own clock can expire a key
+  before a TTL extension for it arrives (`EXPIRE`, `PEXPIREAT`, `PERSIST`, stream lag and clock skew
+  both widen the window). The extension is then a no-op on the replica, while the key lives on in
+  KeyDB, forever after a `PERSIST`. KeyDB's own plain replicas have the same window. Accepted and
+  documented, with no grace flag. The operator page, `docs/multi-master.md`, has no KeyDB section
+  yet (P7-4 adds "Onboarding from KeyDB"); until it does, this paragraph and the `PLAN.md` note are
+  where it is written down.
 
 ### D-10. RDB loader tolerance (B.6)
 
@@ -1050,8 +1074,9 @@ still pass under if the feature were removed.
 | `test_info_and_metrics_show_classic_counters[plain_replica\|peer_mode]` (real KeyDB), `test_scripted_active_master_exact_classic_counters`, `test_scripted_quiet_active_master_shows_zero_counters`, `test_scripted_stock_master_raw_keydb_only_command_shows_only_that_counter` (exact counts, INFO and `/metrics`; the raw path); `PeerReplicationInfo.ShowsClassicFieldsOnlyForClassicLinks`, `.OmitsClassicFieldsWhenMasterNotActiveAndCountersZero`; `ClassicReplayTest.ClassicLinkFieldsFollowTheRenderPredicate`, `.ClassicTotalSeriesFollowTheRenderPredicate` | Omitting the INFO branch (plain) or the peer-line branch; omitting the replica-side Prometheus branch (the plain replica has no series); ignoring `master_active_replica` (a quiet active KeyDB shows nothing); removing the raw-path check |
 | `test_scripted_active_master_down_link_keeps_zero_counters[plain_replica\|peer_mode]x[master_gone\|greet_fails]` (fake master that says `active-replica`: after a full sync the master goes away, or answers every capa with an error; INFO still shows the six zeros, and in peer mode the offset; D-13 "shown whatever its state"); `test_scripted_active_master_series_outlive_the_link[plain_replica\|peer_mode]` (`REPLICAOF NO ONE` / `REMOVE`: the six zero series stay; decision 25); `ClassicReplayTest.ActiveKeyDbMasterSeenSticksOnceNoted` | Reading `active-replica` only while the link is greeted (the down link shows nothing); clearing the per-link flag at the top of `Greet()` (`greet_fails` shows nothing); not calling `NoteActiveKeyDbMaster()` in `Greet()`, or computing the series' gate per scrape from the node's links (no series once the link is gone) |
 | `test_info_and_metrics_absent_for_stock_master`, `..._absent_for_keydb_that_is_not_active[plain_replica\|peer_mode]`, `..._have_no_classic_fields_between_dfly_nodes[plain_replica\|peer_mode]` (no classic field or series, and the link's block ends where it did: `psync_successes`, `clock_skew_ms`); `test_active_replica_boot_warning_names_keydb_drops` | Rendering unconditionally (the stock-master and DFLY tests fail); removing the sentence from the boot warning |
-| `test_greet_sends_capa_active_expire_only_after_active_replica_reply` (KeyDB log lacks "does not support active expiration"; Redis capture shows no send) | Never sending it (the KeyDB warning appears) |
-| `test_plain_replica_of_active_keydb_expires_keys` (+ Redis control with `DEBUG SET-ACTIVE-EXPIRE 0`: replica must not expire) | Not setting the shard flag (DBSIZE stays N) |
+| `test_greet_sends_capa_active_expire_only_after_active_replica_reply[never\|both_sites\|first_site_only\|second_site_only]x[plain_replica\|peer_mode]` (fake master, `FakeClassicMaster.requests`: with no `active-replica` reply none, else exactly one `["REPLCONF","capa","activeExpire"]` immediately after the request whose reply revealed it, either site, peer links too); `test_keydb_is_told_the_replica_expires_keys_itself` (real KeyDB: the `Synchronization with replica ... succeeded` line present, `does not support active expiration` absent) | Never sending it (the six active cases fail, and the KeyDB warning appears); sending it to every master (`never` and `second_site_only` fail); sending it from only one site (the other site's cases fail); once per site instead of once per `Greet()` (`both_sites` and `first_site_only` count two) |
+| `test_plain_replica_of_active_keydb_expires_keys[plain\|with_slot_range]` (real KeyDB: N keys `PX 3000`, the replica's DBSIZE polled without reading a key reaches N+2 and then the two keys that did not expire, after KeyDB's own has; `with_slot_range` is `REPLICAOF <host> <port> 0 16383`); `test_plain_replica_of_plain_redis_never_expires_on_its_own` (a Redis 7 of its own with `enable-debug-command yes` and `DEBUG SET-ACTIVE-EXPIRE 0`: the replica's DBSIZE stays N+2 past the TTL, then drops by exactly the one key read on the master) | Not setting the shard flag (the replica's DBSIZE stays 52 while KeyDB's is 2); the flag set for any master (the control's replica falls to 2 while Redis holds 52); predicating on `!slot_range_` instead of the main-link marker (`with_slot_range` fails alike) |
+| `ReplicaActiveExpiryTest.ReapsExpiredKeysButNeverEvicts` (shards `SetReplica(true)` with the flag on, memory limit far under usage: DBSIZE, not the `deleted` stat, shows the expired keys gone and the rest all there, `evicted_keys == 0`, over many more heartbeats), `.ControlAMasterHeartbeatUnderTheSamePressureEvicts`, `.ReapsNothingWithoutTheFlag`, `.BypassesReplicaDeleteExpiredFlag` (`--replica_delete_expired=false`: the sweep and the read path both delete), `.ControlWithoutTheFlagAReplicaThatDeletesNothingServesExpiredKeys` (served as live) | The heartbeat gate back to `!IsReplica()` (the sweep tests fail); the `ExpireIfNeeded` gate without the flag (`BypassesReplicaDeleteExpiredFlag`); eviction allowed on a replica (`DCHECK(!owner_->IsReplica())` in `FreeMemWithEvictionStepAtomic` aborts); the sweep on every replica (`ReapsNothingWithoutTheFlag`); no eviction at all (the control fails) |
 | `test_keydb_onboarding_keeps_up_under_load` (`slow`; release bar under `DRAKEYDB_PERF=1`, smoke otherwise) | n/a measurement; control = per-command path made artificially slow must fail the smoke's ratio |
 | `ClassicAuthorMapTest.*` (distinct idx and hash on every proactor, link uuid, memoization, `CapFallsBackToLinkIdxAndCounts`, `CapIgnoresLinkUuid`, `DedupStillWorksForOverCapAuthor`); `ClassicApplyFamilyTest.PeerEnvelopeStampsKey...`; `test_keydb_restart_consumes_one_author_slot` | Not registering the origin hash (`IncomingStamp` DCHECK); not setting `repl_mvcc` (stamp is a local mint); counting link uuids against the cap; overflow stamped `kSelfIdx` |
 | `AuthorDedupTest.*` (`ConcurrentSameEnvelopeAppliesOnce`: two fibers on `pp_->at(0)`/`at(1)`, the dispatch stub sleeps 10 ms before `Commit`, exactly one `kApply`; `ReleaseLetsSecondLinkApply`; `CancelledWaiterReturnsNotConsumed`; `NestedOuterAdvancesWhenInnerDeduped`; `EvictionSkipsInflight`; `ClearResetsAppliedKeepsInflight`); `test_keydb_mesh_forwarded_duplicates_deduped` (KeyDB A and B forwarding, drakeydb on both, pipelined `INCR` x N at full rate must equal N) | Setting `inflight` without ever waiting (two `kApply`; the pytest ends in (N, 2N], statistical, the gtest is the deterministic proof); disabling dedup (2N) |
@@ -1185,10 +1210,10 @@ forwarding KeyDB masters double-applies deltas (`INCR`, `APPEND`, ...), and that
 |---|---|---|
 | `src/server/classic_replay.{h,cc}` **(new)** | `CapaReply`/`ParseCapaReply`; `RreplayEnvelope`/`ParseRreplayEnvelope`; `ClassicApplier`; `ClassicApplyRewrites`; `TranslateMvccRestore`; `IsKeyDbOnlyCommand`; `ClassicAuthorMap` (+ `--classic_author_cap`); `AuthorDedup`; `ClassicLinkStats`/process counters; `--classic_partial_psync` (split into a second pair if it passes ~800 lines) | 0, 1, 2, 3 |
 | `src/server/classic_replay_test.cc` **(new)** | Pure units and `ClassicApplyFamilyTest` | 0-3 |
-| `src/server/replica.{h,cc}` | Capa parse + activeExpire send; stream-prefix buffer and graceful `CHECK`s (0); unwrap hook and batch-flush lambda; expiry flag set/clear; dedup `Clear()` at the flush point; PSYNC offset/CONTINUE; counters | 0-3 |
+| `src/server/replica.{h,cc}` | Capa parse + activeExpire send (once per `Greet()`); stream-prefix buffer and graceful `CHECK`s (0); unwrap hook and batch-flush lambda; `ApplyReplicaActiveExpiry` (three call sites) and the `SetMainLink()` marker; dedup `Clear()` at the flush point; PSYNC offset/CONTINUE; counters | 0-3 |
 | `src/server/replica_types.h` | `ReplicaSummary` classic fields | 1, 2, 3 |
-| `src/server/engine_shard.{h,cc}` | `replica_active_expiry_`, `expire_only` split (authorized exception to the "untouched" list; ~15 lines) | 1 |
-| `src/server/db_slice.cc` | One-line `ExpireIfNeeded` gate (`:2097-2098`) | 1 |
+| `src/server/engine_shard.{h,cc}` | `replica_active_expiry_` and the heartbeat gate, `eviction_goal` kept 0 on a replica (authorized exception to the "untouched" list; ~20 lines, no `expire_only` parameter); `friend class ReplicaActiveExpiryTest` | 1 |
+| `src/server/db_slice.cc` | One-expression `ExpireIfNeeded` gate (`!owner_->ReplicaActiveExpiry()`) | 1 |
 | `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards (0); U-15 guards in `Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch` (1, review round and re-review) | 0, 1 |
 | `src/server/dflycmd.cc` | U-15 null-`conn()` guard in `DFLY THREAD` (review round) | 1 |
 | `src/server/transaction.cc`, `src/server/multimaster_lww.cc` | Comments only (`:1628-1648` tripwire; `ApplyLwwRewrites` contract) | 2 |
@@ -1262,7 +1287,7 @@ PLAN.md. The phase exit also records the D-12 release-build measurement (`DRAKEY
 | 5 | **Partial-PSYNC leftover hand-off** (silent loss), the full-sync tail hand-off (Task 0.6) and the FULLRESYNC header overwrite | D-8, D-10; fake master makes the coalesced cases deterministic; repeat x10 |
 | 6 | **Dedup watermark** can evict at 4096 (never an in-flight entry) and is cleared by a flushing full sync | KeyDB shares the exposure; D-5; documented |
 | 7 | **`PeerRegistry` indices are append-only and KeyDB mints a new uuid at every start** (`server.cpp:4082`, not persisted): every restart of a KeyDB master is a new link uuid (one new index, outside the cap), every restart of a forwarding KeyDB a new author; a flapping forwarder eats the cap until drakeydb restarts | `--classic_author_cap` (default 4096, forwarded authors only) with link-idx fallback, counter and warning; `classic_link_uuid_changes` and `multimaster_peer_registry_size` make the growth visible; no reclamation (indices live in journaled entries); documented |
-| 8 | **Expiry split touches `engine_shard.cc`/`db_slice.cc`**, upstream-hot files | ~15 lines + one gate; watchlist rows; eviction provably unreachable on replicas |
+| 8 | **Expiry split touches `engine_shard.cc`/`db_slice.cc`**, upstream-hot files | ~20 lines + one gate expression; watchlist rows; eviction unreachable on replicas (`ReapsExpiredKeysButNeverEvicts`, with its master control) |
 | 9 | **Author-hash divergence** between RDB-aux stamps (sender) and stream stamps (author) on exact mvcc ties | Documented residual |
 | 10 | **Fake master / KeyDB test cost and flakiness** on a 4-core runner | `slow` marker; the release perf bar has fixed bounds and the CI smoke loose ones (D-12); x10 pass rates |
 | 11 | **CI build time** for KeyDB | Cache keyed on the v6.3.4 tag |

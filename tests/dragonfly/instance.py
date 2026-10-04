@@ -790,6 +790,13 @@ class KeyDBServer:
         with open(self.log_path, errors="replace") as f:
             return "".join(f.readlines()[-lines:])
 
+    def log_text(self):
+        """Everything the server has logged so far ("" without a log)."""
+        if not self.log_path or not os.path.exists(self.log_path):
+            return ""
+        with open(self.log_path, errors="replace") as f:
+            return f.read()
+
     def client(self, **kwargs) -> RedisClient:
         """A new asyncio client for this server; the caller closes it."""
         return RedisClient(host="localhost", port=self.port, decode_responses=True, **kwargs)

@@ -272,6 +272,10 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
   // flip the shards into replica mode (that would stop expiry/eviction process-wide).
   if (!IsPeerMode())
     SetShardStates(true);
+  // drakeydb: P7 -- Start() greeted this link before the fiber existed (the loop below greets
+  // only a link that is not), so the master's answer is applied here.
+  if (state_mask_ & R_GREETED)
+    ApplyReplicaActiveExpiry(master_active_replica_);
 
   error_code ec;
   while (state_mask_ & R_ENABLED) {
@@ -331,6 +335,9 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
         continue;
       }
       state_mask_ |= R_GREETED;
+      // drakeydb: P7 -- only a successful Greet() sets or clears it (a master that stopped saying
+      // `active-replica` clears it); a failed one, above, leaves it as it was.
+      ApplyReplicaActiveExpiry(master_active_replica_);
       continue;
     }
 
@@ -384,6 +391,7 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
   // Revert shard states to normal state.
   if (!IsPeerMode())
     SetShardStates(false);
+  ApplyReplicaActiveExpiry(false);  // drakeydb: P7
 
   VLOG(1) << "Main replication fiber finished";
 }
@@ -405,6 +413,23 @@ error_code Replica::Greet() {
     if (capa.active_replica)
       master_active_replica_ = true;
     return capa;
+  };
+  // drakeydb: P7 -- an active KeyDB learns that a replica expires keys itself from `REPLCONF capa
+  // activeExpire` (and warns "does not support active expiration" about one that never sent it).
+  // It is its own command, sent once per Greet(), right after the first capa reply that reveals
+  // `active-replica`. Only such a master ever gets it: any other master's handshake is what
+  // upstream sends. Its reply is read leniently: the master already showed it is active, and
+  // expiry (ApplyReplicaActiveExpiry) does not depend on the acknowledgement. Peer links send it
+  // too, truthfully (their node expires as a master) and never touch the shards.
+  bool active_expire_sent = false;
+  auto advertise_active_expire = [&]() -> error_code {
+    if (!master_active_replica_ || active_expire_sent)
+      return {};
+    active_expire_sent = true;
+    RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa activeExpire"));
+    if (!read_capa_reply().ok)
+      LOG_FIRST_N(WARNING, 1) << "Master did not OK REPLCONF capa activeExpire";
+    return {};
   };
   // Corresponds to server.repl_state == REPL_STATE_CONNECTING state in redis
   RETURN_ON_ERR(SendCommandAndReadResponse("PING"));  // optional.
@@ -443,6 +468,7 @@ error_code Replica::Greet() {
   // Corresponds to server.repl_state == REPL_STATE_SEND_CAPA
   RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa eof capa psync2"));
   PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok);
+  RETURN_ON_ERR(advertise_active_expire());
 
   // drakeydb: node identity exchange (KeyDB-compatible; KeyDB sends uuid right after its capa
   // batch). Clear the previous connection's identity before the exchange so an unsupported reply
@@ -622,6 +648,7 @@ error_code Replica::Greet() {
 
   if (LastResponseArgs().size() == 1) {  // Redis
     PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok);
+    RETURN_ON_ERR(advertise_active_expire());
   } else if (LastResponseArgs().size() >= 3) {  // it's dragonfly master.
     PC_RETURN_ON_BAD_RESPONSE(!HandleCapaDflyResp());
     if (auto ec = ConfigureDflyMaster(); ec)
@@ -1441,6 +1468,17 @@ void Replica::JoinDflyFlows() {
 
 void Replica::SetShardStates(bool replica) {
   shard_set->RunBriefInParallel([replica](EngineShard* shard) { shard->SetReplica(replica); });
+}
+
+// drakeydb: P7 -- a plain replica of an active KeyDB expires keys itself, because that master
+// sends no DEL for them (spec D-9, decision 13). A peer-mode node never leaves master mode, and an
+// ADDREPLICAOF link shares SetShardStates with the main one (last writer wins), so only the main
+// link of a non-peer node decides.
+void Replica::ApplyReplicaActiveExpiry(bool enabled) {
+  if (IsPeerMode() || !main_link_)
+    return;
+  shard_set->RunBriefInParallel(
+      [enabled](EngineShard* shard) { shard->SetReplicaActiveExpiry(enabled); });
 }
 
 error_code Replica::SendNextPhaseRequest(string_view kind) {

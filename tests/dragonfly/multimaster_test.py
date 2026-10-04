@@ -498,6 +498,10 @@ async def test_greet_accepts_capa_reply_with_capability_words(
     try:
         await r.set("seeded", "v")
         await proxy.override_next_response(capa_request, capa_reply)
+        # drakeydb: P7-1 Task 1.4 -- the `active-replica` replies make this replica believe its
+        # master is an active KeyDB: it sends `REPLCONF capa activeExpire` as well (the real Redis
+        # behind the proxy answers +OK) and, once greeted, turns on the shard flag that makes it
+        # expire keys itself. Nothing here sets a TTL, so no assertion below depends on it.
         assert await c.execute_command(f"REPLICAOF localhost {proxy.port}") == "OK"
         await wait_available_async(c)
 
