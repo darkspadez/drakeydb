@@ -886,7 +886,10 @@ void EngineShard::RetireExpiredAndEvict() {
 
   size_t deleted_bytes = 0;
   // drakeydb: P7 -- never on a replica: FreeMemWithEvictionStepAtomic DCHECKs against it, and
-  // CalculateEvictionBytes advances eviction_state_. A replica gets here only to expire keys.
+  // CalculateEvictionBytes advances eviction_state_. The store guarded by `track_deleted_bytes`
+  // at the end of this function can still run on a node that was a master, and only writes
+  // `deleted_bytes_at_prev_eviction`, which CalculateEvictionBytes alone reads. A replica gets
+  // here only to expire keys.
   size_t eviction_goal =
       (!IsReplica() && GetFlag(FLAGS_enable_heartbeat_eviction)) ? CalculateEvictionBytes() : 0;
 

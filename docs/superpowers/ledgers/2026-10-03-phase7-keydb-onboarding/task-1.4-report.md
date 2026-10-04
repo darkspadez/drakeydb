@@ -175,3 +175,79 @@ binary built after the last restore; the P7 run is the P7 row above and is not c
    or "eviction reaches a replica" (the latter aborts `ReapsExpiredKeysButNeverEvicts` on the `DCHECK`).
 5. **A KeyDB replaced by a Redis at the same address** keeps expiring until the first successful greet clears it (a
    full resync follows). Documented.
+
+## Review fix round
+
+Base: HEAD `e8f28b7` (Task 1.4 as committed). Opus's review: approve once Important #2 is fixed, no
+Critical. Not committed. Scratch (good copies, raw falsification output, run logs) is under `p74r/`.
+
+**Important #1 is not touched, as instructed**: spec D-9's lag-window text, `docs/PLAN.md` and
+`decisions.md` still say what they said; the owner decides, and an advisor is scoping a code option.
+
+### What changed
+
+| Item | Change |
+|---|---|
+| Important #2, the in-loop apply | `test_plain_replica_of_active_keydb_expires_keys` gains `boot_replicaof` (`df_factory.create(replicaof=f"localhost:{keydb.port}")`): its first greet is the fiber's, so the flag can only come from the in-loop apply. New `test_replica_active_expiry_follows_the_master_of_every_reconnect` (fake master, reconnects). |
+| Minor 3, `classic_master_` | Both apply sites pass `classic_master_ && master_active_replica_` (INFO's pair). Tests: `test_dfly_master_that_says_active_replica_never_turns_replica_expiry_on[replicaof_command\|boot_replicaof]`, one per site. |
+| Minor 4, flags | `absl::FlagSaver saver_;` in `ReplicaActiveExpiryTest`, and a check in its `SetUp` that `hz` and `replica_delete_expired` are at their defaults on entry. |
+| Minor 5, lenient reply | `test_greet_survives_any_reply_to_capa_active_expire[error\|two_element_array\|integer]x[plain_replica\|peer_mode]`. `FakeClassicMaster.script_capa_reply(reply, only_for=)` became per-word rules (one call per word, the default still set without `only_for`), so `activeExpire` can get its own reply while the first capa reply says `active-replica`. |
+| Minor 6, comment | `engine_shard.cc`: the `eviction_goal` comment no longer says `eviction_state_` never advances on a replica: `CalculateEvictionBytes` advances it, and the store guarded by `track_deleted_bytes` at the end of the function can still run on a node that was a master, writing only `deleted_bytes_at_prev_eviction`, which `CalculateEvictionBytes` alone reads. No code change. |
+| Minor 7, docs | D-9: `mi->isActive` is also reset when a master is created (`server.cpp:3251`); the flag is per shard, so keys arriving through `ADDREPLICAOF` links are self-expired too while the main link has it on; the flag's trigger is `classic_master_ && master_active_replica_` (and D-2's "only trigger" sentence says so). `engine_shard.h`: the flag is read by `Heartbeat` and by `DbSlice::ExpireIfNeeded`. D-15 rows and the `replica.cc` UPSTREAM-SYNC row follow. |
+
+### Design notes and deviations
+
+- **The reconnect variant uses a fake master, not a swap of real servers.** The reviewer's ad hoc check swapped KeyDB
+  for a Redis with active expiry off at the same address and back. The test does the same thing with
+  `FakeClassicMaster` on one address: `active-replica`, then plain `+OK`, then `active-replica`, each reconnect (the
+  master drops the link, `serve(...)` re-scripts capa and PSYNC) a full resync whose stream sets keys with `PX 3000`.
+  No process restarts, no port reuse, deterministic; it is the in-loop `Greet()` of the same `Replica` each time.
+  A real Redis/KeyDB swap was not added.
+- **The `classic_master_` test is not the one the brief sketched.** A fake master answering `capa dragonfly` with the
+  single string `+OK active-replica` is, to `Greet()`, a classic master (the replica takes the Redis branch on a
+  one-element reply) and *should* set the flag: that is the existing `second_site_only` case. To have
+  `master_active_replica_` true and `classic_master_` false the first capa reply must say it and the second must be a
+  real Dragonfly array, so the test is a real Dragonfly master (`--hz=0`, so it sweeps nothing; nothing reads a key)
+  behind the proxy, whose `override_next_response(b"REPLCONF capa eof", b"+OK active-replica\r\n")` makes the first
+  reply say it. The replica, which then also sends `capa activeExpire`, must keep every key, like the master.
+- **Both `classic_master_` conjuncts are pinned**, because the test has an attach variant per site (the `REPLICAOF`
+  command is applied by the top of `MainReplicationFb`, `--replicaof` by the in-loop apply).
+- **The flags check in `SetUp` is the test of the `FlagSaver`**: `--gtest_repeat=2` cannot show a leak (the leaked flags
+  do not break the other tests), the ordering of the fixture's own tests can.
+
+### Falsification
+
+Pytests: the named change in `replica.cc`, `ninja -j3 dragonfly`, `pytest tests/dragonfly/keydb_onboarding_test.py -k "<expr>"`
+(`KEYDB_SERVER_PATH=<scratchpad>/KeyDB/src/keydb-server KEYDB_REQUIRED=1 DRAGONFLY_PATH=/home/user/drakeydb/build-dbg/dragonfly`,
+under `flock /tmp/drakey-pytest.lock`), the source restored; `dragonfly` was **rebuilt after the last one** and every run
+below "Results" is on that rebuild.
+
+| Mutation | `-k` | Result |
+|---|---|---|
+| FA: the in-loop apply deleted (`:340`) | `boot_replicaof or every_reconnect` | 2 failed: `boot_replicaof` at `assert_dbsize(c, 2)` with `assert 52 == 2` (the flag was never set, that link is greeted only by the loop); the reconnect test's middle phase, `a replica of a plain master expired keys` (`assert 1 == (50 + 1)`: the flag stayed on from the first phase). |
+| FA2: the in-loop apply always clears (`ApplyReplicaActiveExpiry(false)`) | same | 2 failed: `boot_replicaof` `assert 52 == 2`; the reconnect test's last phase, `assert_dbsize(c, 1)` with `assert 51 == 1` (the next greet no longer sets it). |
+| FB1: first apply site without `classic_master_` | `never_turns_replica_expiry_on` | `replicaof_command` fails, `boot_replicaof` passes. |
+| FB2: in-loop site without `classic_master_` | same | `boot_replicaof` fails, `replicaof_command` passes. (FB1's first run, before the test had an attach variant per site, failed with `the replica expired keys on its own`, `assert 2 == (50 + 2)`.) |
+| FD: the `activeExpire` reply parse strict (`PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok)`) | `survives_any_reply or capa_active_expire` | 6 failed, 8 passed: every `survives_any_reply` case, `redis.exceptions.ResponseError: replication cancelled` (the `Greet()` failed); the eight greet cases, whose reply is an OK, pass. |
+| FC: `FlagSaver` removed from the fixture | `./classic_replay_test --gtest_filter='ReplicaActiveExpiryTest.*'` | the first test passes, the next four fail in `SetUp`: `hz` is `"0"`, default `"100"`; the last also `replica_delete_expired` `"false"`, default `"true"`. |
+
+Not falsified: a *desync* of the handshake after `activeExpire` (the sequence assertion and `connection_count == 1` would catch
+one; no mutation makes `Greet()` misread the reply's length).
+
+### Results (debug build, rebuilt after the last mutation)
+
+- `./classic_replay_test --gtest_repeat=2`: `[  PASSED  ] 71 tests.` twice.
+- `keydb_onboarding_test.py`, the whole file, real KeyDB, `KEYDB_REQUIRED=1`: `82 passed in 177.39s` (72 before, 10 new cases:
+  `boot_replicaof` 1, reconnect 1, `survives_any_reply` 6, DFLY master 2).
+- `multimaster_test.py -k "greet or capa or classic or keydb or expir"`: `20 passed, 57 deselected`.
+- `./multi_master_test`: `[  PASSED  ] 222 tests.` (rebuilt after the `replica.cc` change).
+- `pre-commit run --files <the changed files>`: `pyflakes`, `trim trailing whitespace`, `fix end of files`, `check python ast`,
+  `Clang formatting`, `black` all Passed, no file changed.
+
+### Not done
+
+- The other gtest binaries (`dragonfly_test`, `generic_family_test`, `multi_test`, `server_family_test`) and
+  `keydb_harness_test.py`, `redis_replication_test.py`, `replication_test.py -k expir` were not rerun: this round changes a comment in
+  `engine_shard.{h,cc}`, one predicate in `replica.cc` and tests only.
+- A real Redis/KeyDB swap at one address, and the `classic_master_` conjunct for a *reconnect* from a classic master to a Dragonfly
+  one (the in-loop site is exercised on a first greet by `boot_replicaof`, not after a swap), stay untested.

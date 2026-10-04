@@ -273,9 +273,10 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
   if (!IsPeerMode())
     SetShardStates(true);
   // drakeydb: P7 -- Start() greeted this link before the fiber existed (the loop below greets
-  // only a link that is not), so the master's answer is applied here.
+  // only a link that is not), so the master's answer is applied here. Only a classic master that
+  // said `active-replica` counts (INFO reads it the same way): a DFLY one never drives the flag.
   if (state_mask_ & R_GREETED)
-    ApplyReplicaActiveExpiry(master_active_replica_);
+    ApplyReplicaActiveExpiry(classic_master_ && master_active_replica_);
 
   error_code ec;
   while (state_mask_ & R_ENABLED) {
@@ -337,7 +338,7 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
       state_mask_ |= R_GREETED;
       // drakeydb: P7 -- only a successful Greet() sets or clears it (a master that stopped saying
       // `active-replica` clears it); a failed one, above, leaves it as it was.
-      ApplyReplicaActiveExpiry(master_active_replica_);
+      ApplyReplicaActiveExpiry(classic_master_ && master_active_replica_);
       continue;
     }
 

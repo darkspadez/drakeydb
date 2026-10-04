@@ -1554,6 +1554,13 @@ class ReplicaActiveExpiryTest : public BaseFamilyTest {
   static constexpr int kHeartbeatRounds = 200;
 
   void SetUp() override {
+    // saver_ puts back the flags these tests change; one found off its default here means an
+    // earlier test leaked it.
+    for (const char* name : {"hz", "replica_delete_expired"}) {
+      absl::CommandLineFlag* flag = absl::FindCommandLineFlag(name);
+      ASSERT_NE(flag, nullptr) << name;
+      EXPECT_EQ(flag->CurrentValue(), flag->DefaultValue()) << name;
+    }
     absl::SetFlag(&FLAGS_hz, 0);
     BaseFamilyTest::SetUp();
     shard_set->TEST_EnableCacheMode();
@@ -1600,6 +1607,8 @@ class ReplicaActiveExpiryTest : public BaseFamilyTest {
     for (int i = 0; i < kHeartbeatRounds && DbSize() != kPlainKeys; ++i)
       RunHeartbeats();
   }
+
+  absl::FlagSaver saver_;
 };
 
 TEST_F(ReplicaActiveExpiryTest, ReapsExpiredKeysButNeverEvicts) {

@@ -1719,9 +1719,9 @@ async def assert_dbsize(c, expected):
 
 
 @pytest.mark.keydb
-@pytest.mark.parametrize("slots", ["", " 0 16383"], ids=["plain", "with_slot_range"])
+@pytest.mark.parametrize("attach", ["plain", "with_slot_range", "boot_replicaof"])
 async def test_plain_replica_of_active_keydb_expires_keys(
-    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, slots
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, attach
 ):
     """A plain replica of an active KeyDB expires keys itself (decision 13, spec D-9): KeyDB, told
     by `REPLCONF capa activeExpire` that its replica does, streams no DEL for a key that expired.
@@ -1731,16 +1731,22 @@ async def test_plain_replica_of_active_keydb_expires_keys(
 
     `with_slot_range` attaches with `REPLICAOF <host> <port> 0 16383`: the node's main link then
     has a slot range, and still drives the flag (the marker, not `!slot_range_`, decides).
+    `boot_replicaof` attaches with the `--replicaof` flag: the fiber greets that link itself, so
+    the flag comes from the in-loop apply of MainReplicationFb, which no `REPLICAOF` command
+    reaches for its first greet (Start() greets there, and the fiber applies it at its top).
 
     Falsifying: with the shard flag never set, the replica's DBSIZE stays at the full keyspace
     while KeyDB's is down to two. With a link that only counts when it has no slot range, the
-    `with_slot_range` case fails the same way.
+    `with_slot_range` case fails the same way; without the in-loop apply, `boot_replicaof` does.
     """
     keydb = keydb_server_factory(active_replica=True)
-    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"))
+    flags = {"replicaof": f"localhost:{keydb.port}"} if attach == "boot_replicaof" else {}
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"), **flags)
     node.start()
     c = node.client()
-    assert await c.execute_command(f"REPLICAOF localhost {keydb.port}{slots}") == "OK"
+    if attach != "boot_replicaof":
+        slots = " 0 16383" if attach == "with_slot_range" else ""
+        assert await c.execute_command(f"REPLICAOF localhost {keydb.port}{slots}") == "OK"
     await wait_available_async(c)
 
     async with keydb.client() as k:
@@ -1807,6 +1813,65 @@ async def test_plain_replica_of_plain_redis_never_expires_on_its_own(
         master.stop()
 
 
+async def test_replica_active_expiry_follows_the_master_of_every_reconnect(
+    df_factory: DflyInstanceFactory, tmp_path
+):
+    """The flag is decided again by every successful `Greet()`, the one a reconnect makes in the
+    replication fiber included (MainReplicationFb's in-loop apply): the master that answers
+    `active-replica`, the same address then answering plain `+OK`, then `active-replica` again,
+    each time with a full resync whose stream sets keys with a short TTL.
+
+    The replica's DBSIZE, never reading a key, goes down to the one key without a TTL while the
+    master says `active-replica`, stays at the full keyspace well past the TTL once it does not
+    (the flag was cleared), and goes down again when it says it once more (it was set again).
+
+    Falsifying: without the apply after a reconnect's `Greet()`, the middle phase fails (the flag
+    stays on from the first); applying `false` there instead, the last phase fails.
+    """
+    ttl_ms = 3000
+
+    async with FakeClassicMaster() as master:
+
+        def serve(offset, prefix, active):
+            """What the next handshake answers and the next full sync's stream sets."""
+            master.script_capa_reply(b"+OK active-replica\r\n" if active else b"+OK\r\n")
+            stream = b"".join(
+                resp_command("SET", f"{prefix}:{i}", "v", "PX", str(ttl_ms))
+                for i in range(EXPIRING_KEYS)
+            ) + resp_command("SET", f"{prefix}:keep", "v")
+            master.script_psync(diskless_full_sync(offset=offset), stream=stream)
+
+        async def reconnect_to(offset, prefix, active):
+            """Makes the master drop the link and serve `serve(...)` to the reconnect."""
+            serve(offset, prefix, active)
+            psyncs = len(master.psync_requests)
+            await master.drop_connections()
+
+            @assert_eventually(times=200)
+            async def resynced():
+                assert len(master.psync_requests) > psyncs
+
+            await resynced()
+
+        serve(1000, "a", active=True)
+        node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"))
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+        await assert_dbsize(c, EXPIRING_KEYS + 1)
+        await assert_dbsize(c, 1)  # active: the keys expire on the replica
+
+        await reconnect_to(2000, "b", active=False)
+        await assert_dbsize(c, EXPIRING_KEYS + 1)
+        await asyncio.sleep(ttl_ms / 1000 + 2)  # well past every TTL
+        assert await c.dbsize() == EXPIRING_KEYS + 1, "a replica of a plain master expired keys"
+
+        await reconnect_to(3000, "c", active=True)
+        await assert_dbsize(c, EXPIRING_KEYS + 1)
+        await assert_dbsize(c, 1)  # and the next greet sets it again
+        assert master.connection_count == 3, "one connection per phase"
+
+
 def capa_requests(master):
     """The REPLCONF capa requests the scripted master got, in order."""
     return [r for r in master.requests if r[:2] == ["REPLCONF", "capa"]]
@@ -1860,6 +1925,94 @@ async def test_greet_sends_capa_active_expire_only_after_active_replica_reply(
             assert capas.count(active_expire) == 1, capas
             at = master.requests.index(reveal_request)
             assert master.requests[at + 1] == active_expire, master.requests
+
+
+LENIENT_ACTIVE_EXPIRE_REPLIES = {
+    "error": b"-ERR Unrecognized capability\r\n",
+    "two_element_array": b"*2\r\n+OK\r\n+active-replica\r\n",
+    "integer": b":1\r\n",
+}
+
+
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+@pytest.mark.parametrize(
+    "reply", list(LENIENT_ACTIVE_EXPIRE_REPLIES.values()), ids=list(LENIENT_ACTIVE_EXPIRE_REPLIES)
+)
+async def test_greet_survives_any_reply_to_capa_active_expire(
+    df_factory: DflyInstanceFactory, tmp_path, peer_mode, reply
+):
+    """The master has already shown it is active, so whatever it answers `REPLCONF capa
+    activeExpire` is a warning at most, never a failed handshake (spec D-2): an error, a two-element
+    array (read as two response words, not one) and an integer each leave the link up, and the
+    requests after it are answered in order, so the reply was consumed whole and nothing desynced.
+
+    Falsifying: a `Greet()` that fails on a reply that is not an OK ends it at the first of them,
+    before the PSYNC.
+    """
+    async with FakeClassicMaster() as master:
+        master.script_capa_reply(b"+OK active-replica\r\n")
+        master.script_capa_reply(reply, only_for="activeExpire")
+        if peer_mode:
+            master.script_uuid(SCRIPTED_PEER_UUID)
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET))
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+
+        @assert_eventually(times=100)
+        async def handshake_is_over():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert master.psync_requests
+
+        await handshake_is_over()
+        assert master.connection_count == 1, "the replica reconnected"
+
+        def step(request):
+            return " ".join(request[:2]) if request[0] == "REPLCONF" else request[0]
+
+        at = master.requests.index(["REPLCONF", "capa", "activeExpire"])
+        expected = ["REPLCONF UUID", "REPLCONF DRAKEY-VERSION"]
+        expected += ["REPLCONF PEER"] if peer_mode else []
+        expected += ["REPLCONF capa", "PSYNC"]
+        assert [step(r) for r in master.requests[at + 1 : at + 1 + len(expected)]] == expected
+
+
+@pytest.mark.parametrize("attach", ["replicaof_command", "boot_replicaof"])
+async def test_dfly_master_that_says_active_replica_never_turns_replica_expiry_on(
+    df_factory: DflyInstanceFactory, proxy_factory, tmp_path, attach
+):
+    """Only a classic master that says `active-replica` drives replica active expiry (the same
+    reading INFO has). A Dragonfly master answers `capa dragonfly` with an array, so it can say
+    nothing there; a proxy makes it say `+OK active-replica` at the first capa reply instead, which
+    sets `master_active_replica_` (and gets `capa activeExpire` sent) while `classic_master_` stays
+    false. The replica must not expire keys on its own: the master (with `--hz=0`, so that it
+    sweeps nothing, and nothing reads a key) keeps its expired keys, and so does the replica.
+
+    `replicaof_command` is applied by the top of MainReplicationFb, `boot_replicaof` (the
+    `--replicaof` flag) by its in-loop apply: each site has its own `classic_master_` check.
+
+    Falsifying: reading `master_active_replica_` alone at the first site fails
+    `replicaof_command`, at the in-loop one `boot_replicaof`: the replica's DBSIZE falls to two
+    while the master still holds every key.
+    """
+    master = df_factory.create(proactor_threads=2, hz=0, dir=str(tmp_path / "master"))
+    master.start()
+    cm = master.client()
+    proxy = await proxy_factory(master.port)
+    await proxy.override_next_response(b"REPLCONF capa eof", b"+OK active-replica\r\n")
+    flags = {"replicaof": f"localhost:{proxy.port}"} if attach == "boot_replicaof" else {}
+    replica = df_factory.create(proactor_threads=2, dir=str(tmp_path / "replica"), **flags)
+    replica.start()
+    cr = replica.client()
+    if attach == "replicaof_command":
+        assert await cr.execute_command(f"REPLICAOF localhost {proxy.port}") == "OK"
+    await wait_available_async(cr)
+
+    await write_expiring_keys(cm)
+    await assert_dbsize(cr, EXPIRING_KEYS + 2)
+    await asyncio.sleep(EXPIRE_TTL_MS / 1000 + 2)  # well past every TTL
+    assert await cm.dbsize() == EXPIRING_KEYS + 2, "the master swept with --hz=0"
+    assert await cr.dbsize() == EXPIRING_KEYS + 2, "the replica expired keys on its own"
+    info = await cr.info("replication")
+    assert info["role"] == "slave" and info["master_link_status"] == "up", info
 
 
 @pytest.mark.keydb

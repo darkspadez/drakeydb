@@ -168,7 +168,8 @@ class EngineShard {
 
   // drakeydb: P7 -- a replica of an active KeyDB expires keys itself (spec D-9): the master sends
   // no DEL for them. Opens the heartbeat's expiry sweep and the replica gate of
-  // DbSlice::ExpireIfNeeded, never eviction. Set per shard from Replica (replica.cc), read here.
+  // DbSlice::ExpireIfNeeded, never eviction. Set per shard from Replica (replica.cc), read by
+  // Heartbeat and by DbSlice::ExpireIfNeeded.
   void SetReplicaActiveExpiry(bool enabled) {
     replica_active_expiry_ = enabled;
   }

@@ -55,8 +55,8 @@ class FakeClassicMaster:
     Answers PING with +PONG; REPLCONF UUID, DRAKEY-VERSION and PEER with the error a pre-fork
     master gives for an unknown option (REPLCONF UUID with a bare `+<uuid>`, as KeyDB does, after
     script_uuid()); every other REPLCONF (listening-port, capa, ip-address) with +OK (every capa
-    one, or those naming its `only_for`, with what script_capa_reply() set), except `REPLCONF ACK`,
-    which is never answered.
+    one with what script_capa_reply() set, those naming a word it was given `only_for` with that
+    word's reply), except `REPLCONF ACK`, which is never answered.
     PSYNC/SYNC is answered by one write() of the bytes given to script_psync(), so coalescing on
     the wire is deterministic; the optional stream bytes follow in a second write, after
     `stream_delay` seconds if given (long enough for the replica to read the first write alone:
@@ -78,7 +78,7 @@ class FakeClassicMaster:
         self._close_after_psync = False
         self._uuid = None
         self._capa_reply = b"+OK\r\n"
-        self._capa_only_for = None
+        self._capa_rules = {}
         self._server = None
         self._handler_tasks = set()
         self._writers = set()
@@ -95,11 +95,16 @@ class FakeClassicMaster:
         self._uuid = uuid
 
     def script_capa_reply(self, reply, only_for=None):
-        """Sets the reply (a complete RESP line) to every following `REPLCONF capa ...`, e.g.
-        b"+OK active-replica\\r\\n" for what an active KeyDB says. With `only_for` (a capability
-        word, e.g. "dragonfly"), only the requests that name it get `reply`, the others +OK."""
-        self._capa_reply = reply
-        self._capa_only_for = only_for.lower() if only_for else None
+        """Sets the reply (a complete RESP reply: a line, or an array's whole bytes) to the
+        `REPLCONF capa ...` requests, e.g. b"+OK active-replica\\r\\n" for what an active KeyDB
+        says. Without `only_for` it is the reply to every one of them. With `only_for` (a
+        capability word, e.g. "dragonfly" or "activeExpire", any case), only the requests that name
+        it get `reply`, in addition to whatever the default is (+OK until set); one call per word.
+        """
+        if only_for is None:
+            self._capa_reply = reply
+        else:
+            self._capa_rules[only_for.lower()] = reply
 
     async def drop_connections(self):
         """Closes every open connection, as a master that went away does, and keeps listening."""
@@ -214,10 +219,12 @@ class FakeClassicMaster:
                 writer.write(b"-ERR Unrecognized REPLCONF option: " + option.encode() + b"\r\n")
             elif option == "CAPA":
                 named = [word.lower() for word in request[1:]]
-                if self._capa_only_for is None or self._capa_only_for in named:
-                    writer.write(self._capa_reply)
-                else:
-                    writer.write(b"+OK\r\n")
+                writer.write(
+                    next(
+                        (self._capa_rules[w] for w in named if w in self._capa_rules),
+                        self._capa_reply,
+                    )
+                )
             else:
                 writer.write(b"+OK\r\n")
         elif name in ("PSYNC", "SYNC"):
