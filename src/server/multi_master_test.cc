@@ -887,6 +887,23 @@ class MvccStoreTest : public BaseFamilyTest {
     absl::SetFlag(&FLAGS_active_replica, false);
   }
 
+  // drakeydb: P7-0 -- the default namespace's DbSlice registers TombstoneGcStep as an on-idle task
+  // (its constructor, db_slice.cc), and nothing stops it in this fixture: whenever a shard goes
+  // idle, helio runs it on its own wall-clock schedule. A test that bounds how much GC a number of
+  // explicit TombstoneGcStep calls may do has to stop it first, or a background lap that lands
+  // after AdvanceTime -- likely on a loaded box, where the window stretches -- reaps every expired
+  // tombstone at once, whatever budget the test set. Same removal Service::Shutdown performs
+  // (Namespaces::StopTombstoneGc); idempotent, so TearDown's own call is a no-op.
+  void StopBackgroundTombstoneGc() {
+    namespaces->StopTombstoneGc();
+    for (ShardId sid = 0; sid < shard_set->size(); ++sid) {
+      shard_set->Await(sid, [sid] {
+        EXPECT_FALSE(namespaces->GetDefaultNamespace().GetDbSlice(sid).TEST_HasTombstoneGcTask())
+            << "shard " << sid << " still runs the background tombstone GC";
+      });
+    }
+  }
+
   // drakeydb: P4-1 Task 7 -- shard-hops to read back the stamp arm/commit left (or didn't leave)
   // on a key, the same way production code would via DbSlice::GetMvcc.
   std::optional<MvccStamp> StampOf(std::string_view key) {
@@ -1978,6 +1995,8 @@ TEST_F(MvccStoreTest, DeleteAtTombstoneCapDegradesToEraseAndCountsTheDrop) {
 // on the real on-idle scheduler (registered from the DbSlice constructor) -- this proves the step
 // function itself is correct regardless of when/how often the scheduler happens to call it.
 TEST_F(MvccStoreTest, TombstoneGcReapsExpiredTombstonesWithinBudget) {
+  // The explicit steps below must be the only GC: see StopBackgroundTombstoneGc.
+  StopBackgroundTombstoneGc();
   absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);        // seconds
   absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 1);  // buckets/step -- see below
   absl::Cleanup restore = [] {
@@ -2210,6 +2229,8 @@ TEST_F(MvccStoreTest, GcDoesNotEraseATombstoneFlaggedSlotWithALivePrimeKey) {
 // larger than one budget=1 step can visit, and a small one on db1 -- before this fix, db1's
 // tombstones were never reaped no matter how many steps ran.
 TEST_F(MvccStoreTest, TombstoneGcServicesEveryDatabaseUnderRoundRobin) {
+  // The explicit steps below must be the only GC: see StopBackgroundTombstoneGc.
+  StopBackgroundTombstoneGc();
   absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);        // seconds
   absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 1);  // buckets/step
   absl::Cleanup restore = [] {
