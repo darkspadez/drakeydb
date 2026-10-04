@@ -2451,11 +2451,54 @@ SMOKE_OPS_PER_S = 5000
 # at both ends, where the load starts and stops.
 STEADY_TRIM = 2
 MB = 1 << 20
+# The bar's second half (spec D-12): drakeydb's max lag within COMPARATOR_FACTOR times of a KeyDB
+# active replica's on the same load, or COMPARATOR_FLOOR over it where that is more (see
+# comparator_bound).
+COMPARATOR_FACTOR = 1.5
+COMPARATOR_FLOOR = MB
+# The share of the writes KeyDB was offered that a drakeydb replica must have unwrapped from an
+# RREPLAY envelope: every write of an active KeyDB goes out in one.
+ENVELOPE_SHARE = 0.9
 
 
 def perf_mode():
     """Whether to run the release bar of spec D-12 and not the functional smoke."""
     return os.environ.get("DRAKEYDB_PERF", "").strip().lower() in ("1", "true", "yes")
+
+
+def require_perf_box(df_factory):
+    """Fails a DRAKEYDB_PERF=1 run that cannot be the release bar, and says why."""
+    cpus = set(KEYDB_CPUS + REPLICA_CPUS + LOADER_CPUS)
+    allowed = os.sched_getaffinity(0)
+    if not cpus <= allowed:
+        pytest.fail(
+            f"DRAKEYDB_PERF=1 pins to cpus {sorted(cpus)} and this process may only use "
+            f"{sorted(allowed)}"
+        )
+    if shutil.which("redis-benchmark") is None:
+        pytest.fail("DRAKEYDB_PERF=1 needs redis-benchmark on PATH")
+    binary = os.path.realpath(df_factory.params.path)
+    if "build-dbg" in binary:
+        pytest.fail(f"DRAKEYDB_PERF=1 is the release bar and {binary} is a debug build")
+
+
+@pytest.fixture
+def restore_cpu_affinity():
+    """Puts the cpu mask of the thread that runs the test's event loop back at teardown.
+
+    The release bar pins that thread (driver_pinned_to), and a test that pytest-timeout aborts
+    never runs the `finally` of its coroutine, which would leave every later test on one cpu."""
+    before = os.sched_getaffinity(0)
+    yield
+    os.sched_setaffinity(0, before)
+
+
+def comparator_bound(comparator_max_lag):
+    """The largest max lag (bytes) drakeydb may show when a KeyDB replica's was `comparator_max_lag`:
+    COMPARATOR_FACTOR times it, or COMPARATOR_FLOOR over it where that is more. Two INFOs read a few
+    milliseconds apart skew a lag by about that much (see summarise), which would otherwise turn two
+    lags of a few hundred KB into a ratio of 2."""
+    return max(COMPARATOR_FACTOR * comparator_max_lag, comparator_max_lag + COMPARATOR_FLOOR)
 
 
 def pin_threads(pid, cpus, spread_proactors=False):
@@ -2500,26 +2543,34 @@ class BenchmarkLoad:
     them: redis-benchmark 7.0 has no duration, and an `-n` sized for one machine would make the
     window as long as that machine is slow. KeyDB executes the commands it has read whole, so a
     kill mid-pipeline leaves a clean stream.
+
+    Their stderr goes to redis-benchmark-<test>.log in `log_dir`. One that exits before stop()
+    leaves that in `error` (see BackgroundTask).
     """
 
-    def __init__(self, port, cpus):
+    def __init__(self, port, cpus, log_dir):
         self.port = port
         self.cpus = cpus
-        self.procs = []
+        self.log_dir = log_dir
+        self.procs = []  # (process, its log's path)
+        self.error = None
 
     def start(self):
         for test in ("set", "incr"):
             command = ["redis-benchmark", "-p", str(self.port), "-P", "100", "-c", "25"]
             command += ["-t", test, "-r", str(KEYSPACE), "-n", "2000000000", "-q"]
-            command = ["taskset", "-c", ",".join(map(str, self.cpus))] + command
-            self.procs.append(
-                subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            )
+            log_path = os.path.join(self.log_dir, f"redis-benchmark-{test}.log")
+            with open(log_path, "w") as log:
+                proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=log)
+            pin_threads(proc.pid, self.cpus)
+            self.procs.append((proc, log_path))
 
     async def stop(self):
-        for proc in self.procs:
+        for proc, log_path in self.procs:
+            if proc.poll() is not None:
+                self.error = f"redis-benchmark exited by itself, code {proc.returncode}: {log_path}"
             proc.terminate()
-        for proc in self.procs:
+        for proc, _ in self.procs:
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -2527,22 +2578,45 @@ class BenchmarkLoad:
                 proc.wait()
 
     def cpu_seconds(self):
-        return sum(cpu_seconds(proc.pid) for proc in self.procs)
+        return sum(cpu_seconds(proc.pid) for proc, _ in self.procs)
 
 
-class CappedLoad:
+class BackgroundTask:
+    """An asyncio task that runs from start() to stop(), beside the sampling.
+
+    One that dies by itself leaves what it died of in `error`: stop() runs in a `finally`, where an
+    exception would skip the other stop and replace the failure being handled. The run asserts on
+    `error` once the window is over."""
+
+    def __init__(self):
+        self.task = None
+        self.error = None
+
+    def start(self):
+        self.task = asyncio.create_task(self._run())
+
+    async def stop(self):
+        if self.task is None:
+            return
+        self.task.cancel()
+        try:
+            await self.task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # it died before the cancel
+            self.error = e
+
+
+class CappedLoad(BackgroundTask):
     """The smoke's load: SETs and INCRs of the same keys, pipelined in batches over one connection
     at about `rate` commands a second, which a debug build on a shared box can keep up with."""
 
     BATCH = 100
 
     def __init__(self, client, rate):
+        super().__init__()
         self.client = client
         self.rate = rate
-        self.task = None
-
-    def start(self):
-        self.task = asyncio.create_task(self._run())
 
     async def _run(self):
         period = self.BATCH / self.rate
@@ -2557,34 +2631,26 @@ class CappedLoad:
             next_at += period
             await asyncio.sleep(max(0.0, next_at - time.monotonic()))
 
-    async def stop(self):
-        if self.task is not None:
-            self.task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.task
-
     def cpu_seconds(self):
         return 0.0  # runs inside this process
 
 
-class ReplicationProbe:
-    """Times the replication delay: every 100 ms it writes a marker key into KeyDB and polls the
-    replica, every millisecond, for the time until it can read it. Two INFOs a few milliseconds
-    apart resolve a lag only to a few hundred KB at the release bar's rate; this is the time a client
-    waits for a write, to a millisecond or two, which is what two replicas can be compared by. The
-    cost is ten writes and some hundreds of reads a second."""
+class ReplicationProbe(BackgroundTask):
+    """Times the replication delay a client sees: every 100 ms it writes a marker key into KeyDB
+    and polls the replica, every millisecond, for the time until it can read it. That is the
+    replica's apply time plus its own GET service time and this process's scheduling, so it is not
+    a lag: a replica that is busy answers its reads later. It is a second view, in milliseconds,
+    where two INFOs a few milliseconds apart resolve a lag only to a few hundred KB at the release
+    bar's rate. The cost is ten writes and some hundreds of reads a second."""
 
     GIVE_UP_S = 5.0
 
     def __init__(self, master, replica, started):
+        super().__init__()
         self.master = master
         self.replica = replica
         self.started = started
         self.delays = []  # (second of the window the marker was written at, delay in seconds)
-        self.task = None
-
-    def start(self):
-        self.task = asyncio.create_task(self._run())
 
     async def _run(self):
         for n in range(1, 1 << 30):
@@ -2597,11 +2663,6 @@ class ReplicationProbe:
                 await asyncio.sleep(0.001)
             self.delays.append((written - self.started, time.monotonic() - written))
             await asyncio.sleep(0.1)
-
-    async def stop(self):
-        self.task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self.task
 
     def summary(self, first_s, last_s):
         """The delays, in ms, of the markers written between `first_s` and `last_s` of the window."""
@@ -2651,8 +2712,9 @@ def summarise(samples):
     """The rates, lag and CPU use of one second-by-second series, over its steady window."""
     # The two offsets are read within milliseconds of each other and the master's moves by
     # megabytes a second, so a lag carries a noise of a few hundred KB at the release bar's rate (it
-    # can read below 0): far below the bounds, but too coarse to compare two replicas by. The
-    # replication delay of the probe (ReplicationProbe) is the finer measure for that.
+    # can read below 0): far below the bounds, but coarse for comparing two replicas, which is why
+    # comparator_bound has a floor. The client-visible delay of ReplicationProbe is a second view;
+    # it includes the replica's GET service time.
     lags = [sample["m"] - sample["r"] for sample in samples]
 
     steady = samples[STEADY_TRIM:-STEADY_TRIM]
@@ -2699,15 +2761,16 @@ async def wait_drained(master, replica, stopped_at, give_up_s):
 
     Polls every 50 ms for a poll with equal offsets that the next poll finds unchanged on the
     master's side: KeyDB may still be working through what the generators sent, and an offset that
-    only met the master's on its way up does not count."""
+    only met the master's on its way up does not count. A replica whose link is down has no offset
+    and never matches, so the caller's link checks then say what happened."""
     equal_at = equal_offset = None
     while time.monotonic() - stopped_at <= give_up_s:
         polled_at = time.monotonic()
         m = int((await master.info("replication"))["master_repl_offset"])
-        r = int((await replica.info("replication"))["slave_repl_offset"])
+        r = (await replica.info("replication")).get("slave_repl_offset")
         if equal_at is not None and m == equal_offset:
             return equal_at - stopped_at
-        equal_at, equal_offset = (polled_at, m) if r == m else (None, None)
+        equal_at, equal_offset = (polled_at, m) if r is not None and int(r) == m else (None, None)
         await asyncio.sleep(0.05)
     return None
 
@@ -2758,22 +2821,25 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
     - "keydb": a second active KeyDB, the comparator of the bar,
     - "drakeydb_raw": a plain drakeydb replica of the plain KeyDB, whose raw stream it squashes.
 
-    Samples both offsets once a second, checks that the link held, drains, and that the keys match.
-    With `bar` it also asserts the bounds of spec D-12. Returns the numbers.
+    Samples both offsets once a second, times the drain from the moment the load is dead, then
+    checks that the link held, and that the keys match. With `bar` it also asserts the absolute
+    bounds of spec D-12; the comparison with a KeyDB replica needs two runs (see
+    test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica). Returns the numbers. The KeyDBs it
+    started are stopped before it returns, so that a run that follows starts from nothing else.
     """
     perf = perf_mode()
     if perf:
-        if (os.cpu_count() or 0) < 4:
-            pytest.fail("DRAKEYDB_PERF=1 is the 4-cpu release bar: this box has fewer cpus")
-        if shutil.which("redis-benchmark") is None:
-            pytest.fail("DRAKEYDB_PERF=1 needs redis-benchmark on PATH")
+        require_perf_box(df_factory)
 
     master = keydb_server_factory(active_replica=replica_kind != "drakeydb_raw")
     async with contextlib.AsyncExitStack() as stack:
+        # Pushed before the clients are entered, so that it runs after they are closed.
+        stack.callback(master.stop)
         k = await stack.enter_async_context(master.client())
         node = None
         if replica_kind == "keydb":
             follower = keydb_server_factory(active_replica=True)
+            stack.callback(follower.stop)
             replica_pid = follower.proc.pid
             replica = await stack.enter_async_context(follower.client())
             await replica.execute_command("REPLICAOF", "localhost", master.port)
@@ -2794,7 +2860,8 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
             pin_threads(master.proc.pid, KEYDB_CPUS)
             pin_threads(replica_pid, REPLICA_CPUS, spread_proactors=node is not None)
             stack.enter_context(driver_pinned_to(LOADER_CPUS))
-            load, window = BenchmarkLoad(master.port, LOADER_CPUS), PERF_WINDOW_S
+            load = BenchmarkLoad(master.port, LOADER_CPUS, df_factory.params.log_dir)
+            window = PERF_WINDOW_S
         else:
             load_client = await stack.enter_async_context(master.client())
             load, window = CappedLoad(load_client, SMOKE_OPS_PER_S), SMOKE_WINDOW_S
@@ -2817,11 +2884,15 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
                 await asyncio.sleep(max(0.0, started + i - time.monotonic()))
                 samples.append(await take_sample(started, k, replica, cpu_sources))
         finally:
+            # Neither stop() raises about what its task died of (see BackgroundTask), so both run
+            # and the failure being handled is the one reported.
             if probe:
                 await probe.stop()
             await load.stop()
         stopped_at = time.monotonic()
 
+        died = [f"{type(b).__name__}: {b.error!r}" for b in (load, probe) if b and b.error]
+        assert not died, f"something that ran beside the sampling died: {died}"
         result = summarise(samples)
         if probe:
             result["replication_delay_ms"] = probe.summary(STEADY_TRIM, window - STEADY_TRIM)
@@ -2831,6 +2902,20 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
         bounds = bar_bounds(perf, result["produce_bytes_per_s"])
         result.update(replica=replica_kind, perf=perf, window_s=window, bounds=bounds)
         result["loadavg_1m_before"] = load_before
+        if node:
+            result["binary"] = os.path.realpath(df_factory.params.path)
+
+        # The drain is timed first, from the moment the load is dead: the link, counter and key
+        # checks below make requests of their own (a /metrics scrape among them) that would count
+        # as drain time. It is waited for as long as the bound allows, or a minute when there are
+        # no bounds and only the numbers matter; it is recorded before the bounds are asserted, so
+        # that a run that fails them still records all its numbers.
+        give_up_s = bounds["max_drain_s"] + 3 if bar else 60
+        drain_s = await wait_drained(k, replica, stopped_at, give_up_s)
+        result["drain_s"] = None if drain_s is None else round(drain_s, 3)
+        record_throughput(f"{replica_kind}:{'perf' if perf else 'smoke'}", result)
+        skipped = ("lag_series", "samples")
+        summary = {key: value for key, value in result.items() if key not in skipped}
 
         # (1) The link held: no reconnect, and KeyDB served no other sync than the first.
         link = await replica.info("replication")
@@ -2840,23 +2925,21 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
         assert await sync_counts(k) == synced, "KeyDB served another sync during the load"
         assert (await k.info("replication"))["connected_slaves"] == 1
 
-        # The drain is timed before the bounds are asserted, so that a run that fails them still
-        # records all its numbers. It is waited for as long as the bound allows, or a minute when
-        # there are no bounds and only the numbers matter.
-        give_up_s = bounds["max_drain_s"] + 3 if bar else 60
-        drain_s = await wait_drained(k, replica, stopped_at, give_up_s)
-        result["drain_s"] = None if drain_s is None else round(drain_s, 3)
-        record_throughput(f"{replica_kind}:{'perf' if perf else 'smoke'}", result)
+        # The envelope path ran: about one unwrapped envelope for every write KeyDB took. A
+        # replica that took a raw stream keeps up too, and must not pass for this one.
+        if replica_kind == "drakeydb":
+            envelopes = result.get("applied_envelopes_per_s")
+            assert (
+                envelopes is not None and envelopes >= ENVELOPE_SHARE * result["offered_ops_per_s"]
+            ), f"the replica unwrapped {envelopes} envelopes/s of the writes offered: {summary}"
 
         # (2) The replica kept up over the steady window, and (3) the lag drained in time.
         if bar:
-            skipped = ("lag_series", "samples")
-            summary = {key: value for key, value in result.items() if key not in skipped}
             assert result["ratio"] >= bounds["min_ratio"], summary
             assert result["max_lag"] <= bounds["max_lag"], summary
-        assert drain_s is not None, f"not drained {give_up_s} s after the load stopped"
+        assert drain_s is not None, f"not drained {give_up_s} s after the load stopped: {summary}"
         if bar:
-            assert drain_s <= bounds["max_drain_s"], result["drain_s"]
+            assert drain_s <= bounds["max_drain_s"], summary
 
         # Both hold the same keys.
         await assert_same_keys(k, replica)
@@ -2866,24 +2949,29 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
 @pytest.mark.slow
 @pytest.mark.keydb
 async def test_keydb_onboarding_keeps_up_under_load(
-    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, restore_cpu_affinity
 ):
     """A plain replica of an active KeyDB keeps up with a write load that KeyDB takes at full speed
     (owner decision 12, spec D-12). Per-command dispatch of the RREPLAY envelopes gives up the
     squasher's batching, and this is the measurement that it still keeps up.
 
     Over a window of pipelined SETs and INCRs, sampled once a second, minus the first and last 2 s:
-    the link never reconnects and KeyDB serves one full sync; the replica's offset advances at
-    least `min_ratio` as fast as the master's, and its lag never exceeds `max_lag`; within
-    `max_drain_s` of the load stopping the lag is 0; and both servers then hold the same keys, the
-    INCR counters included.
+    the link never reconnects and KeyDB serves one full sync; the replica unwrapped about one
+    envelope for every write; its offset advances at least `min_ratio` as fast as the master's,
+    and its lag never exceeds `max_lag`; within `max_drain_s` of the load stopping the lag is 0;
+    and both servers then hold the same keys, the INCR counters included.
 
     By default this is a smoke, to show the test and the plumbing work on a debug build or a shared
     CI box: about 5000 writes a second from one asyncio connection, and loose bounds (ratio 0.5,
-    lag 32 MB, drain 10 s). It does not claim the bar. With DRAKEYDB_PERF=1 and a release
-    DRAGONFLY_PATH on a quiet 4-cpu box it is the bar: redis-benchmark at full speed (pinned, see
-    BenchmarkLoad) and a ratio of 0.95, a lag of at most max(2 s of the master's output, 8 MB) and
-    a drain within 2 s.
+    lag 32 MB, drain 10 s). It does not claim the bar. Its 32 MB lag bound is the spec's number
+    and cannot fire: the smoke writes about 7.4 MB in all. What it asserts is the ratio, the drain,
+    the link, the envelopes and the keys.
+
+    With DRAKEYDB_PERF=1 and a release DRAGONFLY_PATH on a quiet 4-cpu box it asserts the absolute
+    half of the bar: redis-benchmark at full speed (pinned, see BenchmarkLoad) and a ratio of
+    0.95, a lag of at most max(2 s of the master's output, 8 MB) and a drain within 2 s. The other
+    half, a lag within 1.5 times of a KeyDB active replica's on the same load, is asserted by
+    test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica, which runs both.
 
     Falsifying: a 1 ms sleep per enveloped command in ClassicApplier::ApplyCommand caps the replica
     at about 1000 commands a second, and the smoke's ratio assertion fails (0.18). Under
@@ -2898,18 +2986,118 @@ async def test_keydb_onboarding_keeps_up_under_load(
 
 @pytest.mark.slow
 @pytest.mark.keydb
+@pytest.mark.skipif(not perf_mode(), reason="the 1.5x half of the release bar: DRAKEYDB_PERF=1")
+async def test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, restore_cpu_affinity
+):
+    """Owner decision 12 in full: under the release bar's load, drakeydb's max lag is within 1.5
+    times of a KeyDB active replica's (comparator_bound).
+
+    Runs the comparator, a second active KeyDB as the replica, and then drakeydb, one after the
+    other under the same pinning and load, so that neither takes the other's cpus (the drakeydb
+    run asserts the absolute bar as well, see test_keydb_onboarding_keeps_up_under_load). The
+    bound is on the max lag of each run's steady window; the marker delays and the drains are
+    recorded, not asserted."""
+    comparator = await run_throughput(
+        df_factory, keydb_server_factory, tmp_path, replica_kind="keydb", bar=False
+    )
+    drakeydb = await run_throughput(
+        df_factory, keydb_server_factory, tmp_path, replica_kind="drakeydb", bar=True
+    )
+    bound = comparator_bound(comparator["max_lag"])
+    record_throughput(
+        "comparator_bound",
+        {
+            "comparator_max_lag": comparator["max_lag"],
+            "drakeydb_max_lag": drakeydb["max_lag"],
+            "bound": bound,
+            "binary": drakeydb["binary"],
+        },
+    )
+    assert drakeydb["max_lag"] <= bound, (
+        f"drakeydb's max lag of {drakeydb['max_lag']} B ({drakeydb['binary']}) is over "
+        f"{bound:.0f} B, the bound on a KeyDB replica's of {comparator['max_lag']} B: "
+        f"max({COMPARATOR_FACTOR} x it, it + {COMPARATOR_FLOOR} B)"
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.keydb
 @pytest.mark.skipif(
     not perf_mode(), reason="the reference setups of the release bar: DRAKEYDB_PERF=1"
 )
 @pytest.mark.parametrize("replica_kind", ["keydb", "drakeydb_raw"])
 async def test_keydb_throughput_reference_setups(
-    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, replica_kind
+    df_factory: DflyInstanceFactory,
+    keydb_server_factory,
+    tmp_path,
+    restore_cpu_affinity,
+    replica_kind,
 ):
     """The numbers the release bar is judged against, under its load and pinning, and no bounds:
-    a second active KeyDB as the replica (drakeydb's lag must be within 1.5 times of its), and a
-    drakeydb replica of a plain KeyDB, whose raw stream the squasher batches (the reference the
-    envelope path pays against). They run apart from the drakeydb run, so that no replica takes
-    the cpus of another; the link, drain and key checks still hold."""
+    a second active KeyDB as the replica (drakeydb's lag must be within 1.5 times of its, which
+    test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica asserts), and a drakeydb replica of a
+    plain KeyDB, whose raw stream the squasher batches (the reference the envelope path pays
+    against). They run apart from the drakeydb run, so that no replica takes the cpus of another;
+    the link, drain and key checks still hold."""
     await run_throughput(
         df_factory, keydb_server_factory, tmp_path, replica_kind=replica_kind, bar=False
     )
+
+
+def test_comparator_bound_is_1_5_times_with_a_floor_of_1_mb():
+    """comparator_bound, the bar's comparison with a KeyDB replica's max lag: 1 MB over a small
+    one, 1.5 times a large one, and the two meet at twice the floor."""
+    assert comparator_bound(0) == MB
+    assert comparator_bound(500_000) == 500_000 + MB
+    assert comparator_bound(2 * MB) == 3 * MB
+    assert comparator_bound(10 * MB) == 15 * MB
+
+
+async def test_background_task_stop_leaves_what_the_task_died_of_in_error():
+    """stop() of a task that died by itself returns and leaves its exception in `error`, so that
+    the stops in run_throughput's `finally` neither skip each other nor replace the failure being
+    handled; a task stopped while it runs leaves no error, and one never started is a no-op."""
+
+    class Dies(BackgroundTask):
+        async def _run(self):
+            raise ConnectionError("the replica went away")
+
+    class Runs(BackgroundTask):
+        async def _run(self):
+            await asyncio.sleep(3600)
+
+    never_started, dies, runs = Runs(), Dies(), Runs()
+    await never_started.stop()
+    dies.start()
+    runs.start()
+    await asyncio.sleep(0)  # both run to their first await, or to their death
+    await dies.stop()
+    await runs.stop()
+    assert isinstance(dies.error, ConnectionError)
+    assert runs.error is None and runs.task.cancelled()
+    assert never_started.error is None
+
+
+class ScriptedInfo:
+    """A client whose `info("replication")` answers from a script; the last answer repeats."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+
+    async def info(self, section):
+        assert section == "replication"
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+
+async def test_wait_drained_counts_a_replica_without_an_offset_as_not_drained():
+    """A replica whose link is down has no slave_repl_offset: wait_drained gives up with None and
+    leaves the link assertion of run_throughput to say what happened, where it used to raise a
+    KeyError. One that catches up is drained once the master has stood still for a poll."""
+    master = ScriptedInfo({"master_repl_offset": 100})
+    down = ScriptedInfo({"master_link_status": "down"})
+    assert await wait_drained(master, down, time.monotonic(), give_up_s=0.2) is None
+
+    catching_up = ScriptedInfo({"slave_repl_offset": 90}, {"slave_repl_offset": 100})
+    drained = await wait_drained(master, catching_up, time.monotonic(), give_up_s=5)
+    assert drained is not None and drained < 1

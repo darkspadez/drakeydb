@@ -1,7 +1,7 @@
 # Task 1.5 report: throughput, "must keep up with KeyDB"
 
-Branch `feat/phase7-1-rreplay-unwrap`, started at HEAD `2bdf3d7`. Not committed (the orchestrator
-commits). Implementer: Sonnet. Brief: `brief-task-1.5.md`; plan Tasks 1.5 and 1.6; spec D-12; ledger
+Branch `feat/phase7-1-rreplay-unwrap`, started at HEAD `2bdf3d7`, committed as `6806524`; the review
+fix round (last section) is not committed. Implementer: Sonnet. Brief: `brief-task-1.5.md`; plan Tasks 1.5 and 1.6; spec D-12; ledger
 `decisions.md` row 12. Scratch material (every run's JSON line, pytest log and load/cpu snapshot, the
 wrapper scripts, the falsification sources and build scripts) is in the orchestrator's scratchpad under
 `runs/`, `falsify/`, `perf_run.sh`, `smoke_run.sh`, `campaign.sh`, `aggregate.py`.
@@ -13,17 +13,20 @@ wrapper scripts, the falsification sources and build scripts) is in the orchestr
   <= 61 MB, that is `max(2 s x produce rate, 8 MB)`), drain 0.036 s after the load stops (bar <= 2 s),
   no reconnect, no second sync, and both servers hold the same 100,000 `key:` and 100,000 `counter:`
   values. The comparator (a second active KeyDB as the replica) is at or above drakeydb on every lag
-  measure: drakeydb is 0.80x its max lag, 0.94x its median lag and 0.73x / 0.47x / 0.41x its replication
-  delay at p50 / p99 / max, so within the 1.5x bound.
+  measure: drakeydb is 0.80x its max lag, 0.94x its median lag and 0.73x / 0.47x / 0.41x its client-visible marker
+  delay at p50 / p99 / max (which includes the replica's own GET service time), so within the 1.5x bound.
 - The load is bounded by KeyDB's one server thread (99% of cpu 0 in every run), about 213,000 writes/s
   (30.5 MB/s of stream, 143 bytes per command: the RREPLAY wrapper is 100 of them). drakeydb's replica
   took 55% of one cpu for that (2.6 us per command), KeyDB's own replica 96% (4.4 us). The bar is
   therefore "keeps up with what one KeyDB thread can produce"; a rough ceiling for drakeydb's envelope
   path is 1/2.6 us, about 385,000 commands/s, about 1.8x that.
-- The test `test_keydb_onboarding_keeps_up_under_load` (`slow`, `keydb`) is a 15 s smoke by default (about
-  5000 writes/s, ratio >= 0.5, lag < 32 MB, drain < 10 s) and the release bar under `DRAKEYDB_PERF=1`. A
-  second, perf-only test, `test_keydb_throughput_reference_setups[keydb|drakeydb_raw]`, measures the
-  comparator and the raw squashed reference with the same harness and no bounds.
+- The test `test_keydb_onboarding_keeps_up_under_load` (`slow`, `keydb`) is a smoke by default (a 10 s
+  window, 13-16 s of wall time; about 5000 writes/s, ratio >= 0.5, lag < 32 MB, drain < 10 s) and the
+  absolute half of the release bar under `DRAKEYDB_PERF=1`. A second, perf-only test,
+  `test_keydb_throughput_reference_setups[keydb|drakeydb_raw]`, measures the comparator and the raw
+  squashed reference with the same harness and no bounds. The 1.5x half of the bar is asserted by a third,
+  perf-only test added in the review fix round, `test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica`;
+  the three-run tables below were taken before it existed and compared by hand.
 - Falsified (below): a 1 ms sleep per enveloped command fails the smoke's ratio assertion (0.18 vs 0.5),
   fails the release run (KeyDB drops the lagging replica at its 256 MB output buffer, reported as a down
   link), and a calibrated 3 us busy wait per command fails the release ratio assertion itself (0.86 vs
@@ -38,7 +41,9 @@ wrapper scripts, the falsification sources and build scripts) is in the orchestr
 
 No product source changed. `git status` shows only the test file; `ninja -C build-opt -n dragonfly` says
 "no work to do" (the release binary matches the tree: `git diff --stat 8eeba7c..HEAD` touches docs,
-`classic_replay_test.cc`, `fake_classic_master.py` and `keydb_onboarding_test.py` only).
+`classic_replay_test.cc`, `fake_classic_master.py` and `keydb_onboarding_test.py` only). That was true
+when written; HEAD has since taken `1404897` (`generic_family.cc`, SORT .. STORE), and the fix round
+rebuilt `build-opt` to HEAD before measuring.
 
 ## Method
 
@@ -81,14 +86,19 @@ debug drakeydb `build-dbg/dragonfly`.
   minus replica offset, per sample. "ops/s" of the apply side is derived at the master's bytes per
   command (143, 43 raw); drakeydb's own `rreplay_unwrapped` counter gives 226,256 vs 226,178 offered in
   run 1, so the derivation holds.
-- **Replication delay probe** (perf mode; `ReplicationProbe`, not part of the brief): every 100 ms a
-  marker key is written into KeyDB and the replica is polled every millisecond until it shows it. Two
-  `INFO`s a few ms apart resolve a lag to a few hundred KB at 30 MB/s (the lag can read below 0), so
-  the byte lags of two replicas cannot be compared at 1.5x resolution; the delay is in ms and says what
-  a client waits. About 200 markers per run, 10 writes and a few hundred reads a second.
+- **Client-visible delay probe** (perf mode; `ReplicationProbe`, not part of the brief): every 100 ms a
+  marker key is written into KeyDB and the replica is polled every millisecond until it shows it. The
+  delay is the replica's apply time plus its own GET service time plus the driver's scheduling (the
+  driver shares cpu 3 with the load generators), so it is not a lag: a replica that is busy answers its
+  reads later, and KeyDB's, at 96% of its cpu, does. Two `INFO`s a few ms apart resolve a lag only to a
+  few hundred KB at 30 MB/s (the lag can read below 0), so the probe is a second view, in ms, of what a
+  client waits. About 200 markers per run, 10 writes and a few hundred reads a second.
 - **Drain:** poll both offsets every 50 ms from the moment the load generators are dead; the drain time
   is the time of the first poll with equal offsets that the next poll finds unchanged on the master
-  (KeyDB may still be working through what the generators sent).
+  (KeyDB may still be working through what the generators sent). In the tables below the first poll came
+  only after the summary, a link check (a `/metrics` scrape for drakeydb, none for KeyDB), the sync
+  counters and an `INFO`, so those drains carry that overhead and the two replicas' carry different
+  amounts; the fix round moved the drain first (see its section).
 - **Final checks:** `DBSIZE` equal and all 100,000 `key:` and 100,000 `counter:` names `MGET`ed on both
   servers and compared (a counter's value is the number of `INCR`s it took; this is the "sum" check, in
   full).
@@ -138,13 +148,16 @@ multi-MB stalls (run 2's 5.6 MB max lag) that drakeydb's runs do not.
 |---|---|---|---|---|
 | max lag (bytes, steady window) | 1,351,120 | 1,682,373 | 0.80 | yes |
 | median lag (bytes) | 933,412 | 990,685 | 0.94 | yes |
-| replication delay p50 (ms) | 8.0 | 11.0 | 0.73 | yes |
-| replication delay p99 (ms) | 20.8 | 44.7 | 0.47 | yes |
-| replication delay max (ms) | 23.1 | 56.2 | 0.41 | yes |
+| client-visible delay p50 (ms) | 8.0 | 11.0 | 0.73 | yes |
+| client-visible delay p99 (ms) | 20.8 | 44.7 | 0.47 | yes |
+| client-visible delay max (ms) | 23.1 | 56.2 | 0.41 | yes |
 | drain after the load stops (s) | 0.036 | 0.066 | 0.55 | yes |
 
 The byte lags are at the resolution limit (see the method: +-a few hundred KB of INFO skew) and say
-"the same"; the delay probe is the finer measure, and drakeydb is the faster one.
+"the same". The delay probe is the client-visible time to read a write back: it includes the replica's
+own GET service time, and the comparator at 96% of its cpu serves GETs slower, so its p99 of 0.47x is
+partly read latency and not lag. The verdict does not rest on it: on the byte lags alone drakeydb's worst
+run (1,565 KB) is 1.04x the comparator's best (1,511 KB), well inside 1.5x plus the floor.
 
 ### Reference: drakeydb replica of a plain KeyDB, raw stream squashed (`...[df_factory0-drakeydb_raw]`)
 
@@ -184,7 +197,7 @@ corrected for INFO skew, no delay probe) and gave the same picture: drakeydb rat
 | lag drains within 2 s of the load stopping | 0.036 s median, 0.071 s worst | pass |
 | no reconnect; KeyDB one full sync | `dragonfly_replica_reconnect_count` unchanged, KeyDB `sync_full == 1` and no sync counter moved, `connected_slaves == 1`, link `up` | pass |
 | final key counts equal (and the INCR counters) | `DBSIZE` equal; all 200,000 `key:`/`counter:` values equal | pass |
-| drakeydb lag within 1.5x of a KeyDB active replica's | 0.80x max, 0.94x median (offsets); 0.47x p99 delay | pass |
+| drakeydb lag within 1.5x of a KeyDB active replica's | 0.80x max, 0.94x median (offsets, compared by hand from the medians); 0.47x p99 client-visible delay. Asserted since the fix round, by `test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica` | pass |
 
 **Task 1.6 is not triggered.** Task 1.6 Step 1 (the profile) was not run; the per-command cost figures
 above come from CPU time, not from a profile.
@@ -309,8 +322,9 @@ campaign above before the falsification and the confirmations after it (`final-*
 - **Smoke timing on a heavily loaded CI box** was not tried beyond this VM (6 of 6 passes on the final
   file, each 13-16 s; the debug replica used 33% of a cpu for 5000 writes/s, so there is a factor of
   3 of room before ratio 0.5 is at risk).
-- **`DRAKEYDB_PERF=1` with a debug binary** would fail the bar and mean nothing; the test does not
-  check the build type.
+- **`DRAKEYDB_PERF=1` with a debug binary** would fail the bar and mean nothing. Since the fix round it
+  fails at once with a message when the binary's realpath contains `build-dbg`; a debug build somewhere
+  else is not recognised.
 - The plan's Task 1.5 Step 5 commit (`test: pin that the RREPLAY path keeps up with KeyDB under load (P7)`)
   is the orchestrator's. Nothing in the plan, the spec or `docs/PLAN.md` was edited; D-12 and decision 12
   need no change (the bar passed as written). The plan's Task 1.5 text could gain an "as built" line for
@@ -333,4 +347,112 @@ DRAKEYDB_PERF=1 DRAKEYDB_PERF_OUT=<file>.jsonl KEYDB_SERVER_PATH=... KEYDB_REQUI
   # and ...::test_keydb_throughput_reference_setups[df_factory0-keydb] / [df_factory0-drakeydb_raw]
 
 pre-commit run --files tests/dragonfly/keydb_onboarding_test.py   # pyflakes, whitespace, ast, black: passed
+```
+
+## Review fix round (review of `6806524`)
+
+Test-only: `tests/dragonfly/keydb_onboarding_test.py` and this report; no product source. Not committed.
+`build-opt` was three ninja steps behind HEAD (`1404897` changed `generic_family.cc`), so it was rebuilt
+(`ninja -C build-opt -j3 dragonfly`, `generic_family.cc` and two links) before the perf runs below; all
+runs are on HEAD `faf1f3f` plus these edits (HEAD then moved to `219ed8f`, docs only).
+
+### What changed, by finding
+
+| finding | change |
+|---|---|
+| I1: the 1.5x half of D-12 was not asserted | New perf-only test `test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica` (`slow`, `keydb`, `skipif(not perf_mode())`). It calls `run_throughput` for the KeyDB active-replica comparator (no bounds), then for drakeydb (`bar=True`, so the absolute bar too), one after the other under the same pinning and load, and asserts drakeydb's steady-window max lag `<= comparator_bound(c) = max(1.5 c, c + 1 MB)` (the floor absorbs the INFO-sampling skew; the constants are `COMPARATOR_FACTOR`, `COMPARATOR_FLOOR`). `run_throughput` now stops the KeyDBs it started before returning, so the second leg starts from nothing else. Its docstring and the bar test's say which test asserts what; the verdict row above and the summary say the same. Task 2.4 Step 5's re-run is this one test. |
+| M1: a dead probe skipped `load.stop()` and replaced the real assertion | `BackgroundTask` base class for `CappedLoad` and `ReplicationProbe` (this is also M9's `stop` dedupe): `stop()` never raises about what its task died of, it leaves it in `error`; `BenchmarkLoad` leaves an early exit of a generator in `error` too. Both stops in the `finally` always run, the failure in flight is the one reported, and `run_throughput` asserts on the `error`s straight after the window. |
+| M2: drain floored by the link checks | After the window: `stopped_at`, the pure summary, then the drain poll, and only then the link, `/metrics`, sync-counter and key checks. `wait_drained` treats a missing `slave_repl_offset` as "not equal", so a dropped link still ends in the link assertion's message. The drain is now like-for-like between drakeydb and KeyDB (neither does anything but poll before it). |
+| M3: probe called "the finer measure" | Relabelled client-visible delay, including the replica's GET service time (`ReplicationProbe` docstring, the `summarise` comment, the method text, the comparison table and its verdict above). |
+| M4: envelope path not asserted | For `replica_kind == "drakeydb"`, `applied_envelopes_per_s` must exist and be `>= 0.9 x` the offered ops/s (`ENVELOPE_SHARE`), in smoke and perf mode. |
+| M5: smoke's 32 MB bound cannot fire | Said in the bar test's docstring: the spec's number, the smoke writes about 7.4 MB in all, the live assertions are ratio, drain, link, envelopes and keys. |
+| M6: cpu check, taskset, stderr | `require_perf_box`: `{0,1,2,3} <= os.sched_getaffinity(0)` (not `os.cpu_count()`), and `redis-benchmark` on PATH. The generators are pinned with `pin_threads` (no `taskset`), and their stderr goes to `redis-benchmark-set.log` / `-incr.log` in the log dir. |
+| M7: perf mode on a debug binary | `require_perf_box` fails at once if the realpath of `DRAGONFLY_PATH` contains `build-dbg`; the realpath is in the result (`binary`) and in the bar and comparator assertion messages. |
+| M8: timeout leaves the driver pinned | A `restore_cpu_affinity` fixture on the three perf-capable tests puts the thread's mask back at teardown, which runs after a pytest-timeout abort. Scratch check below. |
+| M9: duplication | Done: `CappedLoad.stop` / `ReplicationProbe.stop` (above) and `taskset` vs `pin_threads`. Not done: `assert_idle_synced` vs `wait_for_synced_link` / `offsets_equal`: different checks (KeyDB's `slave0.state` against the peer-mode link fields of the scripted tests), and merging them would touch tests outside this fix. |
+| M10: report nits | Line 3 and the "15 s smoke" (the window is 10 s, 13-16 s is wall time) corrected above. |
+
+Three fast tests without KeyDB: `test_comparator_bound_is_1_5_times_with_a_floor_of_1_mb`,
+`test_background_task_stop_leaves_what_the_task_died_of_in_error` and
+`test_wait_drained_counts_a_replica_without_an_offset_as_not_drained` (fake clients).
+
+### Numbers (`DRAKEYDB_PERF=1`, `build-opt`, quiet box, one run of each)
+
+Both tests passed. `loadavg` is the 1-minute load when the test took its reading; the comparator test's
+second leg reads the first leg's own load. Columns as in the tables above.
+
+`test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica[df_factory0]`: PASSED in 66.5 s (`runs/fix-cmp-1`).
+
+| leg | load | offered ops/s | produce MB/s | apply MB/s | ratio | max lag KB | median lag KB | client delay ms (n) | drain s | cpu % |
+|---|---|---|---|---|---|---|---|---|---|---|
+| KeyDB replica | 0.24 | 278,779 | 39.9 | 39.9 | 0.9999 | 2045 | 1032 | 10.1/34.0/44.3 (202) | 0.069 | 99.0 / 99.1 / 6.9 |
+| drakeydb | 1.19 | 278,471 | 39.8 | 39.8 | 1.0000 | 1080 | 911 | 6.6/17.0/19.4 (209) | 0.064 | 99.5 / 59.1 / 6.5 |
+
+The bound is `max(1.5 x 2,045,311, 2,045,311 + 1,048,576) = 3,093,887` B; drakeydb's max lag is
+1,079,691 B, 0.53x the comparator's. The envelope counter advanced at 278,472/s against 278,471 offered.
+
+`test_keydb_onboarding_keeps_up_under_load[df_factory0]`: PASSED in 34.6 s (`runs/fix-bar-1`): offered
+277,026/s, produce 39.6 MB/s, apply 39.6 MB/s (277,071 ops/s, envelopes 277,071/s), ratio 1.0002 (bar
+>= 0.95), max lag 1,280,359 B (bar 79,217,776 B), median lag 944,050 B, drain 0.12 s (bar 2 s), client
+delay 6.2/15.3/42.1 ms (210), cpu 99.2 / 56.8 / 6.4, load 0.48.
+
+Against the three-run tables above: the master's rate this session was 277-279k writes/s, not 213-226k
+(KeyDB's one thread is the load; the box was not the same speed, and nothing here explains it), so these
+rows are not folded into those medians. drakeydb's replica used 2.05 us of cpu per command here (56.8% at
+277k/s) against 2.6 us there. The drains, 0.064 to 0.12 s, are measured from the moment the generators
+are dead; the earlier 0.028-0.071 s began after the link checks and are not comparable.
+
+Smoke (default mode, `-k keeps_up`): `build-dbg` 2 of 2 passed (14.7 s, 15.2 s wall), `build-opt` 1 of 1
+(12.7 s); ratio 1.0, max lag 14,750 B, 5000 envelopes/s of 5000 offered, drain 0.051 / 0.052 s on debug and
+0.0 on release (drained at the first poll, which is now the instant the load is dead). Once more on the
+final file, the smoke with the three fast tests: 4 of 4 passed on `build-dbg` (13.8 s) and on `build-opt`
+(16.3 s); `pre-commit run --files` on the test and this report passes (pyflakes, whitespace, ast, black).
+
+### Falsification
+
+Every guard added was flipped, the file restored from a saved copy (`diff` clean) after each.
+
+| guard | flip | result |
+|---|---|---|
+| I1, the assertion's wiring (perf, `build-opt`) | `10 * drakeydb["max_lag"] <= bound` | FAILS: `drakeydb's max lag of 1290730 B (.../build-opt/drakeydb) is over 3487898 B, the bound on a KeyDB replica's of 2325265 B`, `assert (10 * 1290730) <= 3487897.5` (`runs/fals-i1a`, 69 s) |
+| I1, the bound (perf) | `comparator_bound` returns `0.25 * c` | FAILS: `assert 1338655 <= 567053.5` (`runs/fals-i1b`, 69 s) |
+| I1, the floor | `comparator_bound` without the floor | the unit test FAILS: `assert equals failed -0.0 +1048576` |
+| M4, the rate (smoke, debug) | `ENVELOPE_SHARE = 1.5` | FAILS: `the replica unwrapped 5000 envelopes/s of the writes offered` |
+| M4, a raw path (smoke, debug) | the drakeydb replica of a plain KeyDB master | FAILS: `the replica unwrapped None envelopes/s of the writes offered`; ratio 1.0, max lag 4,750 B and the drain all passed, so without the assertion this run would have passed |
+| M2, a replica without an offset (unit) | `wait_drained` indexes `["slave_repl_offset"]` (the old behaviour) | the unit test FAILS: `KeyError: 'slave_repl_offset'` |
+| M1, the stop (unit) | `BackgroundTask.stop` re-raises (the old behaviour) | the unit test FAILS: `ConnectionError: the replica went away` |
+| M1, in the flow (smoke, debug) | `CappedLoad` raises on its third batch | FAILS with the point: `something that ran beside the sampling died: ["CappedLoad: RuntimeError('FALSIFY: the load died')"]` |
+
+A factor of 0.5 in `COMPARATOR_FACTOR` alone would not fail it, by design: `max(0.5 c, c + 1 MB)` is
+`c + 1 MB`, so the two flips above are the ones that bite.
+
+Checked, no flip: `DRAKEYDB_PERF=1` with `DRAGONFLY_PATH=build-dbg/dragonfly` fails in 0.24 s with
+`DRAKEYDB_PERF=1 is the release bar and /home/user/drakeydb/build-dbg/drakeydb is a debug build`;
+`taskset -c 0-2` around pytest fails with `DRAKEYDB_PERF=1 pins to cpus [0, 1, 2, 3] and this process may
+only use [0, 1, 2]`; during a perf run both `redis-benchmark` processes showed `Cpus_allowed_list: 3` and
+`redis-benchmark-{set,incr}.log` exist in the log dir, empty. (The driver thread is on cpu 3 before
+they start and children inherit it, so that shows the outcome and not that `pin_threads` alone did it.)
+M8: a scratch file of four tests under `--timeout=3`, deleted after: with the fixture the next test sees
+all four cpus; without it, it sees `{3}`.
+
+### Not done, not verified, open risks
+
+- One perf run of each test, not three medians: the three-run tables above remain the report's main
+  evidence, and these are a re-measurement of the new tests on the rebuilt binary.
+- The comparison is between two single runs, and the comparator's max lag is noisy (1.5-5.6 MB in the
+  first campaign, 2.0-2.3 MB in the three here). The 1 MB floor means a comparator run under about 0.5 MB
+  would fail drakeydb's usual 1.1-1.6 MB; not seen in six runs, and the KeyDB batch alone is 0.7 MB.
+- A pytest-timeout abort now restores the driver's pin, but the two `redis-benchmark` processes keep
+  running until the fixture tears the KeyDB master down (they exit on "Server closed the connection").
+- The comparator test's second leg starts while the 1-minute load still carries the first leg's own load
+  (1.19); the quiet-box wait of `perf_run.sh` applies before the first leg only.
+- `docs/PLAN.md`, the plan and the spec showed as modified in the tree at 23:30-23:35Z and HEAD moved to
+  `219ed8f` (docs only) at 23:38Z; none of it is from this round, and this round did not touch them.
+- The plan's Task 1.5 text and Task 2.4 Step 5 were not edited; Step 5's re-run is the comparator test.
+
+```
+DRAKEYDB_PERF=1 DRAKEYDB_PERF_OUT=<file>.jsonl KEYDB_SERVER_PATH=... KEYDB_REQUIRED=1 \
+  DRAGONFLY_PATH=/home/user/drakeydb/build-opt/dragonfly \
+  /root/drakey-venv-pinned/bin/python -m pytest -p no:cacheprovider \
+  "tests/dragonfly/keydb_onboarding_test.py::test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica[df_factory0]"
 ```
