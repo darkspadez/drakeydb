@@ -2407,4 +2407,158 @@ TEST_F(GenericFamilyTest, ExpirePastEmitsExpiredEvent) {
   EXPECT_GE(GetMetrics().events.expired_keys, 1u);
 }
 
+// drakeydb: P7-1 (decision 32) -- `SORT <source that cannot be sorted> STORE <dst>`. A fork
+// regression from P4-0 made a shard callback return the failure as the hop's status, and on a
+// multi-shard transaction RunCallback CHECK-fails on any hop status but OK: a missing, wrong-type
+// or non-numeric source plus a destination on another shard aborted the server. With one shard
+// there was no abort, but a missing source replied an empty array and left the destination stale
+// where Redis and KeyDB delete it and reply 0 (sort.cpp: an empty result deletes the STORE key;
+// a wrong-type or unparsable source is an error raised before the destination is touched).
+//
+// A crash takes the whole test binary down, so the tests below fail by aborting as well as by
+// their assertions. They need two shards and place the destination on the source's shard and on
+// the other one, for each way SORT reaches its source (the sorted fetch, BY nosort, BY pattern).
+namespace {
+
+// A key named `prefix<i>` on the same shard as `src` or on a different one, under this process's
+// shard count.
+string SortStoreDstKey(string_view prefix, string_view src, bool same_shard) {
+  const ShardId src_sid = Shard(src, shard_set->size());
+  for (int i = 0;; ++i) {
+    string candidate = StrCat(prefix, i);
+    if ((Shard(candidate, shard_set->size()) == src_sid) == same_shard)
+      return candidate;
+    CHECK_LT(i, 10000) << "no '" << prefix << "' key on the wanted shard";
+  }
+}
+
+// The options between the source and STORE, one per code path of SortGeneric that reads the source.
+const vector<vector<string>> kSortStoreVariants = {
+    {},                            // sorted fetch, numeric
+    {"ALPHA"},                     // sorted fetch, lexicographic
+    {"DESC", "LIMIT", "0", "2"},   // sorted fetch with bounds
+    {"GET", "#"},                  // sorted fetch with a GET pattern
+    {"BY", "nosort"},              // unsorted fetch
+    {"BY", "nosort", "GET", "#"},  // unsorted fetch with a GET pattern
+    {"BY", "weight_*"},            // BY pattern: unsorted fetch, then external keys
+};
+
+vector<string> SortStoreCommand(string_view src, const vector<string>& variant, string_view dst) {
+  vector<string> cmd{"SORT", string(src)};
+  cmd.insert(cmd.end(), variant.begin(), variant.end());
+  cmd.insert(cmd.end(), {"STORE", string(dst)});
+  return cmd;
+}
+
+}  // namespace
+
+// The source does not exist: the destination is deleted, whatever its type or TTL, and the reply
+// is 0. Before: an abort across shards, an empty array and a stale destination within one.
+TEST_F(GenericFamilyTest, SortStoreOfMissingSourceDeletesDestination) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const string src = "sort-missing-src";
+
+  int round = 0;
+  for (bool same_shard : {true, false}) {
+    for (const auto& variant : kSortStoreVariants) {
+      const string dst = SortStoreDstKey("sort-missing-dst", src, same_shard);
+      SCOPED_TRACE(StrCat(same_shard ? "same shard" : "other shard", ", variant ",
+                          absl::StrJoin(variant, " ")));
+      const auto cmd = SortStoreCommand(src, variant, dst);
+
+      // The destination exists, a list or a string by turns, with a TTL: all of it goes.
+      if (round++ % 2 == 0)
+        Run({"rpush", dst, "stale"});
+      else
+        Run({"set", dst, "stale"});
+      Run({"expire", dst, "1000"});
+      EXPECT_THAT(Run(cmd), IntArg(0));
+      EXPECT_THAT(Run({"exists", dst}), IntArg(0));
+      EXPECT_THAT(Run({"ttl", dst}), IntArg(-2));
+
+      // Nothing to delete the second time: the same reply, and no key appears.
+      EXPECT_THAT(Run(cmd), IntArg(0));
+      EXPECT_THAT(Run({"exists", dst}), IntArg(0));
+      EXPECT_THAT(Run({"exists", src}), IntArg(0));
+    }
+  }
+  EXPECT_THAT(Run({"dbsize"}), IntArg(0)) << "no key was left behind";
+}
+
+// The source is an existing key of a type SORT cannot read: WRONGTYPE, the destination untouched.
+TEST_F(GenericFamilyTest, SortStoreOfWrongTypeSourceKeepsDestination) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const string src = "sort-wrongtype-src";
+
+  for (string_view type : {"string", "hash"}) {
+    if (type == "string")
+      Run({"set", src, "x"});
+    else
+      Run({"hset", src, "f", "v"});
+
+    for (bool same_shard : {true, false}) {
+      for (const auto& variant : kSortStoreVariants) {
+        const string dst = SortStoreDstKey("sort-wrongtype-dst", src, same_shard);
+        SCOPED_TRACE(StrCat(type, " source, ", same_shard ? "same shard" : "other shard",
+                            ", variant ", absl::StrJoin(variant, " ")));
+
+        Run({"del", dst});
+        Run({"rpush", dst, "kept", "too"});
+        EXPECT_THAT(Run(SortStoreCommand(src, variant, dst)), ErrArg("WRONGTYPE"));
+        EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespElementsAre("kept", "too"));
+      }
+    }
+    Run({"del", src});
+  }
+}
+
+// The source holds elements a numeric SORT cannot convert: the error, the destination untouched.
+// The same abort as above for a destination on another shard (the hop result was
+// INVALID_NUMERIC_RESULT). ALPHA and BY nosort do not convert anything and succeed.
+TEST_F(GenericFamilyTest, SortStoreOfUnparsableSourceKeepsDestination) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const string src = "sort-unparsable-src";
+  Run({"rpush", src, "not", "numbers"});
+
+  const vector<vector<string>> variants = {{}, {"DESC", "LIMIT", "0", "2"}, {"GET", "#"}};
+  for (bool same_shard : {true, false}) {
+    for (const auto& variant : variants) {
+      const string dst = SortStoreDstKey("sort-unparsable-dst", src, same_shard);
+      SCOPED_TRACE(StrCat(same_shard ? "same shard" : "other shard", ", variant ",
+                          absl::StrJoin(variant, " ")));
+
+      Run({"del", dst});
+      Run({"rpush", dst, "kept"});
+      EXPECT_THAT(Run(SortStoreCommand(src, variant, dst)), ErrArg("can't be converted"));
+      EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespElementsAre("kept"));
+      EXPECT_THAT(Run({"lrange", src, "0", "-1"}), RespElementsAre("not", "numbers"));
+    }
+  }
+}
+
+// A source whose own lazy member expiry empties it reaches the same STORE of nothing on the
+// unsorted path, which used to return an empty array and leave the destination alone: a set whose
+// every member is expired is a missing source, and the destination goes, like on the sorted path.
+TEST_F(GenericFamilyTest, SortStoreOfFullyExpiredSetDeletesDestination) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const string src = "sort-expired-src";
+
+  for (bool same_shard : {true, false}) {
+    for (const auto& variant : kSortStoreVariants) {
+      const string dst = SortStoreDstKey("sort-expired-dst", src, same_shard);
+      SCOPED_TRACE(StrCat(same_shard ? "same shard" : "other shard", ", variant ",
+                          absl::StrJoin(variant, " ")));
+
+      ASSERT_THAT(Run({"sadd", src, "m"}), IntArg(1));
+      ASSERT_THAT(Run({"fieldexpire", src, "1", "m"}), ArrLen(1));
+      Run({"rpush", dst, "stale"});
+      AdvanceTime(1100);
+
+      EXPECT_THAT(Run(SortStoreCommand(src, variant, dst)), IntArg(0));
+      EXPECT_THAT(Run({"exists", src}), IntArg(0));
+      EXPECT_THAT(Run({"exists", dst}), IntArg(0));
+    }
+  }
+}
+
 }  // namespace dfly

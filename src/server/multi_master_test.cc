@@ -9671,6 +9671,110 @@ TEST_F(OriginJournalFamilyTest, FullExpirySortStoreJournalsDestinationDelete) {
       << "the destination effect must be journaled before the concluding verbatim SORT entry";
 }
 
+// drakeydb: P7-1 (decision 32) -- the journal of a cross-shard `SORT <source with nothing to read>
+// STORE <dst>`. A missing source deletes the destination (Redis/KeyDB: an empty result), and that
+// delete is hand-journaled on the destination's shard as a plain `DEL dst`: nothing else journals a
+// cross-shard SORT (it is CO::NO_AUTOJOURNAL and is revived for a single shard only). Everything
+// that changes nothing journals nothing: the same command with no destination left to delete, and
+// the two failures that leave the destination alone (WRONGTYPE, a non-numeric element). Those two
+// used to abort the server on this very cross-shard placement. On one shard the revived
+// auto-journal still records a failing STORE's verbatim command; that is not pinned here (see
+// ISSUE-REGISTER D-33).
+//
+// Falsifying: with the fetch callback returning the failure as the hop's status again, this test
+// aborts on its first command (RunCallback's CHECK_EQ, `0 vs. 2`, KEY_NOTFOUND), and the WRONGTYPE
+// and non-numeric commands abort the same way (`0 vs. 8`, `0 vs. 17`) in the one-command
+// GenericFamilyTest.SortStoreOf* tests. With the missing-source STORE reverted to an empty-array
+// reply, the reply is not 0, `dst` survives, and no DEL is journaled.
+TEST_F(MultiShardOriginJournalFamilyTest, CrossShardStoreOfMissingSourceJournalsDestinationDelete) {
+  const size_t num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "test requires more than one shard to be meaningful";
+
+  const std::string src = "sort-gone-src";
+  const ShardId src_sid = Shard(src, num_shards);
+  const std::string dst = FindKeyOnDifferentShard("sort-gone-dst", src_sid, num_shards);
+  const ShardId dst_sid = Shard(dst, num_shards);
+  ASSERT_NE(src_sid, dst_sid) << "test setup must exercise two distinct shards";
+
+  const std::string wrong_type = "sort-gone-string";
+  const std::string kept =
+      FindKeyOnDifferentShard("sort-gone-kept", Shard(wrong_type, num_shards), num_shards);
+  const std::string unparsable = "sort-gone-words";
+  const std::string kept2 =
+      FindKeyOnDifferentShard("sort-gone-kept2", Shard(unparsable, num_shards), num_shards);
+  Run({"rpush", dst, "stale"});
+  Run({"set", wrong_type, "x"});
+  Run({"rpush", kept, "kept"});
+  Run({"rpush", unparsable, "not", "numbers"});
+  Run({"rpush", kept2, "kept"});
+
+  DecodingEntryCapturingConsumer consumer;
+  std::vector<uint32_t> consumer_ids(num_shards, 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+
+  EXPECT_EQ(Run({"sort", src, "store", dst}).GetInt(), 0);
+  EXPECT_EQ(Run({"exists", dst}).GetInt(), 0);
+  EXPECT_EQ(Run({"sort", src, "store", dst}).GetInt(), 0) << "nothing left to delete";
+  EXPECT_THAT(Run({"sort", wrong_type, "store", kept}), ErrArg("WRONGTYPE"));
+  EXPECT_THAT(Run({"sort", unparsable, "store", kept2}), ErrArg("can't be converted"));
+  EXPECT_THAT(Run({"lrange", kept, "0", "-1"}).GetVec(), testing::ElementsAre("kept"));
+  EXPECT_THAT(Run({"lrange", kept2, "0", "-1"}).GetVec(), testing::ElementsAre("kept"));
+
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(1u, consumer.entries.size()) << "only the delete that happened is journaled";
+  EXPECT_EQ(dst_sid, consumer.entries[0].shard_id);
+  EXPECT_EQ((std::vector<std::string>{"DEL", dst}), consumer.entries[0].args);
+}
+
+// drakeydb: P7-1 (decision 32) -- the same-shard form of the above: src and dst share the one
+// shard, so SORT auto-journals verbatim (revived) and the destination delete is journaled in front
+// of it. The explicit `DEL dst` is what keeps a replica of an older build, whose replay of
+// `SORT <missing> STORE dst` leaves the destination alone, converging with this node; a replica of
+// this build deletes it either way. When no destination existed there is no DEL entry.
+//
+// Falsifying: passing source_deleted_by_fetch=false from SortStoreNothing (generic_family.cc)
+// drops the `DEL dst` entry -- only the verbatim SORT is left.
+TEST_F(OriginJournalFamilyTest, SameShardStoreOfMissingSourceJournalsDestinationDeleteBeforeSort) {
+  ASSERT_EQ(1u, shard_set->size()) << "this test pins the same-shard STORE path";
+
+  const std::string src = "sort-gone-src";
+  const std::string dst = "sort-gone-dst";
+
+  Run({"rpush", dst, "stale"});
+
+  DecodingEntryCapturingConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size(), 0);
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    journal::StartInThread();
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+
+  EXPECT_EQ(Run({"sort", src, "store", dst}).GetInt(), 0);
+  EXPECT_EQ(Run({"exists", dst}).GetInt(), 0);
+  size_t first_run = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    first_run = consumer.entries.size();
+  }
+  EXPECT_EQ(Run({"sort", src, "by", "nosort", "store", dst}).GetInt(), 0);
+
+  shard_set->RunBriefInParallel(
+      [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+
+  util::fb2::LockGuard lk(consumer.mu_);
+  ASSERT_EQ(3u, consumer.entries.size()) << "DEL dst, SORT, then only the SORT of the second run";
+  EXPECT_EQ((std::vector<std::string>{"DEL", dst}), consumer.entries[0].args);
+  EXPECT_EQ("SORT", consumer.entries[1].args[0]);
+  EXPECT_EQ(2u, first_run);
+  EXPECT_EQ("SORT", consumer.entries[2].args[0]);
+}
+
 // drakeydb: P4-3 Task 7 fix round (C1/C2 review).
 // CrossShardStoreHandJournalsRestoreOfDestinationEffect above proves the DESTINATION side of a
 // cross-shard SORT ... STORE; this test proves the SOURCE side, which the first pass of the fix

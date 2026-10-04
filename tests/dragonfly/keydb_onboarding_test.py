@@ -983,6 +983,92 @@ async def test_classic_stream_eval_of_a_connection_command_does_not_abort(
         assert node.find_in_logs(r"did not apply and is skipped: EVAL: .*No connection")
 
 
+# `SORT <source that cannot be sorted> STORE <dst>`, with `dst` on another shard than the source
+# (the replica runs two shards; the pairs below were checked to split, and the falsification below
+# shows it): the commands that set the scene, the SORT, and what `dst` holds once it ran (None:
+# deleted).
+SORT_STORE_SCENARIOS = {
+    "missing_source": (
+        [("RPUSH", "d1", "stale")],
+        ("SORT", "nosuch", "STORE", "d1"),
+        "d1",
+        None,
+    ),
+    "wrong_type_source": (
+        [("SET", "s", "x"), ("RPUSH", "d1", "kept")],
+        ("SORT", "s", "STORE", "d1"),
+        "d1",
+        ["kept"],
+    ),
+    "non_numeric_source": (
+        [("RPUSH", "l", "a", "b"), ("RPUSH", "d2", "kept")],
+        ("SORT", "l", "STORE", "d2"),
+        "d2",
+        ["kept"],
+    ),
+}
+
+
+@pytest.mark.parametrize("framing", ["raw", "in_envelope"])
+@pytest.mark.parametrize("scenario", list(SORT_STORE_SCENARIOS))
+async def test_classic_stream_sort_store_of_an_unsortable_source_does_not_abort(
+    df_factory: DflyInstanceFactory, tmp_path, scenario, framing
+):
+    """A `SORT` with a source that does not exist, has the wrong type or holds non-numbers, and a
+    `STORE` destination on another shard, killed the process that ran it (ISSUE-REGISTER D-33, a
+    P4-0 regression: the shard callback returned the failure as the hop's status, and a hop of a
+    multi-shard transaction CHECK-fails on anything but OK). Any classic master's stream can carry
+    it, raw or inside an RREPLAY envelope. It is a command now like any other: a missing source
+    deletes the destination and replies 0, as in Redis and KeyDB; the other two are errors the
+    stream discards with the destination untouched. The replica stays up, the commands around the
+    SORT apply, and the offset the master settles on is the exact length of the stream.
+
+    Falsifying: with the fetch callback returning the failure as the hop's status again, the
+    replica process dies as it applies the SORT (a CHECK in Transaction::RunCallback), so `b`
+    never arrives; with the missing-source STORE back to an empty-array reply, `d1` survives.
+    """
+    setup, sort, dst, expected = SORT_STORE_SCENARIOS[scenario]
+    wrap = resp_command if framing == "raw" else rreplay
+    commands = [*setup, sort, ("SET", "b", "2")]
+    stream = b"".join(wrap(*command) for command in commands)
+    async with FakeClassicMaster() as master:
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET), stream=stream, stream_delay=SECOND_WRITE_DELAY_S
+        )
+        node = df_factory.create(
+            proactor_threads=2,
+            num_shards=2,
+            dir=str(tmp_path / "df"),
+            replication_acks_interval=100,
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("b") == "2"
+
+        await applied()
+        if expected is None:
+            assert await c.exists(dst) == 0
+        else:
+            assert await c.lrange(dst, 0, -1) == expected
+        expected_offset = SYNC_OFFSET + len(stream)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected_offset, master.ack_offsets
+        assert max(master.ack_offsets) == expected_offset, master.ack_offsets
+        assert master.connection_count == 1, "the replica reconnected"
+        info = await c.info("replication")
+        assert info["master_link_status"] == "up", info
+        if framing == "in_envelope":
+            assert info["rreplay_unwrapped"] == len(commands), info
+            # (the field is not shown while it is 0)
+            assert info.get("classic_apply_errors", 0) == (0 if expected is None else 1), info
+
+
 @pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
 async def test_unwrap_flushes_raw_batch_before_envelope(
     df_factory: DflyInstanceFactory, tmp_path, peer_mode

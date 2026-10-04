@@ -1792,8 +1792,10 @@ TEST_F(ReplicaActiveExpiryTest, EveryCommandClassOfTheWindowHasItsDocumentedOutc
 // destination is lost. Where the destination already existed the replica leaves it as it was
 // (RENAME) or empties it (SUNIONSTORE, whose result is empty), and the master's holds the source's
 // data; with no destination, the replica has none. RENAME and COPY carry the source's deadline to
-// the destination, so on the master it is gone at it all the same; a moved element (LMOVE, SMOVE)
-// or a computed result (STORE) has no deadline there, and the difference stays.
+// the destination, so on the master it is gone at it all the same: a replica with no destination
+// converges, and one that held a live destination keeps it for good (a stale key, not a lag). A
+// moved element (LMOVE, SMOVE) or a computed result (STORE) has no deadline there, and the
+// difference stays.
 TEST_F(ReplicaActiveExpiryTest, MoversAndStoresSeeTheDueSourceAsMissing) {
   SetReplicaMode(/*replica=*/true, /*active_expiry=*/true);
 
@@ -1825,7 +1827,10 @@ TEST_F(ReplicaActiveExpiryTest, MoversAndStoresSeeTheDueSourceAsMissing) {
             0);
 
   // With a live destination: RENAME leaves it as it was, LMOVE does not push to it and
-  // SUNIONSTORE of a missing source empties it (the master holds the source's data in all three).
+  // SUNIONSTORE of a missing source empties it. The master holds the source's data in all three.
+  // Only RENAME's destination takes the source's deadline there (KeyDB `db.cpp:1507-1511`), so the
+  // master's is gone at it while this one, with no TTL of its own, stays for good (COPY .. REPLACE
+  // is the same, argued and not run).
   EXPECT_THAT(Run({"rename", "s:rename_over", "s:old"}), ErrArg("no such key"));
   EXPECT_EQ(Run({"get", "s:old"}), "old");
   EXPECT_THAT(Run({"lmove", "lmove:over_src", "lmove:over_dst", "left", "left"}),

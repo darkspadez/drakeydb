@@ -2246,6 +2246,12 @@ string OpFetchStringValue(const OpArgs& op_args, std::string_view key) {
 // would never reach it, leaving a stale destination there (the cross-shard path already
 // hand-journals unconditionally). Only that case passes true: an ordinary same-shard STORE keeps
 // the recipe replay and the unchanged journal size (D-13's accepted exposure is unrelated).
+//
+// drakeydb: P7-1 (decision 32) -- SortStoreNothing (below) passes true as well, for a source that
+// is missing or that the unsorted fetch's lazy expiry emptied. A replay of the verbatim SORT on
+// that source now deletes its destination itself, so a replica of this build converges either way;
+// the hand-journaled DEL keeps a replica of an older build (empty array, stale destination)
+// converging too. OpStore journals a DEL only for a destination it actually deleted.
 template <typename IteratorBegin, typename IteratorEnd>
 OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, IteratorBegin&& start_it,
                            IteratorEnd&& end_it, bool has_get_patterns,
@@ -2625,6 +2631,36 @@ OpStatus PopulateSortEntriesFromByPattern(const SortParams& params,
   return OpStatus::OK;
 }
 
+// drakeydb: P7-1 (decision 32) -- STORE with nothing to read: the source does not exist, or its own
+// lazy member expiry emptied it. Redis and KeyDB still run the STORE: an empty result deletes the
+// destination and replies 0 (sort.cpp, `outputlen == 0` -> dbDelete(storekey)). This used to reply
+// an empty array and leave the destination stale; the multi-shard form even aborted the server
+// (see the fetch callbacks below). A wrong-type or unparsable source never gets here: that error is
+// raised before the destination is touched, as in Redis. Runs the concluding hop of the
+// transaction SortGeneric already opened, and passes source_deleted_by_fetch so the destination
+// delete is hand-journaled on the same-shard path too: a replica that replays the verbatim SORT
+// from an older build would otherwise leave its destination stale (OpStore's comment). Upstream
+// main has this function with the same two call sites; the difference is the
+// source_deleted_by_fetch argument, which only this fork's OpStore has.
+void SortStoreNothing(string_view store_key, CommandContext* cmd_cntx) {
+  ShardId dest_sid = Shard(store_key, shard_set->size());
+  OpResult<uint32_t> store_len;
+  cmd_cntx->tx()->Execute(
+      [&](Transaction* t, EngineShard* shard) {
+        if (shard->shard_id() == dest_sid) {
+          vector<SortEntryBase> none;
+          store_len = OpStore(t->GetOpArgs(shard), store_key, none.begin(), none.end(),
+                              /*has_get_patterns=*/false, /*source_deleted_by_fetch=*/true);
+        }
+        return OpStatus::OK;
+      },
+      true);
+  if (store_len)
+    cmd_cntx->SendLong(store_len.value());
+  else
+    cmd_cntx->SendError(store_len.status());
+}
+
 void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_only) {
   // drakeydb: P4-3 Task 7 -- SORT is registered CO::NO_AUTOJOURNAL; SORT_RO is not (and must
   // never call ReviveAutoJournal -- its DCHECK requires CO::NO_AUTOJOURNAL on the command, which
@@ -2716,6 +2752,10 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
     // elem_result->first is empty both for missing/empty containers and for errors;
     // use elem_result's OpStatus to distinguish actual error cases (e.g. WRONG_TYPE).
     if (elem_result->first.empty()) {
+      // drakeydb: P7-1 (decision 32) -- before the Conclude: a STORE still overwrites (deletes)
+      // its destination and replies 0, like the sorted path below.
+      if (elem_result != OpStatus::WRONG_TYPE && params.store_key)
+        return SortStoreNothing(params.store_key.value(), cmd_cntx);
       cmd_cntx->tx()->Conclude();
       if (elem_result == OpStatus::WRONG_TYPE)
         return cmd_cntx->SendError(elem_result.status());
@@ -2738,7 +2778,8 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
     // destination effect even when source and destination share a shard: the same-shard verbatim
     // recipe replay applies this fetch's DEL first and early-returns on the now-missing source
     // (the sort_status != OK path below) without ever reaching OpStore, silently dropping the
-    // destination delete a peer would need to converge.
+    // destination delete a peer would need to converge. (Before P7-1; that path now runs
+    // SortStoreNothing, and this flag stays for replicas of an older build, see OpStore.)
     bool source_deleted_by_fetch = false;
 
     // Handle BY pattern with external key lookups
@@ -2756,7 +2797,14 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
           // A failed SORT may still have journaled an SREM for members removed by lazy expiry,
           // but the failed SORT itself must not be auto-journaled. Propagate the operation status
           // to Transaction::LogAutoJournalOnShard instead of masking it with OK.
-          return fetch_result.status();
+          //
+          // drakeydb: P7-1 (decision 32) -- only on a single-shard transaction. On a multi-shard
+          // one RunCallback CHECK-fails on any hop result but OK (a missing, wrong-type or
+          // unparsable source plus a STORE destination on another shard aborted the server, release
+          // builds included), and nothing there auto-journals anyway (SORT is NO_AUTOJOURNAL and
+          // is revived only for a single shard). The failure reaches the code below through
+          // fetch_result either way.
+          return t->GetUniqueShardCnt() == 1 ? fetch_result.status() : OpStatus::OK;
         }
         return OpStatus::OK;
       };
@@ -2768,6 +2816,10 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
 
     if (sort_status != OpStatus::OK) {
       DVLOG(2) << "Sorting failed with status " << sort_status;
+      // drakeydb: P7-1 (decision 32) -- a missing source with STORE deletes the destination and
+      // replies 0, as in Redis; before the Conclude, SortStoreNothing runs the concluding hop.
+      if (sort_status == OpStatus::KEY_NOTFOUND && params.store_key)
+        return SortStoreNothing(params.store_key.value(), cmd_cntx);
       cmd_cntx->tx()->Conclude();
       if (sort_status == OpStatus::WRONG_TYPE)
         return cmd_cntx->SendError(sort_status);
@@ -2826,7 +2878,7 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
 
     auto store_cb = [&](Transaction* t, EngineShard* shard) {
       if (shard->shard_id() == dest_sid) {
-        // The unsorted fetch early-returns when its own lazy expiry emptied the source
+        // The unsorted fetch hands a source its own lazy expiry emptied to SortStoreNothing
         // (OpFetchContainerElements), so a deleted source can never reach this store.
         store_len = OpStore(t->GetOpArgs(shard), store_key_sv, entries.begin(), entries.end(),
                             has_get_patterns, /*source_deleted_by_fetch=*/false);
