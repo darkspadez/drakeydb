@@ -164,6 +164,13 @@ commit had not been built where it was written): clean build, no warnings; the 1
 pass, and pass 40 repeats with three CPU spinners; full `multi_master_test` 222 passed, 1 skipped
 (root-only skip).
 
+### PR #10 safety-net check-ins stopped (2026-10-04 20:16Z)
+
+Check-ins #3–#5 (11:55Z, 16:15Z, 20:16Z) found nothing new: every runnable check green,
+`large-tests-arm`/`fuzz-pr` queued for lack of fork runners, no review threads, waiting only on the
+owner's review and merge. After three quiet check-ins they stopped; the next GitHub event or owner
+message resumes the watch.
+
 ## P7-1 … P7-4
 
 Pending (see plan).
