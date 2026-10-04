@@ -133,6 +133,22 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
   commit; its touched suites were re-run (see that row in the table above) and the gate's
   `ctest` + the replication-path suites are re-run on the PR head before the PR is opened.
 
+### P7-0 PR head `dbc7e6c` — re-gate and PR CI
+
+- **Re-gate** (full `ninja`, no warnings): `ctest -L DFLY` 88/89 (IPv6 only); pytest
+  `keydb_onboarding` 25 passed + 4 strict xfail, `keydb_harness` 21, `multimaster` 77,
+  `multimaster_merge` 4, `redis_replication` 12, `replication` 43 — all green.
+- **PR CI** ([darkspadez/drakeydb#10](https://github.com/darkspadez/drakeydb/pull/10), run
+  37168885667): pre-commit, `keydb-interop`, fakeredis and five of six builds (ASAN/UBSAN
+  included) green. `build (ubuntu-dev:24, Debug, g++)` failed one test of 806:
+  `replication_resilience_test.py::test_replicaof_reject_on_load` (`DID NOT RAISE
+  BusyLoadingError`). Not this PR's: the test documents its own `INFO`→`REPLICAOF` race
+  (`:705-709`) — a short startup load can finish between the two calls — and P7-0's loader edits
+  are inert for startup loads (`source_limit_ == SIZE_MAX`). Local interleaved 5x each, PR binary
+  vs `main` binary: 10/10 passed. The session's GitHub integration cannot re-run jobs (403); the
+  owner was asked to re-run once from the Actions tab. `large-tests-arm` and `fuzz-pr` sit queued
+  with no runner, as on darkspadez/drakeydb#9.
+
 ## P7-1 … P7-4
 
 Pending (see plan).
