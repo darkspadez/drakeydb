@@ -1672,4 +1672,113 @@ TEST_F(ReplicaActiveExpiryTest, ControlWithoutTheFlagAReplicaThatDeletesNothingS
   EXPECT_EQ(DbSize(), kPlainKeys + kTtlKeys);
 }
 
+// Owner decision 24, option A, pinned: the documented window. A replica that expires keys itself
+// decides on the clock of the command it is running (Transaction::InitTxTime), so a TTL refresh the
+// master ran before the deadline and the replica applies after it finds no key, and is a no-op:
+// the key is lost on the replica while the master keeps it. Nothing runs a heartbeat here, so it
+// is the access that deletes the key, as DBSIZE shows. Decision 27 (plan Task 2.8) gives
+// enveloped commands the master's clock, which closes the window for them (its tests are the
+// envelope ones); a command run as here, with no envelope, keeps the local clock and this test.
+TEST_F(ReplicaActiveExpiryTest, ARefreshThatArrivesAfterTheDeadlineFindsNoKey) {
+  SetReplicaMode(/*replica=*/true, /*active_expiry=*/true);
+  ASSERT_EQ(Run({"set", "k", "v", "PX", "100"}), "OK");
+  AdvanceTime(1000);
+  ASSERT_EQ(DbSize(), 1);  // due, and still in the table: only an access deletes it
+
+  EXPECT_EQ(CheckedInt({"persist", "k"}), 0);
+  EXPECT_EQ(DbSize(), 0);
+}
+
+// The control of the one above: the same refresh before the deadline works on such a replica, so
+// the 0 above is the deletion's doing and not a PERSIST that cannot work on a replica's shard.
+TEST_F(ReplicaActiveExpiryTest, ControlARefreshBeforeTheDeadlineKeepsTheKey) {
+  SetReplicaMode(/*replica=*/true, /*active_expiry=*/true);
+  ASSERT_EQ(Run({"set", "k", "v", "PX", "100"}), "OK");
+  EXPECT_EQ(CheckedInt({"persist", "k"}), 1);
+  AdvanceTime(1000);
+  EXPECT_EQ(Run({"get", "k"}), "v");
+}
+
+// Every class of command that decision 24 lists as affected, run after the deadline against a key
+// that expired meanwhile: it sees no key, as it would have for a key that never existed. The
+// master, which ran each of them before the deadline, saw the key and replied (and changed) other
+// than what is asserted here. The last group is the commands that are not affected: they replace
+// the key or remove it, so both sides end with the same data.
+TEST_F(ReplicaActiveExpiryTest, EveryCommandClassOfTheWindowSeesNoKey) {
+  SetReplicaMode(/*replica=*/true, /*active_expiry=*/true);
+
+  const uint64_t far_ms = GetCurrentTimeMs() + 100000000;
+  const string far_ms_str = absl::StrCat(far_ms);
+  const string far_sec_str = absl::StrCat(far_ms / 1000);
+
+  // One key per command, all with a 100 ms TTL: strings holding "5" ("5555" for SETRANGE, whose
+  // reply is the value's length), and one of every container.
+  auto expiring_string = [&](string_view key, string_view value = "5") {
+    ASSERT_EQ(Run({"set", key, value, "PX", "100"}), "OK") << key;
+  };
+  auto expiring = [&](initializer_list<string_view> create, string_view key) {
+    ASSERT_GT(CheckedInt(create), 0) << key;
+    ASSERT_EQ(CheckedInt({"pexpire", key, "100"}), 1) << key;
+  };
+  for (string_view key :
+       {"s:expire", "s:pexpire", "s:expireat", "s:pexpireat", "s:persist", "s:getex", "s:incr",
+        "s:append", "s:rename", "s:copy", "s:nx", "s:set", "s:del"}) {
+    expiring_string(key);
+  }
+  expiring_string("s:setrange", "5555");
+  expiring({"hset", "h", "f", "1"}, "h");
+  expiring({"rpush", "l", "a"}, "l");
+  expiring({"sadd", "st", "a"}, "st");
+  expiring({"rpush", "lmove:src", "a"}, "lmove:src");
+  expiring({"sadd", "smove:src", "a"}, "smove:src");
+  expiring({"sadd", "union:src", "a"}, "union:src");
+  AdvanceTime(1000);
+  ASSERT_EQ(DbSize(), 20);  // all due, none deleted yet
+
+  // TTL refreshes are no-ops, and the key is lost (for good after a PERSIST).
+  EXPECT_EQ(CheckedInt({"expire", "s:expire", "60"}), 0);
+  EXPECT_EQ(CheckedInt({"pexpire", "s:pexpire", "60000"}), 0);
+  EXPECT_EQ(CheckedInt({"expireat", "s:expireat", far_sec_str}), 0);
+  EXPECT_EQ(CheckedInt({"pexpireat", "s:pexpireat", far_ms_str}), 0);
+  EXPECT_EQ(CheckedInt({"persist", "s:persist"}), 0);
+  EXPECT_THAT(Run({"getex", "s:getex", "persist"}), ArgType(RespExpr::NIL));
+  for (string_view key :
+       {"s:expire", "s:pexpire", "s:expireat", "s:pexpireat", "s:persist", "s:getex"}) {
+    EXPECT_EQ(CheckedInt({"exists", key}), 0) << key;
+  }
+
+  // Read-then-write commands compute from nothing. The master replied, and holds, 6 after INCR,
+  // "5x" after APPEND, "x555" (length 4) after SETRANGE, and a hash, a list and a set of two.
+  EXPECT_EQ(CheckedInt({"incr", "s:incr"}), 1);
+  EXPECT_EQ(CheckedInt({"append", "s:append", "x"}), 1);
+  EXPECT_EQ(Run({"get", "s:append"}), "x");
+  EXPECT_EQ(CheckedInt({"setrange", "s:setrange", "0", "x"}), 1);
+  EXPECT_EQ(Run({"get", "s:setrange"}), "x");
+  EXPECT_EQ(CheckedInt({"hset", "h", "g", "2"}), 1);
+  EXPECT_EQ(CheckedInt({"hlen", "h"}), 1);
+  EXPECT_EQ(CheckedInt({"lpush", "l", "b"}), 1);
+  EXPECT_EQ(CheckedInt({"llen", "l"}), 1);
+  EXPECT_EQ(CheckedInt({"sadd", "st", "b"}), 1);
+  EXPECT_EQ(CheckedInt({"scard", "st"}), 1);
+
+  // Movers and STORE commands see their source as missing.
+  EXPECT_THAT(Run({"rename", "s:rename", "s:renamed"}), ErrArg("no such key"));
+  EXPECT_EQ(CheckedInt({"copy", "s:copy", "s:copied"}), 0);
+  EXPECT_THAT(Run({"lmove", "lmove:src", "lmove:dst", "left", "left"}), ArgType(RespExpr::NIL));
+  EXPECT_EQ(CheckedInt({"smove", "smove:src", "smove:dst", "a"}), 0);
+  EXPECT_EQ(CheckedInt({"sunionstore", "union:dst", "union:src"}), 0);
+  EXPECT_EQ(CheckedInt({"exists", "s:renamed", "s:copied", "lmove:dst", "smove:dst", "union:dst"}),
+            0);
+
+  // A conditional SET succeeds where the master's replied nil.
+  EXPECT_EQ(Run({"set", "s:nx", "new", "nx"}), "OK");
+  EXPECT_EQ(Run({"get", "s:nx"}), "new");
+
+  // Not affected: a plain SET replaces the key, DEL removes it.
+  EXPECT_EQ(Run({"set", "s:set", "new"}), "OK");
+  EXPECT_EQ(Run({"get", "s:set"}), "new");
+  EXPECT_EQ(CheckedInt({"del", "s:del"}), 0);
+  EXPECT_EQ(CheckedInt({"exists", "s:del"}), 0);
+}
+
 }  // namespace dfly

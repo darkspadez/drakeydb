@@ -10,6 +10,7 @@ tests need no KeyDB.
 import asyncio
 import functools
 import re
+import time
 
 import pytest
 import redis
@@ -2035,3 +2036,181 @@ async def test_keydb_is_told_the_replica_expires_keys_itself(
     await synchronized()
     log = keydb.log_text()
     assert "does not support active expiration" not in log, log
+
+
+# The window of owner decision 24 (option A), scripted with the commands an active KeyDB streams:
+# every TTL is absolute (`SET k v PXAT <ms>`, `PEXPIREAT`) and `INCR` is `INCRBY c 1`, as
+# tests/dragonfly/data/README.md shows. A key is due at `deadline`, WINDOW_TTL_MS after it is
+# streamed (long enough that the SET is applied first, however loaded the box), and the late
+# commands are streamed once the clock is WINDOW_PAST_MS past it. The replica's clock is this
+# host's, so they are applied at least that far past the deadline whatever the load: a busy box
+# only delays the apply, which moves it further past.
+WINDOW_TTL_MS = 3000
+WINDOW_PAST_MS = 1000
+
+
+def now_ms():
+    return time.time_ns() // 1_000_000
+
+
+async def sleep_until_ms(ms):
+    await asyncio.sleep(max(0, ms - now_ms()) / 1000)
+
+
+def keydb_mvcc(ms):
+    """The mvcc an active KeyDB mints at `ms` on its clock: the milliseconds above the 20 low bits
+    of a counter (`MVCC_MS_SHIFT`, `server.h:960`; `incrementMvccTstamp`). The envelopes of
+    tests/dragonfly/data/README.md carry the very `mstime()` the same command's `PXAT` was
+    computed from (the mvcc's milliseconds equal the `PXAT` minus the relative TTL asked for)."""
+    return ms << 20
+
+
+def stream_command(framing, *command, master_ms=0):
+    """`command` as the master streams it: raw, or in the RREPLAY envelope an active KeyDB wraps it
+    in, whose mvcc says the master ran it at `master_ms` on its clock."""
+    if framing == "raw":
+        return resp_command(*command)
+    return rreplay(*command, mvcc=keydb_mvcc(master_ms))
+
+
+async def attach_to_stream_live(df_factory, tmp_path, master, sweep):
+    """A plain replica of a scripted active KeyDB, its full sync done and its stream open for
+    `master.send_stream()`. `sweep="access_only"` starts it with --hz=0: no heartbeat reaps
+    anything, so the only way a due key goes is an access to it."""
+    master.script_capa_reply(b"+OK active-replica\r\n")
+    master.script_psync(diskless_full_sync(offset=SYNC_OFFSET))
+    flags = {"hz": 0} if sweep == "access_only" else {}
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"), **flags)
+    node.start()
+    c = node.client()
+    assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+    await wait_for_synced_link(node, c, peer_mode=False)
+    return node, c
+
+
+async def stream_and_wait_applied(master, c, marker, *commands):
+    """Streams `commands` and then `SET <marker> 1`, and waits for the marker on the replica: a
+    stream applies in order, so every command before it is applied by then. Nothing else is read:
+    reading a due key on the replica would delete it, and test something else."""
+    await master.send_stream(b"".join(commands) + resp_command("SET", marker, "1"))
+
+    @assert_eventually(times=300)
+    async def applied():
+        assert await c.get(marker) == "1"
+
+    await applied()
+
+
+async def assert_only_an_access_can_delete(c, key):
+    """With --hz=0 nothing sweeps, so `key` (a due key and the first marker) must still be in the
+    table: DBSIZE counts entries and reads none."""
+    size = await c.dbsize()
+    assert size == 2, f"{key} and a marker should be there, DBSIZE is {size}: was the SET late?"
+
+
+@pytest.mark.parametrize("sweep", ["sweep", "access_only"])
+@pytest.mark.parametrize("framing", ["raw", "envelope"])
+async def test_plain_replica_of_active_keydb_loses_a_ttl_refresh_that_arrives_after_the_deadline(
+    df_factory: DflyInstanceFactory, tmp_path, framing, sweep
+):
+    """Pins owner decision 24, option A, as the spec D-9 documents it. The master set `k` with a
+    deadline 3 s ahead and, 300 ms before that deadline, streamed `PEXPIREAT k <now + 60 s>`; the
+    replica applies that a second after the deadline. The replica has deleted `k` by then (the
+    sweep, or, with --hz=0, the access the refresh makes), so the refresh finds no key, is a no-op,
+    and `k` is gone for good, while the master still holds it. It stays gone.
+
+    `access_only` is the case that pins "any access deletes": no sweep runs, and the test checks
+    that `k` is still in the table, due, before the refresh. A replica that only swept (option C)
+    would pass the `sweep` cases and fail these. `framing` is raw or RREPLAY, whose mvcc carries
+    the master's own time: 300 ms before the deadline.
+
+    Decision 27 (plan Task 2.8) makes an enveloped command run at its author's time, so the
+    `envelope-access_only` case flips: the refresh runs at 300 ms before the deadline, `k` is still
+    in the table, and survives with a TTL of about 60 s. The `raw` cases do not (a raw command
+    keeps the replica's clock), and neither does `envelope-sweep`: the sweep keeps the replica's
+    clock too and deletes `k` at its own deadline, a second before the refresh arrives, which no
+    apply clock can undo.
+
+    Falsifying: a replica that serves a due key as live (`ExpireIfNeeded` returns it) applies the
+    refresh to it: `k` is still there.
+    """
+    async with FakeClassicMaster() as master:
+        node, c = await attach_to_stream_live(df_factory, tmp_path, master, sweep)
+        t0 = now_ms()
+        deadline = t0 + WINDOW_TTL_MS
+        set_k = stream_command(framing, "SET", "k", "v", "PXAT", deadline, master_ms=t0)
+        await stream_and_wait_applied(master, c, "marker:set", set_k)
+        await sleep_until_ms(deadline + WINDOW_PAST_MS)
+        if sweep == "access_only":
+            await assert_only_an_access_can_delete(c, "k")
+
+        refresh = stream_command(
+            framing, "PEXPIREAT", "k", now_ms() + 60_000, master_ms=deadline - 300
+        )
+        await stream_and_wait_applied(master, c, "marker:refresh", refresh)
+        for _ in range(10):  # for a second
+            assert await c.exists("k") == 0, "k survived a refresh that arrived after its deadline"
+            await asyncio.sleep(0.1)
+        assert await c.dbsize() == 2  # the two markers
+        assert master.connection_count == 1, "the replica reconnected"
+
+
+COUNTER_SCENARIOS = {
+    # What the replica's clock alone decides: no author time on a raw command.
+    "raw": ("raw", 200),
+    # The master ran INCR 200 ms after the deadline: it deleted `c` lazily and replied 1.
+    "envelope_applied_after_the_deadline": ("envelope", 200),
+    # The master ran INCR 300 ms before the deadline: it replied 6, and holds 6.
+    "envelope_applied_before_the_deadline": ("envelope", -300),
+}
+
+
+@pytest.mark.parametrize("sweep", ["sweep", "access_only"])
+@pytest.mark.parametrize("scenario", list(COUNTER_SCENARIOS))
+async def test_plain_replica_of_active_keydb_recomputes_a_counter_from_nothing_after_the_deadline(
+    df_factory: DflyInstanceFactory, tmp_path, scenario, sweep
+):
+    """Pins owner decision 24, option A, for a read-then-write command. The master set `c` to 5
+    with a deadline 3 s ahead, and later streamed `INCRBY c 1` and `PEXPIREAT c <now + 60 s>`; the
+    replica applies them a second after the deadline and computes from nothing: `c` is "1", with a
+    TTL of about 60 s.
+
+    In the first two scenarios that is what the master holds too: it ran the `INCR` after the
+    deadline, deleted `c` lazily (an active KeyDB propagates no DEL for it) and replied 1. A
+    replica that served the stale `c` (KeyDB's own plain replica, option B, or sweep only, option
+    C) would apply it to 5 and hold 6. In the third the master ran it before the deadline and holds
+    6: the documented window, and the replica holds 1. That is the scenario decision 27 (plan Task
+    2.8) flips, in its `access_only` case: an enveloped command runs at its author's time, so the
+    replica holds 6 there. The first two keep their "1" under it (the raw one has no author time,
+    the second's is after the deadline), and so does `sweep` of the third: the sweep keeps the
+    replica's clock and has deleted `c` at its own deadline, before the late commands arrive.
+
+    `access_only` starts the replica with --hz=0 and checks that `c` is still in the table, due,
+    before the late commands: only an access can delete it, which the `sweep` cases cannot show.
+
+    Falsifying: a replica that serves a due key as live reads "6" in every scenario.
+    """
+    framing, master_offset_ms = COUNTER_SCENARIOS[scenario]
+    async with FakeClassicMaster() as master:
+        node, c = await attach_to_stream_live(df_factory, tmp_path, master, sweep)
+        t0 = now_ms()
+        deadline = t0 + WINDOW_TTL_MS
+        set_c = stream_command(framing, "SET", "c", 5, "PXAT", deadline, master_ms=t0)
+        await stream_and_wait_applied(master, c, "marker:set", set_c)
+        await sleep_until_ms(deadline + WINDOW_PAST_MS)
+        if sweep == "access_only":
+            await assert_only_an_access_can_delete(c, "c")
+
+        at = deadline + master_offset_ms
+        expire_at = now_ms() + 60_000
+        await stream_and_wait_applied(
+            master,
+            c,
+            "marker:late",
+            stream_command(framing, "INCRBY", "c", 1, master_ms=at),
+            stream_command(framing, "PEXPIREAT", "c", expire_at, master_ms=at + 1),
+        )
+        value = await c.get("c")
+        assert value == "1", f"c is {value!r}: the replica computed it from a due key"
+        assert 0 < await c.pttl("c") <= 60_000
+        assert master.connection_count == 1, "the replica reconnected"

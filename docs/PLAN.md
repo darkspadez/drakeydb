@@ -932,12 +932,27 @@ the top, or the Non-goals list at the end. The design spec is
   has to run active expiry itself (ledger decision 13). Built in P7-1 Task 1.4 (spec D-9): the
   node's main link sets a per-shard flag after a successful greet with an `active-replica` master,
   which opens the heartbeat's expiry sweep and the read-path gate on a replica, never eviction, and
-  sends `REPLCONF capa activeExpire`. **Lag window (owner decision 24, accepted, no grace flag):**
-  a replica that expires on its own clock can expire a key before a TTL extension (`EXPIRE`,
-  `PEXPIREAT`, `PERSIST`) for it arrives; the extension is then a no-op there while the key lives
-  on in KeyDB, forever after a `PERSIST`. Stream lag and clock skew widen it, and KeyDB's own plain
-  replicas share it. Operators get it in the "Onboarding from KeyDB" section of
-  `docs/multi-master.md` that P7-4 adds; until then spec D-9 is where it is written down.
+  sends `REPLCONF capa activeExpire`. **Expiry window (owner decision 24, option A, accepted, no
+  grace flag):** the replica deletes a key on the first access after its own per-command clock
+  passes the key's absolute expiry (a replicated command counts as much as a client's), else in
+  the sweep. It diverges from the master only when the master ran a command on the key before the
+  deadline and the replica applies it after: a band of `lag + skew` around each expiry, since an
+  active KeyDB streams every TTL absolute (`SET .. PXAT`, `PEXPIREAT`; live captures in
+  `tests/dragonfly/data/README.md`). Affected: TTL refreshes (`EXPIRE`, `PEXPIRE`, `EXPIREAT`,
+  `PEXPIREAT`, `PERSIST`, `GETEX`: a no-op, the key is lost, for good after a `PERSIST`),
+  read-then-write commands on the key (`INCR`, `APPEND`, `HSET`, `SADD`, `LPUSH`, ...: computed from
+  nothing), movers and the STORE family reading it as a source, and `SET .. NX`; a plain `SET` and
+  `DEL` are not. This is upstream Dragonfly's default (`--replica_delete_expired=true`) under any
+  master that is not an active KeyDB, KeyDB's own *active* replicas' behaviour, and drakeydb
+  peers'. KeyDB's own **plain** replicas do not share it: they never delete on access and apply
+  replicated writes to logically expired keys until their slow sweep reaps them (seconds to tens of
+  minutes), a different and wider failure, which is why serving the key and sweeping later
+  (options B and C) was rejected. `--replica_delete_expired=false` stays ignored on a flagged
+  replica (decision 28). Decision 27 (P7-2 Task 2.8) runs each enveloped command at its author's
+  time (`mvcc >> 20`), which closes the window for the commands that find the key still in the
+  table; the sweep keeps the replica's clock and leaves the rest. Operators get it in the
+  "Onboarding from KeyDB" section of `docs/multi-master.md` that P7-4 adds; until then spec D-9 is
+  where it is written down.
 - "Apply-context from envelope" cannot ride the squasher: `repl_mvcc` is copied once per batch
   (`main_service.cc:1815-1816`, `multi_command_squasher.cc:114-115`), so RREPLAY commands dispatch
   one by one, each with its own mvcc and origin (ledger decision 11).

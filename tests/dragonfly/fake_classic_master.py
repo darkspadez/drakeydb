@@ -61,7 +61,8 @@ class FakeClassicMaster:
     the wire is deterministic; the optional stream bytes follow in a second write, after
     `stream_delay` seconds if given (long enough for the replica to read the first write alone:
     coalescing is deterministic only then). Afterwards the connection stays open, still recording
-    requests, until the replica closes it or `close_after_psync` is set.
+    requests, until the replica closes it or `close_after_psync` is set; `send_stream()` writes
+    more stream bytes into it whenever a test wants them, to time commands against the clock.
 
     Recorded: `connection_count` (every accepted connection), `requests` (every request as a list
     of words, all connections, in arrival order) and `psync_requests` (the PSYNC ones).
@@ -82,6 +83,7 @@ class FakeClassicMaster:
         self._server = None
         self._handler_tasks = set()
         self._writers = set()
+        self._stream_writer = None
 
     def script_psync(self, reply, stream=b"", close_after_psync=False, stream_delay=0):
         """Sets what every following PSYNC is answered with (see the class docstring)."""
@@ -105,6 +107,15 @@ class FakeClassicMaster:
             self._capa_reply = reply
         else:
             self._capa_rules[only_for.lower()] = reply
+
+    async def send_stream(self, data):
+        """Writes `data` into the replication stream of the connection that was last answered a
+        PSYNC, behind whatever script_psync() wrote there, as a live master streams a command that
+        was just run. The caller owns the timing: nothing is written until it is called."""
+        writer = self._stream_writer
+        assert writer is not None, "no replica is in the replication stream yet"
+        writer.write(data)
+        await writer.drain()
 
     async def drop_connections(self):
         """Closes every open connection, as a master that went away does, and keeps listening."""
@@ -201,6 +212,8 @@ class FakeClassicMaster:
             pass
         finally:
             self._writers.discard(writer)
+            if self._stream_writer is writer:
+                self._stream_writer = None
             self._handler_tasks.discard(task)
             writer.close()
 
@@ -230,6 +243,7 @@ class FakeClassicMaster:
         elif name in ("PSYNC", "SYNC"):
             writer.write(self._psync_reply)
             await writer.drain()
+            self._stream_writer = writer
             if self._psync_stream:
                 await asyncio.sleep(self._stream_delay)
                 writer.write(self._psync_stream)

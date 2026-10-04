@@ -1124,10 +1124,155 @@ existing `IsClockSkewConcerning` path (`LOG_EVERY_T`). A DFLY peer's handshake e
 
 **Done:** `clock_skew_ms` is meaningful on a KeyDB link; a DFLY peer's value is unchanged.
 
+### Task 2.8: Envelope-time apply (decision 27)
+
+**Goal:** A command of an RREPLAY envelope runs at its **author's** time instead of the replica's,
+so a key's expiry is decided on every access as the master decided it, whatever the stream lag
+(owner decision 27). Spec D-9 has the window this closes and the one it leaves open; read both
+first.
+**Files:** Modify `src/server/classic_replay.{h,cc}` (the time function, the per-command scope),
+`src/server/conn_context.h`, `src/server/main_service.cc` (one line in `PrepareTransaction`),
+`src/server/transaction.{h,cc}`, `docs/UPSTREAM-SYNC.md`; Test `src/server/classic_replay_test.cc`,
+`tests/dragonfly/keydb_onboarding_test.py`.
+**Depends on:** Task 1.2 (the applier). The per-command context it sets and restores is the one of
+Task 2.2 (stamps) and Task 2.4 (the EVAL guard override): whichever of the three lands first adds
+one RAII scope in `ApplyCommand` that sets the fields before the dispatch and puts them back on
+every exit (early return and error included), and the others extend it.
+**Interfaces:**
+- `uint64_t EnvelopeTimeMs(uint64_t mvcc, uint64_t now_ms)` (pure, `classic_replay.h`, so a gtest
+  can table-drive it): `mvcc >> 20` (KeyDB's `ms << 20 | counter`; drakeydb's own `MvccClock` has
+  the same layout) when `mvcc != 0` and that is within `kMaxEnvelopeTimeSkewMs = 60'000` of
+  `now_ms`, either way, inclusive; else 0, which means "keep the local clock". `OBJ_MVCC_INVALID`
+  (all ones) and any stamp with bit 63 set fall outside the window by themselves.
+- `ConnectionContext::repl_time_ms` (0: none): per command, unlike `repl_origin_idx` and
+  `repl_lww_guard`, which are per link. `ClassicApplier::ApplyCommand` gains the envelope's mvcc
+  (the **innermost** layer's: the envelope that directly wraps the command, as Task 2.2's author is)
+  and sets it from `EnvelopeTimeMs(mvcc, GetCurrentTimeMs())`. A fallback of a non-zero mvcc is a
+  `LOG_EVERY_T(WARNING, 60)` naming the link, the stamp's ms and the local clock, and no counter:
+  D-13's six counters are pinned by exact-equality tests in INFO and /metrics, and a seventh is a
+  follow-up the owner can ask for. `SELECT` (the first use of a db) is not a data command and keeps
+  the local clock.
+- `PrepareTransaction` copies it next to `SetReplOrigin` (`main_service.cc:891-893`, after both the
+  fresh-transaction and the MULTI-reuse branches): `Transaction::SetReplTime(uint64_t ms)` stores
+  `repl_time_ms_` and, for a non-zero `ms`, sets `time_now_ms_` at once (the constructor already
+  read the local clock, `transaction.cc:144`); `0` only clears the member. `Transaction::InitTxTime`
+  becomes `time_now_ms_ = repl_time_ms_ ? repl_time_ms_ : GetCurrentTimeMs()`, so the re-schedule
+  after a cancelled attempt (`:943`) keeps the author's time. A squashed stub copies `time_now_ms_`
+  from its parent (`MultiUpdateWithParent`, `:556`), so an `EVAL`'s stubs run at the same time. Not
+  the squasher's `dist_trans` (`main_service.cc:1818-1821`): raw batches keep the local clock.
+- It is a **separate field, not `repl_mvcc >> 20`**: a plain link carries no stamps (Task 2.2:
+  `repl_mvcc == 0`) and needs the time just the same, and a peer link's stamp must stay the
+  envelope's whole mvcc whatever the time rule decides (a stamp is never "implausible"; the clock
+  is). Only `ClassicApplier` sets it: `JournalExecutor` links (DFLY peers and replicas) leave it 0.
+- **The 1 ms edge: left as it is.** KeyDB expires on `now > when` (`db.cpp:2068`), drakeydb on `now
+  >= expire` (`db_slice.cc:2098`), so a command the master ran in the very millisecond `E` found the
+  key live there and finds it due here. Shifting the author's time by one millisecond would make the
+  two agree only when KeyDB's clock did not tick between `incrementMvccTstamp` (the envelope's ms,
+  at the start of `call()`) and its own lookup (`keyIsExpired` re-reads the cached clock,
+  `g_pserver->mstime`, which a time thread advances continuously), and it would move every other
+  reader of the transaction's time by a millisecond. The residual is 1 ms either way, for commands
+  run within a millisecond of a deadline; a characterization test pins it.
+- **Why 60 s, and why both ways.** A stamp in the future makes the replica expire keys early (any
+  deadline up to the stamp is due); one in the past, or 0, anchors a relative TTL before it began
+  and serves keys that are due. So the stamp must be bounded on both sides, by a number that is
+  larger than any skew the node already treats as an operational problem (`kClockSkewWarnMs` is 250
+  ms) and than any healthy lag, and that a test can hit at both ends. A rule scaled by the observed
+  lag (`max(10 s, 2 x lag)`) was rejected: the lag is measured from the same stamps, so a garbage
+  one would widen its own tolerance, and it needs per-link state on the dispatch path. A link more
+  than 60 s behind falls back to the local clock while it drains, which is no worse than the window
+  Task 1.4 documented (spec D-9). No flag: a node whose clock is a minute off needs NTP, and its
+  `clock_skew_ms` (Task 2.7) says so first.
+- **What the sweep keeps.** `EngineShard::Heartbeat` and `DbSlice::ExpireAllIfNeeded` stay on the
+  local clock (decision 27), so the task closes the window only while a due key is still in the
+  table (spec D-9, "What it leaves open"). Step 4's pytests measure that and say so in their
+  docstrings; do not "fix" it here.
+- [ ] **Step 0: Audit the clock reads** and record the table in `task-2.8-report.md`: every
+  `GetCurrentTimeMs()` in `src/server` outside tests, and whether the expiry decision of a command
+  that can arrive in an envelope flows through it. Known at the time of writing: the TTL bases of
+  `SET`, `GETEX`, the `EXPIRE` family and `RESTORE ... ABSTTL` read `db_cntx.time_now_ms`
+  (`string_family.cc:1049`, `:1104`, `:1170`, `:1515`, `:1560`; `generic_family.cc:563`, `:718`,
+  `:1806`, `:1890`; `db_slice.cc:1870`), the transaction's, which is what this task changes; the
+  journaled absolute deadline of `SET .. PX` (`string_family.cc:1170`) is derived from it, so a
+  cascaded sub-replica is told the author's `E` (confirm). Direct reads that stay local: `SETEX` and
+  `PSETEX` (`string_family.cc:1357`; KeyDB rewrites both to `SET .. PX` and the feed makes that
+  `PXAT`, so neither is on the wire), the flush paths (`db_slice.cc:1281`, `:1372`),
+  `blocking_controller.cc:156`, the sweep (`engine_shard.cc:885`, `db_slice.cc:2185`) and the
+  stamping clock (`journal.cc:140`, `journal_slice.cc:167`, the local mint). A site that decides
+  expiry for an enveloped command and is not in the first list moves to the transaction's clock in
+  this task.
+- [ ] **Step 1: Failing tests.** `ClassicApplyFamilyTest` with the shards in replica mode and the
+  replica active expiry flag on (the fixture of `ReplicaActiveExpiryTest`, `--hz 0`), `AdvanceTime`
+  past the deadline, a key set with `SET k v PXAT <E>`: `.EnvelopeTimeBeforeTheDeadlineKeepsTheKey`
+  (`PEXPIREAT k <far>` in an envelope whose mvcc says `E - 300 ms`: the refresh applies, `k` is
+  there with that deadline, DBSIZE unchanged), `.EnvelopeTimeAfterTheDeadlineStillFindsNoKey` (`E +
+  200 ms`: gone, the control that passes before and after), `.EnvelopeTimeOfTheDeadlineIsDue` and
+  `.EnvelopeTimeOneMsBeforeTheDeadlineIsLive` (the 1 ms edge: `E` is due, `E - 1` is live),
+  `.RawCommandKeepsTheLocalClock` (the same refresh dispatched raw on the same context: gone),
+  `.NestedEnvelopeUsesTheInnermostAuthorsTime` (outer after `E`, inner before: kept),
+  `.RelativeTtlIsAnchoredOnTheEnvelopeTime` (`SET k v PX 500` in an envelope at `M`: `PEXPIRETIME k
+  == M + 500`), `.TheOverrideDoesNotOutliveItsCommand` (an enveloped command, then a raw one on the
+  same context: local clock; also after a command the dispatcher rejected, after a skipped control
+  or KeyDB-only command and after a malformed layer), `.PlainAndPeerLinksBothRunAtTheEnvelopesTime`
+  (the peer applier of Task 2.2 beside the plain one) and
+  `.PeerStampStaysTheEnvelopeMvccWhenTheTimeFallsBack` (a stamp whose ms is 61 s off: the time is
+  local, `StampOf(key)` is still `{envelope mvcc, author hash}`).
+  `ClassicReplayTest.EnvelopeTimeMs*` (table: 0, all ones, bit 63, now, +-59'999, +-60'000 and
+  +-60'001 ms, the counter bits ignored) and a direct `Transaction` test that `InitTxTime()` after
+  `SetReplTime(ms)` keeps `ms` (the retry; `transaction.h` needs a `friend` for it, like
+  `ReplicaActiveExpiryTest`). Pytests, in the file's window section (the flips):
+  `test_plain_replica_of_active_keydb_loses_a_ttl_refresh_that_arrives_after_the_deadline[envelope-access_only]`
+  now expects `exists k == 1` and `0 < pttl k <= 60_000`, and its `raw` and `envelope-sweep` cases
+  keep expecting absence;
+  `test_plain_replica_of_active_keydb_recomputes_a_counter_from_nothing_after_the_deadline[envelope_applied_before_the_deadline-access_only]`
+  now expects `"6"`, and the other five cases keep `"1"` (the `-sweep` one because the sweep deleted
+  `c` at the replica's `E`). New pytest
+  `test_plain_replica_honours_an_envelope_time_only_within_a_minute_of_its_own` (fake master,
+  `--hz=0`, crafted mvcc values; the exact edges are the gtest table's). A key due locally, then a
+  `PEXPIREAT` whose envelope says the master applied it 45 s ago (before the deadline): honoured,
+  the key survives; 75 s ago: falls back to the local clock, the key is gone; mvcc 0: local, gone.
+  A key still live locally (deadline 30 s ahead) and a `PEXPIREAT` stamped 45 s in the future:
+  honoured, so the key is due at that time and gone; stamped 75 s ahead: local, the key survives.
+  A `peer_mode` variant once Tasks 2.2 and 2.4 are in the same branch.
+- [ ] **Step 2: Run, observe failure** (the flipped cases and the crafted ones fail on the P7-1
+  behaviour; the controls and the raw cases pass).
+- [ ] **Step 3: Implement** as above; document `repl_time_ms` in `conn_context.h` beside
+  `repl_origin_idx`, and `SetReplTime` in `transaction.h` beside `SetReplOrigin`.
+- [ ] **Step 4: Falsify**, one at a time, restore and record verbatim: (a) `ApplyCommand` never sets
+  the field (every flipped case and the crafted survivors fail); (b) `PrepareTransaction` does not
+  copy it (same); (c) `SetReplTime` stores but does not update `time_now_ms_` (the first access runs
+  at the local clock: the flips fail); (d) `InitTxTime` ignores the override (the retry unit test
+  fails; nothing else can show it, since the retry needs a cancelled multi-shard schedule: say so);
+  (e) the field is not cleared after the command (`TheOverrideDoesNotOutliveItsCommand` and
+  `RawCommandKeepsTheLocalClock`); (f) read `mvcc` instead of `mvcc >> 20` (every envelope falls
+  back: the flips fail); (g) drop the window (honour any stamp: `EnvelopeTimeMs*` and the far-stamp
+  pytest cases fail), and then one side only (the other side's cases fail); (h) the outermost
+  layer's time (`NestedEnvelopeUsesTheInnermostAuthorsTime`). Record that the `raw` and `-sweep`
+  pytest cases pass under the change and under its reversal alike: they pin what the change must
+  not touch (the raw clock, the sweep's residual), not the change itself.
+- [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; the whole of `classic_replay_test`,
+  `keydb_onboarding_test.py` (real KeyDB, `KEYDB_REQUIRED=1`) and `multi_master_test` (the
+  transaction and `PrepareTransaction` are shared); the per-command path's cost is one field copy,
+  so re-run Task 1.5's smoke only if the whole-branch review asks. Add the `UPSTREAM-SYNC.md` rows
+  (`transaction.{h,cc}`, `conn_context.h`, `main_service.cc`: one hunk each, say which test to
+  re-run); pre-commit; commit `feat: apply RREPLAY commands at their author's time (P7)`.
+
+**Open question for the owner (not part of decision 27, not scheduled):** the residual above is the
+sweep. Closing it takes a **stream clock** for the sweep to compare deadlines with: the highest
+author time the link has applied (the enveloped cron `PING` keeps it moving every
+`repl-ping-replica-period`, 10 s in KeyDB's defaults, `config.cpp:2920`; segment 13 of
+`tests/dragonfly/data/README.md`), so a due key would stand for up to that long on a quiet master.
+It is a design of its own (per-shard watermark, multi-link and peer-mode rules, a stalled link) and
+a trade of staleness for convergence.
+
+**Done:** an enveloped command sees a key as its author did whenever the key is still in the table;
+a raw command, an unusable stamp and the sweep keep the local clock; the window the sweep leaves is
+measured, documented, and not hidden by a test that passes for the wrong reason.
+
 ### P7-2 gate and PR
 
 - [ ] Whole-branch review, adversarial pass (briefed only to refute the no-forward and convergence
-  claims and the dedup reservation's exactly-once claim), fix loops. Gate and PR as in P7-0.
+  claims, the dedup reservation's exactly-once claim and Task 2.8's account of what the sweep leaves
+  open), fix loops. Gate and PR as in P7-0.
 
 ---
 
@@ -1314,8 +1459,10 @@ observable), `tests/dragonfly/keydb_onboarding_test.py`.
   needs a mesh or data is lost, `config.cpp:2705-2710`, and skips the forward at
   `replication.cpp:5507`; with a single KeyDB master there is nothing to forward), otherwise
   forwarding stays on and the dedup absorbs the duplicates; `repl-backlog-size` sizing for partial
-  resync, cutover with `REPLICAOF REMOVE`, expiry semantics (decision 13, `--replica_delete_expired`
-  note; replica active expiry is for the main `replica_` link only), member-TTL and cron loss,
+  resync, cutover with `REPLICAOF REMOVE`, expiry semantics (decisions 13, 24, 27 and 28: the window
+  of spec D-9, what envelope-time apply closes and the sweep leaves open, `--replica_delete_expired`
+  ignored on a flagged replica; replica active expiry is for the main `replica_` link only),
+  member-TTL and cron loss,
   `KEYDB.MVCCRESTORE` applied (and `keydb_mvccrestore_failed`), the counters and where they render;
   the unsupported or by-design combinations — the dedup is reset by a flushing full sync (so a
   cluster `ADDREPLICAOF` of a forwarding mesh is unsupported) and not by an operator `FLUSHALL`
