@@ -10,8 +10,9 @@ no home in the phase currently being worked on. Two parts:
   the phase that should close it.
 
 Add entries as they are found. Delete an entry only when it is filed upstream (Part 1, with the
-issue link recorded) or landed (Part 2). Every entry states how it was established, so a reader
-can tell a live-proven defect from a static argument.
+issue link recorded), landed (Part 2), or withdrawn (either part; keep a withdrawn entry for one
+phase as a record first). Every entry states how it was established, so a reader can tell a
+live-proven defect from a static argument.
 
 Related: [UPSTREAM-SYNC.md](UPSTREAM-SYNC.md) (merge workflow), [PLAN.md](PLAN.md) (phase plan).
 
@@ -183,7 +184,7 @@ in source.
 
 **Status:** not filed.
 
-### U-8. `GEORADIUS`/`GEORADIUSBYMEMBER`'s `STORE` destination never replicates
+### U-8. `GEORADIUS`/`GEORADIUSBYMEMBER`'s `STORE` destination never replicates -- withdrawn (not a bug)
 
 **Where:** `src/server/geo_family.cc:779,782` — both registered
 `CO::JOURNALED | CO::STORE_LAST_KEY | CO::NO_AUTOJOURNAL`, and the file has no `RecordJournal`
@@ -199,7 +200,17 @@ issuing node and never reaches any replica or peer, regardless of configuration.
 `WillAutoJournalVerbatim`/`NO_AUTOJOURNAL` audit that found the `SORT` defect. Not reproduced
 against a live replica.
 
-**Status:** not filed.
+**Status (2026-10-03): withdrawn — not a bug.** The static argument above missed that the
+`STORE` callback sets `zparams.journal_update = true` (`geo_family.cc:654`) and writes through
+`ZSetFamily::OpAdd`, which hand-journals the destination itself: a bare `DEL` for an empty result
+(`zset_family.cc:1963`) and, for a non-empty one, `DEL` then `ZADD` (`:2053` opens the branch;
+`DEL` is recorded at `:2055`, `ZADD` at `:2072`). What does remain true of these commands is the
+`DEL` + `ZADD` split that D-21 registers — a different defect (a stale result merging into a newer
+destination), not a failure to replicate. Live re-test (P7-0 Task 0.1, debug build of `c60dfdb`,
+`--proactor_threads 4` → 4 shards): after stable sync was confirmed with a marker key, 8
+`GEORADIUS … STORE` and 8 `GEORADIUSBYMEMBER … STOREDIST` destinations written on the master all
+reached a plain replica byte-for-byte (16/16, `ZRANGE … WITHSCORES` digests equal). Kept here for
+one phase as a record, then delete.
 
 ### U-9. `EvalInternal`'s connection migration can null-deref on a classic replicated-apply link
 
@@ -227,10 +238,145 @@ classic links either way, but a classic upstream master is the most direct route
 `EVAL` reaching this exact branch via replication.
 
 **How established:** static reading of `EvalInternal`'s migration branch composed with
-`JournalExecutor`'s constructor; not reproduced against a live crash (would need a single-shard
-`EVAL` whose key lands on a different shard than the one that dispatches the replicated apply).
+`JournalExecutor`'s constructor; reproduced deterministically by P7-0 Task 0.5 (a `JournalExecutor`
+on thread 0 applying `EVAL "return redis.call('SET', KEYS[1], 'v')" 1 <key on another shard>`
+raised SIGSEGV in `Connection::RequestAsyncMigration` 3/3 on the unfixed build).
 
-**Status:** not filed.
+**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.5): the migration branch also requires
+`conn_cntx->conn() != nullptr` — migration is a latency optimisation, so skipping it is
+semantically neutral. Regression test `DflyEngineTest.EvalReplicatedApplyNoConnNoCrash`
+(`src/server/dragonfly_test.cc`). Still not filed upstream.
+
+### U-10. `VerifyCommandState`'s `TAKEN_OVER` branch dereferences a null `conn()` on a replicated apply
+
+**Where:** `src/server/main_service.cc`, `Service::VerifyCommandState`, `case
+GlobalState::TAKEN_OVER:` — `dfly_cntx.conn()->IsPrivileged() || ...`. The restricted-command check
+a few lines above guards the same call with `dfly_cntx.conn() != nullptr` ("no connection owner
+means the command is internal, therefore always permitted"); this branch does not.
+
+Every replicated apply dispatches through `Service::DispatchCommand` with a context whose `conn()`
+is `nullptr` (`JournalExecutor`; `Replica::ConsumeRedisStream`'s own bare `ConnectionContext`). A
+node in `TAKEN_OVER` that is still applying its own master's stream therefore crashes on the first
+applied command. `TAKEN_OVER` is set by `DFLY TAKEOVER` (`dflycmd.cc`) on the node a replica takes
+over, and a node that is itself a replica is only possible with cascaded replication
+(`--experimental_cascaded_partial_sync`, off by default; `ServerFamily::ReplConf` refuses to
+replicate a replica otherwise) — so reachable on any apply path (DFLY stable sync and a classic
+link alike) of a cascaded node whose upstream keeps writing during a `REPLTAKEOVER`.
+
+**How established:** live and in-process. Chain `master -> r1 -> r2`, `--proactor_threads 4
+--experimental_cascaded_partial_sync`, ~1 s of pipelined `APPEND`s on `master`, then `REPLTAKEOVER 10`
+on `r2`: `r1` died with SIGSEGV 4/4 on the unfixed build (stack `DflyShardReplica::StableSyncDflyReadFb
+-> ExecuteTx -> JournalExecutor::Execute -> Service::DispatchCommand`) and exited 0 with
+`REPLTAKEOVER` answering `OK` 5/5 after the fix. Deterministically, `DflyEngineTest.
+ReplicatedApplyDuringTakeoverNoCrash` crashes at `main_service.cc:1430` (gdb) without it.
+
+**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.5, same commit as U-9): a context with no
+connection is never refused by the `TAKEN_OVER` gate, as at the restricted-command check — refusing
+it would drop the upstream's writes on a takeover that then fails back to `ACTIVE`. Still not
+filed upstream.
+
+**The cost of "allow":** `WaitReplicaFlowToCatchup` (`dflycmd.cc`) waits until the taking-over
+replica's acked LSN reaches `journal::GetLsn()`, and a cascaded node that keeps applying its
+master's stream keeps appending to its own journal, so that target moves. Under sustained upstream
+writes a `REPLTAKEOVER` whose old master is a cascaded node can therefore run out its timeout and
+answer `Takeover failed!` (`DflyCmd::TakeOver`). That follows from the code; it was not observed:
+the probe above kept writing throughout the takeover and `REPLTAKEOVER` still answered `OK` 5/5.
+Refusing the applies would avoid that wait, since nothing new reaches the journal, and is worse:
+a refused apply is dropped while the stream moves on. `Replica::ConsumeRedisStream` advances
+`repl_offs_` after every dispatch whatever its result, and the DFLY stable-sync path logs a `DFATAL`
+for a failed entry only while the node is `ACTIVE`. Once the takeover then fails back to `ACTIVE`,
+the node has lost writes its upstream believes were applied, and nothing re-sends them. A takeover
+that times out is loud and can be retried.
+
+### U-11. A classic full sync aborts the replica when stream bytes arrive with the end of the RDB
+
+**Where:** `Replica::InitiatePSync` after `RdbLoader::Load` — `CHECK_EQ(0u,
+loader.Leftover().size())`, `CHECK_EQ(snapshot_size, loader.bytes_read())` and
+`CHECK(ps.UnusedPrefix().empty())` on a `$<len>` sync; `CHECK(chained.UnusedPrefix().empty())` after
+the `$EOF:` token; `RdbLoader::Load`'s first `ReadAtLeast(bytes, 9)` ignores `source_limit_`.
+
+A disk-based classic master (KeyDB's default; Redis with `repl-diskless-sync no`) flushes the writes
+it buffered during its BGSAVE right behind the file. When the RDB's end lands in the loader's first
+(16 KB) read, that unclamped read swallows stream bytes and the `Leftover()` CHECK aborts the
+replica; even without the abort those writes and their offset were dropped. The neighbouring CHECKs
+abort on malformed tails, and an RDB longer than `$<len>` trips the helio `io.cc:143` DCHECK in a
+debug build.
+
+**How established:** live on the unmodified main build — plain KeyDB v6.3.4, disk-based sync, an
+`INCR` loop during the attach: `replica.cc:831] Check failed: 0u == loader.Leftover().size() (0 vs.
+2507)` in 4 of 8 runs. With a scripted master, deterministically `(0 vs. 46)` (disk) and
+`replica.cc:829 Check failed: chained.UnusedPrefix().empty()` (diskless); also `replica.cc:1910
+Check failed: kRdbEofMarkSize == token.size()` and `io.cc:143 … (0 vs. 8)`.
+
+**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.6): the loader's first read honors
+the source limit, the bytes behind a correct full sync go to `ConsumeRedisStream` and into
+`repl_offs_`, and every other tail disagreement is an error that reconnects. Tests
+`RdbTest.LoaderFirstReadHonorsTheSourceLimit`,
+`RdbTest.LoaderSourceLimitShorterThanTheRdbIsAnError`,
+`keydb_onboarding_test.py::test_psync_{stream_bytes_behind_full_sync_are_applied,
+full_sync_tail_mismatch_does_not_abort_replica,bad_eof_token_size_does_not_abort_replica}`. Not
+filed upstream.
+
+**Retry behavior, not changed:** a persistently malformed master is retried every ~0.5 s with no
+backoff (`MainReplicationFb`'s reconnect loop sleeps 500 ms), where it used to abort the process.
+Each attempt logs an `ERROR` and a `WARNING`; a plain replica `FlushAll`s its dataset per attempt
+(the flush precedes the load, so it is empty again each time); a peer-mode node takes exclusive
+`LOADING` and re-merges per attempt. That is strictly better than the abort and matches upstream's
+pattern for its other full-sync failures. Follow-up candidate: rate-limited logging and a reconnect
+backoff for a master that fails the same way repeatedly.
+
+**Related, not changed:** a `$0` header (`+FULLRESYNC <id> <offset>` then `$0`) is not a full sync
+here. `InitiatePSync`'s `if (snapshot_size || token != nullptr)` (`replica.cc:759`) sends it to the
+else branch, "Re-established sync with Redis master", which is the partial-resync branch: nothing is
+flushed, so stale data stays, and the offset from the `+FULLRESYNC` line has already been adopted.
+Pre-existing, upstream's; P7-3 (classic partial PSYNC) takes over that branch and must tell a `$0`
+full sync from a partial resync.
+
+### U-12. `Service::DispatchCommand` closes a null connection when a handler throws on a replicated apply
+
+**Where:** `src/server/main_service.cc`, `Service::DispatchCommand`, after `InvokeCmd` —
+`cmd_cntx->SendError("Internal Error"); dfly_cntx->conn()->MarkForClose();`.
+
+`InvokeCmd` catches a `std::exception` thrown by a command handler, logs `Internal error, system
+probably unstable` and returns `DispatchResult::ERROR`, the only way to reach that block. A
+replicated apply (`JournalExecutor`; `Replica::ConsumeRedisStream`'s own context) has no connection
+(see U-9, U-10), so a handler that throws while applying turned an already-logged internal error
+into a SIGSEGV in `Connection::MarkForClose`.
+
+**How established:** deterministically in-process: `DflyEngineTest.
+ReplicatedApplyHandlerThrowNoConnNoCrash` replaces `ECHO`'s handler with one that throws
+`std::runtime_error` and applies `ECHO x` through a `JournalExecutor`; without the guard it dies
+with SIGSEGV in `facade::Connection::MarkForClose <- Service::DispatchCommand`. No production
+command throws deterministically, so a live trigger was not reproduced: it needs a `std::exception`
+thrown on a handler's coordinator side (a shard callback's `bad_alloc` becomes `OUT_OF_MEMORY` and
+its other exceptions abort, both in `Transaction::RunCallback`).
+
+**Status (2026-10-03): fixed in this fork** (P7-0 review fix round): the close requires `conn() !=
+nullptr`. The failed command is still dropped, logged and not retried, and the replication link
+stays up, so a replica that hits this diverges silently on that key. Not filed upstream.
+
+### U-13. An empty command name in a classic stream aborts the replica
+
+**Where:** `Replica::ConsumeRedisStream` (`src/server/replica.cc`), the debug dump of a command
+whose name starts with `\r`: `LastResponseArgs()[0].GetBuf()[0] == '\r'`, evaluated for every
+command that is not `MULTI`/`EXEC`, before the check that the name has a first byte.
+
+The stream bytes `*1\r\n$0\r\n\r\n` are a valid RESP array of one empty bulk string: a command with
+an empty name. The parser accepts it and the read of its first byte is out of bounds: SIGABRT in a
+debug build (`absl/types/span.h:335` `assert(false && "i < size()")`), a 1-byte out-of-bounds read
+in a release one. Any classic master, plain Redis and Valkey included, can send it in its
+replication stream, so it is reachable from a malformed or hostile master after any valid sync.
+
+**How established:** a scripted master (an adversarial pass over P7-0): a valid diskless or disk
+full sync, then `*1\r\n$0\r\n\r\n`, then `SET a 1` aborts the debug replica with SIGABRT in
+`Span<>::operator[]` called from `Replica::ConsumeRedisStream`.
+
+**Status (2026-10-04): fixed in this fork** (P7-0): the dump requires a non-empty name, so the
+empty name is dispatched as the unknown command it is (dropped, counted in `unknown_cmds`, its bytes
+counted into `repl_offs_` exactly) and the commands after it apply. Tests
+`keydb_onboarding_test.py::test_classic_stream_empty_command_name_does_not_abort` (the
+`diskless_later_write`, `disk_later_write` and `disk_behind_rdb` cases). Pre-existing in upstream
+Dragonfly; not filed upstream. On the byte-identity exception list (spec, item 2).
 
 ---
 
@@ -409,8 +555,8 @@ token on each arm, so `Disarm` can only cancel its own), not a narrower scope.
 whole-branch review; not reproduced. `RdbMvccTest.MergeLwwTombstoneInstallForAbsentKeyDoesNot
 StealConcurrentArm` pins the half that IS closed.
 
-**Owner:** unassigned; needs per-arm ownership in `MvccStamper`. **From:** P4-3 Tasks 6/13, final
-review.
+**Owner:** tombstone-lifecycle phase (scheduled after P7); needs per-arm ownership in
+`MvccStamper`. **From:** P4-3 Tasks 6/13, final review.
 
 ### D-15. Tombstone merge is only ever tested with two peers
 
@@ -498,8 +644,9 @@ three-peer scenario is unmeasured (see D-15). The live-reap and member-expiry-re
 identical exposure was identified when those paths were changed to derive their stamp from the
 value's own too.
 
-**Status:** open. **Owner:** unassigned (tombstone lifecycle). **From:** the merge-load synthetic
-tombstone's own introduction; widened when the local-reap paths adopted the same rule.
+**Status:** open. **Owner:** tombstone-lifecycle phase (scheduled after P7). **From:** the
+merge-load synthetic tombstone's own introduction; widened when the local-reap paths adopted the
+same rule.
 
 ### D-18. Runtime-revived recipes and name-level full-value writes are unguarded
 
@@ -666,7 +813,7 @@ silently discarded by a mid-command lazy expiry this way), but that change is wh
 resulting gap between the discarded `X` and the installed tombstone precisely `X -
 ExpiryTombstoneFor(S)` rather than something already partly closed by a reap-time mint.
 
-**Owner:** P4-5 (tombstone lifecycle). **From:** P4-4.
+**Owner:** tombstone-lifecycle phase (scheduled after P7). **From:** P4-4.
 
 ### D-21. `*STORE`'s `DEL` + add split can merge a stale result into a newer destination
 
@@ -986,13 +1133,13 @@ expiry's per-node independence, and `FloorAppliedStamp`'s own scope (it governs 
 COMMITTED stamp when a live value is present to floor against — it has nothing to floor against
 here, since the key is absent at apply time); not reproduced with a live three-step repro.
 
-**Owner:** PR-B (tombstone lifecycle). An expiry tombstone that records the EXPIRED VALUE'S OWN
-deadline `D` (not merely its stamp) would let a receiver applying a delta authored strictly before
-`D` drop it outright instead of re-creating the key: the key would have expired at `D` on every
-node anyway, author included, so a delta timestamped before `D` describes a value that no longer
-exists anywhere once `D` passes.
+**Owner:** tombstone-lifecycle phase (scheduled after P7). An expiry tombstone that records the
+EXPIRED VALUE'S OWN deadline `D` (not merely its stamp) would let a receiver applying a delta
+authored strictly before `D` drop it outright instead of re-creating the key: the key would have
+expired at `D` on every node anyway, author included, so a delta timestamped before `D` describes
+a value that no longer exists anywhere once `D` passes.
 
-This is not new with PR-A (P4-4): deltas have always applied in plain arrival order against each
+This is not new with P4-4: deltas have always applied in plain arrival order against each
 node's own, independently-timed expiry: the streaming guard on
 `SET`/`SETNX`/`GETSET`/`GETDEL`/`RESTORE`/`MSET`/`DEL` is what is new here, not the underlying
 gap this describes. **From:** P4-4 (documented alongside the guard; the gap itself predates it).
@@ -1075,7 +1222,7 @@ with a live two-node repro (an unstamped key reaching this path at all requires 
 never-stamped local write or a D-7-style unauthoritative merge load, followed by that same key's
 own natural expiry).
 
-**Owner:** open (tombstone lifecycle, PR-B candidate). Fix path if wanted: distinguish "no arm
+**Owner:** tombstone-lifecycle phase (scheduled after P7). Fix path if wanted: distinguish "no arm
 found" from "arm found but carries no real stamp" more finely, or accept the resurrection risk as
 inherent to a genuinely unstamped key (which, by definition, this fork never had real authority
 over to begin with). **From:** P4-4 (found while auditing `RecordExpiryBlocking`'s own text against

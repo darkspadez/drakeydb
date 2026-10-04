@@ -14,21 +14,21 @@ support is being built in phases:
 | Phase | Feature | Status |
 |---|---|---|
 | 0 | Fork setup + rebrand (binary: `drakeydb`) | complete |
-| 1 | Persistent node identity (UUID) + handshake | planned |
-| 2 | Writable multi-source replica (fan-in) | planned |
-| 3 | Origin-tagged journal + active-active mesh | planned |
-| 4–6 | MVCC timestamps + convergent last-write-wins (streaming + full-sync merge) | planned |
-| 7 | One-way onboarding from live KeyDB masters | planned |
+| 1 | Persistent node identity (UUID) + handshake | complete |
+| 2 | Writable multi-source replica (fan-in) | complete |
+| 3 | Origin-tagged journal + active-active mesh | complete |
+| 4–6 | MVCC timestamps + convergent last-write-wins (streaming + full-sync merge) | complete (the full-sync merge and the streaming guard both landed within phase 4) |
+| 7 | One-way onboarding from live KeyDB masters | in progress |
 | 8–9 | Mesh hardening, CI, first release | planned |
 
 With multi-master flags off, drakeydb retains wire protocol, on-disk format, metrics, and
 `INFO` compatibility with upstream Dragonfly. Runtime defaults and fork-specific surface
 behavior can differ; see [BRANDING.md](BRANDING.md) for the compatibility policy.
 
-## Planned multi-master interface
+## Multi-master interface
 
-The multi-master interface is planned for Phase 2 and is not implemented yet. The following
-commands illustrate the intended interface:
+The multi-master interface is implemented (phases 2–4). For merge, tombstone, and operational
+guidance see [docs/multi-master.md](docs/multi-master.md). For example:
 
 ```bash
 # Node A and node B, both writable, replicating from each other (full mesh):

@@ -119,3 +119,31 @@ OK
 ## Step 6
 
 Continue being great and build your app with the power of DragonflyDB!
+
+## KeyDB (interop tests)
+
+`tests/dragonfly/keydb_onboarding_test.py` replicates from a real KeyDB, so it needs a `keydb-server`
+binary and is skipped without one. KeyDB v6.3.4 builds from source on Ubuntu 24.04 (gcc 13):
+
+```bash
+sudo apt install build-essential nasm autotools-dev autoconf libjemalloc-dev tcl tcl-dev \
+     uuid-dev libcurl4-openssl-dev libbz2-dev libzstd-dev liblz4-dev libsnappy-dev libssl-dev
+git clone --depth 1 --branch v6.3.4 https://github.com/Snapchat/KeyDB
+cd KeyDB && make -j4 BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc
+```
+
+The test harness runs `$KEYDB_SERVER_PATH`, or `keydb-server` from `PATH`. Set `KEYDB_REQUIRED=1`
+(`true` and `yes` work too) to make a missing binary fail the tests instead of skipping them (CI and
+gate runs do). A `KEYDB_SERVER_PATH` that is not an executable always fails them:
+
+```bash
+# in the KeyDB directory
+export KEYDB_SERVER_PATH=$PWD/src/keydb-server KEYDB_REQUIRED=1
+# in the repository root
+DRAGONFLY_PATH=$PWD/build-dbg/dragonfly python3 -m pytest tests/dragonfly/keydb_onboarding_test.py
+```
+
+Tests that use the `redis_server` fixture (a real Redis master) look for the version-suffixed
+binaries CI installs (`redis-server-7.2.2`, ...); without them they use `$REDIS_SERVER_PATH`, or
+`redis-server` from `PATH`, unless the test needs Redis 7 and that binary is older (the test then
+skips).

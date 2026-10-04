@@ -5936,4 +5936,67 @@ TEST_F(RdbMvccTest, WithoutMergeLwwTombstoneInstallHonorsCapForAbsentKeys) {
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold";
 }
 
+// drakeydb: P7 -- a classic master's disk-based full sync is `$<len>`, the RDB, then the commands
+// it buffered while producing it, often in the same segment. RdbLoader::Load's very first read used
+// to ignore the source limit and pull those commands into its buffer, so a caller that knew the
+// RDB's size could not tell the RDB's end from its read-ahead (Replica::InitiatePSync aborted on
+// it).
+TEST_F(RdbTest, LoaderFirstReadHonorsTheSourceLimit) {
+  std::string body = "";
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "limited-key");
+  AppendString(&body, "limited-val");
+  const std::string rdb = WrapInRdb(body);
+  const std::string_view stream = "*1\r\n$4\r\nPING\r\n";
+  const std::string wire = rdb + std::string(stream);
+
+  io::BytesSource src{io::Buffer(wire)};
+  RdbLoadContext load_context;
+  size_t bytes_read = 0, leftover = 0;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.set_source_limit(rdb.size());
+    auto res = loader.Load(&src);
+    bytes_read = loader.bytes_read();
+    leftover = loader.Leftover().size();
+    return res;
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "limited-key"}), "limited-val");
+  EXPECT_EQ(bytes_read, rdb.size());
+  EXPECT_EQ(leftover, 0u) << "the loader read past the end of the RDB it was told about";
+
+  char rest[64];
+  io::Source& rest_src = src;
+  io::Result<size_t> rest_sz =
+      rest_src.ReadSome(io::MutableBytes{reinterpret_cast<uint8_t*>(rest), 64});
+  ASSERT_TRUE(rest_sz);
+  EXPECT_EQ(std::string_view(rest, *rest_sz), stream)
+      << "the bytes behind the RDB must stay unread";
+}
+
+// A source limit that cuts the RDB short is a corrupt RDB: an error, not the DCHECK ReadAtLeast
+// raises for a destination smaller than the minimum it was asked to read.
+TEST_F(RdbTest, LoaderSourceLimitShorterThanTheRdbIsAnError) {
+  std::string body;
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "cut-key");
+  AppendString(&body, "cut-val");
+  const std::string rdb = WrapInRdb(body);
+
+  // The last two limits cannot even hold the 9-byte signature that the first read asks for.
+  for (size_t limit :
+       {rdb.size() - 1, rdb.size() - 4, rdb.size() - 9, size_t{9}, size_t{8}, size_t{0}}) {
+    io::BytesSource src{io::Buffer(rdb)};
+    RdbLoadContext load_context;
+    auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+      RdbLoader loader(service_.get(), &load_context);
+      loader.set_source_limit(limit);
+      return loader.Load(&src);
+    });
+    EXPECT_TRUE(ec) << "limit " << limit << " of " << rdb.size() << " bytes";
+  }
+}
+
 }  // namespace dfly
