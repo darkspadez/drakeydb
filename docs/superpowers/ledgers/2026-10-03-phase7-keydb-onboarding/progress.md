@@ -149,6 +149,21 @@ quality review → fix loop → commit. Per sub-PR: whole-branch review → adve
   owner re-ran it once from the Actions tab: **passed** (attempt 2, 06:22Z), confirming the race.
   `large-tests-arm` and `fuzz-pr` sit queued with no runner, as on darkspadez/drakeydb#9.
 
+### Reaper and tombstone-GC gtest fixes from another session (owner, 2026-10-04)
+
+The owner fixed load-sensitive `multi_master_test` cases in another session (branch
+`claude/relaxed-franklin-b0qhqn`, cut from P7-0 `bcd101d`) and asked for them on this work. They
+were cherry-picked onto P7-1 (the owner's choice, so PR #10 stays as reviewed):
+
+- `dfbe84d`: direct reaper assertions loop with a fresh `reset_time_quota`, at most 100 calls;
+- `c6ebff7`: the two GC-budget tests stop the background tombstone GC first;
+- `32a63f8`: `LocalOnlyReaperDoesNotJournalNamespaceBlindDelete` pauses the heartbeat reaper.
+
+This closes the "reaper sibling tests are load-sensitive" follow-up. Verified here (the first
+commit had not been built where it was written): clean build, no warnings; the 17 reaper/GC tests
+pass, and pass 40 repeats with three CPU spinners; full `multi_master_test` 222 passed, 1 skipped
+(root-only skip).
+
 ## P7-1 … P7-4
 
 Pending (see plan).
