@@ -9880,6 +9880,18 @@ TEST_F(ReaperJournalFamilyTest, LocalOnlyReaperDoesNotJournalNamespaceBlindDelet
 
   EXPECT_EQ(Run({"sadd", "local-only-reap", "member"}).GetInt(), 1);
   Run({"fieldexpire", "local-only-reap", "1", "member"});
+
+  // drakeydb: P7-0 -- pause the background heartbeat's own reaper before advancing past the TTL,
+  // as MemberExpiryReaperReconcilesMemoryAccounting below does. That reaper sweeps this same
+  // default namespace with journal_deletions on, so if it reaches "local-only-reap" first, the DEL
+  // it journals -- correctly -- is captured below and fails this test for a reap the test never
+  // made (4 of 5 failures of the original single-call version under load). Active mode is enabled
+  // only inside the callback, around the explicit local-only call, with no yield in between.
+  const bool saved_active_replica = absl::GetFlag(FLAGS_active_replica);
+  absl::SetFlag(&FLAGS_active_replica, false);
+  absl::Cleanup restore_active_replica = [saved_active_replica] {
+    absl::SetFlag(&FLAGS_active_replica, saved_active_replica);
+  };
   AdvanceTime(1100);
   consumer.entries.clear();
 
@@ -9891,9 +9903,11 @@ TEST_F(ReaperJournalFamilyTest, LocalOnlyReaperDoesNotJournalNamespaceBlindDelet
       DbSlice& db_slice = ns.GetDbSlice(shard->shard_id());
       DbContext cntx{&ns, 0, TEST_current_time_ms};
       journal::DisableFlushGuard guard(shard->journal());
+      absl::SetFlag(&FLAGS_active_replica, true);
       db_slice.DeleteExpiredStep(
           cntx, 100000,
           {.ensure_member_reaping = true, .journal_deletions = false, .reset_time_quota = true});
+      absl::SetFlag(&FLAGS_active_replica, false);
     });
     ++reap_calls;
   } while (Run({"exists", "local-only-reap"}).GetInt() != 0 && reap_calls < kMaxReapCalls);
