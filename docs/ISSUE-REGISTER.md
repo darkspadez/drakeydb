@@ -1644,7 +1644,7 @@ array and left `dst` as it was, where Redis and KeyDB delete it and reply `:0`
    TTL, and replies `:0`, as Redis and KeyDB do. The delete is hand-journaled as `DEL dst`, on one
    shard too, and only when there was a `dst`.
 3. A wrong-type or non-numeric source replies its error and leaves `dst` alone, as Redis and KeyDB
-   do (both errors come before the destination is touched, `sort.cpp:281-284`, `:515`).
+   do (both errors come before the destination is touched, `sort.cpp:278-285`, `:515`).
 
 **Residual, not fixed:** on one shard a failing STORE (WRONGTYPE, non-numeric) still journals its
 verbatim `SORT`. Measured on the P7-1 build (a one-shard master with one replica, the replica's
