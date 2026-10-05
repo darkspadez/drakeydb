@@ -682,6 +682,24 @@ request reaches the master, the later `SET b 2` applies, the ACK offset is exact
 against real KeyDB after the fix. Pre-existing in upstream Dragonfly; not filed upstream. On the
 byte-identity exception list (spec, item 2).
 
+### U-20. `SORT .. LIMIT` with an offset plus count beyond `uint32` replies garbage or crashes
+
+**Where:** `GetSortRange` and the partial sort's end in `SortVisitor` (`src/server/generic_family.cc`).
+
+`LIMIT 1 4294967295` and `LIMIT 4294967295 1` are valid in Redis and KeyDB (everything from the
+offset on; nothing). Here `offset + count` wrapped around a `uint32`, so the range ended before it
+began: the plain form replied a garbage array length, and the `BY` and `BY nosort` forms killed the
+server with SIGSEGV. Any client can send it, and so can a classic master's stream (`SORT .. LIMIT ..
+STORE` is replicated verbatim).
+
+**Status (2026-10-05): fixed in this fork** (P7-1, `bb2a2a0`, found while fixing D-34): both sums
+are 64-bit. Two `// drakeydb: P7-1` hunks, counted apart from decision 34's in the UPSTREAM-SYNC
+`generic_family.cc` row. Tested in `GenericSortOrderTest` and the D-34 pytests; falsified (each sum
+back to 32 bits: the test binary dies with SIGSEGV, the server dies in all four pytests; the partial
+sort's alone: one gtest and four pytests fail). Negative or beyond-`uint32` `LIMIT` arguments are
+still an error here where Redis and KeyDB clamp them (D-34, "Left open"). Pre-existing in upstream
+Dragonfly; not filed upstream. On the byte-identity exception list (spec, item 2).
+
 ---
 
 ## Part 2 — drakeydb deferred work
@@ -1837,14 +1855,13 @@ the cross-shard cases (`0 vs. 4`).
 **Owner:** none (resolved; the residual is journal noise, not divergence). **From:** P4-0
 (`1b6a2e82`); found by the Opus review of `2bdf3d7` (C1), fixed in P7-1.
 
-### D-34. `SORT` orders tied `BY` weights and a SET under `BY nosort` unlike Redis and KeyDB --
-fix in progress
+### D-34. `SORT` orders tied `BY` weights, a missing `ALPHA BY` weight and `BY nosort` unlike Redis and KeyDB -- fixed in P7-1
 
 **Where:** `SortGeneric` and the ordering it sorts with (`src/server/generic_family.cc`; as read at
 `fb037bb`: the `BY` weight fill and comparison around `:1977-1987` and `:2615-2621`, and the
 `nosort` branch around `:2740`).
 
-Two differences from Redis and from KeyDB's `sort.cpp`, which follows it:
+Four differences from Redis and from KeyDB's `sort.cpp`, which follows it:
 
 1. **Ties under `BY`.** With `BY`, a `SortEntry`'s `key` holds the weight, so two elements with the
    same weight compare equal and `std::sort` leaves them in the order the fetch produced them (a
@@ -1854,12 +1871,23 @@ Two differences from Redis and from KeyDB's `sort.cpp`, which follows it:
    weights, a pattern whose keys do not exist (every weight is 0), and `DESC` of either.
 2. **`BY nosort` on a SET that is stored or scripted.** Redis and KeyDB sort such a set
    alphabetically (`dontsort && type == OBJ_SET && (storekey || lua)`: "so the result is
-   consistent across scripting and replication", `sort.cpp:298-308`); a list and a sorted set keep
+   consistent across scripting and replication", `sort.cpp:296-310`); a list and a sorted set keep
    their native order. Dragonfly keeps the set's iteration order.
+3. **`BY nosort` on a LIST or a ZSET under `DESC`.** KeyDB walks the list from its tail and the
+   zset by descending rank, and takes `LIMIT offset count` from that walk (`sort.cpp:356-380`,
+   `:401-439`). Dragonfly ignored `DESC` on this path: the reply and the `STORE` came out ascending,
+   and `LIMIT` counted from the head.
+4. **A missing weight under `ALPHA BY`.** `sortCompare` puts a weight key that is absent, or not a
+   string, before every present weight, the empty string included, and two missing weights tie
+   (`sort.cpp:160-168`; `lookupKeyByPattern` returns NULL for both). Dragonfly mapped a missing
+   weight to `""`, so "missing" and "present but empty" were the same: with `c` missing and `b`
+   empty, `SORT sa BY aw_* ALPHA DESC` is `e a d f b c` on KeyDB and was `e a d f c b` here, and
+   `SORT sa BY aw_* ALPHA LIMIT 1 3` is `b f d` and was `c f d`. (A numeric `BY` needs no such rule:
+   a missing weight is the score 0 in both, and ties with a present `"0"`.)
 
 **Why it matters:** a classic master replicates `SORT .. STORE` as the command, not as its result
 (an active KeyDB wraps it in RREPLAY, verbatim), so the replica re-runs it and must order exactly
-as the master did. Redis and KeyDB made both rules above precisely for that. A drakeydb replica of
+as the master did. Redis and KeyDB fixed the orders above precisely for that. A drakeydb replica of
 any classic master therefore ends up with the same members in a different order, silently: the
 link stays up, every counter is clean, and nothing ever corrects it. The difference is upstream
 Dragonfly's; P7-1 is what puts active KeyDB's RREPLAY stream, and so its verbatim `SORT .. STORE`,
@@ -1869,9 +1897,10 @@ recipe).
 
 **How established (live):** the P7-1 adversarial pass (`sort_keydb.py`, C1): an active KeyDB
 v6.3.4 master and three drakeydb plain replicas of 1, 2 and 4 shards. These converged: a missing
-source (`dst` deleted), `dst == src` (list and set), a wrong-type and a non-numeric source,
-`DESC LIMIT`, `GET nokey_*`, `MULTI`/`EXEC`, `EVAL`, and odd numerics (`0x10`, `" 5"`, `1e3`,
-`+-inf`, the empty string). These diverged on every replica, ten keys each, permanently:
+source (`dst` deleted), `dst == src` (list and set), `DESC LIMIT`, `GET nokey_*`, `MULTI`/`EXEC`,
+`EVAL`, and odd numerics (`0x10`, `" 5"`, `1e3`, `+-inf`, the empty string). (A wrong-type or
+non-numeric source converged only vacuously: a failing command is not replicated.) These diverged
+on every replica, ten keys each, permanently:
 `SORT s BY nokey_* STORE d` (KeyDB `a .. j`, replica `f i h g j c e d b a`),
 `SORT s BY w_* STORE d` with tied weights (also inside `MULTI` and `EVAL`, and with
 `GET # GET h_*`), `SORT l BY w_* STORE d` on a list with missing weights (the replica keeps list
@@ -1879,14 +1908,97 @@ order), `SORT s BY nosort [LIMIT 0 3] STORE d` on a set (KeyDB `a .. j` and `a b
 the set's iteration order), `SORT s BY nokey_* DESC STORE d` and `SORT s BY w_* ALPHA STORE d`.
 `SORT .. STORE` forms between drakeydb nodes (a meshed peer pair of 2 and 3 shards, and a DFLY
 master and replica of 1 and 4, 4 and 1, and 3 and 2 shards, 25 forms) converged
-(`sort_peers.py`, `sort_dfly.py`).
+(`sort_peers.py`, `sort_dfly.py`). Rules 3 and 4 were found by reading `sort.cpp` against the code
+for decision 34 and measured the same way, on standalone KeyDB 6.3.4 and Redis 7.0.15 against the
+build before the fix (80 of 115 forms differed).
 
-**Status (2026-10-05): fix in progress, P7-1** (owner decision 34): drakeydb's `SORT` adopts both
-rules for every caller, matching Redis and KeyDB: a tie under `BY` breaks on the element, and a SET
-under `BY nosort` that is stored or scripted is sorted alphabetically. This is a client-visible
-change in reply order for tied and nosort-SET cases versus upstream Dragonfly, and an upstreamable
-Redis-compatibility fix; it changes no journal wire. **A documented limitation stays:** `ALPHA BY`
-ties. In Redis and KeyDB the order of two elements with the same `BY` value under `ALPHA` is the
-order the master's sort received them in (`pqsort` is not stable), which a replica cannot
-reproduce, so a master and a replica can still disagree on those ties. See `docs/differences.md`.
-**Owner:** P7-1. **From:** the P7-1 adversarial pass (C1); decision 34 in the ledger.
+**Status (2026-10-05): fixed in P7-1** (owner decision 34): drakeydb's `SORT` adopts the four rules
+for every caller, reply and `STORE` alike, matching Redis and KeyDB. A client-visible change in
+reply order for tied, nosort and missing-weight cases versus upstream Dragonfly, and an
+upstreamable Redis-compatibility fix; it changes no journal wire (`SortStoreNothing`, `OpStore`'s
+hand-journal and the single-shard auto-journal are as they were; only the order of what is stored
+or replied changes). What changed, all in `generic_family.cc`:
+
+- `SortEntry::less` breaks a tie on the element (`ResultKey()`, bytewise); `DESC` reverses the whole
+  comparison, the tie-break included, as KeyDB negates `cmp`.
+- An `ALPHA` entry carries a `weight_missing` bit, set from `OpFetchStringValue`'s new `found`
+  out-parameter (absent, expired or not a string), and `less` puts a missing weight first.
+- A SET under `BY nosort` with `STORE`, or inside a script (`conn_state.script_info` of the
+  command's context, which a replicated apply has although it has no connection), is sorted `ALPHA`
+  by the element with the `BY` dropped; `GET`, `DESC` and `LIMIT` apply after the sort. Any other
+  SET under `nosort` keeps its iteration order, as in Redis.
+- A LIST or ZSET under `BY nosort DESC` is reversed before `LIMIT` and `GET` are applied.
+
+Checked after the fix: 123 forms against standalone KeyDB on 1, 2 and 4 shards, with the same
+replies at every shard count. 93 equal; the 30 that differ are the `ALPHA BY` ties (below), a plain
+`BY nosort` set under `LIMIT` (no order in either), `SORT_RO` (KeyDB 6.3.4 has none, and drakeydb
+equals Redis 7.0.15 on it), and the differences listed below and in D-35. The adversarial probe
+again against an active KeyDB master: the one form that still differs is `SORT s BY w_* ALPHA
+STORE` (once per replica, the residual below), and without it `BAD 0`; `sort_peers.py` and
+`sort_dfly.py` are clean.
+
+**Found on the way, fixed in the same change (an ungated crash, upstream's):** `LIMIT 1 4294967295`
+and `LIMIT 4294967295 1` are valid in Redis and KeyDB (everything from the offset on; nothing). Here
+`offset + count` wrapped around a `uint32` in `GetSortRange` and in the partial sort's end, so the
+range ended before it began: the plain form replied a garbage array length and the `BY`/`nosort`
+forms killed the server (`SIGSEGV`). A client, or a KeyDB master's stream, could do it. Both sums
+are 64-bit now.
+
+**Residual, a documented limitation:** `ALPHA BY` ties. In Redis and KeyDB the order of two elements
+with the same `BY` value under `ALPHA` is the order the master's sort received them in (`pqsort` is
+not stable; a set's hash order differs even between two KeyDB processes, measured), which a replica
+cannot reproduce, so a master and a replica can still disagree on those ties. drakeydb breaks them
+on the element, so its own replicas and peers agree. See `docs/differences.md`.
+
+**Also found while checking the forms, not orderings, left open** (each a difference from Redis and
+KeyDB that a client sees; the first three can leave a replica of a KeyDB master with a different or
+a stale `dst`, silently):
+
+- `LIMIT` with a negative argument, or one beyond `uint32`, is the error `value is not an integer
+  or out of range` here (upstream's `SortNegativeLimit` pins it). Redis and KeyDB accept them: a
+  negative offset is 0, a negative count means all, a larger count is clamped. `SORT l LIMIT 0 -1
+  STORE d` succeeds on a KeyDB master and fails on its drakeydb replica, which leaves `d` as it was.
+- `GET <pattern>` of a key that does not exist replies the empty string here and nil in Redis and
+  KeyDB (a `STORE` keeps `""` in both); a `GET` pattern without `*` reads that literal key here
+  where Redis and KeyDB give nil: `SORT s GET str STORE d` stores `str`'s value here and `""` there.
+- Numeric parsing, probed with 46 spellings as a `BY` weight. Equal for `0x1A`, `0x1p3`, `1e5`,
+  `.5`, `5.`, `+5`, `-0`, a leading space/tab/newline, `inf`/`-Infinity`, `nan` (an error in both)
+  and the empty string. KeyDB's `strtod` check rejects a trailing space, tab or newline (`"5 "`)
+  and an out-of-range number (`1e400`, `1e-400`); drakeydb accepts both (a failing SORT is not
+  replicated, so no replica diverges). KeyDB accepts a NUL byte after the number (`"5\0"`,
+  `strtod` stops there); drakeydb rejects it, so that `SORT .. STORE` leaves a drakeydb replica's
+  `dst` stale (binary weights only).
+- Hash-field patterns (`BY w_*->field`, `GET h_*->field`): D-35.
+- Not a drakeydb difference, noted because it breaks naive probes: Redis 7.0 and KeyDB 6.3.4 keep
+  `errno` between commands, so after a numeric SORT of a value that overflows (`1e400`) every later
+  numeric SORT of non-integer elements fails with "can't be converted" until some syscall changes
+  `errno` (checked on both).
+
+**Owner:** none (resolved; the residual is documented). **From:** the P7-1 adversarial pass (C1);
+decision 34 in the ledger.
+
+### D-35. `SORT` hash-field patterns (`->`) are unsupported; a classic stream that uses them diverges silently
+
+**Where:** `PopulateSortEntriesFromByPattern` and `FetchGetPatternValues`
+(`src/server/generic_family.cc`) build the weight or `GET` key by putting the element where the
+first `*` is and read it as a string, so `->` is part of the key name. Redis and KeyDB's
+`lookupKeyByPattern` (`sort.cpp:61-137`) read a pattern `key_*->field` as "the hash at
+`key_<element>`, its field `field`", for `BY` and `GET` alike; a missing key, a key that is not a
+hash and a missing field are all NULL. The fakeredis test `test_sort_with_hash`
+(`tests/fakeredis/test/test_mixins/test_generic_commands.py`) is marked
+`unsupported_server_types("dragonfly")` for the same reason.
+
+**How established (live, standalone KeyDB v6.3.4 against the P7-1 build, 2 shards):** a set `s` of
+`a .. j` and a hash `hw_<c>` per element with `f` = the letter's code mod 3 and `g` = `G<c>`.
+`SORT s BY hw_*->f` is `c f i a d g j b e h` on KeyDB (weights 0 0 0 1 1 1 1 2 2 2, ties on the
+element) and `a b c d e f g h i j` here: the key `hw_a->f` never exists, so every weight is
+missing, 0, a tie. `SORT s ALPHA GET hw_*->g` is `Ga .. Gj` on KeyDB and ten empty strings here.
+With `STORE d` the same two lists land in `d`. An active KeyDB master replicates such a `SORT ..
+STORE` verbatim, so a drakeydb replica of it ends with a different `d` and nothing says so: the link
+stays up and every counter is clean (the class of D-34, for a command D-34's fix does not cover).
+
+**Status:** open; owner decision pending. Not fixed in P7-1 (decision 34 covers orderings only).
+`SORT` is a command a classic stream carries, so a stream that uses `->` diverges until it is
+supported, or until the choice is made to document it as a limitation of onboarding from KeyDB.
+**Owner:** the owner's decision (pending). **From:** the P7-1 SORT-ordering work (decision 34),
+probe `probe.py` cases `hash_by_field*` and `hash_get_field*`.

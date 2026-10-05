@@ -1414,6 +1414,14 @@ the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE
      sent to the master. Upstream sent `DFLY TAKEOVER` on the replication socket and read the next
      streamed command as its reply, losing that command for good. A takeover from a Dragonfly
      master, and `REPLTAKEOVER` on a master or an active node, are byte-identical.
+   - **`SORT` ordering and `LIMIT`** (P7-1, decision 34, ISSUE-REGISTER D-34 and U-20): `SORT` now
+     orders as Redis and KeyDB do (a `BY` tie breaks on the element, a missing `ALPHA BY` weight
+     sorts first, a SET under `BY nosort` that is stored or scripted is sorted, `BY nosort DESC`
+     walks a list or zset backwards), so a classic master's verbatim `SORT .. STORE` re-runs to the
+     same `dst`. A client sees a different reply order than upstream for tied and `nosort` cases; no
+     journal or RDB byte changes, but a same-shard `SORT .. STORE` is journaled as the command (D-13),
+     so a replica on an older build re-runs it in the old order. `LIMIT` sums beyond `uint32`, which
+     replied garbage or crashed, are 64-bit.
    - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
      migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
      a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a

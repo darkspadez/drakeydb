@@ -88,10 +88,10 @@ Consequences:
   same-shard sorted `STORE` whose own fetch emptied the source journals `DEL <dst>` ahead of the
   verbatim `SORT`, and a partial lazy member expiry journals `SREM <key> <members>` ahead of it.
 
-## `SORT` tie order and `BY nosort` on a set (drakeydb fork)
+## `SORT` order follows Redis and KeyDB (drakeydb fork)
 
 Redis and KeyDB give `SORT` a deterministic order, because a master replicates `SORT ... STORE` as
-the command and its replicas must reproduce the result. Upstream Dragonfly differs in two places,
+the command and its replicas must reproduce the result. Upstream Dragonfly differs in four places,
 and so did this fork until P7-1 (owner decision 34, `docs/ISSUE-REGISTER.md` D-34, which tracks the
 fix):
 
@@ -102,11 +102,24 @@ fix):
   result is stored (`STORE`) or produced inside a script, so that replication and scripting are
   consistent; a list and a sorted set keep their native order. Dragonfly kept the set's iteration
   order.
+- **`BY nosort` on a list or a sorted set under `DESC`.** Redis walks a list from its tail and a
+  sorted set by descending rank, and counts `LIMIT` along that walk. Dragonfly ignored `DESC` here:
+  the reply and the stored list came out in ascending order.
+- **A missing weight under `ALPHA BY`.** Redis sorts a weight key that does not exist (or is not a
+  string) before every weight that does, the empty string included. Dragonfly treated a missing
+  weight as the empty string.
 
-drakeydb's `SORT` follows Redis and KeyDB in both for every caller, not only for a replicated
-apply, so a client sees a different order than on upstream Dragonfly for tied weights and for a
-set under `nosort` with `STORE` or in a script.
+drakeydb's `SORT` follows Redis and KeyDB in all four for every caller, not only for a replicated
+apply, so a client sees a different order than on upstream Dragonfly for tied weights, for a set
+under `nosort` with `STORE` or in a script, for a list or sorted set under `nosort` and `DESC`, and
+for a missing `ALPHA BY` weight. A set under plain `BY nosort`, neither stored nor scripted, still
+comes out in its own iteration order, which Redis leaves open too.
 
 **Limitation:** with `ALPHA` and `BY`, the order of two elements that have the same `BY` value is
 the order Redis's own sort received them in (its sort is not stable), so a replica of a Redis or
-KeyDB master can still order such ties differently from its master.
+KeyDB master can still order such ties differently from its master. drakeydb breaks them on the
+element.
+
+**Not supported:** hash-field patterns in `BY` and `GET` (`BY w_*->field`, `GET h_*->field`, which
+Redis and KeyDB read as a field of the hash at `w_<element>`) are taken as part of the key name, so
+they find nothing (`docs/ISSUE-REGISTER.md` D-35, owner decision pending).
