@@ -1095,7 +1095,10 @@ row records the choice.
 between nodes of the same build: a SET under `BY nosort` that is stored or scripted is sorted ALPHA
 by the element, a numeric `BY` tie breaks on the element, an `ALPHA BY` tie keeps the fetch order of
 a list or an integer set, and `LIMIT` and `GET` are decided by the same rules on every node, so two
-nodes of one build that hold the same data re-run a same-shard `SORT .. STORE` to the same `dst`. What
+nodes of one build that hold the same data and run the same `--sort_set_max_intset_entries` re-run a
+same-shard `SORT .. STORE` to the same `dst` (two nodes with different values of that flag order the
+ties of an integer set between the two limits differently: a master at 600 and a replica at 512 stored
+`-1000 -987 ...` and `-1000 -103 -116 ...` from one 549-member set, the SORT round-2 review's M1). What
 is left of this entry is the part about pattern keys that differ between nodes, and a **new
 mixed-version risk**: the journal carries the command, not its result, so a node of an older build
 that re-runs a same-shard `SORT .. STORE` orders a tied `BY`, a `BY nosort` set, a missing `ALPHA
@@ -2263,6 +2266,9 @@ on every case; the tables are in `task-1.7b-sort-semantics-report.md`):
    differs from `--sort_set_max_intset_entries` is the operator's to match, below): KeyDB never
    converts back, so its order is the dict's, and drakeydb's rule for the same
    members (ascending) differs. Measured with `SADD hist 30 2 10 1 200 9`, `SADD hist x`, `SREM hist x`.
+   The reverse holds too: lowering `set-max-intset-entries` at runtime (`CONFIG SET`) leaves an existing
+   larger intset an intset until its next add (checked live), so such a set is ordered ascending on the
+   master while drakeydb, at the new limit, breaks its ties on the element.
 4. **Another libc.** This holds for a KeyDB whose libc `qsort` is a stable mergesort; the one on
    this box is (glibc 2.39, probed). A KeyDB on musl or on a glibc whose `qsort` is not a stable
    mergesort orders ties differently; not checked here.
@@ -2282,8 +2288,9 @@ on every case; the tables are in `task-1.7b-sort-semantics-report.md`):
 `--sort_set_max_intset_entries` (uint32, default 512, the Redis and KeyDB default), read once per
 `SORT` in `SortTiesInFetchOrder` (`generic_family.cc`, a `// drakeydb: P7-1 (decision 41)` hunk), not
 per element, and not changeable with `CONFIG SET` (boot-only, like the other fork flags). An operator
-sets it to the classic master's `set-max-intset-entries` (`docs/multi-master.md`); `0` turns the
-emulation off, so no set is ordered ascending and every set breaks its ties on the element. Measured
+sets it to the classic master's `set-max-intset-entries` (`docs/multi-master.md`), and **every
+drakeydb node, peers and replicas, must run the same value**: a same-shard `SORT .. STORE` replays as the
+command and each node applies its own flag (D-13); `0` turns the emulation off, so no set is ordered ascending and every set breaks its ties on the element. Measured
 live (`sort2b/logs/flag-live.txt`): a KeyDB and a Redis started with `set-max-intset-entries 100`
 and with `600` against drakeydb with the flag at the same value, at the default and at `0`, over
 `SORT <integer set> BY nokey_* ALPHA`: at limit 100, sets of 50 and 100 members are an intset in KeyDB
@@ -2310,8 +2317,8 @@ replies 0, 300 replies 43, 512 replies 255, 600 replies 343, and `SCARD` is righ
 assigns `res = StringSetWrapper{...}.Add(vals, ...)`, which re-adds every member and so counts only
 those the dense set did not hold yet (the ones after the overflow point), discarding what the intset
 loop had counted. A different command and not SORT's, and upstream's: the line is in the fork's
-base commit (`git log -S` finds it first in `05abfdd`). Not fixed here; the SORT tests do not check
-that reply and say so.
+base commit (`git log -S` finds it first in `05abfdd`). Fixed by P7-1 round 2c (`439d67f`, U-22); the
+SORT tests do not check that reply.
 
 **Owner:** none (resolved; the residuals are documented). **From:** the P7-1 adversarial pass (C1);
 decisions 34, 36, 37, 38 and 41 in the ledger; the SORT review (`I1`, `M1`-`M5`).
@@ -2365,8 +2372,7 @@ upstream Dragonfly (which took the `->` as part of the key name; upstream main, 
   string weight that is not (`One or more scores can't be converted into double`, `STORE` leaves `dst`).
 - **Cross-shard:** the key part (`prefix + element + suffix`), not the whole pattern, decides the shard
   the hash is read on, and the read is the same "read uncommitted" lookup the string weights use.
-- A field whose **TTL has passed** (`HSETEX`, `HEXPIRE`; KeyDB has no field TTLs, so this is drakeydb's
-  rule, tested against `HGET`) is missing, and a hash that lazy field expiry empties by this read is deleted,
+- A field whose **TTL has passed** (`HSETEX`, `HEXPIRE`; tested against `HGET`) is missing, and a hash that lazy field expiry empties by this read is deleted,
   as an `HGET` (or `HTTL`) deletes it (`HSetFamily::DeleteIfEmpty`, the derived `DEL`).
 
 What changed (`generic_family.cc`, `// drakeydb: P7-1 (decision 35)`; `hset_family.{h,cc}`): `SortPattern`
@@ -2374,8 +2380,11 @@ gains `field`; `ParseSortPattern` (C-string scan) and `IsSortElementPattern`; `O
 `OpFetchPatternValue` beside `OpFetchStringValue`; `FetchGetPatternValues` (each pattern parsed once) and
 `PopulateSortEntriesFromByPattern` read through `OpFetchPatternValue`; and `HSetFamily::GetFieldValue`, the
 read `CmdHGet` does through `HMapWrap`, so the hash is read as an `HGET` reads it whether it is a listpack
-or a StringMap with field TTLs. Nothing in the journal changes: the weights and `GET` values are read, never
-written, and the SORT itself still journals as before (D-13 for a same-shard `STORE`).
+or a StringMap with field TTLs. The journal changes only as an `HGET` changes it: a hash that this read's
+lazy field expiry emptied is deleted and that derived `DEL` is journaled, from outside the SORT's
+transaction and from `SORT_RO` too (harmless on replicas; on peer links the derived flag keeps it off and it
+is stamped like an expiry). The weights and `GET` values are otherwise only read, and the SORT itself still
+journals as before (D-13 for a same-shard `STORE`).
 
 **Checked.** Live (`sort2b/probes/hf_table.py`, 156 forms: 28 `BY` and 22 `GET` shapes over a list and a set,
 reply and `STORE`, hash sets' unordered ties left out for KeyDB and Redis alike): KeyDB and Redis agree on
@@ -2419,8 +2428,14 @@ their gtests.
    concurrent writer to that hash can change a weight between two elements' reads, as for a string weight;
    Redis has no such window (one thread). The lazy-expiry delete of an emptied hash runs on the shard that
    owns it, outside the SORT's transaction, as `ExpireIfNeeded` does for a string weight with a TTL.
-4. **KeyDB has no hash-field TTLs**, so a field's expiry is drakeydb's rule (an expired field is missing,
-   as for `HGET`); a KeyDB master never sends one. Between drakeydb nodes a field TTL is read like the TTL
+4. **KeyDB's member TTLs are dropped.** KeyDB expires single hash fields with `EXPIREMEMBER` (and its
+   family); a drakeydb replica drops those commands (decision 8, counted in `keydb_cmds_dropped`), and an
+   active KeyDB never streams the field's expiry. So a field KeyDB expired lingers on the replica, and a
+   `->` sort that reads it diverges silently: live, after `EXPIREMEMBER hx f 1`, the master's `hx` was
+   `{g}` and the replica's `{f:5, g}`, and `SORT lx BY h*->f GET h*->f STORE dsx` stored `["","1"]` on the
+   master and `["1","5"]` on the replica, `classic_apply_errors` 0 (the SORT round-2 review's M2). A plain
+   (non-active) KeyDB master streams the expiry and converges. drakeydb's own field TTLs (`HSETEX`,
+   `HEXPIRE`) are read as `HGET` reads them. Between drakeydb nodes a field TTL is read like the TTL
    of a string weight key: a same-shard `SORT .. STORE` is journaled as the command and replayed at the
    peer's clock, so a field that expired on one node and not yet on the other can give another list
    (D-13: a `BY`/`GET` pattern key is not a transaction key); a cross-shard `STORE` journals its result.

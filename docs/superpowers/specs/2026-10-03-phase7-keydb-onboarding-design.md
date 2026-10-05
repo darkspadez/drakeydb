@@ -1454,9 +1454,11 @@ the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE
      and `GET h_*->field` read a field of the hash at the key the first `*` names, as KeyDB's
      `lookupKeyByPattern` does (upstream took the `->` as part of the key name), and the integer-set
      limit of the `ALPHA BY` tie rule is the flag `--sort_set_max_intset_entries` (default 512, the
-     Redis and KeyDB `set-max-intset-entries` default). Both are client-visible and change no journal
-     or RDB byte; the older-build caveat above applies to a `->` form as well. One hunk in
-     `hset_family.{h,cc}` (`HSetFamily::GetFieldValue`, the `HGET` read of a field).
+     Redis and KeyDB `set-max-intset-entries` default; every drakeydb node must run the same value).
+     Both are client-visible; no RDB byte changes, and the journal changes only as an `HGET` changes
+     it (the derived `DEL` of a hash this read's lazy field expiry emptied). The older-build caveat
+     above applies to a `->` form as well. One hunk in each of `hset_family.h` and `hset_family.cc`
+     (`HSetFamily::GetFieldValue`, the `HGET` read of a field).
    - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
      migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
      a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a
@@ -1548,7 +1550,7 @@ REPLACE` onto a live destination found its source due (D-9, ISSUE-REGISTER D-32,
 | `src/server/engine_shard.{h,cc}` | `replica_active_expiry_` and the heartbeat gate, `eviction_goal` kept 0 on a replica (authorized exception to the "untouched" list; ~20 lines, no `expire_only` parameter); `friend class ReplicaActiveExpiryTest` (1); the sweep's clock on a flagged shard, `SweepClockMs(now)` in `RetireExpiredAndEvict` (2, Task 2.9) | 1, 2 |
 | `src/server/db_slice.cc` | One-expression `ExpireIfNeeded` gate (`!owner_->ReplicaActiveExpiry()`) (1); the read-path hide in `FindInternal` (2, Task 2.9) | 1, 2 |
 | `src/server/generic_family.cc` | `SortGeneric`'s multi-shard fetch hop and its two `SortStoreNothing` call sites (P7-1 review round, decision 32); the read-path hide in `ScanCb` (2, Task 2.9, decision 33) | 1, 2 |
-| `src/server/hset_family.{h,cc}` | `HSetFamily::GetFieldValue`, the `HGET` read of one field, for `SORT`'s hash-field patterns (P7-1, decision 35) | 1 |
+| `src/server/hset_family.{h,cc}` | `HSetFamily::GetFieldValue`, the `HGET` read of one field, for `SORT`'s hash-field patterns (P7-1, decision 35) | 1 each |
 | `src/server/set_family.cc` | `OpAdd` adds the string set's count to the intset loop's instead of assigning it, so `SADD` replies the members added when an integer set converts mid-call (P7-1, decision 40, U-22) | 1 |
 | `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards (0); U-15 guards in `Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch` (1, review round and re-review); the `SetReplTime` copy beside `SetReplOrigin` in `PrepareTransaction` (2, Task 2.8) | 0, 1, 2 |
 | `src/server/conn_context.h` | `repl_time_ms`, the per-command envelope time beside `repl_origin_idx` (Task 2.8) | 2 |
