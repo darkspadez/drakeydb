@@ -55,7 +55,7 @@ extern "C" {
 #include "server/acl/acl_commands_def.h"
 #include "server/acl/user_registry.h"
 #include "server/blocking_controller.h"
-#include "server/classic_replay.h"
+#include "server/classic_replay.h"  // drakeydb: P7
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/debugcmd.h"
@@ -3806,7 +3806,7 @@ void ServerFamily::ReplTakeOver(facade::CmdArgParser parser, CommandContext* cmd
   auto repl_ptr = replica_;
   CHECK(repl_ptr);
 
-  // drakeydb: C2 -- TakeOver sends `DFLY TAKEOVER` on the master socket and reads the reply from
+  // drakeydb: U-18 -- TakeOver sends `DFLY TAKEOVER` on the master socket and reads the reply from
   // it, but a classic master has none to give and the replication fiber reads the same socket: the
   // "reply" would be streamed commands, lost for good, with the offset left behind. Refused before
   // the journal below is started on a node that stays a replica.

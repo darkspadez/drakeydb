@@ -1397,8 +1397,22 @@ the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE
        `CACHING`, `MIGRATE`, `HELP` and an unknown one are refused too. No stock master propagates
        `CLIENT`, and it is `NOSCRIPT`.
 
-     ISSUE-REGISTER U-15 lists what was left (cluster mode) and why a filter at the stream boundary
-     was rejected.
+     The P7-1 close (adversarial finding I3) adds a twelfth guard, in `cluster_family.cc`: under
+     `--cluster_mode=emulated`, `CLUSTER INFO|SLOTS|NODES|SHARDS` on a context without a connection
+     reply `No connection` (upstream died with SIGSEGV in `Connection::LocalBindAddress`). Other
+     subcommands and other cluster modes are untouched, and a client always has a connection.
+     ISSUE-REGISTER U-15 lists what was left (`DFLYCLUSTER FLOW`, `DFLY FLOW`) and why a filter at the
+     stream boundary was rejected.
+   - **U-17** (P7-1 close): `REPLICAOF`, `SLAVEOF`, `ADDREPLICAOF` and `REPLTAKEOVER` in a classic
+     master's stream, raw or inside an envelope, reply `No connection` and the stream carries on.
+     Upstream joined the replication fiber from itself (`Check failed: active != this`, SIGABRT in
+     release builds too), parked that fiber on its own socket (`REPLTAKEOVER`), or opened a second
+     link (`ADDREPLICAOF`). Client-issued commands and the `--replicaof` boot path are unchanged.
+   - **U-18** (P7-1 close): a client `REPLTAKEOVER` on a replica whose last completed handshake found
+     a classic master is refused with an error, before a journal is started and before anything is
+     sent to the master. Upstream sent `DFLY TAKEOVER` on the replication socket and read the next
+     streamed command as its reply, losing that command for good. A takeover from a Dragonfly
+     master, and `REPLTAKEOVER` on a master or an active node, are byte-identical.
    - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
      migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
      a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a

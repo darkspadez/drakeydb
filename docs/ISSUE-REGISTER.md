@@ -489,15 +489,16 @@ registration it leaves in `DbTable::watched_keys`, which the test counts across 
 the `CLIENT` consolidation in the re-review follow-up): each of the handlers above replies `No
 connection` (the error `CLIENT SETINFO` already gives) when its context has no connection, and
 `QUIT` replies `OK` and has nothing to close. The failed command is dropped and, inside an envelope,
-counted in `classic_apply_errors`; the link stays up and the commands around it apply. Eleven
+counted in `classic_apply_errors`; the link stays up and the commands around it apply. Twelve
 `// drakeydb: U-15` guards, over a shared `ReplyIfNoConnection` in `server_family.cc`: five in
 `server_family.cc` (`ServerFamily::Client`, once for every subcommand, then `Auth`, `Info`, `Hello`
-and `ReplConf`), five in `main_service.cc` (`Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch`)
-and one in `dflycmd.cc` (`DFLY THREAD`). The last two files are beyond what owner decision 26 named.
-The first fix had fourteen guards: the `CLIENT` consolidation removed the five per-subcommand ones
-and added one. Tests `ClassicNoConnectionTest.*` (one case per guarded handler, plus `Watch`, three
-`EVAL` cases, `REPLCONF GETACK` and the `CLIENT` subcommands that never crashed;
-`classic_replay_test.cc`), `ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver`,
+and `ReplConf`), five in `main_service.cc` (`Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch`),
+one in `dflycmd.cc` (`DFLY THREAD`) and one in `cluster_family.cc` (emulated `CLUSTER`, below). The
+last three files are beyond what owner decision 26 named. The first fix had fourteen guards: the
+`CLIENT` consolidation removed the five per-subcommand ones and added one. Tests
+`ClassicNoConnectionTest.*` (one case per guarded handler, plus `Watch`, three `EVAL` cases,
+`REPLCONF GETACK` and the `CLIENT` subcommands that never crashed; `classic_replay_test.cc`),
+`ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver`,
 `.ReplicatedWatchLeavesNoRegistrationBehind`, `.InfoInAnEnvelopeIsAnApplyErrorNotACrash` and
 `.EvalOfAConnectionCommandInAnEnvelopeIsAnApplyErrorNotACrash`, and
 `keydb_onboarding_test.py::test_classic_stream_info_command_does_not_abort` and
@@ -505,14 +506,32 @@ and added one. Tests `ClassicNoConnectionTest.*` (one case per guarded handler, 
 Pre-existing in upstream Dragonfly; not filed upstream. On the byte-identity exception list (spec,
 item 2).
 
-**Not changed, follow-up:** `DFLYCLUSTER FLOW` (`ClusterFamily::DflyMigrateFlow`) and, under
-`--cluster_mode=emulated`, `CLUSTER SLOTS|SHARDS|NODES` (`ClusterFamily::GetEmulatedShardInfo`)
-dereference `conn()` too, but only with cluster mode on, which is not the default; they were not
-probed. `GetEmulatedShardInfo` needs a design decision, not a guard: it answers with the address the
-client connected to. `DFLY FLOW` (`SetupFlowConnection`) dereferences it only once the master replid
-matches and a sync session in the preparation state is found, which only a real replica connection
-of this node creates, so a stream could hit it only inside that window, with a replid and a session
-id it has to guess.
+**Emulated `CLUSTER` (P7-1 close, 2026-10-05, adversarial finding I3).** Under
+`--cluster_mode=emulated`, `CLUSTER INFO`, `SLOTS`, `NODES` and `SHARDS` answer with the address the
+client connected to (`ClusterFamily::GetEmulatedShardInfo`, via `GetShardInfos`), and on the apply
+context all four die with SIGSEGV in `facade::Connection::LocalBindAddress`, raw, inside an envelope,
+and as `EVAL "return redis.call('CLUSTER','INFO')"` (`CLUSTER` is script-callable). The adversarial
+pass reproduced them (`targeted_cluster.jsonl`); the earlier text here called them "not probed" and
+left out `CLUSTER INFO`. The narrowest guard closes them: `ClusterFamily::Cluster` replies `No
+connection` for those four subcommands when `IsClusterEmulated()` and `conn() == nullptr`, ahead of
+the dispatch on the subcommand. `HELP`, `MYID`, `KEYSLOT`, an unknown subcommand and every other
+cluster mode (answered from the config) are untouched, and a real client always has a connection.
+Tests `ClassicNoConnectionEmulatedClusterTest` instantiation `I3` (`ClusterInfo`, `ClusterSlots`,
+`ClusterNodes`, `ClusterShards`, `EvalClusterInfo`), the control
+`ClassicEmulatedClusterTest.ClientsAndConnectionlessSubcommandsStillAnswer`, and
+`keydb_onboarding_test.py::test_classic_stream_emulated_cluster_query_does_not_abort` (8 cases).
+Falsified: without the guard each gtest case dies with SIGSEGV in `Connection::LocalBindAddress`
+(one process each) and every pytest case loses the replica with the same frame; with the condition
+flipped to `conn() != nullptr` the control fails (a real client's `CLUSTER INFO` gets `ERR No
+connection`).
+
+**Not changed, follow-up:** `DFLYCLUSTER FLOW` (`ClusterFamily::DflyMigrateFlow`) dereferences
+`conn()` too, but only with cluster mode on; the adversarial pass saw `DFLYCLUSTER CONFIG|FLOW`
+survive in the stream. `--cluster_mode=yes` was inconclusive there (the probe key got `MOVED`), and
+its `CLUSTER` answers come from the config. `DFLY FLOW` (`SetupFlowConnection`) dereferences it only
+once the master replid matches and a sync session in the preparation state is found, which only a
+real replica connection of this node creates, so a stream could hit it only inside that window, with
+a replid and a session id it has to guess.
 
 **A stream-boundary filter was considered and rejected.** The class could be closed once, by the
 dispatcher or `ConsumeRedisStream` refusing connection-bound commands for a context without a
@@ -569,6 +588,90 @@ scratchpad.
 no code written. Candidate fix: refuse blocking commands (`CO::BLOCKING`) on replicated contexts,
 or give them zero timeout semantics (try once, never wait). **Owner:** after P7, with the upstream
 sync.
+
+### U-17. A command that rewires the replica's own link, in a classic stream, aborts or stalls the replica
+
+**Where:** `ServerFamily::ReplicaOf` (serves `REPLICAOF` and `SLAVEOF`), `ServerFamily::AddReplicaOf`
+and `ServerFamily::ReplTakeOver` (`src/server/server_family.cc`), reached from
+`Replica::ConsumeRedisStream`'s dispatch of a raw command, or of the inner command of an RREPLAY
+envelope, on the apply context U-15 describes (no connection).
+
+`REPLICAOF NO ONE`, `SLAVEOF NO ONE` and `REPLICAOF <host> <port>` run `Replica::Stop` on the link
+they replace, which is the link the command arrived on. `Stop` joins the replication fiber, and that
+fiber is the one running the command: `fiber_interface.cc:373 Check failed: active != this`
+(`Replica::Stop <- ServerFamily::ReplicaOfNoOne <- DispatchCommand <- ConsumeRedisStream`), a SIGABRT
+in release builds too. On a peer (`--active_replica`) node the same abort comes through `REPLICAOF NO
+ONE` and `REPLICAOF REMOVE <this link's master>`. A raw `REPLTAKEOVER` parks the replication fiber on
+the master socket the fiber reads itself, for the takeover timeout plus 10 s (a classic master never
+answers): the link stays `up` and nothing more applies. `ADDREPLICAOF` does not crash, but opens a
+second link to a master the stream chose. No stock master propagates any of them (none is a write
+command), so only a hostile or broken master sends them. The raw path is upstream's; P7-1's envelope
+path is a second way in.
+
+**How established:** the P7-1 adversarial pass (findings I1, I2), a scripted master, raw and
+enveloped. For the fix, `keydb_onboarding_test.py::test_classic_stream_link_command_does_not_abort`
+without the guards: all 12 `REPLICAOF`/`SLAVEOF` cases (plain replica: `REPLICAOF NO ONE`, `SLAVEOF NO
+ONE`, `REPLICAOF <reachable>`; peer node: `NO ONE`, `SLAVEOF NO ONE`, `REPLICAOF REMOVE <master>`; raw
+and in an envelope) die with `Check failed: active != this`, and both `ADDREPLICAOF` cases open a
+second connection to the master.
+
+**Status (2026-10-05): fixed in this fork** (P7-1 close, `8b860ea`): `ReplicaOf`, `AddReplicaOf` and
+`ReplTakeOver` reply `No connection` (U-15's `ReplyIfNoConnection`) as their first statement when the
+context has no connection. The command is dropped and, inside an envelope, counted in
+`classic_apply_errors`; the link stays up, the offset is exact and the commands around it apply.
+Three `// drakeydb: U-17` guards, all in `server_family.cc`. Unaffected: the `--replicaof` boot path
+(`ServerFamily::Replicate` calls `ReplicaOfInternal` directly; pinned by the `[boot_replicaof]` cases
+of `test_plain_replica_of_active_keydb_expires_keys` and
+`test_dfly_master_that_says_active_replica_never_turns_replica_expiry_on`) and every client-issued
+command (a client has a connection). `REPLICAOF` is not callable from a script. Tests
+`ClassicNoConnectionTest` instantiation `U17` (`ReplicaofNoOne`, `SlaveofNoOne`, `ReplicaofHost`,
+`SlaveofHost`, `ReplicaofRemove`, `Addreplicaof`, `ReplTakeover`, `ReplTakeoverSave`) and the pytest
+above (16 cases). Falsified: without the guards the 8 gtests and 15 of the 16 pytest cases fail; the
+raw `REPLTAKEOVER` case passes while U-18's refusal is in place, and with both removed both
+`REPLTAKEOVER 30` cases fail (`b` never arrives). So on a classic link the `ReplTakeOver` guard pins
+the reply, and covers contexts that are not a classic stream (`JournalExecutor`), rather than being
+the only thing between the stream and the stall. Pre-existing in upstream Dragonfly (the raw path);
+not filed upstream. On the byte-identity exception list (spec, item 2).
+
+### U-18. A client `REPLTAKEOVER` on a replica of a classic master consumes replication stream bytes
+
+**Where:** `ServerFamily::ReplTakeOver` -> `Replica::TakeOver` (`src/server/replica.cc`), which sends
+`DFLY TAKEOVER <timeout> <session id>` on the master socket and reads the reply from it with the
+shared parser.
+
+On a classic link that socket is the replication stream, which `ConsumeRedisStream` reads too, and a
+classic master never answers a replica's command (KeyDB, Redis and Valkey discard them). So the
+"reply" `TakeOver` reads is whatever the master streams next: that command is applied nowhere, the
+replica's offset stays behind by its bytes for good, the link stays `up`, and the master lists the
+replica `online lag 0`. Silent, permanent divergence; the client sees `Couldn't execute takeover: Bad
+message`, or waits out the timeout against an idle master. Before that, `StartJournalAtOwnLSN` has
+already started a journal on a node that stays a replica. Operator-triggered, but it is the natural
+cutover command for an operator moving off KeyDB.
+
+**How established:** the P7-1 adversarial pass (finding C2, `takeover_load.py`): an active KeyDB
+taking ~1.5k `INCR`/s while a client ran `REPLTAKEOVER` on the replica; every takeover failed with
+`Bad response to "DFLY TAKEOVER 0 ": "*5 RREPLAY ... INCRBY ctr 1 ..."`, and the replica lost 8 writes
+(32 against a stock KeyDB master). For the fix, the pytest without the refusal: the replica logs `Bad
+response to "DFLY TAKEOVER 1 ": "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n"`, the streamed `SET b 2`
+read as the reply.
+
+**Status (2026-10-05): fixed in this fork** (P7-1 close, `8b860ea`): `ReplTakeOver` refuses with
+`REPLTAKEOVER is not supported on a replica of a classic (Redis protocol) master` when
+`replica_->GetSummary().classic_link` (the protocol of the last completed `Greet()`), and sends nothing
+to the master. The check comes after `IsMaster()` (an idempotent `OK` on a master) and before
+`StartJournalAtOwnLSN`, so a refused takeover starts no journal. One `// drakeydb: U-18` hunk in
+`server_family.cc`. A takeover from a Dragonfly master is unchanged: the DFLY takeover tests
+(`replication_resilience_test.py` `test_take_over_*`, `test_double_take_over`,
+`multimaster_test.py::test_active_node_admits_fork_consumers_refuses_others_and_takeover`,
+`cluster_test.py::test_replica_takeover_moved`; 14 runs) pass. A link whose first `Greet()` never
+completed reads `classic_link` false and still gets upstream's `Full sync not done` (not reachable once
+`REPLICAOF` returned `OK`: `Start()` greets first). Test
+`keydb_onboarding_test.py::test_client_repltakeover_on_a_replica_of_a_classic_master_is_refused` (a
+scripted master silent to `DFLY`, as KeyDB is: the error names `REPLTAKEOVER` and "classic", no `DFLY`
+request reaches the master, the later `SET b 2` applies, the ACK offset is exact, one connection, role
+`slave`, link `up`). Falsified: refusal removed -> `Couldn't execute takeover: Bad message`. Not re-run
+against real KeyDB after the fix. Pre-existing in upstream Dragonfly; not filed upstream. On the
+byte-identity exception list (spec, item 2).
 
 ---
 
