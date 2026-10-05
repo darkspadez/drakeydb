@@ -4169,7 +4169,9 @@ void ServerFamily::Role(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
   // replication fiber to end, and a command streamed by a classic master runs on that fiber, in a
   // context with no connection (ReplyIfNoConnection). Taking the mutex from there deadlocks both:
   // the fiber never ends and the REPLICAOF never replies. Refused before the lock, as are DEBUG
-  // REPLICA and DEBUG REPLDIAG (debugcmd.cc), the other commands that take it.
+  // REPLICA and DEBUG REPLDIAG (debugcmd.cc), the other handlers that take it and had no guard yet
+  // (INFO, CLIENT LIST/KILL, REPLCONF, REPLICAOF, SLAVEOF, ADDREPLICAOF, REPLTAKEOVER and the
+  // emulated CLUSTER take it behind the U-15/U-17 guards).
   if (ReplyIfNoConnection(cmd_cntx))
     return;
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());

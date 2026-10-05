@@ -133,6 +133,13 @@ class FakeClassicMaster:
             writer.close()
 
     @property
+    def stream_writer(self):
+        """The connection send_stream() writes into: the one that was last answered a PSYNC and is
+        still open, None before that and once it closed. A test that needs the replica back in the
+        stream (after drop_connections(), say) polls for it not being None."""
+        return self._stream_writer
+
+    @property
     def psync_requests(self):
         return [r for r in self.requests if r and r[0].upper() in ("PSYNC", "SYNC")]
 

@@ -1499,7 +1499,7 @@ TEST_F(ClassicApplyFamilyTest, DflymigrateAckWithoutAClusterConfigIsUnknownMigra
 // `DFLYMIGRATE` alone is allowed by its arity. The handler read a subcommand that is not there and
 // left the parser's error unchecked, which a debug build's parser destructor asserts on.
 TEST_F(ClassicApplyFamilyTest, BareDflymigrateIsAnErrorNotAnAbort) {
-  EXPECT_THAT(Run({"dflymigrate"}), ErrArg(""));
+  EXPECT_THAT(Run({"dflymigrate"}), ErrArg("syntax error"));
 
   OnLink([&](Link& link) { EXPECT_TRUE(DispatchRaw(link, Resp({"DFLYMIGRATE"})).has_value()); });
 }

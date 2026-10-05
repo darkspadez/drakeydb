@@ -1241,7 +1241,7 @@ async def test_classic_stream_debug_replica_pause_does_not_strand_the_link(
             assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
             info = await c.info("replication")
             assert info["master_link_status"] == "up", info
-            assert master._stream_writer is not None
+            assert master.stream_writer is not None
 
         await streaming_again()
         await master.send_stream(set_c)

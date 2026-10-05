@@ -613,7 +613,11 @@ OpResult<uint32_t> OpAdd(const OpArgs& op_args, std::string_view key, const NewE
   }
 
   if (co.Encoding() != kEncodingIntSet) {
-    res = StringSetWrapper{co, op_args.db_cntx}.Add(vals, UINT32_MAX, false);
+    // drakeydb: P7-1 (decision 40) -- `+=`, upstream assigned. Reached with res > 0 when the intset
+    // above was converted mid-call (overflow or a non-integer): the integers it had already added
+    // are in the string set now, so Add() counts only the rest of the call and the two sum to the
+    // new members. Assigning replied the remainder alone (300 integers to a new key: 43).
+    res += StringSetWrapper{co, op_args.db_cntx}.Add(vals, UINT32_MAX, false);
   }
 
   // drakeydb: Phase 4, P4-1 Task 8 fix round 2 (F3), corrected round 3 -- arm before journaling,
