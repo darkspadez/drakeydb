@@ -1486,16 +1486,51 @@ async def test_classic_stream_sort_store_of_an_unsortable_source_does_not_abort(
 #           one's key is a list, not a string)
 #   ln      a list with duplicates; ldup, lalpha, lodd... the converged forms of the adversarial pass
 #
-# Left out on purpose: a list holding "1e400". A numeric SORT of it leaves errno at ERANGE, which
-# Redis 7.0 and KeyDB 6.3.4 never reset before the next strtod, so every numeric SORT after it
-# fails with "can't be converted" until some syscall changes errno (checked on both servers): a
-# state of the master's process that no replica shares.
+# A list holding "1e400" (lerange) is sorted by the reply test alone, and last. A numeric SORT of
+# it leaves errno at ERANGE, which Redis 7.0 and KeyDB 6.3.4 never reset before the next strtod, so
+# every numeric SORT after it fails with "can't be converted" until some syscall changes errno
+# (checked on both servers): a state of the master's process that no replica shares. A failing SORT
+# is never replicated, so the replication test never sorts it.
 #
-# Left out on purpose: an ALPHA BY tie. KeyDB leaves equal weights in the order its own sort
-# received the elements (a list's order, a set's hash order, which differs between two KeyDB
-# processes), which no replica can reproduce; drakeydb breaks such a tie on the element (D-34's
-# residual). A test of it against KeyDB could only be flaky, and one that asserts the divergence
-# would pin a defect, so the rule is covered by gtests alone (GenericSortOrderTest).
+# ALPHA BY ties (decision 37): KeyDB's full sort is libc qsort, a stable mergesort in glibc, so tied
+# weights keep the order the elements were fetched in, and the forms over a list (ldup, ml, bl) and
+# over an integer set KeyDB holds as an intset (ids, si300, si512: ascending numeric order) are in
+# the lists below, DESC included. Left out on purpose: a tie over a set KeyDB holds as a hash set (a
+# per-process order, two KeyDB processes differ), over a zset, over more than 512 integers, and
+# under a LIMIT that cuts a BY sort (KeyDB's pqsort is deterministic but not stable, not ported):
+# KeyDB's own answer is not reproducible or not ours, and a test that asserts the divergence would
+# pin a defect. drakeydb breaks those ties on the element, which GenericSortOrderTest covers.
+#
+# Round 2a adds, each under its own comment below: LIMIT clamped as Redis does (and refused where
+# Redis refuses), several '*' in a pattern, GET of nothing (nil in a reply), the ALPHA BY ties
+# above, a zset with equal scores, and numbers with a NUL.
+
+
+def sort_ties_data():
+    """Data that is too long to write out: the 2000-element list of the SORT review's tie probe
+    (weights DE, FR, US and "", a hundred missing), and all-integer sets of 300 and 512 members
+    (an intset in KeyDB up to 512, a dense set in drakeydb past 256) in an order no iteration of
+    them follows by luck."""
+    rng = random.Random(7)
+    elements = [f"u{rng.randrange(10**6):06d}" for _ in range(2000)]
+    unique = sorted(set(elements))
+    missing = set(rng.sample(unique, 100))
+    weights = []
+    for element in unique:
+        if element not in missing:
+            weights += [f"cw_{element}", rng.choice(["DE", "FR", "US", ""])]
+
+    def integers(n):
+        return [str(int((i * 7919) % n) * 13 - 1000) for i in range(n)]
+
+    return [
+        ("RPUSH", "bl", *elements),
+        ("MSET", *weights),
+        ("SADD", "si300", *integers(300)),
+        ("SADD", "si512", *integers(512)),
+    ]
+
+
 SORT_ORDER_DATA = [
     ("SADD", "s", *"jihgfedcba"),
     *[("SET", f"w_{ch}", "2" if ch == "a" else "1") for ch in "abcdefghij"],
@@ -1528,6 +1563,49 @@ SORT_ORDER_DATA = [
     ("RPUSH", "lhex", "0x1A", "2"),
     ("RPUSH", "words", "b", "a"),
     ("SET", "str", "x"),
+    # GET: g is a list; go_1 is a string, go_2 is missing, go_3 is the empty string, go_4 is a hash
+    ("RPUSH", "g", *"1234"),
+    ("SET", "go_1", "first"),
+    ("SET", "go_3", ""),
+    ("HSET", "go_4", "f", "v"),
+    ("SET", "gfixed", "FIXED"),
+    *[("SET", f"gw_{e}", w) for e, w in zip("1234", "4321")],
+    ("ZADD", "gz", 4, "1", 3, "2", 2, "3", 1, "4"),
+    # more than one '*': the pattern's first is substituted, the rest are literal keys
+    ("RPUSH", "m", *"123"),
+    *[
+        command
+        for e, w in zip("123", "321")
+        for command in (
+            ("SET", f"ws_{e}_*", w),
+            ("SET", f"wd_{e}*", w),
+            ("SET", f"gh_{e}*", f"S{e}"),
+        )
+    ],
+    # ALPHA BY ties: ml is a list (weights m, m, missing, "", m), ids an integer set whose name_9
+    # sorts first; inw_* weighs every member 1 (a numeric BY tie)
+    ("RPUSH", "ml", *"qprst"),
+    ("SET", "mw_q", "m"),
+    ("SET", "mw_p", "m"),
+    ("SET", "mw_s", ""),
+    ("SET", "mw_t", "m"),
+    ("SADD", "ids", "30", "2", "10", "1", "200", "9"),
+    *[("SET", f"name_{e}", "same") for e in ("30", "2", "10", "1", "200")],
+    ("SET", "name_9", "aaa"),
+    *[("SET", f"inw_{e}", "1") for e in ("30", "2", "10", "1", "200", "9")],
+    # a zset with equal scores, and one under numeric BY weights with ties and a missing one
+    ("ZADD", "ze", 1, "c", 1, "a", 1, "b", 1, "d", 1, "e"),
+    ("ZADD", "zq", 1, "x", 2, "y", 3, "z", 4, "w", 5, "v"),
+    *[("SET", f"zqw_{e}", w) for e, w in zip("xyzw", "1101")],
+    # a NUL ends a number for strtod ("5\0x" is 5, "\0" is 0)
+    ("RPUSH", "lnul", "5\x00x", "3", "\x007", "2\x00"),
+    ("RPUSH", "lw2", *"abc"),
+    ("SET", "wn_a", "5\x00x"),
+    ("SET", "wn_b", "3"),
+    ("SET", "wn_c", "\x00"),
+    # a number out of range: the last form of the reply test (see SORT_ORDER_LAST_FORMS)
+    ("RPUSH", "lerange", "1e400", "3"),
+    *sort_ties_data(),
 ]
 
 # (source, options): run as `SORT <source> <options>` and, with `STORE <dst>`, as a stored sort.
@@ -1585,13 +1663,102 @@ SORT_ORDER_FORMS = [
     ("lalpha", "ALPHA DESC"),
     ("ldup", "ALPHA"),
     ("s", "ALPHA"),
+    # LIMIT as Redis clamps it: a negative offset is 0, a negative count is the rest (decision 36)
+    ("ln", "LIMIT 0 -1"),
+    ("ln", "LIMIT -5 3"),
+    ("ln", "LIMIT 2 -1"),
+    ("ln", "LIMIT 99 1"),
+    ("ln", "LIMIT -1 -1"),
+    ("ln", "LIMIT 2 99999999999"),
+    ("ln", "LIMIT 0 9223372036854775807"),
+    ("ln", "LIMIT -9223372036854775808 2"),
+    ("ln", "DESC LIMIT 1 -1"),
+    ("ln", "ALPHA LIMIT -2 3"),
+    ("zl", "BY nosort DESC LIMIT -2 3"),
+    ("zl", "BY nosort LIMIT 2 -1"),
+    ("z", "BY nosort DESC LIMIT 1 -1"),
+    ("s", "BY w_* LIMIT 2 -1"),
+    ("s", "BY w_* DESC LIMIT -1 3"),
+    ("s", "ALPHA LIMIT -1 4"),
+    # ... and refused as Redis refuses it (decisions 36 and 38): the same error, and a stored sort
+    # leaves its destination as it was, on KeyDB and so on the replica
+    ("ln", "LIMIT +1 2"),
+    ("ln", "LIMIT 01 2"),
+    ("ln", "LIMIT 1 +2"),
+    ("ln", "LIMIT -0 2"),
+    ("ln", "LIMIT 0 99999999999999999999"),
+    ("ln", "LIMIT 9223372036854775808 1"),
+    # only the first '*' of a pattern is substituted (decision 36)
+    ("m", "BY ws_*_*"),
+    ("m", "BY ws_*_* DESC"),
+    ("m", "BY wd_**"),
+    ("m", "BY wd_** GET #"),
+    ("m", "GET gh_**"),
+    ("m", "GET gh_* GET gh_**"),
+    ("m", "BY nostar"),
+    # GET of a missing or non-string key, or with a pattern without '*': nil in a reply, "" stored
+    ("g", "GET go_*"),
+    ("g", "GET # GET go_*"),
+    ("g", "GET gfixed"),
+    ("g", "BY gw_* GET go_*"),
+    ("g", "BY nosort GET gfixed"),
+    ("g", "DESC GET go_*"),
+    ("gz", "BY nosort GET go_*"),
+    ("g", "GET go_* LIMIT 1 1"),
+    ("ml", "BY mw_* ALPHA GET mw_* GET #"),
+    ("ln", "GET nokey_*"),
+    ("s", "ALPHA GET # GET nokey_*"),
+    ("zl", "BY nosort DESC GET # GET h_*"),
+    # ALPHA BY ties keep the fetch order of a list or an integer set (decision 37): ldup and ml are
+    # lists, ids and the 300 and 512 members are intsets in KeyDB, bl is the review's 2000 elements
+    # (LIMIT 0 -1 does not cut the result, so KeyDB sorts it with its stable qsort as well)
+    ("ldup", "BY nokey_* ALPHA"),
+    ("ldup", "BY nokey_* ALPHA DESC"),
+    ("ml", "BY mw_* ALPHA"),
+    ("ml", "BY mw_* ALPHA DESC"),
+    ("ml", "BY mw_* ALPHA LIMIT 1 3"),
+    ("ml", "BY mw_* ALPHA DESC LIMIT 1 3"),
+    ("ids", "BY name_* ALPHA"),
+    ("ids", "BY name_* ALPHA DESC"),
+    ("ids", "BY nokey_* ALPHA"),
+    ("ids", "BY nokey_* ALPHA DESC"),
+    ("ids", "BY name_* ALPHA LIMIT 1 3"),
+    ("si300", "BY nokey_* ALPHA"),
+    ("si300", "BY nokey_* ALPHA DESC"),
+    ("si512", "BY nokey_* ALPHA"),
+    ("si512", "BY nokey_* ALPHA DESC"),
+    ("bl", "BY cw_* ALPHA"),
+    ("bl", "BY cw_* ALPHA DESC"),
+    ("bl", "BY cw_* ALPHA LIMIT 0 -1"),
+    ("bl", "BY cw_* ALPHA DESC LIMIT -3 -1"),
+    # review M4: equal scores in a zset under BY nosort, numeric BY ties of a zset and of an intset
+    ("ze", "BY nosort"),
+    ("ze", "BY nosort DESC"),
+    ("ze", "BY nosort DESC LIMIT 1 2"),
+    ("ze", "BY nosort LIMIT 1 -1"),
+    ("zq", "BY zqw_*"),
+    ("zq", "BY zqw_* DESC"),
+    ("zq", "BY zqw_* LIMIT 1 3"),
+    ("ids", "BY inw_*"),
+    ("ids", "BY inw_* DESC"),
+    # a NUL ends a number, and a trailing space does not (decision 36): lsp is refused by both
+    ("lnul", ""),
+    ("lnul", "DESC"),
+    ("lw2", "BY wn_*"),
+    ("lw2", "BY wn_* DESC"),
+    ("lsp", ""),
 ]
 
-# Forms that run as stored sorts only, because their reply is not comparable:
-#   - BY nosort on a set: stored, it is sorted ALPHA ("1" "10" "2" ... for the intset), and so it is
-#     inside EVAL (below); as a plain reply the set has no order, in KeyDB either
-#   - GET of a key that does not exist replies nil in Redis and KeyDB, and the empty string here
-#     (a STORE keeps "" in both)
+# Forms of the reply test that must run after every other numeric SORT: a number out of range is
+# refused, and KeyDB (like Redis 7.0) then keeps errno at ERANGE, so every numeric SORT of a
+# non-integer value after it fails there until some syscall changes errno, a state no replica shares.
+SORT_ORDER_LAST_FORMS = [
+    ("lerange", ""),
+]
+
+# Forms that run as stored sorts only, because their reply is not comparable: BY nosort on a set is
+# sorted ALPHA when stored ("1" "10" "2" ... for the intset), and so it is inside EVAL (below); as a
+# plain reply the set has no order, in KeyDB either
 SORT_ORDER_STORE_ONLY_FORMS = [
     ("s", "BY nosort"),
     ("s", "BY nosort LIMIT 0 3"),
@@ -1600,9 +1767,6 @@ SORT_ORDER_STORE_ONLY_FORMS = [
     ("s", "BY nosort GET # GET h_*"),
     ("sn", "BY nosort"),
     ("sn", "BY nosort DESC"),
-    ("ln", "GET nokey_*"),
-    ("s", "ALPHA GET # GET nokey_*"),
-    ("zl", "BY nosort DESC GET # GET h_*"),
 ]
 
 # Run inside EVAL, where a set under BY nosort is sorted even without a STORE
@@ -1642,6 +1806,25 @@ async def sort_value(client, key):
     return kind, None
 
 
+async def shard_of(client, key):
+    """The shard of drakeydb that holds `key` (DEBUG OBJECT names it)."""
+    return int(re.search(r"shard:(\d+)", await client.execute_command("DEBUG", "OBJECT", key))[1])
+
+
+async def sort_placement(client, sources):
+    """(same, cross): how many of the stored sorts `sources` (destination -> source) left their
+    destination on the shard of their source, and how many on another one."""
+    same = cross = 0
+    for dst, source in sources.items():
+        if dst == source or not await client.exists(dst) or not await client.exists(source):
+            continue
+        if await shard_of(client, dst) == await shard_of(client, source):
+            same += 1
+        else:
+            cross += 1
+    return same, cross
+
+
 async def sort_replies(client, source, options, script=False):
     """The reply of `SORT <source> <options>` (inside EVAL with `script`), or its error."""
     args = options.split()
@@ -1660,16 +1843,26 @@ async def test_plain_replica_of_active_keydb_orders_sort_store_as_keydb_does(
 ):
     """Every `SORT .. STORE` an active KeyDB makes leaves the same list on a plain replica of one
     and of two shards: tied BY weights, a missing ALPHA BY weight, BY nosort on a set (and a list
-    and a zset under DESC and LIMIT), a count beyond uint32, a destination that is the source, one
-    on another shard than its source, and the forms that already converged in the adversarial pass
-    (missing, wrong-type and non-numeric sources, odd numbers). The stored sorts also run inside
-    MULTI and EVAL. Every key of KeyDB's keyspace is compared, type and order, after the replica has
-    caught up (a marker written last arrives last).
+    and a zset under DESC and LIMIT), a count beyond uint32, a destination that is the source, and
+    the forms that already converged in the adversarial pass (missing, wrong-type and non-numeric
+    sources, odd numbers). Round 2a adds LIMIT with a negative or 64-bit argument (and the spellings
+    Redis refuses, which no replica ever sees), several '*', GET of nothing, ALPHA BY ties over a
+    list and an integer set (the review's 2000 elements, DESC included), equal zset scores and a NUL
+    in a number. The stored sorts also run inside MULTI and EVAL. Every key of KeyDB's keyspace is
+    compared, type and order, after the replica has caught up (a marker written last arrives
+    last), and the replica must not have counted an apply error: KeyDB replicates only what it
+    ran, so every SORT it sends is one the replica must run too.
+
+    With two shards the destinations are asserted to fall on both sides of their source's shard
+    (DEBUG OBJECT names it): some stored sorts are a same-shard SORT the replica re-runs verbatim,
+    some a cross-shard one.
 
     Falsifying (ISSUE-REGISTER D-34, each reverted in turn): a tie under BY broken on the weight
     again leaves the tied BY forms in the replica's set order; no forced sort for a stored set
     under BY nosort leaves its iteration order; DESC ignored on the list and zset walk leaves them
-    ascending; the missing-weight bit ignored puts a missing weight after the empty one.
+    ascending; the missing-weight bit ignored puts a missing weight after the empty one. Round 2a:
+    a LIMIT parsed as uint32 fails the clamped forms on the replica (dst stays as it was); a
+    tie-break on the element instead of the fetch order reorders the list and intset ties.
     """
     keydb = keydb_server_factory(active_replica=True)
     node, c = await attach_plain_replica(df_factory, tmp_path, keydb, num_shards=shards)
@@ -1677,6 +1870,7 @@ async def test_plain_replica_of_active_keydb_orders_sort_store_as_keydb_does(
     async with keydb.client() as k:
         await load_sort_order_data(k)
         stored = {}  # key -> what was stored into it, for the failure message
+        sources = {}  # key -> the source of the sort that stored into it
 
         async def store(dst, form, *command):
             """Runs a stored sort on KeyDB over a destination that held a string; an error reply
@@ -1686,6 +1880,7 @@ async def test_plain_replica_of_active_keydb_orders_sort_store_as_keydb_does(
             with contextlib.suppress(redis.exceptions.ResponseError):
                 await k.execute_command(*command)
             stored[dst] = form
+            sources[dst] = command[1]
 
         for source, options in SORT_ORDER_FORMS + SORT_ORDER_STORE_ONLY_FORMS:
             dst = f"dst:{len(stored)}"
@@ -1744,7 +1939,14 @@ async def test_plain_replica_of_active_keydb_orders_sort_store_as_keydb_does(
         assert not diverged, "\n".join(diverged)
         info = await c.info("replication")
         assert info["role"] == "slave" and info["master_link_status"] == "up", info
+        assert info.get("classic_apply_errors", 0) == 0, info
         assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+        if shards == 2:
+            same, cross = await sort_placement(c, sources)
+            assert same >= 5 and cross >= 5, (
+                f"{same} stored sorts have their destination on their source's shard and {cross} "
+                "on another one: the test would not exercise both ways of applying a SORT"
+            )
 
 
 @pytest.mark.keydb
@@ -1756,10 +1958,13 @@ async def test_sort_replies_in_the_order_keydb_does(
     shards as from a standalone KeyDB holding the same data: not only what a stored sort leaves
     (the test above) but what a client is told. The same forms run inside EVAL, where a set under
     BY nosort is sorted even without STORE. A set under plain `BY nosort` has no order in either
-    server: it is compared as a set.
+    server: it is compared as a set. Round 2a's forms are in the list too, so the replies agree
+    where a stored list does: LIMIT clamped (and refused) as Redis does, several '*', a GET of
+    nothing (nil here as there), ALPHA BY ties over a list and an integer set.
 
     Falsifying: as the test above, and with the script check always false (a set under BY nosort
-    inside EVAL keeps its iteration order) the EVAL forms differ.
+    inside EVAL keeps its iteration order) the EVAL forms differ; GET of a missing key replying ""
+    again differs on every GET form that reads one.
     """
     keydb = keydb_server_factory(active_replica=False)
     node = df_factory.create(proactor_threads=2, num_shards=shards, dir=str(tmp_path / "df"))
@@ -1786,7 +1991,89 @@ async def test_sort_replies_in_the_order_keydb_does(
             got = sorted(await sort_replies(c, source, options))
             if expected != got:
                 differing.append(f"SORT {source} {options}: KeyDB {expected}, drakeydb {got}")
+        for source, options in SORT_ORDER_LAST_FORMS:
+            expected = await sort_replies(k, source, options)
+            got = await sort_replies(c, source, options)
+            if expected != got:
+                differing.append(f"SORT {source} {options}: KeyDB {expected}, drakeydb {got}")
         assert not differing, "\n".join(differing)
+
+
+async def resp3_replies(port, *commands):
+    """The raw bytes of the reply to each command, on a connection that has spoken HELLO 3.
+
+    redis-py hands a RESP3 set (`~`) back as a list, so the type on the wire is read off the bytes.
+    Each reply is cut off by the reply to an ECHO of a marker sent right behind its command.
+    """
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+    async def exchange(command):
+        marker = f"end-{random.getrandbits(64):x}"
+        writer.write(resp_command(*command) + resp_command("ECHO", marker))
+        await writer.drain()
+        tail = f"${len(marker)}\r\n{marker}\r\n".encode()
+        data = b""
+        while not data.endswith(tail):
+            chunk = await asyncio.wait_for(reader.read(65536), timeout=10)
+            assert chunk, f"the connection closed after {data!r}"
+            data += chunk
+        return data[: -len(tail)]
+
+    try:
+        assert (await exchange(("HELLO", "3"))).startswith(b"%")
+        return [await exchange(command) for command in commands]
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.parametrize("shards", [1, 2])
+async def test_sort_replies_an_array_in_resp3(df_factory: DflyInstanceFactory, tmp_path, shards):
+    """In RESP3 `SORT` and `SORT_RO` reply an array (`*`) whatever they sort, a set and a zset
+    included, as Redis and KeyDB do (checked live on both: `*` for every form below, and `_` for a
+    nil GET value); drakeydb used to send a set (`~`) for a set or a zset source, a type that tells
+    a RESP3 client the order it was given means nothing. A nil GET value is the RESP3 null.
+
+    Falsifying: with the reply built as a SET collection again, the set and zset forms start with
+    `~`.
+    """
+    node = df_factory.create(proactor_threads=2, num_shards=shards, dir=str(tmp_path / "df"))
+    node.start()
+    c = node.client()
+    await c.sadd("s", "b", "a", "c")
+    await c.zadd("z", {"x": 1, "y": 2})
+    await c.rpush("l", "2", "1", "3")
+    for key, value in (("w_a", "3"), ("w_b", "2"), ("w_c", "1")):
+        await c.set(key, value)
+
+    forms = [
+        ("s", "ALPHA"),
+        ("s", "ALPHA LIMIT 0 2"),
+        ("s", "BY w_*"),
+        ("s", "BY nosort"),
+        ("s", "BY nosort LIMIT 0 2"),
+        ("s", "ALPHA GET #"),
+        ("z", "ALPHA"),
+        ("z", "BY nosort"),
+        ("z", "BY nosort GET #"),
+        ("z", "BY nosort DESC LIMIT 0 1"),
+        ("l", ""),
+        ("l", "BY w_*"),
+    ]
+    commands = [
+        (name, source, *options.split())
+        for name in ("SORT", "SORT_RO")
+        for source, options in forms
+    ]
+    for command, raw in zip(commands, await resp3_replies(node.port, *commands)):
+        assert raw.startswith(b"*"), f"{' '.join(command)} replied {raw[:40]!r}, not an array"
+
+    (nil_get,) = await resp3_replies(node.port, ("SORT", "s", "ALPHA", "GET", "nokey_*"))
+    assert nil_get == b"*3\r\n_\r\n_\r\n_\r\n", nil_get
+    (script,) = await resp3_replies(
+        node.port, ("EVAL", "return redis.call('SORT', KEYS[1], 'ALPHA')", 1, "s")
+    )
+    assert script.startswith(b"*3\r\n"), script
 
 
 @pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
