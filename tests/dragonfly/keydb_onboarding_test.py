@@ -19,6 +19,7 @@ import shutil
 import statistics
 import subprocess
 import time
+from types import SimpleNamespace
 
 import psutil
 import pytest
@@ -2452,12 +2453,15 @@ SMOKE_OPS_PER_S = 5000
 STEADY_TRIM = 2
 MB = 1 << 20
 # The bar's second half (spec D-12): drakeydb's max lag within COMPARATOR_FACTOR times of a KeyDB
-# active replica's on the same load, or COMPARATOR_FLOOR over it where that is more (see
-# comparator_bound).
+# active replica's on the same load, or a floor over it where that is more (see comparator_bound).
+# The floor is COMPARATOR_FLOOR or COMPARATOR_SKEW_S of the master's output, whichever is larger:
+# 1 MB was about 35-40 ms of the 25-30 MB/s that the first campaign measured, and the noise it
+# absorbs grows with the rate (see comparator_floor).
 COMPARATOR_FACTOR = 1.5
 COMPARATOR_FLOOR = MB
-# The share of the writes KeyDB was offered that a drakeydb replica must have unwrapped from an
-# RREPLAY envelope: every write of an active KeyDB goes out in one.
+COMPARATOR_SKEW_S = 0.04
+# The share of the writes KeyDB executed that a drakeydb replica must have unwrapped from an
+# RREPLAY envelope by the time it has drained: every write of an active KeyDB goes out in one.
 ENVELOPE_SHARE = 0.9
 
 
@@ -2466,8 +2470,11 @@ def perf_mode():
     return os.environ.get("DRAKEYDB_PERF", "").strip().lower() in ("1", "true", "yes")
 
 
-def require_perf_box(df_factory):
-    """Fails a DRAKEYDB_PERF=1 run that cannot be the release bar, and says why."""
+def require_perf_box(df_factory, starts_drakeydb):
+    """Fails a DRAKEYDB_PERF=1 run that cannot be the release bar, and says why.
+
+    The binary is only looked at for a run that starts a drakeydb: one with a KeyDB for its replica
+    starts none, and does not care what DRAGONFLY_PATH is."""
     cpus = set(KEYDB_CPUS + REPLICA_CPUS + LOADER_CPUS)
     allowed = os.sched_getaffinity(0)
     if not cpus <= allowed:
@@ -2478,8 +2485,13 @@ def require_perf_box(df_factory):
     if shutil.which("redis-benchmark") is None:
         pytest.fail("DRAKEYDB_PERF=1 needs redis-benchmark on PATH")
     binary = os.path.realpath(df_factory.params.path)
-    if "build-dbg" in binary:
-        pytest.fail(f"DRAKEYDB_PERF=1 is the release bar and {binary} is a debug build")
+    # A heuristic, and the only one: it is the path of the repo's debug build tree, so a debug
+    # binary built elsewhere passes.
+    if starts_drakeydb and "build-dbg" in binary:
+        pytest.fail(
+            f"DRAKEYDB_PERF=1 is the release bar and {binary} looks like a debug build (its path "
+            "contains 'build-dbg', which is all that is checked)"
+        )
 
 
 @pytest.fixture
@@ -2493,12 +2505,24 @@ def restore_cpu_affinity():
     os.sched_setaffinity(0, before)
 
 
-def comparator_bound(comparator_max_lag):
-    """The largest max lag (bytes) drakeydb may show when a KeyDB replica's was `comparator_max_lag`:
-    COMPARATOR_FACTOR times it, or COMPARATOR_FLOOR over it where that is more. Two INFOs read a few
-    milliseconds apart skew a lag by about that much (see summarise), which would otherwise turn two
-    lags of a few hundred KB into a ratio of 2."""
-    return max(COMPARATOR_FACTOR * comparator_max_lag, comparator_max_lag + COMPARATOR_FLOOR)
+def comparator_floor(produce_bytes_per_s):
+    """The least margin (bytes) comparator_bound leaves over a KeyDB replica's max lag, on a load
+    whose master writes `produce_bytes_per_s`: COMPARATOR_FLOOR, or COMPARATOR_SKEW_S of that
+    output where it is more. Two INFOs read a few milliseconds apart skew a lag by the output of
+    those milliseconds (see summarise), so the noise of the comparison grows with the master's
+    rate, and a floor of fixed size would be a smaller share of it on a faster box."""
+    return max(COMPARATOR_FLOOR, COMPARATOR_SKEW_S * produce_bytes_per_s)
+
+
+def comparator_bound(comparator_max_lag, produce_bytes_per_s):
+    """The largest max lag (bytes) drakeydb may show when a KeyDB replica's was `comparator_max_lag`
+    on a load whose master wrote `produce_bytes_per_s`: COMPARATOR_FACTOR times it, or
+    comparator_floor over it where that is more. The floor keeps INFO-sampling noise from turning
+    two lags of a few hundred KB into a ratio of 2."""
+    return max(
+        COMPARATOR_FACTOR * comparator_max_lag,
+        comparator_max_lag + comparator_floor(produce_bytes_per_s),
+    )
 
 
 def pin_threads(pid, cpus, spread_proactors=False):
@@ -2586,7 +2610,8 @@ class BackgroundTask:
 
     One that dies by itself leaves what it died of in `error`: stop() runs in a `finally`, where an
     exception would skip the other stop and replace the failure being handled. The run asserts on
-    `error` once the window is over."""
+    `error` once the window is over. A cancellation of the caller of stop() is not an outcome of
+    the task and still propagates."""
 
     def __init__(self):
         self.task = None
@@ -2599,12 +2624,11 @@ class BackgroundTask:
         if self.task is None:
             return
         self.task.cancel()
-        try:
-            await self.task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:  # it died before the cancel
-            self.error = e
+        # Unlike `await self.task`, this raises CancelledError only when the caller is cancelled:
+        # the task's own cancellation, which is the one stop() asked for, is not raised here.
+        await asyncio.wait([self.task])
+        if not self.task.cancelled() and (died := self.task.exception()):  # before the cancel
+            self.error = died
 
 
 class CappedLoad(BackgroundTask):
@@ -2674,6 +2698,39 @@ class ReplicationProbe(BackgroundTask):
         return {"n": len(delays), "p50": quantile(0.5), "p99": quantile(0.99), "max": quantile(1)}
 
 
+def count_writes(stats):
+    """The writes KeyDB has executed, from its INFO commandstats: the SETs and INCRs of the load.
+    An active KeyDB rewrites INCR into the INCRBY it replicates, and counts it as that."""
+    return sum(
+        stats.get(f"cmdstat_{name}", {}).get("calls", 0) for name in ("set", "incr", "incrby")
+    )
+
+
+async def read_totals(master, replica):
+    """The writes `master` has executed so far and the envelopes `replica` has unwrapped (None for
+    one that reports no such counter: a KeyDB, or a drakeydb that took a raw stream)."""
+    writes = count_writes(await master.info("commandstats"))
+    return {
+        "writes": writes,
+        "envelopes": (await replica.info("replication")).get("rreplay_unwrapped"),
+    }
+
+
+def assert_envelopes_unwrapped(writes, envelopes, summary):
+    """Asserts that the envelope path ran: that a replica which has drained has taken apart about
+    one RREPLAY envelope for each of the `writes` KeyDB executed over the run, ENVELOPE_SHARE of
+    them at least. `envelopes` is None for a replica whose INFO has no such counter.
+
+    The totals do not depend on the rate the replica kept up at, which the run's own bounds judge:
+    a slow replica that drains has unwrapped as many as a fast one. A replica that took a raw
+    stream keeps up too, and must not pass for this one."""
+    assert envelopes is not None, f"the replica reports no rreplay_unwrapped: {summary}"
+    assert envelopes >= ENVELOPE_SHARE * writes, (
+        f"the replica unwrapped {envelopes} envelopes for the {writes} writes KeyDB executed "
+        f"(at least {ENVELOPE_SHARE:.0%} are expected): {summary}"
+    )
+
+
 async def take_sample(started, master, replica, cpu_sources):
     """One reading of both servers, taken concurrently. Each time stamp is the middle of its own
     request: under load a server can take milliseconds to answer."""
@@ -2698,10 +2755,7 @@ async def take_sample(started, master, replica, cpu_sources):
         "tr": tr,
         "m": int(m["master_repl_offset"]),
         "r": int(r["slave_repl_offset"]),
-        # An active KeyDB rewrites INCR into the INCRBY it replicates, and counts it as that.
-        "ops": sum(
-            stats.get(f"cmdstat_{name}", {}).get("calls", 0) for name in ("set", "incr", "incrby")
-        ),
+        "ops": count_writes(stats),
         # drakeydb counts the envelopes it applied; KeyDB has no such field.
         "envelopes": r.get("rreplay_unwrapped"),
         "cpu": {name: source() for name, source in cpu_sources.items()},
@@ -2822,14 +2876,15 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
     - "drakeydb_raw": a plain drakeydb replica of the plain KeyDB, whose raw stream it squashes.
 
     Samples both offsets once a second, times the drain from the moment the load is dead, then
-    checks that the link held, and that the keys match. With `bar` it also asserts the absolute
-    bounds of spec D-12; the comparison with a KeyDB replica needs two runs (see
+    checks that the link held, that a "drakeydb" replica unwrapped about one envelope for every
+    write, and that the keys match. With `bar` it also asserts the absolute bounds of spec D-12;
+    the comparison with a KeyDB replica needs two runs (see
     test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica). Returns the numbers. The KeyDBs it
     started are stopped before it returns, so that a run that follows starts from nothing else.
     """
     perf = perf_mode()
     if perf:
-        require_perf_box(df_factory)
+        require_perf_box(df_factory, starts_drakeydb=replica_kind != "keydb")
 
     master = keydb_server_factory(active_replica=replica_kind != "drakeydb_raw")
     async with contextlib.AsyncExitStack() as stack:
@@ -2871,6 +2926,7 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
             "loader": load.cpu_seconds,
         }
 
+        before = await read_totals(k, replica)
         load_before = os.getloadavg()[0]
         samples = []
         probe = None
@@ -2913,6 +2969,16 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
         give_up_s = bounds["max_drain_s"] + 3 if bar else 60
         drain_s = await wait_drained(k, replica, stopped_at, give_up_s)
         result["drain_s"] = None if drain_s is None else round(drain_s, 3)
+        if drain_s is not None:
+            # Drained, the replica holds everything KeyDB wrote: the totals of the whole run, the
+            # load's first and last moments and the drain included.
+            after = await read_totals(k, replica)
+            result["writes_total"] = after["writes"] - before["writes"]
+            result["envelopes_total"] = (
+                None
+                if after["envelopes"] is None
+                else after["envelopes"] - (before["envelopes"] or 0)
+            )
         record_throughput(f"{replica_kind}:{'perf' if perf else 'smoke'}", result)
         skipped = ("lag_series", "samples")
         summary = {key: value for key, value in result.items() if key not in skipped}
@@ -2925,14 +2991,6 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
         assert await sync_counts(k) == synced, "KeyDB served another sync during the load"
         assert (await k.info("replication"))["connected_slaves"] == 1
 
-        # The envelope path ran: about one unwrapped envelope for every write KeyDB took. A
-        # replica that took a raw stream keeps up too, and must not pass for this one.
-        if replica_kind == "drakeydb":
-            envelopes = result.get("applied_envelopes_per_s")
-            assert (
-                envelopes is not None and envelopes >= ENVELOPE_SHARE * result["offered_ops_per_s"]
-            ), f"the replica unwrapped {envelopes} envelopes/s of the writes offered: {summary}"
-
         # (2) The replica kept up over the steady window, and (3) the lag drained in time.
         if bar:
             assert result["ratio"] >= bounds["min_ratio"], summary
@@ -2940,6 +2998,11 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
         assert drain_s is not None, f"not drained {give_up_s} s after the load stopped: {summary}"
         if bar:
             assert drain_s <= bounds["max_drain_s"], summary
+
+        # The envelope path ran. It is judged after the bounds: a replica that fell below the
+        # ratio fails that, with its own message, and not this.
+        if replica_kind == "drakeydb":
+            assert_envelopes_unwrapped(result["writes_total"], result["envelopes_total"], summary)
 
         # Both hold the same keys.
         await assert_same_keys(k, replica)
@@ -2956,10 +3019,11 @@ async def test_keydb_onboarding_keeps_up_under_load(
     squasher's batching, and this is the measurement that it still keeps up.
 
     Over a window of pipelined SETs and INCRs, sampled once a second, minus the first and last 2 s:
-    the link never reconnects and KeyDB serves one full sync; the replica unwrapped about one
-    envelope for every write; its offset advances at least `min_ratio` as fast as the master's,
-    and its lag never exceeds `max_lag`; within `max_drain_s` of the load stopping the lag is 0;
-    and both servers then hold the same keys, the INCR counters included.
+    the link never reconnects and KeyDB serves one full sync; its offset advances at least
+    `min_ratio` as fast as the master's, and its lag never exceeds `max_lag`; within `max_drain_s`
+    of the load stopping the lag is 0; the replica has by then unwrapped about one envelope for
+    every write KeyDB executed over the run (totals, so that the rate it kept up at is judged by
+    the ratio and not twice); and both servers hold the same keys, the INCR counters included.
 
     By default this is a smoke, to show the test and the plumbing work on a debug build or a shared
     CI box: about 5000 writes a second from one asyncio connection, and loose bounds (ratio 0.5,
@@ -2998,18 +3062,25 @@ async def test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica(
     run asserts the absolute bar as well, see test_keydb_onboarding_keeps_up_under_load). The
     bound is on the max lag of each run's steady window; the marker delays and the drains are
     recorded, not asserted."""
+    # Leg 2 starts a drakeydb: a debug binary fails here and not after leg 1's 35 s.
+    require_perf_box(df_factory, starts_drakeydb=True)
     comparator = await run_throughput(
         df_factory, keydb_server_factory, tmp_path, replica_kind="keydb", bar=False
     )
     drakeydb = await run_throughput(
         df_factory, keydb_server_factory, tmp_path, replica_kind="drakeydb", bar=True
     )
-    bound = comparator_bound(comparator["max_lag"])
+    # Both legs' INFO sampling is skewed by the output of its own master, so the larger rate sets
+    # the floor.
+    produce = max(comparator["produce_bytes_per_s"], drakeydb["produce_bytes_per_s"])
+    bound = comparator_bound(comparator["max_lag"], produce)
     record_throughput(
         "comparator_bound",
         {
             "comparator_max_lag": comparator["max_lag"],
             "drakeydb_max_lag": drakeydb["max_lag"],
+            "produce_bytes_per_s": produce,
+            "floor": comparator_floor(produce),
             "bound": bound,
             "binary": drakeydb["binary"],
         },
@@ -3017,7 +3088,8 @@ async def test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica(
     assert drakeydb["max_lag"] <= bound, (
         f"drakeydb's max lag of {drakeydb['max_lag']} B ({drakeydb['binary']}) is over "
         f"{bound:.0f} B, the bound on a KeyDB replica's of {comparator['max_lag']} B: "
-        f"max({COMPARATOR_FACTOR} x it, it + {COMPARATOR_FLOOR} B)"
+        f"max({COMPARATOR_FACTOR} x it, it + {comparator_floor(produce):.0f} B), the floor being "
+        f"max({COMPARATOR_FLOOR} B, {COMPARATOR_SKEW_S * 1000:.0f} ms of the {produce} B/s written)"
     )
 
 
@@ -3045,13 +3117,45 @@ async def test_keydb_throughput_reference_setups(
     )
 
 
-def test_comparator_bound_is_1_5_times_with_a_floor_of_1_mb():
-    """comparator_bound, the bar's comparison with a KeyDB replica's max lag: 1 MB over a small
-    one, 1.5 times a large one, and the two meet at twice the floor."""
-    assert comparator_bound(0) == MB
-    assert comparator_bound(500_000) == 500_000 + MB
-    assert comparator_bound(2 * MB) == 3 * MB
-    assert comparator_bound(10 * MB) == 15 * MB
+def test_comparator_bound_is_1_5_times_with_a_floor_of_1_mb_at_the_smokes_rate():
+    """comparator_bound, the bar's comparison with a KeyDB replica's max lag, where the master
+    writes 0.74 MB/s (the smoke) and the rate's share of the floor is small: 1 MB over a small
+    lag, 1.5 times a large one, and the two meet at twice the floor."""
+    rate = 737_526
+    assert comparator_bound(0, rate) == MB
+    assert comparator_bound(500_000, rate) == 500_000 + MB
+    assert comparator_bound(2 * MB, rate) == 3 * MB
+    assert comparator_bound(10 * MB, rate) == 15 * MB
+
+
+def test_comparator_floor_grows_with_the_masters_rate():
+    """The noise of two INFOs read a few ms apart is the output of those ms, so the floor is 40 ms
+    of the master's output where that is over 1 MB (above 25 MB/s, MB being 2**20), and the bound
+    with it."""
+    assert comparator_floor(0) == MB
+    assert comparator_floor(25 * MB) == MB  # 40 ms are 1,048,576 B at 26,214,400 B/s
+    assert comparator_floor(40 * MB) == pytest.approx(1.6 * MB)
+    assert comparator_floor(100 * MB) == pytest.approx(4 * MB)
+    # At the release bar's 40 MB/s a comparator at 500 KB allows 1.6 MB over it, not 1 MB: a bound
+    # of 2.1 MB and not 1.5 MB, against the 1.1-1.6 MB max lags drakeydb showed in the campaign.
+    assert comparator_bound(500_000, 40 * MB) == pytest.approx(500_000 + 1.6 * MB)
+    # The two halves meet at twice the floor, 3.2 MB here.
+    assert comparator_bound(3.2 * MB, 40 * MB) == pytest.approx(4.8 * MB)
+    assert comparator_bound(10 * MB, 40 * MB) == pytest.approx(15 * MB)
+
+
+def test_require_perf_box_looks_at_the_binary_only_for_a_run_that_starts_a_drakeydb(monkeypatch):
+    """A DRAKEYDB_PERF=1 run of two KeyDBs does not care what DRAGONFLY_PATH is; one that starts a
+    drakeydb refuses a path in the debug build tree, and says the path is all it looked at."""
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1, 2, 3})
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/redis-benchmark")
+    debug = SimpleNamespace(params=SimpleNamespace(path="/repo/build-dbg/dragonfly"))
+    release = SimpleNamespace(params=SimpleNamespace(path="/repo/build-opt/dragonfly"))
+
+    require_perf_box(debug, starts_drakeydb=False)
+    require_perf_box(release, starts_drakeydb=True)
+    with pytest.raises(pytest.fail.Exception, match="looks like a debug build.*'build-dbg'"):
+        require_perf_box(debug, starts_drakeydb=True)
 
 
 async def test_background_task_stop_leaves_what_the_task_died_of_in_error():
@@ -3077,6 +3181,66 @@ async def test_background_task_stop_leaves_what_the_task_died_of_in_error():
     assert isinstance(dies.error, ConnectionError)
     assert runs.error is None and runs.task.cancelled()
     assert never_started.error is None
+
+
+async def test_background_task_stop_propagates_a_cancellation_of_its_caller():
+    """stop() swallows the cancellation it asked its task for, and not one of its own caller (a
+    pytest-timeout abort of the test, or a `wait_for` around the run), which must still unwind."""
+
+    class Runs(BackgroundTask):
+        async def _run(self):
+            await asyncio.sleep(3600)
+
+    runs = Runs()
+    runs.start()
+    await asyncio.sleep(0)
+    stopper = asyncio.create_task(runs.stop())
+    await asyncio.sleep(0)  # it has cancelled the task and waits for it to unwind
+    stopper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopper
+    assert runs.error is None
+    await asyncio.wait([runs.task])
+    assert runs.task.cancelled()
+
+
+def synthetic_samples(replica_share, seconds=11, writes_per_s=1000, bytes_per_write=100):
+    """Samples of a replica that applies `replica_share` of what the master writes, as
+    take_sample makes them: second-by-second, with offsets, write counts and envelope counts."""
+    return [
+        {
+            "tm": float(t),
+            "tr": float(t),
+            "m": t * writes_per_s * bytes_per_write,
+            "r": round(replica_share * t * writes_per_s * bytes_per_write),
+            "ops": t * writes_per_s,
+            "envelopes": round(replica_share * t * writes_per_s),
+            "cpu": {"replica": 0.0},
+        }
+        for t in range(seconds)
+    ]
+
+
+def test_envelopes_are_judged_on_totals_and_not_on_the_rate_the_replica_kept_up_at():
+    """A replica that applied 70% of the master's rate over the window and then drained has
+    unwrapped an envelope for every write. Its envelopes per second are under 90% of the writes
+    offered per second, which is what the first form of this assertion compared; the totals after
+    the drain are what show whether the envelope path ran, and the ratio bound judges the rate."""
+    result = summarise(synthetic_samples(replica_share=0.7))
+    assert result["ratio"] == pytest.approx(0.7)
+    assert result["applied_envelopes_per_s"] < ENVELOPE_SHARE * result["offered_ops_per_s"]
+
+    assert_envelopes_unwrapped(writes=10_000, envelopes=10_000, summary=result)
+    assert_envelopes_unwrapped(writes=10_000, envelopes=9_000, summary=result)  # the share exactly
+    with pytest.raises(AssertionError, match=r"unwrapped 8999 envelopes for the 10000 writes"):
+        assert_envelopes_unwrapped(writes=10_000, envelopes=8_999, summary=result)
+
+
+def test_a_replica_without_the_envelope_counter_did_not_take_envelopes():
+    """A drakeydb replica of a plain KeyDB (a raw stream) keeps up and drains, and its INFO has no
+    rreplay_unwrapped: it must not pass for the replica of an active KeyDB."""
+    with pytest.raises(AssertionError, match="reports no rreplay_unwrapped"):
+        assert_envelopes_unwrapped(writes=10_000, envelopes=None, summary={})
 
 
 class ScriptedInfo:

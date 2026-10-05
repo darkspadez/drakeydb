@@ -456,3 +456,79 @@ DRAKEYDB_PERF=1 DRAKEYDB_PERF_OUT=<file>.jsonl KEYDB_SERVER_PATH=... KEYDB_REQUI
   /root/drakey-venv-pinned/bin/python -m pytest -p no:cacheprovider \
   "tests/dragonfly/keydb_onboarding_test.py::test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica[df_factory0]"
 ```
+
+## Delta review fixes (review of `f281564`, brief B)
+
+Test-only plus the plan: `tests/dragonfly/keydb_onboarding_test.py`, the plan's Task 2.9 and Task 3.1
+text, and this section. No product source, nothing committed. `build-dbg/dragonfly` was relinked twice
+by the concurrent code work while this ran (after the relink it is HEAD plus the other coder's
+uncommitted edits); one run hit `PermissionError` on the binary mid-link, was re-warmed and rerun, as
+the brief allows. The two default smokes and the first throttled run were on the earlier binary
+(`build-dbg/drakeydb`, 23:11Z), the rest on the relinked one (00:04Z).
+
+### What changed, by finding
+
+| finding | change |
+|---|---|
+| M-2, envelope assert against the wrong denominator | The assertion no longer compares a replica-side rate with `offered_ops_per_s` (a hidden 0.9 ratio floor under the smoke's documented 0.5, and the wrong message in perf mode). `run_throughput` reads `read_totals` (KeyDB's `set`+`incr`+`incrby` calls, the replica's `rreplay_unwrapped`) before the load starts and once more after the drain, and `assert_envelopes_unwrapped(writes, envelopes, summary)` requires the envelope delta to be `>= 0.9 x` the writes delta (`ENVELOPE_SHARE`). A drained replica has applied everything, so the totals do not depend on the rate it kept up at: the ratio bound judges that. `None` (a raw stream: INFO has no counter) fails with its own message. The totals are in the recorded result (`writes_total`, `envelopes_total`). `count_writes` is shared with `take_sample`. |
+| NIT-4, envelope assert fired before the ratio | The assertion moved after the bar's ratio, lag and drain asserts, so a replica below the ratio bound fails that, with its message. |
+| M-3, absolute 1 MB comparator floor | `comparator_floor(rate) = max(COMPARATOR_FLOOR, COMPARATOR_SKEW_S x rate)`, 1 MB or 40 ms of the master's output; `comparator_bound(c, produce_bytes_per_s)`. The comparator test passes the larger of the two legs' `produce_bytes_per_s` (each leg's INFO sampling is skewed by its own master) and records `produce_bytes_per_s` and `floor` beside the bound. At the bar's 40 MB/s the floor is 1.6 MB; below 25 MB/s (MB = 2^20) it is the old 1 MB, which was 35-40 ms of the first campaign's 25-30 MB/s. |
+| NIT-1, `BackgroundTask.stop` swallowed an outer cancellation | `stop()` cancels the task and waits with `asyncio.wait([task])`, which raises `CancelledError` only when the caller is cancelled; the task's own cancellation and its exception are read from the finished task. |
+| NIT-3, `require_perf_box` checked the binary for runs that start no drakeydb | `require_perf_box(df_factory, starts_drakeydb)`: the `build-dbg` check is only for `replica_kind != "keydb"`; the comparator test calls it up front with `True`, so a debug binary fails before leg 1's 35 s. The message names the heuristic (the path contains `build-dbg`, all that is checked). |
+| M-5 (plan) | Task 2.9 "The reset": the identity is the node uuid alone, recorded at the call (which precedes the first envelope of a connection), empty uuid always resets, the `false` call clears the record, and why the replication id is not used (not yet known at `ApplyReplicaActiveExpiry`, `replica.cc:279`, `:341`, whose replid is set at `:2025`; a `+CONTINUE <newid>` would reset, against Task 3.1's hazard (k)). Test (f): the second fake master changes only the uuid; the same master reconnects twice, the first reconnect's `+FULLRESYNC` under another replication id (so a replid half would show at the second). Falsification (h) gains the replid-instead-of and replid-as-well-as flips. Task 3.1 hazard (k), Steps 1, 3 and 4 say the same, with a `+CONTINUE <newid>` variant. `ScanCb` is cited as `generic_family.cc:813-814`. |
+
+### New and changed fast tests (no KeyDB, no server)
+
+`test_comparator_bound_is_1_5_times_with_a_floor_of_1_mb_at_the_smokes_rate` (the renamed old test),
+`test_comparator_floor_grows_with_the_masters_rate`,
+`test_require_perf_box_looks_at_the_binary_only_for_a_run_that_starts_a_drakeydb`,
+`test_background_task_stop_propagates_a_cancellation_of_its_caller`,
+`test_envelopes_are_judged_on_totals_and_not_on_the_rate_the_replica_kept_up_at` (synthetic samples of a
+replica at 0.7: its envelopes/s are under 0.9 x offered, and it passes on totals),
+`test_a_replica_without_the_envelope_counter_did_not_take_envelopes`. With the three that were already
+there (one of them renamed above): 8 selected, 8 passed (0.54 s); the file collects 113 tests (108 at `f281564`).
+
+### Results
+
+Default smoke (`-k keeps_up`, `build-dbg`, `flock`, the scratchpad KeyDB build, `KEYDB_REQUIRED=1`): 2 of 2
+passed, 15.17 s and 14.42 s. Ratio 1.003 / 1.0, max lag 14,750 B, drain 0.055 / 0.052 s, `writes_total`
+50,100, `envelopes_total` 50,101 in both (one more than the writes; not a write, probably a PING
+envelope, not checked). Perf mode was not run.
+
+### Falsification
+
+Every flip was undone from a saved copy (`diff` clean after each); the old-form runs used a copy of the
+`f281564` file under a temporary name in `tests/dragonfly/`, deleted after. The slow replica of the M-2
+and NIT-4 rows is the replica process duty-cycled with `SIGSTOP`/`SIGCONT` from outside the test
+(scratchpad `deltaB/throttle.py`, run 15 ms / stop 85 ms, or 5 / 95), starting 1 s after the replica
+process does, with the same throttle for both files.
+
+| guard | flip or input | result |
+|---|---|---|
+| M-2, hidden floor | throttle 15/85, the `f281564` file (smoke, debug) | FAILS: `the replica unwrapped 3328 envelopes/s of the writes offered`, `assert (3328 is not None and 3328 >= (0.9 * 5001))`, ratio 0.6654, which the smoke's own bound (0.5) allows |
+| M-2, the fix | throttle 15/85, the new file | PASSES (24.96 s): ratio 0.7097, drain 4.167 s, 50,300 writes and 50,301 envelopes, envelopes/s 3,548 against 0.9 x 4,999 = 4,499 |
+| M-2, raw path | the smoke with `active_replica=False` on the master (a plain KeyDB master) | FAILS: `the replica reports no rreplay_unwrapped: {... 'ratio': 1.0, ... 'drain_s': 0.0, ... 'writes_total': 50100, 'envelopes_total': None}`; ratio, drain and keys would have passed |
+| M-2, the threshold | `ENVELOPE_SHARE * writes + 1` (unit) | FAILS: `assert 9000 >= ((0.9 * 10000) + 1)` |
+| NIT-4, order | throttle 5/95, new file | FAILS on the ratio: `assert 0.2113 >= 0.5` |
+| NIT-4, order | throttle 5/95, the `f281564` file | FAILS on the envelopes first: `the replica unwrapped 1048 envelopes/s ...`, ratio 0.2097 |
+| M-3, floor ignores the rate | `comparator_floor` returns `COMPARATOR_FLOOR` | the unit test FAILS: `assert equals failed -1048576 +1677721.6` |
+| M-3, the bound ignores `comparator_floor` | `comparator_max_lag + COMPARATOR_FLOOR` in `comparator_bound` | the unit test FAILS: `-1548576 +2177721.6` |
+| NIT-1 | `stop()` as before (`await self.task` with `except CancelledError: pass`) | `test_background_task_stop_propagates_a_cancellation_of_its_caller` FAILS: `DID NOT RAISE CancelledError` (the other `stop` test passes) |
+| NIT-3 | the debug check without `starts_drakeydb and` | the unit test FAILS: `DRAKEYDB_PERF=1 is the release bar and /repo/build-dbg/dragonfly looks like a debug build ...` for the run that starts none |
+
+### Not done, not verified, open risks
+
+- Perf mode (`DRAKEYDB_PERF=1`, `build-opt`) was not run. The wiring of `produce` into
+  `comparator_bound` and the up-front `require_perf_box` call in
+  `test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica` are covered by reading and by the unit
+  tests of the functions they call, not by a run; the 40 ms constant is the brief's, checked only
+  against the 1 MB it replaces at 25-30 MB/s, not measured on a faster box.
+- The totals are read after `wait_drained`, which needs the offsets equal for two polls; that the
+  counter was advanced by the time the offset was is read from the code (the review's note on
+  `replica.cc:1340-1343`), and the 1-envelope margin in both smokes (50,101 for 50,100) agrees.
+- Plan only: the `Replica` member for the recorded uuid and its name are left to Task 2.9's
+  implementation. `docs/superpowers/ledgers/.../decisions.md` row 29 ("reset with the expiry flag") is
+  review finding MINOR-6 and was not touched (not in this brief's file list).
+- The brief cites `ExpireIfNeeded` in `ScanCb` at `generic_family.cc:813`; at HEAD (`83d6c0d`) and in the
+  tree the `HasExpire()` guard is `:813` and the `ExpireIfNeeded` call `:814`, so the plan now cites
+  `:813-814`.

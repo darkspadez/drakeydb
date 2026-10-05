@@ -1343,7 +1343,7 @@ link is healthy. Spec D-9 has the window and what this closes and leaves; read i
 warning in `RedisStreamAcksFb`, the lag in `GetSummary`), `src/server/replica_types.h`,
 `src/server/server_family.cc` (one INFO line), `src/server/engine_shard.cc` (the sweep's clock,
 `:885`), `src/server/db_slice.cc` (the hide, `:947-953`), `src/server/generic_family.cc` (the
-`ScanCb` hide, `:814`), `docs/UPSTREAM-SYNC.md`; Test `src/server/classic_replay_test.cc`,
+`ScanCb` hide, `:813-814`), `docs/UPSTREAM-SYNC.md`; Test `src/server/classic_replay_test.cc`,
 `tests/dragonfly/keydb_onboarding_test.py`. About ten hunks, three of them in files upstream edits
 often (`engine_shard.cc`, `db_slice.cc`, `generic_family.cc`). **Cost:** one relaxed load per
 envelope (and a relaxed store when the stamp is larger), one load per heartbeat tick, one load per
@@ -1376,13 +1376,27 @@ Task 1.4 (the flag).
   `config.cpp:2920`) and that envelope is the clock's heartbeat on a quiet master.
 - **The reset** is `ResetStreamClock()` in `Replica::ApplyReplicaActiveExpiry`, after its early
   return for a peer-mode or non-main link, and only when the master is not the one the clock last
-  advanced under, or the flag is cleared: the main link records the master's identity
-  (`MasterContext::master_node_uuid` and `master_repl_id`, `replica.h:37-45`) beside the clock, and
-  each call, from the top of `MainReplicationFb` and after every successful in-loop `Greet()`,
-  compares it, while the call with `false` at the end always resets. It is **not** reset on every
-  `Greet()`: a reconnect to the same master, and a `+CONTINUE` resume (Task 3.1), continue the same
-  stream, so its last stamp is still the best known clock, and the 60 s floor, not a reset, bounds a
-  long outage (a reset would put the sweep on the local clock while the backlog the master queued is
+  advanced under, or the flag is cleared. **A master is its node uuid and nothing else**:
+  `MasterContext::master_node_uuid` (`replica.h:37-45`), which `Greet()` has just read from the
+  `REPLCONF UUID` reply (`replica.cc:477-496`), and which KeyDB mints anew at every process start
+  (`server.cpp:4082`), so one uuid is one process and one clock. The main link keeps the uuid the
+  clock last advanced under beside it (a `Replica` member), and each call, from the top of
+  `MainReplicationFb` and after every successful in-loop `Greet()` (`replica.cc:279`, `:341`),
+  compares the two: a different one resets the clock and is recorded, the same one changes
+  nothing. The record is written here, and so names the master of the last stamp: this call runs
+  before the first envelope of a connection. The call with `false` at the end always resets, and
+  clears the record. An empty uuid (a master that gave none) is no identity and never equals one:
+  it resets, the sweep going to the local clock, the safe side.
+  **The replication id is not part of the identity**, for two reasons. It is not known when the
+  check runs: the call follows `Greet()` and precedes the PSYNC reply that sets `master_repl_id`
+  (the `+FULLRESYNC` parse, `replica.cc:2025`, and Task 3.1's `+CONTINUE <newid>` adoption), so it
+  still holds the previous connection's, and a replication-id half of the check could never fire
+  there. And if the check moved after the PSYNC, a `+CONTINUE <newid>` from the same master (its id
+  shifted, its process and clock the same) would reset the clock, which Task 3.1's hazard (k)
+  forbids. It is **not** reset on every `Greet()` either: a reconnect to the same master, under
+  another replication id included, and a `+CONTINUE` resume (Task 3.1), continue the same stream,
+  so its last stamp is still the best known clock, and the 60 s floor, not a reset, bounds a long
+  outage (a reset would put the sweep on the local clock while the backlog the master queued is
   yet to be applied, the window this task closes). A new master starts without a clock, and the
   sweep is on the local one until its first stamp.
 - **The sweep clock.** `uint64_t SweepClockMs(uint64_t stream_ms, uint64_t now_ms)` (pure, so a
@@ -1410,8 +1424,9 @@ Task 1.4 (the flag).
   is the stamp less one, the very value its envelope has just advanced `stream_ms` to (Task 2.8's
   single evaluation), so the key is due on `S` whenever it is due on `T`; a command of an
   `ADDREPLICAOF` link can reach it, and sees what it saw before, no key, with the entry left in the
-  table. **`ScanCb` hides too (owner decision 33):** in `ScanCb` (`generic_family.cc:814`), before
-  its `ExpireIfNeeded`, when `op_args.shard->ReplicaActiveExpiry()` and
+  table. **`ScanCb` hides too (owner decision 33):** in `ScanCb` (`generic_family.cc:813-814`, the
+  `HasExpire()` guard and the `ExpireIfNeeded` it calls), before that call, when
+  `op_args.shard->ReplicaActiveExpiry()` and
   `StreamClockHides(op_args.db_cntx.time_now_ms, expire)`, `return false`: the key is neither
   returned nor deleted. `ScanCb` is the callback of `OpScan`, reached by `SCAN` and `KEYS`
   (`ScanGeneric`), by `RANDOMKEY` (`RandomKey`'s own `OpScan` calls, `:3394`) and by `RM`
@@ -1486,8 +1501,11 @@ Task 1.4 (the flag).
   because the clock only moves forward, so a smaller stamp after a larger one would change nothing
   and the warning could not fire; then a `ping` stamped 5 s ago moves it forward: at least 5000,
   growing by about the time that passes; the same master dropping the link and greeting again keeps
-  it (no reset on a reconnect); a second fake master, with another uuid and replication id, resets
-  it to 0; a fake master that does not say `active-replica` shows no such field);
+  it (no reset on a reconnect), twice, the first reconnect's `+FULLRESYNC` carrying another
+  replication id: the id is not part of the identity, and the second reconnect is the call that
+  would see it change; a second fake master, with another uuid and **the same replication id**
+  (only the uuid differs), resets it to 0; a fake master that does not say `active-replica` shows
+  no such field);
   `test_plain_replica_of_active_keydb_survives_a_rate_limiter_window_rollover` (g) (real KeyDB,
   `repl_ping_replica_period=1`, behind a proxy that holds the link across the deadline: `INCR rl`
   and `EXPIRE rl 3`, a second `INCR rl` at 2.3 s while the proxy is paused, the proxy resumed at 4.5
@@ -1519,8 +1537,12 @@ Task 1.4 (the flag).
   (`TheHideLeavesTheMutablePathAlone` fails or the entry is duplicated); (e) the innermost layer's
   stamp ((e), `StreamClockOfANestIsTheOutermostLayers`); (f) no window on the advance ((d),
   `StreamClockIgnoresStampsOutsideTheWindow`); (g) a plain store instead of a forward-only one
-  (`StreamClockOnlyMovesForward`); (h) no reset on a new master ((f)'s second-master step), and a
-  reset on every `Greet()` ((f)'s same-master reconnect step); (i) `publish_clock` always true
+  (`StreamClockOnlyMovesForward`); (h) no reset on a new master ((f)'s second-master step, which
+  changes only the uuid), a reset on every `Greet()` ((f)'s same-master reconnect step), and an
+  identity that is the replication id: instead of the uuid ((f)'s second-master step: its id is
+  unchanged, so nothing resets), or as well as it ((f)'s second reconnect, which follows the first
+  one's `+FULLRESYNC` under another id: the call compares the id of the previous connection, one
+  reconnect late); (i) `publish_clock` always true
   (`StreamClockIsLeftAloneByANonPublishingApplier`); (j) the advance before the `running()` check
   (`...NotConsumed`); (k) **redundant by construction: record that, and do not count it as a
   falsification.** The hide without the `stream_ms` test is an equivalent mutant for every command
@@ -1608,11 +1630,12 @@ the batch entry next to `deferred_ack_bytes`, and count it where `repl_offs_` ad
 and document** that `keydb_cmds_dropped` counts commands seen, at least once across a resync.
 **(k) A `+CONTINUE` resume must not reset the stream clock** (Task 2.9, `stream_ms`; spec D-9). A
 resumed link continues the stream it left, so the last stamp it applied is still the best known
-clock of that master, and `ResetStreamClock()` belongs to a new master identity (its uuid or
-replication id) or a cleared flag, not to a `Greet()` or a resume. A resume that reset it would put
-the sweep back on the local clock while the backlog the master queued during the outage is yet to
-be applied: the window Task 2.9 closes, reopened exactly after an outage. The 60 s floor, not a
-reset, bounds a long one.
+clock of that master, and `ResetStreamClock()` belongs to a new master identity (its node uuid,
+not its replication id: Task 2.9's reset says why) or a cleared flag, not to a `Greet()` or a
+resume. A resume that reset it would put the sweep back on the local clock while the backlog the
+master queued during the outage is yet to be applied: the window Task 2.9 closes, reopened exactly
+after an outage. The 60 s floor, not a reset, bounds a long one. `+CONTINUE <newid>` adopts another
+replication id from the same uuid, so it keeps the clock too.
 - [ ] **Step 1: Failing tests** against `redis_server` (7.0.15), real KeyDB and the fake master,
   each asserting master `sync_partial_ok`/`sync_full`/`sync_partial_err` (`server.cpp:6017-6019` for
   KeyDB) and **exact** value counts: (a) leftover after `CONTINUE` — fake master sends
@@ -1636,7 +1659,8 @@ reset, bounds a long one.
   (k) the stream clock across the resume — a fake master saying `active-replica`, an enveloped
   `ping` stamped 5 s ago, `Proxy.drop_connection()`, `+CONTINUE <same id>`: INFO's
   `replica_stream_clock_lag_ms` is at least 5000 plus the outage once the link is back and before
-  any new envelope, never 0.
+  any new envelope, never 0; and again, dropping twice, the first resume answering `+CONTINUE
+  <newid>` (the same uuid), which must change nothing either.
 - [ ] **Step 2: Run, observe failure** (today every reconnect sends `-1`).
 - [ ] **Step 3: Implement** spec D-8: request `offs = (flag && !master_repl_id.empty() &&
   classic_stable_reached_) ? repl_offs_ + 1 : -1`; `+CONTINUE [<newid>]` consumes its line, adopts
@@ -1648,13 +1672,15 @@ reset, bounds a long one.
   from (a queued raw `SELECT` is not applied, and not counted, yet); a `+CONTINUE` re-selects it
   through the applier's `SelectDb` (the db's tables must exist) before the first resumed command,
   and a full sync starts again in db 0. A `+CONTINUE` does not touch the stream clock (hazard (k)):
-  `ApplyReplicaActiveExpiry`'s identity check, which a resume of the same master passes unchanged,
-  stays the only reset.
+  `ApplyReplicaActiveExpiry`'s uuid check, which a resume of the same master passes unchanged (a
+  `+CONTINUE <newid>` adopts a replication id and leaves the uuid, which is why the check cannot
+  use the id), stays the only reset.
 - [ ] **Step 4: Run; falsify** each hazard separately and record: use a fresh `io_buf` (a); send
   `repl_offs_` instead of `+ 1` (b); count deferred MULTI/EXEC bytes early (c); do not clear
   `classic_stable_reached_` at the FULLRESYNC parse (g); ignore the flag (flag-off test); start the
   resumed apply context in db 0 (i: the resumed keys land in db 0); reset the stream clock on the
-  `+CONTINUE` path (k: the lag reads 0 after the resume).
+  `+CONTINUE` path (k: the lag reads 0 after the resume); compare the replication id as well in
+  Task 2.9's check (k's `<newid>` variant: the lag reads 0 after the second resume).
   Run the leftover and offset tests x10 for a pass rate.
 - [ ] **Step 5:** `replication_test.py` unchanged-green; pre-commit; commit
   `feat: resume classic replication links with a partial PSYNC (P7)`.
