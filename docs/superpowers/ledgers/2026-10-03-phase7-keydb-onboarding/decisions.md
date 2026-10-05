@@ -77,6 +77,16 @@ mechanism (D-n).
   (`rdb_load.cc:3193`). A payload whose type byte is 64 (a KeyDB cron job) is a counted drop in
   `keydb_cmds_dropped`, like `KEYDB.CRON`, and not a `keydb_mvccrestore_failed` failure. (Spec
   D-7a.)
+- **Decision 34: "everywhere" covers every ordering rule of KeyDB's `sort.cpp`** (lead, 2026-10-05,
+  from reading `sort.cpp` for the brief). Two more rules fall under it besides the two the row
+  names: `BY nosort DESC` on a list or a sorted set walks it from the tail or by descending rank,
+  with `LIMIT` taken from that walk (`sort.cpp:356-382`, `:401-430`); and under `ALPHA BY` a missing
+  (or non-string) weight key sorts before every present weight, the empty string included
+  (`:160-168`). Remaining `ALPHA BY` ties are broken on the element: KeyDB's order there follows its
+  own input order, which no replica can reproduce, so breaking on the element at least keeps
+  drakeydb's own replicas and peers deterministic. Hash-field patterns (`BY w_*->f`,
+  `GET h_*->f`) are not an ordering rule; drakeydb does not support them at all (ISSUE-REGISTER
+  D-35), and the owner decides separately.
 
 ## Corrections to PLAN.md's Phase 7 stub
 
