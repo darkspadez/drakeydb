@@ -5,6 +5,7 @@
 #include "server/generic_family.h"
 
 #include <absl/cleanup/cleanup.h>
+#include <absl/strings/escaping.h>
 
 extern "C" {
 #include "redis/rdb.h"
@@ -24,6 +25,8 @@ extern "C" {
 ABSL_DECLARE_FLAG(bool, multi_exec_squash);
 ABSL_DECLARE_FLAG(uint32_t, container_iteration_yield_interval_usec);
 ABSL_DECLARE_FLAG(std::string, notify_keyspace_events);
+ABSL_DECLARE_FLAG(uint32_t, num_shards);
+ABSL_DECLARE_FLAG(uint32_t, sort_set_max_intset_entries);
 
 using namespace testing;
 using namespace std;
@@ -1888,20 +1891,24 @@ TEST_F(GenericFamilyTest, HashFieldExpiryDuringDeserialize) {
   Run({"RENAME", "src", "dst"});
 }
 
+// drakeydb: P7-1 (decision 36) -- changed from upstream, which rejected a negative LIMIT argument:
+// Redis and KeyDB clamp it (a negative offset is 0, a negative count is everything from the offset
+// on), so `LIMIT 0 -1` works there and a KeyDB master's `SORT .. LIMIT 0 -1 STORE` must not fail on
+// its replica. The expected values are what Redis and KeyDB answer.
 TEST_F(GenericFamilyTest, SortNegativeLimit) {
   Run({"lpush", "list-neg", "1", "2", "3", "4", "5"});
 
   // Negative offset
   auto resp = Run({"sort", "list-neg", "LIMIT", "-1", "2"});
-  ASSERT_THAT(resp, ErrArg("value is not an integer"));
+  ASSERT_THAT(resp, RespElementsAre("1", "2"));
 
   // Negative limit
   resp = Run({"sort", "list-neg", "LIMIT", "0", "-1"});
-  ASSERT_THAT(resp, ErrArg("value is not an integer"));
+  ASSERT_THAT(resp, RespElementsAre("1", "2", "3", "4", "5"));
 
   // Both negative
   resp = Run({"sort", "list-neg", "LIMIT", "-1", "-1"});
-  ASSERT_THAT(resp, ErrArg("value is not an integer"));
+  ASSERT_THAT(resp, RespElementsAre("1", "2", "3", "4", "5"));
 }
 
 TEST_F(GenericFamilyTest, SortBy) {
@@ -1935,8 +1942,10 @@ TEST_F(GenericFamilyTest, SortBy) {
   Run({"set", "w_1", "30"});  // restore w_1
   // Sorted order: 3 (w_3=10), 2 (w_2=20), 1 (w_1=30). LIMIT 1 2 skips first, returns next 2
   ASSERT_THAT(Run({"sort", "list-1", "BY", "w_*", "LIMIT", "1", "2"}), RespElementsAre("2", "1"));
-  // multiple asterisks should result in syntax error
-  ASSERT_THAT(Run({"sort", "list-1", "BY", "w_*_*"}), ErrArg("syntax error"));
+  // drakeydb: P7-1 (decision 36) -- changed from upstream, which answered "syntax error" for
+  // several asterisks: Redis and KeyDB substitute the first one only, so this looks up w_1_*, w_2_*
+  // and w_3_*, none of which exists, and every weight is 0 (a tie, broken on the element).
+  ASSERT_THAT(Run({"sort", "list-1", "BY", "w_*_*"}), RespElementsAre("1", "2", "3"));
 }
 
 TEST_F(GenericFamilyTest, SortGet) {
@@ -1970,10 +1979,12 @@ TEST_F(GenericFamilyTest, SortGet) {
   resp = Run({"sort", "mylist", "BY", "weight_*", "GET", "#", "GET", "obj_*"});
   ASSERT_THAT(resp, RespElementsAre("3", "third", "2", "second", "1", "first"));
 
-  // Test 6: GET with missing keys (should return empty strings, sorted: 1,2,3)
+  // Test 6: GET with missing keys (sorted: 1,2,3)
+  // drakeydb: P7-1 (decision 36) -- changed from upstream, which replied "" here: Redis and KeyDB
+  // reply nil for a missing key (STORE keeps "", see GenericSortOrderTest).
   Run({"del", "obj_2"});
   resp = Run({"sort", "mylist", "GET", "obj_*"});
-  ASSERT_THAT(resp, RespElementsAre("first", "", "third"));
+  ASSERT_THAT(resp, RespElementsAre("first", ArgType(RespExpr::NIL), "third"));
 
   // Restore obj_2 for further tests
   Run({"set", "obj_2", "second"});
@@ -2005,8 +2016,12 @@ TEST_F(GenericFamilyTest, SortGet) {
   resp = Run({"sort", "mylist", "BY", "nosort", "GET", "obj_*"});
   ASSERT_THAT(resp, RespElementsAre("third", "second", "first"));  // insertion order
 
-  // Test 12: GET pattern validation (multiple asterisks should error)
-  ASSERT_THAT(Run({"sort", "mylist", "GET", "obj_*_*"}), ErrArg("syntax error"));
+  // Test 12: GET pattern with several asterisks
+  // drakeydb: P7-1 (decision 36) -- changed from upstream's "syntax error": only the first asterisk
+  // is substituted (obj_1_*, ... do not exist), so every value is nil, as in Redis and KeyDB.
+  ASSERT_THAT(
+      Run({"sort", "mylist", "GET", "obj_*_*"}),
+      RespElementsAre(ArgType(RespExpr::NIL), ArgType(RespExpr::NIL), ArgType(RespExpr::NIL)));
 
   // Test 13: GET with empty list
   Run({"del", "emptylist"});
@@ -2016,9 +2031,12 @@ TEST_F(GenericFamilyTest, SortGet) {
   ASSERT_THAT(resp, ArrLen(0));
 
   // Test 14: GET with literal pattern (no asterisk)
+  // drakeydb: P7-1 (decision 36) -- changed from upstream, which read the fixed key: Redis and
+  // KeyDB return nil for a pattern without an asterisk ("to GET a fixed key does not make sense").
   Run({"set", "fixed_key", "fixed_value"});
   resp = Run({"sort", "mylist", "GET", "fixed_key"});
-  ASSERT_THAT(resp, RespElementsAre("fixed_value", "fixed_value", "fixed_value"));
+  ASSERT_THAT(resp, RespElementsAre(ArgType(RespExpr::NIL), ArgType(RespExpr::NIL),
+                                    ArgType(RespExpr::NIL)));
 
   // Test 15: SORT_RO with GET
   resp = Run({"sort_ro", "mylist", "GET", "#", "GET", "obj_*"});
@@ -2405,6 +2423,1536 @@ TEST_F(GenericFamilyTest, ExpirePastEmitsExpiredEvent) {
   EXPECT_EQ("__keyevent@0__:expired", msg.channel);
   EXPECT_EQ("foo", msg.message);
   EXPECT_GE(GetMetrics().events.expired_keys, 1u);
+}
+
+// drakeydb: P7-1 (decision 32) -- `SORT <source that cannot be sorted> STORE <dst>`. A fork
+// regression from P4-0 made a shard callback return the failure as the hop's status, and on a
+// multi-shard transaction RunCallback CHECK-fails on any hop status but OK: a missing, wrong-type
+// or non-numeric source plus a destination on another shard aborted the server. With one shard
+// there was no abort, but a missing source replied an empty array and left the destination stale
+// where Redis and KeyDB delete it and reply 0 (sort.cpp: an empty result deletes the STORE key;
+// a wrong-type or unparsable source is an error raised before the destination is touched).
+//
+// A crash takes the whole test binary down, so the tests below fail by aborting as well as by
+// their assertions. They need two shards and place the destination on the source's shard and on
+// the other one, for each way SORT reaches its source (the sorted fetch, BY nosort, BY pattern).
+namespace {
+
+// A key named `prefix<i>` on the same shard as `src` or on a different one, under this process's
+// shard count.
+string SortStoreDstKey(string_view prefix, string_view src, bool same_shard) {
+  const ShardId src_sid = Shard(src, shard_set->size());
+  for (int i = 0;; ++i) {
+    string candidate = StrCat(prefix, i);
+    if ((Shard(candidate, shard_set->size()) == src_sid) == same_shard)
+      return candidate;
+    CHECK_LT(i, 10000) << "no '" << prefix << "' key on the wanted shard";
+  }
+}
+
+// The options between the source and STORE, one per code path of SortGeneric that reads the source.
+const vector<vector<string>> kSortStoreVariants = {
+    {},                            // sorted fetch, numeric
+    {"ALPHA"},                     // sorted fetch, lexicographic
+    {"DESC", "LIMIT", "0", "2"},   // sorted fetch with bounds
+    {"GET", "#"},                  // sorted fetch with a GET pattern
+    {"BY", "nosort"},              // unsorted fetch
+    {"BY", "nosort", "GET", "#"},  // unsorted fetch with a GET pattern
+    {"BY", "weight_*"},            // BY pattern: unsorted fetch, then external keys
+};
+
+vector<string> SortStoreCommand(string_view src, const vector<string>& variant, string_view dst) {
+  vector<string> cmd{"SORT", string(src)};
+  cmd.insert(cmd.end(), variant.begin(), variant.end());
+  cmd.insert(cmd.end(), {"STORE", string(dst)});
+  return cmd;
+}
+
+}  // namespace
+
+// The source does not exist: the destination is deleted, whatever its type or TTL, and the reply
+// is 0. Before: an abort across shards, an empty array and a stale destination within one.
+TEST_F(GenericFamilyTest, SortStoreOfMissingSourceDeletesDestination) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const string src = "sort-missing-src";
+
+  int round = 0;
+  for (bool same_shard : {true, false}) {
+    for (const auto& variant : kSortStoreVariants) {
+      const string dst = SortStoreDstKey("sort-missing-dst", src, same_shard);
+      SCOPED_TRACE(StrCat(same_shard ? "same shard" : "other shard", ", variant ",
+                          absl::StrJoin(variant, " ")));
+      const auto cmd = SortStoreCommand(src, variant, dst);
+
+      // The destination exists, a list or a string by turns, with a TTL: all of it goes.
+      if (round++ % 2 == 0)
+        Run({"rpush", dst, "stale"});
+      else
+        Run({"set", dst, "stale"});
+      Run({"expire", dst, "1000"});
+      EXPECT_THAT(Run(cmd), IntArg(0));
+      EXPECT_THAT(Run({"exists", dst}), IntArg(0));
+      EXPECT_THAT(Run({"ttl", dst}), IntArg(-2));
+
+      // Nothing to delete the second time: the same reply, and no key appears.
+      EXPECT_THAT(Run(cmd), IntArg(0));
+      EXPECT_THAT(Run({"exists", dst}), IntArg(0));
+      EXPECT_THAT(Run({"exists", src}), IntArg(0));
+    }
+  }
+  EXPECT_THAT(Run({"dbsize"}), IntArg(0)) << "no key was left behind";
+}
+
+// The source is an existing key of a type SORT cannot read: WRONGTYPE, the destination untouched.
+TEST_F(GenericFamilyTest, SortStoreOfWrongTypeSourceKeepsDestination) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const string src = "sort-wrongtype-src";
+
+  for (string_view type : {"string", "hash"}) {
+    if (type == "string")
+      Run({"set", src, "x"});
+    else
+      Run({"hset", src, "f", "v"});
+
+    for (bool same_shard : {true, false}) {
+      for (const auto& variant : kSortStoreVariants) {
+        const string dst = SortStoreDstKey("sort-wrongtype-dst", src, same_shard);
+        SCOPED_TRACE(StrCat(type, " source, ", same_shard ? "same shard" : "other shard",
+                            ", variant ", absl::StrJoin(variant, " ")));
+
+        Run({"del", dst});
+        Run({"rpush", dst, "kept", "too"});
+        EXPECT_THAT(Run(SortStoreCommand(src, variant, dst)), ErrArg("WRONGTYPE"));
+        EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespElementsAre("kept", "too"));
+      }
+    }
+    Run({"del", src});
+  }
+}
+
+// The source holds elements a numeric SORT cannot convert: the error, the destination untouched.
+// The same abort as above for a destination on another shard (the hop result was
+// INVALID_NUMERIC_RESULT). ALPHA and BY nosort do not convert anything and succeed.
+TEST_F(GenericFamilyTest, SortStoreOfUnparsableSourceKeepsDestination) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const string src = "sort-unparsable-src";
+  Run({"rpush", src, "not", "numbers"});
+
+  const vector<vector<string>> variants = {{}, {"DESC", "LIMIT", "0", "2"}, {"GET", "#"}};
+  for (bool same_shard : {true, false}) {
+    for (const auto& variant : variants) {
+      const string dst = SortStoreDstKey("sort-unparsable-dst", src, same_shard);
+      SCOPED_TRACE(StrCat(same_shard ? "same shard" : "other shard", ", variant ",
+                          absl::StrJoin(variant, " ")));
+
+      Run({"del", dst});
+      Run({"rpush", dst, "kept"});
+      EXPECT_THAT(Run(SortStoreCommand(src, variant, dst)), ErrArg("can't be converted"));
+      EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespElementsAre("kept"));
+      EXPECT_THAT(Run({"lrange", src, "0", "-1"}), RespElementsAre("not", "numbers"));
+    }
+  }
+}
+
+// A source whose own lazy member expiry empties it reaches the same STORE of nothing on the
+// unsorted path, which used to return an empty array and leave the destination alone: a set whose
+// every member is expired is a missing source, and the destination goes, like on the sorted path.
+TEST_F(GenericFamilyTest, SortStoreOfFullyExpiredSetDeletesDestination) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const string src = "sort-expired-src";
+
+  for (bool same_shard : {true, false}) {
+    for (const auto& variant : kSortStoreVariants) {
+      const string dst = SortStoreDstKey("sort-expired-dst", src, same_shard);
+      SCOPED_TRACE(StrCat(same_shard ? "same shard" : "other shard", ", variant ",
+                          absl::StrJoin(variant, " ")));
+
+      ASSERT_THAT(Run({"sadd", src, "m"}), IntArg(1));
+      ASSERT_THAT(Run({"fieldexpire", src, "1", "m"}), ArrLen(1));
+      Run({"rpush", dst, "stale"});
+      AdvanceTime(1100);
+
+      EXPECT_THAT(Run(SortStoreCommand(src, variant, dst)), IntArg(0));
+      EXPECT_THAT(Run({"exists", src}), IntArg(0));
+      EXPECT_THAT(Run({"exists", dst}), IntArg(0));
+    }
+  }
+}
+
+// drakeydb: P7-1 (decision 34) -- SORT orders as Redis and KeyDB do, for every caller
+// (ISSUE-REGISTER D-34). KeyDB replicates `SORT .. STORE` verbatim, so a replica that orders
+// differently ends up with the same members in another order, silently. The rules, each from
+// KeyDB's sort.cpp:
+//   - a numeric tie under BY breaks on the element, not on the weight (:153-156);
+//   - under ALPHA BY a missing weight sorts before every present one, the empty string included
+//     (:160-168);
+//   - BY nosort on a SET that is stored, or runs in a script, sorts ALPHA by the element
+//     (:296-310);
+//   - BY nosort on a LIST or a ZSET walks it from the tail under DESC, and LIMIT counts along that
+//     walk (:356-380, :401-439).
+//
+// Every expected list below is what real KeyDB v6.3.4 answers to the same data and command, and
+// Redis 7.0.15 answers the same to all of them: the reply, the list STORE leaves and, for the
+// nosort tables, both inside EVAL; SORT_RO's replies (KeyDB 6.3.4 has no SORT_RO) were checked on
+// Redis alone. They were taken from the servers, not derived by hand. The exceptions are the
+// ALPHA BY ties of a hash set or a zset, which say so.
+namespace {
+
+struct SortOrderCase {
+  string source;
+  vector<string> options;  // between the source key and STORE
+  vector<string> expected;
+};
+
+string SortOrderCaseName(const SortOrderCase& c) {
+  return StrCat("SORT ", c.source, " ", absl::StrJoin(c.options, " "));
+}
+
+const vector<SortOrderCase> kByTieCases = {
+    {"s", {"BY", "w_*"}, {"b", "c", "d", "e", "f", "g", "h", "i", "j", "a"}},
+    {"s", {"BY", "w_*", "DESC"}, {"a", "j", "i", "h", "g", "f", "e", "d", "c", "b"}},
+    {"s", {"BY", "w_*", "LIMIT", "1", "3"}, {"c", "d", "e"}},
+    {"s", {"BY", "w_*", "DESC", "LIMIT", "2", "4"}, {"i", "h", "g", "f"}},
+    {"s", {"BY", "w_*", "LIMIT", "5", "100"}, {"g", "h", "i", "j", "a"}},
+    {"s", {"BY", "nokey_*"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}},
+    {"s", {"BY", "nokey_*", "DESC"}, {"j", "i", "h", "g", "f", "e", "d", "c", "b", "a"}},
+    {"l", {"BY", "lw_*"}, {"r", "t", "u", "w", "y", "q", "e", "i", "o", "p"}},
+    {"l", {"BY", "lw_*", "DESC"}, {"p", "o", "i", "e", "q", "y", "w", "u", "t", "r"}},
+    {"sm", {"BY", "nw_*"}, {"c", "a", "b", "d"}},
+    {"sm", {"BY", "nw_*", "DESC"}, {"d", "b", "a", "c"}},
+    {"ln", {"BY", "nokey_*"}, {"1", "3", "3", "5", "5", "5", "7", "9"}},
+    {"ln", {"BY", "nokey_*", "DESC"}, {"9", "7", "5", "5", "5", "3", "3", "1"}},
+    {"s", {"BY", "w_*", "GET", "#", "GET", "h_*"}, {"b",  "Hb", "c",  "Hc", "d",  "Hd", "e",
+                                                    "He", "f",  "Hf", "g",  "Hg", "h",  "Hh",
+                                                    "i",  "Hi", "j",  "Hj", "a",  "Ha"}},
+    {"s", {"BY", "w_*", "DESC", "LIMIT", "1", "2", "GET", "#"}, {"j", "i"}},
+};
+
+const vector<SortOrderCase> kAlphaByCases = {
+    {"sa", {"BY", "aw_*", "ALPHA"}, {"c", "b", "f", "d", "a", "e"}},
+    {"sa", {"BY", "aw_*", "ALPHA", "DESC"}, {"e", "a", "d", "f", "b", "c"}},
+    {"sa", {"BY", "aw_*", "ALPHA", "LIMIT", "1", "3"}, {"b", "f", "d"}},
+    {"sa", {"BY", "aw_*", "ALPHA", "DESC", "LIMIT", "1", "3"}, {"a", "d", "f"}},
+    {"sa", {"BY", "aw_*", "ALPHA", "GET", "#"}, {"c", "b", "f", "d", "a", "e"}},
+    {"sw", {"BY", "ww_*", "ALPHA"}, {"x", "y", "z"}},
+    {"sw", {"BY", "ww_*", "ALPHA", "DESC"}, {"z", "y", "x"}},
+};
+
+const vector<SortOrderCase> kNosortSetCases = {
+    {"s", {"BY", "nosort"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}},
+    {"s", {"BY", "nosort", "DESC"}, {"j", "i", "h", "g", "f", "e", "d", "c", "b", "a"}},
+    {"s", {"BY", "nosort", "LIMIT", "0", "3"}, {"a", "b", "c"}},
+    {"s", {"BY", "nosort", "DESC", "LIMIT", "1", "2"}, {"i", "h"}},
+    {"s", {"BY", "nosort", "GET", "#", "GET", "h_*"}, {"a",  "Ha", "b",  "Hb", "c",  "Hc", "d",
+                                                       "Hd", "e",  "He", "f",  "Hf", "g",  "Hg",
+                                                       "h",  "Hh", "i",  "Hi", "j",  "Hj"}},
+    {"sn", {"BY", "nosort"}, {"1", "10", "2", "3", "4", "5", "6", "7", "8", "9"}},
+    {"sn", {"BY", "nosort", "DESC"}, {"9", "8", "7", "6", "5", "4", "3", "2", "10", "1"}},
+};
+
+const vector<SortOrderCase> kNosortWalkCases = {
+    {"zl", {"BY", "nosort"}, {"x", "y", "z", "w", "v"}},
+    {"zl", {"BY", "nosort", "DESC"}, {"v", "w", "z", "y", "x"}},
+    {"zl", {"BY", "nosort", "LIMIT", "1", "2"}, {"y", "z"}},
+    {"zl", {"BY", "nosort", "DESC", "LIMIT", "1", "2"}, {"w", "z"}},
+    {"zl", {"BY", "nosort", "DESC", "LIMIT", "3", "10"}, {"y", "x"}},
+    {"zl", {"BY", "nosort", "DESC", "LIMIT", "9", "2"}, {}},
+    {"zl", {"BY", "nosort", "DESC", "GET", "#"}, {"v", "w", "z", "y", "x"}},
+    {"zl", {"BY", "nosort", "GET", "#"}, {"x", "y", "z", "w", "v"}},
+    {"z", {"BY", "nosort"}, {"b", "c", "a", "e", "d"}},
+    {"z", {"BY", "nosort", "DESC"}, {"d", "e", "a", "c", "b"}},
+    {"z", {"BY", "nosort", "LIMIT", "1", "2"}, {"c", "a"}},
+    {"z", {"BY", "nosort", "DESC", "LIMIT", "1", "2"}, {"e", "a"}},
+    {"z", {"BY", "nosort", "DESC", "LIMIT", "3", "10"}, {"c", "b"}},
+    {"z", {"BY", "nosort", "DESC", "LIMIT", "9", "2"}, {}},
+    {"z", {"BY", "nosort", "DESC", "GET", "#"}, {"d", "e", "a", "c", "b"}},
+    {"z", {"BY", "nosort", "GET", "#"}, {"b", "c", "a", "e", "d"}},
+};
+
+const vector<SortOrderCase> kWideLimitCases = {
+    {"ln", {"LIMIT", "1", "4294967295"}, {"3", "3", "5", "5", "5", "7", "9"}},
+    {"ln", {"LIMIT", "4294967295", "1"}, {}},
+    {"zl", {"BY", "nosort", "LIMIT", "1", "4294967295"}, {"y", "z", "w", "v"}},
+    {"zl", {"BY", "nosort", "DESC", "LIMIT", "1", "4294967295"}, {"w", "z", "y", "x"}},
+    {"s", {"BY", "w_*", "LIMIT", "1", "4294967295"}, {"c", "d", "e", "f", "g", "h", "i", "j", "a"}},
+    {"s", {"BY", "w_*", "DESC", "LIMIT", "4294967295", "4294967295"}, {}},
+};
+
+// drakeydb: P7-1 (decisions 36, 37, 38) -- the rest of KeyDB's SORT semantics (round 2a). Every
+// table below is what real KeyDB v6.3.4 answers, and Redis 7.0.15 answers the same (the reply, the
+// STORE list; SORT_RO on Redis alone), unless a comment says it is drakeydb's own rule.
+
+// A GET table row: a nullopt in `expected` is a nil in the reply and "" in the list STORE leaves.
+struct SortGetCase {
+  string source;
+  vector<string> options;
+  vector<optional<string>> expected;
+};
+
+// One spelling of a number, as an element (the list [value, "3"]) and as a BY weight (the list
+// [a, b], a weighing `value` and b 3). Accepted: both sorts reply; else the Redis error and, with
+// STORE, a destination left as it was.
+struct SortNumberCase {
+  string value;
+  bool accepted;
+  vector<string> elements;  // SORT of the list [value, "3"]
+  vector<string> by;        // SORT of [a, b] BY the weights
+};
+
+// LIMIT as sortCommand clamps it (decision 36): a negative offset is 0, a negative count is
+// everything from the offset, anything past the end is cut, 64-bit arguments are fine.
+const vector<SortOrderCase> kLimitCases = {
+    {"ln", {"LIMIT", "0", "-1"}, {"1", "3", "3", "5", "5", "5", "7", "9"}},
+    {"ln", {"LIMIT", "-5", "3"}, {"1", "3", "3"}},
+    {"ln", {"LIMIT", "2", "-1"}, {"3", "5", "5", "5", "7", "9"}},
+    {"ln", {"LIMIT", "99", "1"}, {}},
+    {"ln", {"LIMIT", "8", "1"}, {}},
+    {"ln", {"LIMIT", "7", "1"}, {"9"}},
+    {"ln", {"LIMIT", "1", "0"}, {}},
+    {"ln", {"LIMIT", "-1", "-1"}, {"1", "3", "3", "5", "5", "5", "7", "9"}},
+    {"ln", {"LIMIT", "-3", "-7"}, {"1", "3", "3", "5", "5", "5", "7", "9"}},
+    {"ln", {"LIMIT", "2", "99999999999"}, {"3", "5", "5", "5", "7", "9"}},
+    {"ln", {"LIMIT", "9223372036854775807", "1"}, {}},
+    {"ln", {"LIMIT", "-9223372036854775808", "2"}, {"1", "3"}},
+    {"ln", {"LIMIT", "0", "9223372036854775807"}, {"1", "3", "3", "5", "5", "5", "7", "9"}},
+    {"ln", {"LIMIT", "9223372036854775807", "9223372036854775807"}, {}},
+    {"ln", {"DESC", "LIMIT", "1", "-1"}, {"7", "5", "5", "5", "3", "3", "1"}},
+    {"ln", {"ALPHA", "LIMIT", "-2", "3"}, {"1", "3", "3"}},
+    {"ln", {"BY", "nokey_*", "LIMIT", "-5", "-1"}, {"1", "3", "3", "5", "5", "5", "7", "9"}},
+    {"ln", {"BY", "nosort", "LIMIT", "-5", "-1"}, {"5", "3", "9", "1", "7", "5", "5", "3"}},
+    {"zl", {"BY", "nosort", "LIMIT", "2", "-1"}, {"z", "w", "v"}},
+    {"zl", {"BY", "nosort", "DESC", "LIMIT", "-2", "3"}, {"v", "w", "z"}},
+    {"zl", {"BY", "nosort", "DESC", "LIMIT", "1", "-1"}, {"w", "z", "y", "x"}},
+    {"z", {"BY", "nosort", "DESC", "LIMIT", "1", "-1"}, {"e", "a", "c", "b"}},
+    {"z", {"BY", "nosort", "LIMIT", "-1", "2"}, {"b", "c"}},
+    {"s", {"BY", "w_*", "LIMIT", "2", "-1"}, {"d", "e", "f", "g", "h", "i", "j", "a"}},
+    {"s", {"BY", "w_*", "DESC", "LIMIT", "-1", "3"}, {"a", "j", "i"}},
+    {"s", {"ALPHA", "LIMIT", "-1", "4"}, {"a", "b", "c", "d"}},
+    {"s", {"ALPHA", "DESC", "LIMIT", "3", "-1"}, {"g", "f", "e", "d", "c", "b", "a"}},
+};
+// The spellings of a LIMIT argument that string2ll refuses (decisions 36 and 38): no '+', no
+// leading zero, no space, no "-0", nothing but digits, nothing beyond long long.
+const vector<pair<string, string>> kRejectedLimits = {
+    {"+1", "2"},
+    {"01", "2"},
+    {"1", "+2"},
+    {"1", "02"},
+    {" 1", "2"},
+    {"1 ", "2"},
+    {"-0", "2"},
+    {"0", "-0"},
+    {"0", "99999999999999999999"},
+    {"9223372036854775808", "1"},
+    {"-9223372036854775809", "1"},
+    {"1.5", "2"},
+    {"0x10", "1"},
+    {"1e2", "1"},
+    {"a", "1"},
+    {"", "1"},
+    {"1", ""},
+};
+
+// A pattern with several '*' (decision 36): the first is replaced by the element, the rest stay.
+// "BY nostar" has none at all and does not sort.
+const vector<SortOrderCase> kStarCases = {
+    {"m", {"BY", "ws_*_*"}, {"3", "2", "1"}},
+    {"m", {"BY", "ws_*_*", "DESC"}, {"1", "2", "3"}},
+    {"m", {"BY", "wd_**"}, {"3", "2", "1"}},
+    {"m", {"BY", "wd_**", "DESC"}, {"1", "2", "3"}},
+    {"m", {"BY", "wd_**", "GET", "#"}, {"3", "2", "1"}},
+    {"m", {"BY", "nostar"}, {"1", "2", "3"}},
+    {"m", {"BY", "nostar", "DESC"}, {"3", "2", "1"}},
+    {"m", {"BY", "nostar", "GET", "#"}, {"1", "2", "3"}},
+    {"m", {"GET", "gh_**"}, {"S1", "S2", "S3"}},
+};
+// GET of a key that is missing or not a string, and of a pattern without '*', is nil in a reply and
+// "" in STORE (decision 36). go_2 is missing, go_3 is the empty string (not nil), go_4 is a hash.
+const vector<SortGetCase> kGetCases = {
+    {"g", {"GET", "go_*"}, {"first", nullopt, "", nullopt}},
+    {"g", {"GET", "#", "GET", "go_*"}, {"1", "first", "2", nullopt, "3", "", "4", nullopt}},
+    {"g", {"GET", "gfixed"}, {nullopt, nullopt, nullopt, nullopt}},
+    {"g", {"GET", "gfixed", "GET", "#"}, {nullopt, "1", nullopt, "2", nullopt, "3", nullopt, "4"}},
+    {"g", {"BY", "nosort", "GET", "gfixed"}, {nullopt, nullopt, nullopt, nullopt}},
+    {"g", {"BY", "gw_*", "GET", "gfixed"}, {nullopt, nullopt, nullopt, nullopt}},
+    {"g", {"BY", "gw_*", "GET", "go_*"}, {nullopt, "", nullopt, "first"}},
+    {"g", {"BY", "nostar", "GET", "go_*"}, {"first", nullopt, "", nullopt}},
+    {"g", {"DESC", "GET", "go_*"}, {nullopt, "", nullopt, "first"}},
+    {"gz", {"BY", "nosort", "GET", "go_*"}, {nullopt, "", nullopt, "first"}},
+    {"g", {"GET", "go_*", "LIMIT", "1", "1"}, {nullopt}},
+    {"g", {"GET", "#"}, {"1", "2", "3", "4"}},
+    {"g", {"ALPHA", "GET", "go_*"}, {"first", nullopt, "", nullopt}},
+    {"g", {"GET", "go_*_*"}, {nullopt, nullopt, nullopt, nullopt}},
+    {"m", {"GET", "gh_**"}, {"S1", "S2", "S3"}},
+    {"m", {"GET", "gh_*", "GET", "gh_**"}, {nullopt, "S1", nullopt, "S2", nullopt, "S3"}},
+    {"m", {"BY", "ws_*_*", "GET", "gh_**"}, {"S3", "S2", "S1"}},
+    {"ml",
+     {"BY", "mw_*", "ALPHA", "GET", "mw_*", "GET", "#"},
+     {nullopt, "r", "", "s", "m", "q", "m", "p", "m", "t"}},
+};
+// Numeric elements and weights as Redis loads scores (decision 36): strtod over the bytes up to the
+// first NUL, refused on anything left, on ERANGE, on a subnormal result and on NaN. Both servers
+// refuse the same spellings, including "5 " and "1e-310", and accept "5\0x" as 5 and "\0" as 0.
+const vector<SortNumberCase> kNumberCases = {
+    {"0"s, true, {"0"s, "3"s}, {"a"s, "b"s}},
+    {"-0"s, true, {"-0"s, "3"s}, {"a"s, "b"s}},
+    {"3"s, true, {"3"s, "3"s}, {"a"s, "b"s}},
+    {"3.0"s, true, {"3"s, "3.0"s}, {"a"s, "b"s}},
+    {"3.5"s, true, {"3"s, "3.5"s}, {"b"s, "a"s}},
+    {"2.5"s, true, {"2.5"s, "3"s}, {"a"s, "b"s}},
+    {"-2"s, true, {"-2"s, "3"s}, {"a"s, "b"s}},
+    {"+5"s, true, {"3"s, "+5"s}, {"b"s, "a"s}},
+    {"00012"s, true, {"3"s, "00012"s}, {"b"s, "a"s}},
+    {".5"s, true, {".5"s, "3"s}, {"a"s, "b"s}},
+    {"5."s, true, {"3"s, "5."s}, {"b"s, "a"s}},
+    {"-.5e-2"s, true, {"-.5e-2"s, "3"s}, {"a"s, "b"s}},
+    {"1e5"s, true, {"3"s, "1e5"s}, {"b"s, "a"s}},
+    {"1E5"s, true, {"3"s, "1E5"s}, {"b"s, "a"s}},
+    {"1e+5"s, true, {"3"s, "1e+5"s}, {"b"s, "a"s}},
+    {"1e"s, false, {}, {}},
+    {"e5"s, false, {}, {}},
+    {"1.5e-3"s, true, {"1.5e-3"s, "3"s}, {"a"s, "b"s}},
+    {"--5"s, false, {}, {}},
+    {"5e+"s, false, {}, {}},
+    {"1,5"s, false, {}, {}},
+    {"0x10"s, true, {"3"s, "0x10"s}, {"b"s, "a"s}},
+    {"0x1A"s, true, {"3"s, "0x1A"s}, {"b"s, "a"s}},
+    {"0X1a"s, true, {"3"s, "0X1a"s}, {"b"s, "a"s}},
+    {"0x1p3"s, true, {"3"s, "0x1p3"s}, {"b"s, "a"s}},
+    {"0x1.8p1"s, true, {"0x1.8p1"s, "3"s}, {"a"s, "b"s}},
+    {"0x"s, false, {}, {}},
+    {" "s, false, {}, {}},
+    {" 5"s, true, {"3"s, " 5"s}, {"b"s, "a"s}},
+    {"  5"s, true, {"3"s, "  5"s}, {"b"s, "a"s}},
+    {"\x09"
+     "5"s,
+     true,
+     {"3"s,
+      "\x09"
+      "5"s},
+     {"b"s, "a"s}},
+    {"\x0a"
+     "5"s,
+     true,
+     {"3"s,
+      "\x0a"
+      "5"s},
+     {"b"s, "a"s}},
+    {"5 "s, false, {}, {}},
+    {"5\x09"s, false, {}, {}},
+    {"5\x0a"s, false, {}, {}},
+    {"+ 5"s, false, {}, {}},
+    {"5 5"s, false, {}, {}},
+    {"inf"s, true, {"3"s, "inf"s}, {"b"s, "a"s}},
+    {"+inf"s, true, {"3"s, "+inf"s}, {"b"s, "a"s}},
+    {"-inf"s, true, {"-inf"s, "3"s}, {"a"s, "b"s}},
+    {"INF"s, true, {"3"s, "INF"s}, {"b"s, "a"s}},
+    {"iNf"s, true, {"3"s, "iNf"s}, {"b"s, "a"s}},
+    {"infinity"s, true, {"3"s, "infinity"s}, {"b"s, "a"s}},
+    {"-Infinity"s, true, {"-Infinity"s, "3"s}, {"a"s, "b"s}},
+    {"infx"s, false, {}, {}},
+    {"in"s, false, {}, {}},
+    {"nan"s, false, {}, {}},
+    {"NaN"s, false, {}, {}},
+    {"-nan"s, false, {}, {}},
+    {"nan(1)"s, false, {}, {}},
+    {"1e400"s, false, {}, {}},
+    {"-1e400"s, false, {}, {}},
+    {"1e-400"s, false, {}, {}},
+    {"1e-310"s, false, {}, {}},
+    {"4.9e-324"s, false, {}, {}},
+    // The rule is libc-independent: a subnormal result is refused even where strtod sets no ERANGE
+    // (musl for 4.9e-324; glibc for these exact hex ones, which it alone would accept).
+    {"0x1p-1074"s, false, {}, {}},
+    {"-0x1p-1074"s, false, {}, {}},
+    {"2.2250738585072014e-308"s, true, {"2.2250738585072014e-308"s, "3"s}, {"a"s, "b"s}},
+    {"1.7976931348623157e308"s, true, {"3"s, "1.7976931348623157e308"s}, {"b"s, "a"s}},
+    {"1.7976931348623159e308"s, false, {}, {}},
+    {string(400, '9'), false, {}, {}},
+    {StrCat("0.", string(400, '0'), "1"), false, {}, {}},
+    {"9223372036854775807"s, true, {"3"s, "9223372036854775807"s}, {"b"s, "a"s}},
+    {"9223372036854775808"s, true, {"3"s, "9223372036854775808"s}, {"b"s, "a"s}},
+    {"-9223372036854775809"s, true, {"-9223372036854775809"s, "3"s}, {"a"s, "b"s}},
+    {"9007199254740993"s, true, {"3"s, "9007199254740993"s}, {"b"s, "a"s}},
+    {"5\x00"s, true, {"3"s, "5\x00"s}, {"b"s, "a"s}},
+    {"5\x00x"s, true, {"3"s, "5\x00x"s}, {"b"s, "a"s}},
+    {"\x00"
+     "5"s,
+     true,
+     {"\x00"
+      "5"s,
+      "3"s},
+     {"a"s, "b"s}},
+    {"\x00"s, true, {"\x00"s, "3"s}, {"a"s, "b"s}},
+    {"\x00"
+     "abc"s,
+     true,
+     {"\x00"
+      "abc"s,
+      "3"s},
+     {"a"s, "b"s}},
+    {"abc\x00"
+     "5"s,
+     false,
+     {},
+     {}},
+    {"5\x00"
+     "1e400"s,
+     true,
+     {"3"s,
+      "5\x00"
+      "1e400"s},
+     {"b"s, "a"s}},
+    {"1e400\x00"s, false, {}, {}},
+    {"5\x00\x00"s, true, {"3"s, "5\x00\x00"s}, {"b"s, "a"s}},
+    {""s, true, {""s, "3"s}, {"a"s, "b"s}},
+    {"\xd9\xa5"s, false, {}, {}},
+    {"0b1"s, false, {}, {}},
+    {"1d5"s, false, {}, {}},
+    {"1f"s, false, {}, {}},
+    {"1_0"s, false, {}, {}},
+};
+
+// What ALPHA BY does with equal weights (decision 37). For a list and for a set KeyDB holds as an
+// intset (below) KeyDB's libc qsort is a stable mergesort: tied elements keep the order they were
+// fetched in, a list's own and the intset's ascending numeric one, under DESC too.
+const vector<SortOrderCase> kAlphaByStableTieCases = {
+    {"tl", {"BY", "nokey_*", "ALPHA"}, {"b", "a", "b", "a"}},
+    {"tl", {"BY", "nokey_*", "ALPHA", "DESC"}, {"b", "a", "b", "a"}},
+    {"ml", {"BY", "mw_*", "ALPHA"}, {"r", "s", "q", "p", "t"}},
+    {"ml", {"BY", "mw_*", "ALPHA", "DESC"}, {"q", "p", "t", "s", "r"}},
+    {"ml", {"BY", "mw_*", "ALPHA", "LIMIT", "1", "3"}, {"s", "q", "p"}},
+    {"ml", {"BY", "mw_*", "ALPHA", "DESC", "LIMIT", "1", "3"}, {"p", "t", "s"}},
+    {"ml", {"BY", "mw_*", "ALPHA", "LIMIT", "0", "-1"}, {"r", "s", "q", "p", "t"}},
+    {"ml", {"BY", "mw_*", "ALPHA", "GET", "#"}, {"r", "s", "q", "p", "t"}},
+    {"ids", {"BY", "name_*", "ALPHA"}, {"9", "1", "2", "10", "30", "200"}},
+    {"ids", {"BY", "name_*", "ALPHA", "DESC"}, {"1", "2", "10", "30", "200", "9"}},
+    {"ids", {"BY", "nokey_*", "ALPHA"}, {"1", "2", "9", "10", "30", "200"}},
+    {"ids", {"BY", "nokey_*", "ALPHA", "DESC"}, {"1", "2", "9", "10", "30", "200"}},
+    {"ids", {"BY", "name_*", "ALPHA", "LIMIT", "0", "-1"}, {"9", "1", "2", "10", "30", "200"}},
+    {"ids", {"BY", "name_*", "ALPHA", "LIMIT", "1", "3"}, {"1", "2", "10"}},
+    {"ids", {"BY", "name_*", "ALPHA", "GET", "#"}, {"9", "1", "2", "10", "30", "200"}},
+};
+// The remaining ties are drakeydb's own rule, not KeyDB's: KeyDB receives a hash-encoded set's
+// elements in a per-process order (two KeyDB processes answer differently), and a zset's through
+// its dict, so no replica could follow it; they break on the element, bytewise, which at least
+// keeps drakeydb's replicas and peers equal. DESC reverses that too, as KeyDB's -cmp does.
+const vector<SortOrderCase> kAlphaByElementTieCases = {
+    {"ts", {"BY", "tw_*", "ALPHA"}, {"a", "b", "c", "d"}},
+    {"ts", {"BY", "tw_*", "ALPHA", "DESC"}, {"d", "c", "b", "a"}},
+    {"tm", {"BY", "nokey_*", "ALPHA"}, {"a", "b", "c", "d"}},
+    {"tm", {"BY", "nokey_*", "ALPHA", "DESC"}, {"d", "c", "b", "a"}},
+    {"zt", {"BY", "nokey_*", "ALPHA"}, {"a", "b", "c", "d"}},
+    {"zt", {"BY", "nokey_*", "ALPHA", "DESC"}, {"d", "c", "b", "a"}},
+    {"mix", {"BY", "nokey_*", "ALPHA"}, {"10", "9", "B", "a"}},
+    {"mix", {"BY", "nokey_*", "ALPHA", "DESC"}, {"a", "B", "9", "10"}},
+};
+
+// Review M4: a zset with equal scores under BY nosort, and the numeric BY ties of a zset and of an
+// intset (which break on the element, bytewise: "1" "10" "2").
+const vector<SortOrderCase> kTieRowsM4 = {
+    {"ze", {"BY", "nosort"}, {"a", "b", "c", "d", "e"}},
+    {"ze", {"BY", "nosort", "DESC"}, {"e", "d", "c", "b", "a"}},
+    {"ze", {"BY", "nosort", "DESC", "LIMIT", "1", "2"}, {"d", "c"}},
+    {"ze", {"BY", "nosort", "LIMIT", "1", "-1"}, {"b", "c", "d", "e"}},
+    {"ze", {"BY", "nosort", "GET", "#"}, {"a", "b", "c", "d", "e"}},
+    {"zq", {"BY", "zqw_*"}, {"v", "z", "w", "x", "y"}},
+    {"zq", {"BY", "zqw_*", "DESC"}, {"y", "x", "w", "z", "v"}},
+    {"zq", {"BY", "zqw_*", "LIMIT", "1", "3"}, {"z", "w", "x"}},
+    {"zq", {"BY", "zqw_*", "DESC", "LIMIT", "1", "3"}, {"x", "w", "z"}},
+    {"ids", {"BY", "inw_*"}, {"1", "10", "2", "200", "30", "9"}},
+    {"ids", {"BY", "inw_*", "DESC"}, {"9", "30", "200", "2", "10", "1"}},
+    {"ids", {"BY", "inw_*", "LIMIT", "1", "3"}, {"10", "2", "200"}},
+};
+
+// drakeydb: P7-1 (decision 35) -- hash-field patterns, round 2b. The expected lists are what real
+// KeyDB v6.3.4 and Redis 7.0.15 answer to the same data and command (see LoadHashFieldData); a
+// nullopt is a nil in a reply and "" in the list STORE leaves.
+const vector<SortGetCase> kHashFieldCases = {
+    {"hl", {"BY", "hf_*->f"}, {"i", "d", "e", "f", "g", "h", "x->y", "b", "c", "a"}},
+    {"hl", {"BY", "hf_*->f", "DESC"}, {"a", "c", "b", "x->y", "h", "g", "f", "e", "d", "i"}},
+    {"hl", {"BY", "hf_*->f", "LIMIT", "2", "5"}, {"e", "f", "g", "h", "x->y"}},
+    {"hl", {"BY", "hf_*->f", "DESC", "LIMIT", "1", "4"}, {"c", "b", "x->y", "h"}},
+    {"hl", {"BY", "hf_*->n"}, {"c", "d", "e", "f", "g", "h", "x->y", "b", "a", "i"}},
+    {"hl", {"BY", "hf_*->n", "DESC"}, {"i", "a", "b", "x->y", "h", "g", "f", "e", "d", "c"}},
+    {"hl", {"BY", "hf_*->nofield"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"}},
+    {"hl", {"BY", "hf_*->nofield", "DESC"}, {"x->y", "i", "h", "g", "f", "e", "d", "c", "b", "a"}},
+    {"hl", {"BY", "*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "b", "c", "a"}},
+    {"hl", {"BY", "hq->w_*"}, {"d", "e", "f", "g", "h", "x->y", "b", "c", "a", "i"}},
+    {"hl", {"BY", "hr->w_*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "c", "a", "b"}},
+    {"hl", {"BY", "hf_*_*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "a", "b", "c"}},
+    {"hl", {"BY", "hf_*->f*"}, {"a", "b", "d", "e", "f", "g", "h", "i", "x->y", "c"}},
+    {"hl", {"BY", "hf_*->f", "GET", "#"}, {"i", "d", "e", "f", "g", "h", "x->y", "b", "c", "a"}},
+    {"hl",
+     {"BY", "hf_*->f", "GET", "hf_*->g"},
+     {"", nullopt, nullopt, "Gf", "Gg", nullopt, "Gxy", "Gb", "Gc", "Ga"}},
+    {"hl",
+     {"BY", "hf_*->f", "GET", "hf_*->g", "GET", "#"},
+     {"",      "i", nullopt, "d",    nullopt, "e", "Gf", "f", "Gg", "g",
+      nullopt, "h", "Gxy",   "x->y", "Gb",    "b", "Gc", "c", "Ga", "a"}},
+    {"hl",
+     {"BY", "hf_*->f", "DESC", "LIMIT", "1", "6", "GET", "hf_*->g"},
+     {"Gc", "Gb", "Gxy", nullopt, "Gg", "Gf"}},
+    {"hl",
+     {"BY", "hf_*->f", "GET", "hq->w_*", "GET", "hr->w_*->g"},
+     {"9",     "Ri",    nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      nullopt, nullopt, nullopt, nullopt, "1",     "Rb",    "2",     "Rc",    "3",     "Ra"}},
+    {"hl",
+     {"BY", "hr->w_*->g", "ALPHA", "DESC"},
+     {"i", "c", "b", "a", "d", "e", "f", "g", "h", "x->y"}},
+    {"hl", {"BY", "hf->f"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"}},
+    {"hl", {"BY", "hf->f", "DESC"}, {"x->y", "i", "h", "g", "f", "e", "d", "c", "b", "a"}},
+    {"hl",
+     {"BY", "hf->f", "GET", "hf_*->g"},
+     {"Ga", "Gb", "Gc", nullopt, nullopt, "Gf", "Gg", nullopt, "", "Gxy"}},
+    {"hl", {"BY", "hf_*->f", "ALPHA"}, {"d", "e", "f", "h", "g", "i", "x->y", "b", "c", "a"}},
+    {"hl",
+     {"BY", "hf_*->f", "ALPHA", "DESC"},
+     {"a", "c", "b", "x->y", "i", "g", "d", "e", "f", "h"}},
+    {"hl", {"BY", "hf_*->g", "ALPHA"}, {"d", "e", "h", "i", "a", "b", "c", "f", "g", "x->y"}},
+    {"hl",
+     {"BY", "hf_*->g", "ALPHA", "DESC"},
+     {"x->y", "g", "f", "c", "b", "a", "i", "d", "e", "h"}},
+    {"hl", {"BY", "hf_*->nofield", "ALPHA"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"}},
+    {"hl", {"BY", "hf_*->", "ALPHA"}, {"d", "e", "f", "g", "h", "i", "a", "b", "c", "x->y"}},
+    {"hl", {"BY", "hf_*->->", "ALPHA"}, {"b", "c", "d", "e", "f", "g", "h", "i", "x->y", "a"}},
+    {"hl", {"BY", "hf_*-->g", "ALPHA"}, {"b", "c", "d", "e", "f", "g", "h", "i", "x->y", "a"}},
+    {"hl", {"BY", "hf_*->f->g", "ALPHA"}, {"a", "c", "d", "e", "f", "g", "h", "i", "x->y", "b"}},
+    {"hl", {"BY", "hf->f", "ALPHA"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"}},
+    {"hl",
+     {"BY", "hf_*->g", "ALPHA", "GET", "hf_*->g", "GET", "#"},
+     {nullopt, "d", nullopt, "e", nullopt, "h", "",   "i", "Ga",  "a",
+      "Gb",    "b", "Gc",    "c", "Gf",    "f", "Gg", "g", "Gxy", "x->y"}},
+    {"hl",
+     {"BY", "nosort", "GET", "hf_*->g"},
+     {"Ga", "Gb", "Gc", nullopt, nullopt, "Gf", "Gg", nullopt, "", "Gxy"}},
+    {"hl",
+     {"BY", "nosort", "DESC", "GET", "hf_*->g"},
+     {"Gxy", "", nullopt, "Gg", "Gf", nullopt, nullopt, "Gc", "Gb", "Ga"}},
+    {"hs", {"BY", "hf_*->f"}, {"i", "d", "e", "f", "g", "h", "x->y", "b", "c", "a"}},
+    {"hs", {"BY", "hf_*->f", "DESC"}, {"a", "c", "b", "x->y", "h", "g", "f", "e", "d", "i"}},
+    {"hs", {"BY", "hf_*->f", "LIMIT", "2", "5"}, {"e", "f", "g", "h", "x->y"}},
+    {"hs", {"BY", "hf_*->f", "DESC", "LIMIT", "1", "4"}, {"c", "b", "x->y", "h"}},
+    {"hs", {"BY", "hf_*->n"}, {"c", "d", "e", "f", "g", "h", "x->y", "b", "a", "i"}},
+    {"hs", {"BY", "hf_*->n", "DESC"}, {"i", "a", "b", "x->y", "h", "g", "f", "e", "d", "c"}},
+    {"hs", {"BY", "hf_*->nofield"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"}},
+    {"hs", {"BY", "hf_*->nofield", "DESC"}, {"x->y", "i", "h", "g", "f", "e", "d", "c", "b", "a"}},
+    {"hs", {"BY", "*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "b", "c", "a"}},
+    {"hs", {"BY", "hq->w_*"}, {"d", "e", "f", "g", "h", "x->y", "b", "c", "a", "i"}},
+    {"hs", {"BY", "hr->w_*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "c", "a", "b"}},
+    {"hs", {"BY", "hf_*_*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "a", "b", "c"}},
+    {"hs", {"BY", "hf_*->f*"}, {"a", "b", "d", "e", "f", "g", "h", "i", "x->y", "c"}},
+    {"hs", {"BY", "hf_*->f", "GET", "#"}, {"i", "d", "e", "f", "g", "h", "x->y", "b", "c", "a"}},
+    {"hs",
+     {"BY", "hf_*->f", "GET", "hf_*->g"},
+     {"", nullopt, nullopt, "Gf", "Gg", nullopt, "Gxy", "Gb", "Gc", "Ga"}},
+    {"hs",
+     {"BY", "hf_*->f", "GET", "hf_*->g", "GET", "#"},
+     {"",      "i", nullopt, "d",    nullopt, "e", "Gf", "f", "Gg", "g",
+      nullopt, "h", "Gxy",   "x->y", "Gb",    "b", "Gc", "c", "Ga", "a"}},
+    {"hs",
+     {"BY", "hf_*->f", "DESC", "LIMIT", "1", "6", "GET", "hf_*->g"},
+     {"Gc", "Gb", "Gxy", nullopt, "Gg", "Gf"}},
+    {"hs",
+     {"BY", "hf_*->f", "GET", "hq->w_*", "GET", "hr->w_*->g"},
+     {"9",     "Ri",    nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      nullopt, nullopt, nullopt, nullopt, "1",     "Rb",    "2",     "Rc",    "3",     "Ra"}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->g"},
+     {"Ga", "Gb", "Gc", nullopt, nullopt, "Gf", "Gg", nullopt, "", "Gxy"}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->f"},
+     {"3", "1", "2", nullopt, nullopt, nullopt, "", nullopt, "-1", "0"}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->nofield"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "#", "GET", "hf_*->g"},
+     {"a", "Ga", "b", "Gb", "c", "Gc",    "d", nullopt, "e",    nullopt,
+      "f", "Gf", "g", "Gg", "h", nullopt, "i", "",      "x->y", "Gxy"}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->g", "GET", "#", "GET", "hf_*->f"},
+     {"Ga", "a",     "3",     "Gb",    "b",     "1",  "Gc", "c",     "2",    nullopt,
+      "d",  nullopt, nullopt, "e",     nullopt, "Gf", "f",  nullopt, "Gg",   "g",
+      "",   nullopt, "h",     nullopt, "",      "i",  "-1", "Gxy",   "x->y", "0"}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->"},
+     {"ARROWa", "ARROWb", "ARROWc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      "ARROWxy"}},
+    {"hl",
+     {"ALPHA", "GET", "*->g"},
+     {"Ba", "Bb", "Bc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hq->w_*"},
+     {"3", "1", "2", nullopt, nullopt, nullopt, nullopt, nullopt, "9", nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hr->w_*->g"},
+     {"Ra", "Rb", "Rc", nullopt, nullopt, nullopt, nullopt, nullopt, "Ri", nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*_*->g"},
+     {"Sa", "Sb", "Sc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->->"},
+     {"ARROWFIELD", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*-->g"},
+     {"DASHa", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->f->g"},
+     {nullopt, "FARROWG", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->f*"},
+     {nullopt, nullopt, "7", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf->g"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_->g*"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "#->g"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*"},
+     {nullopt, nullopt, nullopt, nullopt, "iamastring", nullopt, nullopt, nullopt, nullopt,
+      nullopt}},
+    {"hl", {"ALPHA", "GET", "hf_*->g", "LIMIT", "2", "3"}, {"Gc", nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "DESC", "GET", "hf_*->g"},
+     {"Gxy", "", nullopt, "Gg", "Gf", nullopt, nullopt, "Gc", "Gb", "Ga"}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->g"},
+     {"Ga", "Gb", "Gc", nullopt, nullopt, "Gf", "Gg", nullopt, "", "Gxy"}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->f"},
+     {"3", "1", "2", nullopt, nullopt, nullopt, "", nullopt, "-1", "0"}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->nofield"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "#", "GET", "hf_*->g"},
+     {"a", "Ga", "b", "Gb", "c", "Gc",    "d", nullopt, "e",    nullopt,
+      "f", "Gf", "g", "Gg", "h", nullopt, "i", "",      "x->y", "Gxy"}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->g", "GET", "#", "GET", "hf_*->f"},
+     {"Ga", "a",     "3",     "Gb",    "b",     "1",  "Gc", "c",     "2",    nullopt,
+      "d",  nullopt, nullopt, "e",     nullopt, "Gf", "f",  nullopt, "Gg",   "g",
+      "",   nullopt, "h",     nullopt, "",      "i",  "-1", "Gxy",   "x->y", "0"}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->"},
+     {"ARROWa", "ARROWb", "ARROWc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      "ARROWxy"}},
+    {"hs",
+     {"ALPHA", "GET", "*->g"},
+     {"Ba", "Bb", "Bc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hq->w_*"},
+     {"3", "1", "2", nullopt, nullopt, nullopt, nullopt, nullopt, "9", nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hr->w_*->g"},
+     {"Ra", "Rb", "Rc", nullopt, nullopt, nullopt, nullopt, nullopt, "Ri", nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*_*->g"},
+     {"Sa", "Sb", "Sc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->->"},
+     {"ARROWFIELD", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*-->g"},
+     {"DASHa", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->f->g"},
+     {nullopt, "FARROWG", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->f*"},
+     {nullopt, nullopt, "7", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf->g"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_->g*"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "#->g"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*"},
+     {nullopt, nullopt, nullopt, nullopt, "iamastring", nullopt, nullopt, nullopt, nullopt,
+      nullopt}},
+    {"hs", {"ALPHA", "GET", "hf_*->g", "LIMIT", "2", "3"}, {"Gc", nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "DESC", "GET", "hf_*->g"},
+     {"Gxy", "", nullopt, "Gg", "Gf", nullopt, nullopt, "Gc", "Gb", "Ga"}},
+};
+
+const vector<SortGetCase> kHashFieldNulCases = {
+    {"nl", {"ALPHA", "GET", "#\x00x"s}, {"a", "b", "c"}},
+    {"nl", {"ALPHA", "GET", "#\x00"s}, {"a", "b", "c"}},
+    {"nl", {"ALPHA", "GET", "hn_*\x00->g"s}, {"S2", nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "hn_*->g\x00h"s}, {"NULFIELD", nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "hn_*->g\x00"s}, {"NULEND", nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "hn_*->\x00g"s}, {"S1", nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "h\x00v_*->g"s}, {nullopt, nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "hn_*\x00"s}, {"S3", nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "hn_*->g", "GET", "#\x00x"s}, {"Ga", "a", "Gb", "b", "Gc", "c"}},
+    {"nl", {"BY", "h\x00v_*->f"s}, {"a", "b", "c"}},
+    {"nl", {"BY", "h\x00v_*->f"s, "GET", "#"}, {"a", "b", "c"}},
+    {"nl", {"BY", "h\x00*"s, "GET", "#"}, {"a", "b", "c"}},
+    {"nl", {"BY", "hn_*->g\x00h"s, "ALPHA"}, {"b", "c", "a"}},
+    {"nl", {"BY", "hn_*->\x00g"s, "ALPHA"}, {"b", "c", "a"}},
+    {"nl", {"BY", "hn_*\x00"s, "ALPHA", "GET", "#"}, {"b", "c", "a"}},
+    {"nl", {"BY", "hn_*->f"}, {"b", "c", "a"}},
+    {"nl", {"BY", "hn_*->f", "GET", "hn_*->g"}, {"Gb", "Gc", "Ga"}},
+    {"nl", {"BY", "hn_*->f\x00"s, "GET", "hn_*->g"}, {"Ga", "Gb", "Gc"}},
+};
+}  // namespace
+
+class GenericSortOrderTest : public GenericFamilyTest {
+ protected:
+  void LoadData();
+  void ExpectReply(const SortOrderCase& c);
+  void ExpectStore(const SortOrderCase& c);
+  void ExpectScript(const SortOrderCase& c);
+  void ExpectGetReply(const SortGetCase& c);
+  void ExpectGetStore(const SortGetCase& c);
+  void LoadHashFieldData();
+  void LoadHashFieldNulData();
+};
+
+// The data the tables above were taken on (the same commands ran against KeyDB and Redis).
+void GenericSortOrderTest::LoadData() {
+  // s: a SET of letters; every letter weighs 1 (w_*), except a, which weighs 2.
+  Run({"sadd", "s", "j", "i", "h", "g", "f", "e", "d", "c", "b", "a"});
+  for (string_view ch : {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}) {
+    Run({"set", StrCat("w_", ch), ch == "a" ? "2" : "1"});
+    Run({"set", StrCat("h_", ch), StrCat("H", ch)});
+  }
+  Run({"sadd", "sn", "5", "3", "9", "1", "7", "2", "8", "4", "6", "10"});
+  // l: a LIST whose elements mostly have no weight (lw_*).
+  Run({"rpush", "l", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p"});
+  for (string_view ch : {"e", "i", "o", "p"})
+    Run({"set", StrCat("lw_", ch), "3"});
+  Run({"set", "lw_q", "1"});
+  Run({"rpush", "ln", "5", "3", "9", "1", "7", "5", "5", "3"});
+  // sm: a and d weigh 0, b has no weight (also 0), c weighs -1.
+  Run({"sadd", "sm", "d", "c", "b", "a"});
+  Run({"set", "nw_a", "0"});
+  Run({"set", "nw_c", "-1"});
+  Run({"set", "nw_d", "0"});
+  // z: a ZSET whose rank order (b c a e d) is not the members' order; zl: a LIST out of order.
+  Run({"zadd", "z", "3", "a", "1", "b", "2", "c", "5", "d", "4", "e"});
+  Run({"rpush", "zl", "x", "y", "z", "w", "v"});
+  // sa: ALPHA BY weights aw_*: c has none, b has the empty string, the others are distinct.
+  Run({"sadd", "sa", "f", "e", "d", "c", "b", "a"});
+  Run({"set", "aw_a", "m"});
+  Run({"set", "aw_b", ""});
+  Run({"set", "aw_d", "b"});
+  Run({"set", "aw_e", "z"});
+  Run({"set", "aw_f", "a"});
+  // sw: x's weight key is a list (not a string, so missing), y's is empty, z's is "a".
+  Run({"sadd", "sw", "z", "y", "x"});
+  Run({"rpush", "ww_x", "a"});
+  Run({"set", "ww_y", ""});
+  Run({"set", "ww_z", "a"});
+  // The ALPHA BY ties: equal weights (ts), no weights at all (tm), a list with duplicates (tl).
+  Run({"sadd", "ts", "d", "c", "b", "a"});
+  for (string_view ch : {"a", "b", "c"})
+    Run({"set", StrCat("tw_", ch), "x"});
+  Run({"set", "tw_d", "y"});
+  Run({"sadd", "tm", "d", "c", "b", "a"});
+  Run({"rpush", "tl", "b", "a", "b", "a"});
+
+  // Round 2a (decisions 36-38), generated with the tables above from the same fixture: GET data (g,
+  // go_*, gfixed, gw_*, gz), several '*' (m, ws_*_*, wd_**, gh_**), ALPHA BY ties (ml, mw_*, ids,
+  // name_*, inw_*), a zset with equal scores (ze), a zset under numeric BY ties (zq, zqw_*), and a
+  // zset and a mixed set for the element rule (zt, mix).
+  Run({"rpush", "g", "1", "2", "3", "4"});
+  Run({"set", "go_1", "first"});
+  Run({"set", "go_3", ""});
+  Run({"hset", "go_4", "f", "v"});
+  Run({"set", "gfixed", "FIXED"});
+  Run({"set", "gw_1", "4"});
+  Run({"set", "gw_2", "3"});
+  Run({"set", "gw_3", "2"});
+  Run({"set", "gw_4", "1"});
+  Run({"zadd", "gz", "4", "1", "3", "2", "2", "3", "1", "4"});
+  Run({"rpush", "m", "1", "2", "3"});
+  Run({"set", "ws_1_*", "3"});
+  Run({"set", "wd_1*", "3"});
+  Run({"set", "gh_1*", "S1"});
+  Run({"set", "ws_2_*", "2"});
+  Run({"set", "wd_2*", "2"});
+  Run({"set", "gh_2*", "S2"});
+  Run({"set", "ws_3_*", "1"});
+  Run({"set", "wd_3*", "1"});
+  Run({"set", "gh_3*", "S3"});
+  Run({"rpush", "ml", "q", "p", "r", "s", "t"});
+  Run({"set", "mw_q", "m"});
+  Run({"set", "mw_p", "m"});
+  Run({"set", "mw_s", ""});
+  Run({"set", "mw_t", "m"});
+  Run({"sadd", "ids", "30", "2", "10", "1", "200", "9"});
+  Run({"set", "name_30", "same"});
+  Run({"set", "name_2", "same"});
+  Run({"set", "name_10", "same"});
+  Run({"set", "name_1", "same"});
+  Run({"set", "name_200", "same"});
+  Run({"set", "name_9", "aaa"});
+  Run({"set", "inw_30", "1"});
+  Run({"set", "inw_2", "1"});
+  Run({"set", "inw_10", "1"});
+  Run({"set", "inw_1", "1"});
+  Run({"set", "inw_200", "1"});
+  Run({"set", "inw_9", "1"});
+  Run({"zadd", "ze", "1", "c", "1", "a", "1", "b", "1", "d", "1", "e"});
+  Run({"zadd", "zq", "1", "x", "2", "y", "3", "z", "4", "w", "5", "v"});
+  Run({"set", "zqw_x", "1"});
+  Run({"set", "zqw_y", "1"});
+  Run({"set", "zqw_z", "0"});
+  Run({"set", "zqw_w", "1"});
+  Run({"zadd", "zt", "1", "d", "1", "c", "1", "b", "1", "a"});
+  Run({"sadd", "mix", "10", "9", "a", "B"});
+}
+
+// SORT and SORT_RO reply `expected`, in this order.
+void GenericSortOrderTest::ExpectReply(const SortOrderCase& c) {
+  for (string_view name : {"SORT", "SORT_RO"}) {
+    vector<string> cmd{string(name), c.source};
+    cmd.insert(cmd.end(), c.options.begin(), c.options.end());
+    EXPECT_THAT(Run(cmd), RespArray(ElementsAreArray(c.expected))) << name;
+  }
+}
+
+// STORE leaves `expected` in a list at dst, whether dst is on the source's shard or on another one,
+// over a dst that held something else (an empty result deletes it, as Redis does).
+void GenericSortOrderTest::ExpectStore(const SortOrderCase& c) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  for (bool same_shard : {true, false}) {
+    const string dst = SortStoreDstKey("sort-order-dst", c.source, same_shard);
+    SCOPED_TRACE(StrCat("STORE on ", same_shard ? "the source's shard" : "another shard"));
+
+    Run({"set", dst, "stale"});
+    EXPECT_THAT(Run(SortStoreCommand(c.source, c.options, dst)), IntArg(c.expected.size()));
+    if (c.expected.empty())
+      EXPECT_THAT(Run({"exists", dst}), IntArg(0));
+    else
+      EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespArray(ElementsAreArray(c.expected)));
+  }
+}
+
+// The same inside EVAL, where a SET under BY nosort is sorted even without STORE: the reply of
+// SORT and of SORT_RO, and the list STORE leaves.
+void GenericSortOrderTest::ExpectScript(const SortOrderCase& c) {
+  const string dst = SortStoreDstKey("sort-order-script-dst", c.source, false);
+  for (string_view name : {"SORT", "SORT_RO"}) {
+    vector<string> eval{"EVAL", StrCat("return redis.call('", name, "', KEYS[1], unpack(ARGV))"),
+                        "2", c.source, dst};
+    eval.insert(eval.end(), c.options.begin(), c.options.end());
+    EXPECT_THAT(Run(eval), RespArray(ElementsAreArray(c.expected))) << name;
+  }
+
+  vector<string> eval{"EVAL", "return redis.call('SORT', KEYS[1], unpack(ARGV))", "2", c.source,
+                      dst};
+  eval.insert(eval.end(), c.options.begin(), c.options.end());
+  eval.insert(eval.end(), {"STORE", dst});
+  Run({"set", dst, "stale"});
+  EXPECT_THAT(Run(eval), IntArg(c.expected.size()));
+  if (c.expected.empty())
+    EXPECT_THAT(Run({"exists", dst}), IntArg(0));
+  else
+    EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespArray(ElementsAreArray(c.expected)));
+}
+
+// SORT and SORT_RO reply `expected`, a nil where it holds a nullopt.
+void GenericSortOrderTest::ExpectGetReply(const SortGetCase& c) {
+  vector<Matcher<const RespExpr&>> elements;
+  for (const optional<string>& e : c.expected) {
+    elements.push_back(e ? Matcher<const RespExpr&>(Eq(*e))
+                         : Matcher<const RespExpr&>(ArgType(RespExpr::NIL)));
+  }
+  for (string_view name : {"SORT", "SORT_RO"}) {
+    vector<string> cmd{string(name), c.source};
+    cmd.insert(cmd.end(), c.options.begin(), c.options.end());
+    EXPECT_THAT(Run(cmd), RespArray(ElementsAreArray(elements))) << name;
+  }
+}
+
+// STORE leaves the same values with "" for each nil, on the source's shard and on another one.
+void GenericSortOrderTest::ExpectGetStore(const SortGetCase& c) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  vector<string> stored;
+  for (const optional<string>& e : c.expected)
+    stored.push_back(e.value_or(""));
+
+  for (bool same_shard : {true, false}) {
+    const string dst = SortStoreDstKey("sort-get-dst", c.source, same_shard);
+    SCOPED_TRACE(StrCat("STORE on ", same_shard ? "the source's shard" : "another shard"));
+
+    Run({"set", dst, "stale"});
+    EXPECT_THAT(Run(SortStoreCommand(c.source, c.options, dst)), IntArg(stored.size()));
+    EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespArray(ElementsAreArray(stored)));
+  }
+}
+
+// Rule 1: two elements with the same BY weight, or none (a missing key weighs 0), come out in the
+// elements' order, ASC and DESC alike, under LIMIT and into STORE. Before, they came out in the
+// order the source held them in: a set's iteration order, which a replica does not share.
+TEST_F(GenericSortOrderTest, TiedByWeightsBreakOnTheElement) {
+  LoadData();
+  for (const SortOrderCase& c : kByTieCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// Rule 2: under ALPHA BY a weight key that does not exist, or is not a string, sorts before every
+// weight that does, the empty string included, and DESC puts it last.
+TEST_F(GenericSortOrderTest, AlphaByPutsAMissingWeightFirst) {
+  LoadData();
+  for (const SortOrderCase& c : kAlphaByCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// Decision 37: under ALPHA BY, tied weights keep the fetch order for a list and for an integer set,
+// ASC and DESC alike (the missing weights sort first and DESC puts them last); the order of the
+// elements before this was the element's.
+TEST_F(GenericSortOrderTest, AlphaByTiesKeepTheFetchOrderOfAListOrAnIntegerSet) {
+  LoadData();
+  for (const SortOrderCase& c : kAlphaByStableTieCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// The members of an integer set of n members, in an order no iteration follows by luck.
+static vector<string> IntegerMembers(unsigned n) {
+  vector<string> members;
+  for (unsigned i = 0; i < n; ++i)
+    members.push_back(to_string(int((i * 7919u) % n) * 13 - 1000));
+  return members;
+}
+
+// KeyDB holds a set of up to 512 integers as an intset, which iterates in ascending numeric order,
+// and its stable sort keeps that order for tied weights. drakeydb decides this on the members, not
+// on its own encoding: its intset ends at 256 members, so the sets of 257, 300 and 512 below are
+// hash sets here and would otherwise break on the element. A set of more than 512 integers is a
+// hash set in KeyDB as well (its order differs between processes), so those break on the element
+// here. Live KeyDB, Redis and drakeydb agreed on the sizes up to 512 (and not on 513 and 600).
+TEST_F(GenericSortOrderTest, AlphaByTiesOverIntegerSetsOfEverySize) {
+  for (unsigned n : {100u, 256u, 257u, 300u, 512u, 513u, 600u}) {
+    SCOPED_TRACE(StrCat("a set of ", n, " integers"));
+    const string key = StrCat("big-ints-", n);
+    vector<string> members = IntegerMembers(n);
+    vector<string> sadd{"sadd", key};
+    sadd.insert(sadd.end(), members.begin(), members.end());
+    Run(sadd);  // its reply is not checked: a set that outgrows its intset in one call counts short
+    ASSERT_THAT(Run({"scard", key}), IntArg(n));
+    EXPECT_THAT(Run({"debug", "object", key}).GetString(),
+                HasSubstr(n <= 256 ? "encoding:intset" : "encoding:dense_set"));
+
+    vector<string> ascending = members;
+    if (n <= 512) {
+      sort(ascending.begin(), ascending.end(),
+           [](const string& l, const string& r) { return stoll(l) < stoll(r); });
+    } else {
+      sort(ascending.begin(), ascending.end());
+    }
+    vector<string> descending = ascending;
+    if (n > 512)
+      reverse(descending.begin(), descending.end());  // the element rule is negated by DESC
+
+    ExpectReply({key, {"BY", "nokey_*", "ALPHA"}, ascending});
+    ExpectStore({key, {"BY", "nokey_*", "ALPHA"}, ascending});
+    ExpectReply({key, {"BY", "nokey_*", "ALPHA", "DESC"}, descending});
+    ExpectStore({key, {"BY", "nokey_*", "ALPHA", "DESC"}, descending});
+  }
+}
+
+// What KeyDB leaves undetermined (ALPHA BY ties of a hash set or a zset) is deterministic here: see
+// the table above.
+TEST_F(GenericSortOrderTest, AlphaByTiesOfOtherSourcesBreakOnTheElement) {
+  LoadData();
+  for (const SortOrderCase& c : kAlphaByElementTieCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// Review M4, under decisions 34 and 37: a zset's equal scores under BY nosort (rank order, DESC
+// from the tail, LIMIT along it), and numeric BY ties of a zset and of an intset.
+TEST_F(GenericSortOrderTest, ZsetAndIntsetTiesUnderByAndNosort) {
+  LoadData();
+  for (const SortOrderCase& c : kTieRowsM4) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// Decisions 36 and 38: LIMIT clamps as sortCommand does, so `LIMIT 0 -1` is everything.
+TEST_F(GenericSortOrderTest, LimitIsClampedLikeRedis) {
+  LoadData();
+  for (const SortOrderCase& c : kLimitCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// What string2ll refuses is refused: the Redis error, before the source or the destination is
+// touched (a STORE keeps its old destination).
+TEST_F(GenericSortOrderTest, LimitRejectsWhatStringToLongLongRejects) {
+  LoadData();
+  const string kError = "value is not an integer or out of range";
+  for (const auto& [offset, count] : kRejectedLimits) {
+    SCOPED_TRACE(StrCat("LIMIT '", offset, "' '", count, "'"));
+    for (string_view name : {"SORT", "SORT_RO"}) {
+      EXPECT_THAT(Run({name, "ln", "LIMIT", offset, count}), ErrArg(kError)) << name;
+      EXPECT_THAT(Run({name, "no-such-source", "LIMIT", offset, count}), ErrArg(kError)) << name;
+    }
+    for (bool same_shard : {true, false}) {
+      const string dst = SortStoreDstKey("sort-limit-dst", "ln", same_shard);
+      Run({"set", dst, "stale"});
+      EXPECT_THAT(Run({"sort", "ln", "LIMIT", offset, count, "STORE", dst}), ErrArg(kError));
+      EXPECT_THAT(Run({"get", dst}), "stale");
+    }
+  }
+
+  // The first valid LIMIT is not undone by a later one that is refused, and a LIMIT without its two
+  // arguments is a syntax error, as in Redis.
+  EXPECT_THAT(Run({"sort", "ln", "LIMIT", "1", "2", "LIMIT", "+1", "2"}), ErrArg(kError));
+  EXPECT_THAT(Run({"sort", "ln", "LIMIT", "1"}), ErrArg("syntax error"));
+  EXPECT_THAT(Run({"sort", "ln", "LIMIT"}), ErrArg("syntax error"));
+}
+
+// Decision 36: only the first '*' of a BY or a GET pattern is substituted; the rest is literal.
+TEST_F(GenericSortOrderTest, OnlyTheFirstAsteriskOfAPatternIsSubstituted) {
+  LoadData();
+  for (const SortOrderCase& c : kStarCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// Decision 36: GET of a missing or non-string key, and GET of a pattern without '*', is nil in the
+// reply (RESP2 $-1) and "" in STORE, not "" and not the value of a fixed key as before.
+TEST_F(GenericSortOrderTest, GetOfNothingIsNilInTheReplyAndEmptyInStore) {
+  LoadData();
+  for (const SortGetCase& c : kGetCases) {
+    SCOPED_TRACE(StrCat("SORT ", c.source, " ", absl::StrJoin(c.options, " ")));
+    ExpectGetReply(c);
+    ExpectGetStore(c);
+  }
+}
+
+// Decision 36: a numeric element or BY weight loads as in sortCommand, so "5 " and "1e-310" are
+// refused (trailing space, ERANGE), "5\0x" is 5 and "\0" is 0 (strtod stops at the NUL), and a
+// missing weight is 0. The expected values come from KeyDB and Redis, spelling by spelling.
+TEST_F(GenericSortOrderTest, NumbersLoadAsRedisLoadsScores) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  for (const SortNumberCase& c : kNumberCases) {
+    SCOPED_TRACE(
+        StrCat("value of ", c.value.size(), " bytes: ", absl::CHexEscape(c.value.substr(0, 40))));
+    Run({"flushall"});
+    Run({"rpush", "num-l", c.value, "3"});
+    Run({"rpush", "num-b", "a", "b"});
+    Run({"set", "numw_a", c.value});
+    Run({"set", "numw_b", "3"});
+
+    const SortOrderCase as_element{"num-l", {}, c.elements};
+    const SortOrderCase as_weight{"num-b", {"BY", "numw_*"}, c.by};
+    if (c.accepted) {
+      for (const SortOrderCase& sort_case : {as_element, as_weight}) {
+        ExpectReply(sort_case);
+        ExpectStore(sort_case);
+      }
+      continue;
+    }
+
+    for (const SortOrderCase& sort_case : {as_element, as_weight}) {
+      for (string_view name : {"SORT", "SORT_RO"}) {
+        vector<string> cmd{string(name), sort_case.source};
+        cmd.insert(cmd.end(), sort_case.options.begin(), sort_case.options.end());
+        EXPECT_THAT(Run(cmd), ErrArg("One or more scores can't be converted into double"));
+      }
+      for (bool same_shard : {true, false}) {
+        const string dst = SortStoreDstKey("sort-number-dst", sort_case.source, same_shard);
+        Run({"set", dst, "stale"});
+        EXPECT_THAT(Run(SortStoreCommand(sort_case.source, sort_case.options, dst)),
+                    ErrArg("One or more scores can't be converted into double"));
+        EXPECT_THAT(Run({"get", dst}), "stale");
+      }
+    }
+  }
+}
+
+// Rule 3: BY nosort on a SET that is stored, or sorted inside a script, comes out ALPHA by the
+// element (note "1" "10" "2" for the intset), with GET, DESC and LIMIT applied after the sort.
+TEST_F(GenericSortOrderTest, NosortSetThatIsStoredOrScriptedIsSortedAlpha) {
+  LoadData();
+  for (const SortOrderCase& c : kNosortSetCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectStore(c);
+    ExpectScript(c);
+  }
+
+  // Inside MULTI a STORE is stored all the same.
+  Run({"multi"});
+  Run({"sort", "s", "BY", "nosort", "STORE", "multi-dst"});
+  ASSERT_THAT(Run({"exec"}), RespElementsAre(IntArg(10)));
+  EXPECT_THAT(Run({"lrange", "multi-dst", "0", "-1"}),
+              RespElementsAre("a", "b", "c", "d", "e", "f", "g", "h", "i", "j"));
+}
+
+// A SET under BY nosort that is neither stored nor scripted keeps its iteration order, which no
+// one defines (Redis and KeyDB leave it open too): the members, each once, and LIMIT cuts that
+// walk. This is not an order to assert; it pins that the plain reply is not sorted away or lost.
+TEST_F(GenericSortOrderTest, NosortSetReplyKeepsItsMembers) {
+  LoadData();
+  const vector<string> members{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"};
+
+  for (string_view name : {"SORT", "SORT_RO"}) {
+    EXPECT_THAT(Run({name, "s", "BY", "nosort"}), RespArray(UnorderedElementsAreArray(members)));
+
+    auto resp = Run({name, "s", "BY", "nosort", "LIMIT", "2", "3"});
+    ASSERT_THAT(resp, ArrLen(3));
+    set<string> distinct;
+    for (const RespExpr& e : resp.GetVec())
+      distinct.insert(e.GetString());
+    EXPECT_EQ(distinct.size(), 3u);
+    EXPECT_TRUE(all_of(distinct.begin(), distinct.end(), [&](const string& m) {
+      return find(members.begin(), members.end(), m) != members.end();
+    }));
+  }
+
+  Run({"multi"});
+  Run({"sort", "s", "BY", "nosort"});
+  auto resp = Run({"exec"});
+  ASSERT_THAT(resp, ArrLen(1));
+  EXPECT_THAT(resp.GetVec()[0], RespArray(UnorderedElementsAreArray(members)));
+}
+
+// Rule 4: BY nosort on a LIST or a ZSET walks it from the tail under DESC, in the reply and into
+// STORE, and LIMIT counts along that walk. ASC is the native order, as before.
+TEST_F(GenericSortOrderTest, NosortListAndZsetHonourDesc) {
+  LoadData();
+  for (const SortOrderCase& c : kNosortWalkCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+    ExpectScript(c);
+  }
+}
+
+// `LIMIT 1 4294967295` is a valid count in Redis and KeyDB (everything from the offset on), and
+// summed with the offset it wrapped around a uint32: the range ended before it began, which
+// crashed the server (BY forms) or replied garbage (plain form). Found while checking decision 34's
+// forms against KeyDB.
+TEST_F(GenericSortOrderTest, LimitCountBeyondUint32DoesNotOverflow) {
+  LoadData();
+  for (const SortOrderCase& c : kWideLimitCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// drakeydb: P7-1 (decision 35) -- hash-field patterns (round 2b). `BY w_*->f` and `GET h_*->f` read
+// field `f` of the hash at the key the first '*' names, as lookupKeyByPattern does
+// (sort.cpp:61-137): the first "->" after the '*' starts the field, if a character follows it; a
+// missing key, a key that is not a hash and a missing field are all "no value" (a nil in a reply,
+// "" in STORE, a weight of 0 under numeric BY and a missing weight under ALPHA BY). Every expected
+// list in kHashFieldCases and kHashFieldNulCases is what real KeyDB v6.3.4 answers to the same data
+// and command, and Redis 7.0.15 answers the same (and SORT_RO, on Redis): they were generated from
+// the fixtures below.
+//
+// hl is a list and hs a set of a..i and "x->y". For element e, hf_e is: a hash with the numeric
+// field f, the text field g and the number text n (a, b, c, i, x->y); missing (d); a string (e); a
+// hash without f (f); a hash whose f is empty (g); a list (h). The other keys are the odd spellings
+// of the cases.
+void GenericSortOrderTest::LoadHashFieldData() {
+  Run({"rpush", "hl", "a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"});
+  Run({"sadd", "hs", "x->y", "i", "h", "g", "f", "e", "d", "c", "b", "a"});
+  Run({"hset", "hf_a", "f", "3", "g", "Ga", "n", "10"});
+  Run({"hset", "hf_b", "f", "1", "g", "Gb", "n", "9.5"});
+  Run({"hset", "hf_c", "f", "2", "g", "Gc", "n", "-3"});
+  Run({"set", "hf_e", "iamastring"});
+  Run({"hset", "hf_f", "g", "Gf"});
+  Run({"hset", "hf_g", "f", "", "g", "Gg"});
+  Run({"rpush", "hf_h", "1", "2"});
+  Run({"hset", "hf_i", "f", "-1", "g", "", "n", "1e2"});
+  Run({"hset", "hf_x->y", "f", "0", "g", "Gxy", "n", "0"});
+  Run({"hset", "hf_a", "->", "ARROWFIELD"});
+  Run({"hset", "hf_b", "f->g", "FARROWG"});
+  Run({"hset", "hf_c", "f*", "7"});
+  Run({"hset", "hf_a-", "g", "DASHa"});
+  Run({"set", "hf_a->", "ARROWa"});
+  Run({"set", "hf_b->", "ARROWb"});
+  Run({"set", "hf_c->", "ARROWc"});
+  Run({"set", "hf_x->y->", "ARROWxy"});
+  Run({"set", "hq->w_a", "3"});
+  Run({"set", "hq->w_b", "1"});
+  Run({"set", "hq->w_c", "2"});
+  Run({"set", "hq->w_i", "9"});
+  Run({"hset", "hr->w_a", "f", "2", "g", "Ra"});
+  Run({"hset", "hr->w_b", "f", "3", "g", "Rb"});
+  Run({"hset", "hr->w_c", "f", "1", "g", "Rc"});
+  Run({"hset", "hr->w_i", "f", "0", "g", "Ri"});
+  Run({"hset", "hf_a_*", "f", "1", "g", "Sa"});
+  Run({"hset", "hf_b_*", "f", "2", "g", "Sb"});
+  Run({"hset", "hf_c_*", "f", "3", "g", "Sc"});
+  Run({"hset", "a", "f", "3", "g", "Ba"});
+  Run({"hset", "b", "f", "1", "g", "Bb"});
+  Run({"hset", "c", "f", "2", "g", "Bc"});
+}
+
+// Source nl, and the keys that a pattern holding a NUL byte does and does not reach: Redis scans a
+// pattern as a C string, so a NUL hides a '*' or a "->" that follows it, "#\0x" is "#", and the key
+// and the field are cut by length.
+void GenericSortOrderTest::LoadHashFieldNulData() {
+  Run({"rpush", "nl", "a", "b", "c"});
+  Run({"hset", "hn_a", "f", "5", "g", "Ga", "g\x00h"s, "NULFIELD", "g\x00"s, "NULEND"});
+  Run({"hset", "hn_b", "f", "1", "g", "Gb"});
+  Run({"hset", "hn_c", "f", "3", "g", "Gc"});
+  Run({"set", "hn_a->\x00g"s, "S1"});
+  Run({"set", "hn_a\x00->g"s, "S2"});
+  Run({"set", "hn_a\x00"s, "S3"});
+  Run({"hset", "h\x00v_a"s, "f", "5", "g", "Ha"});
+  Run({"hset", "h\x00v_b"s, "f", "1", "g", "Hb"});
+  Run({"hset", "h\x00v_c"s, "f", "3", "g", "Hc"});
+}
+
+TEST_F(GenericSortOrderTest, HashFieldPatternsAreReadAsRedisReadsThem) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  LoadHashFieldData();
+  for (const SortGetCase& c : kHashFieldCases) {
+    SCOPED_TRACE(StrCat("SORT ", c.source, " ", absl::StrJoin(c.options, " ")));
+    ExpectGetReply(c);
+    ExpectGetStore(c);
+  }
+}
+
+TEST_F(GenericSortOrderTest, HashFieldPatternsWithNulBytesAreScannedAsCStrings) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  LoadHashFieldNulData();
+  for (const SortGetCase& c : kHashFieldNulCases) {
+    SCOPED_TRACE(StrCat("SORT ", c.source, " ", absl::CHexEscape(absl::StrJoin(c.options, " "))));
+    ExpectGetReply(c);
+    ExpectGetStore(c);
+  }
+}
+
+// A numeric BY over a text field is the same error as over a text string key (KeyDB: "One or more
+// scores can't be converted into double"), with STORE leaving the destination as it was; ALPHA
+// sorts it.
+TEST_F(GenericSortOrderTest, HashFieldNumericByOfATextFieldFailsAsOverAStringKey) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  LoadHashFieldData();
+  const string kError = "One or more scores can't be converted into double";
+  for (const vector<string>& options :
+       {vector<string>{"BY", "hf_*->g"}, vector<string>{"BY", "hf_*->"}}) {
+    SCOPED_TRACE(absl::StrJoin(options, " "));
+    for (string_view name : {"SORT", "SORT_RO"}) {
+      vector<string> cmd{string(name), "hl"};
+      cmd.insert(cmd.end(), options.begin(), options.end());
+      EXPECT_THAT(Run(cmd), ErrArg(kError)) << name;
+    }
+    for (bool same_shard : {true, false}) {
+      const string dst = SortStoreDstKey("sort-hf-text-dst", "hl", same_shard);
+      Run({"set", dst, "stale"});
+      EXPECT_THAT(Run(SortStoreCommand("hl", options, dst)), ErrArg(kError));
+      EXPECT_THAT(Run({"get", dst}), "stale");
+    }
+  }
+}
+
+// A hash with more fields than a listpack holds is a StringMap (which is also what a field TTL
+// makes of one); both read the same through SORT.
+TEST_F(GenericSortOrderTest, HashFieldIsReadFromAListpackAndFromAStringMap) {
+  Run({"rpush", "he", "p", "q", "r", "s"});
+  for (string_view e : {"p", "q", "r"}) {
+    const string key = StrCat("hh_", e);
+    Run({"hset", key, "f", e == "p" ? "3" : e == "q" ? "1" : "2", "g", StrCat("V", e)});
+    EXPECT_THAT(Run({"debug", "object", key}).GetString(), HasSubstr("encoding:listpack"));
+  }
+  // s: a StringMap by size, with its f and g among 300 fields
+  vector<string> big{"hset", "hh_s", "f", "0", "g", "Vs"};
+  for (int i = 0; i < 300; ++i) {
+    big.push_back(StrCat("filler", i));
+    big.push_back("x");
+  }
+  Run(big);
+  ASSERT_THAT(Run({"debug", "object", "hh_s"}).GetString(), HasSubstr("encoding:dense_set"));
+
+  ExpectGetReply({"he", {"BY", "hh_*->f", "GET", "hh_*->g"}, {"Vs", "Vq", "Vr", "Vp"}});
+  ExpectGetStore({"he", {"BY", "hh_*->f", "GET", "hh_*->g"}, {"Vs", "Vq", "Vr", "Vp"}});
+  const SortGetCase desc_case{"he",
+                              {"BY", "hh_*->f", "DESC", "GET", "hh_*->nofield", "GET", "#"},
+                              {nullopt, "p", nullopt, "r", nullopt, "q", nullopt, "s"}};
+  ExpectGetReply(desc_case);
+  ExpectGetStore(desc_case);
+}
+
+// Field expiry (HSETEX, drakeydb's hash-field TTL; KeyDB has its own, EXPIREMEMBER, which a
+// drakeydb replica drops, decision 8): a field that has expired is missing, as it is for HGET:
+// weight 0 under numeric BY and a nil in GET. The hash of a field TTL is a StringMap, so this is
+// that encoding's read; when the read leaves the hash empty it is deleted, as an HGET does.
+TEST_F(GenericSortOrderTest, HashFieldWithAnExpiredTtlIsMissing) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  Run({"rpush", "tl2", "t", "u", "v"});
+  Run({"hsetex", "ht_t", "1", "f", "5"});
+  Run({"hset", "ht_t", "g", "Gt"});
+  Run({"hset", "ht_u", "g", "Gu"});
+  Run({"hset", "ht_v", "f", "3", "g", "Gv"});
+
+  // not expired yet: u (no f, weight 0), v (3), t (5)
+  ExpectGetReply(
+      {"tl2", {"BY", "ht_*->f", "GET", "#", "GET", "ht_*->f"}, {"u", nullopt, "v", "3", "t", "5"}});
+  ExpectGetStore(
+      {"tl2", {"BY", "ht_*->f", "GET", "#", "GET", "ht_*->f"}, {"u", nullopt, "v", "3", "t", "5"}});
+
+  // expired: t has no f any more, so t and u tie at 0 and break on the element. SORT reads the
+  // field first: an HGET would drop it from the hash and hide a SORT that did not look at its TTL
+  AdvanceTime(2000);
+  ExpectGetReply({"tl2",
+                  {"BY", "ht_*->f", "GET", "#", "GET", "ht_*->f"},
+                  {"t", nullopt, "u", nullopt, "v", "3"}});
+  ExpectGetStore({"tl2",
+                  {"BY", "ht_*->f", "GET", "#", "GET", "ht_*->f"},
+                  {"t", nullopt, "u", nullopt, "v", "3"}});
+  ExpectGetReply({"tl2", {"BY", "ht_*->f", "ALPHA", "GET", "#"}, {"t", "u", "v"}});
+  // and the field that did not expire is there
+  ExpectGetReply({"tl2", {"ALPHA", "GET", "ht_*->g"}, {"Gt", "Gu", "Gv"}});
+  EXPECT_THAT(Run({"hget", "ht_t", "f"}), ArgType(RespExpr::NIL));
+}
+
+TEST_F(GenericSortOrderTest, HashFieldReadDeletesAHashItsLazyExpiryEmptied) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  for (string_view name : {"SORT", "SORT_RO"}) {
+    Run({"flushall"});
+    Run({"rpush", "ex-l", "x", "y"});
+    Run({"hsetex", "ex_x", "1", "f", "1"});
+    Run({"hsetex", "ex_y", "1", "f", "2"});
+    ASSERT_THAT(Run({"exists", "ex_x", "ex_y"}), IntArg(2));
+    AdvanceTime(2000);
+
+    // the field is read through SORT, and the hash its expiry emptied goes (as for HGET, below)
+    EXPECT_THAT(Run({name, "ex-l", "BY", "ex_*->f"}), RespElementsAre("x", "y")) << name;
+    EXPECT_THAT(Run({"exists", "ex_x"}), IntArg(0)) << name;
+    EXPECT_THAT(Run({"exists", "ex_y"}), IntArg(0)) << name;
+  }
+
+  Run({"hsetex", "ex_h", "1", "f", "1"});
+  AdvanceTime(2000);
+  EXPECT_THAT(Run({"hget", "ex_h", "f"}), ArgType(RespExpr::NIL));
+  EXPECT_THAT(Run({"exists", "ex_h"}), IntArg(0));
+}
+
+// The key part of the pattern, not the whole pattern string, decides which shard a hash is read on:
+// with three shards, a source, a destination and hashes on the source's shard, the destination's
+// and the third one.
+TEST_F(GenericSortOrderTest, HashFieldIsReadOnTheShardOfTheKeyPart) {
+  absl::FlagSaver fs;
+  absl::SetFlag(&FLAGS_num_shards, 3);
+  num_threads_ = 4;
+  ResetService();
+  ASSERT_EQ(shard_set->size(), 3u);
+
+  auto key_on = [](string_view prefix, ShardId sid) {
+    for (int i = 0;; ++i) {
+      string candidate = StrCat(prefix, i);
+      if (Shard(candidate, shard_set->size()) == sid)
+        return candidate;
+      CHECK_LT(i, 10000) << "no '" << prefix << "' key on shard " << sid;
+    }
+  };
+  const string src = key_on("hfs-src", 0);
+  const string dst = key_on("hfs-dst", 1);
+
+  vector<string> push{"rpush", src};
+  vector<pair<int, string>> by_weight;  // (weight, element)
+  for (ShardId sid = 0; sid < 3; ++sid) {
+    for (int n = 0; n < 4; ++n) {
+      string element;
+      for (int i = 0;; ++i) {
+        element = StrCat("e", sid, "_", n, "_", i);
+        if (Shard(StrCat("hfs_", element), shard_set->size()) == sid)
+          break;
+        CHECK_LT(i, 10000);
+      }
+      const int weight = (sid * 4 + n) * 7 % 12;  // a scramble of 0 .. 11, no ties
+      Run({"hset", StrCat("hfs_", element), "f", to_string(weight), "g", StrCat("G", element)});
+      push.push_back(element);
+      by_weight.emplace_back(weight, element);
+    }
+  }
+  Run(push);
+  sort(by_weight.begin(), by_weight.end());
+  vector<string> expected;
+  for (const auto& [weight, element] : by_weight)
+    expected.push_back(StrCat("G", element));
+
+  EXPECT_THAT(Run({"sort", src, "BY", "hfs_*->f", "GET", "hfs_*->g"}),
+              RespArray(ElementsAreArray(expected)));
+  EXPECT_THAT(Run({"sort", src, "BY", "hfs_*->f", "GET", "hfs_*->g", "STORE", dst}),
+              IntArg(expected.size()));
+  EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespArray(ElementsAreArray(expected)));
+}
+
+// Decision 41: --sort_set_max_intset_entries is how many members an integer-only set may have to be
+// ordered as KeyDB and Redis hold it, an intset (ascending numeric, which their stable sort keeps
+// for tied ALPHA BY weights); a bigger one is a hash set there, which no replica can follow, so it
+// breaks ties on the element (bytewise) here. 512 is their default. Live KeyDB started with
+// `set-max-intset-entries 100` and `600` answers ascending for 100 and for 550 and 600 members (and
+// 512 for the default), and in the other rows its order differs from run to run, so those rows are
+// this rule. 0 turns the emulation off: no set is ordered ascending.
+TEST_F(GenericSortOrderTest, SortSetMaxIntsetEntriesIsTheLimitOfTheIntsetOrder) {
+  absl::FlagSaver fs;
+  EXPECT_EQ(absl::GetFlag(FLAGS_sort_set_max_intset_entries), 512u) << "the default is KeyDB's";
+
+  struct Row {
+    uint32_t limit;
+    unsigned members;
+    bool ascending;
+  };
+  for (const Row& row :
+       {Row{100, 100, true}, Row{100, 101, false}, Row{100, 150, false}, Row{600, 550, true},
+        Row{600, 600, true}, Row{600, 601, false}, Row{512, 512, true}, Row{512, 513, false},
+        Row{512, 550, false}, Row{0, 5, false}, Row{0, 100, false}, Row{2, 3, false}}) {
+    SCOPED_TRACE(StrCat("limit ", row.limit, ", ", row.members, " members"));
+    absl::SetFlag(&FLAGS_sort_set_max_intset_entries, row.limit);
+
+    const string key = StrCat("ints-", row.limit, "-", row.members);
+    vector<string> members = IntegerMembers(row.members);
+    vector<string> sadd{"sadd", key};
+    sadd.insert(sadd.end(), members.begin(), members.end());
+    Run(sadd);  // its reply is not checked, see AlphaByTiesOverIntegerSetsOfEverySize
+    ASSERT_THAT(Run({"scard", key}), IntArg(row.members));
+
+    vector<string> ascending = members;
+    if (row.ascending) {
+      sort(ascending.begin(), ascending.end(),
+           [](const string& l, const string& r) { return stoll(l) < stoll(r); });
+    } else {
+      sort(ascending.begin(), ascending.end());
+    }
+    vector<string> descending = ascending;
+    if (!row.ascending)
+      reverse(descending.begin(), descending.end());  // the element rule is negated by DESC
+
+    ExpectReply({key, {"BY", "nokey_*", "ALPHA"}, ascending});
+    ExpectStore({key, {"BY", "nokey_*", "ALPHA"}, ascending});
+    ExpectReply({key, {"BY", "nokey_*", "ALPHA", "DESC"}, descending});
+    ExpectStore({key, {"BY", "nokey_*", "ALPHA", "DESC"}, descending});
+  }
 }
 
 }  // namespace dfly

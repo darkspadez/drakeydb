@@ -1643,6 +1643,28 @@ struct InterleaveHarness {
   }
 };
 
+// drakeydb: P7-1 -- RDB_OPCODE_DF_MVCC and RDB_OPCODE_DF_TOMBSTONES live only in a save's body, so
+// the opcode-byte scans in the tests that use this start at the end of the header. The header's
+// integer aux fields (ctime, used-mem, table-mem) are raw LE bytes that can hold any value (PR #11
+// CI, 2026-10-05: ctime 0x6ac3dd1e put 0xDD at offset 65). This saves the header with used-mem
+// poisoned to 0xE1DD (int32-encoded as dd e1 00 00, i.e. both opcode bytes), so a scan that wrongly
+// starts at 0 fails on every run instead of only when the clock happens to collide. Returns the
+// header's length, i.e. the offset where the body starts; `sink` must be the unaligned sink that
+// `saver` writes to.
+size_t SaveHeaderWithPoisonedUsedMem(RdbSaver* saver, const Service* service,
+                                     const io::StringSink& sink) {
+  // Evaluated first: it hops to every shard, and the poison window should only span SaveHeader.
+  const auto global_data = RdbSaver::GetGlobalData(service, true);
+
+  constexpr uint64_t kOpcodeBytes = 0xE1DD;
+  // exchange + compensating add rather than a store: EngineShard::CacheStats applies per-shard
+  // deltas to this global, so any that land in between must survive the restore.
+  const uint64_t prev = used_mem_current.exchange(kOpcodeBytes);
+  CHECK(!saver->SaveHeader(global_data));
+  used_mem_current.fetch_add(prev - kOpcodeBytes);  // unsigned wrap is intended
+  return sink.str().size();
+}
+
 }  // namespace
 
 // The following are tests that directly feed byte data to loader to exercise chunk loading.
@@ -2547,12 +2569,13 @@ TEST_F(RdbMvccTest, EmitsOpcodeOnlyForTheStampedKey) {
   });
 
   io::StringSink sink;
+  size_t header_len = 0;
   std::string bytes = pp_->at(0)->Await([&]() -> std::string {
     RdbSaver saver(&sink, SaveMode::SINGLE_SHARD_WITH_SUMMARY, /*align_writes=*/false, "",
                    DflyVersion::CURRENT_VER);
     ExecutionState cntx;
     EngineShard* shard = EngineShard::tlocal();
-    CHECK(!saver.SaveHeader(RdbSaver::GetGlobalData(service_.get(), true)));
+    header_len = SaveHeaderWithPoisonedUsedMem(&saver, service_.get(), sink);
 
     // DbSlice::RegisterOnChange (inside StartSnapshotInShard's SliceSnapshot::Start) DCHECKs the
     // shard's intent lock is held; ordinary command dispatch holds it via transaction scheduling,
@@ -2563,6 +2586,7 @@ TEST_F(RdbMvccTest, EmitsOpcodeOnlyForTheStampedKey) {
     shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
     return std::move(sink).str();
   });
+  ASSERT_GT(header_len, 9u) << "SaveHeader must have flushed more than the REDIS%04d magic";
 
   std::string key0_encoded, key1_encoded;
   AppendString(&key0_encoded, "k0");
@@ -2583,6 +2607,7 @@ TEST_F(RdbMvccTest, EmitsOpcodeOnlyForTheStampedKey) {
 
   size_t pos = bytes.find(mvcc_block);
   ASSERT_NE(pos, std::string::npos) << "expected a 0xDD opcode block carrying k1's exact stamp";
+  ASSERT_GE(pos, header_len) << "the opcode block must sit in the body, not the header";
 
   // The block must sit immediately before k1's type byte: exactly one byte (the RDB type), then
   // k1's own key encoding.
@@ -2591,10 +2616,12 @@ TEST_F(RdbMvccTest, EmitsOpcodeOnlyForTheStampedKey) {
   EXPECT_EQ(bytes.substr(after_block + 1, key1_encoded.size()), key1_encoded)
       << "0xDD opcode block must be positioned before k1's type byte";
 
-  // 0xDD's first (and only legitimate) occurrence in the whole buffer is k1's block above -- so no
-  // 0xDD opcode precedes k0 (its stamp is zero == unstamped == absent), and the block does not
-  // appear a second time anywhere else either.
-  EXPECT_EQ(bytes.find(static_cast<char>(0xDD)), pos)
+  // 0xDD's first (and only legitimate) occurrence in the body is k1's block above -- so no 0xDD
+  // opcode precedes k0 (its stamp is zero == unstamped == absent), and the block does not appear a
+  // second time anywhere else either.
+  // drakeydb: P7-1 -- the first scan starts at header_len, never 0 (see
+  // SaveHeaderWithPoisonedUsedMem).
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD), header_len), pos)
       << "0xDD must not appear anywhere before k1's opcode block (e.g., preceding k0)";
   EXPECT_EQ(bytes.find(static_cast<char>(0xDD), pos + 1), std::string::npos)
       << "0xDD must not appear a second time anywhere in the buffer";
@@ -2611,12 +2638,13 @@ TEST_F(RdbTest, NoMvccOpcodeOrAuxWhenInactive) {
   ASSERT_EQ(Run({"set", "k1", "v1"}), "OK");
 
   io::StringSink sink;
+  size_t header_len = 0;
   std::string bytes = pp_->at(0)->Await([&]() -> std::string {
     RdbSaver saver(&sink, SaveMode::SINGLE_SHARD_WITH_SUMMARY, /*align_writes=*/false, "",
                    DflyVersion::CURRENT_VER);
     ExecutionState cntx;
     EngineShard* shard = EngineShard::tlocal();
-    CHECK(!saver.SaveHeader(RdbSaver::GetGlobalData(service_.get(), true)));
+    header_len = SaveHeaderWithPoisonedUsedMem(&saver, service_.get(), sink);
 
     shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
     saver.StartSnapshotInShard(/*stream_journal=*/false, &cntx, shard);
@@ -2624,9 +2652,13 @@ TEST_F(RdbTest, NoMvccOpcodeOrAuxWhenInactive) {
     shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
     return std::move(sink).str();
   });
+  ASSERT_GT(header_len, 9u) << "SaveHeader must have flushed more than the REDIS%04d magic";
 
+  // drakeydb: P7-1 -- the breadcrumb aux field is in the header, so that search covers the whole
+  // buffer; the opcode byte lives only in the body, so its scan starts at header_len (see
+  // SaveHeaderWithPoisonedUsedMem).
   EXPECT_EQ(bytes.find("drakeydb-mvcc"), std::string::npos);
-  EXPECT_EQ(bytes.find(static_cast<char>(0xDD)), std::string::npos);
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD), header_len), std::string::npos);
 }
 
 // drakeydb: P4-2 Task 2 -- the read-side counterpart to EmitsOpcodeOnlyForTheStampedKey above:
@@ -3540,12 +3572,13 @@ TEST_F(RdbTest, NoTombstoneOpcodeWhenInactive) {
   ASSERT_THAT(Run({"del", "k0"}), IntArg(1));
 
   io::StringSink sink;
+  size_t header_len = 0;
   std::string bytes = pp_->at(0)->Await([&]() -> std::string {
     RdbSaver saver(&sink, SaveMode::SINGLE_SHARD_WITH_SUMMARY, /*align_writes=*/false, "",
                    DflyVersion::CURRENT_VER);
     ExecutionState cntx;
     EngineShard* shard = EngineShard::tlocal();
-    CHECK(!saver.SaveHeader(RdbSaver::GetGlobalData(service_.get(), true)));
+    header_len = SaveHeaderWithPoisonedUsedMem(&saver, service_.get(), sink);
 
     shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
     saver.StartSnapshotInShard(/*stream_journal=*/false, &cntx, shard);
@@ -3553,8 +3586,11 @@ TEST_F(RdbTest, NoTombstoneOpcodeWhenInactive) {
     shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
     return std::move(sink).str();
   });
+  ASSERT_GT(header_len, 9u) << "SaveHeader must have flushed more than the REDIS%04d magic";
 
-  EXPECT_EQ(bytes.find(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES)), std::string::npos);
+  // drakeydb: P7-1 -- body only: the header's integer aux fields can hold 0xE1 (see
+  // SaveHeaderWithPoisonedUsedMem).
+  EXPECT_EQ(bytes.find(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES), header_len), std::string::npos);
 }
 
 // drakeydb: P4-3 Task 5 review fix (I5) -- every tombstone test above uses RdbMvccTest, whose
@@ -5934,6 +5970,69 @@ TEST_F(RdbMvccTest, WithoutMergeLwwTombstoneInstallHonorsCapForAbsentKeys) {
       << "the at-cap drop must be counted in mvcc_tombstones_dropped (DEBUG MVCC / INFO), not "
          "silently discarded";
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold";
+}
+
+// drakeydb: P7 -- a classic master's disk-based full sync is `$<len>`, the RDB, then the commands
+// it buffered while producing it, often in the same segment. RdbLoader::Load's very first read used
+// to ignore the source limit and pull those commands into its buffer, so a caller that knew the
+// RDB's size could not tell the RDB's end from its read-ahead (Replica::InitiatePSync aborted on
+// it).
+TEST_F(RdbTest, LoaderFirstReadHonorsTheSourceLimit) {
+  std::string body = "";
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "limited-key");
+  AppendString(&body, "limited-val");
+  const std::string rdb = WrapInRdb(body);
+  const std::string_view stream = "*1\r\n$4\r\nPING\r\n";
+  const std::string wire = rdb + std::string(stream);
+
+  io::BytesSource src{io::Buffer(wire)};
+  RdbLoadContext load_context;
+  size_t bytes_read = 0, leftover = 0;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.set_source_limit(rdb.size());
+    auto res = loader.Load(&src);
+    bytes_read = loader.bytes_read();
+    leftover = loader.Leftover().size();
+    return res;
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "limited-key"}), "limited-val");
+  EXPECT_EQ(bytes_read, rdb.size());
+  EXPECT_EQ(leftover, 0u) << "the loader read past the end of the RDB it was told about";
+
+  char rest[64];
+  io::Source& rest_src = src;
+  io::Result<size_t> rest_sz =
+      rest_src.ReadSome(io::MutableBytes{reinterpret_cast<uint8_t*>(rest), 64});
+  ASSERT_TRUE(rest_sz);
+  EXPECT_EQ(std::string_view(rest, *rest_sz), stream)
+      << "the bytes behind the RDB must stay unread";
+}
+
+// A source limit that cuts the RDB short is a corrupt RDB: an error, not the DCHECK ReadAtLeast
+// raises for a destination smaller than the minimum it was asked to read.
+TEST_F(RdbTest, LoaderSourceLimitShorterThanTheRdbIsAnError) {
+  std::string body;
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "cut-key");
+  AppendString(&body, "cut-val");
+  const std::string rdb = WrapInRdb(body);
+
+  // The last two limits cannot even hold the 9-byte signature that the first read asks for.
+  for (size_t limit :
+       {rdb.size() - 1, rdb.size() - 4, rdb.size() - 9, size_t{9}, size_t{8}, size_t{0}}) {
+    io::BytesSource src{io::Buffer(rdb)};
+    RdbLoadContext load_context;
+    auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+      RdbLoader loader(service_.get(), &load_context);
+      loader.set_source_limit(limit);
+      return loader.Load(&src);
+    });
+    EXPECT_TRUE(ec) << "limit " << limit << " of " << rdb.size() << " bytes";
+  }
 }
 
 }  // namespace dfly

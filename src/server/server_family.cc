@@ -55,6 +55,7 @@ extern "C" {
 #include "server/acl/acl_commands_def.h"
 #include "server/acl/user_registry.h"
 #include "server/blocking_controller.h"
+#include "server/classic_replay.h"  // drakeydb: P7
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/debugcmd.h"
@@ -403,6 +404,17 @@ std::optional<cron::cronexpr> InferSnapshotCronExpr() {
   }
 
   return std::nullopt;
+}
+
+// drakeydb: U-15 -- a replicated apply (Replica::ConsumeRedisStream, JournalExecutor) runs its
+// commands in a context with no connection. A command that works on the client's own connection
+// has nothing to work on there: it replies the error ClientSetInfo already gives, and the stream,
+// which discards replies, carries on. Returns true if it replied.
+bool ReplyIfNoConnection(CommandContext* cmd_cntx) {
+  if (cmd_cntx->conn() != nullptr)
+    return false;
+  cmd_cntx->SendError("No connection");
+  return true;
 }
 
 void ClientSetName(facade::ParsedArgs args, CommandContext* cmd_cntx) {
@@ -2174,6 +2186,9 @@ bool ServerFamily::DoAuth(ConnectionContext* cntx, std::string_view username,
 }
 
 void ServerFamily::Auth(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   if (parser.HasAtLeast(3)) {
     return cmd_cntx->SendError(kSyntaxErr);
   }
@@ -2273,6 +2288,10 @@ void ClientHelp(SinkReplyBuilder* builder) {
 }
 
 void ServerFamily::Client(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- every subcommand is about the caller's own connection. No stock master
+  // propagates CLIENT and it is NOSCRIPT, so refusing all of them here costs no real traffic.
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   string sub_cmd = absl::AsciiStrToUpper(parser.Next<string_view>());
   facade::ParsedArgs sub_args = parser.UnparsedArgs();
   auto* builder = cmd_cntx->rb();
@@ -3180,6 +3199,10 @@ string ServerFamily::FormatInfoMetrics(
         append("slave_read_only", 1);
         append("psync_attempts", rinfo.psync_attempts);
         append("psync_successes", rinfo.psync_successes);
+        // drakeydb: P7 -- a classic link to an active KeyDB (or whose counters moved), only: a
+        // stock master's INFO stays what upstream prints.
+        for (const ClassicCounterValue& field : ClassicLinkFields(rinfo))
+          append(field.name, field.value);
       };
 
       const auto& info = *m.replica_side_info;
@@ -3356,6 +3379,9 @@ string ServerFamily::FormatInfoMetrics(
 }
 
 void ServerFamily::Info(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   std::vector<std::string> sections;
   bool need_metrics{false};  // Save time - do not fetch metrics if we don't need them.
   // Start with nothing; each requested section enables what it needs (default INFO below).
@@ -3428,6 +3454,9 @@ void ServerFamily::Info(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void ServerFamily::Hello(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   facade::ParsedArgs args = parser.UnparsedArgs();
   // If no arguments are provided default to RESP2.
   bool is_resp3 = false;
@@ -3523,6 +3552,9 @@ void ServerFamily::Hello(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void ServerFamily::AddReplicaOf(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-17 -- see ReplicaOf.
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   facade::ParsedArgs args = parser.UnparsedArgs();
   util::fb2::LockGuard lk(replicaof_mu_);
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
@@ -3562,6 +3594,12 @@ void ServerFamily::StopAllClusterReplicas() {
 }
 
 void ServerFamily::ReplicaOf(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-17 -- a command streamed by a classic master runs on the replication fiber, in a
+  // context with no connection (see ReplyIfNoConnection). Rewiring the link from there makes
+  // Replica::Stop join the fiber it runs on. Not the --replicaof boot path: Replicate() calls
+  // ReplicaOfInternal directly.
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   ReplicaOfInternal(parser.UnparsedArgs(), cmd_cntx, ActionOnConnectionFail::kReturnOnError);
 }
 
@@ -3650,6 +3688,7 @@ void ServerFamily::ReplicaOfInternal(facade::ParsedArgs args, CommandContext* cm
 
   auto new_replica = make_shared<Replica>(replicaof_args->host, replicaof_args->port, &service_,
                                           master_replid(), replicaof_args->slot_range);
+  new_replica->SetMainLink();  // drakeydb: P7 -- AddReplicaOf's links stay unmarked.
   GenericError ec;
   switch (on_error) {
     case ActionOnConnectionFail::kReturnOnError:
@@ -3730,6 +3769,11 @@ void ServerFamily::ReplicaOfActive(facade::ParsedArgs args, CommandContext* cmd_
 // REPLTAKEOVER <seconds> [SAVE]
 // SAVE is used only by tests.
 void ServerFamily::ReplTakeOver(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-17 -- see ReplicaOf. Raw, REPLTAKEOVER also parks the replication fiber on the
+  // master socket it reads itself.
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
+
   VLOG(1) << "ReplTakeOver start";
 
   int timeout_sec = parser.Next<int>();
@@ -3761,6 +3805,15 @@ void ServerFamily::ReplTakeOver(facade::CmdArgParser parser, CommandContext* cmd
 
   auto repl_ptr = replica_;
   CHECK(repl_ptr);
+
+  // drakeydb: U-18 -- TakeOver sends `DFLY TAKEOVER` on the master socket and reads the reply from
+  // it, but a classic master has none to give and the replication fiber reads the same socket: the
+  // "reply" would be streamed commands, lost for good, with the offset left behind. Refused before
+  // the journal below is started on a node that stays a replica.
+  if (repl_ptr->GetSummary().classic_link) {
+    return cmd_cntx->SendError(
+        "REPLTAKEOVER is not supported on a replica of a classic (Redis protocol) master");
+  }
 
   // Start journal to allow partial sync from same source master
   repl_ptr->StartJournalAtOwnLSN();
@@ -3795,6 +3848,9 @@ std::string ServerFamily::GetLineageId() const {
 }
 
 void ServerFamily::ReplConf(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   facade::ParsedArgs args = parser.UnparsedArgs();
   auto* builder = cmd_cntx->rb();
 
@@ -4109,6 +4165,15 @@ void ServerFamily::Wait(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void ServerFamily::Role(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-19 -- a client's REPLICAOF holds replicaof_mu_ while Replica::Stop waits for the
+  // replication fiber to end, and a command streamed by a classic master runs on that fiber, in a
+  // context with no connection (ReplyIfNoConnection). Taking the mutex from there deadlocks both:
+  // the fiber never ends and the REPLICAOF never replies. Refused before the lock, as are DEBUG
+  // REPLICA and DEBUG REPLDIAG (debugcmd.cc), the other handlers that take it and had no guard yet
+  // (INFO, CLIENT LIST/KILL, REPLCONF, REPLICAOF, SLAVEOF, ADDREPLICAOF, REPLTAKEOVER and the
+  // emulated CLUSTER take it behind the U-15/U-17 guards).
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
   util::fb2::LockGuard lk(replicaof_mu_);
   // Thread local var is_master is updated under mutex replicaof_mu_ together with replica_,

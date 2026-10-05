@@ -21,6 +21,8 @@ extern "C" {
 #include "facade/error.h"
 #include "facade/facade_test.h"
 #include "server/command_registry.h"
+#include "server/engine_shard_set.h"
+#include "server/journal/executor.h"
 #include "server/main_service.h"
 #include "server/test_utils.h"
 #include "util/accept_server.h"
@@ -280,6 +282,83 @@ TEST_F(DflyEngineTest, EvalSha) {
 TEST_F(DflyEngineTest, EvalShaNegativeZeroNumKeys) {
   EXPECT_THAT(Run({"evalsha", "k1", "-0"}), ErrArg(facade::kInvalidIntErr));
   EXPECT_THAT(Run({"eval", "return 1", "-0"}), ErrArg(facade::kInvalidIntErr));
+}
+
+// A replicated apply context (Replica::ConsumeRedisStream, JournalExecutor) has no connection, yet
+// a single-shard EVAL asks its connection to migrate to the key's shard when that is not the
+// executing thread. Run from thread 0 with a key owned by another shard, that used to dereference
+// the null connection.
+TEST_F(DflyEngineTest, EvalReplicatedApplyNoConnNoCrash) {
+  ASSERT_GE(shard_set->size(), 2u);
+
+  string key;
+  for (unsigned i = 0; key.empty(); ++i) {
+    string candidate = absl::StrCat("u9-key-", i);
+    if (Shard(candidate, shard_set->size()) != 0)
+      key = candidate;
+  }
+
+  facade::DispatchResult result = facade::DispatchResult::ERROR;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        JournalExecutor executor(service_.get());
+        vector<string> args = {"EVAL", "return redis.call('SET', KEYS[1], 'v')", "1", key};
+        journal::ParsedEntry::CmdData cmd_data;
+        cmd_data.Assign(args.begin(), args.end(), args.size());
+        result = executor.Execute(0, cmd_data);
+      })
+      .Join();
+
+  EXPECT_EQ(result, facade::DispatchResult::OK);
+  EXPECT_THAT(Run({"get", key}), "v");
+}
+
+// A node being taken over refuses commands from every connection that is not privileged, but a
+// replicated apply context has no connection to ask (a cascaded node keeps applying its own
+// master's stream while it is taken over).
+TEST_F(DflyEngineTest, ReplicatedApplyDuringTakeoverNoCrash) {
+  ASSERT_EQ(service_->SwitchState(GlobalState::ACTIVE, GlobalState::TAKEN_OVER),
+            GlobalState::ACTIVE);
+
+  facade::DispatchResult result = facade::DispatchResult::ERROR;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        JournalExecutor executor(service_.get());
+        vector<string> args = {"SET", "u10-key", "v"};
+        journal::ParsedEntry::CmdData cmd_data;
+        cmd_data.Assign(args.begin(), args.end(), args.size());
+        result = executor.Execute(0, cmd_data);
+      })
+      .Join();
+
+  ASSERT_EQ(service_->SwitchState(GlobalState::TAKEN_OVER, GlobalState::ACTIVE),
+            GlobalState::TAKEN_OVER);
+  EXPECT_EQ(result, facade::DispatchResult::OK);
+  EXPECT_THAT(Run({"get", "u10-key"}), "v");
+}
+
+// A handler that throws is answered with "Internal Error" and its connection is closed, but a
+// replicated apply context has no connection to close: the close used to dereference it.
+TEST_F(DflyEngineTest, ReplicatedApplyHandlerThrowNoConnNoCrash) {
+  auto handler = [](facade::CmdArgParser, CommandContext* cmd_cntx) {
+    cmd_cntx->SendOk();
+    throw std::runtime_error("handler failure");
+  };
+  std::move(*service_->mutable_registry()->Find("ECHO")).SetHandler(handler);
+
+  facade::DispatchResult result = facade::DispatchResult::OK;
+  pp_->at(0)
+      ->LaunchFiber([&] {
+        JournalExecutor executor(service_.get());
+        vector<string> args = {"ECHO", "x"};
+        journal::ParsedEntry::CmdData cmd_data;
+        cmd_data.Assign(args.begin(), args.end(), args.size());
+        result = executor.Execute(0, cmd_data);
+      })
+      .Join();
+
+  EXPECT_EQ(result, facade::DispatchResult::ERROR);
+  EXPECT_EQ(Run({"ping"}), "PONG");
 }
 
 TEST_F(DflyEngineTest, ScriptFlush) {

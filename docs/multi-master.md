@@ -673,7 +673,44 @@ producing an older-compatible file at the cost of discarding all stamps and tomb
 a reduced feature set, an active mesh should be upgraded node by node with each new binary able to
 admit and be admitted by the others before traffic depends on it — there is no mixed-version
 "tombstones on some links, not others" steady state; a link either meets the minimum version and
-gets the full feature set, or it is refused at handshake.
+gets the full feature set, or it is refused at handshake. One thing the gate does not cover is
+`SORT`'s ordering: a same-shard `SORT ... STORE` is journaled as the command, so a node of an older
+build re-runs it in the old order (tied `BY` weights, a stored `BY nosort` set, a missing or tied
+`ALPHA BY` weight), fails on a form the new build accepts (a negative `LIMIT`, several `*`) or reads
+a hash-field pattern (`BY w_*->f`, `GET h_*->f`) as a plain key name, while a newer node computed the
+new result, and no counter shows the difference; keep such `SORT ... STORE` forms out of the traffic
+until every node runs the new build (ISSUE-REGISTER D-13, D-34, D-35). For the same reason every
+node must run the same `--sort_set_max_intset_entries`.
+
+## A classic master's stream is trusted
+
+A drakeydb replica of a classic master (Redis, Valkey, KeyDB, plain or active) applies whatever that
+master streams. Commands that would crash, stall or deadlock the replica, or rewire its own link
+(`INFO`, `CLIENT`, `REPLICAOF`, `REPLTAKEOVER`, `ROLE`, `DEBUG REPLICA`, `DFLYMIGRATE`, ...), are
+refused on the replication path (ISSUE-REGISTER U-15, U-17, U-19), but the stream is otherwise
+trusted, as it is on a KeyDB or Redis replica:
+
+- **`SHUTDOWN` stops the replica** (owner decision 39). A streamed `SHUTDOWN` makes the replica
+  exit cleanly with status **0**, so a supervisor that restarts only on failure leaves it down, and
+  `SHUTDOWN SAVE|NOSAVE` decides its exit snapshot. No conforming master sends it (KeyDB and Redis
+  never propagate `SHUTDOWN`); a KeyDB replica does the same with one it reads from its master.
+- Other commands a hostile or broken master could stream change or empty the replica's data or
+  files (`FLUSHALL`, `CONFIG SET dir` with `SAVE`, `DFLY LOAD`), as on any replica.
+- `SORT` re-run from the stream orders as Redis and KeyDB do (decisions 34–38) and reads `BY` and
+  `GET` hash-field patterns (`w_*->field`) as they do (decision 35). Set
+  `--sort_set_max_intset_entries` (default 512) to the master's `set-max-intset-entries` if that is
+  not 512: it is the size up to which Redis and KeyDB hold a set of integers as an intset, whose
+  ascending order decides the ties of `SORT <set> BY <weights> ALPHA`, and a replica with another
+  limit orders those ties differently for a set of a size in between (a master at 600 holds 550
+  integers as an intset, a replica at 512 breaks their ties on the element). It matters for no other
+  `SORT`, and for no set that is not all integers (ISSUE-REGISTER D-34, D-35). **Run the same value
+  on every drakeydb node**, peers and replicas alike: a same-shard `SORT ... STORE` is replicated as
+  the command and each node applies its own flag, so two drakeydb nodes with different values store
+  differently ordered `dst` lists, silently (a cross-shard `STORE` is journaled as its result and is
+  unaffected).
+
+Point drakeydb only at masters you control. The full KeyDB onboarding guide lands with Phase 7's
+last sub-PR.
 
 ## Known residual exposures
 
@@ -708,7 +745,7 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
   accepted here while a peer that saw the `DEL` against a still-live value holds a newer
   tombstone — a divergence a subsequent full sync from that peer repairs while its tombstone is
   still live, but not otherwise, and only if no later unguarded delta lands on the key first (see
-  D-23). Owned by P4-5 (tombstone lifecycle).
+  D-23). Owned by the tombstone-lifecycle phase (scheduled after P7).
 - **D-21** — a non-empty `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, `ZUNIONSTORE`/`ZINTERSTORE`/
   `ZDIFFSTORE`/`ZRANGESTORE`, or `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST` result always
   journals `DEL` (guarded) then `SADD`/`ZADD` (delta, unguarded) as two entries; a guarded receiver
@@ -754,8 +791,8 @@ Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:
   `EXPIRE` never fires. Mitigation: run `EXPIRE k ttl NX` after every `INCR`, not only when `INCR`
   returns 1 -- `NX` fires exactly when there is currently no TTL, self-healing the silently
   re-created key, and stays a cheap no-op the rest of the time -- on an active node a firing
-  `EXPIRE` ships the key's full state and re-converges every peer. Owned by P4-5 (tombstone
-  lifecycle).
+  `EXPIRE` ships the key's full state and re-converges every peer. Owned by the tombstone-lifecycle
+  phase (scheduled after P7).
 - **D-28** — `HEXPIRE`/`FIELDEXPIRE`/`SADDEX`/`HSETEX` auto-journal the client's own RELATIVE
   member-TTL seconds argument verbatim; each receiver computes that member's deadline from ITS OWN
   arrival time, drifting later with replication lag, compounding across a replica chain. Same root

@@ -10,8 +10,9 @@ no home in the phase currently being worked on. Two parts:
   the phase that should close it.
 
 Add entries as they are found. Delete an entry only when it is filed upstream (Part 1, with the
-issue link recorded) or landed (Part 2). Every entry states how it was established, so a reader
-can tell a live-proven defect from a static argument.
+issue link recorded), landed (Part 2), or withdrawn (either part; keep a withdrawn entry for one
+phase as a record first). Every entry states how it was established, so a reader can tell a
+live-proven defect from a static argument.
 
 Related: [UPSTREAM-SYNC.md](UPSTREAM-SYNC.md) (merge workflow), [PLAN.md](PLAN.md) (phase plan).
 
@@ -183,7 +184,7 @@ in source.
 
 **Status:** not filed.
 
-### U-8. `GEORADIUS`/`GEORADIUSBYMEMBER`'s `STORE` destination never replicates
+### U-8. `GEORADIUS`/`GEORADIUSBYMEMBER`'s `STORE` destination never replicates -- withdrawn (not a bug)
 
 **Where:** `src/server/geo_family.cc:779,782` — both registered
 `CO::JOURNALED | CO::STORE_LAST_KEY | CO::NO_AUTOJOURNAL`, and the file has no `RecordJournal`
@@ -199,7 +200,17 @@ issuing node and never reaches any replica or peer, regardless of configuration.
 `WillAutoJournalVerbatim`/`NO_AUTOJOURNAL` audit that found the `SORT` defect. Not reproduced
 against a live replica.
 
-**Status:** not filed.
+**Status (2026-10-03): withdrawn — not a bug.** The static argument above missed that the
+`STORE` callback sets `zparams.journal_update = true` (`geo_family.cc:654`) and writes through
+`ZSetFamily::OpAdd`, which hand-journals the destination itself: a bare `DEL` for an empty result
+(`zset_family.cc:1963`) and, for a non-empty one, `DEL` then `ZADD` (`:2053` opens the branch;
+`DEL` is recorded at `:2055`, `ZADD` at `:2072`). What does remain true of these commands is the
+`DEL` + `ZADD` split that D-21 registers — a different defect (a stale result merging into a newer
+destination), not a failure to replicate. Live re-test (P7-0 Task 0.1, debug build of `c60dfdb`,
+`--proactor_threads 4` → 4 shards): after stable sync was confirmed with a marker key, 8
+`GEORADIUS … STORE` and 8 `GEORADIUSBYMEMBER … STOREDIST` destinations written on the master all
+reached a plain replica byte-for-byte (16/16, `ZRANGE … WITHSCORES` digests equal). Kept here for
+one phase as a record, then delete.
 
 ### U-9. `EvalInternal`'s connection migration can null-deref on a classic replicated-apply link
 
@@ -227,10 +238,693 @@ classic links either way, but a classic upstream master is the most direct route
 `EVAL` reaching this exact branch via replication.
 
 **How established:** static reading of `EvalInternal`'s migration branch composed with
-`JournalExecutor`'s constructor; not reproduced against a live crash (would need a single-shard
-`EVAL` whose key lands on a different shard than the one that dispatches the replicated apply).
+`JournalExecutor`'s constructor; reproduced deterministically by P7-0 Task 0.5 (a `JournalExecutor`
+on thread 0 applying `EVAL "return redis.call('SET', KEYS[1], 'v')" 1 <key on another shard>`
+raised SIGSEGV in `Connection::RequestAsyncMigration` 3/3 on the unfixed build).
 
-**Status:** not filed.
+**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.5): the migration branch also requires
+`conn_cntx->conn() != nullptr` — migration is a latency optimisation, so skipping it is
+semantically neutral. Regression test `DflyEngineTest.EvalReplicatedApplyNoConnNoCrash`
+(`src/server/dragonfly_test.cc`). Still not filed upstream.
+
+### U-10. `VerifyCommandState`'s `TAKEN_OVER` branch dereferences a null `conn()` on a replicated apply
+
+**Where:** `src/server/main_service.cc`, `Service::VerifyCommandState`, `case
+GlobalState::TAKEN_OVER:` — `dfly_cntx.conn()->IsPrivileged() || ...`. The restricted-command check
+a few lines above guards the same call with `dfly_cntx.conn() != nullptr` ("no connection owner
+means the command is internal, therefore always permitted"); this branch does not.
+
+Every replicated apply dispatches through `Service::DispatchCommand` with a context whose `conn()`
+is `nullptr` (`JournalExecutor`; `Replica::ConsumeRedisStream`'s own bare `ConnectionContext`). A
+node in `TAKEN_OVER` that is still applying its own master's stream therefore crashes on the first
+applied command. `TAKEN_OVER` is set by `DFLY TAKEOVER` (`dflycmd.cc`) on the node a replica takes
+over, and a node that is itself a replica is only possible with cascaded replication
+(`--experimental_cascaded_partial_sync`, off by default; `ServerFamily::ReplConf` refuses to
+replicate a replica otherwise) — so reachable on any apply path (DFLY stable sync and a classic
+link alike) of a cascaded node whose upstream keeps writing during a `REPLTAKEOVER`.
+
+**How established:** live and in-process. Chain `master -> r1 -> r2`, `--proactor_threads 4
+--experimental_cascaded_partial_sync`, ~1 s of pipelined `APPEND`s on `master`, then `REPLTAKEOVER 10`
+on `r2`: `r1` died with SIGSEGV 4/4 on the unfixed build (stack `DflyShardReplica::StableSyncDflyReadFb
+-> ExecuteTx -> JournalExecutor::Execute -> Service::DispatchCommand`) and exited 0 with
+`REPLTAKEOVER` answering `OK` 5/5 after the fix. Deterministically, `DflyEngineTest.
+ReplicatedApplyDuringTakeoverNoCrash` crashes at `main_service.cc:1430` (gdb) without it.
+
+**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.5, same commit as U-9): a context with no
+connection is never refused by the `TAKEN_OVER` gate, as at the restricted-command check — refusing
+it would drop the upstream's writes on a takeover that then fails back to `ACTIVE`. Still not
+filed upstream.
+
+**The cost of "allow":** `WaitReplicaFlowToCatchup` (`dflycmd.cc`) waits until the taking-over
+replica's acked LSN reaches `journal::GetLsn()`, and a cascaded node that keeps applying its
+master's stream keeps appending to its own journal, so that target moves. Under sustained upstream
+writes a `REPLTAKEOVER` whose old master is a cascaded node can therefore run out its timeout and
+answer `Takeover failed!` (`DflyCmd::TakeOver`). That follows from the code; it was not observed:
+the probe above kept writing throughout the takeover and `REPLTAKEOVER` still answered `OK` 5/5.
+Refusing the applies would avoid that wait, since nothing new reaches the journal, and is worse:
+a refused apply is dropped while the stream moves on. `Replica::ConsumeRedisStream` advances
+`repl_offs_` after every dispatch whatever its result, and the DFLY stable-sync path logs a `DFATAL`
+for a failed entry only while the node is `ACTIVE`. Once the takeover then fails back to `ACTIVE`,
+the node has lost writes its upstream believes were applied, and nothing re-sends them. A takeover
+that times out is loud and can be retried.
+
+### U-11. A classic full sync aborts the replica when stream bytes arrive with the end of the RDB
+
+**Where:** `Replica::InitiatePSync` after `RdbLoader::Load` — `CHECK_EQ(0u,
+loader.Leftover().size())`, `CHECK_EQ(snapshot_size, loader.bytes_read())` and
+`CHECK(ps.UnusedPrefix().empty())` on a `$<len>` sync; `CHECK(chained.UnusedPrefix().empty())` after
+the `$EOF:` token; `RdbLoader::Load`'s first `ReadAtLeast(bytes, 9)` ignores `source_limit_`.
+
+A disk-based classic master (KeyDB's default; Redis with `repl-diskless-sync no`) flushes the writes
+it buffered during its BGSAVE right behind the file. When the RDB's end lands in the loader's first
+(16 KB) read, that unclamped read swallows stream bytes and the `Leftover()` CHECK aborts the
+replica; even without the abort those writes and their offset were dropped. The neighbouring CHECKs
+abort on malformed tails, and an RDB longer than `$<len>` trips the helio `io.cc:143` DCHECK in a
+debug build.
+
+**How established:** live on the unmodified main build — plain KeyDB v6.3.4, disk-based sync, an
+`INCR` loop during the attach: `replica.cc:831] Check failed: 0u == loader.Leftover().size() (0 vs.
+2507)` in 4 of 8 runs. With a scripted master, deterministically `(0 vs. 46)` (disk) and
+`replica.cc:829 Check failed: chained.UnusedPrefix().empty()` (diskless); also `replica.cc:1910
+Check failed: kRdbEofMarkSize == token.size()` and `io.cc:143 … (0 vs. 8)`.
+
+**Status (2026-10-03): fixed in this fork** (P7-0 Task 0.6): the loader's first read honors
+the source limit, the bytes behind a correct full sync go to `ConsumeRedisStream` and into
+`repl_offs_`, and every other tail disagreement is an error that reconnects. Tests
+`RdbTest.LoaderFirstReadHonorsTheSourceLimit`,
+`RdbTest.LoaderSourceLimitShorterThanTheRdbIsAnError`,
+`keydb_onboarding_test.py::test_psync_{stream_bytes_behind_full_sync_are_applied,
+full_sync_tail_mismatch_does_not_abort_replica,bad_eof_token_size_does_not_abort_replica}`. Not
+filed upstream.
+
+**Retry behavior, not changed:** a persistently malformed master is retried every ~0.5 s with no
+backoff (`MainReplicationFb`'s reconnect loop sleeps 500 ms), where it used to abort the process.
+Each attempt logs an `ERROR` and a `WARNING`; a plain replica `FlushAll`s its dataset per attempt
+(the flush precedes the load, so it is empty again each time); a peer-mode node takes exclusive
+`LOADING` and re-merges per attempt. That is strictly better than the abort and matches upstream's
+pattern for its other full-sync failures. Follow-up candidate: rate-limited logging and a reconnect
+backoff for a master that fails the same way repeatedly.
+
+**Related, not changed:** a `$0` header (`+FULLRESYNC <id> <offset>` then `$0`) is not a full sync
+here. `InitiatePSync`'s `if (snapshot_size || token != nullptr)` (`replica.cc:759`) sends it to the
+else branch, "Re-established sync with Redis master", which is the partial-resync branch: nothing is
+flushed, so stale data stays, and the offset from the `+FULLRESYNC` line has already been adopted.
+Pre-existing, upstream's; P7-3 (classic partial PSYNC) takes over that branch and must tell a `$0`
+full sync from a partial resync.
+
+### U-12. `Service::DispatchCommand` closes a null connection when a handler throws on a replicated apply
+
+**Where:** `src/server/main_service.cc`, `Service::DispatchCommand`, after `InvokeCmd` —
+`cmd_cntx->SendError("Internal Error"); dfly_cntx->conn()->MarkForClose();`.
+
+`InvokeCmd` catches a `std::exception` thrown by a command handler, logs `Internal error, system
+probably unstable` and returns `DispatchResult::ERROR`, the only way to reach that block. A
+replicated apply (`JournalExecutor`; `Replica::ConsumeRedisStream`'s own context) has no connection
+(see U-9, U-10), so a handler that throws while applying turned an already-logged internal error
+into a SIGSEGV in `Connection::MarkForClose`.
+
+**How established:** deterministically in-process: `DflyEngineTest.
+ReplicatedApplyHandlerThrowNoConnNoCrash` replaces `ECHO`'s handler with one that throws
+`std::runtime_error` and applies `ECHO x` through a `JournalExecutor`; without the guard it dies
+with SIGSEGV in `facade::Connection::MarkForClose <- Service::DispatchCommand`. No production
+command throws deterministically, so a live trigger was not reproduced: it needs a `std::exception`
+thrown on a handler's coordinator side (a shard callback's `bad_alloc` becomes `OUT_OF_MEMORY` and
+its other exceptions abort, both in `Transaction::RunCallback`).
+
+**Status (2026-10-03): fixed in this fork** (P7-0 review fix round): the close requires `conn() !=
+nullptr`. The failed command is still dropped, logged and not retried, and the replication link
+stays up, so a replica that hits this diverges silently on that key. Not filed upstream.
+
+### U-13. An empty command name in a classic stream aborts the replica
+
+**Where:** `Replica::ConsumeRedisStream` (`src/server/replica.cc`), the debug dump of a command
+whose name starts with `\r`: `LastResponseArgs()[0].GetBuf()[0] == '\r'`, evaluated for every
+command that is not `MULTI`/`EXEC`, before the check that the name has a first byte.
+
+The stream bytes `*1\r\n$0\r\n\r\n` are a valid RESP array of one empty bulk string: a command with
+an empty name. The parser accepts it and the read of its first byte is out of bounds: SIGABRT in a
+debug build (`absl/types/span.h:335` `assert(false && "i < size()")`), a 1-byte out-of-bounds read
+in a release one. Any classic master, plain Redis and Valkey included, can send it in its
+replication stream, so it is reachable from a malformed or hostile master after any valid sync.
+
+**How established:** a scripted master (an adversarial pass over P7-0): a valid diskless or disk
+full sync, then `*1\r\n$0\r\n\r\n`, then `SET a 1` aborts the debug replica with SIGABRT in
+`Span<>::operator[]` called from `Replica::ConsumeRedisStream`.
+
+**Status (2026-10-04): fixed in this fork** (P7-0): the dump requires a non-empty name, so the
+empty name is dispatched as the unknown command it is (dropped, counted in `unknown_cmds`, its bytes
+counted into `repl_offs_` exactly) and the commands after it apply. Tests
+`keydb_onboarding_test.py::test_classic_stream_empty_command_name_does_not_abort` (the
+`diskless_later_write`, `disk_later_write` and `disk_behind_rdb` cases). Pre-existing in upstream
+Dragonfly; not filed upstream. On the byte-identity exception list (spec, item 2).
+
+### U-14. A command whose name is an array in a classic stream aborts the replica
+
+**Where:** `Replica::ConsumeRedisStream` (`src/server/replica.cc`): `auto cmd =
+last_args[0].GetView();`, reached for every command that is not an RREPLAY envelope.
+
+The stream bytes `*0\r\n` and `*-1\r\n` are valid RESP: an empty array and a nil array. The
+`RedisParser` in server mode accepts both and yields a one-element vector whose only element is an
+`ARRAY` (`*0`) or a `NIL_ARRAY` (`*-1`), not a string. `RespExpr::GetView()` is `std::get<Buffer>`
+on that element, which throws `std::bad_variant_access`; nothing on the replication fiber catches
+it, so the process terminates (`std::terminate`; observed in a debug build, and nothing on the path
+depends on the build type). Any classic master, plain Redis and Valkey included, can send it in its
+replication stream, so it is reachable from a malformed or hostile master after any valid sync. Same
+family as U-13 (a stream command whose name is not a readable string), found by the P7-1 review.
+
+**How established:** a scripted master (the P7-1 review's probe): a valid diskless full sync, then
+`*0\r\n` (or `*-1\r\n`), then `SET after 1` aborts the debug replica with SIGABRT,
+`std::__throw_bad_variant_access <- RespExpr::GetView <- Replica::ConsumeRedisStream`. Inside an
+RREPLAY envelope the same bytes as the inner command took the same abort in `ClassicApplier::
+ApplyCommand` until the applier required a string name (P7-1 fix round); that half is ours, not
+upstream's.
+
+**Status (2026-10-04): fixed in this fork** (P7-1 review fix round): such a command is skipped, like
+`MULTI`/`EXEC`, with a rate-limited warning (`Skipping a command without a name from <master>`), its
+bytes counted into `repl_offs_` exactly (immediately, or with the batch ahead of it when one is
+queued) and the commands around it applied. The guard is one `// drakeydb: U-14` hunk ahead of the
+queuing branch. A nil *string* name (`*1\r\n$-1\r\n`) does not crash (it reads as the empty name)
+and is left to U-13's path, an unknown command. Tests
+`keydb_onboarding_test.py::test_classic_stream_command_with_an_array_for_a_name_does_not_abort`
+(`empty_array`, `nil_array`, `behind_a_queued_command`). Pre-existing in upstream Dragonfly; not
+filed upstream. On the byte-identity exception list (spec, item 2).
+
+### U-15. A connection command in a classic stream dereferences a null `conn()`
+
+**Where:** `ServerFamily::Info` (`src/server/server_family.cc`): `cmd_cntx->conn()->IsPrivileged()`
+and `->GetTlsCertInfo()`, the first thing it does with the connection once it has collected the
+metrics.
+
+`Replica::ConsumeRedisStream` builds its apply context as `ConnectionContext{nullptr, {}}` (U-9,
+U-10, U-12 are the same context) and dispatches whatever the master streams through
+`Service::DispatchCommand` or the squasher. Nothing on that path refuses a command that is about the
+client's own connection: `VerifyCommandState` takes a context without an owner for an internal one
+and permits everything, and ACL validation is skipped. So `INFO` (read-only, so the squasher runs it
+standalone: `ServerFamily::Info <- CommandId::Invoke <- MultiCommandSquasher::ExecuteStandalone`)
+kills the replica with SIGSEGV. Any classic master, plain Redis and Valkey included, can put
+`*1\r\n$4\r\nINFO\r\n` in its stream, so it is reachable from a malformed or hostile master after
+any valid sync, raw or inside an RREPLAY envelope (`INFO` is a known command, so it passes the
+unknown-command check). Found by the P7-1 Task 1.3 review (O-1), whose probe was a scripted master:
+a valid full sync, then `SET a 1`, `INFO`, `SET b 2`.
+
+The same context reaches every handler that dereferences `conn()` without a check. The audit
+(`task-1.3-report.md`, "U-15 audit") found, besides `INFO`: `CLIENT SETNAME`, `GETNAME`, `INFO`,
+`ID` and `KILL`, `AUTH`, `HELLO`, `REPLCONF` (its `capa dragonfly` and `listening-port` options, on
+a node that is a master: a peer-mode node, or with `--experimental_cascaded_partial_sync`; a plain
+replica refuses `REPLCONF` before it gets there), `QUIT`, `DFLY THREAD <n>`, and two that do not
+fail at the command: `MONITOR` leaves a null connection in the monitor list, which the next command
+of any client dereferences, and `SUBSCRIBE`/`SSUBSCRIBE`/`PSUBSCRIBE` register the stream's context
+in the channel store (a context that is gone when the link ends), which the next client's `PUBLISH`
+dereferences.
+
+The re-review of that fix found a third of the second kind, `WATCH`. `Service::Watch` registers a
+pointer to `exec_info.watched_dirty` of its context in each shard's watched-key table
+(`DbSlice::RegisterWatchedKey`), and only the connection's close, `UNWATCH`, `EXEC` or `RESET`
+unregisters it. On the classic stream that context is a stack local of `Replica::ConsumeRedisStream`,
+so once the stream ends, a write to the key (`DbSlice::PostUpdate`) or a `FLUSHDB`
+(`InvalidateDbWatches`) stores through a dangling pointer. A debug build does not notice the store
+(it lands in a dead fiber stack): the reviewer's `watch_probe.py`, run again for this fix on the
+build without the guard, left the process up through `REPLICAOF NO ONE`, a `SET` of the key and a
+`FLUSHALL`, raw and in an envelope. It is silent memory corruption, not a crash, which is why its
+test reads the registration itself.
+
+**What the guards also cover, and what they change besides the crash.**
+
+- A script. `redis.call` runs its command on the context of the `EVAL` (`CallFromScript`,
+  `main_service.cc`), which in a classic stream has no connection either, and `INFO`, `HELLO` and
+  `QUIT` are not `CO::NOSCRIPT`. The re-review probed `EVAL "return redis.call('INFO')" 0`, raw and
+  in an envelope (`eval_probe.py`): the replica survives, because the guards sit in the handlers,
+  and the script fails with an error that carries `No connection`. With the `Info` and `Hello`
+  guards removed the same scripts kill the replica with SIGSEGV (this follow-up's falsification).
+- The other contexts without a connection, `JournalExecutor` (a Dragonfly master's stream) and the
+  RDB-load search-aux path (`LoadSearchCommandFromAux`, a fixed `FT.CREATE` or `FT.SYNUPDATE`), run
+  on the same kind of context. The aux command name is not the wire's to choose, so nothing there
+  reaches a guarded handler today; the guards are what would keep it safe.
+- `REPLCONF` is guarded at the top of its handler, so every variant now replies `No connection`,
+  including those that never dereferenced the connection (`GETACK`, `ACK`, `UUID`, `PEER`, ...).
+  `REPLCONF GETACK *` is real stock traffic (a master asking for an ACK). What changes is the text
+  of a reply the stream discards: `Replicating a replica is unsupported` on a plain replica,
+  `syntax error` where the handler got past that refusal. Where it did, which is where `IsMaster()`
+  is true (a peer-mode node) or `--experimental_cascaded_partial_sync` is on for a non-active node,
+  every `GETACK` also logged `Error in receiving command, num args: 2` at ERROR, from the generic
+  error callback; that line is gone. The effect is log-only.
+- `CLIENT` has one guard, at the top of `ServerFamily::Client`, for every subcommand (it replaced
+  five per-subcommand guards). It therefore also refuses the subcommands that reached their
+  handlers without a crash (`LIST`, `PAUSE`, `UNPAUSE`, `TRACKING`, `CACHING`, `MIGRATE`, `HELP`)
+  and turns the syntax error of a malformed or unknown one into `No connection`. No stock master
+  propagates `CLIENT`, and it is `CO::NOSCRIPT`, so only a hostile or broken master can send it.
+  `CLIENT SETINFO` keeps the guard upstream gave it.
+
+**How established:** the review's probe, and two throwaway probes as a gtest (each case in its own
+process, on the apply context of the stream, before the fix): 47 commands inside envelopes, then 31
+dispatched raw, which also reaches what an envelope skips, such as `REPLCONF`. `INFO`, the five
+`CLIENT` subcommands, `AUTH`, `HELLO`, `QUIT`, `REPLCONF listening-port|capa` and `DFLY THREAD 1`
+die with SIGSEGV; `MONITOR` and `SUBSCRIBE` die on the next client command (`DispatchMonitor`, the
+channel store's `Borrow()`); every other probed command (`CLIENT
+LIST`, `PAUSE`, `TRACKING`, `CACHING` and `MIGRATE` among them) did not. The re-review's probes
+(`watch_probe.py`, `eval_probe.py`) found `WATCH` and the script path; `WATCH` is pinned by the
+registration it leaves in `DbTable::watched_keys`, which the test counts across every shard and db.
+
+**Status (2026-10-04): fixed in this fork** (P7-1 review fix round, owner decision 26; `WATCH` and
+the `CLIENT` consolidation in the re-review follow-up): each of the handlers above replies `No
+connection` (the error `CLIENT SETINFO` already gives) when its context has no connection, and
+`QUIT` replies `OK` and has nothing to close. The failed command is dropped and, inside an envelope,
+counted in `classic_apply_errors`; the link stays up and the commands around it apply. Fourteen
+`// drakeydb: U-15` guards, over a shared `ReplyIfNoConnection` in `server_family.cc`: five in
+`server_family.cc` (`ServerFamily::Client`, once for every subcommand, then `Auth`, `Info`, `Hello`
+and `ReplConf`), five in `main_service.cc` (`Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch`),
+two in `dflycmd.cc` (`DFLY THREAD`, `DFLY FLOW`) and two in `cluster_family.cc` (emulated `CLUSTER`
+and `DFLYMIGRATE FLOW`, both below). The last three files are beyond what owner decision 26 named.
+The first fix had fourteen guards: the `CLIENT` consolidation removed the five per-subcommand ones
+and added one. Tests
+`ClassicNoConnectionTest.*` (one case per guarded handler, plus `Watch`, three `EVAL` cases,
+`REPLCONF GETACK` and the `CLIENT` subcommands that never crashed; `classic_replay_test.cc`),
+`ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver`,
+`.ReplicatedWatchLeavesNoRegistrationBehind`, `.InfoInAnEnvelopeIsAnApplyErrorNotACrash` and
+`.EvalOfAConnectionCommandInAnEnvelopeIsAnApplyErrorNotACrash`, and
+`keydb_onboarding_test.py::test_classic_stream_info_command_does_not_abort` and
+`::test_classic_stream_eval_of_a_connection_command_does_not_abort` (each `raw`, `in_envelope`).
+Pre-existing in upstream Dragonfly; not filed upstream. On the byte-identity exception list (spec,
+item 2).
+
+**Emulated `CLUSTER` (P7-1 close, 2026-10-05, adversarial finding I3).** Under
+`--cluster_mode=emulated`, `CLUSTER INFO`, `SLOTS`, `NODES` and `SHARDS` answer with the address the
+client connected to (`ClusterFamily::GetEmulatedShardInfo`, via `GetShardInfos`), and on the apply
+context all four die with SIGSEGV in `facade::Connection::LocalBindAddress`, raw, inside an envelope,
+and as `EVAL "return redis.call('CLUSTER','INFO')"` (`CLUSTER` is script-callable). The adversarial
+pass reproduced them (`targeted_cluster.jsonl`); the earlier text here called them "not probed" and
+left out `CLUSTER INFO`. The narrowest guard closes them: `ClusterFamily::Cluster` replies `No
+connection` for those four subcommands when `IsClusterEmulated()` and `conn() == nullptr`, ahead of
+the dispatch on the subcommand. `HELP`, `MYID`, `KEYSLOT`, an unknown subcommand and every other
+cluster mode (answered from the config) are untouched, and a real client always has a connection.
+Tests `ClassicNoConnectionEmulatedClusterTest` instantiation `I3` (`ClusterInfo`, `ClusterSlots`,
+`ClusterNodes`, `ClusterShards`, `EvalClusterInfo`), the control
+`ClassicEmulatedClusterTest.ClientsAndConnectionlessSubcommandsStillAnswer`, and
+`keydb_onboarding_test.py::test_classic_stream_emulated_cluster_query_does_not_abort` (8 cases).
+Falsified: without the guard each gtest case dies with SIGSEGV in `Connection::LocalBindAddress`
+(one process each) and every pytest case loses the replica with the same frame; with the condition
+flipped to `conn() != nullptr` the control fails (a real client's `CLUSTER INFO` gets `ERR No
+connection`).
+
+**Hidden commands (P7-1 close, 2026-10-05, whole-branch re-review finding I-1).** The adversarial
+pass listed the commands to fuzz through `COMMAND`, which leaves out every `CO::HIDDEN` one
+(`Service::Command`), so five were never sent: `DFLY`, `DFLYCLUSTER`, `DFLYMIGRATE`, `GAT` and
+`_XGROUP_HELP` (a registry dump has no others; a `--command_alias` clone is hidden too and shares
+its source's handler). One of them was a further U-15: `DFLYMIGRATE FLOW <id> <shard>`
+(`ClusterFamily::DflyMigrateFlow`) names the connection it arrives on (`conn()->SetName`) before it
+looks up the migration, and `DFLYMIGRATE` is registered whatever the cluster mode, so the stream of
+any classic master, raw or in an envelope, killed the replica with SIGSEGV in `Connection::SetName`.
+An earlier version of this entry named `DFLYCLUSTER FLOW` and said "only with cluster mode on": that
+command has no `FLOW` (it answers `Cluster is disabled`), so the adversarial pass's probe of it
+could not have found this. `DFLYMIGRATE FLOW` goes on to `Migrate()` the connection and keep its
+`socket()`, so the guard is the first statement of `DflyMigrateFlow`; `INIT` and `ACK` never read
+the connection.
+
+**The sweep.** Each hidden command and each subcommand its handler dispatches on, with junk and with
+plausible arguments, plus `ROLE`, `DEBUG REPLICA PAUSE|RESUME|OFFSET`, `DEBUG REPLDIAG` and
+`SHUTDOWN`: 70 cases (`DFLY` 29, `DFLYCLUSTER` 16, `DFLYMIGRATE` 15, `GAT` 2, `_XGROUP_HELP` 1, the
+rest 7), raw and inside an envelope, one fresh process per case, streamed by a scripted active-KeyDB
+master with a probe write behind each, with `--cluster_mode` unset, `emulated`, and `yes` (a config
+pushed first): 420 runs per build. The outcome is survived (the probe applied, the settled ACK
+offset exact, one connection, link up, role, keys and cluster nodes unchanged), crash, stall or side
+effect. Before the fixes (`ac35f61`) 386 survived and 34 did not: 12 are `SHUTDOWN` (below); the
+other 22 are three crashes. `DFLYMIGRATE FLOW x 0` and with a shard number that parses (`x 99999`):
+SIGSEGV in `Connection::SetName`, 12 runs, every mode. `DFLYMIGRATE ACK x 1`: SIGSEGV in
+`ClusterConfig::GetIncomingMigrations`, 4 runs (every mode but `yes`, where a config exists). A bare
+`DFLYMIGRATE`: SIGABRT, an `assert` in the destructor of the command's argument parser, 6 runs. The
+last two do not read the connection and are U-21; a client can send them too. After the fixes 408
+runs survive and the 12 `SHUTDOWN` runs end the process (below); all 90 `DFLYMIGRATE` runs survive.
+The `DFLY` subcommands, `DFLYCLUSTER` (answered from the config; `CONFIG` hands
+`DispatchTracker` the null issuer it accepts), `GAT` (refuses a caller that is not memcache) and
+`_XGROUP_HELP` read no connection and survived throughout. (In `yes` mode the sweep's
+`DFLYCLUSTER CONFIG` case re-sends the config already pushed, which returns early; a streamed config
+that *differs* would replace the replica's cluster config, a side effect, after a bounded wait of up
+to 2 s on the null-issuer tracker. That path was established by reading only, as the guard
+round-2 review noted.) `ROLE` and `DEBUG REPLICA|REPLDIAG`
+survive a single command and deadlock a concurrent client's `REPLICAOF NO ONE` (U-19).
+`--cluster_mode=yes`, which the adversarial pass could not judge (its probe key got `MOVED`), is
+covered by pushing a config first.
+
+`DFLY FLOW` is guarded too (`DflyCmd::Flow`). The junk arguments of the sweep
+stop at its replid and session checks, so it survived; but with a live session (`REPLCONF capa
+dragonfly` creates one, in the preparation state) and this node's replid, `DFLY FLOW <replid> <sync
+id> 0` on the apply context dies with SIGSEGV in `Connection::SetName` (`SetupFlowConnection`), as a
+gtest shows. A classic stream would need this node's replid and the id of a live session, and a
+replica refuses to create sessions (`REPLCONF` is refused on a replica) unless it is a peer-mode
+node or runs `--experimental_cascaded_partial_sync`; no way for a stream to learn the replid was
+found, so the guard closes a window nothing is known to open, instead of leaving it argued away.
+`DFLY SYNC`, `STARTSTABLE` and `TAKEOVER` with the same session do not crash (a session leaves the
+preparation state only through `FLOW`; `DFLY SYNC` replies `invalid state`).
+
+**`SHUTDOWN` in a stream.** Raw, in an envelope, and as `SHUTDOWN NOSAVE NOW`, it makes the replica
+exit with status 0, cleanly, within the probe's 5 s, in all three modes; the sweep's harness counts
+those runs as crashes because the process is gone, but the status is 0. By reading the code:
+`ShutdownCmd` only stops the listeners (`acceptor_->Stop()`), the main thread's `acceptor->Wait()`
+returns and runs `Service::Shutdown`, which stops the replica from there, so the replication fiber
+that ran the command is not joined by itself (U-17's abort does not apply). `SHUTDOWN
+SAVE|NOSAVE|FORCE` also sets `save_on_shutdown_` for that exit. No conforming master streams it
+(KeyDB registers it `noprop`, `server.cpp:782-784`), and a KeyDB replica runs one read from its
+master link the same way. **Owner decision 39 (2026-10-05): kept as is, documented** (operator note
+in `docs/multi-master.md`, KeyDB onboarding). A guard in the handler is not an option anyway:
+`DflyCmd::TakeOver` calls `ShutdownCmd` with a context that has no connection, so a null-connection
+guard would break every successful `DFLY TAKEOVER`. The exit status is 0, so a supervisor that
+restarts only on failure does not restart the node. A hostile master has other ways to stop or empty
+a replica (`CONFIG SET dir` with `SAVE`, `FLUSHALL`, `DFLY LOAD`), and one more on a replica that
+runs `--experimental_cascaded_partial_sync` with a downstream replica in stable sync: a streamed
+`DFLY TAKEOVER 1 SYNC<n>` (session ids count up from 1) passes the active-mode check, runs a real
+takeover and exits the node through `ShutdownCmd` (`dflycmd.cc`, the guard round-2 review's m2).
+
+Tests: `ClassicNoConnectionTest` case `DflymigrateFlow` (instantiation `U15`),
+`ClassicApplyFamilyTest.DflyFlowOfALiveSessionIsAnErrorNotACrash`, and
+`keydb_onboarding_test.py::test_classic_stream_command_without_a_connection_does_not_abort`
+(`dflymigrate_flow`, each `raw` and `in_envelope`). Falsified guard by guard: without the one in
+`DflyMigrateFlow` the gtest dies with SIGSEGV in `Connection::SetName` and both pytest cases lose
+the replica (exit -11); without the one in `DflyCmd::Flow` its gtest dies with SIGSEGV in
+`Connection::SetName` (`SetupFlowConnection`).
+
+**A stream-boundary filter was considered and rejected.** The class could be closed once, by the
+dispatcher or `ConsumeRedisStream` refusing connection-bound commands for a context without a
+connection. It does not hold up:
+
+- No existing `CO::` or ACL flag marks the set. `SELECT` and `PING` are `acl::CONNECTION` and stock
+  masters propagate them; `REPLCONF` is `CO::ADMIN` and is streamed as `GETACK`; `INFO` carries only
+  `CO::LOADING`.
+- `EVAL` bodies bypass a filter on the command name: `redis.call` reaches the handler through
+  `CallFromScript`.
+- `JournalExecutor` and the RDB-load search-aux path never pass through the stream boundary.
+- `VerifyCommandState` would skip `RecordLatency` and log an unthrottled WARNING per refused command.
+
+So the per-handler guards stay; any new upstream handler that dereferences `conn()` is a new U-15,
+caught by `ClassicNoConnectionTest` only if a case is added.
+
+### U-16. A blocking command in a classic stream stalls the link and the replica's shutdown
+
+**Where:** `Replica::ConsumeRedisStream` (`src/server/replica.cc`), the dispatch of a raw command on
+the apply context (`service_.DispatchCommand`, the context U-15 describes).
+
+The replication fiber applies what the master streams by dispatching it itself. A blocking command
+with no timeout, `BLPOP q 0`, parks that fiber until something pushes to `q`; on a replica nothing
+can, because the only writer is the stream the fiber has stopped reading. The link stays `up`, no
+later command applies, and the paths that stop the link (`REPLICAOF NO ONE`, shutdown) do not
+complete. Where exactly they wait was not traced.
+
+It is not only `BLPOP`: every blocking command that waits on a key stalls the link the same way
+(the list under *How established*), **raw and inside an RREPLAY envelope**. The enveloped path is no
+safer: `ClassicApplier::Dispatch` (`classic_replay.cc`) runs the inner command with
+`DispatchCommand(..., ONLY_SYNC)`, and `HandleRreplay`'s one `running()` check (depth 1, before
+anything is dispatched, spec D-3 step 2) cannot interrupt a dispatch that is already parked.
+
+It needs a hostile or broken master: Redis and KeyDB propagate the effect of a satisfied blocking
+pop (`LPOP`, `RPOP`, ...), never the blocking command, so a conforming master does not send `BLPOP`.
+Pre-existing in upstream Dragonfly (the dispatch is upstream's), not specific to drakeydb's classic
+support.
+
+**How established:** the P7-1 re-review's probe, `blpop_probe.py` (a scripted master: a valid diskless
+full sync, then `SET a 1`, `BLPOP q 0`, `SET b 2`): `a` arrives, `b` does not,
+`master_link_status` stays `up`, `REPLICAOF NO ONE` gets no reply within 10 s, and SIGTERM did not
+stop the process within about 40 s. The P7-1 adversarial pass widened it (a scripted master, a
+debug build): a sweep of every registered command with junk arguments and a unique key per case
+(4536 cases, raw and enveloped) hangs on **`BLPOP`, `BRPOP`, `BRPOPLPUSH`, `BZPOPMIN` and
+`BZPOPMAX`** and nothing else. A targeted run then confirmed, raw **and** enveloped, **`BLPOP`,
+`BRPOPLPUSH`, `BLMOVE`, `BZPOPMIN`, `BZMPOP`, `BLMPOP` and `XREAD BLOCK 0`**: the link stalls,
+`REPLICAOF NO ONE` never answers, and SIGTERM does not stop the process within 15 s. So the set is
+`BLPOP`, `BRPOP`, `BRPOPLPUSH`, `BLMOVE`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `BLMPOP` and `XREAD
+BLOCK 0` (`XREADGROUP .. BLOCK 0` was in neither run). The adversarial scripts are
+`adv-p71/fuzz_cmds.py` (with `UNIQUE=1`) and `adv-p71/targeted.py` in the orchestrator's
+scratchpad.
+
+**Status (2026-10-04, widened 2026-10-05): open, out of P7 scope.** Not fixed, not filed upstream,
+no code written. Candidate fix: refuse blocking commands (`CO::BLOCKING`) on replicated contexts,
+or give them zero timeout semantics (try once, never wait). **Owner:** after P7, with the upstream
+sync.
+
+### U-17. A command that rewires the replica's own link, in a classic stream, aborts or stalls the replica
+
+**Where:** `ServerFamily::ReplicaOf` (serves `REPLICAOF` and `SLAVEOF`), `ServerFamily::AddReplicaOf`
+and `ServerFamily::ReplTakeOver` (`src/server/server_family.cc`), reached from
+`Replica::ConsumeRedisStream`'s dispatch of a raw command, or of the inner command of an RREPLAY
+envelope, on the apply context U-15 describes (no connection).
+
+`REPLICAOF NO ONE`, `SLAVEOF NO ONE` and `REPLICAOF <host> <port>` run `Replica::Stop` on the link
+they replace, which is the link the command arrived on. `Stop` joins the replication fiber, and that
+fiber is the one running the command: `fiber_interface.cc:373 Check failed: active != this`
+(`Replica::Stop <- ServerFamily::ReplicaOfNoOne <- DispatchCommand <- ConsumeRedisStream`), a SIGABRT
+in release builds too. On a peer (`--active_replica`) node the same abort comes through `REPLICAOF NO
+ONE` and `REPLICAOF REMOVE <this link's master>`. A raw `REPLTAKEOVER` parks the replication fiber on
+the master socket the fiber reads itself, for the takeover timeout plus 10 s (a classic master never
+answers): the link stays `up` and nothing more applies. `ADDREPLICAOF` does not crash, but opens a
+second link to a master the stream chose. No stock master propagates any of them (none is a write
+command), so only a hostile or broken master sends them. The raw path is upstream's; P7-1's envelope
+path is a second way in.
+
+**How established:** the P7-1 adversarial pass (findings I1, I2), a scripted master, raw and
+enveloped. For the fix, `keydb_onboarding_test.py::test_classic_stream_link_command_does_not_abort`
+without the guards: all 12 `REPLICAOF`/`SLAVEOF` cases (plain replica: `REPLICAOF NO ONE`, `SLAVEOF NO
+ONE`, `REPLICAOF <reachable>`; peer node: `NO ONE`, `SLAVEOF NO ONE`, `REPLICAOF REMOVE <master>`; raw
+and in an envelope) die with `Check failed: active != this`, and both `ADDREPLICAOF` cases open a
+second connection to the master.
+
+**Status (2026-10-05): fixed in this fork** (P7-1 close, `8b860ea`): `ReplicaOf`, `AddReplicaOf` and
+`ReplTakeOver` reply `No connection` (U-15's `ReplyIfNoConnection`) as their first statement when the
+context has no connection. The command is dropped and, inside an envelope, counted in
+`classic_apply_errors`; the link stays up, the offset is exact and the commands around it apply.
+Three `// drakeydb: U-17` guards, all in `server_family.cc`. Unaffected: the `--replicaof` boot path
+(`ServerFamily::Replicate` calls `ReplicaOfInternal` directly; pinned by the `[boot_replicaof]` cases
+of `test_plain_replica_of_active_keydb_expires_keys` and
+`test_dfly_master_that_says_active_replica_never_turns_replica_expiry_on`) and every client-issued
+command (a client has a connection). A script cannot call any of them, in any mode: `CO::ADMIN`
+implies `CO::NOSCRIPT` (the `CommandId` constructor), which `VerifyCommandState` refuses before it
+looks at a script's multi mode, so even a global script (`--!df flags=allow-undeclared-keys`) gets
+`This Redis command is not allowed from script` for `REPLICAOF` (tried against a real server), and
+there is no `EVAL` variant to guard or to test. Tests
+`ClassicNoConnectionTest` instantiation `U17` (`ReplicaofNoOne`, `SlaveofNoOne`, `ReplicaofHost`,
+`SlaveofHost`, `ReplicaofRemove`, `Addreplicaof`, `ReplTakeover`, `ReplTakeoverSave`) and the pytest
+above (16 cases). Falsified: without the guards the 8 gtests and 15 of the 16 pytest cases fail; the
+raw `REPLTAKEOVER` case passes while U-18's refusal is in place, and with both removed both
+`REPLTAKEOVER 30` cases fail (`b` never arrives); the gtest and the `in_envelope` pytest fail with
+only the U-17 guard removed. The `ReplTakeOver` guard is not redundant with U-18: U-18 reads only the
+main link (`replica_`), so on a node whose main link is a Dragonfly master and whose `ADDREPLICAOF`
+link is classic, a `REPLTAKEOVER` streamed on the add-link would pass U-18 and run a real `DFLY
+TAKEOVER` against the Dragonfly master, promoting this node and shutting that master down. The U-17
+guard refuses it first. Pre-existing in upstream Dragonfly (the raw path);
+not filed upstream. On the byte-identity exception list (spec, item 2).
+
+### U-18. A client `REPLTAKEOVER` on a replica of a classic master consumes replication stream bytes
+
+**Where:** `ServerFamily::ReplTakeOver` -> `Replica::TakeOver` (`src/server/replica.cc`), which sends
+`DFLY TAKEOVER <timeout> <session id>` on the master socket and reads the reply from it with the
+shared parser.
+
+On a classic link that socket is the replication stream, which `ConsumeRedisStream` reads too, and a
+current classic master does not answer a replica's command on it (KeyDB 6.3, Redis 7+ and Valkey
+feed a replica from the replication backlog, so a reply never reaches it; Redis 6.2 and older would
+put an error into the stream, which is no better). So the
+"reply" `TakeOver` reads is whatever the master streams next: that command is applied nowhere, the
+replica's offset stays behind by its bytes for good, the link stays `up`, and the master lists the
+replica `online lag 0`. Silent, permanent divergence; the client sees `Couldn't execute takeover: Bad
+message`, or waits out the timeout against an idle master. Before that, `StartJournalAtOwnLSN` has
+already started a journal on a node that stays a replica. Operator-triggered, but it is the natural
+cutover command for an operator moving off KeyDB.
+
+**How established:** the P7-1 adversarial pass (finding C2, `takeover_load.py`): an active KeyDB
+taking ~1.5k `INCR`/s while a client ran `REPLTAKEOVER` on the replica; every takeover failed with
+`Bad response to "DFLY TAKEOVER 0 ": "*5 RREPLAY ... INCRBY ctr 1 ..."`, and the replica lost 8 writes
+(32 against a stock KeyDB master). For the fix, the pytest without the refusal: the replica logs `Bad
+response to "DFLY TAKEOVER 1 ": "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n"`, the streamed `SET b 2`
+read as the reply.
+
+**Status (2026-10-05): fixed in this fork** (P7-1 close, `8b860ea`): `ReplTakeOver` refuses with
+`REPLTAKEOVER is not supported on a replica of a classic (Redis protocol) master` when
+`replica_->GetSummary().classic_link` (the protocol of the last completed `Greet()`), and sends nothing
+to the master. The check comes after `IsMaster()` (an idempotent `OK` on a master) and before
+`StartJournalAtOwnLSN`, so a refused takeover starts no journal. One `// drakeydb: U-18` hunk in
+`server_family.cc`. A takeover from a Dragonfly master is unchanged: the DFLY takeover tests
+(`replication_resilience_test.py` `test_take_over_*`, `test_double_take_over`,
+`multimaster_test.py::test_active_node_admits_fork_consumers_refuses_others_and_takeover`,
+`cluster_test.py::test_replica_takeover_moved`; 14 runs) pass. A link whose first `Greet()` never
+completed reads `classic_link` false and still gets upstream's `Full sync not done`, as before (a
+client `REPLICAOF` cannot leave such a link, since `Start()` greets before it returns `OK`; the
+`--replicaof` boot path can, harmlessly). Test
+`keydb_onboarding_test.py::test_client_repltakeover_on_a_replica_of_a_classic_master_is_refused` (a
+scripted master silent to `DFLY`, as KeyDB is: the error names `REPLTAKEOVER` and "classic", no `DFLY`
+request reaches the master, the later `SET b 2` applies, the ACK offset is exact, one connection, role
+`slave`, link `up`). Falsified: refusal removed -> `Couldn't execute takeover: Bad message`. Not re-run
+against real KeyDB after the fix. Pre-existing in upstream Dragonfly; not filed upstream. On the
+byte-identity exception list (spec, item 2).
+
+### U-19. A command in a classic stream that takes `replicaof_mu_` can deadlock a client's `REPLICAOF NO ONE`
+
+**Where:** `ServerFamily::Role` (`src/server/server_family.cc`), `DebugCmd::Replica` (`DEBUG REPLICA
+PAUSE|RESUME|OFFSET`) and `DebugCmd::ReplDiag` (`DEBUG REPLDIAG`) (`src/server/debugcmd.cc`). Each
+takes `ServerFamily::replicaof_mu_`, directly or through `PauseReplication`, `GetReplicaOffsetInfo` and
+`GetReplicaMasterSocketUnreadBytes`, and is reached from `Replica::ConsumeRedisStream`'s dispatch of a
+raw command, or of the inner command of an RREPLAY envelope, on the apply context U-15 describes (no
+connection).
+
+A client's `REPLICAOF NO ONE` (and `REPLICAOF <host> <port>`) holds `replicaof_mu_` across
+`Replica::Stop`, which cancels the link and joins its replication fiber (`sync_fb_.JoinIfNeeded()`).
+A command streamed by a classic master runs on that fiber. If the fiber is parked on `replicaof_mu_`
+while the client holds it, neither goes on: the fiber never ends, the `REPLICAOF` never replies, and
+the mutex is never released. Measured (`deadlock_probe.py`) on a replica streamed `ROLE` without a
+pause: `REPLICAOF NO ONE` gets no reply, and neither do `ROLE`, `CLIENT LIST`, `REPLTAKEOVER` and
+`DEBUG REPLICA OFFSET` after it. `INFO replication` still answers, because `REPLICAOF NO ONE` flips
+the master flag before it waits and `INFO` takes the mutex only for a replica (a `REPLICAOF <host>
+<port>`, which leaves the node a replica throughout, would hang `INFO` too; read, not measured).
+`PING` and `SET` work, and SIGTERM does not stop the process within 20 s, because
+`ServerFamily::Shutdown` takes the same mutex: it takes SIGKILL. No stock master streams `ROLE` or
+`DEBUG` (neither is a write command), so only a hostile or broken one does, and a client's command
+has to arrive while the stream is busy with them.
+
+`DEBUG REPLICA PAUSE` has a second effect. It pauses the link it arrived on, and `MainReplicationFb`
+does not reconnect a paused link (`if (is_paused_) continue;` ahead of the connect), so when the master
+drops the connection the replica stays down until a client sends `DEBUG REPLICA RESUME`.
+
+**Every acquisition of `replicaof_mu_`** (`server_family.cc`, none elsewhere) and what reaches it:
+
+- `Shutdown`: `Service::Shutdown` on exit. `SHUTDOWN` itself only stops the listeners, so no command
+  runs it (see U-15, "`SHUTDOWN` in a stream").
+- `PauseReplication`, `GetReplicaOffsetInfo`: `DEBUG REPLICA ...`. Guarded here.
+  `GetReplicaMasterSocketUnreadBytes`: `DEBUG REPLDIAG`. Guarded here.
+- `Role`: guarded here.
+- `GetReplicaSummary`: `Info` and the `GetMetrics` it calls (U-15 guard first), the emulated
+  `CLUSTER` (`GetEmulatedShardInfo`, behind its U-15 guard), and `/metrics`, varz and memcached
+  `stats`, which run on their own fibers and do not come from a replication stream.
+- `GetMasterLinkClientInfo`, `IsMasterLinkClientId`: `CLIENT LIST|KILL`, behind the one `Client` guard.
+- `AddReplicaOf`, `ReplTakeOver`, and `ReplicaOfInternal` / `ReplicaOfNoOne` through `ReplicaOf`: the
+  U-17 guards come first. `Replicate()`, the `--replicaof` boot path, calls `ReplicaOfInternal` itself,
+  from the boot flow.
+- `ReplConf`: its U-15 guard is the first statement, ahead of its lock. `GetLineageId`: `ReplConf`, and
+  `DflyCmd::Flow`, which is guarded (U-15).
+- The peers' own mutex (`PeerReplicationManager::mu_`, also held across `Stop`) is taken by
+  `PauseReplication` (here), `INFO`'s peer summaries, `REPLICAOF` on a peer node and `REPLCONF`'s
+  reciprocal check: all behind a guard above.
+
+**How established:** the whole-branch re-review's M-1, by reading the code. For the fix: a scripted
+master floods the stream with the command while a client sends `REPLICAOF NO ONE`
+(`keydb_onboarding_test.py::test_classic_stream_replicaof_mutex_command_cannot_deadlock_replicaof_no_one`):
+without the guards all 8 cases (`ROLE`, `DEBUG REPLICA PAUSE|RESUME|OFFSET`, raw and in an envelope)
+get no reply in 30 s. `test_classic_stream_debug_replica_pause_does_not_strand_the_link`: without the
+guard both cases never see a second connection.
+
+**Status (2026-10-05): fixed in this fork** (P7-1 close, guards round 2): three `// drakeydb: U-19`
+guards, each before the lock and replying `No connection`: `ReplyIfNoConnection` at the top of
+`ServerFamily::Role`, and an inline null-connection check at the top of `DebugCmd::Replica` and of
+`DebugCmd::ReplDiag`. The command is dropped and, inside an envelope, counted in
+`classic_apply_errors`; the link stays up and the commands around it apply. A client has a
+connection, so `ROLE` and `DEBUG` answer it as before, and no script can call either (`ROLE` is
+`NOSCRIPT`, `DEBUG` is `ADMIN`). Tests `ClassicNoConnectionTest` instantiation `U19` (`Role`,
+`DebugReplicaPause`, `DebugReplicaResume`, `DebugReplicaOffset`, `DebugReplDiag`: the fixture's node
+is a master, so they pin the reply, and the deadlock is pinned by the pytests above), and
+`test_classic_stream_command_without_a_connection_does_not_abort` (the same five, raw and in an
+envelope). Falsified one guard at a time: without `Role`'s, its gtest fails and so do 3 of the 4
+pytest cases (both deadlock cases, which get no reply in 30 s, and the envelope case; the raw case
+cannot tell); without `DebugCmd::Replica`'s, its three gtests fail, and 11 of 14 pytest cases (all
+six deadlock cases, both strand cases, the three envelope cases); without `DebugCmd::ReplDiag`'s,
+its gtest and its envelope case fail. `REPLDIAG` has no deadlock test: it spends its time dumping
+every fiber's stack on every thread, so a flood of it rarely parks the fiber on the mutex and would
+flood the logs; its guard is pinned by its reply alone. Pre-existing in upstream Dragonfly; not filed upstream. On the byte-identity
+exception list (spec, item 2).
+
+### U-20. `SORT .. LIMIT` with an offset plus count beyond `uint32` replies garbage or crashes
+
+**Where:** `GetSortRange` and the partial sort's end in `SortVisitor` (`src/server/generic_family.cc`).
+
+`LIMIT 1 4294967295` and `LIMIT 4294967295 1` are valid in Redis and KeyDB (everything from the
+offset on; nothing). Here `offset + count` wrapped around a `uint32`, so the range ended before it
+began: the plain form replied `*4294967295` and then killed the server with SIGSEGV, in
+`SortEntryBase::ResultKey` called from the reply lambda while it streamed elements that did not
+exist (the first write-up said the plain form only replied a garbage array length; the SORT review,
+M2, ran it against the build before the fix and found the crash), and the `BY` and `BY nosort` forms
+killed it the same way. Any client can send it, and so can a classic master's stream (`SORT ..
+LIMIT .. STORE` is replicated verbatim).
+
+**Status (2026-10-05): fixed in this fork** (P7-1, `bb2a2a0`, found while fixing D-34): both sums
+are 64-bit. Two `// drakeydb: P7-1` hunks, counted apart from decision 34's in the UPSTREAM-SYNC
+`generic_family.cc` row. Tested in `GenericSortOrderTest` and the D-34 pytests; falsified (each sum
+back to 32 bits: the test binary dies with SIGSEGV, the server dies in all four pytests; the partial
+sort's alone: one gtest and four pytests fail). Negative or beyond-`uint32` `LIMIT` arguments were
+still an error here where Redis and KeyDB clamp them until P7-1 round 2a, which parses and clamps
+`LIMIT` as `sortCommand` does and keeps these 64-bit sums (D-34). Pre-existing in upstream
+Dragonfly; not filed upstream. On the byte-identity exception list (spec, item 2).
+
+### U-21. `DFLYMIGRATE ACK` on a node without a cluster config dereferences a null config; a bare `DFLYMIGRATE` fails a debug assert
+
+**Where:** `ClusterFamily::DflyMigrateAck` and `ClusterFamily::DflyMigrate`
+(`src/server/cluster/cluster_family.cc`).
+
+`DflyMigrateAck` read `ClusterConfig::Current()->GetIncomingMigrations()`, and `Current()` is null
+until a cluster config has been pushed: always with `--cluster_mode` unset or `emulated`, and in
+`yes` mode until the first `DFLYCLUSTER CONFIG`. `DFLYMIGRATE ACK <id> <attempt>` then dies with
+SIGSEGV in `ClusterConfig::GetIncomingMigrations`: a call through a null pointer, so a release build
+too, by reading (the sweep ran a debug build). The command is `CO::ADMIN | CO::HIDDEN` and
+registered in every cluster mode; an admin command is refused to a client only for a command named
+in `--restricted_commands`, so any client the server takes commands from can kill a node that is not
+in cluster mode. A classic master's stream can send it as well. Second, `DFLYMIGRATE` alone passes
+its arity check (-1), `DflyMigrate` reads a subcommand that is not there, and nobody takes the
+parser's error: in a debug build `~CmdArgParser` asserts (`Parsing error occured but not checked`),
+SIGABRT; a release build answered an unknown subcommand (`Unknown subcommand ...`), and now answers
+`syntax error`, as in a debug build.
+
+**How established:** the P7-1 close's hidden-command sweep (U-15, "The sweep"): `DFLYMIGRATE ACK x
+1` and a bare `DFLYMIGRATE` in a classic stream, raw and in an envelope, killed the replica (`ACK`
+in every mode but `yes`). Both reproduce for a plain client too: the gtests below die in
+`BaseFamilyTest::Run`, before their stream half.
+
+**Status (2026-10-05): fixed in this fork** (P7-1 close, guards round 2): two `// drakeydb: U-21`
+hunks. `DflyMigrate` takes the parse error of the subcommand (`RETURN_ON_PARSE_ERROR`, a `syntax
+error` reply). `DflyMigrateAck` treats a missing config as no incoming migration, which it already
+answers `UNKNOWN_MIGRATION` (a simple string, not an error) for one that is not in the config. Tests
+`ClassicApplyFamilyTest.DflymigrateAckWithoutAClusterConfigIsUnknownMigration` and
+`.BareDflymigrateIsAnErrorNotAnAbort` (a client, then the stream's context), and
+`keydb_onboarding_test.py::test_classic_stream_dflymigrate_without_a_cluster_config_does_not_abort`
+(`ack`, `bare`, each `raw` and `in_envelope`). Falsified: with `RETURN_ON_PARSE_ERROR` removed the
+gtest aborts on the assert and both `bare` pytest cases lose the replica; with the config check
+removed (back to `Current()->`) the gtest dies with SIGSEGV and both `ack` pytest cases lose the
+replica. Pre-existing in upstream Dragonfly; not filed upstream, and worth filing (a remote crash of
+any non-cluster node). On the byte-identity exception list (spec, item 2).
+
+### U-22. `SADD` replies a wrong count when an integer set converts in the middle of the call
+
+**Where:** `OpAdd` (`src/server/set_family.cc`), the string-set branch after the intset loop.
+
+While a key is an intset, `OpAdd` inserts the integers one by one and counts each in `res`
+(`IntsetAddSafe`). It converts the set to a string set when the intset passes `kMaxIntSetEntries`
+(256) or a member is not an integer, and then ran `res = StringSetWrapper{...}.Add(vals, ...)`.
+`Add()` walks every member of the call and counts those the converted set does not hold yet, which
+excludes the integers the intset had already taken, and the assignment threw away the count the loop
+had kept: `SADD` replied only the rest of the call. On a new key 257 distinct integers replied 0,
+258 replied 1, 300 replied 43, 512 replied 255, 600 replied 343, 1000 replied 743; an existing
+intset of 200 plus 100 new integers replied 43, 256 plus one new replied 0, 250 plus 10 replied 3;
+an intset `{1,2,3}` plus `4 5 a 6` replied 2 (Redis: 4) and plus `4 a` replied 1 (Redis: 2). Redis
+answers the number of members that were new, whatever its own conversion threshold (a second Redis
+at `set-max-intset-entries 256` answers the same). The set was right all along (`SCARD` and the
+members match); a client, a `MULTI` reply and a script that returns the `redis.call` result all saw
+the wrong number. Not affected: a call of up to 256 integers on a new key, a set that is a string
+set already (a non-integer member, or converted by an earlier call), `SADDEX` (always a string set;
+its count is `Add()`'s alone), and `SMOVE` and `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, which write
+through the same `OpAdd` but reply a count of their own (1 or 0, the result size). Nothing journaled
+or replicated depends on `res`: the auto-journal of `SADD` gates on the hop's status (`OK` for any
+count, 0 included) and `OpAdd`'s own `SADD` entry (the store commands, `SMOVE`) is built from
+`vals`; a master and a replica of the build before the fix hold the same members after a `SADD` of
+300 integers that replied 43.
+
+**How established:** found by P7-1's SORT round 2a, whose tests build their sets with `SADD`.
+Reproduced against the build before the fix, with a 69-case matrix (new keys, existing keys,
+duplicates, non-integers, `SADDEX`, `SMOVE`, the three store commands) run on that build, on Redis
+7.0.15 at its default and at `set-max-intset-entries 256`, and on the fixed build: Redis equals an
+independent set-arithmetic oracle in all 63 cases it can run, the build before the fix differs from
+it in 24 rows, every one a `SADD` reply, and the fixed build in none. The line is in the fork's
+base commit (`git log -S` finds it first in `05abfdd`).
+
+**Status (2026-10-05): fixed in this fork** (P7-1, owner decision 40): one `// drakeydb: P7-1
+(decision 40)` hunk in `set_family.cc`, `res +=` for `res =`. Tests (`set_family_test.cc`, every
+expected reply Redis 7.0.15's): `SetFamilyTest.SAddCountsAcrossIntsetOverflow` (31 rows: 21 wrong
+before the fix, 10 right before it as controls), `.SAddCountsAfterConversion`, and two controls that
+pass without the change, `.SAddExCountsAcrossIntsetConversion` and
+`.SMoveAndStoreAcrossIntsetOverflow`. Falsified (`res =` back): 22 replies wrong in the first two,
+with the counts above. Pre-existing in upstream Dragonfly; not filed upstream (a wrong reply, not
+a crash or a divergence). On the byte-identity exception list (spec, item 2); the client-visible
+reply is the only change, no journal or RDB byte moves.
 
 ---
 
@@ -270,11 +964,22 @@ longer a second, separately-supplied origin index for `Commit()` to disagree wit
    oversight: upstream's per-shard auto-journal payload is built from `GetShardArgs(shard_id)` and
    dropped the destination effect entirely, so a **plain replica did not converge** on a
    cross-shard `SORT ... STORE` before P4-3. Gating the fix on `--active_replica` would re-open
-   that bug for plain replicas purely to preserve the slogan, so it stays on for everyone.
+   that bug for plain replicas purely to preserve the slogan, so it stays on for everyone. A
+   cross-shard `STORE` with an empty result journals `DEL <dst>`. The same code writes three more
+   `SORT` entries that the merge base does not, also ungated (listed in `docs/UPSTREAM-SYNC.md`): a
+   same-shard `SORT <missing source> STORE <existing dst>`, its `BY nosort` form and a source the
+   fetch's own member expiry emptied journal `DEL <dst>` alone (D-33, decision 32; the merge base
+   journals the verbatim `SORT`, upstream main `DEL <dst>`); a same-shard sorted `STORE` whose own
+   fetch emptied the source journals `DEL <dst>` ahead of the verbatim `SORT` (P4-3 review wave);
+   and a `SORT` that lazily expires some members of a set with member TTLs journals `SREM <key>
+   <members>` ahead of itself (P4-0). Upstream main has since changed SORT's journaling model
+   (`DEL` + `RPUSH` from `OpStore` on every `STORE`, no revived auto-journal), which fixes the
+   premise above in another shape: this exception inverts at the sync, and the `generic_family.cc`
+   row of `docs/UPSTREAM-SYNC.md` records the decision the sync must take.
 
-So "byte-identical with `--active_replica` off" is true for the journal wire *except* cross-shard
-`SORT ... STORE`, true for the RDB file and INFO memory, and not true for INFO as a whole. Stated
-that way in `docs/UPSTREAM-SYNC.md`, `docs/PLAN.md` and `docs/differences.md`.
+So "byte-identical with `--active_replica` off" is true for the journal wire *except* the
+`SORT ... STORE` entries of item 2, true for the RDB file and INFO memory, and not true for INFO as
+a whole. Stated that way in `docs/UPSTREAM-SYNC.md`, `docs/PLAN.md` and `docs/differences.md`.
 
 **Owner:** unassigned; (1) introduced in P1/P3, (2) ruled deliberate in P4-3. **From:** P4-1,
 restated P4-3 final review.
@@ -381,6 +1086,32 @@ the same-shard case too would be correct but changes the wire format for a path 
 under the pre-P4-3 contract, and the size/complexity trade-off of doing so for what is a narrow,
 pattern-key-dependent edge case was left for a future owner decision.
 
+Upstream main has dropped the recipe altogether: `SORT` is `CO::NO_AUTOJOURNAL` there with no
+revive, and `OpStore` journals `DEL <dst>` + `RPUSH <dst> ...` for every `STORE`. Taking that model
+at the sync closes this entry (and D-18's SORT part); `docs/UPSTREAM-SYNC.md`'s `generic_family.cc`
+row records the choice.
+
+**Update (P7-1, D-34 and decisions 36-38; SORT review M3).** The `BY nosort` set case above is closed
+between nodes of the same build: a SET under `BY nosort` that is stored or scripted is sorted ALPHA
+by the element, a numeric `BY` tie breaks on the element, an `ALPHA BY` tie keeps the fetch order of
+a list or an integer set, and `LIMIT` and `GET` are decided by the same rules on every node, so two
+nodes of one build that hold the same data and run the same `--sort_set_max_intset_entries` re-run a
+same-shard `SORT .. STORE` to the same `dst` (two nodes with different values of that flag order the
+ties of an integer set between the two limits differently: a master at 600 and a replica at 512 stored
+`-1000 -987 ...` and `-1000 -103 -116 ...` from one 549-member set, the SORT round-2 review's M1). What
+is left of this entry is the part about pattern keys that differ between nodes, and a **new
+mixed-version risk**: the journal carries the command, not its result, so a node of an older build
+that re-runs a same-shard `SORT .. STORE` orders a tied `BY`, a `BY nosort` set, a missing `ALPHA
+BY` weight or an `ALPHA BY` tie (D-34, decision 37) in the old order, and fails on a negative
+`LIMIT`, a pattern with several `*` or a numeric spelling the new build accepts (decision 36)
+and leaves `dst` stale, while the new-build master computed the new order: the same members in another
+order, silently, with the link up. A cross-shard `STORE` journals the computed `RESTORE` and is not
+exposed. `kDrakeydbReplVersion` is not bumped for it: the gate refuses admission on the active
+master's side only (an older node behind a newer master is not covered, nor a non-active DFLY link),
+and it would force a lockstep upgrade for an ordering nuance; `docs/multi-master.md` ("Upgrade a mesh
+in lockstep") says to upgrade a mesh node by node and not to run a `SORT .. STORE` form this change
+reorders in between.
+
 **Owner:** unassigned; owner to decide whether the divergence-under-`BY`-pattern case is worth the
 added journal size. **From:** P4-3 Task 7.
 
@@ -409,8 +1140,8 @@ token on each arm, so `Disarm` can only cancel its own), not a narrower scope.
 whole-branch review; not reproduced. `RdbMvccTest.MergeLwwTombstoneInstallForAbsentKeyDoesNot
 StealConcurrentArm` pins the half that IS closed.
 
-**Owner:** unassigned; needs per-arm ownership in `MvccStamper`. **From:** P4-3 Tasks 6/13, final
-review.
+**Owner:** tombstone-lifecycle phase (scheduled after P7); needs per-arm ownership in
+`MvccStamper`. **From:** P4-3 Tasks 6/13, final review.
 
 ### D-15. Tombstone merge is only ever tested with two peers
 
@@ -498,8 +1229,9 @@ three-peer scenario is unmeasured (see D-15). The live-reap and member-expiry-re
 identical exposure was identified when those paths were changed to derive their stamp from the
 value's own too.
 
-**Status:** open. **Owner:** unassigned (tombstone lifecycle). **From:** the merge-load synthetic
-tombstone's own introduction; widened when the local-reap paths adopted the same rule.
+**Status:** open. **Owner:** tombstone-lifecycle phase (scheduled after P7). **From:** the
+merge-load synthetic tombstone's own introduction; widened when the local-reap paths adopted the
+same rule.
 
 ### D-18. Runtime-revived recipes and name-level full-value writes are unguarded
 
@@ -666,7 +1398,7 @@ silently discarded by a mid-command lazy expiry this way), but that change is wh
 resulting gap between the discarded `X` and the installed tombstone precisely `X -
 ExpiryTombstoneFor(S)` rather than something already partly closed by a reap-time mint.
 
-**Owner:** P4-5 (tombstone lifecycle). **From:** P4-4.
+**Owner:** tombstone-lifecycle phase (scheduled after P7). **From:** P4-4.
 
 ### D-21. `*STORE`'s `DEL` + add split can merge a stale result into a newer destination
 
@@ -986,13 +1718,19 @@ expiry's per-node independence, and `FloorAppliedStamp`'s own scope (it governs 
 COMMITTED stamp when a live value is present to floor against — it has nothing to floor against
 here, since the key is absent at apply time); not reproduced with a live three-step repro.
 
-**Owner:** PR-B (tombstone lifecycle). An expiry tombstone that records the EXPIRED VALUE'S OWN
-deadline `D` (not merely its stamp) would let a receiver applying a delta authored strictly before
-`D` drop it outright instead of re-creating the key: the key would have expired at `D` on every
-node anyway, author included, so a delta timestamped before `D` describes a value that no longer
-exists anywhere once `D` passes.
+**Owner:** tombstone-lifecycle phase (scheduled after P7). An expiry tombstone that records the
+EXPIRED VALUE'S OWN deadline `D` (not merely its stamp) would let a receiver applying a delta
+authored strictly before `D` drop it outright instead of re-creating the key: the key would have
+expired at `D` on every node anyway, author included, so a delta timestamped before `D` describes
+a value that no longer exists anywhere once `D` passes.
 
-This is not new with PR-A (P4-4): deltas have always applied in plain arrival order against each
+**Related: D-32.** The same mechanism reaches a node that applies a classic master's stream. D-32 is
+its instance on a plain replica of an active KeyDB (the replica's own sweep passes the deadline and
+KeyDB never streams the `DEL`), which P7-2 Task 2.9 closes. It does not close this entry's peers:
+a drakeydb peer, one attached to an active KeyDB through a classic peer link included, sweeps and
+serves reads on its local clock, so this entry owns that share of the orphan after Task 2.9.
+
+This is not new with P4-4: deltas have always applied in plain arrival order against each
 node's own, independently-timed expiry: the streaming guard on
 `SET`/`SETNX`/`GETSET`/`GETDEL`/`RESTORE`/`MSET`/`DEL` is what is new here, not the underlying
 gap this describes. **From:** P4-4 (documented alongside the guard; the gap itself predates it).
@@ -1075,7 +1813,7 @@ with a live two-node repro (an unstamped key reaching this path at all requires 
 never-stamped local write or a D-7-style unauthoritative merge load, followed by that same key's
 own natural expiry).
 
-**Owner:** open (tombstone lifecycle, PR-B candidate). Fix path if wanted: distinguish "no arm
+**Owner:** tombstone-lifecycle phase (scheduled after P7). Fix path if wanted: distinguish "no arm
 found" from "arm found but carries no real stamp" more finely, or accept the resurrection risk as
 inherent to a genuinely unstamped key (which, by definition, this fork never had real authority
 over to begin with). **From:** P4-4 (found while auditing `RecordExpiryBlocking`'s own text against
@@ -1213,3 +1951,554 @@ table, never observing `EXISTS`/`GET`.
 
 **Owner:** open; pre-existing upstream shape (`DelMutable`-then-`Add` for `REPLACE` predates
 drakeydb's own MVCC/LWW work), not introduced by P4-4. Registered only, not fixed. **From:** P4-4.
+
+### D-32. A TTL-keeping write the master ran before a key's deadline leaves a permanent TTL-less
+orphan on a plain replica of an active KeyDB
+
+**Where:** `DbSlice::ExpireIfNeeded` (`db_slice.cc`) and the heartbeat sweep, both opened for a
+plain replica whose master said `active-replica` (P7-1 Task 1.4, spec D-9, ledger decision 13). An
+active KeyDB never streams an expiry `DEL` (`db.cpp:1980`), so such a replica expires keys itself,
+on its own clock, and the two disagree about a key whenever a command crosses a deadline in
+flight:
+
+1. The master holds `c` with a deadline `E`. At `Tm < E` it runs a write that keeps the TTL when
+   the key exists and creates the key when it does not: `INCR` (streamed as `INCRBY c 1`),
+   `APPEND`, `SETRANGE`, `HSET`, `HSETNX`, `SADD`, `LPUSH`, `SET .. KEEPTTL`, ... On the master `c`
+   keeps `E`.
+2. The command reaches the replica at or after `E` on the replica's clock (the stream's lag plus
+   the clocks' skew). The replica has deleted `c` by then, in the sweep or at the first access.
+3. The write finds no key and creates one from nothing, with no TTL.
+4. The master's `c` expires at `E`, and nothing is streamed for it. The replica's `c` stays for
+   ever: the sweep has no TTL to act on and DBSIZE never moves.
+
+**Reproduced** (the reviewer's script, `orphan.py`; now the pytest below): a fake master saying
+`active-replica` streams `SET c 5 PXAT E`, `HSET h f 1` with `PEXPIREAT h E` and `SET kt old PXAT
+E`, and a second past `E` the enveloped `INCRBY c 1`, `HSET h g 2` and `SET kt new KEEPTTL`,
+stamped before `E`. After them the replica has `c`, `h` and `kt` with `pttl -1`, and DBSIZE stays
+5 for 3 s (the pytest checks 2 s). A rate limiter (`INCR`, then `EXPIRE` only when the value is 1) meets it at a window
+rollover on a hot key. A counter whose `EXPIRE` is streamed right behind the `INCR` is not
+orphaned (the `PEXPIREAT` gives the recreated key a TTL), and `SET .. NX` is not affected (a failed
+one is never propagated, `server.cpp:4624`, `t_string.cpp:104-109`). A TTL refresh, `SET .. XX`
+with no expiry and the movers and STORE commands lose data rather than orphan it: a refresh that
+sets a deadline only until that deadline, `PERSIST`, `SET .. XX` without an expiry, a moved element
+and a STORE result for good. `RENAME` and `COPY` onto a **live** `dst` leave a **permanent** stale
+key: the master's `RENAME` gives `dst` the source's deadline `E` (`db.cpp:1507-1511`) and the key is
+gone there at `E`, while the replica's `RENAME` finds no source, fails and keeps its old `dst`,
+which stays for ever unless it carries a TTL of its own. Spec D-9 has the outcome per class.
+
+**Scope.** A Redis, Valkey or Dragonfly master streams an expiry `DEL` (`RecordExpiryBlocking`,
+`db_slice.cc:2159`), which removes the recreated key, so the same replica behaviour is transient
+under them. KeyDB's own *active* replicas (`expireIfNeeded` falls through to the delete,
+`db.cpp:2101`) and drakeydb peers (`PassesPeerEchoFilter` drops `kEntryFlagExpired`) share the
+orphan. Options B (copy KeyDB's plain replica) and C (sweep only) of ledger decision 24 do not
+reliably avoid it either. Under C the replica's own sweep usually reaps the due key first, and the
+late write recreates it with no TTL, the same orphan. B converges only when the write lands before
+KeyDB's slow reap (seconds to tens of minutes), the write then going with the stale object. They
+were rejected as wider for every other class. A full resync (a `REPLICAOF` again, or a reconnect
+that falls back to one) rebuilds the replica from the master's snapshot and drops the orphans.
+
+**Related: D-27.** D-27 is the same mechanism between drakeydb peers: an unguarded delta that keeps
+the TTL when the key exists and creates the key when it does not, authored before a deadline and
+applied after it, re-creates the key with no TTL. This entry is its instance on a plain replica of
+an active KeyDB, where the deadline is passed by the replica's own sweep and an active KeyDB never
+streams the `DEL` that would clean up. Task 2.9 closes only that instance: a plain replica's main
+link publishes the stream clock and runs the replica sweep (`ApplyReplicaActiveExpiry` returns for a
+peer-mode or non-main link). A drakeydb peer, a classic peer link to an active KeyDB included, still
+sweeps and serves reads on its local clock, so its share of the orphan stays open under D-27, whose
+owner is the tombstone-lifecycle phase. Task 2.8 narrows it there too (an enveloped command runs at
+its author's time), but only for a key the local sweep has not yet deleted.
+
+**How established:** the live fake-master run above against the P7-1 build, and now the pytest
+`test_plain_replica_of_active_keydb_keeps_a_ttl_less_orphan_of_a_ttl_keeping_write[sweep|access_only]`
+and `ReplicaActiveExpiryTest.EveryCommandClassOfTheWindowHasItsDocumentedOutcome` (`PTTL == -1` on
+every recreated key), both falsified by serving due keys as live (`task-1.4-report.md`, "Decision
+31 round"). Not reproduced against a real KeyDB end to end: the stream's forms are the captured
+ones (`tests/dragonfly/data/README.md`), and Task 2.9 adds a real-KeyDB rate-limiter test.
+
+**Status:** interim, owner decision 31: documented in P7-1 (spec D-9, this entry, the P7-1 PR
+description), not fixed there. **Owner:** P7-2 Tasks 2.8 and 2.9 (plan): the write then runs at its
+author's time, before `E`, on a key the sweep, on the stream clock, has not deleted, so it finds the
+key with its TTL, and the two pytests flip. They close it while the link is healthy; it stays open
+while the stream is more than 60 s behind the local clock (the floor) or a stamp is unusable (the
+local clock is kept). They close it for a plain replica only: when Task 2.9 lands this entry is
+narrowed, not deleted. The plain-replica part is deleted (landed, per the register's rule) and the
+peer and classic-peer share moves to D-27, which says so. **From:** P7-1 (Task 1.4; found by the
+Opus re-review of `425eeb9`).
+
+### D-33. `SORT .. STORE` of a missing or unsortable source aborted the server -- resolved
+
+**Where:** `SortGeneric`'s fetch hops (`src/server/generic_family.cc`). P4-0 (`1b6a2e82`) made the
+fetch callback return `fetch_result.status()`, so that a failed single-shard SORT is not
+auto-journaled (`LogAutoJournalOnShard` skips a non-OK result). On a transaction of more than one
+shard `Transaction::RunCallback` does `CHECK_EQ(OpStatus::OK, result)` on every hop
+(`transaction.cc:771`, a `CHECK`, so release builds too). With `STORE`'s destination on another
+shard than the source, a source that is missing (`KEY_NOTFOUND`), of the wrong type (`WRONG_TYPE`)
+or holds elements a numeric sort cannot convert (`INVALID_NUMERIC_RESULT`) killed the server:
+`Check failed: OpStatus::OK == result (0 vs. 2)`, `0 vs. 8`, `0 vs. 17`. Reachable by any client, by
+any classic master's stream (raw or inside an RREPLAY envelope; the replica runs the SORT like a
+client does), by the D-9 window, where a due source is a missing one on a flagged replica, and by
+a DFLY-protocol replica or a peer whose shard count differs from its master's: a one-shard master
+journals its failing `SORT .. STORE` verbatim (see the residual below) and the replay runs on the
+replica's own shards, where the destination can be on another one than the source. With
+the destination on the source's shard there was no abort, but a missing source replied an empty
+array and left `dst` as it was, where Redis and KeyDB delete it and reply `:0`
+(`sort.cpp:575-586`).
+
+**Fixed in P7-1 by `1404897` (ledger decision 32):**
+
+1. A multi-shard hop returns `OK` (`GetUniqueShardCnt() == 1 ? fetch_result.status() : OK`); the
+   failure reaches `SortGeneric` through `fetch_result` either way. A single-shard SORT keeps
+   returning it.
+2. `SortStoreNothing` (upstream main has the function with the same two call sites; only this fork's
+   `OpStore` takes the extra `source_deleted_by_fetch`): a missing source, or one the unsorted
+   fetch's own lazy member expiry emptied, with STORE deletes `dst`, whatever its type or TTL, and
+   replies `:0`, as Redis and KeyDB do. The delete is hand-journaled as `DEL dst`, on one shard too,
+   and only when there was a `dst`. On one shard that `DEL` is the whole wire (M-4 of the review of
+   `f281564`): the hop returns `OpStatus::SKIPPED`, which `LogAutoJournalOnShard` treats as "do not
+   journal", so the verbatim `SORT` that the revived auto-journal would record behind it is left
+   out. Before, a peer that held a newer `dst` dropped the LWW-guarded `DEL` and then deleted that
+   `dst` anyway by replaying the `SORT` (D-18's class). The wire is now upstream main's and Redis's:
+   `DEL dst`, or nothing when there was no `dst`. Across shards the hop still returns `OK` (a
+   `CHECK` there) and the wire is unchanged.
+3. A wrong-type or non-numeric source replies its error and leaves `dst` alone, as Redis and KeyDB
+   do (both errors come before the destination is touched, `sort.cpp:278-285`, `:515`).
+
+**Residual, not fixed:** on one shard a failing STORE (WRONGTYPE, non-numeric) still journals its
+verbatim `SORT`. Measured on the P7-1 build (a one-shard master with one replica, the replica's
+`slave_repl_offset` before and after each command): `SORT <string> STORE dst`, the same with `BY
+nosort`, and `SORT <list of words> STORE dst` each advance it by 1, while `GET` and the same two
+failing SORTs without STORE advance it by 0; the two sorted STORE cases measured again after M-4,
+still 1 each. By reading, the fetch hop is not the last hop of a STORE form: the empty concluding
+hop (`Conclude()`) is `OK`, and that is the one whose result `LogAutoJournalOnShard` sees. A
+replica replays the entry, gets the same error and leaves `dst` alone, so nothing diverges; it
+costs one journal entry per failed command. Across shards SORT stays `CO::NO_AUTOJOURNAL` and the
+two failures journal nothing (pinned by `CrossShardStoreOfMissingSourceJournalsDestinationDelete`,
+`multi_master_test.cc`).
+
+The missing-source residual this entry first carried is closed by M-4: `SORT <missing> STORE dst`
+advances the replica by 1 with a `dst` (the `DEL dst`) and by 0 without one, where it advanced it by
+2 and 1 (the `DEL dst` and the `SORT`; the `SORT`); `BY nosort` likewise
+(`SameShardStoreOfMissingSourceJournalsOnlyTheDestinationDelete`). One neighbour keeps the old
+shape: a same-shard sorted `STORE` whose set the fetch itself emptied through member expiry (the
+fetch succeeded with nothing, so it is not `SortStoreNothing`'s) journals `DEL src`, `DEL dst` and
+then the verbatim `SORT` (3 entries measured; `FullExpirySortStoreJournalsDestinationDelete`). A
+peer that holds a newer `dst` drops the guarded `DEL dst` and its replay of the `SORT` deletes it:
+D-13's and D-18's same-shard exposure, not a new class, and left as it is.
+
+**How established:** the abort was reproduced on `main`'s binary by the Opus review of `2bdf3d7`
+(ledger decision 32; not re-run here). The fix is pinned by `GenericFamilyTest.SortStoreOf*`
+(2 shards, `dst` on and off the source's shard, seven option forms, `BY nosort` and `BY` pattern
+included), the journal tests `CrossShardStoreOfMissingSourceJournalsDestinationDelete` and
+`SameShardStoreOfMissingSourceJournalsOnlyTheDestinationDelete` (`multi_master_test.cc`), and the
+classic-stream pytest
+`test_classic_stream_sort_store_of_an_unsortable_source_does_not_abort`. Each of the fix's parts is
+falsified (`task-1.4b-report.md`, "Decision 32 (SORT .. STORE)"): the hop returning the failure
+aborts with the three statuses above, the empty-array reply fails every missing-source test, and
+`source_deleted_by_fetch=false` drops the same-shard `DEL dst`. The review round's change is
+falsified the same way (`task-1.4b-report.md`, "Review of f281564: M-4 and docs"): `OK` from the
+one-shard hop journals the verbatim `SORT` again, and `SKIPPED` without the one-shard gate aborts
+the cross-shard cases (`0 vs. 4`).
+
+**Owner:** none (resolved; the residual is journal noise, not divergence). **From:** P4-0
+(`1b6a2e82`); found by the Opus review of `2bdf3d7` (C1), fixed in P7-1.
+
+### D-34. `SORT` orders tied `BY` weights, a missing `ALPHA BY` weight and `BY nosort` unlike Redis and KeyDB -- fixed in P7-1
+
+**Where:** `SortGeneric` and the ordering it sorts with (`src/server/generic_family.cc`; as read at
+`fb037bb`: the `BY` weight fill and comparison around `:1977-1987` and `:2615-2621`, and the
+`nosort` branch around `:2740`).
+
+Four differences from Redis and from KeyDB's `sort.cpp`, which follows it:
+
+1. **Ties under `BY`.** With `BY`, a `SortEntry`'s `key` holds the weight, so two elements with the
+   same weight compare equal and `std::sort` leaves them in the order the fetch produced them (a
+   set's iteration order, a list's position). Redis and KeyDB's `sortCompare` breaks a numeric tie
+   on the element itself (`compareStringObjects(so1->obj, so2->obj)`, `sort.cpp:153-156`: "this
+   way the result of SORT is deterministic"). Every `BY` form with ties is affected: shared
+   weights, a pattern whose keys do not exist (every weight is 0), and `DESC` of either.
+2. **`BY nosort` on a SET that is stored or scripted.** Redis and KeyDB sort such a set
+   alphabetically (`dontsort && type == OBJ_SET && (storekey || lua)`: "so the result is
+   consistent across scripting and replication", `sort.cpp:296-310`); a list and a sorted set keep
+   their native order. Dragonfly keeps the set's iteration order.
+3. **`BY nosort` on a LIST or a ZSET under `DESC`.** KeyDB walks the list from its tail and the
+   zset by descending rank, and takes `LIMIT offset count` from that walk (`sort.cpp:356-380`,
+   `:401-439`). Dragonfly ignored `DESC` on this path: the reply and the `STORE` came out ascending,
+   and `LIMIT` counted from the head.
+4. **A missing weight under `ALPHA BY`.** `sortCompare` puts a weight key that is absent, or not a
+   string, before every present weight, the empty string included, and two missing weights tie
+   (`sort.cpp:160-168`; `lookupKeyByPattern` returns NULL for both). Dragonfly mapped a missing
+   weight to `""`, so "missing" and "present but empty" were the same: with `c` missing and `b`
+   empty, `SORT sa BY aw_* ALPHA DESC` is `e a d f b c` on KeyDB and was `e a d f c b` here, and
+   `SORT sa BY aw_* ALPHA LIMIT 1 3` is `b f d` and was `c f d`. (A numeric `BY` needs no such rule:
+   a missing weight is the score 0 in both, and ties with a present `"0"`.)
+
+**Why it matters:** a classic master replicates `SORT .. STORE` as the command, not as its result
+(an active KeyDB wraps it in RREPLAY, verbatim), so the replica re-runs it and must order exactly
+as the master did. Redis and KeyDB fixed the orders above precisely for that. A drakeydb replica of
+any classic master therefore ends up with the same members in a different order, silently: the
+link stays up, every counter is clean, and nothing ever corrects it. The difference is upstream
+Dragonfly's; P7-1 is what puts active KeyDB's RREPLAY stream, and so its verbatim `SORT .. STORE`,
+on every classic link. drakeydb to drakeydb did not diverge in the probes: both sides run the same
+code, and a cross-shard `STORE` journals its computed `RESTORE` (D-13 covers the same-shard
+recipe).
+
+**How established (live):** the P7-1 adversarial pass (`sort_keydb.py`, C1): an active KeyDB
+v6.3.4 master and three drakeydb plain replicas of 1, 2 and 4 shards. These converged: a missing
+source (`dst` deleted), `dst == src` (list and set), `DESC LIMIT`, `GET nokey_*`, `MULTI`/`EXEC`,
+`EVAL`, and odd numerics (`0x10`, `" 5"`, `1e3`, `+-inf`, the empty string). (A wrong-type or
+non-numeric source converged only vacuously: a failing command is not replicated.) These diverged
+on every replica, ten keys each, permanently:
+`SORT s BY nokey_* STORE d` (KeyDB `a .. j`, replica `f i h g j c e d b a`),
+`SORT s BY w_* STORE d` with tied weights (also inside `MULTI` and `EVAL`, and with
+`GET # GET h_*`), `SORT l BY w_* STORE d` on a list with missing weights (the replica keeps list
+order), `SORT s BY nosort [LIMIT 0 3] STORE d` on a set (KeyDB `a .. j` and `a b c`, the replica
+the set's iteration order), `SORT s BY nokey_* DESC STORE d` and `SORT s BY w_* ALPHA STORE d`.
+`SORT .. STORE` forms between drakeydb nodes (a meshed peer pair of 2 and 3 shards, and a DFLY
+master and replica of 1 and 4, 4 and 1, and 3 and 2 shards, 25 forms) converged
+(`sort_peers.py`, `sort_dfly.py`). Rules 3 and 4 were found by reading `sort.cpp` against the code
+for decision 34 and measured the same way, on standalone KeyDB 6.3.4 and Redis 7.0.15 against the
+build before the fix (80 of 115 forms differed).
+
+**Status (2026-10-05): fixed in P7-1** (owner decision 34): drakeydb's `SORT` adopts the four rules
+for every caller, reply and `STORE` alike, matching Redis and KeyDB. A client-visible change in
+reply order for tied, nosort and missing-weight cases versus upstream Dragonfly, and an
+upstreamable Redis-compatibility fix; it changes no journal wire (`SortStoreNothing`, `OpStore`'s
+hand-journal and the single-shard auto-journal are as they were; only the order of what is stored
+or replied changes). What changed, all in `generic_family.cc`:
+
+- `SortEntry::less` breaks a tie on the element (`ResultKey()`, bytewise); `DESC` reverses the whole
+  comparison, the tie-break included, as KeyDB negates `cmp`.
+- An `ALPHA` entry carries a `weight_missing` bit, set from `OpFetchStringValue`'s new `found`
+  out-parameter (absent, expired or not a string), and `less` puts a missing weight first.
+- A SET under `BY nosort` with `STORE`, or inside a script (`conn_state.script_info` of the
+  command's context, which a replicated apply has although it has no connection), is sorted `ALPHA`
+  by the element with the `BY` dropped; `GET`, `DESC` and `LIMIT` apply after the sort. Any other
+  SET under `nosort` keeps its iteration order, as in Redis.
+- A LIST or ZSET under `BY nosort DESC` is reversed before `LIMIT` and `GET` are applied.
+
+Checked after the fix: 123 forms against standalone KeyDB on 1, 2 and 4 shards, with the same
+replies at every shard count. 93 equal; the 30 that differ are the `ALPHA BY` ties (below), a plain
+`BY nosort` set under `LIMIT` (no order in either), `SORT_RO` (KeyDB 6.3.4 has none, and drakeydb
+equals Redis 7.0.15 on it), and the differences listed below and in D-35. The adversarial probe
+again against an active KeyDB master: the one form that still differs is `SORT s BY w_* ALPHA
+STORE` (once per replica, the residual below), and without it `BAD 0`; `sort_peers.py` and
+`sort_dfly.py` are clean.
+
+**Found on the way, fixed in the same change (an ungated crash, upstream's):** `LIMIT 1 4294967295`
+and `LIMIT 4294967295 1` are valid in Redis and KeyDB (everything from the offset on; nothing). Here
+`offset + count` wrapped around a `uint32` in `GetSortRange` and in the partial sort's end, so the
+range ended before it began: the plain form replied a garbage array length and the `BY`/`nosort`
+forms killed the server (`SIGSEGV`). A client, or a KeyDB master's stream, could do it. Both sums
+are 64-bit now.
+
+**Residual after round 1, corrected in round 2a (SORT review I1, decision 37).** Round 1 called every
+`ALPHA BY` tie irreproducible ("`pqsort` is not stable; a set's hash order differs even between two
+KeyDB processes") and broke them all on the element. That was too broad. KeyDB's full sort is libc
+`qsort` (`sort.cpp:505-508`), a stable mergesort in glibc (probed on this box, glibc 2.39: no unstable
+pair among 2 to 3,000,000 records, `probes/qsort_stable.c`), and `pqsort` is used only for a `BY` sort
+whose `LIMIT` cuts the result. So tied weights keep the order the elements were fetched in, and that
+order is the same on every node for a **list** (its own order) and for a **set KeyDB holds as an
+intset** (every member a strict integer, at most 512: ascending numeric). Measured: the review's
+2000-element list (weights `DE`, `FR`, `US`, `""` and a hundred missing) answers the same on KeyDB,
+Redis and drakeydb, `ASC`, `DESC` and into `STORE`; drakeydb used to break those ties on the element.
+Only the other sources arrive in a per-process order (a hash set, a zset's dict): two KeyDB processes
+answered differently on every one of them.
+
+**Round 2a (2026-10-05; owner decisions 36, 37, 38): the "left open" items below and I1 are fixed**,
+all in `generic_family.cc` under `// drakeydb: P7-1 (decision N)` comments, changing no journal wire.
+Every behaviour was compared with live KeyDB 6.3.4 and Redis 7.0.15 first (KeyDB and Redis agreed
+on every case; the tables are in `task-1.7b-sort-semantics-report.md`):
+
+- **`LIMIT`** (36, 38). Both arguments parse as Redis's `string2ll` does (`ParseSortLimit`): no `+`,
+  no leading zero, no space, no `-0`, nothing beyond `long long`, and the Redis error text for every
+  refused spelling. What parses is clamped as `sortCommand` does (`GetSortRange`): a negative offset
+  is 0, a negative count is everything from the offset on, an offset or count past the end stops
+  there, so `LIMIT 0 -1` is all of it; the 64-bit sums of U-20 stay. Upstream's `SortNegativeLimit`
+  test changed to these semantics. `SORT l LIMIT 0 -1 STORE d` no longer fails on a replica of a
+  KeyDB master.
+- **`GET`** (36). A missing or non-string key, and a pattern without `*`, are nil in a reply (RESP2
+  `$-1`, RESP3 `_`) and `""` in the list `STORE` leaves; a `*`-less pattern no longer reads that
+  literal key. `BY` with a `*`-less pattern stays "nosort". Upstream's `SortGet` test changed (tests
+  6 and 14).
+- **More than one `*`** (36; SORT review M1). Only the first `*` of a `BY` or `GET` pattern is
+  replaced and the rest is literal, as in `lookupKeyByPattern`; drakeydb answered `syntax error`
+  (and `STORE` left `dst` as it was, where a KeyDB master stored). Upstream's `SortBy` and `SortGet`
+  tests changed (the latter's test 12).
+- **Numbers** (36). A numeric element or `BY` weight loads as `sortCommand` does: `strtod` over the
+  bytes up to the first NUL, refused when anything is left after the number (a trailing space, tab or
+  newline), on `ERANGE` (overflow and underflow alike, denormals included: `1e400`, `1e-400`,
+  `1e-310`, `4.9e-324`) and on NaN; leading whitespace, hex and `inf` are accepted; a missing weight
+  is 0. A NUL ends the string for elements as well as for weights: `"5\0x"` is 5, `"\0"` and
+  `"\0abc"` are 0 (round 1 wrote "binary weights only"; the SORT review showed elements too).
+  KeyDB and Redis agreed on all 77 spellings x 6 forms probed; drakeydb differed on 114 of 462 rows
+  before and on none after. Not copied: KeyDB and Redis never clear `errno` before `strtod`, so
+  after one `ERANGE` every later numeric `SORT` of a non-integer value fails until some syscall
+  changes it; a failing `SORT` is never replicated, so no replica depends on it. **A subnormal result
+  is refused on every libc** (PR darkspadez/drakeydb#11 CI): glibc's `strtod` sets `ERANGE` for every
+  decimal spelling that lands subnormal, but musl returned `4.9e-324` without it (the Alpine Release
+  leg failed), so a mixed musl/glibc drakeydb mesh would disagree on a same-shard `SORT .. STORE`.
+  `ParseSortScore` therefore also refuses `FP_SUBNORMAL`. It equals Redis and KeyDB on glibc for every
+  decimal spelling and differs only for an exact subnormal (a hex float such as `0x1p-1074`, or a
+  ~750-digit decimal), which glibc's `strtod` accepts without `ERANGE` and drakeydb refuses.
+- **`ALPHA BY` ties** (37). `ALPHA BY` compares `(weight missing, weight)`; a tie keeps the fetch
+  order for a list and for an integer-only set, `ASC` and `DESC` alike, and breaks on the element
+  for any other set and for a zset. The order is total (`SortEntryAlpha::seq`), so the partial sort
+  under `LIMIT` agrees with a full sort. The integer-set predicate is decided on the **members**, not
+  on drakeydb's encoding: every member a strict `int64` and at most 512 of them (KeyDB's default
+  `set-max-intset-entries`; since round 2b the limit is the flag `--sort_set_max_intset_entries`,
+  decision 41, below), in which case the fetched elements are put in ascending numeric order
+  first, which is the order a KeyDB intset iterates in. drakeydb's own intset ends at 256 members
+  (`kMaxIntSetEntries`, `set_family.cc`), so deciding by encoding would break the ties of a set of
+  257 to 512 integers on the element where KeyDB keeps ascending order; deciding by content, sets of
+  100, 256, 257, 300 and 512 integers answer the same on KeyDB, Redis and drakeydb, and sets of 513 and
+  600 (a hash set in KeyDB, where Redis and KeyDB disagree with each other) break on the element here.
+- **RESP3** (38). `SORT` and `SORT_RO` reply an array (`*`) for a set or zset source, as Redis and
+  KeyDB do; drakeydb replied the set type (`~`), which tells a RESP3 client the order means
+  nothing. No upstream test or fakeredis test pins `~` (the parsers of both read it as an array).
+
+**Residuals, documented and not fixed:**
+
+1. **Ties under a `LIMIT` that cuts a `BY` sort.** KeyDB then uses `pqsort`, deterministic but not
+   stable (it insertion-sorts fewer than 7 elements, which is why small results agree). drakeydb
+   keeps the fetch order, so the 2000-element list under `LIMIT 0 50` differs (KeyDB and Redis agree
+   with each other and not with drakeydb). A `LIMIT` that does not cut (`LIMIT 0 -1`) is `qsort`
+   in KeyDB and agrees. `pqsort.c` is short and deterministic, so it could be ported;
+   decision 37 left it out.
+2. **Hash-encoded sets and zsets.** KeyDB receives their elements in a per-process order (measured:
+   two KeyDB processes differ on string sets, mixed sets, sets of more than 512 integers and zsets);
+   drakeydb breaks the ties on the element.
+3. **A set KeyDB holds as a hash set for its history.** Every member an integer now, but a non-integer
+   member was added and removed once, or its size once passed `set-max-intset-entries` (a limit that
+   differs from `--sort_set_max_intset_entries` is the operator's to match, below): KeyDB never
+   converts back, so its order is the dict's, and drakeydb's rule for the same
+   members (ascending) differs. Measured with `SADD hist 30 2 10 1 200 9`, `SADD hist x`, `SREM hist x`.
+   The reverse holds too: lowering `set-max-intset-entries` at runtime (`CONFIG SET`) leaves an existing
+   larger intset an intset until its next add (checked live), so such a set is ordered ascending on the
+   master while drakeydb, at the new limit, breaks its ties on the element.
+4. **Another libc.** This holds for a KeyDB whose libc `qsort` is a stable mergesort; the one on
+   this box is (glibc 2.39, probed). A KeyDB on musl or on a glibc whose `qsort` is not a stable
+   mergesort orders ties differently; not checked here.
+5. **A Redis 7.2 or newer master** holds small string sets as listpacks (insertion order), so its
+   ties follow that order; noted, not reproduced. (The comparisons here are against KeyDB 6.3.4 and
+   Redis 7.0.15; no 7.2 binary was available.)
+6. **`ALPHA` replies with a NUL byte in an element or a weight.** KeyDB compares a reply with
+   `strcoll`, which stops at the NUL, and a `STORE` with a bytewise compare; drakeydb is bytewise for
+   both (`SORT l ALPHA` on `"a\0c" "a\0b" "a"` replies `a\0c a\0b a` on KeyDB and Redis, and `a a\0b
+   a\0c` here; their `STORE` leaves `a a\0b a\0c`, as drakeydb's does). Client-visible only: the
+   replicated form is the `STORE`.
+7. **Locale.** KeyDB's `ALPHA` replies follow the locale it runs in (`strcoll`); drakeydb is bytewise,
+   like the C locale (`docs/differences.md`). `STORE` is bytewise everywhere. The KeyDB fixture of the
+   pytests starts keydb-server with `LC_ALL=C` for this reason.
+
+**Round 2b (decision 41): the intset limit is a flag.** The 512 of the intset rule above is
+`--sort_set_max_intset_entries` (uint32, default 512, the Redis and KeyDB default), read once per
+`SORT` in `SortTiesInFetchOrder` (`generic_family.cc`, a `// drakeydb: P7-1 (decision 41)` hunk), not
+per element, and not changeable with `CONFIG SET` (boot-only, like the other fork flags). An operator
+sets it to the classic master's `set-max-intset-entries` (`docs/multi-master.md`), and **every
+drakeydb node, peers and replicas, must run the same value**: a same-shard `SORT .. STORE` replays as the
+command and each node applies its own flag (D-13); `0` turns the emulation off, so no set is ordered ascending and every set breaks its ties on the element. Measured
+live (`sort2b/logs/flag-live.txt`): a KeyDB and a Redis started with `set-max-intset-entries 100`
+and with `600` against drakeydb with the flag at the same value, at the default and at `0`, over
+`SORT <integer set> BY nokey_* ALPHA`: at limit 100, sets of 50 and 100 members are an intset in KeyDB
+(ascending) and answer alike on KeyDB, Redis and drakeydb; 101, 150 and 300 members are a hash set,
+whose order differs between two KeyDB processes and from Redis (so no replica can follow it), and
+drakeydb breaks their ties on the element with the flag at 100 (and keeps ascending with the default
+512). At limit 600, sets of 100, 512, 513, 550 and 600 members are an intset in KeyDB (ascending, the
+same on both KeyDB processes and on Redis) and equal drakeydb with the flag at 600, where drakeydb at
+the default 512 breaks the ties of 513, 550 and 600 on the element; 601 and 700 members are a hash set.
+With the flag at `0` every set is bytewise. A set above KeyDB's limit cannot be compared with a replica
+by construction, so the replication test (`test_sort_set_max_intset_entries_follows_the_masters_limit`)
+compares sets up to the limit by their ties and sets above it by distinct weights only; a 150-member
+set under a limit of 100 is therefore covered by `GenericSortOrderTest.
+SortSetMaxIntsetEntriesIsTheLimitOfTheIntsetOrder` (the rule, not a KeyDB answer), and falsified (the
+constant 512 back) by the 550- and 600-member runs of the 600 limit.
+
+D-35 (hash-field patterns, round 2b) is fixed below. Also not a drakeydb difference, noted because it
+breaks naive probes: the `errno` note under "Numbers".
+
+**Found while testing round 2a, not SORT (now U-22, owner decision 40: fixed in P7-1):** `SADD` of more than 256 integers in one
+call on a new key replies a wrong count while the set is right (`SADD k <257 distinct integers>`
+replies 0, 300 replies 43, 512 replies 255, 600 replies 343, and `SCARD` is right): in `OpAdd`
+(`set_family.cc`), once the intset outgrows `kMaxIntSetEntries` the code converts it and then
+assigns `res = StringSetWrapper{...}.Add(vals, ...)`, which re-adds every member and so counts only
+those the dense set did not hold yet (the ones after the overflow point), discarding what the intset
+loop had counted. A different command and not SORT's, and upstream's: the line is in the fork's
+base commit (`git log -S` finds it first in `05abfdd`). Fixed by P7-1 round 2c (`439d67f`, U-22); the
+SORT tests do not check that reply.
+
+**Owner:** none (resolved; the residuals are documented). **From:** the P7-1 adversarial pass (C1);
+decisions 34, 36, 37, 38 and 41 in the ledger; the SORT review (`I1`, `M1`-`M5`).
+
+### D-35. `SORT` hash-field patterns (`->`) were unsupported; a classic stream that used them diverged silently -- fixed in P7-1
+
+**Where:** `PopulateSortEntriesFromByPattern` and `FetchGetPatternValues`
+(`src/server/generic_family.cc`) build the weight or `GET` key by putting the element where the
+first `*` is and read it as a string, so `->` is part of the key name (since P7-1 round 2a both go
+through `ParseSortPattern` / `SortPattern::KeyFor`, one helper that splits a pattern at its first
+`*` into prefix and suffix: the place for a field). Redis and KeyDB's
+`lookupKeyByPattern` (`sort.cpp:61-137`) read a pattern `key_*->field` as "the hash at
+`key_<element>`, its field `field`", for `BY` and `GET` alike; a missing key, a key that is not a
+hash and a missing field are all NULL. The fakeredis test `test_sort_with_hash`
+(`tests/fakeredis/test/test_mixins/test_generic_commands.py`) was marked
+`unsupported_server_types("dragonfly")` for the same reason (round 2b removed that mark and two stale
+ones on `test_sort_with_store_option` and `test_sort_with_by_and_get_option`).
+
+**How established (live, standalone KeyDB v6.3.4 against the P7-1 build, 2 shards):** a set `s` of
+`a .. j` and a hash `hw_<c>` per element with `f` = the letter's code mod 3 and `g` = `G<c>`.
+`SORT s BY hw_*->f` is `c f i a d g j b e h` on KeyDB (weights 0 0 0 1 1 1 1 2 2 2, ties on the
+element) and `a b c d e f g h i j` here: the key `hw_a->f` never exists, so every weight is
+missing, 0, a tie. `SORT s ALPHA GET hw_*->g` is `Ga .. Gj` on KeyDB and ten empty strings here.
+With `STORE d` the same two lists land in `d`. An active KeyDB master replicates such a `SORT ..
+STORE` verbatim, so a drakeydb replica of it ends with a different `d` and nothing says so: the link
+stays up and every counter is clean (the class of D-34, for a command D-34's fix does not cover).
+
+**Status (2026-10-05): fixed in P7-1** (round 2b, owner decision 35), a client-visible change versus
+upstream Dragonfly (which took the `->` as part of the key name; upstream main, read 2026-10-04, has no
+`->` support either) that changes no journal wire, and an upstreamable Redis-compatibility fix. `BY` and
+`GET` read a hash-field pattern as `lookupKeyByPattern` does, compared against live KeyDB 6.3.4 and Redis
+7.0.15 first (they agreed on every form checked):
+
+- `#` (exactly: `spat[0] == '#' && spat[1] == '\0'`) is the element. A pattern without `*` has no value
+  (a `BY` one means `nosort`, as before).
+- Otherwise the **first** `*` is replaced by the element and the **first `->` after that `*`** starts the
+  field, used only if at least one character follows it (`f[2] != '\0'`): the key is `prefix + element +
+  the text up to that "->"`, the field is everything after it. So `GET w_*->` is the string key
+  `w_<element>->` (a trailing arrow is no field), `w_*->->` reads the field named `->`, `w_*-->g` the key
+  `w_<element>-` and field `g`, `w_*->f->g` the field `f->g`, `w_*->f*` the field `f*`, and a `->` before
+  the `*` (`h->w_*`, `h->w_*->f`) is part of the key name. A second `*` is literal (round 2a).
+- The pattern is scanned as a **C string**, as Redis and KeyDB do (`strchr`, `strstr` and the `f[2]` test
+  stop at a NUL byte; the key and the field are cut by length): a NUL hides the `*` or the `->` after it
+  (`h\0v_*->g` has no `*`, so a `GET` of it is nil and a `BY` of it is `nosort`; `hn_*\0->g` is the string
+  key `hn_<e>\0->g`; `hn_*->\0g` is the string key `hn_<e>->\0g`), `GET "#\0x"` is `GET #`, and a field
+  keeps its NULs (`hn_*->g\0h` is the field `g\0h`). Measured on KeyDB, Redis and drakeydb (16 forms).
+- With a field the key must be a **hash** and hold the field; a missing key, a key of another type and a
+  missing field are all no value: nil in a reply, `""` in the list `STORE` leaves, weight 0 under a numeric
+  `BY` and a **missing** weight under `ALPHA BY` (first, before the empty string, decision 34). Without a
+  field the key must be a string (round 2a). A field value that is not a number is the same error as a
+  string weight that is not (`One or more scores can't be converted into double`, `STORE` leaves `dst`).
+- **Cross-shard:** the key part (`prefix + element + suffix`), not the whole pattern, decides the shard
+  the hash is read on, and the read is the same "read uncommitted" lookup the string weights use.
+- A field whose **TTL has passed** (`HSETEX`, `HEXPIRE`; tested against `HGET`) is missing, and a hash that lazy field expiry empties by this read is deleted,
+  as an `HGET` (or `HTTL`) deletes it (`HSetFamily::DeleteIfEmpty`, the derived `DEL`), unless the guard of
+  residual 3 skips the delete.
+
+What changed (`generic_family.cc`, `// drakeydb: P7-1 (decision 35)`; `hset_family.{h,cc}`): `SortPattern`
+gains `field`; `ParseSortPattern` (C-string scan) and `IsSortElementPattern`; `OpFetchHashFieldValue` and
+`OpFetchPatternValue` beside `OpFetchStringValue`; `FetchGetPatternValues` (each pattern parsed once) and
+`PopulateSortEntriesFromByPattern` read through `OpFetchPatternValue`; and `HSetFamily::GetFieldValue`, the
+read `CmdHGet` does through `HMapWrap`, so the hash is read as an `HGET` reads it whether it is a listpack
+or a StringMap with field TTLs. The journal changes only as an `HGET` changes it: a hash that this read's
+lazy field expiry emptied is deleted and that derived `DEL` is journaled, from outside the SORT's
+transaction and from `SORT_RO` too (harmless on replicas; on peer links the derived flag keeps it off and it
+is stamped like an expiry). That delete is guarded (the review fix below): it runs only on a shard with no
+transaction callback in flight, no change callback registered (a snapshot, a full sync, a slot migration)
+and, in active mode, nothing armed, with the journal flush disabled for the call, as the heartbeat reaper's
+delete runs; otherwise it is skipped and the empty hash stays (residual 3). The weights and `GET` values are
+otherwise only read, and the SORT itself still journals as before (D-13 for a same-shard `STORE`).
+
+**Checked.** Live (`sort2b/probes/hf_table.py`, 156 forms: 28 `BY` and 22 `GET` shapes over a list and a set,
+reply and `STORE`, hash sets' unordered ties left out for KeyDB and Redis alike): KeyDB and Redis agree on
+all of them; the build before this fix differed on 44; drakeydb on 1 and on 2 shards differs on one, `SORT
+l BY hw_*->f LIMIT 2 5 ALPHA`, the `pqsort` residual of D-34 (KeyDB and Redis agree with each other, not with
+drakeydb). The NUL forms (`nul_probe.py`, 16): 6 differed before, none now. The adversarial probe
+`sort_keydb.py` (an active KeyDB master, three plain replicas of 1, 2 and 4 shards) extended with 11 stored `->`
+sorts, one inside `MULTI` and one inside `EVAL` (`sort2b/adv/sort_keydb_hf.py`): every one converged; the build
+before this fix diverged on all 11 on every replica (`BAD 33`), this one on `dst16` only (`BAD 3`, the
+hash-set `ALPHA BY` tie of D-34's residuals). Tests:
+`GenericSortOrderTest.HashFieldPatternsAreReadAsRedisReadsThem` (93 rows from KeyDB and Redis, each as a
+reply, SORT_RO and a list `STORE` on the source's and on another shard),
+`.HashFieldPatternsWithNulBytesAreScannedAsCStrings` (18 rows), `.HashFieldNumericByOfATextFieldFailsAsOverAStringKey`,
+`.HashFieldIsReadFromAListpackAndFromAStringMap`, `.HashFieldWithAnExpiredTtlIsMissing`,
+`.HashFieldReadDeletesAHashItsLazyExpiryEmptied` and `.HashFieldIsReadOnTheShardOfTheKeyPart` (three
+shards: a source, a destination and hashes on each of the three); in `keydb_onboarding_test.py` the same
+forms (and the NUL ones, `\0` in a form) run in `test_plain_replica_of_active_keydb_orders_sort_store_as_keydb_does`
+(an active KeyDB master's stored sorts against a plain replica of one and of two shards: the replica ended
+with a different `dst` on every `->` form before) and `test_sort_replies_in_the_order_keydb_does` (replies,
+and inside `EVAL`). The three fakeredis SORT tests pass against this build with their marks removed
+(`-k sort -m real`: 14 passed; `test_sort_with_hash` failed on the build before).
+
+**Falsified**, each mutation applied, rebuilt, the gtests and the pytests run, and restored (the failing
+tests are in the task report): the field ignored (the pattern a plain string key) fails seven of the
+eight new gtests and both pytests; the shard taken from the whole pattern instead of the key part fails
+six gtests and both pytests on two shards; a string key read as a value for a field pattern, and a missing
+field made present-and-empty (so `ALPHA BY` stops sorting it first and `GET` stops being nil), fail the
+table and both pytests; the `->` found before the `*`, the last `->` instead of the first, a trailing `->`
+taken as a field marker, the pattern scanned past a NUL and `#` matched exactly each fail the table or the
+NUL table and both pytests; no delete of the hash a lazy expiry emptied, and the field TTL ignored, fail
+their gtests.
+
+**Review fix (PR #11, CodeRabbit, confirmed Critical): the delete of an emptied hash was unguarded.**
+`OpFetchHashFieldValue` called `HSetFamily::DeleteIfEmpty` from the pattern fetch, a
+`RunBlockingInParallel` fiber that is no transaction callback and never looked at
+`EngineShard::running_tx()`, so nothing ordered it against the shard's other callbacks. In active mode its derived `DEL` commits the hash's own
+tombstone arm (`CommitOwnTombstone`) and is journaled through `RecordEntry`, whose per-arm commit sweep
+takes every key still armed on the shard. A callback suspended between its `Arm` and its `Commit` (a
+journal write throttled on a stalled stream, `JournalStreamer::ThrottleIfNeeded`; a snapshot's `OnChange`)
+therefore lost its arm to the `DEL`'s stamp: a debug build aborted on `DeleteIfEmpty`'s `ArmedCount() == 0`
+DCHECK, a release build floored the other key's stamp (an MVCC divergence). Live (an `--active_replica` node,
+a plain replica stopped with `SIGSTOP`, 512 KB `SET`s on one shard until one blocked, a field TTL left to
+pass, then `SORT_RO src BY h_*->f` with the hash on that shard): the node aborted on that DCHECK; the same
+without `--active_replica` answered `[nil]`. Two more races of the same fiber: its own `DEL` could yield
+in the throttle before its sweep while the shard polled another write that armed a key and waited, and the
+sweep then took that write's arm (the DCHECK ran before the yield and cannot see it); and
+`DeleteIfEmpty` checked `Empty()` and then called `FindMutable`, which can yield in a change callback, while
+an `HSET` refilled the hash, so a non-empty hash was deleted (in any mode, and only for a caller outside a
+transaction, as `running_tx_` keeps a writer out of one).
+
+Fixed (`// drakeydb: P7-1 (decision 35)` in `OpFetchHashFieldValue`, `// drakeydb: P7-1` in
+`HSetFamily::DeleteIfEmpty`, the caller lists in `mvcc.h`): the fetch calls `DeleteIfEmpty` only when
+`running_tx() == nullptr`, no change callback is registered (`HasRegisteredCallbacks()`, so `FindMutable`
+cannot yield) and, in active mode, `ArmedCount() == 0`, and does so under `journal::DisableFlushGuard` (no
+yield, so the `DEL`'s `AddLogRecord` cannot throttle before its sweep): the heartbeat reaper's own
+preconditions (`engine_shard.cc`). `DeleteIfEmpty` checks again that the hash is empty on the entry
+`FindMutable` returned and cancels its updater if it is not (`Run` would arm the key with no entry to commit
+it). The comment that called this delete "unlocked, as `OpFetchStringValue`'s lazy expiry of a string weight
+is" was wrong, and is gone: that path is `RecordExpiryBlocking` (`kEntryFlagExpired`, no sweep). Tests
+(`MvccStoreTest`, `multi_master_test.cc`): `SortHashFieldFetchLeavesAForeignArmAndItsHashAlone`,
+`SortHashFieldFetchSkipsItsDeleteWhileAChangeCallbackIsRegistered`,
+`SortHashFieldFetchSkipsItsDeleteWhileATransactionCallbackIsSuspended`,
+`SortHashFieldDeleteDoesNotWaitInItsJournalWrite` and
+`DeleteIfEmptyKeepsAHashRefilledWhileItsFindMutableYielded`. Falsified (each mutation applied, rebuilt, its
+tests run, restored): the whole guard removed fails all four guard tests (the first aborts in the DCHECK);
+each of the three conditions, the `DisableFlushGuard` and the re-check fails its own test (without the
+`DisableFlushGuard` only `SortHashFieldDeleteDoesNotWaitInItsJournalWrite` fails), and `Cancel()` dropped
+fails the last test's `ArmedCount()` check. `DEBUG OBJHIST` and `STRINGS` call
+`DeleteIfEmpty` from their own traversal fibers and get the re-check only, not the guard (debug commands, a
+residual of the same class that this fix does not close).
+
+**Residuals, documented and not fixed:**
+
+1. **A hash that experimental hash offloading moved to disk** (`--tiered_experimental_hash_support`, off by
+   default) reads as having no field: `OpFetchHashFieldValue` skips a value that is external and not cool
+   (`HMapWrap` needs it in memory), the way `OpFetchStringValue` does not support tiering (its `TODO`).
+2. **Ties under a `LIMIT` that cuts an `ALPHA BY` sort** are still `pqsort`'s (D-34 residual 1), also for
+   `->` forms; numeric `BY` ties break on the element in both and agree.
+3. **A hash read by SORT is the same lock-free "read uncommitted" lookup the string weights are.** A
+   concurrent writer to that hash can change a weight between two elements' reads, as for a string weight;
+   Redis has no such window (one thread). The delete of a hash that this read's lazy field expiry emptied
+   runs on the shard that owns it, outside the SORT's transaction, which is not what `ExpireIfNeeded` does
+   for a string weight with a TTL (that one is `RecordExpiryBlocking`, flagged `kEntryFlagExpired`, and
+   sweeps no arms): `DeleteIfEmpty`'s derived `DEL` runs `RecordEntry`'s per-arm commit sweep, so the delete
+   is guarded (the review fix above) and **skipped** while a transaction callback is in flight on the
+   shard, a change callback is registered or, in active mode, a key is armed. A zero-size hash then stays:
+   `EXISTS`, `TYPE` and `DBSIZE` see it and `SAVE` logs an error in `SaveEntry` and skips it, until the
+   heartbeat reaper (active mode only) or the next command that reads the hash (`HGET`, `HLEN`, ...) deletes
+   it. This happens only while a snapshot, a full sync or a slot migration runs on that shard, or a
+   callback is suspended there.
+4. **KeyDB's member TTLs are dropped.** KeyDB expires single hash fields with `EXPIREMEMBER` (and its
+   family); a drakeydb replica drops those commands (decision 8, counted in `keydb_cmds_dropped`), and an
+   active KeyDB never streams the field's expiry. So a field KeyDB expired lingers on the replica, and a
+   `->` sort that reads it diverges silently: live, after `EXPIREMEMBER hx f 1`, the master's `hx` was
+   `{g}` and the replica's `{f:5, g}`, and `SORT lx BY h*->f GET h*->f STORE dsx` stored `["","1"]` on the
+   master and `["1","5"]` on the replica, `classic_apply_errors` 0 (the SORT round-2 review's M2). A plain
+   (non-active) KeyDB master streams the expiry and converges. drakeydb's own field TTLs (`HSETEX`,
+   `HEXPIRE`) are read as `HGET` reads them. Between drakeydb nodes a field TTL is read like the TTL
+   of a string weight key: a same-shard `SORT .. STORE` is journaled as the command and replayed at the
+   peer's clock, so a field that expired on one node and not yet on the other can give another list
+   (D-13: a `BY`/`GET` pattern key is not a transaction key); a cross-shard `STORE` journals its result.
+5. **Older builds.** A node on a build before this fix re-running a same-shard `SORT .. STORE` with a `->`
+   pattern reads it as a plain key name and stores another list, as D-13 describes for D-34 (one sentence
+   in `docs/multi-master.md`, "Upgrade a mesh in lockstep"). `kDrakeydbReplVersion` is not bumped.
+
+**Owner:** none (resolved; the residuals are documented). **From:** the P7-1 SORT-ordering work (decision
+34), probe `probe.py` cases `hash_by_field*` and `hash_get_field*`; decision 35 in the ledger.

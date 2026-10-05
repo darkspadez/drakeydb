@@ -1660,6 +1660,18 @@ int32_t HSetFamily::FieldExpireTime(const DbContext& db_context, const PrimeValu
   }
 }
 
+// drakeydb: P7-1 (decision 35) -- the same read as CmdHGet's callback, through HMapWrap, so SORT's
+// `key_*->field` patterns see a listpack and a StringMap (with field TTLs) as HGET does.
+optional<string> HSetFamily::GetFieldValue(const DbContext& db_context, const PrimeValue& pv,
+                                           std::string_view field) {
+  DCHECK_EQ(OBJ_HASH, pv.ObjType());
+
+  HMapWrap hw{pv, db_context};
+  if (auto it = hw.Find(field); it)
+    return string{it->second};
+  return nullopt;
+}
+
 bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std::string_view key,
                                const PrimeValue& pv, bool derived) {
   if (pv.Encoding() != kEncodingStrMap2)
@@ -1669,6 +1681,18 @@ bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std:
     return false;
 
   if (auto res = db_slice.FindMutable(db_cntx, key, OBJ_HASH); res) {
+    // drakeydb: P7-1 -- FindMutable can yield (its change callbacks may wait on a snapshot), and a
+    // caller outside a transaction (SORT's pattern fetch, DEBUG OBJHIST) is not ordered against
+    // a write that refills the hash meanwhile, so the emptiness checked above is checked again on
+    // the entry FindMutable returned (`pv` may not be that entry any more). Cancel, not the
+    // updater's Run on scope exit: nothing was changed, and Run would arm the key with no journal
+    // entry to commit it.
+    if (const PrimeValue& current = res->it->second;
+        current.Encoding() != kEncodingStrMap2 ||
+        !static_cast<StringMap*>(current.RObjPtr())->Empty()) {
+      res->post_updater.Cancel();
+      return false;
+    }
     db_slice.DelMutable(db_cntx, std::move(*res), DbSlice::DeleteReason::kExpired);
     if (db_slice.shard_owner()->journal()) {
       // drakeydb: Phase 3 -- db_cntx carries the causing transaction's replication-apply origin

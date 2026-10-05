@@ -29,6 +29,13 @@ class HSetFamily {
   static int32_t FieldExpireTime(const DbContext& db_context, const PrimeValue& pv,
                                  std::string_view field);
 
+  // drakeydb: P7-1 (decision 35) -- the value of `field` in the hash `pv`, as HGET reads it:
+  // nullopt for a field the hash does not hold, one whose TTL has passed included (a StringMap
+  // drops it lazily on this read). The hash must be in memory. As after FieldExpireTime, the caller
+  // runs DeleteIfEmpty when it wants the hash gone because that read emptied it.
+  static std::optional<std::string> GetFieldValue(const DbContext& db_context, const PrimeValue& pv,
+                                                  std::string_view field);
+
   // Delete the hash key if it became empty after lazy field expiry.
   // Returns true if the key was deleted.
   //

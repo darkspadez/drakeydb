@@ -1,0 +1,2 @@
+# The captures are byte-exact RESP streams with CRLF line ends: never convert them.
+*.bin binary

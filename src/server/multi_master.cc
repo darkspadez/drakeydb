@@ -10,6 +10,7 @@
 #include "absl/strings/str_cat.h"
 #include "base/logging.h"
 #include "facade/cmd_arg_parser.h"
+#include "server/classic_replay.h"  // drakeydb: P7 -- the classic link fields of a peer line
 #include "server/engine_shard_set.h"
 #include "server/journal/journal.h"
 #include "server/multimaster_lww.h"  // drakeydb: P4-4 -- for FLAGS_multi_master_stream_lww
@@ -148,7 +149,7 @@ bool ValidateMultiMasterFlags() {
                   "authority and can resurrect an older delete -- see docs/multi-master.md); "
                   "delta-journaled RMW commands (INCR, APPEND, ...) always resolve by arrival "
                   "order, never LWW-compared -- dropping a delta would lose it outright, not "
-                  "merely reorder it";
+                  "merely reorder it; KeyDB member TTLs and cron jobs are dropped on onboarding";
   if (!absl::GetFlag(FLAGS_multi_master_stream_lww)) {
     LOG(WARNING) << "--multi_master_stream_lww=false: streamed peer writes for otherwise-guarded "
                     "commands apply in plain arrival order, same as every stable-sync apply "
@@ -210,6 +211,14 @@ std::string RenderPeerReplicationInfo(const std::vector<ReplicaSummary>& peers, 
     // is itself the meaningful "no clock sample yet" value, so there is no separate "absent"
     // case to omit the field for.
     absl::StrAppend(&out, ",clock_skew_ms=", p.clock_skew_ms);
+    // drakeydb: P7 -- a classic link to an active KeyDB (or whose counters moved) also shows what
+    // it counted and how far into the master's stream it is; a stock master's line stays as it was.
+    // ClassicLinkFields is empty exactly for a link that is not shown.
+    if (const auto fields = ClassicLinkFields(p); !fields.empty()) {
+      for (const ClassicCounterValue& field : fields)
+        absl::StrAppend(&out, ",", field.name, "=", field.value);
+      absl::StrAppend(&out, ",repl_offset=", p.repl_offset_sum);
+    }
     absl::StrAppend(&out, "\r\n");
   }
   return out;

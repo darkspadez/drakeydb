@@ -4,6 +4,9 @@
 
 #include "server/set_family.h"
 
+#include <absl/container/flat_hash_set.h>
+#include <absl/strings/str_cat.h>
+
 #include "base/flags.h"
 #include "base/gtest.h"
 #include "base/logging.h"
@@ -27,6 +30,12 @@ namespace dfly {
 
 class SetFamilyTest : public BaseFamilyTest {
  protected:
+  // drakeydb: P7-1 (decision 40) -- runs `head... members...` as one command, so that a test can
+  // cross the 256-entry intset limit inside a single call.
+  RespExpr RunWithMembers(vector<string> head, const vector<string>& members) {
+    head.insert(head.end(), members.begin(), members.end());
+    return Run(head);
+  }
 };
 
 MATCHER_P(ConsistsOfMatcher, elements, "") {
@@ -852,6 +861,170 @@ TEST_F(SetFamilyTest, EmptyStoreDeletesForeignTypeDest) {
     Run({"SET", "dest", "hello"});
     EXPECT_THAT(Run({cmd, "dest", "nx1", "nx2"}), IntArg(0)) << cmd;
     EXPECT_THAT(Run({"EXISTS", "dest"}), IntArg(0)) << cmd;
+  }
+}
+
+namespace {
+
+// The strings prefix + i for the integers i in [first, last): decimal integers for an empty prefix.
+vector<string> Members(std::string_view prefix, int first, int last) {
+  vector<string> res;
+  for (int i = first; i < last; ++i)
+    res.push_back(absl::StrCat(prefix, i));
+  return res;
+}
+
+vector<string> Ints(int first, int last) {
+  return Members("", first, last);
+}
+
+vector<string> Cat(initializer_list<vector<string>> parts) {
+  vector<string> res;
+  for (const vector<string>& part : parts)
+    res.insert(res.end(), part.begin(), part.end());
+  return res;
+}
+
+}  // namespace
+
+// drakeydb: P7-1 (decision 40, ISSUE-REGISTER U-22) -- upstream's OpAdd counted the members an
+// intset took before it overflowed (256 entries) or met a non-integer, then overwrote that count
+// with the string set's count of members still missing, which is only the rest of the call: SADD of
+// 300 integers to a new key replied 43. Every `expected` below is Redis 7.0.15's reply to the same
+// commands (its own intset limit is 512, but the reply does not depend on where a set converts).
+TEST_F(SetFamilyTest, SAddCountsAcrossIntsetOverflow) {
+  struct Case {
+    std::string_view name;
+    vector<string> existing;  // loaded with one SADD beforehand, unless empty
+    vector<string> added;     // the measured SADD
+    int64_t expected;
+  };
+  const vector<Case> cases = {
+      // New key: the intset is converted at the 257th integer.
+      {"new 255", {}, Ints(0, 255), 255},
+      {"new 256", {}, Ints(0, 256), 256},
+      {"new 257", {}, Ints(0, 257), 257},
+      {"new 258", {}, Ints(0, 258), 258},
+      {"new 300", {}, Ints(0, 300), 300},
+      {"new 512", {}, Ints(0, 512), 512},
+      {"new 600", {}, Ints(0, 600), 600},
+      {"new 1000", {}, Ints(0, 1000), 1000},
+      // Duplicates inside the call count once.
+      {"new 300 twice", {}, Cat({Ints(0, 300), Ints(0, 300)}), 300},
+      {"new 257 three times", {}, Cat({Ints(0, 257), Ints(0, 257), Ints(0, 257)}), 257},
+      {"new duplicates across the limit",
+       {},
+       Cat({Ints(0, 256), {"1", "2", "256", "256", "257", "258"}}),
+       259},
+      // An existing intset key that grows past the limit in one call.
+      {"256 plus one new", Ints(0, 256), {"256"}, 1},
+      {"256 plus one present", Ints(0, 256), {"255"}, 0},
+      {"256 plus 300 new", Ints(0, 256), Ints(256, 556), 300},
+      {"256 plus 1000, 128 present", Ints(0, 256), Ints(128, 1128), 872},
+      {"250 plus 10 new", Ints(0, 250), Ints(250, 260), 10},
+      {"250 plus 10 new twice", Ints(0, 250), Cat({Ints(250, 260), Ints(250, 260)}), 10},
+      {"200 plus 100 new", Ints(0, 200), Ints(200, 300), 100},
+      {"200 plus 100, 50 present", Ints(0, 200), Ints(150, 250), 50},
+      // An intset widened to 64-bit entries.
+      {"int64 intset",
+       Cat({{"9223372036854775807", "-9223372036854775808"}, Ints(0, 254)}),
+       {"9223372036854775806", "5", "300", "301"},
+       3},
+      // An existing intset key that meets a non-integer: the integers before it were already
+      // taken by the intset.
+      {"{1,2,3} plus 4 5 a 6", {"1", "2", "3"}, {"4", "5", "a", "6"}, 4},
+      {"{1,2,3} plus 4 a", {"1", "2", "3"}, {"4", "a"}, 2},
+      {"{1,2,3} plus a 4", {"1", "2", "3"}, {"a", "4"}, 2},
+      {"{1,2,3} plus 4 a 4 a 1", {"1", "2", "3"}, {"4", "a", "4", "a", "1"}, 2},
+      {"200 plus ints, a, ints", Ints(0, 200), Cat({Ints(200, 230), {"a"}, Ints(230, 240)}), 41},
+      // Both in one call: the overflow comes first.
+      {"250 plus overflow, a, ints", Ints(0, 250), Cat({Ints(250, 270), {"a"}, Ints(270, 280)}),
+       31},
+      // Never went through the intset: these were right before the fix.
+      {"new mixed", {}, {"1", "2", "a", "3"}, 4},
+      {"new 300 ints and a", {}, Cat({Ints(0, 300), {"a"}}), 301},
+      {"new 1000 strings", {}, Members("s", 0, 1000), 1000},
+      {"string set plus 300 ints", Cat({{"a"}, Ints(0, 100)}), Ints(0, 400), 300},
+      {"string set of 301 plus ints", Cat({Ints(0, 300), {"a"}}), Ints(250, 700), 400},
+  };
+
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    Run({"flushall"});
+    if (!c.existing.empty())
+      RunWithMembers({"sadd", "k"}, c.existing);
+    EXPECT_THAT(RunWithMembers({"sadd", "k"}, c.added), IntArg(c.expected));
+
+    // The set itself was right before the fix too; only the reply was wrong.
+    absl::flat_hash_set<string> all(c.existing.begin(), c.existing.end());
+    all.insert(c.added.begin(), c.added.end());
+    EXPECT_THAT(Run({"scard", "k"}), IntArg(all.size()));
+  }
+}
+
+// A call that converts the set, then one answered from the string set it left.
+TEST_F(SetFamilyTest, SAddCountsAfterConversion) {
+  EXPECT_THAT(RunWithMembers({"sadd", "k"}, Ints(0, 300)), IntArg(300));
+  EXPECT_THAT(RunWithMembers({"sadd", "k"}, Ints(0, 400)), IntArg(100));
+  EXPECT_THAT(Run({"scard", "k"}), IntArg(400));
+}
+
+// SADDEX always writes a string set, so it never had the intset counting; this pins its replies
+// next to SADD's. There is no Redis counterpart, so the expected replies are the plain count of
+// members that were not in the set.
+TEST_F(SetFamilyTest, SAddExCountsAcrossIntsetConversion) {
+  EXPECT_THAT(RunWithMembers({"saddex", "new", "1000"}, Ints(0, 300)), IntArg(300));
+  EXPECT_THAT(RunWithMembers({"saddex", "new", "1000"}, Ints(0, 300)), IntArg(0));
+
+  RunWithMembers({"sadd", "exist"}, Ints(0, 200));
+  EXPECT_THAT(RunWithMembers({"saddex", "exist", "1000"}, Ints(150, 300)), IntArg(100));
+  EXPECT_THAT(Run({"scard", "exist"}), IntArg(300));
+
+  RunWithMembers({"sadd", "full"}, Ints(0, 256));
+  EXPECT_THAT(Run({"saddex", "full", "1000", "256"}), IntArg(1));
+
+  Run({"sadd", "small", "1", "2", "3"});
+  EXPECT_THAT(Run({"saddex", "small", "1000", "4", "a", "6"}), IntArg(3));
+}
+
+// SMOVE and the *STORE commands write through the same OpAdd but never reply its count; they
+// were right before the fix and must stay right. Expected replies are Redis 7.0.15's.
+TEST_F(SetFamilyTest, SMoveAndStoreAcrossIntsetOverflow) {
+  for (std::string_view member : {"1"sv, "a"sv}) {
+    SCOPED_TRACE(member);
+    Run({"flushall"});
+    Run({"sadd", "src", "a", "1"});
+    RunWithMembers({"sadd", "dst"}, Ints(1000, 1256));
+    EXPECT_THAT(Run({"smove", "src", "dst", member}), IntArg(1));
+    EXPECT_THAT(Run({"scard", "dst"}), IntArg(257));
+    EXPECT_THAT(Run({"sismember", "dst", member}), IntArg(1));
+  }
+
+  // a is 0..599 and b is 100..699, so the union has 700 members, the intersection 500 and the
+  // difference 100. Each destination kind is overwritten.
+  struct Store {
+    std::string_view cmd;
+    int64_t expected;
+  };
+  for (const Store& s :
+       {Store{"sunionstore", 700}, Store{"sinterstore", 500}, Store{"sdiffstore", 100}}) {
+    for (std::string_view dst_kind : {"none"sv, "string"sv, "intset"sv, "big"sv, "strset"sv}) {
+      SCOPED_TRACE(absl::StrCat(s.cmd, " over ", dst_kind));
+      Run({"flushall"});
+      RunWithMembers({"sadd", "a"}, Ints(0, 600));
+      RunWithMembers({"sadd", "b"}, Ints(100, 700));
+      if (dst_kind == "string")
+        Run({"set", "dst", "x"});
+      else if (dst_kind == "intset")
+        RunWithMembers({"sadd", "dst"}, Ints(5000, 5100));
+      else if (dst_kind == "big")
+        RunWithMembers({"sadd", "dst"}, Ints(5000, 5600));
+      else if (dst_kind == "strset")
+        Run({"sadd", "dst", "zz", "yy"});
+
+      EXPECT_THAT(Run({s.cmd, "dst", "a", "b"}), IntArg(s.expected));
+      EXPECT_THAT(Run({"scard", "dst"}), IntArg(s.expected));
+    }
   }
 }
 

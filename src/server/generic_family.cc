@@ -9,6 +9,10 @@
 #include <absl/strings/ascii.h>
 #include <absl/strings/str_cat.h>
 
+// drakeydb: P7-1 (decision 36) -- <cerrno>, <cmath> and <cstdlib> are for SORT's strtod
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
 #include <optional>
 
 #include "facade/cmd_arg_parser.h"
@@ -17,6 +21,7 @@
 
 extern "C" {
 #include "redis/crc64.h"
+#include "redis/util.h"  // drakeydb: P7-1 (decision 36), string2ll for SORT's LIMIT
 }
 
 #include "base/cycle_clock.h"
@@ -40,6 +45,7 @@ extern "C" {
 #include "server/journal/journal.h"
 #include "server/multi_master.h"
 #include "server/multimaster_lww.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/rdb_extensions.h"
 #include "server/rdb_load.h"
@@ -57,6 +63,16 @@ namespace rng = std::ranges;
 ABSL_FLAG(uint32_t, dbnum, 16, "Number of databases");
 ABSL_FLAG(uint32_t, keys_output_limit, 8192, "Maximum number of keys output by keys command");
 ABSL_FLAG(bool, unlink_experimental_async, true, "If true, runs unlink command asynchronously.");
+
+// drakeydb: P7-1 (decision 41) -- the intset limit SortTiesInFetchOrder emulates; see there.
+ABSL_FLAG(
+    uint32_t, sort_set_max_intset_entries, 512,
+    "Decides how SORT <set> BY ... ALPHA breaks ties between equal weights: an integer-only set of "
+    "at most this many members keeps its ascending numeric (fetch) order, as Redis/KeyDB hold such "
+    "a set as an intset; any other set breaks ties on the element. Set it to the classic master's "
+    "set-max-intset-entries when replicating from KeyDB or Redis, and run every drakeydb node with "
+    "the same value, or a replicated same-shard SORT .. STORE can store a different order on each. "
+    "0 turns the rule off: every set breaks ties on the element.");
 
 namespace dfly {
 using namespace std;
@@ -1926,7 +1942,10 @@ void GenericFamily::Stick(facade::CmdArgParser parser, CommandContext* cmd_cntx)
 struct SortEntryBase {
   string key;
   const string* bound_value = nullptr;
-  vector<string> get_values;  // Stores fetched GET pattern values
+  // Fetched GET pattern values. drakeydb: P7-1 (decision 36) -- nullopt where lookupKeyByPattern
+  // finds nothing (a missing or non-string key, a pattern without '*', and under a `->` pattern a
+  // key that is not a hash or a missing field): nil in a reply, "" in STORE, as in Redis.
+  vector<optional<string>> get_values;
 
   void BindValue(const std::string* value) {
     bound_value = value;
@@ -1945,22 +1964,47 @@ struct SortEntryScore : public SortEntryBase {
   double score;
 };
 
+// drakeydb: P7-1 (decision 34) -- an ALPHA entry also remembers whether its BY weight key was
+// missing (absent, expired or not a string). Redis and KeyDB's sortCompare puts a missing weight
+// before every present one, the empty string included (sort.cpp:160-168), while the fetch maps
+// both to "". Only meaningful under ALPHA BY: a missing numeric weight is the score 0 in KeyDB too.
+//
+// drakeydb: P7-1 (decision 37) -- `seq` is the position the element was fetched at, which the sort
+// keeps on a tie when SortParams::ties_in_fetch_order says so (it shares the padding of the bool).
+struct SortEntryAlpha : public SortEntryBase {
+  bool weight_missing = false;
+  uint32_t seq = 0;
+};
+
+// drakeydb: P7-1 (decision 36) -- a numeric weight or element as sortCommand loads it (sort.cpp:
+// 475-483): strtod over the bytes up to the first NUL, which is where c_str() ends for it ("5\0x"
+// is 5, "\0" is 0). Refused: bytes left after the number, ERANGE, NaN, and a subnormal result.
+// Leading whitespace, hex and inf are strtod's to accept. The rule does not depend on the libc: on
+// glibc it equals Redis and KeyDB for every decimal spelling, and differs only for an exact
+// subnormal (a hex float such as 0x1p-1074, or a ~750-digit decimal), which glibc's strtod accepts
+// without ERANGE. musl skips ERANGE for some subnormals (4.9e-324), so the subnormal check cannot
+// be left to errno: a mixed mesh would disagree on a same-shard SORT .. STORE, which is journaled
+// as the command. Redis and KeyDB never clear errno before the call, so after one ERANGE they
+// refuse every later non-integer value until a syscall changes it; this does not copy that, a
+// failing SORT is never replicated.
+bool ParseSortScore(const string& item, double* score) {
+  errno = 0;
+  char* end = nullptr;
+  *score = strtod(item.c_str(), &end);
+  return *end == '\0' && errno != ERANGE && !std::isnan(*score) &&
+         std::fpclassify(*score) != FP_SUBNORMAL;
+}
+
 // SortEntry stores all data required for sorting
 template <bool ALPHA>
 struct SortEntry
     // Store score only if we need it
-    : public std::conditional_t<ALPHA, SortEntryBase, SortEntryScore> {
+    : public std::conditional_t<ALPHA, SortEntryAlpha, SortEntryScore> {
   bool Parse(string&& item) {
     if constexpr (!ALPHA) {
-      if (!absl::SimpleAtod(item, &this->score)) {
-        if (!item.empty()) {
-          return false;
-        }
-        this->score = 0;
-      }
-      if (std::isnan(this->score)) {
+      // drakeydb: P7-1 (decision 36) -- strtod's rule, see ParseSortScore
+      if (!ParseSortScore(item, &this->score))
         return false;
-      }
     }
     this->key = std::move(item);
     return true;
@@ -1974,20 +2018,54 @@ struct SortEntry
     return true;
   }
 
-  static bool less(const SortEntry& l, const SortEntry& r) {
-    if constexpr (!ALPHA) {
-      if (l.score < r.score) {
-        return true;
-      } else if (r.score < l.score) {
-        return false;
-      }
-      // to prevent unstrict order we compare values lexicographically
+  // drakeydb: P7-1 (decision 34) -- records that the weight key was missing; see SortEntryAlpha.
+  void SetWeightMissing(bool missing) {
+    if constexpr (ALPHA) {
+      this->weight_missing = missing;
     }
-    return l.key < r.key;
   }
 
-  static bool greater(const SortEntry& l, const SortEntry& r) {
-    return less(r, l);
+  // drakeydb: P7-1 (decision 37) -- records the fetch position; see SortEntryAlpha.
+  void SetSeq(size_t seq) {
+    if constexpr (ALPHA) {
+      // A result of 2^32 entries cannot be held in memory long before this wraps.
+      this->seq = static_cast<uint32_t>(seq);
+    }
+  }
+
+  // Three-way comparison of the weights alone: the scores or, under ALPHA, a missing weight before
+  // every present one and then the weights' bytes.
+  static int CompareWeights(const SortEntry& l, const SortEntry& r) {
+    if constexpr (!ALPHA) {
+      return (l.score > r.score) - (l.score < r.score);
+    } else {
+      // drakeydb: P7-1 (decision 34) -- ALPHA BY compares the weights, a missing one first (see
+      // SortEntryAlpha); two missing weights compare equal, as `key` is "" for both.
+      if (l.weight_missing != r.weight_missing)
+        return l.weight_missing ? -1 : 1;
+      return l.key.compare(r.key);
+    }
+  }
+
+  // Whether `l` goes before `r`. The weights decide. A tie is broken on the element, bytewise, as
+  // sortCompare does for a numeric tie (sort.cpp:153-156); under BY `key` holds the weight and the
+  // element is the bound value, without BY ResultKey() is `key` itself. DESC negates the whole
+  // comparison, the element tie-break included, as KeyDB negates `cmp`.
+  //
+  // drakeydb: P7-1 (decision 37) -- with `ties_in_fetch_order` (ALPHA BY over a list or an integer
+  // set) a tie keeps the order the elements were fetched in, ASC and DESC alike, as KeyDB's stable
+  // libc qsort does. It is a total order, so partial_sort under LIMIT agrees with a full sort.
+  static bool Precedes(const SortEntry& l, const SortEntry& r, bool reversed,
+                       bool ties_in_fetch_order) {
+    int cmp = CompareWeights(l, r);
+    if (cmp == 0) {
+      if constexpr (ALPHA) {
+        if (ties_in_fetch_order)
+          return l.seq < r.seq;
+      }
+      cmp = l.ResultKey().compare(r.ResultKey());
+    }
+    return reversed ? cmp > 0 : cmp < 0;
   }
 };
 
@@ -2229,13 +2307,73 @@ OpResult<pair<vector<string>, CompactObjType>> OpFetchContainerElements(const Op
 
 // Fetch a string value from a key (for BY pattern lookups)
 // TODO: does not support tiering.
-string OpFetchStringValue(const OpArgs& op_args, std::string_view key) {
+string OpFetchStringValue(const OpArgs& op_args, std::string_view key, bool* found = nullptr) {
   auto it = op_args.GetDbSlice().FindReadOnly(op_args.db_cntx, key);
+  // drakeydb: P7-1 (decision 34) -- `found` tells a missing key, or one that is not a string, from
+  // a string that is empty (ALPHA BY sorts the first before the second).
+  if (found)
+    *found = IsValid(it) && it->second.ObjType() == OBJ_STRING;
   if (!IsValid(it) || it->second.ObjType() != OBJ_STRING) {
     return {};  // Missing key defaults to empty string
   }
 
   return it->second.ToString();
+}
+
+// drakeydb: P7-1 (decision 35) -- the value of a BY or GET pattern's hash field, as
+// lookupKeyByPattern reads it: the field of the hash at `key`. `found` is false (and the result
+// empty) for a missing key, a key that is not a hash and a field the hash does not hold, an expired
+// one included. As HGET does, it deletes a hash whose lazy field expiry this read just emptied,
+// unless a snapshot or a suspended callback makes that unsafe here (see below).
+// TODO: does not support tiering; a hash the experimental hash offloading moved to disk reads as
+// missing.
+string OpFetchHashFieldValue(const OpArgs& op_args, std::string_view key, std::string_view field,
+                             bool* found) {
+  auto& db_slice = op_args.GetDbSlice();
+  auto it = db_slice.FindReadOnly(op_args.db_cntx, key);
+  *found = false;
+  if (!IsValid(it) || it->second.ObjType() != OBJ_HASH ||
+      (it->second.IsExternal() && !it->second.IsCool())) {
+    return {};
+  }
+
+  optional<string> value = HSetFamily::GetFieldValue(op_args.db_cntx, it->second, field);
+  // drakeydb: P7-1 (decision 35) -- the read's StringMap::Find drops expired fields lazily, as
+  // HGET does, so a hash it emptied goes now: a zero-size hash would linger otherwise, seen by
+  // EXISTS, TYPE and DBSIZE, and SAVE logs an error in SaveEntry and skips it
+  // (FieldExpireHashDeletesEmptyHash pins the delete for FIELDEXPIRE).
+  //
+  // This runs in a RunBlockingInParallel fiber, outside any transaction, so nothing orders it
+  // against the shard's other callbacks, and DeleteIfEmpty can yield twice: FindMutable runs the
+  // change callbacks, and the derived DEL's journal write throttles on a stalled stream. A
+  // callback suspended between its Arm and its Commit would then have its keys floored by this
+  // DEL's journal entry (the per-arm sweep of RecordEntry, active mode), as would one that starts
+  // while this DEL waits to be swept; a write that refills the hash meanwhile would lose it. So
+  // the delete runs only where it cannot yield or meet an arm, the heartbeat reaper's
+  // preconditions (engine_shard.cc): no transaction callback in flight on the shard, no change
+  // callback registered (FindMutable cannot yield), nothing armed, and the journal flush disabled
+  // (the DEL's AddLogRecord cannot throttle before its sweep). It is skipped only while a snapshot,
+  // a full sync or a slot migration runs on the shard, or a callback is suspended there; the empty
+  // hash then stays until the reaper (active mode) or the next command that reads the hash.
+  if (op_args.shard->running_tx() == nullptr && !db_slice.HasRegisteredCallbacks() &&
+      (!db_slice.mvcc_enabled() || MvccStamper::tlocal()->ArmedCount() == 0)) {
+    journal::DisableFlushGuard no_preempt(op_args.shard->journal());
+    HSetFamily::DeleteIfEmpty(db_slice, op_args.db_cntx, key, it->second);
+  }
+  if (!value)
+    return {};
+
+  *found = true;
+  return std::move(*value);
+}
+
+// drakeydb: P7-1 (decision 35) -- what a BY or GET pattern reads at `key`: the string there, or
+// with a `field` that field of the hash there. See OpFetchStringValue and OpFetchHashFieldValue.
+string OpFetchPatternValue(const OpArgs& op_args, std::string_view key, std::string_view field,
+                           bool* found) {
+  if (field.empty())
+    return OpFetchStringValue(op_args, key, found);
+  return OpFetchHashFieldValue(op_args, key, field, found);
 }
 
 // drakeydb: P4-3 review wave (CodeRabbit, Major) -- `source_deleted_by_fetch` extends the
@@ -2246,6 +2384,15 @@ string OpFetchStringValue(const OpArgs& op_args, std::string_view key) {
 // would never reach it, leaving a stale destination there (the cross-shard path already
 // hand-journals unconditionally). Only that case passes true: an ordinary same-shard STORE keeps
 // the recipe replay and the unchanged journal size (D-13's accepted exposure is unrelated).
+//
+// drakeydb: P7-1 (decision 32) -- SortStoreNothing (below) passes true as well, for a source that
+// is missing or that the unsorted fetch's lazy expiry emptied. On one shard it also keeps the
+// verbatim SORT out of the journal (its hop returns SKIPPED), so this hand-journaled `DEL dst` is
+// that STORE's whole wire, as in upstream main: a peer applies it under the LWW guard, where a
+// replayed SORT would delete a newer dst unguarded (ISSUE-REGISTER D-18), and a replica of an older
+// build (whose SORT replay leaves the destination stale) converges too. OpStore journals a DEL only
+// for a destination it actually deleted, so a STORE with no destination journals nothing, as Redis
+// does.
 template <typename IteratorBegin, typename IteratorEnd>
 OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, IteratorBegin&& start_it,
                            IteratorEnd&& end_it, bool has_get_patterns,
@@ -2282,9 +2429,10 @@ OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, Iterator
   QList::Where where = QList::TAIL;
   for (auto it = start_it; it != end_it; ++it) {
     if (has_get_patterns) {
-      // Store all GET pattern values for this entry
+      // Store all GET pattern values for this entry; drakeydb: P7-1 (decision 36) -- a nil one is
+      // stored as "", as sortCommand does (sort.cpp:561)
       for (const auto& value : it->get_values) {
-        ql_v2->Push(value, where);
+        ql_v2->Push(value ? string_view{*value} : string_view{}, where);
       }
     } else {
       // No GET patterns - store the element itself
@@ -2370,9 +2518,11 @@ OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, Iterator
   return len;
 }
 
+// drakeydb: P7-1 (decision 36) -- LIMIT's arguments exactly as parsed: negative and beyond 32 bits
+// are valid, as in Redis; GetSortRange clamps them to the size of what is sorted.
 struct SortBounds {
-  uint32_t offset = 0;
-  uint32_t count = 0;
+  int64_t offset = 0;
+  int64_t count = 0;
 };
 
 struct SortParams {
@@ -2380,6 +2530,9 @@ struct SortParams {
   bool reversed = false;
   bool is_read_only = false;
   bool to_sort = true;
+  // drakeydb: P7-1 (decision 37) -- ALPHA BY over a list, or a set KeyDB holds as an intset: tied
+  // weights keep the fetch order instead of breaking on the element. See SortGeneric.
+  bool ties_in_fetch_order = false;
 
   optional<string_view> store_key;
   optional<SortBounds> bounds;
@@ -2393,12 +2546,77 @@ void ParseSortGet(CmdArgParser* parser, SortParams* params) {
   params->get_patterns.push_back(parser->Next<string_view>());
 }
 
+// drakeydb: P7-1 (decision 36 and 38) -- LIMIT's arguments go through string2ll, as Redis's
+// getLongFromObjectOrReply does (sort.cpp:220-229): no '+', no leading zero ("0" itself apart), no
+// space, nothing beyond long long, and the Redis error text for any of them. SimpleAtoi, which the
+// parser would use, takes "+1" and "01".
+void ParseSortLimit(CmdArgParser* parser, SortParams* params) {
+  auto [offset, count] = parser->Next<string_view, string_view>();
+  if (parser->HasError())
+    return;
+
+  long long parsed_offset = 0, parsed_count = 0;
+  if (!string2ll(offset.data(), offset.size(), &parsed_offset) ||
+      !string2ll(count.data(), count.size(), &parsed_count)) {
+    return parser->Report(CmdArgParser::INVALID_INT);
+  }
+  params->bounds = SortBounds{parsed_offset, parsed_count};
+}
+
+// drakeydb: P7-1 (decision 35, and 36 for the first '*') -- a BY or GET pattern as
+// lookupKeyByPattern reads it (sort.cpp:61-137). The first '*' is replaced by the element and what
+// follows it, further '*' included, is literal; the key is `prefix + element + suffix`. The first
+// "->" after that '*' introduces a hash field, if at least one character follows it: the pattern
+// then names the field of the hash at that key, otherwise a string at it ("w_*->" is the string key
+// `w_<element>->`). A "->" before the '*' is part of the prefix. Redis scans the pattern as a C
+// string (strchr, strstr and the `f[2] != '\0'` test stop at a NUL byte, while the key and the
+// field are cut by length), so a NUL hides the '*' or the "->" that follows it, and "#\0x" is "#".
+struct SortPattern {
+  string_view prefix;
+  string_view suffix;  // between the '*' and the "->" of a field, else up to the end of the pattern
+  string_view field;   // empty: the key holds a string
+
+  string KeyFor(string_view element) const {
+    return absl::StrCat(prefix, element, suffix);
+  }
+};
+
+// The pattern "#" (spat[0] == '#' && spat[1] == '\0' in lookupKeyByPattern): GET of the element
+// itself.
+bool IsSortElementPattern(string_view pattern) {
+  return !pattern.empty() && pattern[0] == '#' && (pattern.size() == 1 || pattern[1] == '\0');
+}
+
+// nullopt for a pattern without '*': a BY one then means "nosort", a GET one has no value.
+optional<SortPattern> ParseSortPattern(string_view pattern) {
+  const string_view c_string = pattern.substr(0, pattern.find('\0'));
+  const size_t star_pos = c_string.find('*');
+  if (star_pos == string_view::npos)
+    return nullopt;
+
+  SortPattern parsed{pattern.substr(0, star_pos), pattern.substr(star_pos + 1), {}};
+  const size_t arrow_pos = c_string.find("->", star_pos + 1);
+  // c_string ends where a NUL (or the pattern) does, which is the `*(f + 2) == '\0'` case
+  if (arrow_pos != string_view::npos && arrow_pos + 2 < c_string.size()) {
+    parsed.suffix = pattern.substr(star_pos + 1, arrow_pos - (star_pos + 1));
+    parsed.field = pattern.substr(arrow_pos + 2);
+  }
+  return parsed;
+}
+
+// drakeydb: P7-1 (decision 36) -- the part of `entries` that LIMIT selects, clamped as sortCommand
+// clamps it (sort.cpp:324-333): a negative offset is 0, a negative count means everything from the
+// offset on, and an offset or a count that reaches past the end stops there. The sums are 64-bit:
+// `LIMIT 1 4294967295` must not wrap around (it ended the range before its start, once).
 template <typename C> auto GetSortRange(const C& entries, const optional<SortBounds>& bounds) {
   auto start_it = entries.begin();
   auto end_it = entries.end();
   if (bounds) {
-    start_it += std::min<uint32_t>(bounds->offset, entries.size());
-    end_it = entries.begin() + std::min<uint32_t>(bounds->offset + bounds->count, entries.size());
+    const uint64_t size = entries.size();
+    const uint64_t start = std::clamp<int64_t>(bounds->offset, 0, static_cast<int64_t>(size));
+    const uint64_t count = bounds->count < 0 ? size : std::min<uint64_t>(bounds->count, size);
+    start_it += start;
+    end_it = entries.begin() + std::min(start + count, size);
   }
 
   return std::make_pair(start_it, end_it);
@@ -2407,13 +2625,14 @@ template <typename C> auto GetSortRange(const C& entries, const optional<SortBou
 // Generic GET pattern fetcher that abstracts element access and result storage.
 // Handles pattern expansion, shard distribution, and parallel fetching.
 // Special pattern "#" returns the element value itself.
+// drakeydb: P7-1 (decision 36) -- a nullopt result is nil (see SortEntryBase::get_values).
 // Uses "read uncommitted" isolation - fetches values across shards without transaction guarantees.
 //
 // Template parameters:
 //   ElementContainer: Container type holding elements (e.g., vector<string>, vector<SortEntry>)
 //   ElementAccessor: Callable that returns string_view for element at index: (size_t) ->
 //   string_view ResultSetter: Callable that stores fetched value: (size_t elem_idx, size_t
-//   pattern_idx, string value) -> void
+//   pattern_idx, optional<string> value) -> void
 template <typename ElementContainer, typename ElementAccessor, typename ResultSetter>
 void FetchGetPatternValues(const SortParams& params, const DbContext& db_cntx,
                            const ElementContainer& elements, ElementAccessor get_element_key,
@@ -2421,8 +2640,17 @@ void FetchGetPatternValues(const SortParams& params, const DbContext& db_cntx,
   if (params.get_patterns.empty())
     return;
 
+  // drakeydb: P7-1 (decision 35) -- each pattern is parsed once; a nullopt one has no '*' and no
+  // value
+  vector<optional<SortPattern>> sort_patterns;
+  sort_patterns.reserve(params.get_patterns.size());
+  for (string_view pattern : params.get_patterns)
+    sort_patterns.push_back(ParseSortPattern(pattern));
+
   // Build a list of all external keys to fetch, organized by shard
   // Structure: keys_by_shard[shard_id] = [(elem_idx, pattern_idx, ext_key), ...]
+  // drakeydb: P7-1 (decision 35) -- the shard is the key part's, not the whole pattern's: a hash
+  // field is read on the shard that owns the hash.
   vector<vector<tuple<size_t, size_t, string>>> keys_by_shard(shard_set->size());
 
   // Build external keys for each element and pattern
@@ -2430,22 +2658,21 @@ void FetchGetPatternValues(const SortParams& params, const DbContext& db_cntx,
     for (size_t pattern_idx = 0; pattern_idx < params.get_patterns.size(); ++pattern_idx) {
       std::string_view pattern = params.get_patterns[pattern_idx];
 
-      if (pattern == "#") {
+      if (IsSortElementPattern(pattern)) {
         // Special pattern - return the element itself, no external fetch needed
         set_result(elem_idx, pattern_idx, string(get_element_key(elem_idx)));
         continue;
       }
 
-      // Build external key by replacing '*' with the actual element value
-      size_t star_pos = pattern.find('*');
-      string ext_key;
-      if (star_pos == std::string_view::npos) {
-        // No asterisk - use pattern as literal key
-        ext_key = string(pattern);
-      } else {
-        ext_key = absl::StrCat(pattern.substr(0, star_pos), get_element_key(elem_idx),
-                               pattern.substr(star_pos + 1));
+      // Build external key by replacing the first '*' with the actual element value
+      const optional<SortPattern>& sort_pattern = sort_patterns[pattern_idx];
+      if (!sort_pattern) {
+        // drakeydb: P7-1 (decision 36) -- no asterisk: Redis does not read a fixed key, GET of it
+        // is nil (sort.cpp:82-87)
+        set_result(elem_idx, pattern_idx, nullopt);
+        continue;
       }
+      string ext_key = sort_pattern->KeyFor(get_element_key(elem_idx));
 
       ShardId sid = Shard(ext_key, shard_set->size());
       keys_by_shard[sid].emplace_back(elem_idx, pattern_idx, std::move(ext_key));
@@ -2456,8 +2683,10 @@ void FetchGetPatternValues(const SortParams& params, const DbContext& db_cntx,
   shard_set->RunBlockingInParallel([&](EngineShard* shard) {
     ShardId sid = shard->shard_id();
     for (const auto& [elem_idx, pattern_idx, ext_key] : keys_by_shard[sid]) {
-      string value = OpFetchStringValue({shard, nullptr, db_cntx}, ext_key);
-      set_result(elem_idx, pattern_idx, std::move(value));
+      bool found = false;
+      string value = OpFetchPatternValue({shard, nullptr, db_cntx}, ext_key,
+                                         sort_patterns[pattern_idx]->field, &found);
+      set_result(elem_idx, pattern_idx, found ? optional<string>{std::move(value)} : nullopt);
     }
   });
 }
@@ -2480,7 +2709,7 @@ OpStatus PopulateGetPatternValues(const SortParams& params, const DbContext& db_
   FetchGetPatternValues(
       params, db_cntx, *entries,
       [&](size_t idx) -> std::string_view { return (*entries)[idx].ResultKey(); },
-      [&](size_t entry_idx, size_t pattern_idx, string value) {
+      [&](size_t entry_idx, size_t pattern_idx, optional<string> value) {
         (*entries)[entry_idx].get_values[pattern_idx] = std::move(value);
       });
 
@@ -2490,7 +2719,6 @@ OpStatus PopulateGetPatternValues(const SortParams& params, const DbContext& db_
 // Visitor to handle the actual sorting and reply generation
 struct SortVisitor {
   const SortParams& params;
-  CompactObjType result_type;
   CommandContext* cmd_cntx;
   vector<string> raw_elements;
   // drakeydb: P4-3 review wave -- true when OpFetchSortEntries deleted the source on this
@@ -2500,7 +2728,10 @@ struct SortVisitor {
 
   template <typename T> void operator()(T& entries) {
     using value_t = typename std::decay_t<decltype(entries)>::value_type;
-    auto cmp = params.reversed ? &value_t::greater : &value_t::less;
+    // drakeydb: P7-1 (decision 37) -- see SortEntry::Precedes
+    auto cmp = [&](const value_t& l, const value_t& r) {
+      return value_t::Precedes(l, r, params.reversed, params.ties_in_fetch_order);
+    };
 
     DCHECK(params.to_sort);
 
@@ -2508,10 +2739,11 @@ struct SortVisitor {
 
     // Sort logic
     if (params.bounds) {
-      auto sort_it =
-          entries.begin() +
-          std::min<uint32_t>(params.bounds->offset + params.bounds->count, entries.size());
-      std::partial_sort(entries.begin(), sort_it, entries.end(), cmp);
+      // Only the entries up to the end of the LIMIT range have to be in place; drakeydb: P7-1
+      // (decision 36) -- that end is GetSortRange's, clamped as sortCommand clamps it.
+      auto range_end = GetSortRange(entries, params.bounds).second;
+      std::partial_sort(entries.begin(), entries.begin() + (range_end - entries.cbegin()),
+                        entries.end(), cmp);
     } else {
       rng::sort(entries, cmp);
     }
@@ -2524,10 +2756,8 @@ struct SortVisitor {
     }
 
     if (!params.store_key) {
-      bool is_set = (result_type == OBJ_SET || result_type == OBJ_ZSET);
       bool has_get_patterns = !params.get_patterns.empty();
-      auto replier = [entries = std::move(entries), bounds = params.bounds, is_set,
-                      has_get_patterns,
+      auto replier = [entries = std::move(entries), bounds = params.bounds, has_get_patterns,
                       raw_elements = std::move(raw_elements)](RedisReplyBuilder* rb) {
         DVLOG(2) << "Replying with sorted entries, count: " << entries.size();
         auto [start_it, end_it] = GetSortRange(entries, bounds);
@@ -2537,13 +2767,18 @@ struct SortVisitor {
                                      ? num_entries * entries.front().get_values.size()
                                      : num_entries;
 
-        rb->StartCollection(collection_size, is_set ? CollectionType::SET : CollectionType::ARRAY);
+        // drakeydb: P7-1 (decision 38) -- an array whatever the source, as in Redis: RESP3's set
+        // type would drop the order a client sees.
+        rb->StartArray(collection_size);
 
         for (auto it = start_it; it != end_it; ++it) {
           if (has_get_patterns && !it->get_values.empty()) {
-            // Send all GET pattern values for this entry
+            // Send all GET pattern values for this entry; nil for a missing one
             for (const auto& value : it->get_values) {
-              rb->SendBulkString(value);
+              if (value)
+                rb->SendBulkString(*value);
+              else
+                rb->SendNull();
             }
           } else {
             // No GET patterns - send the element itself
@@ -2587,12 +2822,12 @@ OpStatus PopulateSortEntriesFromByPattern(const SortParams& params,
   DCHECK(params.by_pattern);
 
   vector<vector<pair<size_t, string>>> keys_by_shard(shard_set->size());
-  std::string_view pattern = *params.by_pattern;
-  size_t star_pos = pattern.find('*');
-  DCHECK_NE(star_pos, std::string_view::npos);
+  // drakeydb: P7-1 (decisions 35, 36) -- the first '*' only, and a hash field if the pattern has
+  // one, see SortPattern; the shard is the key part's, which is where the hash (or string) lives
+  optional<SortPattern> pattern = ParseSortPattern(*params.by_pattern);
+  DCHECK(pattern);
   for (size_t i = 0; i < raw_elements.size(); ++i) {
-    string ext_key =
-        absl::StrCat(pattern.substr(0, star_pos), raw_elements[i], pattern.substr(star_pos + 1));
+    string ext_key = pattern->KeyFor(raw_elements[i]);
     ShardId sid = Shard(ext_key, shard_set->size());
     keys_by_shard[sid].emplace_back(i, std::move(ext_key));
   }
@@ -2604,11 +2839,16 @@ OpStatus PopulateSortEntriesFromByPattern(const SortParams& params,
     bool success = std::visit(
         [&](auto& dest) {
           for (const auto& [idx, ext_key] : keys_by_shard[sid]) {
-            string external_value = OpFetchStringValue({shard, nullptr, db_cntx}, ext_key);
+            bool found = false;
+            // drakeydb: P7-1 (decision 35) -- a hash field when the pattern names one
+            string external_value =
+                OpFetchPatternValue({shard, nullptr, db_cntx}, ext_key, pattern->field, &found);
             auto& entry = dest[idx];
             if (!entry.Parse(std::move(external_value)))
               return false;
             entry.BindValue(&raw_elements[idx]);
+            entry.SetWeightMissing(!found);  // drakeydb: P7-1 (decision 34)
+            entry.SetSeq(idx);               // drakeydb: P7-1 (decision 37)
           }
           return true;
         },
@@ -2623,6 +2863,91 @@ OpStatus PopulateSortEntriesFromByPattern(const SortParams& params,
   }
 
   return OpStatus::OK;
+}
+
+// drakeydb: P7-1 (decision 32) -- STORE with nothing to read: the source does not exist, or its own
+// lazy member expiry emptied it. Redis and KeyDB still run the STORE: an empty result deletes the
+// destination and replies 0 (sort.cpp, `outputlen == 0` -> dbDelete(storekey)). This used to reply
+// an empty array and leave the destination stale; the multi-shard form even aborted the server
+// (see the fetch callbacks below). A wrong-type or unparsable source never gets here: that error is
+// raised before the destination is touched, as in Redis. Runs the concluding hop of the
+// transaction SortGeneric already opened, and passes source_deleted_by_fetch so the destination
+// delete is hand-journaled on the same-shard path too.
+//
+// The wire is `DEL dst` alone, when there was a dst to delete, and nothing when there was none --
+// as in upstream main (OpStore journals the delete) and in Redis (no dirty, no propagation). On one
+// shard SORT's auto-journal is revived, so the hop returns SKIPPED, which LogAutoJournalOnShard
+// treats as "do not journal": the verbatim SORT stays out of the journal, and the DEL that
+// source_deleted_by_fetch hand-journals is all of it (without that argument nothing would be). A
+// peer that holds a newer dst drops the LWW-guarded DEL, where a replayed SORT would delete that
+// dst regardless (ISSUE-REGISTER D-18). Across shards SORT is not revived and the hop must return
+// OK, as Transaction::RunCallback CHECK-fails on any other status there. Upstream main has this
+// function with the same two call sites; the differences are the source_deleted_by_fetch argument,
+// which only this fork's OpStore has, and the status.
+void SortStoreNothing(string_view store_key, CommandContext* cmd_cntx) {
+  ShardId dest_sid = Shard(store_key, shard_set->size());
+  OpResult<uint32_t> store_len;
+  cmd_cntx->tx()->Execute(
+      [&](Transaction* t, EngineShard* shard) {
+        if (shard->shard_id() == dest_sid) {
+          vector<SortEntryBase> none;
+          store_len = OpStore(t->GetOpArgs(shard), store_key, none.begin(), none.end(),
+                              /*has_get_patterns=*/false, /*source_deleted_by_fetch=*/true);
+        }
+        return t->GetUniqueShardCnt() == 1 ? OpStatus::SKIPPED : OpStatus::OK;
+      },
+      true);
+  if (store_len)
+    cmd_cntx->SendLong(store_len.value());
+  else
+    cmd_cntx->SendError(store_len.status());
+}
+
+// drakeydb: P7-1 (decision 37) -- whether ALPHA BY ties keep the order the elements were fetched
+// in. KeyDB sorts with libc qsort, a stable mergesort in glibc, so equal weights stay in the order
+// the elements came in (sort.cpp:505-508; the pqsort it uses instead for BY with a LIMIT that cuts
+// the result is not ported). That order is the same on every node for:
+//  - a list: its own order;
+//  - a set KeyDB holds as an intset (every member a strict integer, at most
+//    set-max-intset-entries of them, 512 by default): ascending numeric order, which this puts
+//    `elements` in.
+// A hash-encoded set and a zset (read through its dict) come in a per-process order no replica
+// shares, so their ties still break on the element.
+//
+// The intset case is decided on the members, not on drakeydb's own encoding: its intset stops at
+// 256 entries (set_family.cc) where KeyDB's goes up to 512, and a set can be a hash set here for
+// other reasons (member TTLs), so the same members answer the same on every build. A 600-member
+// integer set is a hash set in KeyDB, hence broken on the element here as well. A set KeyDB holds
+// as a hash set for its history (a member that was not an integer once, a size that once passed
+// the limit) is not known from the members; it is the residual of decision 37.
+//
+// drakeydb: P7-1 (decision 41) -- the limit is --sort_set_max_intset_entries, which an operator
+// sets to the classic master's set-max-intset-entries (it is not read per element, only here). 0
+// matches no set: the emulation is off and every set breaks its ties on the element.
+bool SortTiesInFetchOrder(CompactObjType source_type, vector<string>* elements) {
+  if (source_type == OBJ_LIST)
+    return true;
+
+  const size_t max_intset_entries = absl::GetFlag(FLAGS_sort_set_max_intset_entries);
+  if (source_type != OBJ_SET || elements->size() > max_intset_entries)
+    return false;
+
+  vector<pair<long long, size_t>> by_value;  // (member, position in `elements`)
+  by_value.reserve(elements->size());
+  for (const string& element : *elements) {
+    long long value;
+    if (!string2ll(element.data(), element.size(), &value))
+      return false;
+    by_value.emplace_back(value, by_value.size());
+  }
+  std::sort(by_value.begin(), by_value.end());
+
+  vector<string> ascending;
+  ascending.reserve(by_value.size());
+  for (const auto& [value, pos] : by_value)
+    ascending.push_back(std::move((*elements)[pos]));
+  elements->swap(ascending);
+  return true;
 }
 
 void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_only) {
@@ -2647,7 +2972,7 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
 
   static constexpr auto kGrammar = Compile(Options(
       Exist("ALPHA", &SortParams::alpha), Map(&SortParams::reversed, "DESC", true, "ASC", false),
-      Into(&SortParams::bounds, Field("LIMIT", &SortBounds::offset, &SortBounds::count)),
+      Action("LIMIT", ParseSortLimit),  // drakeydb: P7-1 (decisions 36, 38)
       IfNot(&SortParams::is_read_only, Field("STORE", &SortParams::store_key)),
       Field("BY", &SortParams::by_pattern), Action("GET", ParseSortGet)));
   kGrammar.Apply(&parser, &params);
@@ -2656,27 +2981,12 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
     return cmd_cntx->SendError(parser.TakeError().MakeReply());
   }
 
-  // Validate BY pattern has exactly one '*'
-  if (params.by_pattern) {
-    size_t star_count = std::count(params.by_pattern->begin(), params.by_pattern->end(), '*');
-    if (star_count == 0) {
-      // "nosort" pattern - no '*' means skip sorting, preserve insertion order
-      params.to_sort = false;
-      params.by_pattern.reset();
-    } else if (star_count != 1) {
-      return cmd_cntx->SendError(kSyntaxErr);
-    }
-  }
-
-  // Validate GET patterns: each pattern must be "#" or have at most 1 asterisk
-  for (const auto& pattern : params.get_patterns) {
-    if (pattern == "#") {
-      continue;  // Special pattern, always valid
-    }
-    size_t star_count = std::count(pattern.begin(), pattern.end(), '*');
-    if (star_count > 1) {
-      return cmd_cntx->SendError(kSyntaxErr);
-    }
+  // drakeydb: P7-1 (decision 36) -- a pattern may hold any number of '*', only the first is
+  // substituted (see SortPattern), for BY and for GET alike, as in Redis (sort.cpp:233-239).
+  if (params.by_pattern && !ParseSortPattern(*params.by_pattern)) {
+    // "nosort" pattern - no '*' means skip sorting, preserve insertion order
+    params.to_sort = false;
+    params.by_pattern.reset();
   }
 
   // Asserting that if is_read_only as true, then store_key should not exist.
@@ -2716,6 +3026,10 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
     // elem_result->first is empty both for missing/empty containers and for errors;
     // use elem_result's OpStatus to distinguish actual error cases (e.g. WRONG_TYPE).
     if (elem_result->first.empty()) {
+      // drakeydb: P7-1 (decision 32) -- before the Conclude: a STORE still overwrites (deletes)
+      // its destination and replies 0, like the sorted path below.
+      if (elem_result != OpStatus::WRONG_TYPE && params.store_key)
+        return SortStoreNothing(params.store_key.value(), cmd_cntx);
       cmd_cntx->tx()->Conclude();
       if (elem_result == OpStatus::WRONG_TYPE)
         return cmd_cntx->SendError(elem_result.status());
@@ -2726,6 +3040,23 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
     raw_elements.swap(elem_result->first);
     source_type = elem_result->second;
   }
+
+  // drakeydb: P7-1 (decision 34) -- BY nosort on a SET that is stored, or runs inside a script,
+  // sorts ALPHA by the element with the BY dropped (sort.cpp:296-310: "so the result is consistent
+  // across scripting and replication"); GET, DESC and LIMIT then apply to the sorted set as usual.
+  // Any other SET keeps its iteration order, which is unordered in Redis too.
+  const bool nosort_set_sorted = !params.to_sort && source_type == OBJ_SET &&
+                                 (params.store_key || cntx->conn_state.script_info);
+  if (nosort_set_sorted) {
+    params.to_sort = true;
+    params.alpha = true;
+  }
+
+  // drakeydb: P7-1 (decision 34) -- BY nosort on a LIST or a ZSET honours DESC: KeyDB walks the
+  // list from its tail and the zset by descending rank, and takes LIMIT from that walk
+  // (sort.cpp:356-380, :401-439).
+  if (!params.to_sort && params.reversed && (source_type == OBJ_LIST || source_type == OBJ_ZSET))
+    std::reverse(raw_elements.begin(), raw_elements.end());
 
   if (params.to_sort) {
     // Step 2 and 3: Prepare SortEntryList, fetch external keys if needed, perform sorting
@@ -2738,14 +3069,27 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
     // destination effect even when source and destination share a shard: the same-shard verbatim
     // recipe replay applies this fetch's DEL first and early-returns on the now-missing source
     // (the sort_status != OK path below) without ever reaching OpStore, silently dropping the
-    // destination delete a peer would need to converge.
+    // destination delete a peer would need to converge. (Before P7-1; that path now runs
+    // SortStoreNothing, and this flag stays for replicas of an older build, see OpStore.)
     bool source_deleted_by_fetch = false;
 
     // Handle BY pattern with external key lookups
     if (params.by_pattern) {
       DCHECK(source_type == OBJ_SET || source_type == OBJ_ZSET || source_type == OBJ_LIST);
+      // drakeydb: P7-1 (decision 37) -- ALPHA BY ties keep the fetch order of a list or an integer
+      // set; SortTiesInFetchOrder may reorder raw_elements, so it runs before the entries bind to
+      // it.
+      params.ties_in_fetch_order = params.alpha && SortTiesInFetchOrder(source_type, &raw_elements);
       sort_status =
           PopulateSortEntriesFromByPattern(params, raw_elements, db_cntx, &sorted_entries);
+    } else if (nosort_set_sorted) {
+      // drakeydb: P7-1 (decision 34) -- the elements are already fetched (the unsorted path above);
+      // sort them as they are. A STORE of them is the same single concluding hop as before.
+      auto& entries = std::get<vector<SortEntry<true>>>(sorted_entries);
+      entries.reserve(raw_elements.size());
+      for (string& element : raw_elements)
+        entries.emplace_back().Parse(std::move(element));
+      raw_elements.clear();
     } else {  // No BY pattern, sort directly on fetched elements
       OpResult<CompactObjType> fetch_result;
       auto fetch_cb = [&](Transaction* t, EngineShard* shard) {
@@ -2756,7 +3100,18 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
           // A failed SORT may still have journaled an SREM for members removed by lazy expiry,
           // but the failed SORT itself must not be auto-journaled. Propagate the operation status
           // to Transaction::LogAutoJournalOnShard instead of masking it with OK.
-          return fetch_result.status();
+          //
+          // drakeydb: P7-1 (decision 32) -- only on a single-shard transaction. On a multi-shard
+          // one RunCallback CHECK-fails on any hop result but OK (a missing, wrong-type or
+          // unparsable source plus a STORE destination on another shard aborted the server, release
+          // builds included), and nothing there auto-journals anyway (SORT is NO_AUTOJOURNAL and
+          // is revived only for a single shard). The failure reaches the code below through
+          // fetch_result either way. With STORE this hop is not the concluding one, so for a
+          // missing source the journal sees SortStoreNothing's hop instead (SKIPPED on one shard:
+          // the wire is `DEL dst` alone, or nothing when there was no dst); a wrong-type or
+          // unparsable source concludes through the empty Conclude() below and still journals the
+          // verbatim SORT on one shard (ISSUE-REGISTER D-33).
+          return t->GetUniqueShardCnt() == 1 ? fetch_result.status() : OpStatus::OK;
         }
         return OpStatus::OK;
       };
@@ -2768,6 +3123,10 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
 
     if (sort_status != OpStatus::OK) {
       DVLOG(2) << "Sorting failed with status " << sort_status;
+      // drakeydb: P7-1 (decision 32) -- a missing source with STORE deletes the destination and
+      // replies 0, as in Redis; before the Conclude, SortStoreNothing runs the concluding hop.
+      if (sort_status == OpStatus::KEY_NOTFOUND && params.store_key)
+        return SortStoreNothing(params.store_key.value(), cmd_cntx);
       cmd_cntx->tx()->Conclude();
       if (sort_status == OpStatus::WRONG_TYPE)
         return cmd_cntx->SendError(sort_status);
@@ -2776,8 +3135,7 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
       return static_cast<RedisReplyBuilder*>(cmd_cntx->rb())->SendEmptyArray();
     }
 
-    SortVisitor visitor{params, source_type, cmd_cntx, std::move(raw_elements),
-                        source_deleted_by_fetch};
+    SortVisitor visitor{params, cmd_cntx, std::move(raw_elements), source_deleted_by_fetch};
     std::visit(visitor, sorted_entries);
     return;
   }
@@ -2787,16 +3145,17 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
   DCHECK(!raw_elements.empty());
 
   // Fetch GET pattern values if needed (for unsorted path)
-  vector<vector<string>> get_values_per_element;
+  vector<vector<optional<string>>> get_values_per_element;
   if (!params.get_patterns.empty()) {
     // Pre-allocate storage for GET pattern values
-    get_values_per_element.resize(raw_elements.size(), vector<string>(params.get_patterns.size()));
+    get_values_per_element.resize(raw_elements.size(),
+                                  vector<optional<string>>(params.get_patterns.size()));
 
     // Use generic fetcher with lambdas to access raw_elements and store in get_values_per_element
     FetchGetPatternValues(
         params, db_cntx, raw_elements,
         [&](size_t idx) -> std::string_view { return raw_elements[idx]; },
-        [&](size_t elem_idx, size_t pattern_idx, string value) {
+        [&](size_t elem_idx, size_t pattern_idx, optional<string> value) {
           get_values_per_element[elem_idx][pattern_idx] = std::move(value);
         });
   }
@@ -2826,7 +3185,7 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
 
     auto store_cb = [&](Transaction* t, EngineShard* shard) {
       if (shard->shard_id() == dest_sid) {
-        // The unsorted fetch early-returns when its own lazy expiry emptied the source
+        // The unsorted fetch hands a source its own lazy expiry emptied to SortStoreNothing
         // (OpFetchContainerElements), so a deleted source can never reach this store.
         store_len = OpStore(t->GetOpArgs(shard), store_key_sv, entries.begin(), entries.end(),
                             has_get_patterns, /*source_deleted_by_fetch=*/false);
@@ -2843,21 +3202,24 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
     return;
   }
 
-  auto replier = [raw_elements = std::move(raw_elements), params, source_type,
+  auto replier = [raw_elements = std::move(raw_elements), params,
                   get_values = std::move(get_values_per_element)](RedisReplyBuilder* rb) {
     auto [start_it, end_it] = GetSortRange(raw_elements, params.bounds);
-    bool is_set = (source_type == OBJ_SET || source_type == OBJ_ZSET);
     size_t num_entries = std::distance(start_it, end_it);
     size_t collection_size =
         !get_values.empty() ? num_entries * get_values.front().size() : num_entries;
 
-    rb->StartCollection(collection_size, is_set ? CollectionType::SET : CollectionType::ARRAY);
+    // drakeydb: P7-1 (decision 38) -- an array whatever the source, see SortVisitor.
+    rb->StartArray(collection_size);
 
     size_t elem_idx = start_it - raw_elements.begin();
     for (auto it = start_it; it != end_it; ++it, ++elem_idx) {
       if (!get_values.empty() && !get_values[elem_idx].empty()) {
         for (const auto& value : get_values[elem_idx]) {
-          rb->SendBulkString(value);
+          if (value)
+            rb->SendBulkString(*value);
+          else
+            rb->SendNull();
         }
       } else {
         rb->SendBulkString(*it);

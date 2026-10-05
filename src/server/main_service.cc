@@ -1425,9 +1425,12 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId& cid,
     case GlobalState::TAKEN_OVER:
       // Only PING, admin commands, and all commands via admin connections are allowed
       // we prohibit even read commands, because read commands running in pipeline can take a while
-      // to send all data to a client which leads to fail in takeover
-      allowed_by_state =
-          dfly_cntx.conn()->IsPrivileged() || (cid.opt_mask() & CO::ADMIN) || cid.name() == "PING";
+      // to send all data to a client which leads to fail in takeover.
+      // drakeydb: U-10 -- a context without a connection is a replicated apply (see above): a
+      // cascaded node keeps applying its own master's stream while it is being taken over, and
+      // refusing that would drop writes.
+      allowed_by_state = dfly_cntx.conn() == nullptr || dfly_cntx.conn()->IsPrivileged() ||
+                         (cid.opt_mask() & CO::ADMIN) || cid.name() == "PING";
       break;
     default:
       break;
@@ -1644,7 +1647,9 @@ DispatchResult Service::DispatchCommand(facade::ParsedArgs args, facade::ParsedC
 
   if ((res != DispatchResult::OK) && (res != DispatchResult::OOM)) {
     cmd_cntx->SendError("Internal Error");
-    dfly_cntx->conn()->MarkForClose();
+    // drakeydb: U-12 -- a replicated apply (see VerifyCommandState) has no connection to close.
+    if (auto* conn = dfly_cntx->conn(); conn != nullptr)
+      conn->MarkForClose();
   }
 
   return res;
@@ -1991,7 +1996,9 @@ void Service::Quit(CmdArgParser, CommandContext* cmd_cntx) {
 
   auto* cntx = cmd_cntx->server_conn_cntx();
   DeactivateMonitoring(cntx);
-  cmd_cntx->conn()->MarkForClose();
+  // drakeydb: U-15 -- a replicated apply has no connection to close (see DispatchCommand, U-12).
+  if (auto* conn = cmd_cntx->conn(); conn != nullptr)
+    conn->MarkForClose();
 }
 
 void Service::Reset(CmdArgParser, CommandContext* cmd_cntx) {
@@ -2044,6 +2051,11 @@ void Service::Multi(CmdArgParser, CommandContext* cmd_cntx) {
 }
 
 void Service::Watch(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- a replicated apply has no connection to watch for: the shards would keep a
+  // pointer to the dirty flag of the apply context, which is gone when the link ends, and the next
+  // write to the key or FLUSHDB would store through it.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
   auto* cntx = cmd_cntx->server_conn_cntx();
   auto& exec_info = cntx->conn_state.exec_info;
 
@@ -2455,8 +2467,10 @@ void Service::EvalInternal(const EvalArgs& eval_args, Interpreter* interpreter, 
       return OpStatus::OK;
     });
 
-    // Migration only makes sense if there are distinct shards
-    if (sid.has_value() && *sid != ss->thread_index()) {
+    // Migration only makes sense if there are distinct shards.
+    // drakeydb: U-9 -- and for a context that has a connection to migrate: a replicated apply
+    // (Replica, JournalExecutor) has none.
+    if (sid.has_value() && *sid != ss->thread_index() && conn_cntx->conn() != nullptr) {
       VLOG(2) << "Migrating connection " << conn_cntx->conn() << " from "
               << ProactorBase::me()->GetPoolIndex() << " to " << real_sid;
       conn_cntx->conn()->RequestAsyncMigration(shard_set->pool()->at(real_sid), false);
@@ -2727,6 +2741,10 @@ void Service::Publish(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void Service::Subscribe(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- a replicated apply has no connection to subscribe: the channel store would
+  // keep a subscriber it cannot reach, and the first PUBLISH of a client would dereference it.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
   bool sharded = cmd_cntx->cid()->IsShardedPubSub();
   if (!sharded && IsClusterEnabled())
     return cmd_cntx->SendError("SUBSCRIBE is not supported in cluster mode yet");
@@ -2752,6 +2770,9 @@ void Service::Unsubscribe(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void Service::PSubscribe(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- see Subscribe.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
 
   if (IsClusterEnabled()) {
@@ -2807,6 +2828,10 @@ void Service::PubsubNumSub(ParsedArgs channels, SinkReplyBuilder* builder) {
 }
 
 void Service::Monitor(CmdArgParser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- a replicated apply has no connection to monitor with: the monitor list would
+  // keep a null connection and the next command of any client would dereference it.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
   VLOG(1) << "starting monitor on this connection: "
           << cmd_cntx->server_conn_cntx()->conn()->GetClientId();
   // we are registering the current connection for all threads so they will be aware of

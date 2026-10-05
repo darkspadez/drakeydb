@@ -4,8 +4,10 @@ import os
 import random
 import re
 import shlex
+import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -13,6 +15,7 @@ from dataclasses import dataclass
 
 import aiohttp
 import psutil
+import redis
 from prometheus_client.parser import text_string_to_metric_families
 from redis.asyncio import Redis as RedisClient
 from redis.asyncio import RedisCluster as RedisCluster
@@ -564,10 +567,28 @@ class RedisServer:
         self.log_dir = log_dir
         self.server_bin = None
 
+    @staticmethod
+    def _major_version(binary):
+        """The major version `binary --version` reports ('Redis server v=7.0.15 ...'), else 0."""
+        try:
+            out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return 0
+        match = re.search(r"\bv=(\d+)\.", out.stdout)
+        return int(match.group(1)) if match else 0
+
     def start(self, redis7=None, **kwargs):
         servers = ["redis-server-7.2.2"]
         if not redis7:
             servers += ["redis-server-6.2.11", "valkey-server-8.0.1"]
+        if not any(shutil.which(s) for s in servers):
+            # drakeydb: none of the version-suffixed CI binaries is installed (a developer machine):
+            # use the configured server, else a plain `redis-server` on PATH, but only one that
+            # satisfies the request. Without a fallback the Popen below raises FileNotFoundError,
+            # which the fixtures turn into a skip outside CI.
+            fallback = os.environ.get("REDIS_SERVER_PATH") or shutil.which("redis-server")
+            if fallback and (not redis7 or self._major_version(fallback) >= 7):
+                servers = [fallback]
         self.server_bin = random.choice(servers)
         command = [
             self.server_bin,
@@ -610,3 +631,198 @@ class RedisServer:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 logging.error(f"{ident} did not exit after SIGKILL within 5s")
+
+
+class KeyDBServer:
+    """A KeyDB (https://github.com/Snapchat/KeyDB) process, used by the onboarding interop tests.
+
+    The binary is $KEYDB_SERVER_PATH, else `keydb-server` on PATH (see find_binary). With
+    active_replica a KeyDB accepts writes while replicating and wraps what it sends its replicas
+    in RREPLAY envelopes. Config names are KeyDB's own, so they differ from Redis in places
+    (`multi-master-no-forward`, not `multimaster-no-forward`).
+    """
+
+    def __init__(
+        self,
+        port,
+        log_dir=None,
+        active_replica=True,
+        multi_master=False,
+        no_forward=True,
+        **extra_args,
+    ):
+        if multi_master and not active_replica:
+            raise ValueError("KeyDB refuses to start with multi-master but without active-replica")
+        self.port = port
+        self.active_replica = active_replica
+        self.multi_master = multi_master
+        self.no_forward = no_forward
+        self.extra_args = extra_args
+        self.log_path = os.path.join(log_dir, f"keydb-server-{port}.log") if log_dir else None
+        self.proc = None
+        self.server_bin = None
+        self._owned_dir = None
+
+    @staticmethod
+    def find_binary():
+        """Path of the keydb-server to run, or None when there is none.
+
+        A KEYDB_SERVER_PATH that is set must resolve to an executable: it is never replaced by a
+        `keydb-server` found on PATH, so a mistyped path cannot run a different KeyDB.
+        """
+        return shutil.which(os.environ.get("KEYDB_SERVER_PATH") or "keydb-server")
+
+    @staticmethod
+    def required():
+        """Whether a missing keydb-server must fail the tests instead of skipping them."""
+        return os.environ.get("KEYDB_REQUIRED", "").strip().lower() in ("1", "true", "yes")
+
+    @classmethod
+    def unavailable(cls):
+        """None when a keydb-server can be started, else (reason, fatal) for tests that need one.
+
+        `fatal` says they must fail instead of skipping: the gate and CI runs ask for that with
+        KEYDB_REQUIRED, and a KEYDB_SERVER_PATH that is set but is not an executable is always
+        fatal, because someone asked for that binary and a typo must not look like an absent KeyDB.
+        """
+        if cls.find_binary() is not None:
+            return None
+        configured = os.environ.get("KEYDB_SERVER_PATH")
+        if configured:
+            return f"KEYDB_SERVER_PATH={configured!r} is not an executable", True
+        return "keydb-server not found (set KEYDB_SERVER_PATH or add it to PATH)", cls.required()
+
+    def _config(self):
+        """Config directives for the command line, keyed by directive name."""
+        config = {
+            "port": self.port,
+            "save": "",
+            "appendonly": "no",
+            "protected-mode": "no",
+            "repl-diskless-sync": "yes",
+            "repl-diskless-sync-delay": 0,
+            "server-threads": 1,
+        }
+        if self.active_replica:
+            config["active-replica"] = "yes"
+            # Only an active replica forwards what it replays, so the option is only passed to one.
+            # KeyDB logs a warning whenever it is set to yes (validateMultiMasterNoForward in its
+            # config.cpp): expect it in the log of a default KeyDBServer.
+            config["multi-master-no-forward"] = self.no_forward
+        if self.multi_master:
+            config["multi-master"] = "yes"
+        if self.log_path:
+            config["logfile"] = self.log_path
+        if self._owned_dir:
+            config["dir"] = self._owned_dir
+        for key, value in self.extra_args.items():
+            config[key.replace("_", "-")] = value
+        return config
+
+    def _command(self):
+        def spell(value):
+            return ("yes" if value else "no") if isinstance(value, bool) else str(value)
+
+        command = [self.server_bin]
+        for key, value in self._config().items():
+            if value is None:
+                continue
+            values = value if isinstance(value, (list, tuple)) else [value]
+            # KeyDB reads a directive's values from the argv entries after it, so `--save ""`
+            # is two entries.
+            command.append(f"--{key}")
+            command.extend(spell(v) for v in values)
+        return command
+
+    def start(self, timeout=15):
+        self.server_bin = self.find_binary()
+        if self.server_bin is None:
+            raise FileNotFoundError("keydb-server not found: set KEYDB_SERVER_PATH or add to PATH")
+        if "dir" not in self.extra_args:
+            # Keeps the rdb files of a disk-based sync out of the cwd, which is the repo root.
+            self._owned_dir = tempfile.mkdtemp(prefix="keydb-")
+
+        # drakeydb: P7-1 (SORT review M5) -- LC_ALL=C pins the locale a KeyDB sorts ALPHA replies in:
+        # SORT .. ALPHA compares with strcoll(), which follows the inherited locale (a mixed-case
+        # list sorts "a" before "B" under en_US.UTF-8), where drakeydb is bytewise like the C locale
+        # (and like KeyDB's STORE, which compares bytes whatever the locale).
+        self.proc = subprocess.Popen(self._command(), env={**os.environ, "LC_ALL": "C"})
+        logging.info(f"Started {self.server_bin} on port {self.port}, pid={self.proc.pid}")
+        try:
+            self._wait_ready(timeout)
+        except BaseException:
+            self.stop()
+            raise
+
+    def _served_by(self):
+        """The pid of the server answering on our port, or None while nothing answers."""
+        try:
+            # RESP2: a plain INFO, and no HELLO for a stub or an old server to trip over.
+            with redis.Redis(port=self.port, socket_timeout=1, protocol=2) as r:
+                return int(r.info("server")["process_id"])
+        except (redis.RedisError, OSError, KeyError, ValueError):
+            return None
+
+    def _wait_ready(self, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ret = self.proc.poll()
+            if ret is not None:
+                raise RuntimeError(
+                    f"keydb-server on port {self.port} exited with code {ret} during startup\n"
+                    f"{self.log_tail()}"
+                )
+            pid = self._served_by()
+            if pid == self.proc.pid:
+                return
+            if pid is not None:
+                # Anything answering is not enough: a stale server on a reused port would pass for
+                # ours while the one we started fails to bind.
+                raise RuntimeError(
+                    f"port {self.port} is served by process {pid}, not by the keydb-server we "
+                    f"started (pid {self.proc.pid})\n{self.log_tail()}"
+                )
+            time.sleep(0.05)
+        raise TimeoutError(
+            f"keydb-server on port {self.port} did not answer INFO in {timeout}s\n"
+            f"{self.log_tail()}"
+        )
+
+    def log_tail(self, lines=20):
+        if not self.log_path or not os.path.exists(self.log_path):
+            return ""
+        with open(self.log_path, errors="replace") as f:
+            return "".join(f.readlines()[-lines:])
+
+    def log_text(self):
+        """Everything the server has logged so far ("" without a log)."""
+        if not self.log_path or not os.path.exists(self.log_path):
+            return ""
+        with open(self.log_path, errors="replace") as f:
+            return f.read()
+
+    def client(self, **kwargs) -> RedisClient:
+        """A new asyncio client for this server; the caller closes it."""
+        return RedisClient(host="localhost", port=self.port, decode_responses=True, **kwargs)
+
+    def stop(self):
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            ident = f"keydb-server (port={self.port}, pid={proc.pid})"
+            ret = proc.poll()
+            if ret is not None:
+                logging.error(f"{ident} already exited with code {ret}")
+            else:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    logging.error(f"{ident} did not terminate in 10s; sending SIGKILL")
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        logging.error(f"{ident} did not exit after SIGKILL within 5s")
+        if self._owned_dir:
+            shutil.rmtree(self._owned_dir, ignore_errors=True)
+            self._owned_dir = None

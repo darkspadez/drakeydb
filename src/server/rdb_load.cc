@@ -2420,6 +2420,15 @@ error_code RdbLoader::Load(io::Source* src) {
   src_ = src;
 
   IoBuf::Bytes bytes = mem_buf_->AppendBuffer();
+  // drakeydb: P7 -- the first read honors the source limit like every later one. Unclamped it pulls
+  // whatever follows the RDB on the wire (a classic master's replication stream) into mem_buf_ and
+  // bytes_read_ overshoots the declared size, so the caller cannot tell the RDB's end from its
+  // read.
+  if (source_limit_ < bytes.size()) {
+    if (source_limit_ < 9)
+      return RdbError(errc::wrong_signature);
+    bytes = bytes.subspan(0, source_limit_);
+  }
   io::Result<size_t> read_sz = src_->ReadAtLeast(bytes, 9);
   if (!read_sz)
     return read_sz.error();
@@ -2805,6 +2814,15 @@ error_code RdbLoaderBase::EnsureReadInternal(size_t min_to_read) {
   // important when reading from sockets.
   if (bytes_read_ + out_buf.size() > source_limit_) {
     out_buf = out_buf.subspan(0, source_limit_ - bytes_read_);
+  }
+
+  // drakeydb: P7 -- an RDB that runs past its declared size (a master's malformed `$<len>`) leaves
+  // fewer bytes under the limit than the read needs; that is a corrupt RDB, and ReadAtLeast
+  // DCHECKs on a destination smaller than its minimum.
+  if (out_buf.size() < min_sz) {
+    LOG(ERROR) << "Out of bound read " << min_sz << " bytes with " << out_buf.size()
+               << " left under the source limit " << source_limit_;
+    return RdbError(errc::rdb_file_corrupted);
   }
 
   io::Result<size_t> res = src_->ReadAtLeast(out_buf, min_sz);

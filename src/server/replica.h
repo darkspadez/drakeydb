@@ -13,6 +13,7 @@
 #include "facade/facade_types.h"
 #include "facade/redis_parser.h"
 #include "io/io_buf.h"
+#include "server/classic_replay.h"  // drakeydb: P7 -- ClassicLinkStats (classic_stats_)
 #include "server/cluster/cluster_defs.h"
 #include "server/execution_state.h"
 #include "server/journal/tx_executor.h"
@@ -133,6 +134,9 @@ class Replica : ProtocolClient {
   // if a stable sync is interrupted to join the cancelled stable sync fibers.
   void JoinDflyFlows();
   void SetShardStates(bool replica);  // Call SetReplica(replica) on all shards.
+  // drakeydb: P7 -- Call SetReplicaActiveExpiry(enabled) on all shards, for the main link of a
+  // non-peer node only (see SetMainLink); a no-op for any other link.
+  void ApplyReplicaActiveExpiry(bool enabled);
   bool EnterLoadingState();
 
   // drakeydb: releases this peer-mode Replica's live UUID admission, if one was claimed.
@@ -163,6 +167,14 @@ class Replica : ProtocolClient {
   // drakeydb: true if this Replica was constructed with peer_mode set (see ReplicaPeerMode).
   bool IsPeerMode() const {
     return peer_mode_.has_value();
+  }
+
+  // drakeydb: P7 -- marks the node's main link, ServerFamily::replica_. Only that link drives the
+  // shards' replica active expiry flag (ApplyReplicaActiveExpiry): an ADDREPLICAOF link shares
+  // SetShardStates (last writer wins) and never touches it. Not `!slot_range_`: REPLICAOF
+  // <host> <port> <start> <end> gives the main link a slot range too. Call before the link starts.
+  void SetMainLink() {
+    main_link_ = true;
   }
 
   // The replication id of the lineage root master. Equals the direct master's id, unless the
@@ -259,6 +271,9 @@ class Replica : ProtocolClient {
   // drakeydb: set iff this Replica is a peer-mode replica of an active node (see IsPeerMode()).
   std::optional<ReplicaPeerMode> peer_mode_;
 
+  // drakeydb: P7 -- set iff this is the node's main link, see SetMainLink().
+  bool main_link_ = false;
+
   // drakeydb: Phase 3 T6 -- the PeerRegistry origin index for master_context_.master_node_uuid,
   // captured by Greet() from PeerRegistry::AddOrGet(). Threaded down to each DflyShardReplica
   // (see InitiateDflySync) and to ConsumeRedisStream's own ConnectionContext, so writes applied
@@ -284,6 +299,37 @@ class Replica : ProtocolClient {
   // (multi_master.h). Atomic: read from the INFO fiber via GetSummary(), written from the
   // replication fiber running Greet().
   std::atomic<int64_t> clock_skew_ms_{0};
+
+  // drakeydb: P7 -- true iff the master answered a `REPLCONF capa` of this connection's Greet()
+  // with the `active-replica` word (an active KeyDB does). Cleared at the top of every Greet().
+  // Not atomic: Greet() runs from Replica::Start in the REPLICAOF caller's fiber, on this
+  // Replica's own thread and before the replication fiber starts, and from the replication fiber
+  // after that, so the two never overlap. It is set by the capa reply, which is not the last step
+  // of Greet(): after a failed Greet() it may be stale. So the replica active expiry decision
+  // (ApplyReplicaActiveExpiry) reads it only once R_GREETED is set in state_mask_. INFO does not:
+  // it reads classic_master_was_active_ below.
+  bool master_active_replica_ = false;
+
+  // drakeydb: P7 -- the last Greet() that completed found a classic (Redis protocol) master, not a
+  // DFLY one. Unlike master_active_replica_ it is not cleared when a reconnect starts, so that a
+  // link that is down keeps showing the counters it has (ClassicLinkShown). Same threads as above.
+  bool classic_master_ = false;
+
+  // drakeydb: P7 -- some Greet() of this Replica completed with a classic master that answered
+  // `active-replica`. Set beside classic_master_ and never cleared, by a reconnect or a failed
+  // Greet() either, so that INFO keeps showing the zero counters of an active KeyDB's link while it
+  // is down (spec D-13: "shown whatever its state"). Same threads as above.
+  bool classic_master_was_active_ = false;
+
+  // drakeydb: P7 -- what ConsumeRedisStream's ClassicApplier counted over this Replica's life
+  // (RREPLAY envelopes unwrapped, malformed, self-authored, commands that did not apply).
+  ClassicLinkStats classic_stats_;
+
+  // drakeydb: P7 -- replication stream bytes already read from the master but not yet applied: what
+  // follows a correct classic full sync (InitiatePSync), and the hand-off point for any later
+  // phase that over-reads. ConsumeRedisStream parses them before it reads the socket, so they are
+  // counted into repl_offs_ like any other stream byte. Only the replication fiber touches it.
+  std::string pending_stream_bytes_;
 };
 
 class RdbLoader;

@@ -457,6 +457,153 @@ async def test_active_replica_merges_redis_full_sync_via_synthetic_uuid(
         await r.aclose()
 
 
+CAPA_SITES = [b"REPLCONF capa eof", b"REPLCONF capa dragonfly"]
+CAPA_SITE_IDS = ["capa_eof", "capa_dragonfly"]
+
+
+@pytest.mark.parametrize("capa_request", CAPA_SITES, ids=CAPA_SITE_IDS)
+@pytest.mark.parametrize(
+    "capa_reply",
+    [
+        b"+OK keydb-fastsync-save\r\n",
+        b"+OK some-future-word keydb-fastsync-save\r\n",
+        b"+OK active-replica\r\n",
+        b"+OK active-replica keydb-fastsync-save\r\n",
+    ],
+    ids=["fastsync", "unknown_word", "active", "active_fastsync"],
+)
+async def test_greet_accepts_capa_reply_with_capability_words(
+    df_factory: DflyInstanceFactory, redis_server, proxy_factory, tmp_path, capa_request, capa_reply
+):
+    """A KeyDB appends capability words to its `REPLCONF capa ...` replies (`+OK
+    keydb-fastsync-save`; an active one also says `active-replica`), and Replica::Greet() must take
+    `OK <words>` as an OK at both capa sites: `REPLCONF capa eof capa psync2` and the Redis branch
+    of `REPLCONF capa dragonfly`.
+
+    A proxy in front of a real Redis master overrides the reply to one capa command (the override
+    only ever hits the first matching reply, hence one site per case); everything else the master
+    says is untouched, so the full sync is a real one.
+
+    Falsifying: with Greet() back on the strict CheckRespIsSimpleReply("OK") at either site,
+    REPLICAOF raises "replication cancelled" and the log names `Bad response to "REPLCONF capa
+    ...": "+OK keydb-fastsync-save\\r\\n"`.
+    """
+    import redis.asyncio as aioredis
+
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "plain"))
+    node.start()
+    c = node.client()
+    r = aioredis.Redis(port=redis_server.port, decode_responses=True)
+    proxy = await proxy_factory(redis_server.port)
+    try:
+        await r.set("seeded", "v")
+        await proxy.override_next_response(capa_request, capa_reply)
+        # drakeydb: P7-1 Task 1.4 -- the `active-replica` replies make this replica believe its
+        # master is an active KeyDB: it sends `REPLCONF capa activeExpire` as well (the real Redis
+        # behind the proxy answers +OK) and, once greeted, turns on the shard flag that makes it
+        # expire keys itself. Nothing here sets a TTL, so no assertion below depends on it.
+        assert await c.execute_command(f"REPLICAOF localhost {proxy.port}") == "OK"
+        await wait_available_async(c)
+
+        @assert_eventually(times=100)
+        async def synced():
+            info = await c.info("replication")
+            assert info["role"] == "slave" and info["master_link_status"] == "up", info
+            assert await c.get("seeded") == "v"
+
+        await synced()
+        await r.set("streamed", "v2")
+
+        @assert_eventually(times=100)
+        async def streamed():
+            assert await c.get("streamed") == "v2"
+
+        await streamed()
+    finally:
+        await r.aclose()
+
+
+@pytest.mark.parametrize("capa_request", CAPA_SITES, ids=CAPA_SITE_IDS)
+@pytest.mark.parametrize(
+    "bad_reply",
+    [b"+OKAY\r\n", b"+ok active-replica\r\n", b"+OKactive-replica\r\n", b"+active-replica\r\n"],
+    ids=["okay", "lowercase", "no_space", "no_ok"],
+)
+async def test_greet_still_refuses_malformed_capa_reply(
+    df_factory: DflyInstanceFactory, redis_server, proxy_factory, tmp_path, capa_request, bad_reply
+):
+    """The suffix tolerance of test_greet_accepts_capa_reply_with_capability_words is exactly `OK`
+    or `OK <words>`: any other capa reply is still a bad response that refuses the link.
+
+    Falsifying: with ParseCapaReply no longer requiring a space after "OK" (classic_replay.cc),
+    the okay and no_space cases are not refused and REPLICAOF succeeds instead of raising.
+    """
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "plain"))
+    node.start()
+    c = node.client()
+    proxy = await proxy_factory(redis_server.port)
+    await proxy.override_next_response(capa_request, bad_reply)
+    with pytest.raises(redis.exceptions.ResponseError, match="replication cancelled"):
+        await c.execute_command(f"REPLICAOF localhost {proxy.port}")
+    assert (await c.info("replication"))["role"] == "master"
+
+
+@pytest.mark.keydb
+@pytest.mark.parametrize("diskless", ["no", "yes"], ids=["disk_based_sync", "diskless_sync"])
+async def test_plain_replica_of_keydb_applies_stream_flushed_behind_full_sync(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, diskless
+):
+    """A classic master queues the writes it takes while it produces the RDB and flushes them right
+    behind it, often in the same segment as the RDB's end (a disk-based sync's `$<len>`, KeyDB's own
+    default; a diskless one only after the replica's first ACK). Those bytes are the start of the
+    replication stream, not a malformed tail: dropping them loses writes, and treating them as an
+    error aborts the replica (a CHECK in Replica::InitiatePSync) or makes it resync forever.
+
+    A plain KeyDB master takes an INCR loop while a plain drakeydb replica attaches, six times; once
+    the loop stops, the replica's counter must equal KeyDB's exactly (a lost or repeated command
+    shows) and the replica must never have called the tail malformed.
+
+    This is a smoke test against a live KeyDB, not a deterministic one: whether the RDB's end lands
+    in the loader's first read depends on timing. On the build without the fix the disk-based
+    variant aborted the replica (ISSUE-REGISTER U-11) in 4 of 8 runs; the diskless variant never did
+    in 8, which makes it the control (KeyDB streams only after the replica's first ACK there, so
+    there is nothing behind the RDB to over-read). The deterministic coverage is the fake-master
+    tests of keydb_onboarding_test.py (test_psync_stream_bytes_behind_full_sync_are_applied and the
+    malformed-tail tests).
+    """
+    keydb = keydb_server_factory(active_replica=False, repl_diskless_sync=diskless)
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"))
+    node.start()
+    c = node.client()
+
+    async with keydb.client() as k:
+        await k.mset({f"key{i}": i for i in range(5)})
+        for _ in range(6):
+
+            async def incr_loop(stop):
+                while not stop.is_set():
+                    await k.incr("counter")
+
+            stop = asyncio.Event()
+            writer = asyncio.create_task(incr_loop(stop))
+            try:
+                assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+                await wait_available_async(c)
+            finally:
+                stop.set()
+                await writer
+            expected = await k.get("counter")
+
+            @assert_eventually(times=100)
+            async def converged():
+                assert await c.get("counter") == expected
+
+            await converged()
+            await c.execute_command("REPLICAOF NO ONE")
+    node.stop()
+    assert not node.find_in_logs("Bad full sync tail")
+
+
 async def test_harness_gives_each_instance_a_distinct_identity(df_factory: DflyInstanceFactory):
     # No dir= on purpose: these share the session cwd, so without the harness default they would
     # all load the same drakeydb.uuid file.

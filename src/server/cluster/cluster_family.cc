@@ -438,6 +438,14 @@ void ClusterFamily::Cluster(CmdArgParser parser, CommandContext* cmd_cntx) {
     return builder->SendError(WrongNumArgsError(absl::StrCat("CLUSTER ", sub_cmd)));
   }
 
+  // drakeydb: U-15 -- the emulated node answers these four with the address its client connected
+  // to (GetEmulatedShardInfo), and a replicated apply has no connection. The other cluster modes
+  // answer from the config and are not touched.
+  if (IsClusterEmulated() && cmd_cntx->conn() == nullptr &&
+      (sub_cmd == "SHARDS" || sub_cmd == "SLOTS" || sub_cmd == "NODES" || sub_cmd == "INFO")) {
+    return builder->SendError("No connection");
+  }
+
   auto* cntx = cmd_cntx->server_conn_cntx();
   if (sub_cmd == "HELP") {
     return ClusterHelp(builder);
@@ -832,6 +840,9 @@ void ClusterFamily::DflySlotMigrationStatus(CmdArgParser parser, CommandContext*
 
 void ClusterFamily::DflyMigrate(CmdArgParser parser, CommandContext* cmd_cntx) {
   string sub_cmd = absl::AsciiStrToUpper(parser.Next());
+  // drakeydb: U-21 -- `DFLYMIGRATE` alone passes the arity check, and a parser error nobody took
+  // fails the parser's destructor assert in a debug build.
+  RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
 
   if (sub_cmd == "INIT") {
     InitMigration(parser, cmd_cntx);
@@ -994,6 +1005,12 @@ void ClusterFamily::InitMigration(CmdArgParser parser, CommandContext* cmd_cntx)
 }
 
 void ClusterFamily::DflyMigrateFlow(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- a flow is the connection it arrives on: named here, migrated and handed to
+  // the migration below. A replicated apply has none, and DFLYMIGRATE is registered in every
+  // cluster mode, so a classic master can stream this. INIT and ACK never read the connection.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
+
   auto [source_id, shard_id] = parser.Next<std::string_view, uint32_t>();
 
   RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
@@ -1085,7 +1102,10 @@ void ClusterFamily::DflyMigrateAck(CmdArgParser parser, CommandContext* cmd_cntx
   RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
 
   VLOG(1) << "DFLYMIGRATE ACK" << ack_args;
-  auto in_migrations = ClusterConfig::Current()->GetIncomingMigrations();
+  // drakeydb: U-21 -- no config yet (cluster mode off, or none pushed) is no incoming migration at
+  // all, answered as one that is not in the config.
+  auto config = ClusterConfig::Current();
+  auto in_migrations = config ? config->GetIncomingMigrations() : std::vector<MigrationInfo>{};
   auto m_it = rng::find_if(in_migrations, [source_id = source_id](const auto& m) {
     return m.node_info.id == source_id;
   });
