@@ -115,10 +115,40 @@ under `nosort` with `STORE` or in a script, for a list or sorted set under `noso
 for a missing `ALPHA BY` weight. A set under plain `BY nosort`, neither stored nor scripted, still
 comes out in its own iteration order, which Redis leaves open too.
 
-**Limitation:** with `ALPHA` and `BY`, the order of two elements that have the same `BY` value is
-the order Redis's own sort received them in (its sort is not stable), so a replica of a Redis or
-KeyDB master can still order such ties differently from its master. drakeydb breaks them on the
-element.
+Round 2a (P7-1, owner decisions 36, 37 and 38) brought `SORT` in line with Redis and KeyDB in six
+more places, all of them visible to a client and none of them a journal change:
+
+- **`LIMIT`.** The arguments parse as Redis parses integers (no `+`, no leading zero, no space, none
+  beyond `long long`; the same error text) and are clamped as Redis clamps them: a negative offset is
+  0, a negative count means everything from the offset on, so `LIMIT 0 -1` is all of it, and an offset
+  or count past the end is cut there. Upstream Dragonfly rejected a negative argument and one beyond
+  32 bits.
+- **`GET`.** A key that is missing or not a string, and a pattern without `*`, are nil in the reply
+  (`$-1` in RESP2, `_` in RESP3) and an empty string in the list `STORE` leaves. Upstream replied
+  an empty string for a missing key, and read the key named by a pattern without `*`.
+- **Several `*` in a `BY` or `GET` pattern.** Only the first is replaced by the element and the rest
+  are literal. Upstream answered `syntax error`.
+- **Numbers.** A numeric element or `BY` weight is loaded as Redis loads it: C `strtod` over the bytes
+  up to the first NUL (`"5\0x"` is 5), refused when anything follows the number (`"5 "`), on overflow
+  and underflow (`1e400`, `1e-400`, and the denormals) and on NaN. Leading whitespace, hex (`0x10`)
+  and `inf` are accepted. Upstream accepted trailing whitespace and out-of-range numbers and refused a
+  NUL.
+- **`ALPHA BY` ties.** Elements with the same weight keep the order they were read in for a list and
+  for a set that Redis would hold as an intset (all members integers, at most 512 of them: then in
+  ascending numeric order), `DESC` included, as Redis's stable `qsort` does; for any other set and for
+  a sorted set they are ordered by the element. Upstream left them in the order the source iterated.
+- **RESP3.** A `SORT` or `SORT_RO` of a set or sorted set replies an array, not the set type.
+
+**Limitations of `ALPHA BY` ties.** What a replica of a Redis or KeyDB master cannot follow is only
+what the master's own order depends on: a hash-encoded set or a sorted set is read in a per-process
+order, so there drakeydb orders ties by the element; a set the master holds as a hash set because of
+its history (a non-integer member once, more than 512 members once) is ordered by the intset rule
+here; a `LIMIT` that cuts a `BY` sort uses a different, deterministic but unstable algorithm in Redis
+(`pqsort`) which is not ported, so ties under such a `LIMIT` can differ; a Redis built on a libc whose
+`qsort` is not a stable mergesort (the one checked, glibc 2.39, is) or a Redis 7.2 or newer, which
+holds small string sets as listpacks, orders ties differently too. An `ALPHA` reply that contains a NUL
+byte is compared in full here and up to the NUL by Redis (its replies use `strcoll`; its `STORE`
+compares bytes, as drakeydb does). `docs/ISSUE-REGISTER.md` D-34 has the details.
 
 **Not supported:** hash-field patterns in `BY` and `GET` (`BY w_*->field`, `GET h_*->field`, which
 Redis and KeyDB read as a field of the hash at `w_<element>`) are taken as part of the key name, so

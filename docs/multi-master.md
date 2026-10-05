@@ -673,7 +673,12 @@ producing an older-compatible file at the cost of discarding all stamps and tomb
 a reduced feature set, an active mesh should be upgraded node by node with each new binary able to
 admit and be admitted by the others before traffic depends on it — there is no mixed-version
 "tombstones on some links, not others" steady state; a link either meets the minimum version and
-gets the full feature set, or it is refused at handshake.
+gets the full feature set, or it is refused at handshake. One thing the gate does not cover is
+`SORT`'s ordering: a same-shard `SORT ... STORE` is journaled as the command, so a node of an older
+build re-runs it in the old order (tied `BY` weights, a stored `BY nosort` set, a missing or tied
+`ALPHA BY` weight) or fails on a form the new build accepts (a negative `LIMIT`, several `*`) while a
+newer node computed the new result, and no counter shows the difference; keep such `SORT ... STORE`
+forms out of the traffic until every node runs the new build (ISSUE-REGISTER D-13, D-34).
 
 ## Known residual exposures
 

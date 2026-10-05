@@ -1430,14 +1430,22 @@ the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE
      cluster config (every cluster mode until a config is pushed) read the config through a null
      pointer, SIGSEGV for a client and for a stream alike, and a bare `DFLYMIGRATE` failed a debug
      build's parser-destructor assert. They answer `UNKNOWN_MIGRATION` and `syntax error` now.
-   - **`SORT` ordering and `LIMIT`** (P7-1, decision 34, ISSUE-REGISTER D-34 and U-20): `SORT` now
-     orders as Redis and KeyDB do (a `BY` tie breaks on the element, a missing `ALPHA BY` weight
-     sorts first, a SET under `BY nosort` that is stored or scripted is sorted, `BY nosort DESC`
-     walks a list or zset backwards), so a classic master's verbatim `SORT .. STORE` re-runs to the
-     same `dst`. A client sees a different reply order than upstream for tied and `nosort` cases; no
-     journal or RDB byte changes, but a same-shard `SORT .. STORE` is journaled as the command (D-13),
-     so a replica on an older build re-runs it in the old order. `LIMIT` sums beyond `uint32`, which
-     replied garbage or crashed, are 64-bit.
+   - **`SORT` ordering, `LIMIT`, `GET`, numbers and RESP3** (P7-1, decisions 34, 36, 37 and 38,
+     ISSUE-REGISTER D-34 and U-20): `SORT` now orders as Redis and KeyDB do (a `BY` tie breaks on the
+     element, a missing `ALPHA BY` weight sorts first, a SET under `BY nosort` that is stored or
+     scripted is sorted, `BY nosort DESC` walks a list or zset backwards, and `ALPHA BY` ties keep
+     the fetch order of a list or an integer set), so a classic master's verbatim `SORT .. STORE`
+     re-runs to the same `dst`. Also as Redis does, and client-visible: `LIMIT` is parsed as an
+     integer is (no `+` or leading zero; the Redis error) and clamped (a negative offset is 0, a
+     negative count is the rest, so `LIMIT 0 -1` is all), `GET` of a missing key or of a pattern
+     without `*` is nil in a reply and `""` in `STORE`, only the first `*` of a pattern is replaced,
+     a numeric element or weight loads with `strtod` (`"5 "` and `1e400` are refused, a NUL ends the
+     number), and a `SORT` of a set or zset replies a RESP3 array, not the set type. A client sees a
+     different reply than upstream for all of these; no journal or RDB byte changes, but a same-shard
+     `SORT .. STORE` is journaled as the command (D-13), so a replica on an older build re-runs it in
+     the old order (or fails on a form it does not know). `LIMIT` sums beyond `uint32`, which replied
+     garbage or crashed, are 64-bit. Upstream's `SortNegativeLimit`, `SortBy` and `SortGet` tests
+     changed with it.
    - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
      migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
      a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a
