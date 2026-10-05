@@ -14,7 +14,7 @@
 | **P4 — MVCC store + stamping + wire** | ✅ **complete** — P4-0 [#5](https://github.com/darkspadez/drakeydb/pull/5), P4-1 [#6](https://github.com/darkspadez/drakeydb/pull/6), P4-2 [#7](https://github.com/darkspadez/drakeydb/pull/7), P4-3 [#8](https://github.com/darkspadez/drakeydb/pull/8), P4-4 [#9](https://github.com/darkspadez/drakeydb/pull/9) all merged (last: `c60dfdb`, 2026-09-24) | see [Phase 4](#phase-4); P4-4's own exit gate was partial, so the full Phase-4 gate is re-run as P7-0 Task 0.2's baseline |
 | P5 — Streaming LWW guard | ✅ **superseded by P4-4** | see [Phase 5](#phase-5) |
 | P6 — Merge-on-full-sync LWW | ✅ **delivered by P4-3** (PR #8) | see [Phase 6](#phase-6) |
-| **P7 — KeyDB one-way onboarding** | 🚧 **in progress** | see [Phase 7](#phase-7) and `docs/superpowers/specs/2026-10-03-phase7-keydb-onboarding-design.md` |
+| **P7 — KeyDB one-way onboarding** | 🚧 **in progress** — P7-0 [#10](https://github.com/darkspadez/drakeydb/pull/10) and P7-1 [#11](https://github.com/darkspadez/drakeydb/pull/11) open (stacked); P7-2..P7-4 pending | see [Phase 7](#phase-7) and `docs/superpowers/specs/2026-10-03-phase7-keydb-onboarding-design.md` |
 | P8–P9 | not started | — |
 
 The design spec's planned P4-5 (tombstones) shipped inside P4-3, so there is no separate P4-5.
