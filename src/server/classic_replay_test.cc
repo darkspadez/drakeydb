@@ -1447,6 +1447,83 @@ INSTANTIATE_TEST_SUITE_P(
         NoConnectionCase{"EvalQuit", Resp({"EVAL", "return redis.call('QUIT')", "0"}), false}),
     [](const testing::TestParamInfo<NoConnectionCase>& info) { return string(info.param.name); });
 
+// The commands that rewire this node's own replication link (ISSUE-REGISTER U-17). Streamed by a
+// classic master they run on the replication fiber, and Replica::Stop of the link they replace
+// joins that fiber (SIGABRT, `Check failed: active != this`); a raw REPLTAKEOVER parks the fiber
+// on its own socket instead. The fixture's node is a master with no link, so what these cases pin
+// is the reply (without the guard: OK, or the refusal of the command's own check, or a failed
+// connect to port 1), and the abort itself is pinned by the scripted-master pytests.
+INSTANTIATE_TEST_SUITE_P(
+    U17, ClassicNoConnectionTest,
+    testing::Values(
+        NoConnectionCase{"ReplicaofNoOne", Resp({"REPLICAOF", "NO", "ONE"})},
+        NoConnectionCase{"SlaveofNoOne", Resp({"SLAVEOF", "NO", "ONE"})},
+        NoConnectionCase{"ReplicaofHost", Resp({"REPLICAOF", "127.0.0.1", "1"})},
+        NoConnectionCase{"SlaveofHost", Resp({"SLAVEOF", "127.0.0.1", "1"})},
+        // Only an active-replica node takes REMOVE; on this one it is a bad port: guarded first.
+        NoConnectionCase{"ReplicaofRemove", Resp({"REPLICAOF", "REMOVE", "127.0.0.1", "1"})},
+        NoConnectionCase{"Addreplicaof", Resp({"ADDREPLICAOF", "127.0.0.1", "1", "0", "16383"})},
+        NoConnectionCase{"ReplTakeover", Resp({"REPLTAKEOVER", "0"})},
+        NoConnectionCase{"ReplTakeoverSave", Resp({"REPLTAKEOVER", "1", "SAVE"})}),
+    [](const testing::TestParamInfo<NoConnectionCase>& info) { return string(info.param.name); });
+
+// The emulated cluster node answers CLUSTER INFO|SLOTS|NODES|SHARDS with the address its client
+// connected to (ClusterFamily::GetEmulatedShardInfo), so they read the connection of the context
+// they run on. The other cluster modes answer from the config.
+class ClassicEmulatedClusterTest : public ClassicApplyFamilyTest {
+ protected:
+  void SetUp() override {
+    SetTestFlag("cluster_mode", "emulated");
+    ClassicApplyFamilyTest::SetUp();
+  }
+
+ private:
+  absl::FlagSaver saver_;  // puts cluster_mode back for the tests that follow
+};
+
+class ClassicNoConnectionEmulatedClusterTest
+    : public ClassicEmulatedClusterTest,
+      public testing::WithParamInterface<NoConnectionCase> {};
+
+// Each case used to dereference a null Connection* (ISSUE-REGISTER U-15, found by the P7-1
+// adversarial pass): run one at a time (--gtest_filter) to tell which, as for the cases above.
+TEST_P(ClassicNoConnectionEmulatedClusterTest, ReplicatedClusterQueryIsAnErrorNotACrash) {
+  OnLink([&](Link& link) {
+    optional<string> error = DispatchRaw(link, GetParam().wire);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_THAT(*error, testing::HasSubstr("No connection"));
+  });
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    I3, ClassicNoConnectionEmulatedClusterTest,
+    testing::Values(NoConnectionCase{"ClusterInfo", Resp({"CLUSTER", "INFO"})},
+                    NoConnectionCase{"ClusterSlots", Resp({"CLUSTER", "SLOTS"})},
+                    NoConnectionCase{"ClusterNodes", Resp({"CLUSTER", "NODES"})},
+                    NoConnectionCase{"ClusterShards", Resp({"CLUSTER", "SHARDS"})},
+                    NoConnectionCase{"EvalClusterInfo",
+                                     Resp({"EVAL", "return redis.call('CLUSTER', 'INFO')", "0"})}),
+    [](const testing::TestParamInfo<NoConnectionCase>& info) { return string(info.param.name); });
+
+// The guard is for a context without a connection only: a client of the emulated node gets its
+// answers, and the cluster commands that never read the connection answer on the stream's context.
+TEST_F(ClassicEmulatedClusterTest, ClientsAndConnectionlessSubcommandsStillAnswer) {
+  EXPECT_THAT(Run({"cluster", "info"}).GetString(), testing::HasSubstr("cluster_state:ok"));
+  EXPECT_THAT(Run({"cluster", "nodes"}).GetString(), testing::HasSubstr("myself,master"));
+  EXPECT_EQ(Run({"cluster", "slots"}).GetVec().size(), 1u);
+  EXPECT_EQ(Run({"cluster", "shards"}).GetVec().size(), 1u);
+
+  OnLink([&](Link& link) {
+    EXPECT_FALSE(DispatchRaw(link, Resp({"CLUSTER", "MYID"})).has_value());
+    EXPECT_FALSE(DispatchRaw(link, Resp({"CLUSTER", "KEYSLOT", "k"})).has_value());
+    EXPECT_FALSE(DispatchRaw(link, Resp({"CLUSTER", "HELP"})).has_value());
+    // An unknown subcommand is still the syntax error it was, not the guard's.
+    optional<string> error = DispatchRaw(link, Resp({"CLUSTER", "NOSUCHSUB"}));
+    ASSERT_TRUE(error.has_value());
+    EXPECT_THAT(*error, testing::Not(testing::HasSubstr("No connection")));
+  });
+}
+
 // What a replicated MONITOR or SUBSCRIBE would leave behind is worse than the failed command: a
 // null connection in the monitor list, and a context that is gone in the channel store, which the
 // next client's command or PUBLISH dereferences. Neither is registered now, so the clients go on.

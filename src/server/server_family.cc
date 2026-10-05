@@ -3552,6 +3552,9 @@ void ServerFamily::Hello(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void ServerFamily::AddReplicaOf(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-17 -- see ReplicaOf.
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   facade::ParsedArgs args = parser.UnparsedArgs();
   util::fb2::LockGuard lk(replicaof_mu_);
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
@@ -3591,6 +3594,12 @@ void ServerFamily::StopAllClusterReplicas() {
 }
 
 void ServerFamily::ReplicaOf(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-17 -- a command streamed by a classic master runs on the replication fiber, in a
+  // context with no connection (see ReplyIfNoConnection). Rewiring the link from there makes
+  // Replica::Stop join the fiber it runs on. Not the --replicaof boot path: Replicate() calls
+  // ReplicaOfInternal directly.
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   ReplicaOfInternal(parser.UnparsedArgs(), cmd_cntx, ActionOnConnectionFail::kReturnOnError);
 }
 
@@ -3760,6 +3769,11 @@ void ServerFamily::ReplicaOfActive(facade::ParsedArgs args, CommandContext* cmd_
 // REPLTAKEOVER <seconds> [SAVE]
 // SAVE is used only by tests.
 void ServerFamily::ReplTakeOver(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-17 -- see ReplicaOf. Raw, REPLTAKEOVER also parks the replication fiber on the
+  // master socket it reads itself.
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
+
   VLOG(1) << "ReplTakeOver start";
 
   int timeout_sec = parser.Next<int>();
@@ -3791,6 +3805,15 @@ void ServerFamily::ReplTakeOver(facade::CmdArgParser parser, CommandContext* cmd
 
   auto repl_ptr = replica_;
   CHECK(repl_ptr);
+
+  // drakeydb: C2 -- TakeOver sends `DFLY TAKEOVER` on the master socket and reads the reply from
+  // it, but a classic master has none to give and the replication fiber reads the same socket: the
+  // "reply" would be streamed commands, lost for good, with the offset left behind. Refused before
+  // the journal below is started on a node that stays a replica.
+  if (repl_ptr->GetSummary().classic_link) {
+    return cmd_cntx->SendError(
+        "REPLTAKEOVER is not supported on a replica of a classic (Redis protocol) master");
+  }
 
   // Start journal to allow partial sync from same source master
   repl_ptr->StartJournalAtOwnLSN();

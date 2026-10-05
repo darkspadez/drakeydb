@@ -438,6 +438,14 @@ void ClusterFamily::Cluster(CmdArgParser parser, CommandContext* cmd_cntx) {
     return builder->SendError(WrongNumArgsError(absl::StrCat("CLUSTER ", sub_cmd)));
   }
 
+  // drakeydb: U-15 -- the emulated node answers these four with the address its client connected
+  // to (GetEmulatedShardInfo), and a replicated apply has no connection. The other cluster modes
+  // answer from the config and are not touched.
+  if (IsClusterEmulated() && cmd_cntx->conn() == nullptr &&
+      (sub_cmd == "SHARDS" || sub_cmd == "SLOTS" || sub_cmd == "NODES" || sub_cmd == "INFO")) {
+    return builder->SendError("No connection");
+  }
+
   auto* cntx = cmd_cntx->server_conn_cntx();
   if (sub_cmd == "HELP") {
     return ClusterHelp(builder);

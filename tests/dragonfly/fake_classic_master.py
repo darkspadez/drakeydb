@@ -63,6 +63,8 @@ class FakeClassicMaster:
     coalescing is deterministic only then). Afterwards the connection stays open, still recording
     requests, until the replica closes it or `close_after_psync` is set; `send_stream()` writes
     more stream bytes into it whenever a test wants them, to time commands against the clock.
+    Every other command is answered +OK, unless script_silent() named it: a real master never
+    replies to a replica's command once the replica is in the stream.
 
     Recorded: `connection_count` (every accepted connection), `requests` (every request as a list
     of words, all connections, in arrival order) and `psync_requests` (the PSYNC ones).
@@ -80,6 +82,7 @@ class FakeClassicMaster:
         self._uuid = None
         self._capa_reply = b"+OK\r\n"
         self._capa_rules = {}
+        self._silent = set()
         self._server = None
         self._handler_tasks = set()
         self._writers = set()
@@ -107,6 +110,12 @@ class FakeClassicMaster:
             self._capa_reply = reply
         else:
             self._capa_rules[only_for.lower()] = reply
+
+    def script_silent(self, *names):
+        """Makes the requests named `names` (any case) recorded and never answered, as a real
+        master treats whatever its replica sends once it is streaming (e.g. "DFLY": a Dragonfly
+        replica's `DFLY TAKEOVER`)."""
+        self._silent.update(name.upper() for name in names)
 
     async def send_stream(self, data):
         """Writes `data` into the replication stream of the connection that was last answered a
@@ -221,6 +230,8 @@ class FakeClassicMaster:
     async def _answer(self, request, writer):
         """Writes the reply to `request`; returns False when the connection should be closed."""
         name = request[0].upper()
+        if name in self._silent:
+            return True
         if name == "PING":
             writer.write(b"+PONG\r\n")
         elif name == "REPLCONF":

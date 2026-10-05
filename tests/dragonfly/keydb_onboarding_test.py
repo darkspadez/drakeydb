@@ -984,6 +984,214 @@ async def test_classic_stream_eval_of_a_connection_command_does_not_abort(
         assert node.find_in_logs(r"did not apply and is skipped: EVAL: .*No connection")
 
 
+# The commands that rewire the replica's own link, as a hostile or broken classic master can stream
+# them; `{port}` is the scripted master's. REMOVE means something only to a peer (active-replica)
+# node, which takes the link's own master; REPLTAKEOVER is refused by a peer node anyway.
+LINK_COMMANDS = {
+    "plain_replica": {
+        "replicaof_no_one": ("REPLICAOF", "NO", "ONE"),
+        "slaveof_no_one": ("SLAVEOF", "NO", "ONE"),
+        "replicaof_reachable": ("REPLICAOF", "127.0.0.1", "{port}"),
+        "addreplicaof": ("ADDREPLICAOF", "127.0.0.1", "{port}", "0", "16383"),
+        "repltakeover": ("REPLTAKEOVER", "30"),
+    },
+    "peer_mode": {
+        "replicaof_no_one": ("REPLICAOF", "NO", "ONE"),
+        "slaveof_no_one": ("SLAVEOF", "NO", "ONE"),
+        "replicaof_remove": ("REPLICAOF", "REMOVE", "127.0.0.1", "{port}"),
+    },
+}
+LINK_COMMAND_CASES = [
+    pytest.param(node_kind == "peer_mode", command, id=f"{node_kind}-{name}")
+    for node_kind, commands in LINK_COMMANDS.items()
+    for name, command in commands.items()
+]
+
+
+@pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
+@pytest.mark.parametrize("peer_mode,command", LINK_COMMAND_CASES)
+async def test_classic_stream_link_command_does_not_abort(
+    df_factory: DflyInstanceFactory, tmp_path, scenario, peer_mode, command
+):
+    """A command that rewires the replica's own link, in the replication stream, raw or inside an
+    RREPLAY envelope, used to kill or stall the replica (ISSUE-REGISTER U-17). The stream runs on
+    the replication fiber, in a context with no connection, and `REPLICAOF NO ONE` or `REPLICAOF
+    <host> <port>` (and on a peer node `REPLICAOF REMOVE <this link's master>`) makes
+    Replica::Stop join the fiber it runs on: SIGABRT, `Check failed: active != this`, release builds
+    too. A raw `REPLTAKEOVER` parked the fiber on its own socket (for its timeout and 10 s more:
+    the master never answers), the link `up` and nothing more applied; `ADDREPLICAOF` opened a
+    second link. They are an error reply now, which the stream
+    discards: the replica stays up on the one link, the offset the master settles on is the exact
+    length of the stream, and the commands around them apply. Inside an envelope the failure also
+    shows as a `classic_apply_errors`.
+
+    Falsifying: with the guard of a handler removed, its cases fail: the replica process dies as it
+    reads the command (`REPLICAOF`, `SLAVEOF`), `b` never arrives (raw `REPLTAKEOVER`, once the
+    refusal of a classic master's replica, test_client_repltakeover_..., is gone too), or the master
+    sees a second connection (`ADDREPLICAOF`).
+    """
+    async with FakeClassicMaster() as master:
+        command = [word.format(port=master.port) for word in command]
+        wrap = resp_command if scenario == "raw" else rreplay
+        stream = SET_A + wrap(*command) + SET_B
+        master.script_silent("DFLY")  # as a real master is to a replica's REPLTAKEOVER
+        if peer_mode:
+            master.script_uuid(SCRIPTED_PEER_UUID)
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET), stream=stream, stream_delay=SECOND_WRITE_DELAY_S
+        )
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("b") == "2"
+
+        await applied()
+        assert await c.get("a") == "1"
+        expected = SYNC_OFFSET + len(stream)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert max(master.ack_offsets) == expected, master.ack_offsets
+        assert master.connection_count == 1, "the replica reconnected or opened another link"
+        info = await c.info("replication")
+        if peer_mode:
+            assert info["master0"]["link_status"] == "up", info
+        else:
+            assert info["role"] == "slave" and info["master_link_status"] == "up", info
+        if scenario == "in_envelope":
+            fields = classic_fields(info, peer_mode)
+            assert fields["classic_apply_errors"] == 1, info
+            assert fields["rreplay_unwrapped"] == 1, info
+
+    node.stop()
+    if scenario == "in_envelope":
+        assert node.find_in_logs(rf"did not apply and is skipped: {command[0]}: .*No connection")
+
+
+@pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
+@pytest.mark.parametrize("subcommand", ["INFO", "SLOTS", "NODES", "SHARDS"])
+async def test_classic_stream_emulated_cluster_query_does_not_abort(
+    df_factory: DflyInstanceFactory, tmp_path, scenario, subcommand
+):
+    """`CLUSTER INFO|SLOTS|NODES|SHARDS` in the replication stream of a `--cluster_mode=emulated`
+    replica used to kill it (ISSUE-REGISTER U-15): the emulated node answers with the address its
+    client connected to (ClusterFamily::GetEmulatedShardInfo), and a replicated apply has no
+    connection (a null `conn()`). It is an error reply now, which the stream discards: the replica
+    stays up, the offset the master settles on is the exact length of the stream, and the commands
+    around it apply. Inside an envelope the failure also shows as a `classic_apply_errors`.
+
+    Falsifying: with the guard removed the replica process dies as it reads the command (SIGSEGV
+    out of Connection::LocalBindAddress), so `b` never arrives.
+    """
+    wrap = resp_command if scenario == "raw" else rreplay
+    stream = SET_A + wrap("CLUSTER", subcommand) + SET_B
+    async with FakeClassicMaster() as master:
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET), stream=stream, stream_delay=SECOND_WRITE_DELAY_S
+        )
+        node = df_factory.create(
+            proactor_threads=2,
+            dir=str(tmp_path / "df"),
+            replication_acks_interval=100,
+            cluster_mode="emulated",
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("b") == "2"
+
+        await applied()
+        assert await c.get("a") == "1"
+        expected = SYNC_OFFSET + len(stream)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert max(master.ack_offsets) == expected, master.ack_offsets
+        assert master.connection_count == 1, "the replica reconnected"
+        info = await c.info("replication")
+        assert info["master_link_status"] == "up", info
+        if scenario == "in_envelope":
+            assert info["classic_apply_errors"] == 1, info
+            assert info["rreplay_unwrapped"] == 1, info
+        # A client of the same node still gets its answer.
+        assert (await c.execute_command("CLUSTER INFO"))["cluster_state"] == "ok"
+
+    node.stop()
+    if scenario == "in_envelope":
+        assert node.find_in_logs(r"did not apply and is skipped: CLUSTER: .*No connection")
+
+
+async def test_client_repltakeover_on_a_replica_of_a_classic_master_is_refused(
+    df_factory: DflyInstanceFactory, tmp_path
+):
+    """A client's `REPLTAKEOVER` on a replica of a classic master is refused with an error. Replica::
+    TakeOver sends `DFLY TAKEOVER` on the master socket and reads its reply there, but that socket is
+    the replication stream the replication fiber reads too, and a real master never answers a
+    replica: the "reply" was whatever the master streamed next, commands applied nowhere. The
+    replica stayed `up`, 1 KiB of stream behind the master for good (C2 of the P7-1 adversarial
+    pass). Refused, it sends nothing to the master, stays a replica on the same link,
+    and what the master streams afterwards applies and counts into the offset exactly.
+
+    The scripted master is silent to `DFLY`, as a real one is to everything a replica sends.
+
+    Falsifying: with the refusal removed the replica sends `DFLY TAKEOVER 1` (the master records it),
+    the command that is streamed while it waits is eaten as the reply (`Couldn't execute takeover:
+    Bad message`, `b` never applied, the offset left behind), or the client is told a takeover
+    succeeded.
+    """
+    async with FakeClassicMaster() as master:
+        master.script_silent("DFLY")
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET), stream=SET_A, stream_delay=SECOND_WRITE_DELAY_S
+        )
+        node = df_factory.create(
+            proactor_threads=2, dir=str(tmp_path / "df"), replication_acks_interval=100
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF 127.0.0.1 {master.port}") == "OK"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def synced():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("a") == "1"
+
+        await synced()
+
+        # Not awaited yet: without the refusal the command waits for a reply from the master.
+        takeover = asyncio.create_task(c.execute_command("REPLTAKEOVER", 1))
+        await asyncio.sleep(0.5)
+        await master.send_stream(SET_B)
+        outcome = (await asyncio.gather(takeover, return_exceptions=True))[0]
+        assert isinstance(outcome, redis.exceptions.ResponseError), outcome
+        assert "classic" in str(outcome) and "REPLTAKEOVER" in str(outcome), outcome
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("b") == "2"
+
+        await applied()
+        expected = SYNC_OFFSET + len(SET_A + SET_B)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert max(master.ack_offsets) == expected, master.ack_offsets
+        assert [r for r in master.requests if r[0].upper() == "DFLY"] == []
+        assert master.connection_count == 1, "the replica reconnected"
+        info = await c.info("replication")
+        assert info["role"] == "slave" and info["master_link_status"] == "up", info
+
+    node.stop()
+
+
 # `SORT <source that cannot be sorted> STORE <dst>`, with `dst` on another shard than the source
 # (the replica runs two shards; the pairs below were checked to split, and the falsification below
 # shows it): the commands that set the scene, the SORT, and what `dst` holds once it ran (None:
