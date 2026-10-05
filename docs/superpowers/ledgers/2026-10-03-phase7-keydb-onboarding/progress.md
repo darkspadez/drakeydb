@@ -194,7 +194,39 @@ round's falsification evidence.
 | Link-command guards round 2: U-19 (re-review M-1), U-15 widened to `DFLYMIGRATE FLOW` and `DFLY FLOW` (re-review I-1), U-21 | done: `20b399a`, `ae6a298`; docs `a74fdb9` | `ROLE` and `DEBUG REPLICA\|REPLDIAG` refused before `replicaof_mu_` on a context with no connection (a streamed one deadlocked a client `REPLICAOF NO ONE`, 8 of 8); `DFLYMIGRATE FLOW` and `DFLY FLOW` guarded; `DFLYMIGRATE ACK` without a config and a bare `DFLYMIGRATE` (any client) fixed. Hidden-command sweep: 70 cases x raw/enveloped x 3 cluster modes, all survive; a streamed `SHUTDOWN` exits cleanly (decision 39: kept, documented). Opus review: approve; its doc minors applied |
 | Decisions 34-38: `SORT` as Redis and KeyDB | done: round 1 `bb2a2a0` (docs `ac35f61`), round 2a `4915436` (docs `477bed6`); round 2b (decisions 35, 41) in progress | tie-break on the element under `BY`, a missing `ALPHA BY` weight first, `nosort` SET stored or scripted sorted, `nosort DESC` walk; `LIMIT` strict and clamped; `GET` nil; first `*` only; Redis number parsing; `ALPHA BY` ties stable for lists and integer-only sets (decision 37); RESP3 array (decision 38); U-20 (`LIMIT` overflow crash). Probe `sort_keydb.py` BAD 30 -> 3 (the hash-set residual). Reports `task-1.7-sort-order-report.md`, `task-1.7b-sort-semantics-report.md`. Opus review of round 1: approve with changes (folded into 2a) |
 | Decision 40: `SADD` reply count (U-22) | pending (round 2c) | an upstream bug found by round 2a; fixed in P7-1 |
-| P7-1 gate and PR | pending | the gate (with `KEYDB_REQUIRED=1`), the PR description, then the PR against `main` |
+| P7-1 gate and PR | gate done on `b5c1150` (below); PR pending | the PR description, then the PR against `main`, stacked on darkspadez/drakeydb#10 |
+
+### P7-1 gate — debug build of `b5c1150` (2026-10-05, 4 cores, `KEYDB_REQUIRED=1`)
+
+Each `ctest` binary was built, run and deleted in turn (disk); logs, `results.tsv` and the summary are
+in the orchestrator's scratchpad (`gate-p71/`).
+
+- **`ctest -L DFLY`: 88/89** (5622 gtest cases: 5610 passed, 11 skipped, 1 failed). The failure is
+  `ServerFamilyTest.GetTcpSocketInfoIPv6`, environment (no IPv6), failed identically in isolation.
+  No build errors or warnings.
+- **pytest:**
+
+  | Suite | Result |
+  |---|---|
+  | `keydb_onboarding_test.py` | 171 passed, 3 skipped (`DRAKEYDB_PERF=1` only) |
+  | `keydb_harness_test.py` | 21 passed |
+  | `multimaster_test.py` | 76 passed, 1 failed (the known flake below) |
+  | `multimaster_merge_test.py` | 4 passed |
+  | `redis_replication_test.py` | 12 passed, 7 deselected |
+  | `replication_test.py` | 43 passed, 21 deselected |
+  | `replication_resilience_test.py -k take_over` | 11 passed |
+  | `cluster_test.py -k "migration or takeover"` | 26 passed |
+
+- **`test_simultaneous_reciprocal_replicaof_converges`** failed in the file run and its isolated
+  re-run, then passed 8 of 10 more runs; every failure is "tiebreak never observed in 5 attempts",
+  never a wrong direction or a convergence failure: the pre-existing flake recorded for P7-0 above
+  (P7-0 binary 5/8, `main` 2/8). Not re-measured on `main` this time.
+- **Repeats:** the Task 1.4 expiry tests (`-k "expire or expiry"`) ×10: 220/220; the U-19 deadlock
+  and strand tests ×10: 100/100; the throughput smoke ×5: 5/5; the three later TTL-window tests
+  (`loses_a_ttl_refresh`, `recomputes_a_counter`, `ttl_less_orphan`) ×10: running at the time of this commit (review M-7
+  closed).
+- **Not exercised here:** the `DRAKEYDB_PERF=1` release bar (measured in Task 1.5, unchanged path),
+  a release build, ASAN/UBSAN (PR CI runs them), fakeredis (runs in PR CI).
 
 ## P7-2 … P7-4
 
