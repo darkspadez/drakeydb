@@ -63,6 +63,14 @@ ABSL_FLAG(uint32_t, dbnum, 16, "Number of databases");
 ABSL_FLAG(uint32_t, keys_output_limit, 8192, "Maximum number of keys output by keys command");
 ABSL_FLAG(bool, unlink_experimental_async, true, "If true, runs unlink command asynchronously.");
 
+// drakeydb: P7-1 (decision 41) -- the intset limit SortTiesInFetchOrder emulates; see there.
+ABSL_FLAG(
+    uint32_t, sort_set_max_intset_entries, 512,
+    "SORT orders an integer-only set of at most this many members as Redis/KeyDB hold it as an "
+    "intset (ascending numeric). Set it to the classic master's set-max-intset-entries when "
+    "replicating from KeyDB or Redis. 0 turns the emulation off: tied ALPHA BY members of a "
+    "set then break on the element.");
+
 namespace dfly {
 using namespace std;
 using namespace facade;
@@ -2304,6 +2312,40 @@ string OpFetchStringValue(const OpArgs& op_args, std::string_view key, bool* fou
   return it->second.ToString();
 }
 
+// drakeydb: P7-1 (decision 35) -- the value of a BY or GET pattern's hash field, as
+// lookupKeyByPattern reads it: the field of the hash at `key`. `found` is false (and the result
+// empty) for a missing key, a key that is not a hash and a field the hash does not hold, an expired
+// one included. As HGET does, it deletes a hash whose lazy field expiry this read just emptied.
+// TODO: does not support tiering; a hash the experimental hash offloading moved to disk reads as
+// missing.
+string OpFetchHashFieldValue(const OpArgs& op_args, std::string_view key, std::string_view field,
+                             bool* found) {
+  auto& db_slice = op_args.GetDbSlice();
+  auto it = db_slice.FindReadOnly(op_args.db_cntx, key);
+  *found = false;
+  if (!IsValid(it) || it->second.ObjType() != OBJ_HASH ||
+      (it->second.IsExternal() && !it->second.IsCool())) {
+    return {};
+  }
+
+  optional<string> value = HSetFamily::GetFieldValue(op_args.db_cntx, it->second, field);
+  HSetFamily::DeleteIfEmpty(db_slice, op_args.db_cntx, key, it->second);
+  if (!value)
+    return {};
+
+  *found = true;
+  return std::move(*value);
+}
+
+// drakeydb: P7-1 (decision 35) -- what a BY or GET pattern reads at `key`: the string there, or
+// with a `field` that field of the hash there. See OpFetchStringValue and OpFetchHashFieldValue.
+string OpFetchPatternValue(const OpArgs& op_args, std::string_view key, std::string_view field,
+                           bool* found) {
+  if (field.empty())
+    return OpFetchStringValue(op_args, key, found);
+  return OpFetchHashFieldValue(op_args, key, field, found);
+}
+
 // drakeydb: P4-3 review wave (CodeRabbit, Major) -- `source_deleted_by_fetch` extends the
 // hand-journal below to the one same-shard case the verbatim recipe replay cannot reproduce: when
 // this command's own fetch emptied and deleted the source (OpFetchSortEntries), a peer replaying
@@ -2491,24 +2533,45 @@ void ParseSortLimit(CmdArgParser* parser, SortParams* params) {
   params->bounds = SortBounds{parsed_offset, parsed_count};
 }
 
-// drakeydb: P7-1 (decision 36) -- a BY or GET pattern as lookupKeyByPattern reads it (sort.cpp:
-// 61-137): the first '*' is replaced by the element, and what follows it, further '*' included, is
-// literal. Hash-field patterns ("->") are not parsed here yet (ISSUE-REGISTER D-35).
+// drakeydb: P7-1 (decision 35, and 36 for the first '*') -- a BY or GET pattern as
+// lookupKeyByPattern reads it (sort.cpp:61-137). The first '*' is replaced by the element and what
+// follows it, further '*' included, is literal; the key is `prefix + element + suffix`. The first
+// "->" after that '*' introduces a hash field, if at least one character follows it: the pattern
+// then names the field of the hash at that key, otherwise a string at it ("w_*->" is the string key
+// `w_<element>->`). A "->" before the '*' is part of the prefix. Redis scans the pattern as a C
+// string (strchr, strstr and the `f[2] != '\0'` test stop at a NUL byte, while the key and the
+// field are cut by length), so a NUL hides the '*' or the "->" that follows it, and "#\0x" is "#".
 struct SortPattern {
   string_view prefix;
-  string_view suffix;
+  string_view suffix;  // between the '*' and the "->" of a field, else up to the end of the pattern
+  string_view field;   // empty: the key holds a string
 
   string KeyFor(string_view element) const {
     return absl::StrCat(prefix, element, suffix);
   }
 };
 
+// The pattern "#" (spat[0] == '#' && spat[1] == '\0' in lookupKeyByPattern): GET of the element
+// itself.
+bool IsSortElementPattern(string_view pattern) {
+  return !pattern.empty() && pattern[0] == '#' && (pattern.size() == 1 || pattern[1] == '\0');
+}
+
 // nullopt for a pattern without '*': a BY one then means "nosort", a GET one has no value.
 optional<SortPattern> ParseSortPattern(string_view pattern) {
-  size_t star_pos = pattern.find('*');
+  const string_view c_string = pattern.substr(0, pattern.find('\0'));
+  const size_t star_pos = c_string.find('*');
   if (star_pos == string_view::npos)
     return nullopt;
-  return SortPattern{pattern.substr(0, star_pos), pattern.substr(star_pos + 1)};
+
+  SortPattern parsed{pattern.substr(0, star_pos), pattern.substr(star_pos + 1), {}};
+  const size_t arrow_pos = c_string.find("->", star_pos + 1);
+  // c_string ends where a NUL (or the pattern) does, which is the `*(f + 2) == '\0'` case
+  if (arrow_pos != string_view::npos && arrow_pos + 2 < c_string.size()) {
+    parsed.suffix = pattern.substr(star_pos + 1, arrow_pos - (star_pos + 1));
+    parsed.field = pattern.substr(arrow_pos + 2);
+  }
+  return parsed;
 }
 
 // drakeydb: P7-1 (decision 36) -- the part of `entries` that LIMIT selects, clamped as sortCommand
@@ -2547,8 +2610,17 @@ void FetchGetPatternValues(const SortParams& params, const DbContext& db_cntx,
   if (params.get_patterns.empty())
     return;
 
+  // drakeydb: P7-1 (decision 35) -- each pattern is parsed once; a nullopt one has no '*' and no
+  // value
+  vector<optional<SortPattern>> sort_patterns;
+  sort_patterns.reserve(params.get_patterns.size());
+  for (string_view pattern : params.get_patterns)
+    sort_patterns.push_back(ParseSortPattern(pattern));
+
   // Build a list of all external keys to fetch, organized by shard
   // Structure: keys_by_shard[shard_id] = [(elem_idx, pattern_idx, ext_key), ...]
+  // drakeydb: P7-1 (decision 35) -- the shard is the key part's, not the whole pattern's: a hash
+  // field is read on the shard that owns the hash.
   vector<vector<tuple<size_t, size_t, string>>> keys_by_shard(shard_set->size());
 
   // Build external keys for each element and pattern
@@ -2556,14 +2628,14 @@ void FetchGetPatternValues(const SortParams& params, const DbContext& db_cntx,
     for (size_t pattern_idx = 0; pattern_idx < params.get_patterns.size(); ++pattern_idx) {
       std::string_view pattern = params.get_patterns[pattern_idx];
 
-      if (pattern == "#") {
+      if (IsSortElementPattern(pattern)) {
         // Special pattern - return the element itself, no external fetch needed
         set_result(elem_idx, pattern_idx, string(get_element_key(elem_idx)));
         continue;
       }
 
       // Build external key by replacing the first '*' with the actual element value
-      optional<SortPattern> sort_pattern = ParseSortPattern(pattern);
+      const optional<SortPattern>& sort_pattern = sort_patterns[pattern_idx];
       if (!sort_pattern) {
         // drakeydb: P7-1 (decision 36) -- no asterisk: Redis does not read a fixed key, GET of it
         // is nil (sort.cpp:82-87)
@@ -2582,7 +2654,8 @@ void FetchGetPatternValues(const SortParams& params, const DbContext& db_cntx,
     ShardId sid = shard->shard_id();
     for (const auto& [elem_idx, pattern_idx, ext_key] : keys_by_shard[sid]) {
       bool found = false;
-      string value = OpFetchStringValue({shard, nullptr, db_cntx}, ext_key, &found);
+      string value = OpFetchPatternValue({shard, nullptr, db_cntx}, ext_key,
+                                         sort_patterns[pattern_idx]->field, &found);
       set_result(elem_idx, pattern_idx, found ? optional<string>{std::move(value)} : nullopt);
     }
   });
@@ -2719,7 +2792,8 @@ OpStatus PopulateSortEntriesFromByPattern(const SortParams& params,
   DCHECK(params.by_pattern);
 
   vector<vector<pair<size_t, string>>> keys_by_shard(shard_set->size());
-  // drakeydb: P7-1 (decision 36) -- the first '*' only, see SortPattern
+  // drakeydb: P7-1 (decisions 35, 36) -- the first '*' only, and a hash field if the pattern has
+  // one, see SortPattern; the shard is the key part's, which is where the hash (or string) lives
   optional<SortPattern> pattern = ParseSortPattern(*params.by_pattern);
   DCHECK(pattern);
   for (size_t i = 0; i < raw_elements.size(); ++i) {
@@ -2736,7 +2810,9 @@ OpStatus PopulateSortEntriesFromByPattern(const SortParams& params,
         [&](auto& dest) {
           for (const auto& [idx, ext_key] : keys_by_shard[sid]) {
             bool found = false;
-            string external_value = OpFetchStringValue({shard, nullptr, db_cntx}, ext_key, &found);
+            // drakeydb: P7-1 (decision 35) -- a hash field when the pattern names one
+            string external_value =
+                OpFetchPatternValue({shard, nullptr, db_cntx}, ext_key, pattern->field, &found);
             auto& entry = dest[idx];
             if (!entry.Parse(std::move(external_value)))
               return false;
@@ -2803,7 +2879,8 @@ void SortStoreNothing(string_view store_key, CommandContext* cmd_cntx) {
 // the result is not ported). That order is the same on every node for:
 //  - a list: its own order;
 //  - a set KeyDB holds as an intset (every member a strict integer, at most
-//    set-max-intset-entries = 512 of them): ascending numeric order, which this puts `elements` in.
+//    set-max-intset-entries of them, 512 by default): ascending numeric order, which this puts
+//    `elements` in.
 // A hash-encoded set and a zset (read through its dict) come in a per-process order no replica
 // shares, so their ties still break on the element.
 //
@@ -2812,13 +2889,17 @@ void SortStoreNothing(string_view store_key, CommandContext* cmd_cntx) {
 // other reasons (member TTLs), so the same members answer the same on every build. A 600-member
 // integer set is a hash set in KeyDB, hence broken on the element here as well. A set KeyDB holds
 // as a hash set for its history (a member that was not an integer once, a size that once passed
-// 512) is not known from the members; it is the residual of decision 37.
+// the limit) is not known from the members; it is the residual of decision 37.
+//
+// drakeydb: P7-1 (decision 41) -- the limit is --sort_set_max_intset_entries, which an operator
+// sets to the classic master's set-max-intset-entries (it is not read per element, only here). 0
+// matches no set: the emulation is off and every set breaks its ties on the element.
 bool SortTiesInFetchOrder(CompactObjType source_type, vector<string>* elements) {
   if (source_type == OBJ_LIST)
     return true;
 
-  constexpr size_t kKeydbMaxIntsetEntries = 512;
-  if (source_type != OBJ_SET || elements->size() > kKeydbMaxIntsetEntries)
+  const size_t max_intset_entries = absl::GetFlag(FLAGS_sort_set_max_intset_entries);
+  if (source_type != OBJ_SET || elements->size() > max_intset_entries)
     return false;
 
   vector<pair<long long, size_t>> by_value;  // (member, position in `elements`)

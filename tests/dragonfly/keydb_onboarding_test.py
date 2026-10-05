@@ -1504,6 +1504,16 @@ async def test_classic_stream_sort_store_of_an_unsortable_source_does_not_abort(
 # Round 2a adds, each under its own comment below: LIMIT clamped as Redis does (and refused where
 # Redis refuses), several '*' in a pattern, GET of nothing (nil in a reply), the ALPHA BY ties
 # above, a zset with equal scores, and numbers with a NUL.
+#
+# Round 2b adds hash-field patterns (decision 35, D-35): `BY w_*->f` and `GET h_*->f` read field f of
+# the hash at the key the first '*' names (the forms and their data are under HASH_FIELD_DATA and the
+# `->` forms below, a NUL in a pattern included: `\0` in a form is a NUL byte), and the limit of the
+# integer-set order (decision 41, the last test of this group).
+
+
+def sort_integers(n):
+    """n distinct integers (n up to 10**4), in an order no iteration of a set of them follows by luck."""
+    return [str(int((i * 7919) % n) * 13 - 1000) for i in range(n)]
 
 
 def sort_ties_data():
@@ -1520,16 +1530,54 @@ def sort_ties_data():
         if element not in missing:
             weights += [f"cw_{element}", rng.choice(["DE", "FR", "US", ""])]
 
-    def integers(n):
-        return [str(int((i * 7919) % n) * 13 - 1000) for i in range(n)]
-
     return [
         ("RPUSH", "bl", *elements),
         ("MSET", *weights),
-        ("SADD", "si300", *integers(300)),
-        ("SADD", "si512", *integers(512)),
+        ("SADD", "si300", *sort_integers(300)),
+        ("SADD", "si512", *sort_integers(512)),
     ]
 
+
+# Round 2b (decision 35): hash-field patterns. hl is a list and hs a set of a..i and "x->y". For
+# element e, hf_e is a hash with the numeric field f, the text field g and the number text n (a, b,
+# c, i, x->y); missing (d); a string (e); a hash without f (f); a hash whose f is empty (g); a list
+# (h). The other keys are the odd spellings the forms below read: a field named "->", "f->g" and
+# "f*", the key hf_a- (for "hf_*-->g"), the strings hf_<e>-> (for "hf_*->"), the strings hq->w_<e>
+# and the hashes hr->w_<e> (a "->" before the '*'), the hashes hf_<e>_* (a second '*') and the
+# hashes named by the bare element a, b, c (a pattern that starts with '*'). nl and what follows is
+# for the patterns that hold a NUL byte: Redis scans a pattern as a C string, so a NUL hides the '*'
+# or the "->" after it, "#\0x" is "#", and the key and the field are cut by length.
+HASH_FIELD_LETTERS = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"]
+HASH_FIELD_DATA = [
+    ("RPUSH", "hl", *HASH_FIELD_LETTERS),
+    ("SADD", "hs", *reversed(HASH_FIELD_LETTERS)),
+    ("HSET", "hf_a", "f", "3", "g", "Ga", "n", "10"),
+    ("HSET", "hf_b", "f", "1", "g", "Gb", "n", "9.5"),
+    ("HSET", "hf_c", "f", "2", "g", "Gc", "n", "-3"),
+    ("SET", "hf_e", "iamastring"),
+    ("HSET", "hf_f", "g", "Gf"),
+    ("HSET", "hf_g", "f", "", "g", "Gg"),
+    ("RPUSH", "hf_h", "1", "2"),
+    ("HSET", "hf_i", "f", "-1", "g", "", "n", "1e2"),
+    ("HSET", "hf_x->y", "f", "0", "g", "Gxy", "n", "0"),
+    ("HSET", "hf_a", "->", "ARROWFIELD"),
+    ("HSET", "hf_b", "f->g", "FARROWG"),
+    ("HSET", "hf_c", "f*", "7"),
+    ("HSET", "hf_a-", "g", "DASHa"),
+    *[("SET", f"hf_{e}->", f"ARROW{e.replace('->', '')}") for e in ("a", "b", "c", "x->y")],
+    *[("SET", f"hq->w_{e}", w) for e, w in zip("abci", "3129")],
+    *[("HSET", f"hr->w_{e}", "f", w, "g", f"R{e}") for e, w in zip("abci", "2310")],
+    *[("HSET", f"hf_{e}_*", "f", str(i + 1), "g", f"S{e}") for i, e in enumerate("abc")],
+    *[("HSET", e, "f", w, "g", f"B{e}") for e, w in zip("abc", "312")],
+    ("RPUSH", "nl", "a", "b", "c"),
+    ("HSET", "hn_a", "f", "5", "g", "Ga", "g\x00h", "NULFIELD", "g\x00", "NULEND"),
+    ("HSET", "hn_b", "f", "1", "g", "Gb"),
+    ("HSET", "hn_c", "f", "3", "g", "Gc"),
+    ("SET", "hn_a->\x00g", "S1"),
+    ("SET", "hn_a\x00->g", "S2"),
+    ("SET", "hn_a\x00", "S3"),
+    *[("HSET", f"h\x00v_{e}", "f", w, "g", f"H{e}") for e, w in zip("abc", "513")],
+]
 
 SORT_ORDER_DATA = [
     ("SADD", "s", *"jihgfedcba"),
@@ -1606,7 +1654,106 @@ SORT_ORDER_DATA = [
     # a number out of range: the last form of the reply test (see SORT_ORDER_LAST_FORMS)
     ("RPUSH", "lerange", "1e400", "3"),
     *sort_ties_data(),
+    *HASH_FIELD_DATA,
 ]
+
+# Round 2b (decision 35): the forms over HASH_FIELD_DATA, each over the list hl and the set hs where the
+# order is KeyDB's to define (ALPHA BY ties over the hash set hs, and its reply under BY nosort, are
+# not: a per-process order). A missing key, a key of another type and a missing field are no value
+# (nil under GET, "" stored, weight 0 under numeric BY, a missing weight under ALPHA BY); a form
+# whose pattern ends in "->", or whose "->" comes before the '*', or that has several of them, is
+# read as lookupKeyByPattern reads it. `\0` is a NUL byte.
+HASH_FIELD_FORMS = (
+    [
+        (source, options)
+        for source in ("hl", "hs")
+        for options in (
+            "BY hf_*->f",
+            "BY hf_*->f DESC",
+            "BY hf_*->f LIMIT 2 5",
+            "BY hf_*->f DESC LIMIT 1 4",
+            "BY hf_*->n",
+            "BY hf_*->n DESC",
+            "BY hf_*->nofield",
+            "BY hf_*->nofield DESC",
+            "BY *->f",
+            "BY hq->w_*",
+            "BY hr->w_*->f",
+            "BY hf_*_*->f",
+            "BY hf_*->f*",
+            "BY hf_*->f GET #",
+            "BY hf_*->f GET hf_*->g",
+            "BY hf_*->f GET hf_*->g GET #",
+            "BY hf_*->f DESC LIMIT 1 6 GET hf_*->g",
+            "BY hf_*->f GET hq->w_* GET hr->w_*->g",
+            "ALPHA GET hf_*->g",
+            "ALPHA GET hf_*->f",
+            "ALPHA GET hf_*->nofield",
+            "ALPHA GET # GET hf_*->g",
+            "ALPHA GET hf_*->g GET # GET hf_*->f",
+            "ALPHA GET hf_*->",
+            "ALPHA GET *->g",
+            "ALPHA GET hq->w_*",
+            "ALPHA GET hr->w_*->g",
+            "ALPHA GET hf_*_*->g",
+            "ALPHA GET hf_*->->",
+            "ALPHA GET hf_*-->g",
+            "ALPHA GET hf_*->f->g",
+            "ALPHA GET hf_*->f*",
+            "ALPHA GET hf->g",
+            "ALPHA GET hf_->g*",
+            "ALPHA GET #->g",
+            "ALPHA GET hf_*",
+            "ALPHA GET hf_*->g LIMIT 2 3",
+            "ALPHA DESC GET hf_*->g",
+        )
+    ]
+    + [
+        ("hl", options)
+        for options in (
+            "BY hr->w_*->g ALPHA DESC",
+            "BY hf->f",
+            "BY hf->f DESC",
+            "BY hf->f GET hf_*->g",
+            "BY nosort GET hf_*->g",
+            "BY nosort DESC GET hf_*->g",
+            "BY hf_*->f ALPHA",
+            "BY hf_*->f ALPHA DESC",
+            "BY hf_*->g ALPHA",
+            "BY hf_*->g ALPHA DESC",
+            "BY hf_*->nofield ALPHA",
+            "BY hf_*-> ALPHA",
+            "BY hf_*->-> ALPHA",
+            "BY hf_*-->g ALPHA",
+            "BY hf_*->f->g ALPHA",
+            "BY hf->f ALPHA",
+            "BY hf_*->g ALPHA GET hf_*->g GET #",
+        )
+    ]
+    + [
+        ("nl", options)
+        for options in (
+            "ALPHA GET #\\0x",
+            "ALPHA GET #\\0",
+            "ALPHA GET hn_*\\0->g",
+            "ALPHA GET hn_*->g\\0h",
+            "ALPHA GET hn_*->g\\0",
+            "ALPHA GET hn_*->\\0g",
+            "ALPHA GET h\\0v_*->g",
+            "ALPHA GET hn_*\\0",
+            "ALPHA GET hn_*->g GET #\\0x",
+            "BY h\\0v_*->f",
+            "BY h\\0v_*->f GET #",
+            "BY h\\0* GET #",
+            "BY hn_*->g\\0h ALPHA",
+            "BY hn_*->\\0g ALPHA",
+            "BY hn_*\\0 ALPHA GET #",
+            "BY hn_*->f",
+            "BY hn_*->f GET hn_*->g",
+            "BY hn_*->f\\0 GET hn_*->g",
+        )
+    ]
+)
 
 # (source, options): run as `SORT <source> <options>` and, with `STORE <dst>`, as a stored sort.
 SORT_ORDER_FORMS = [
@@ -1747,6 +1894,7 @@ SORT_ORDER_FORMS = [
     ("lw2", "BY wn_*"),
     ("lw2", "BY wn_* DESC"),
     ("lsp", ""),
+    *HASH_FIELD_FORMS,
 ]
 
 # Forms of the reply test that must run after every other numeric SORT: a number out of range is
@@ -1779,12 +1927,20 @@ SORT_ORDER_SCRIPT_FORMS = [
     ("zl", "BY nosort DESC"),
     ("z", "BY nosort DESC LIMIT 1 2"),
     ("s", "BY w_*"),
+    ("hl", "BY hf_*->f GET hf_*->g"),
+    ("hs", "BY hf_*->f GET hf_*->g GET #"),
+    ("hl", "BY nosort DESC GET hf_*->g"),
 ]
 
 SORT_SCRIPT = "return redis.call('SORT', KEYS[1], unpack(ARGV))"
 
 # Keys that are a stored sort's source as well as its destination
 SORT_ORDER_SOURCES = {"sn", "ln"}
+
+
+def sort_args(options):
+    """The arguments of a form: its words, with `\\0` (a backslash and a zero) read as a NUL byte."""
+    return [word.replace("\\0", "\x00") for word in options.split()]
 
 
 async def load_sort_order_data(client):
@@ -1803,6 +1959,8 @@ async def sort_value(client, key):
         return kind, await client.get(key)
     if kind == "zset":
         return kind, await client.zrange(key, 0, -1, withscores=True)
+    if kind == "hash":
+        return kind, sorted((await client.hgetall(key)).items())
     return kind, None
 
 
@@ -1827,7 +1985,7 @@ async def sort_placement(client, sources):
 
 async def sort_replies(client, source, options, script=False):
     """The reply of `SORT <source> <options>` (inside EVAL with `script`), or its error."""
-    args = options.split()
+    args = sort_args(options)
     try:
         if script:
             return await client.execute_command("EVAL", SORT_SCRIPT, 1, source, *args)
@@ -1885,7 +2043,7 @@ async def test_plain_replica_of_active_keydb_orders_sort_store_as_keydb_does(
         for source, options in SORT_ORDER_FORMS + SORT_ORDER_STORE_ONLY_FORMS:
             dst = f"dst:{len(stored)}"
             form = f"SORT {source} {options} STORE"
-            await store(dst, form, "SORT", source, *options.split(), "STORE", dst)
+            await store(dst, form, "SORT", source, *sort_args(options), "STORE", dst)
 
         # The sources that cannot be sorted, or only oddly: a missing one deletes its destination,
         # a wrong-type or non-numeric one is an error KeyDB does not replicate, hex numbers sort by
@@ -1915,7 +2073,7 @@ async def test_plain_replica_of_active_keydb_orders_sort_store_as_keydb_does(
         ):
             dst = f"dst:eval{i}"
             await k.set(dst, "old")
-            args = [*options.split(), "STORE", dst]
+            args = [*sort_args(options), "STORE", dst]
             assert await k.eval(SORT_SCRIPT, 2, "s", dst, *args) == stored_count
             stored[dst] = f"EVAL SORT s {options} STORE"
 
@@ -1997,6 +2155,102 @@ async def test_sort_replies_in_the_order_keydb_does(
             if expected != got:
                 differing.append(f"SORT {source} {options}: KeyDB {expected}, drakeydb {got}")
         assert not differing, "\n".join(differing)
+
+
+@pytest.mark.keydb
+@pytest.mark.parametrize("shards", [1, 2])
+@pytest.mark.parametrize(
+    "limit, tied_sizes, distinct_sizes",
+    [(100, (50, 100), (101, 150)), (600, (100, 550, 600), (601,))],
+    ids=["limit100", "limit600"],
+)
+async def test_sort_set_max_intset_entries_follows_the_masters_limit(
+    df_factory: DflyInstanceFactory,
+    keydb_server_factory,
+    tmp_path,
+    shards,
+    limit,
+    tied_sizes,
+    distinct_sizes,
+):
+    """A replica started with `--sort_set_max_intset_entries=N` of a KeyDB with `set-max-intset-entries N`
+    leaves the same list as KeyDB for `SORT <integer set> BY <weights> ALPHA .. STORE`, ties and all
+    (decisions 37 and 41). KeyDB holds an integer set of up to N members as an intset, which iterates
+    in ascending numeric order, and its stable sort keeps that order for tied weights; drakeydb
+    emulates that for a set of at most N integers, and N is 512 unless the flag says another. 550
+    members and a limit of 600 is the case the default would get wrong (the replica would break the
+    ties on the element), 100 and 50 members under a limit of 100 the case on the other side.
+
+    Above the limit KeyDB holds a hash set, whose order differs from process to process (two KeyDB
+    processes answer differently, measured), so no replica can follow its ties: those sets are sorted
+    by distinct weights only, where the order is the weights'. That is also why a 150-member set under
+    a limit of 100 is not compared for ties: KeyDB's own answer is not reproducible.
+
+    Falsifying: the flag ignored (the constant 512 back) fails the limit600 runs on the 550 and 600
+    members, the replica ordering their ties bytewise where KeyDB leaves them ascending.
+    """
+    keydb = keydb_server_factory(active_replica=True, set_max_intset_entries=limit)
+    node, c = await attach_plain_replica(
+        df_factory, tmp_path, keydb, num_shards=shards, sort_set_max_intset_entries=limit
+    )
+
+    async with keydb.client() as k:
+        assert await k.config_get("set-max-intset-entries") == {
+            "set-max-intset-entries": str(limit)
+        }
+        stored = {}  # destination -> the form that stored into it
+        for n in (*tied_sizes, *distinct_sizes):
+            members = sort_integers(n)
+            for i in range(0, n, 100):
+                await k.sadd(f"ints{n}", *members[i : i + 100])
+            assert await k.scard(f"ints{n}") == n
+            encoding = await k.execute_command("OBJECT", "ENCODING", f"ints{n}")
+            assert encoding == ("intset" if n <= limit else "hashtable"), (n, encoding)
+            # tie<n>_*: one weight in three is "B", the others "A"; dist<n>_*: every weight differs
+            await k.mset({f"tie{n}_{m}": "B" if i % 3 == 0 else "A" for i, m in enumerate(members)})
+            await k.mset({f"dist{n}_{m}": f"{i:05d}" for i, m in enumerate(members)})
+            forms = [f"BY dist{n}_* ALPHA", f"BY dist{n}_* ALPHA DESC"]
+            if n in tied_sizes:
+                forms += [
+                    "BY nokey_* ALPHA",
+                    "BY nokey_* ALPHA DESC",
+                    f"BY tie{n}_* ALPHA",
+                    f"BY tie{n}_* ALPHA DESC",
+                    f"BY tie{n}_* ALPHA GET #",
+                ]
+            for form in forms:
+                dst = f"dst:{len(stored)}"
+                await k.set(dst, "old")
+                await k.execute_command("SORT", f"ints{n}", *form.split(), "STORE", dst)
+                stored[dst] = f"SORT ints{n} {form}"
+        # the premise: KeyDB leaves an intset's ties ascending
+        biggest = max(tied_sizes)
+        ties_form = next(
+            d for d, f in stored.items() if f == f"SORT ints{biggest} BY nokey_* ALPHA"
+        )
+        assert await k.lrange(ties_form, 0, -1) == sorted(sort_integers(biggest), key=int)
+
+        await k.set("sort:done", "1")
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def caught_up():
+            assert await c.get("sort:done") == "1"
+
+        await caught_up()
+
+        diverged = []
+        for dst, form in stored.items():
+            expected, got = await k.lrange(dst, 0, -1), await c.lrange(dst, 0, -1)
+            if expected != got:
+                at = next(i for i, (e, g) in enumerate(zip(expected, got)) if e != g)
+                diverged.append(
+                    f"{form}: KeyDB {expected[at:at + 3]}.., replica {got[at:at + 3]}.. at {at}"
+                )
+        assert not diverged, "\n".join(diverged)
+        info = await c.info("replication")
+        assert info["role"] == "slave" and info["master_link_status"] == "up", info
+        assert info.get("classic_apply_errors", 0) == 0, info
 
 
 async def resp3_replies(port, *commands):

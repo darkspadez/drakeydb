@@ -1660,6 +1660,18 @@ int32_t HSetFamily::FieldExpireTime(const DbContext& db_context, const PrimeValu
   }
 }
 
+// drakeydb: P7-1 (decision 35) -- the same read as CmdHGet's callback, through HMapWrap, so SORT's
+// `key_*->field` patterns see a listpack and a StringMap (with field TTLs) as HGET does.
+optional<string> HSetFamily::GetFieldValue(const DbContext& db_context, const PrimeValue& pv,
+                                           std::string_view field) {
+  DCHECK_EQ(OBJ_HASH, pv.ObjType());
+
+  HMapWrap hw{pv, db_context};
+  if (auto it = hw.Find(field); it)
+    return string{it->second};
+  return nullopt;
+}
+
 bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std::string_view key,
                                const PrimeValue& pv, bool derived) {
   if (pv.Encoding() != kEncodingStrMap2)

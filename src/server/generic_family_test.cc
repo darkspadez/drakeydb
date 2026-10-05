@@ -25,6 +25,8 @@ extern "C" {
 ABSL_DECLARE_FLAG(bool, multi_exec_squash);
 ABSL_DECLARE_FLAG(uint32_t, container_iteration_yield_interval_usec);
 ABSL_DECLARE_FLAG(std::string, notify_keyspace_events);
+ABSL_DECLARE_FLAG(uint32_t, num_shards);
+ABSL_DECLARE_FLAG(uint32_t, sort_set_max_intset_entries);
 
 using namespace testing;
 using namespace std;
@@ -2957,6 +2959,249 @@ const vector<SortOrderCase> kTieRowsM4 = {
     {"ids", {"BY", "inw_*", "DESC"}, {"9", "30", "200", "2", "10", "1"}},
     {"ids", {"BY", "inw_*", "LIMIT", "1", "3"}, {"10", "2", "200"}},
 };
+
+// drakeydb: P7-1 (decision 35) -- hash-field patterns, round 2b. The expected lists are what real
+// KeyDB v6.3.4 and Redis 7.0.15 answer to the same data and command (see LoadHashFieldData); a
+// nullopt is a nil in a reply and "" in the list STORE leaves.
+const vector<SortGetCase> kHashFieldCases = {
+    {"hl", {"BY", "hf_*->f"}, {"i", "d", "e", "f", "g", "h", "x->y", "b", "c", "a"}},
+    {"hl", {"BY", "hf_*->f", "DESC"}, {"a", "c", "b", "x->y", "h", "g", "f", "e", "d", "i"}},
+    {"hl", {"BY", "hf_*->f", "LIMIT", "2", "5"}, {"e", "f", "g", "h", "x->y"}},
+    {"hl", {"BY", "hf_*->f", "DESC", "LIMIT", "1", "4"}, {"c", "b", "x->y", "h"}},
+    {"hl", {"BY", "hf_*->n"}, {"c", "d", "e", "f", "g", "h", "x->y", "b", "a", "i"}},
+    {"hl", {"BY", "hf_*->n", "DESC"}, {"i", "a", "b", "x->y", "h", "g", "f", "e", "d", "c"}},
+    {"hl", {"BY", "hf_*->nofield"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"}},
+    {"hl", {"BY", "hf_*->nofield", "DESC"}, {"x->y", "i", "h", "g", "f", "e", "d", "c", "b", "a"}},
+    {"hl", {"BY", "*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "b", "c", "a"}},
+    {"hl", {"BY", "hq->w_*"}, {"d", "e", "f", "g", "h", "x->y", "b", "c", "a", "i"}},
+    {"hl", {"BY", "hr->w_*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "c", "a", "b"}},
+    {"hl", {"BY", "hf_*_*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "a", "b", "c"}},
+    {"hl", {"BY", "hf_*->f*"}, {"a", "b", "d", "e", "f", "g", "h", "i", "x->y", "c"}},
+    {"hl", {"BY", "hf_*->f", "GET", "#"}, {"i", "d", "e", "f", "g", "h", "x->y", "b", "c", "a"}},
+    {"hl",
+     {"BY", "hf_*->f", "GET", "hf_*->g"},
+     {"", nullopt, nullopt, "Gf", "Gg", nullopt, "Gxy", "Gb", "Gc", "Ga"}},
+    {"hl",
+     {"BY", "hf_*->f", "GET", "hf_*->g", "GET", "#"},
+     {"",      "i", nullopt, "d",    nullopt, "e", "Gf", "f", "Gg", "g",
+      nullopt, "h", "Gxy",   "x->y", "Gb",    "b", "Gc", "c", "Ga", "a"}},
+    {"hl",
+     {"BY", "hf_*->f", "DESC", "LIMIT", "1", "6", "GET", "hf_*->g"},
+     {"Gc", "Gb", "Gxy", nullopt, "Gg", "Gf"}},
+    {"hl",
+     {"BY", "hf_*->f", "GET", "hq->w_*", "GET", "hr->w_*->g"},
+     {"9",     "Ri",    nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      nullopt, nullopt, nullopt, nullopt, "1",     "Rb",    "2",     "Rc",    "3",     "Ra"}},
+    {"hl",
+     {"BY", "hr->w_*->g", "ALPHA", "DESC"},
+     {"i", "c", "b", "a", "d", "e", "f", "g", "h", "x->y"}},
+    {"hl", {"BY", "hf->f"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"}},
+    {"hl", {"BY", "hf->f", "DESC"}, {"x->y", "i", "h", "g", "f", "e", "d", "c", "b", "a"}},
+    {"hl",
+     {"BY", "hf->f", "GET", "hf_*->g"},
+     {"Ga", "Gb", "Gc", nullopt, nullopt, "Gf", "Gg", nullopt, "", "Gxy"}},
+    {"hl", {"BY", "hf_*->f", "ALPHA"}, {"d", "e", "f", "h", "g", "i", "x->y", "b", "c", "a"}},
+    {"hl",
+     {"BY", "hf_*->f", "ALPHA", "DESC"},
+     {"a", "c", "b", "x->y", "i", "g", "d", "e", "f", "h"}},
+    {"hl", {"BY", "hf_*->g", "ALPHA"}, {"d", "e", "h", "i", "a", "b", "c", "f", "g", "x->y"}},
+    {"hl",
+     {"BY", "hf_*->g", "ALPHA", "DESC"},
+     {"x->y", "g", "f", "c", "b", "a", "i", "d", "e", "h"}},
+    {"hl", {"BY", "hf_*->nofield", "ALPHA"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"}},
+    {"hl", {"BY", "hf_*->", "ALPHA"}, {"d", "e", "f", "g", "h", "i", "a", "b", "c", "x->y"}},
+    {"hl", {"BY", "hf_*->->", "ALPHA"}, {"b", "c", "d", "e", "f", "g", "h", "i", "x->y", "a"}},
+    {"hl", {"BY", "hf_*-->g", "ALPHA"}, {"b", "c", "d", "e", "f", "g", "h", "i", "x->y", "a"}},
+    {"hl", {"BY", "hf_*->f->g", "ALPHA"}, {"a", "c", "d", "e", "f", "g", "h", "i", "x->y", "b"}},
+    {"hl", {"BY", "hf->f", "ALPHA"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"}},
+    {"hl",
+     {"BY", "hf_*->g", "ALPHA", "GET", "hf_*->g", "GET", "#"},
+     {nullopt, "d", nullopt, "e", nullopt, "h", "",   "i", "Ga",  "a",
+      "Gb",    "b", "Gc",    "c", "Gf",    "f", "Gg", "g", "Gxy", "x->y"}},
+    {"hl",
+     {"BY", "nosort", "GET", "hf_*->g"},
+     {"Ga", "Gb", "Gc", nullopt, nullopt, "Gf", "Gg", nullopt, "", "Gxy"}},
+    {"hl",
+     {"BY", "nosort", "DESC", "GET", "hf_*->g"},
+     {"Gxy", "", nullopt, "Gg", "Gf", nullopt, nullopt, "Gc", "Gb", "Ga"}},
+    {"hs", {"BY", "hf_*->f"}, {"i", "d", "e", "f", "g", "h", "x->y", "b", "c", "a"}},
+    {"hs", {"BY", "hf_*->f", "DESC"}, {"a", "c", "b", "x->y", "h", "g", "f", "e", "d", "i"}},
+    {"hs", {"BY", "hf_*->f", "LIMIT", "2", "5"}, {"e", "f", "g", "h", "x->y"}},
+    {"hs", {"BY", "hf_*->f", "DESC", "LIMIT", "1", "4"}, {"c", "b", "x->y", "h"}},
+    {"hs", {"BY", "hf_*->n"}, {"c", "d", "e", "f", "g", "h", "x->y", "b", "a", "i"}},
+    {"hs", {"BY", "hf_*->n", "DESC"}, {"i", "a", "b", "x->y", "h", "g", "f", "e", "d", "c"}},
+    {"hs", {"BY", "hf_*->nofield"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"}},
+    {"hs", {"BY", "hf_*->nofield", "DESC"}, {"x->y", "i", "h", "g", "f", "e", "d", "c", "b", "a"}},
+    {"hs", {"BY", "*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "b", "c", "a"}},
+    {"hs", {"BY", "hq->w_*"}, {"d", "e", "f", "g", "h", "x->y", "b", "c", "a", "i"}},
+    {"hs", {"BY", "hr->w_*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "c", "a", "b"}},
+    {"hs", {"BY", "hf_*_*->f"}, {"d", "e", "f", "g", "h", "i", "x->y", "a", "b", "c"}},
+    {"hs", {"BY", "hf_*->f*"}, {"a", "b", "d", "e", "f", "g", "h", "i", "x->y", "c"}},
+    {"hs", {"BY", "hf_*->f", "GET", "#"}, {"i", "d", "e", "f", "g", "h", "x->y", "b", "c", "a"}},
+    {"hs",
+     {"BY", "hf_*->f", "GET", "hf_*->g"},
+     {"", nullopt, nullopt, "Gf", "Gg", nullopt, "Gxy", "Gb", "Gc", "Ga"}},
+    {"hs",
+     {"BY", "hf_*->f", "GET", "hf_*->g", "GET", "#"},
+     {"",      "i", nullopt, "d",    nullopt, "e", "Gf", "f", "Gg", "g",
+      nullopt, "h", "Gxy",   "x->y", "Gb",    "b", "Gc", "c", "Ga", "a"}},
+    {"hs",
+     {"BY", "hf_*->f", "DESC", "LIMIT", "1", "6", "GET", "hf_*->g"},
+     {"Gc", "Gb", "Gxy", nullopt, "Gg", "Gf"}},
+    {"hs",
+     {"BY", "hf_*->f", "GET", "hq->w_*", "GET", "hr->w_*->g"},
+     {"9",     "Ri",    nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      nullopt, nullopt, nullopt, nullopt, "1",     "Rb",    "2",     "Rc",    "3",     "Ra"}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->g"},
+     {"Ga", "Gb", "Gc", nullopt, nullopt, "Gf", "Gg", nullopt, "", "Gxy"}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->f"},
+     {"3", "1", "2", nullopt, nullopt, nullopt, "", nullopt, "-1", "0"}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->nofield"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "#", "GET", "hf_*->g"},
+     {"a", "Ga", "b", "Gb", "c", "Gc",    "d", nullopt, "e",    nullopt,
+      "f", "Gf", "g", "Gg", "h", nullopt, "i", "",      "x->y", "Gxy"}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->g", "GET", "#", "GET", "hf_*->f"},
+     {"Ga", "a",     "3",     "Gb",    "b",     "1",  "Gc", "c",     "2",    nullopt,
+      "d",  nullopt, nullopt, "e",     nullopt, "Gf", "f",  nullopt, "Gg",   "g",
+      "",   nullopt, "h",     nullopt, "",      "i",  "-1", "Gxy",   "x->y", "0"}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->"},
+     {"ARROWa", "ARROWb", "ARROWc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      "ARROWxy"}},
+    {"hl",
+     {"ALPHA", "GET", "*->g"},
+     {"Ba", "Bb", "Bc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hq->w_*"},
+     {"3", "1", "2", nullopt, nullopt, nullopt, nullopt, nullopt, "9", nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hr->w_*->g"},
+     {"Ra", "Rb", "Rc", nullopt, nullopt, nullopt, nullopt, nullopt, "Ri", nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*_*->g"},
+     {"Sa", "Sb", "Sc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->->"},
+     {"ARROWFIELD", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*-->g"},
+     {"DASHa", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->f->g"},
+     {nullopt, "FARROWG", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*->f*"},
+     {nullopt, nullopt, "7", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf->g"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_->g*"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "#->g"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "GET", "hf_*"},
+     {nullopt, nullopt, nullopt, nullopt, "iamastring", nullopt, nullopt, nullopt, nullopt,
+      nullopt}},
+    {"hl", {"ALPHA", "GET", "hf_*->g", "LIMIT", "2", "3"}, {"Gc", nullopt, nullopt}},
+    {"hl",
+     {"ALPHA", "DESC", "GET", "hf_*->g"},
+     {"Gxy", "", nullopt, "Gg", "Gf", nullopt, nullopt, "Gc", "Gb", "Ga"}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->g"},
+     {"Ga", "Gb", "Gc", nullopt, nullopt, "Gf", "Gg", nullopt, "", "Gxy"}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->f"},
+     {"3", "1", "2", nullopt, nullopt, nullopt, "", nullopt, "-1", "0"}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->nofield"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "#", "GET", "hf_*->g"},
+     {"a", "Ga", "b", "Gb", "c", "Gc",    "d", nullopt, "e",    nullopt,
+      "f", "Gf", "g", "Gg", "h", nullopt, "i", "",      "x->y", "Gxy"}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->g", "GET", "#", "GET", "hf_*->f"},
+     {"Ga", "a",     "3",     "Gb",    "b",     "1",  "Gc", "c",     "2",    nullopt,
+      "d",  nullopt, nullopt, "e",     nullopt, "Gf", "f",  nullopt, "Gg",   "g",
+      "",   nullopt, "h",     nullopt, "",      "i",  "-1", "Gxy",   "x->y", "0"}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->"},
+     {"ARROWa", "ARROWb", "ARROWc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      "ARROWxy"}},
+    {"hs",
+     {"ALPHA", "GET", "*->g"},
+     {"Ba", "Bb", "Bc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hq->w_*"},
+     {"3", "1", "2", nullopt, nullopt, nullopt, nullopt, nullopt, "9", nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hr->w_*->g"},
+     {"Ra", "Rb", "Rc", nullopt, nullopt, nullopt, nullopt, nullopt, "Ri", nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*_*->g"},
+     {"Sa", "Sb", "Sc", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->->"},
+     {"ARROWFIELD", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt,
+      nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*-->g"},
+     {"DASHa", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->f->g"},
+     {nullopt, "FARROWG", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*->f*"},
+     {nullopt, nullopt, "7", nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf->g"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_->g*"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "#->g"},
+     {nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "GET", "hf_*"},
+     {nullopt, nullopt, nullopt, nullopt, "iamastring", nullopt, nullopt, nullopt, nullopt,
+      nullopt}},
+    {"hs", {"ALPHA", "GET", "hf_*->g", "LIMIT", "2", "3"}, {"Gc", nullopt, nullopt}},
+    {"hs",
+     {"ALPHA", "DESC", "GET", "hf_*->g"},
+     {"Gxy", "", nullopt, "Gg", "Gf", nullopt, nullopt, "Gc", "Gb", "Ga"}},
+};
+
+const vector<SortGetCase> kHashFieldNulCases = {
+    {"nl", {"ALPHA", "GET", "#\x00x"s}, {"a", "b", "c"}},
+    {"nl", {"ALPHA", "GET", "#\x00"s}, {"a", "b", "c"}},
+    {"nl", {"ALPHA", "GET", "hn_*\x00->g"s}, {"S2", nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "hn_*->g\x00h"s}, {"NULFIELD", nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "hn_*->g\x00"s}, {"NULEND", nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "hn_*->\x00g"s}, {"S1", nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "h\x00v_*->g"s}, {nullopt, nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "hn_*\x00"s}, {"S3", nullopt, nullopt}},
+    {"nl", {"ALPHA", "GET", "hn_*->g", "GET", "#\x00x"s}, {"Ga", "a", "Gb", "b", "Gc", "c"}},
+    {"nl", {"BY", "h\x00v_*->f"s}, {"a", "b", "c"}},
+    {"nl", {"BY", "h\x00v_*->f"s, "GET", "#"}, {"a", "b", "c"}},
+    {"nl", {"BY", "h\x00*"s, "GET", "#"}, {"a", "b", "c"}},
+    {"nl", {"BY", "hn_*->g\x00h"s, "ALPHA"}, {"b", "c", "a"}},
+    {"nl", {"BY", "hn_*->\x00g"s, "ALPHA"}, {"b", "c", "a"}},
+    {"nl", {"BY", "hn_*\x00"s, "ALPHA", "GET", "#"}, {"b", "c", "a"}},
+    {"nl", {"BY", "hn_*->f"}, {"b", "c", "a"}},
+    {"nl", {"BY", "hn_*->f", "GET", "hn_*->g"}, {"Gb", "Gc", "Ga"}},
+    {"nl", {"BY", "hn_*->f\x00"s, "GET", "hn_*->g"}, {"Ga", "Gb", "Gc"}},
+};
 }  // namespace
 
 class GenericSortOrderTest : public GenericFamilyTest {
@@ -2967,6 +3212,8 @@ class GenericSortOrderTest : public GenericFamilyTest {
   void ExpectScript(const SortOrderCase& c);
   void ExpectGetReply(const SortGetCase& c);
   void ExpectGetStore(const SortGetCase& c);
+  void LoadHashFieldData();
+  void LoadHashFieldNulData();
 };
 
 // The data the tables above were taken on (the same commands ran against KeyDB and Redis).
@@ -3411,6 +3658,296 @@ TEST_F(GenericSortOrderTest, LimitCountBeyondUint32DoesNotOverflow) {
     SCOPED_TRACE(SortOrderCaseName(c));
     ExpectReply(c);
     ExpectStore(c);
+  }
+}
+
+// drakeydb: P7-1 (decision 35) -- hash-field patterns (round 2b). `BY w_*->f` and `GET h_*->f` read
+// field `f` of the hash at the key the first '*' names, as lookupKeyByPattern does
+// (sort.cpp:61-137): the first "->" after the '*' starts the field, if a character follows it; a
+// missing key, a key that is not a hash and a missing field are all "no value" (a nil in a reply,
+// "" in STORE, a weight of 0 under numeric BY and a missing weight under ALPHA BY). Every expected
+// list in kHashFieldCases and kHashFieldNulCases is what real KeyDB v6.3.4 answers to the same data
+// and command, and Redis 7.0.15 answers the same (and SORT_RO, on Redis): they were generated from
+// the fixtures below.
+//
+// hl is a list and hs a set of a..i and "x->y". For element e, hf_e is: a hash with the numeric
+// field f, the text field g and the number text n (a, b, c, i, x->y); missing (d); a string (e); a
+// hash without f (f); a hash whose f is empty (g); a list (h). The other keys are the odd spellings
+// of the cases.
+void GenericSortOrderTest::LoadHashFieldData() {
+  Run({"rpush", "hl", "a", "b", "c", "d", "e", "f", "g", "h", "i", "x->y"});
+  Run({"sadd", "hs", "x->y", "i", "h", "g", "f", "e", "d", "c", "b", "a"});
+  Run({"hset", "hf_a", "f", "3", "g", "Ga", "n", "10"});
+  Run({"hset", "hf_b", "f", "1", "g", "Gb", "n", "9.5"});
+  Run({"hset", "hf_c", "f", "2", "g", "Gc", "n", "-3"});
+  Run({"set", "hf_e", "iamastring"});
+  Run({"hset", "hf_f", "g", "Gf"});
+  Run({"hset", "hf_g", "f", "", "g", "Gg"});
+  Run({"rpush", "hf_h", "1", "2"});
+  Run({"hset", "hf_i", "f", "-1", "g", "", "n", "1e2"});
+  Run({"hset", "hf_x->y", "f", "0", "g", "Gxy", "n", "0"});
+  Run({"hset", "hf_a", "->", "ARROWFIELD"});
+  Run({"hset", "hf_b", "f->g", "FARROWG"});
+  Run({"hset", "hf_c", "f*", "7"});
+  Run({"hset", "hf_a-", "g", "DASHa"});
+  Run({"set", "hf_a->", "ARROWa"});
+  Run({"set", "hf_b->", "ARROWb"});
+  Run({"set", "hf_c->", "ARROWc"});
+  Run({"set", "hf_x->y->", "ARROWxy"});
+  Run({"set", "hq->w_a", "3"});
+  Run({"set", "hq->w_b", "1"});
+  Run({"set", "hq->w_c", "2"});
+  Run({"set", "hq->w_i", "9"});
+  Run({"hset", "hr->w_a", "f", "2", "g", "Ra"});
+  Run({"hset", "hr->w_b", "f", "3", "g", "Rb"});
+  Run({"hset", "hr->w_c", "f", "1", "g", "Rc"});
+  Run({"hset", "hr->w_i", "f", "0", "g", "Ri"});
+  Run({"hset", "hf_a_*", "f", "1", "g", "Sa"});
+  Run({"hset", "hf_b_*", "f", "2", "g", "Sb"});
+  Run({"hset", "hf_c_*", "f", "3", "g", "Sc"});
+  Run({"hset", "a", "f", "3", "g", "Ba"});
+  Run({"hset", "b", "f", "1", "g", "Bb"});
+  Run({"hset", "c", "f", "2", "g", "Bc"});
+}
+
+// Source nl, and the keys that a pattern holding a NUL byte does and does not reach: Redis scans a
+// pattern as a C string, so a NUL hides a '*' or a "->" that follows it, "#\0x" is "#", and the key
+// and the field are cut by length.
+void GenericSortOrderTest::LoadHashFieldNulData() {
+  Run({"rpush", "nl", "a", "b", "c"});
+  Run({"hset", "hn_a", "f", "5", "g", "Ga", "g\x00h"s, "NULFIELD", "g\x00"s, "NULEND"});
+  Run({"hset", "hn_b", "f", "1", "g", "Gb"});
+  Run({"hset", "hn_c", "f", "3", "g", "Gc"});
+  Run({"set", "hn_a->\x00g"s, "S1"});
+  Run({"set", "hn_a\x00->g"s, "S2"});
+  Run({"set", "hn_a\x00"s, "S3"});
+  Run({"hset", "h\x00v_a"s, "f", "5", "g", "Ha"});
+  Run({"hset", "h\x00v_b"s, "f", "1", "g", "Hb"});
+  Run({"hset", "h\x00v_c"s, "f", "3", "g", "Hc"});
+}
+
+TEST_F(GenericSortOrderTest, HashFieldPatternsAreReadAsRedisReadsThem) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  LoadHashFieldData();
+  for (const SortGetCase& c : kHashFieldCases) {
+    SCOPED_TRACE(StrCat("SORT ", c.source, " ", absl::StrJoin(c.options, " ")));
+    ExpectGetReply(c);
+    ExpectGetStore(c);
+  }
+}
+
+TEST_F(GenericSortOrderTest, HashFieldPatternsWithNulBytesAreScannedAsCStrings) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  LoadHashFieldNulData();
+  for (const SortGetCase& c : kHashFieldNulCases) {
+    SCOPED_TRACE(StrCat("SORT ", c.source, " ", absl::CHexEscape(absl::StrJoin(c.options, " "))));
+    ExpectGetReply(c);
+    ExpectGetStore(c);
+  }
+}
+
+// A numeric BY over a text field is the same error as over a text string key (KeyDB: "One or more
+// scores can't be converted into double"), with STORE leaving the destination as it was; ALPHA
+// sorts it.
+TEST_F(GenericSortOrderTest, HashFieldNumericByOfATextFieldFailsAsOverAStringKey) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  LoadHashFieldData();
+  const string kError = "One or more scores can't be converted into double";
+  for (const vector<string>& options :
+       {vector<string>{"BY", "hf_*->g"}, vector<string>{"BY", "hf_*->"}}) {
+    SCOPED_TRACE(absl::StrJoin(options, " "));
+    for (string_view name : {"SORT", "SORT_RO"}) {
+      vector<string> cmd{string(name), "hl"};
+      cmd.insert(cmd.end(), options.begin(), options.end());
+      EXPECT_THAT(Run(cmd), ErrArg(kError)) << name;
+    }
+    for (bool same_shard : {true, false}) {
+      const string dst = SortStoreDstKey("sort-hf-text-dst", "hl", same_shard);
+      Run({"set", dst, "stale"});
+      EXPECT_THAT(Run(SortStoreCommand("hl", options, dst)), ErrArg(kError));
+      EXPECT_THAT(Run({"get", dst}), "stale");
+    }
+  }
+}
+
+// A hash with more fields than a listpack holds is a StringMap (which is also what a field TTL
+// makes of one); both read the same through SORT.
+TEST_F(GenericSortOrderTest, HashFieldIsReadFromAListpackAndFromAStringMap) {
+  Run({"rpush", "he", "p", "q", "r", "s"});
+  for (string_view e : {"p", "q", "r"}) {
+    const string key = StrCat("hh_", e);
+    Run({"hset", key, "f", e == "p" ? "3" : e == "q" ? "1" : "2", "g", StrCat("V", e)});
+    EXPECT_THAT(Run({"debug", "object", key}).GetString(), HasSubstr("encoding:listpack"));
+  }
+  // s: a StringMap by size, with its f and g among 300 fields
+  vector<string> big{"hset", "hh_s", "f", "0", "g", "Vs"};
+  for (int i = 0; i < 300; ++i) {
+    big.push_back(StrCat("filler", i));
+    big.push_back("x");
+  }
+  Run(big);
+  ASSERT_THAT(Run({"debug", "object", "hh_s"}).GetString(), HasSubstr("encoding:dense_set"));
+
+  ExpectGetReply({"he", {"BY", "hh_*->f", "GET", "hh_*->g"}, {"Vs", "Vq", "Vr", "Vp"}});
+  ExpectGetStore({"he", {"BY", "hh_*->f", "GET", "hh_*->g"}, {"Vs", "Vq", "Vr", "Vp"}});
+  const SortGetCase desc_case{"he",
+                              {"BY", "hh_*->f", "DESC", "GET", "hh_*->nofield", "GET", "#"},
+                              {nullopt, "p", nullopt, "r", nullopt, "q", nullopt, "s"}};
+  ExpectGetReply(desc_case);
+  ExpectGetStore(desc_case);
+}
+
+// Field expiry (HSETEX, a drakeydb hash-field TTL that KeyDB has not got): a field that has expired
+// is missing, as it is for HGET: weight 0 under numeric BY and a nil in GET. The hash of a field
+// TTL is a StringMap, so this is that encoding's read; when the read leaves the hash empty it is
+// deleted, as an HGET does.
+TEST_F(GenericSortOrderTest, HashFieldWithAnExpiredTtlIsMissing) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  Run({"rpush", "tl2", "t", "u", "v"});
+  Run({"hsetex", "ht_t", "1", "f", "5"});
+  Run({"hset", "ht_t", "g", "Gt"});
+  Run({"hset", "ht_u", "g", "Gu"});
+  Run({"hset", "ht_v", "f", "3", "g", "Gv"});
+
+  // not expired yet: u (no f, weight 0), v (3), t (5)
+  ExpectGetReply(
+      {"tl2", {"BY", "ht_*->f", "GET", "#", "GET", "ht_*->f"}, {"u", nullopt, "v", "3", "t", "5"}});
+  ExpectGetStore(
+      {"tl2", {"BY", "ht_*->f", "GET", "#", "GET", "ht_*->f"}, {"u", nullopt, "v", "3", "t", "5"}});
+
+  // expired: t has no f any more, so t and u tie at 0 and break on the element. SORT reads the
+  // field first: an HGET would drop it from the hash and hide a SORT that did not look at its TTL
+  AdvanceTime(2000);
+  ExpectGetReply({"tl2",
+                  {"BY", "ht_*->f", "GET", "#", "GET", "ht_*->f"},
+                  {"t", nullopt, "u", nullopt, "v", "3"}});
+  ExpectGetStore({"tl2",
+                  {"BY", "ht_*->f", "GET", "#", "GET", "ht_*->f"},
+                  {"t", nullopt, "u", nullopt, "v", "3"}});
+  ExpectGetReply({"tl2", {"BY", "ht_*->f", "ALPHA", "GET", "#"}, {"t", "u", "v"}});
+  // and the field that did not expire is there
+  ExpectGetReply({"tl2", {"ALPHA", "GET", "ht_*->g"}, {"Gt", "Gu", "Gv"}});
+  EXPECT_THAT(Run({"hget", "ht_t", "f"}), ArgType(RespExpr::NIL));
+}
+
+TEST_F(GenericSortOrderTest, HashFieldReadDeletesAHashItsLazyExpiryEmptied) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  for (string_view name : {"SORT", "SORT_RO"}) {
+    Run({"flushall"});
+    Run({"rpush", "ex-l", "x", "y"});
+    Run({"hsetex", "ex_x", "1", "f", "1"});
+    Run({"hsetex", "ex_y", "1", "f", "2"});
+    ASSERT_THAT(Run({"exists", "ex_x", "ex_y"}), IntArg(2));
+    AdvanceTime(2000);
+
+    // the field is read through SORT, and the hash its expiry emptied goes (as for HGET, below)
+    EXPECT_THAT(Run({name, "ex-l", "BY", "ex_*->f"}), RespElementsAre("x", "y")) << name;
+    EXPECT_THAT(Run({"exists", "ex_x"}), IntArg(0)) << name;
+    EXPECT_THAT(Run({"exists", "ex_y"}), IntArg(0)) << name;
+  }
+
+  Run({"hsetex", "ex_h", "1", "f", "1"});
+  AdvanceTime(2000);
+  EXPECT_THAT(Run({"hget", "ex_h", "f"}), ArgType(RespExpr::NIL));
+  EXPECT_THAT(Run({"exists", "ex_h"}), IntArg(0));
+}
+
+// The key part of the pattern, not the whole pattern string, decides which shard a hash is read on:
+// with three shards, a source, a destination and hashes on the source's shard, the destination's
+// and the third one.
+TEST_F(GenericSortOrderTest, HashFieldIsReadOnTheShardOfTheKeyPart) {
+  absl::FlagSaver fs;
+  absl::SetFlag(&FLAGS_num_shards, 3);
+  num_threads_ = 4;
+  ResetService();
+  ASSERT_EQ(shard_set->size(), 3u);
+
+  auto key_on = [](string_view prefix, ShardId sid) {
+    for (int i = 0;; ++i) {
+      string candidate = StrCat(prefix, i);
+      if (Shard(candidate, shard_set->size()) == sid)
+        return candidate;
+      CHECK_LT(i, 10000) << "no '" << prefix << "' key on shard " << sid;
+    }
+  };
+  const string src = key_on("hfs-src", 0);
+  const string dst = key_on("hfs-dst", 1);
+
+  vector<string> push{"rpush", src};
+  vector<pair<int, string>> by_weight;  // (weight, element)
+  for (ShardId sid = 0; sid < 3; ++sid) {
+    for (int n = 0; n < 4; ++n) {
+      string element;
+      for (int i = 0;; ++i) {
+        element = StrCat("e", sid, "_", n, "_", i);
+        if (Shard(StrCat("hfs_", element), shard_set->size()) == sid)
+          break;
+        CHECK_LT(i, 10000);
+      }
+      const int weight = (sid * 4 + n) * 7 % 12;  // a scramble of 0 .. 11, no ties
+      Run({"hset", StrCat("hfs_", element), "f", to_string(weight), "g", StrCat("G", element)});
+      push.push_back(element);
+      by_weight.emplace_back(weight, element);
+    }
+  }
+  Run(push);
+  sort(by_weight.begin(), by_weight.end());
+  vector<string> expected;
+  for (const auto& [weight, element] : by_weight)
+    expected.push_back(StrCat("G", element));
+
+  EXPECT_THAT(Run({"sort", src, "BY", "hfs_*->f", "GET", "hfs_*->g"}),
+              RespArray(ElementsAreArray(expected)));
+  EXPECT_THAT(Run({"sort", src, "BY", "hfs_*->f", "GET", "hfs_*->g", "STORE", dst}),
+              IntArg(expected.size()));
+  EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespArray(ElementsAreArray(expected)));
+}
+
+// Decision 41: --sort_set_max_intset_entries is how many members an integer-only set may have to be
+// ordered as KeyDB and Redis hold it, an intset (ascending numeric, which their stable sort keeps
+// for tied ALPHA BY weights); a bigger one is a hash set there, which no replica can follow, so it
+// breaks ties on the element (bytewise) here. 512 is their default. Live KeyDB started with
+// `set-max-intset-entries 100` and `600` answers ascending for 100 and for 550 and 600 members (and
+// 512 for the default), and in the other rows its order differs from run to run, so those rows are
+// this rule. 0 turns the emulation off: no set is ordered ascending.
+TEST_F(GenericSortOrderTest, SortSetMaxIntsetEntriesIsTheLimitOfTheIntsetOrder) {
+  absl::FlagSaver fs;
+  EXPECT_EQ(absl::GetFlag(FLAGS_sort_set_max_intset_entries), 512u) << "the default is KeyDB's";
+
+  struct Row {
+    uint32_t limit;
+    unsigned members;
+    bool ascending;
+  };
+  for (const Row& row :
+       {Row{100, 100, true}, Row{100, 101, false}, Row{100, 150, false}, Row{600, 550, true},
+        Row{600, 600, true}, Row{600, 601, false}, Row{512, 512, true}, Row{512, 513, false},
+        Row{512, 550, false}, Row{0, 5, false}, Row{0, 100, false}, Row{2, 3, false}}) {
+    SCOPED_TRACE(StrCat("limit ", row.limit, ", ", row.members, " members"));
+    absl::SetFlag(&FLAGS_sort_set_max_intset_entries, row.limit);
+
+    const string key = StrCat("ints-", row.limit, "-", row.members);
+    vector<string> members = IntegerMembers(row.members);
+    vector<string> sadd{"sadd", key};
+    sadd.insert(sadd.end(), members.begin(), members.end());
+    Run(sadd);  // its reply is not checked, see AlphaByTiesOverIntegerSetsOfEverySize
+    ASSERT_THAT(Run({"scard", key}), IntArg(row.members));
+
+    vector<string> ascending = members;
+    if (row.ascending) {
+      sort(ascending.begin(), ascending.end(),
+           [](const string& l, const string& r) { return stoll(l) < stoll(r); });
+    } else {
+      sort(ascending.begin(), ascending.end());
+    }
+    vector<string> descending = ascending;
+    if (!row.ascending)
+      reverse(descending.begin(), descending.end());  // the element rule is negated by DESC
+
+    ExpectReply({key, {"BY", "nokey_*", "ALPHA"}, ascending});
+    ExpectStore({key, {"BY", "nokey_*", "ALPHA"}, ascending});
+    ExpectReply({key, {"BY", "nokey_*", "ALPHA", "DESC"}, descending});
+    ExpectStore({key, {"BY", "nokey_*", "ALPHA", "DESC"}, descending});
   }
 }
 
