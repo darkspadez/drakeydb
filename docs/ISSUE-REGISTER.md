@@ -883,6 +883,49 @@ removed (back to `Current()->`) the gtest dies with SIGSEGV and both `ack` pytes
 replica. Pre-existing in upstream Dragonfly; not filed upstream, and worth filing (a remote crash of
 any non-cluster node). On the byte-identity exception list (spec, item 2).
 
+### U-22. `SADD` replies a wrong count when an integer set converts in the middle of the call
+
+**Where:** `OpAdd` (`src/server/set_family.cc`), the string-set branch after the intset loop.
+
+While a key is an intset, `OpAdd` inserts the integers one by one and counts each in `res`
+(`IntsetAddSafe`). It converts the set to a string set when the intset passes `kMaxIntSetEntries`
+(256) or a member is not an integer, and then ran `res = StringSetWrapper{...}.Add(vals, ...)`.
+`Add()` walks every member of the call and counts those the converted set does not hold yet, which
+excludes the integers the intset had already taken, and the assignment threw away the count the loop
+had kept: `SADD` replied only the rest of the call. On a new key 257 distinct integers replied 0,
+258 replied 1, 300 replied 43, 512 replied 255, 600 replied 343, 1000 replied 743; an existing
+intset of 200 plus 100 new integers replied 43, 256 plus one new replied 0, 250 plus 10 replied 3;
+an intset `{1,2,3}` plus `4 5 a 6` replied 2 (Redis: 4) and plus `4 a` replied 1 (Redis: 2). Redis
+answers the number of members that were new, whatever its own conversion threshold (a second Redis
+at `set-max-intset-entries 256` answers the same). The set was right all along (`SCARD` and the
+members match); a client, a `MULTI` reply and a script that returns the `redis.call` result all saw
+the wrong number. Not affected: a call of up to 256 integers on a new key, a set that is a string
+set already (a non-integer member, or converted by an earlier call), `SADDEX` (always a string set;
+its count is `Add()`'s alone), and `SMOVE` and `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE`, which write
+through the same `OpAdd` but reply a count of their own (1 or 0, the result size). Nothing journaled
+or replicated depends on `res`: the auto-journal of `SADD` gates on the hop's status (`OK` for any
+count, 0 included) and `OpAdd`'s own `SADD` entry (the store commands, `SMOVE`) is built from
+`vals`; a master and a replica of the build before the fix hold the same members after a `SADD` of
+300 integers that replied 43.
+
+**How established:** found by P7-1's SORT round 2a, whose tests build their sets with `SADD`.
+Reproduced against the build before the fix, with a 69-case matrix (new keys, existing keys,
+duplicates, non-integers, `SADDEX`, `SMOVE`, the three store commands) run on that build, on Redis
+7.0.15 at its default and at `set-max-intset-entries 256`, and on the fixed build: Redis equals an
+independent set-arithmetic oracle in all 63 cases it can run, the build before the fix differs from
+it in 24 rows, every one a `SADD` reply, and the fixed build in none. The line is in the fork's
+base commit (`git log -S` finds it first in `05abfdd`).
+
+**Status (2026-10-05): fixed in this fork** (P7-1, owner decision 40): one `// drakeydb: P7-1
+(decision 40)` hunk in `set_family.cc`, `res +=` for `res =`. Tests (`set_family_test.cc`, every
+expected reply Redis 7.0.15's): `SetFamilyTest.SAddCountsAcrossIntsetOverflow` (31 rows: 21 wrong
+before the fix, 10 right before it as controls), `.SAddCountsAfterConversion`, and two controls that
+pass without the change, `.SAddExCountsAcrossIntsetConversion` and
+`.SMoveAndStoreAcrossIntsetOverflow`. Falsified (`res =` back): 22 replies wrong in the first two,
+with the counts above. Pre-existing in upstream Dragonfly; not filed upstream (a wrong reply, not
+a crash or a divergence). On the byte-identity exception list (spec, item 2); the client-visible
+reply is the only change, no journal or RDB byte moves.
+
 ---
 
 ## Part 2 — drakeydb deferred work

@@ -1430,6 +1430,11 @@ the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE
      cluster config (every cluster mode until a config is pushed) read the config through a null
      pointer, SIGSEGV for a client and for a stream alike, and a bare `DFLYMIGRATE` failed a debug
      build's parser-destructor assert. They answer `UNKNOWN_MIGRATION` and `syntax error` now.
+   - **U-22** (P7-1, decision 40, found while testing `SORT`): `SADD` replied only the members added
+     after an integer set converted to a string set in the middle of the call (past 256 entries, or at
+     a non-integer): 300 integers to a new key replied 43, Redis 300. The reply is the only change, as
+     Redis answers it; the set, the journal and the RDB output were right and are untouched. `SADDEX`,
+     `SMOVE` and the store commands never had it.
    - **`SORT` ordering, `LIMIT`, `GET`, numbers and RESP3** (P7-1, decisions 34, 36, 37 and 38,
      ISSUE-REGISTER D-34 and U-20): `SORT` now orders as Redis and KeyDB do (a `BY` tie breaks on the
      element, a missing `ALPHA BY` weight sorts first, a SET under `BY nosort` that is stored or
@@ -1544,6 +1549,7 @@ REPLACE` onto a live destination found its source due (D-9, ISSUE-REGISTER D-32,
 | `src/server/db_slice.cc` | One-expression `ExpireIfNeeded` gate (`!owner_->ReplicaActiveExpiry()`) (1); the read-path hide in `FindInternal` (2, Task 2.9) | 1, 2 |
 | `src/server/generic_family.cc` | `SortGeneric`'s multi-shard fetch hop and its two `SortStoreNothing` call sites (P7-1 review round, decision 32); the read-path hide in `ScanCb` (2, Task 2.9, decision 33) | 1, 2 |
 | `src/server/hset_family.{h,cc}` | `HSetFamily::GetFieldValue`, the `HGET` read of one field, for `SORT`'s hash-field patterns (P7-1, decision 35) | 1 |
+| `src/server/set_family.cc` | `OpAdd` adds the string set's count to the intset loop's instead of assigning it, so `SADD` replies the members added when an integer set converts mid-call (P7-1, decision 40, U-22) | 1 |
 | `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards (0); U-15 guards in `Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch` (1, review round and re-review); the `SetReplTime` copy beside `SetReplOrigin` in `PrepareTransaction` (2, Task 2.8) | 0, 1, 2 |
 | `src/server/conn_context.h` | `repl_time_ms`, the per-command envelope time beside `repl_origin_idx` (Task 2.8) | 2 |
 | `src/server/dflycmd.cc` | U-15 null-`conn()` guards in `DFLY THREAD` (review round) and `DFLY FLOW` (P7-1 close) | 1 |
