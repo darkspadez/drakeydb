@@ -223,7 +223,7 @@ in the orchestrator's scratchpad (`gate-p71/`).
   (P7-0 binary 5/8, `main` 2/8). Not re-measured on `main` this time.
 - **Repeats:** the Task 1.4 expiry tests (`-k "expire or expiry"`) ×10: 220/220; the U-19 deadlock
   and strand tests ×10: 100/100; the throughput smoke ×5: 5/5; the three later TTL-window tests
-  (`loses_a_ttl_refresh`, `recomputes_a_counter`, `ttl_less_orphan`) ×10: running at the time of this commit (review M-7
+  (`loses_a_ttl_refresh`, `recomputes_a_counter`, `ttl_less_orphan`) ×10: 120/120 (review M-7
   closed).
 - **Not exercised here:** the `DRAKEYDB_PERF=1` release bar (measured in Task 1.5, unchanged path),
   a release build, ASAN/UBSAN (PR CI runs them), fakeredis (runs in PR CI).
