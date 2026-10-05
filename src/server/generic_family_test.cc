@@ -2561,4 +2561,323 @@ TEST_F(GenericFamilyTest, SortStoreOfFullyExpiredSetDeletesDestination) {
   }
 }
 
+// drakeydb: P7-1 (decision 34) -- SORT orders as Redis and KeyDB do, for every caller
+// (ISSUE-REGISTER D-34). KeyDB replicates `SORT .. STORE` verbatim, so a replica that orders
+// differently ends up with the same members in another order, silently. The rules, each from
+// KeyDB's sort.cpp:
+//   - a numeric tie under BY breaks on the element, not on the weight (:153-156);
+//   - under ALPHA BY a missing weight sorts before every present one, the empty string included
+//     (:160-168);
+//   - BY nosort on a SET that is stored, or runs in a script, sorts ALPHA by the element
+//     (:298-308);
+//   - BY nosort on a LIST or a ZSET walks it from the tail under DESC, and LIMIT counts along that
+//     walk (:356-382, :401-430).
+//
+// Every expected list below is what real KeyDB v6.3.4 answers to the same data and command, and
+// Redis 7.0.15 answers the same to all of them: the reply, the list STORE leaves and, for the
+// nosort tables, both inside EVAL; SORT_RO's replies (KeyDB 6.3.4 has no SORT_RO) were checked on
+// Redis alone. They were taken from the servers, not derived by hand. The one exception is the
+// table of ALPHA BY ties, which says so.
+namespace {
+
+struct SortOrderCase {
+  string source;
+  vector<string> options;  // between the source key and STORE
+  vector<string> expected;
+};
+
+string SortOrderCaseName(const SortOrderCase& c) {
+  return StrCat("SORT ", c.source, " ", absl::StrJoin(c.options, " "));
+}
+
+const vector<SortOrderCase> kByTieCases = {
+    {"s", {"BY", "w_*"}, {"b", "c", "d", "e", "f", "g", "h", "i", "j", "a"}},
+    {"s", {"BY", "w_*", "DESC"}, {"a", "j", "i", "h", "g", "f", "e", "d", "c", "b"}},
+    {"s", {"BY", "w_*", "LIMIT", "1", "3"}, {"c", "d", "e"}},
+    {"s", {"BY", "w_*", "DESC", "LIMIT", "2", "4"}, {"i", "h", "g", "f"}},
+    {"s", {"BY", "w_*", "LIMIT", "5", "100"}, {"g", "h", "i", "j", "a"}},
+    {"s", {"BY", "nokey_*"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}},
+    {"s", {"BY", "nokey_*", "DESC"}, {"j", "i", "h", "g", "f", "e", "d", "c", "b", "a"}},
+    {"l", {"BY", "lw_*"}, {"r", "t", "u", "w", "y", "q", "e", "i", "o", "p"}},
+    {"l", {"BY", "lw_*", "DESC"}, {"p", "o", "i", "e", "q", "y", "w", "u", "t", "r"}},
+    {"sm", {"BY", "nw_*"}, {"c", "a", "b", "d"}},
+    {"sm", {"BY", "nw_*", "DESC"}, {"d", "b", "a", "c"}},
+    {"ln", {"BY", "nokey_*"}, {"1", "3", "3", "5", "5", "5", "7", "9"}},
+    {"ln", {"BY", "nokey_*", "DESC"}, {"9", "7", "5", "5", "5", "3", "3", "1"}},
+    {"s", {"BY", "w_*", "GET", "#", "GET", "h_*"}, {"b",  "Hb", "c",  "Hc", "d",  "Hd", "e",
+                                                    "He", "f",  "Hf", "g",  "Hg", "h",  "Hh",
+                                                    "i",  "Hi", "j",  "Hj", "a",  "Ha"}},
+    {"s", {"BY", "w_*", "DESC", "LIMIT", "1", "2", "GET", "#"}, {"j", "i"}},
+};
+
+const vector<SortOrderCase> kAlphaByCases = {
+    {"sa", {"BY", "aw_*", "ALPHA"}, {"c", "b", "f", "d", "a", "e"}},
+    {"sa", {"BY", "aw_*", "ALPHA", "DESC"}, {"e", "a", "d", "f", "b", "c"}},
+    {"sa", {"BY", "aw_*", "ALPHA", "LIMIT", "1", "3"}, {"b", "f", "d"}},
+    {"sa", {"BY", "aw_*", "ALPHA", "DESC", "LIMIT", "1", "3"}, {"a", "d", "f"}},
+    {"sa", {"BY", "aw_*", "ALPHA", "GET", "#"}, {"c", "b", "f", "d", "a", "e"}},
+    {"sw", {"BY", "ww_*", "ALPHA"}, {"x", "y", "z"}},
+    {"sw", {"BY", "ww_*", "ALPHA", "DESC"}, {"z", "y", "x"}},
+};
+
+const vector<SortOrderCase> kNosortSetCases = {
+    {"s", {"BY", "nosort"}, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}},
+    {"s", {"BY", "nosort", "DESC"}, {"j", "i", "h", "g", "f", "e", "d", "c", "b", "a"}},
+    {"s", {"BY", "nosort", "LIMIT", "0", "3"}, {"a", "b", "c"}},
+    {"s", {"BY", "nosort", "DESC", "LIMIT", "1", "2"}, {"i", "h"}},
+    {"s", {"BY", "nosort", "GET", "#", "GET", "h_*"}, {"a",  "Ha", "b",  "Hb", "c",  "Hc", "d",
+                                                       "Hd", "e",  "He", "f",  "Hf", "g",  "Hg",
+                                                       "h",  "Hh", "i",  "Hi", "j",  "Hj"}},
+    {"sn", {"BY", "nosort"}, {"1", "10", "2", "3", "4", "5", "6", "7", "8", "9"}},
+    {"sn", {"BY", "nosort", "DESC"}, {"9", "8", "7", "6", "5", "4", "3", "2", "10", "1"}},
+};
+
+const vector<SortOrderCase> kNosortWalkCases = {
+    {"zl", {"BY", "nosort"}, {"x", "y", "z", "w", "v"}},
+    {"zl", {"BY", "nosort", "DESC"}, {"v", "w", "z", "y", "x"}},
+    {"zl", {"BY", "nosort", "LIMIT", "1", "2"}, {"y", "z"}},
+    {"zl", {"BY", "nosort", "DESC", "LIMIT", "1", "2"}, {"w", "z"}},
+    {"zl", {"BY", "nosort", "DESC", "LIMIT", "3", "10"}, {"y", "x"}},
+    {"zl", {"BY", "nosort", "DESC", "LIMIT", "9", "2"}, {}},
+    {"zl", {"BY", "nosort", "DESC", "GET", "#"}, {"v", "w", "z", "y", "x"}},
+    {"zl", {"BY", "nosort", "GET", "#"}, {"x", "y", "z", "w", "v"}},
+    {"z", {"BY", "nosort"}, {"b", "c", "a", "e", "d"}},
+    {"z", {"BY", "nosort", "DESC"}, {"d", "e", "a", "c", "b"}},
+    {"z", {"BY", "nosort", "LIMIT", "1", "2"}, {"c", "a"}},
+    {"z", {"BY", "nosort", "DESC", "LIMIT", "1", "2"}, {"e", "a"}},
+    {"z", {"BY", "nosort", "DESC", "LIMIT", "3", "10"}, {"c", "b"}},
+    {"z", {"BY", "nosort", "DESC", "LIMIT", "9", "2"}, {}},
+    {"z", {"BY", "nosort", "DESC", "GET", "#"}, {"d", "e", "a", "c", "b"}},
+    {"z", {"BY", "nosort", "GET", "#"}, {"b", "c", "a", "e", "d"}},
+};
+
+const vector<SortOrderCase> kWideLimitCases = {
+    {"ln", {"LIMIT", "1", "4294967295"}, {"3", "3", "5", "5", "5", "7", "9"}},
+    {"ln", {"LIMIT", "4294967295", "1"}, {}},
+    {"zl", {"BY", "nosort", "LIMIT", "1", "4294967295"}, {"y", "z", "w", "v"}},
+    {"zl", {"BY", "nosort", "DESC", "LIMIT", "1", "4294967295"}, {"w", "z", "y", "x"}},
+    {"s", {"BY", "w_*", "LIMIT", "1", "4294967295"}, {"c", "d", "e", "f", "g", "h", "i", "j", "a"}},
+    {"s", {"BY", "w_*", "DESC", "LIMIT", "4294967295", "4294967295"}, {}},
+};
+
+// What ALPHA BY does with equal weights is the one order a replica of KeyDB cannot reproduce: KeyDB
+// leaves such elements in the order its own sort received them (a list's order, a set's hash
+// order, which differs between two KeyDB processes), so these lists are drakeydb's rule, not
+// KeyDB's: a tie breaks on the element, bytewise, so drakeydb's own replicas and peers agree.
+// KeyDB answers `SORT tl BY nokey_* ALPHA` below with b a b a, in the list's order.
+const vector<SortOrderCase> kAlphaByTieCases = {
+    {"ts", {"BY", "tw_*", "ALPHA"}, {"a", "b", "c", "d"}},
+    {"ts", {"BY", "tw_*", "ALPHA", "DESC"}, {"d", "c", "b", "a"}},
+    {"tm", {"BY", "nokey_*", "ALPHA"}, {"a", "b", "c", "d"}},
+    {"tm", {"BY", "nokey_*", "ALPHA", "DESC"}, {"d", "c", "b", "a"}},
+    {"tl", {"BY", "nokey_*", "ALPHA"}, {"a", "a", "b", "b"}},
+};
+
+}  // namespace
+
+class GenericSortOrderTest : public GenericFamilyTest {
+ protected:
+  void LoadData();
+  void ExpectReply(const SortOrderCase& c);
+  void ExpectStore(const SortOrderCase& c);
+  void ExpectScript(const SortOrderCase& c);
+};
+
+// The data the tables above were taken on (the same commands ran against KeyDB and Redis).
+void GenericSortOrderTest::LoadData() {
+  // s: a SET of letters; every letter weighs 1 (w_*), except a, which weighs 2.
+  Run({"sadd", "s", "j", "i", "h", "g", "f", "e", "d", "c", "b", "a"});
+  for (string_view ch : {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}) {
+    Run({"set", StrCat("w_", ch), ch == "a" ? "2" : "1"});
+    Run({"set", StrCat("h_", ch), StrCat("H", ch)});
+  }
+  Run({"sadd", "sn", "5", "3", "9", "1", "7", "2", "8", "4", "6", "10"});
+  // l: a LIST whose elements mostly have no weight (lw_*).
+  Run({"rpush", "l", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p"});
+  for (string_view ch : {"e", "i", "o", "p"})
+    Run({"set", StrCat("lw_", ch), "3"});
+  Run({"set", "lw_q", "1"});
+  Run({"rpush", "ln", "5", "3", "9", "1", "7", "5", "5", "3"});
+  // sm: a and d weigh 0, b has no weight (also 0), c weighs -1.
+  Run({"sadd", "sm", "d", "c", "b", "a"});
+  Run({"set", "nw_a", "0"});
+  Run({"set", "nw_c", "-1"});
+  Run({"set", "nw_d", "0"});
+  // z: a ZSET whose rank order (b c a e d) is not the members' order; zl: a LIST out of order.
+  Run({"zadd", "z", "3", "a", "1", "b", "2", "c", "5", "d", "4", "e"});
+  Run({"rpush", "zl", "x", "y", "z", "w", "v"});
+  // sa: ALPHA BY weights aw_*: c has none, b has the empty string, the others are distinct.
+  Run({"sadd", "sa", "f", "e", "d", "c", "b", "a"});
+  Run({"set", "aw_a", "m"});
+  Run({"set", "aw_b", ""});
+  Run({"set", "aw_d", "b"});
+  Run({"set", "aw_e", "z"});
+  Run({"set", "aw_f", "a"});
+  // sw: x's weight key is a list (not a string, so missing), y's is empty, z's is "a".
+  Run({"sadd", "sw", "z", "y", "x"});
+  Run({"rpush", "ww_x", "a"});
+  Run({"set", "ww_y", ""});
+  Run({"set", "ww_z", "a"});
+  // The ALPHA BY ties: equal weights (ts), no weights at all (tm), a list with duplicates (tl).
+  Run({"sadd", "ts", "d", "c", "b", "a"});
+  for (string_view ch : {"a", "b", "c"})
+    Run({"set", StrCat("tw_", ch), "x"});
+  Run({"set", "tw_d", "y"});
+  Run({"sadd", "tm", "d", "c", "b", "a"});
+  Run({"rpush", "tl", "b", "a", "b", "a"});
+}
+
+// SORT and SORT_RO reply `expected`, in this order.
+void GenericSortOrderTest::ExpectReply(const SortOrderCase& c) {
+  for (string_view name : {"SORT", "SORT_RO"}) {
+    vector<string> cmd{string(name), c.source};
+    cmd.insert(cmd.end(), c.options.begin(), c.options.end());
+    EXPECT_THAT(Run(cmd), RespArray(ElementsAreArray(c.expected))) << name;
+  }
+}
+
+// STORE leaves `expected` in a list at dst, whether dst is on the source's shard or on another one,
+// over a dst that held something else (an empty result deletes it, as Redis does).
+void GenericSortOrderTest::ExpectStore(const SortOrderCase& c) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  for (bool same_shard : {true, false}) {
+    const string dst = SortStoreDstKey("sort-order-dst", c.source, same_shard);
+    SCOPED_TRACE(StrCat("STORE on ", same_shard ? "the source's shard" : "another shard"));
+
+    Run({"set", dst, "stale"});
+    EXPECT_THAT(Run(SortStoreCommand(c.source, c.options, dst)), IntArg(c.expected.size()));
+    if (c.expected.empty())
+      EXPECT_THAT(Run({"exists", dst}), IntArg(0));
+    else
+      EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespArray(ElementsAreArray(c.expected)));
+  }
+}
+
+// The same inside EVAL, where a SET under BY nosort is sorted even without STORE: the reply of
+// SORT and of SORT_RO, and the list STORE leaves.
+void GenericSortOrderTest::ExpectScript(const SortOrderCase& c) {
+  const string dst = SortStoreDstKey("sort-order-script-dst", c.source, false);
+  for (string_view name : {"SORT", "SORT_RO"}) {
+    vector<string> eval{"EVAL", StrCat("return redis.call('", name, "', KEYS[1], unpack(ARGV))"),
+                        "2", c.source, dst};
+    eval.insert(eval.end(), c.options.begin(), c.options.end());
+    EXPECT_THAT(Run(eval), RespArray(ElementsAreArray(c.expected))) << name;
+  }
+
+  vector<string> eval{"EVAL", "return redis.call('SORT', KEYS[1], unpack(ARGV))", "2", c.source,
+                      dst};
+  eval.insert(eval.end(), c.options.begin(), c.options.end());
+  eval.insert(eval.end(), {"STORE", dst});
+  Run({"set", dst, "stale"});
+  EXPECT_THAT(Run(eval), IntArg(c.expected.size()));
+  if (c.expected.empty())
+    EXPECT_THAT(Run({"exists", dst}), IntArg(0));
+  else
+    EXPECT_THAT(Run({"lrange", dst, "0", "-1"}), RespArray(ElementsAreArray(c.expected)));
+}
+
+// Rule 1: two elements with the same BY weight, or none (a missing key weighs 0), come out in the
+// elements' order, ASC and DESC alike, under LIMIT and into STORE. Before, they came out in the
+// order the source held them in: a set's iteration order, which a replica does not share.
+TEST_F(GenericSortOrderTest, TiedByWeightsBreakOnTheElement) {
+  LoadData();
+  for (const SortOrderCase& c : kByTieCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// Rule 2: under ALPHA BY a weight key that does not exist, or is not a string, sorts before every
+// weight that does, the empty string included, and DESC puts it last.
+TEST_F(GenericSortOrderTest, AlphaByPutsAMissingWeightFirst) {
+  LoadData();
+  for (const SortOrderCase& c : kAlphaByCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// What KeyDB leaves undetermined (ALPHA BY ties) is deterministic here: see the table above.
+TEST_F(GenericSortOrderTest, AlphaByTiesBreakOnTheElement) {
+  LoadData();
+  for (const SortOrderCase& c : kAlphaByTieCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
+// Rule 3: BY nosort on a SET that is stored, or sorted inside a script, comes out ALPHA by the
+// element (note "1" "10" "2" for the intset), with GET, DESC and LIMIT applied after the sort.
+TEST_F(GenericSortOrderTest, NosortSetThatIsStoredOrScriptedIsSortedAlpha) {
+  LoadData();
+  for (const SortOrderCase& c : kNosortSetCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectStore(c);
+    ExpectScript(c);
+  }
+
+  // Inside MULTI a STORE is stored all the same.
+  Run({"multi"});
+  Run({"sort", "s", "BY", "nosort", "STORE", "multi-dst"});
+  ASSERT_THAT(Run({"exec"}), RespElementsAre(IntArg(10)));
+  EXPECT_THAT(Run({"lrange", "multi-dst", "0", "-1"}),
+              RespElementsAre("a", "b", "c", "d", "e", "f", "g", "h", "i", "j"));
+}
+
+// A SET under BY nosort that is neither stored nor scripted keeps its iteration order, which no
+// one defines (Redis and KeyDB leave it open too): the members, each once, and LIMIT cuts that
+// walk. This is not an order to assert; it pins that the plain reply is not sorted away or lost.
+TEST_F(GenericSortOrderTest, NosortSetReplyKeepsItsMembers) {
+  LoadData();
+  const vector<string> members{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"};
+
+  for (string_view name : {"SORT", "SORT_RO"}) {
+    EXPECT_THAT(Run({name, "s", "BY", "nosort"}), RespArray(UnorderedElementsAreArray(members)));
+
+    auto resp = Run({name, "s", "BY", "nosort", "LIMIT", "2", "3"});
+    ASSERT_THAT(resp, ArrLen(3));
+    set<string> distinct;
+    for (const RespExpr& e : resp.GetVec())
+      distinct.insert(e.GetString());
+    EXPECT_EQ(distinct.size(), 3u);
+    EXPECT_TRUE(all_of(distinct.begin(), distinct.end(), [&](const string& m) {
+      return find(members.begin(), members.end(), m) != members.end();
+    }));
+  }
+
+  Run({"multi"});
+  Run({"sort", "s", "BY", "nosort"});
+  auto resp = Run({"exec"});
+  ASSERT_THAT(resp, ArrLen(1));
+  EXPECT_THAT(resp.GetVec()[0], RespArray(UnorderedElementsAreArray(members)));
+}
+
+// Rule 4: BY nosort on a LIST or a ZSET walks it from the tail under DESC, in the reply and into
+// STORE, and LIMIT counts along that walk. ASC is the native order, as before.
+TEST_F(GenericSortOrderTest, NosortListAndZsetHonourDesc) {
+  LoadData();
+  for (const SortOrderCase& c : kNosortWalkCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+    ExpectScript(c);
+  }
+}
+
+// `LIMIT 1 4294967295` is a valid count in Redis and KeyDB (everything from the offset on), and
+// summed with the offset it wrapped around a uint32: the range ended before it began, which
+// crashed the server (BY forms) or replied garbage (plain form). Found while checking decision 34's
+// forms against KeyDB.
+TEST_F(GenericSortOrderTest, LimitCountBeyondUint32DoesNotOverflow) {
+  LoadData();
+  for (const SortOrderCase& c : kWideLimitCases) {
+    SCOPED_TRACE(SortOrderCaseName(c));
+    ExpectReply(c);
+    ExpectStore(c);
+  }
+}
+
 }  // namespace dfly

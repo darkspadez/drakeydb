@@ -1591,6 +1591,30 @@ TEST_F(ClassicApplyFamilyTest, EvalOfAConnectionCommandInAnEnvelopeIsAnApplyErro
   EXPECT_EQ(Get("after"), "v");
 }
 
+// drakeydb: P7-1 (decision 34) -- BY nosort on a set sorts it ALPHA inside a script (ISSUE-REGISTER
+// D-34). A script a classic stream applies runs on a context that has no connection (conn() is
+// null), so the test is whether SORT still sees it is under a script: its result, written with
+// RPUSH, must be in the elements' order, not the set's own, raw and in an envelope alike.
+TEST_F(ClassicApplyFamilyTest, SortOfASetUnderNosortInAScriptIsSortedWhenAppliedFromAStream) {
+  Run({"sadd", "s", "j", "i", "h", "g", "f", "e", "d", "c", "b", "a"});
+  const char* script =
+      "local r = redis.call('SORT', KEYS[1], 'BY', 'nosort'); "
+      "redis.call('RPUSH', KEYS[2], unpack(r)); return #r";
+
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"EVAL", script, "2", "s", "in-envelope"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(DispatchRaw(link, Resp({"EVAL", script, "2", "s", "raw"})), nullopt);
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+
+  for (string_view dst : {"in-envelope", "raw"}) {
+    SCOPED_TRACE(dst);
+    EXPECT_THAT(Run({"lrange", dst, "0", "-1"}),
+                RespElementsAre("a", "b", "c", "d", "e", "f", "g", "h", "i", "j"));
+  }
+}
+
 // WATCH puts a pointer to the dirty flag of its connection in the shards and drops it only when the
 // connection closes, or on UNWATCH, EXEC and RESET. The context of a replicated apply is a local of
 // the stream loop and is gone when the link ends, so a WATCH it kept would have the next write to

@@ -1945,11 +1945,19 @@ struct SortEntryScore : public SortEntryBase {
   double score;
 };
 
+// drakeydb: P7-1 (decision 34) -- an ALPHA entry also remembers whether its BY weight key was
+// missing (absent, expired or not a string). Redis and KeyDB's sortCompare puts a missing weight
+// before every present one, the empty string included (sort.cpp:160-168), while the fetch maps
+// both to "". Only meaningful under ALPHA BY: a missing numeric weight is the score 0 in KeyDB too.
+struct SortEntryAlpha : public SortEntryBase {
+  bool weight_missing = false;
+};
+
 // SortEntry stores all data required for sorting
 template <bool ALPHA>
 struct SortEntry
     // Store score only if we need it
-    : public std::conditional_t<ALPHA, SortEntryBase, SortEntryScore> {
+    : public std::conditional_t<ALPHA, SortEntryAlpha, SortEntryScore> {
   bool Parse(string&& item) {
     if constexpr (!ALPHA) {
       if (!absl::SimpleAtod(item, &this->score)) {
@@ -1974,6 +1982,12 @@ struct SortEntry
     return true;
   }
 
+  void SetWeightMissing(bool missing) {
+    if constexpr (ALPHA) {
+      this->weight_missing = missing;
+    }
+  }
+
   static bool less(const SortEntry& l, const SortEntry& r) {
     if constexpr (!ALPHA) {
       if (l.score < r.score) {
@@ -1982,8 +1996,18 @@ struct SortEntry
         return false;
       }
       // to prevent unstrict order we compare values lexicographically
+    } else {
+      // drakeydb: P7-1 (decision 34) -- ALPHA BY compares the weights, a missing one first (see
+      // SortEntryAlpha); two missing weights compare equal, as `key` is "" for both.
+      if (l.weight_missing != r.weight_missing)
+        return l.weight_missing;
+      if (int cmp = l.key.compare(r.key); cmp != 0)
+        return cmp < 0;
     }
-    return l.key < r.key;
+    // drakeydb: P7-1 (decision 34) -- a tie breaks on the element, as sortCompare does for a
+    // numeric tie (sort.cpp:153-156, bytewise like compareStringObjects). Under BY `key` holds the
+    // weight and the element is the bound value; without BY ResultKey() is `key` itself.
+    return l.ResultKey() < r.ResultKey();
   }
 
   static bool greater(const SortEntry& l, const SortEntry& r) {
@@ -2229,8 +2253,12 @@ OpResult<pair<vector<string>, CompactObjType>> OpFetchContainerElements(const Op
 
 // Fetch a string value from a key (for BY pattern lookups)
 // TODO: does not support tiering.
-string OpFetchStringValue(const OpArgs& op_args, std::string_view key) {
+string OpFetchStringValue(const OpArgs& op_args, std::string_view key, bool* found = nullptr) {
   auto it = op_args.GetDbSlice().FindReadOnly(op_args.db_cntx, key);
+  // drakeydb: P7-1 (decision 34) -- `found` tells a missing key, or one that is not a string, from
+  // a string that is empty (ALPHA BY sorts the first before the second).
+  if (found)
+    *found = IsValid(it) && it->second.ObjType() == OBJ_STRING;
   if (!IsValid(it) || it->second.ObjType() != OBJ_STRING) {
     return {};  // Missing key defaults to empty string
   }
@@ -2407,7 +2435,10 @@ template <typename C> auto GetSortRange(const C& entries, const optional<SortBou
   auto end_it = entries.end();
   if (bounds) {
     start_it += std::min<uint32_t>(bounds->offset, entries.size());
-    end_it = entries.begin() + std::min<uint32_t>(bounds->offset + bounds->count, entries.size());
+    // drakeydb: P7-1 -- widened: offset + count wrapped around uint32 for `LIMIT 1 4294967295`
+    // (an accepted count, as in Redis and KeyDB), ending the range before its start.
+    end_it = entries.begin() +
+             std::min<uint64_t>(uint64_t{bounds->offset} + bounds->count, entries.size());
   }
 
   return std::make_pair(start_it, end_it);
@@ -2519,7 +2550,8 @@ struct SortVisitor {
     if (params.bounds) {
       auto sort_it =
           entries.begin() +
-          std::min<uint32_t>(params.bounds->offset + params.bounds->count, entries.size());
+          std::min<uint64_t>(uint64_t{params.bounds->offset} + params.bounds->count,
+                             entries.size());  // drakeydb: P7-1, widened as in GetSortRange
       std::partial_sort(entries.begin(), sort_it, entries.end(), cmp);
     } else {
       rng::sort(entries, cmp);
@@ -2613,11 +2645,13 @@ OpStatus PopulateSortEntriesFromByPattern(const SortParams& params,
     bool success = std::visit(
         [&](auto& dest) {
           for (const auto& [idx, ext_key] : keys_by_shard[sid]) {
-            string external_value = OpFetchStringValue({shard, nullptr, db_cntx}, ext_key);
+            bool found = false;
+            string external_value = OpFetchStringValue({shard, nullptr, db_cntx}, ext_key, &found);
             auto& entry = dest[idx];
             if (!entry.Parse(std::move(external_value)))
               return false;
             entry.BindValue(&raw_elements[idx]);
+            entry.SetWeightMissing(!found);  // drakeydb: P7-1 (decision 34)
           }
           return true;
         },
@@ -2778,6 +2812,23 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
     source_type = elem_result->second;
   }
 
+  // drakeydb: P7-1 (decision 34) -- BY nosort on a SET that is stored, or runs inside a script,
+  // sorts ALPHA by the element with the BY dropped (sort.cpp:298-308: "so the result is consistent
+  // across scripting and replication"); GET, DESC and LIMIT then apply to the sorted set as usual.
+  // Any other SET keeps its iteration order, which is unordered in Redis too.
+  const bool nosort_set_sorted = !params.to_sort && source_type == OBJ_SET &&
+                                 (params.store_key || cntx->conn_state.script_info);
+  if (nosort_set_sorted) {
+    params.to_sort = true;
+    params.alpha = true;
+  }
+
+  // drakeydb: P7-1 (decision 34) -- BY nosort on a LIST or a ZSET honours DESC: KeyDB walks the
+  // list from its tail and the zset by descending rank, and takes LIMIT from that walk
+  // (sort.cpp:356-382, :401-430).
+  if (!params.to_sort && params.reversed && (source_type == OBJ_LIST || source_type == OBJ_ZSET))
+    std::reverse(raw_elements.begin(), raw_elements.end());
+
   if (params.to_sort) {
     // Step 2 and 3: Prepare SortEntryList, fetch external keys if needed, perform sorting
 
@@ -2798,6 +2849,14 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
       DCHECK(source_type == OBJ_SET || source_type == OBJ_ZSET || source_type == OBJ_LIST);
       sort_status =
           PopulateSortEntriesFromByPattern(params, raw_elements, db_cntx, &sorted_entries);
+    } else if (nosort_set_sorted) {
+      // drakeydb: P7-1 (decision 34) -- the elements are already fetched (the unsorted path above);
+      // sort them as they are. A STORE of them is the same single concluding hop as before.
+      auto& entries = std::get<vector<SortEntry<true>>>(sorted_entries);
+      entries.reserve(raw_elements.size());
+      for (string& element : raw_elements)
+        entries.emplace_back().Parse(std::move(element));
+      raw_elements.clear();
     } else {  // No BY pattern, sort directly on fetched elements
       OpResult<CompactObjType> fetch_result;
       auto fetch_cb = [&](Transaction* t, EngineShard* shard) {
