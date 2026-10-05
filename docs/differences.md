@@ -145,7 +145,8 @@ more places, all of them visible to a client and none of them a journal change:
 **Limitations of `ALPHA BY` ties.** What a replica of a Redis or KeyDB master cannot follow is only
 what the master's own order depends on: a hash-encoded set or a sorted set is read in a per-process
 order, so there drakeydb orders ties by the element; a set the master holds as a hash set because of
-its history (a non-integer member once, more than 512 members once) is ordered by the intset rule
+its history (a non-integer member once, more members than its `set-max-intset-entries` once; drakeydb's
+limit is `--sort_set_max_intset_entries`, default 512) is ordered by the intset rule
 here; a `LIMIT` that cuts a `BY` sort uses a different, deterministic but unstable algorithm in Redis
 (`pqsort`) which is not ported, so ties under such a `LIMIT` can differ; a Redis built on a libc whose
 `qsort` is not a stable mergesort (the one checked, glibc 2.39, is) or a Redis 7.2 or newer, which
