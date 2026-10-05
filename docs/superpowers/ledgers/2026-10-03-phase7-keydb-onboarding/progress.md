@@ -192,7 +192,7 @@ round's falsification evidence.
 | Docs round after the two reviews (M-1 ... M-6, I4, M1, C1's register text) | done: `52acafd` | `// drakeydb:` markers on the `flush_batch` lambda and its call site, `Greet()`'s closing block and the two `advertise_active_expire()` calls, and on the forward declaration and the two `classic_replay.h` includes, with the UPSTREAM-SYNC rows; spec D-12 and decision 12 carry the comparator floor, plan Task 1.5 an "as built"; stale spec and plan text (D-14, D-3, D-15 names, byte-identity item 5, the header, D-2's refusal as history); this table and the plan's P7-1 checkboxes; U-16 widened to nine blocking commands, raw and enveloped; spec D-9's main-link rule; ISSUE-REGISTER D-34 and `docs/differences.md` for the SORT ordering; the PR notes |
 | Link-command guards: U-17 (I1, I2), U-18 (C2) and the emulated-cluster `CLUSTER` guard (I3, under U-15) | done: `8b860ea`; register, spec and UPSTREAM-SYNC `98b5900` | `REPLICAOF`, `SLAVEOF`, `ADDREPLICAOF` and `REPLTAKEOVER` reply `No connection` on a context with no connection (the U-15 pattern); a client `REPLTAKEOVER` is refused when the last completed handshake found a classic master (U-18); `CLUSTER INFO\|SLOTS\|NODES\|SHARDS` under `--cluster_mode=emulated` reply `No connection` without one. 14 gtests and 25 fake-master pytests, each fix falsified. Opus re-review of `a9a060e..98b5900`: approve with changes; **I-1** `DFLYMIGRATE FLOW` in a stream still SIGSEGVs, any cluster mode (U-15 named it wrongly), and **M-1** a streamed `ROLE` or `DEBUG REPLICA\|REPLDIAG` can deadlock a client `REPLICAOF NO ONE` on `replicaof_mu_`: both get the same guard in a follow-up round; the doc minors are applied |
 | Link-command guards round 2: U-19 (re-review M-1), U-15 widened to `DFLYMIGRATE FLOW` and `DFLY FLOW` (re-review I-1), U-21 | done: `20b399a`, `ae6a298`; docs `a74fdb9` | `ROLE` and `DEBUG REPLICA\|REPLDIAG` refused before `replicaof_mu_` on a context with no connection (a streamed one deadlocked a client `REPLICAOF NO ONE`, 8 of 8); `DFLYMIGRATE FLOW` and `DFLY FLOW` guarded; `DFLYMIGRATE ACK` without a config and a bare `DFLYMIGRATE` (any client) fixed. Hidden-command sweep: 70 cases x raw/enveloped x 3 cluster modes, all survive; a streamed `SHUTDOWN` exits cleanly (decision 39: kept, documented). Opus review: approve; its doc minors applied |
-| Decisions 34-38: `SORT` as Redis and KeyDB | done: round 1 `bb2a2a0` (docs `ac35f61`), round 2a `4915436` (docs `477bed6`); round 2b (decisions 35, 41) in progress | tie-break on the element under `BY`, a missing `ALPHA BY` weight first, `nosort` SET stored or scripted sorted, `nosort DESC` walk; `LIMIT` strict and clamped; `GET` nil; first `*` only; Redis number parsing; `ALPHA BY` ties stable for lists and integer-only sets (decision 37); RESP3 array (decision 38); U-20 (`LIMIT` overflow crash). Probe `sort_keydb.py` BAD 30 -> 3 (the hash-set residual). Reports `task-1.7-sort-order-report.md`, `task-1.7b-sort-semantics-report.md`. Opus review of round 1: approve with changes (folded into 2a) |
+| Decisions 34-38: `SORT` as Redis and KeyDB | done: round 1 `bb2a2a0` (docs `ac35f61`), round 2a `4915436` (docs `477bed6`), round 2b `7a538e4` (decisions 35, 41; docs `0ea5a72`, `e8a482b`); review of rounds 2a-2c: docs `8bb5dbf`, nits `b5c1150` | tie-break on the element under `BY`, a missing `ALPHA BY` weight first, `nosort` SET stored or scripted sorted, `nosort DESC` walk; `LIMIT` strict and clamped; `GET` nil; first `*` only; Redis number parsing; `ALPHA BY` ties stable for lists and integer-only sets (decision 37); RESP3 array (decision 38); U-20 (`LIMIT` overflow crash). Probe `sort_keydb.py` BAD 30 -> 3 (the hash-set residual). `->` hash-field patterns for `BY` and `GET` (decision 35, D-35 fixed) and `--sort_set_max_intset_entries` (decision 41). Reports `task-1.7-sort-order-report.md`, `task-1.7b-sort-semantics-report.md`, `task-1.7c-sort-hash-fields-report.md`. Opus review of round 1: approve with changes (folded into 2a); of rounds 2a-2c: approve after doc fixes |
 | Decision 40: `SADD` reply count (U-22) | done: `439d67f`, docs `189afbd` | an upstream bug found by round 2a; `task-1.8-sadd-count-report.md` |
 | P7-1 gate and PR | gate done on `b5c1150` (below); PR [darkspadez/drakeydb#11](https://github.com/darkspadez/drakeydb/pull/11) open | against `main`, stacked on darkspadez/drakeydb#10; CI and the owner's review and merge pending |
 
@@ -227,6 +227,29 @@ in the orchestrator's scratchpad (`gate-p71/`).
   closed).
 - **Not exercised here:** the `DRAKEYDB_PERF=1` release bar (measured in Task 1.5, unchanged path),
   a release build, ASAN/UBSAN (PR CI runs them), fakeredis (runs in PR CI).
+
+### P7-1 PR CI and review ([darkspadez/drakeydb#11](https://github.com/darkspadez/drakeydb/pull/11))
+
+- **musl `strtod` (head `3e782b3`):** `build (alpine-dev:latest, Release, g++)` failed
+  `GenericSortOrderTest.NumbersLoadAsRedisLoadsScores` on `4.9e-324` only: musl returns that
+  subnormal without `ERANGE`, where glibc sets it. `ParseSortScore` now refuses a subnormal result on
+  every libc, and two hex rows (`0x1p-1074`, `-0x1p-1074`) pin the rule on glibc too: `784bed5`
+  (docs `8f2e52c`, ISSUE-REGISTER D-34). Every runnable leg passed on `784bed5`.
+- **CodeRabbit (four threads, all resolved):** two docs Minors (this file's decision 40 row; the
+  capture README's handshake text) in `8f2e52c`. A Critical on SORT's emptied-hash delete: the first
+  reply declined it wrongly; Opus then reproduced a debug abort under `--active_replica` (another
+  callback suspended between `Arm` and `Commit` on the same shard; a release build floors that
+  callback's stamps). Fixed by guarding the delete and re-checking emptiness in `DeleteIfEmpty`
+  after `FindMutable`, with five new `MvccStoreTest` cases: `6ff41dd` (ISSUE-REGISTER D-35). Pipes
+  inside table code spans (markdownlint MD056): `4a1ea98`.
+- **`rdb_test` header bytes (head `4a1ea98`):** `build (alpine-dev:latest, Debug, g++)` failed
+  `RdbTest.NoMvccOpcodeOrAuxWhenInactive` and `RdbMvccTest.EmitsOpcodeOnlyForTheStampedKey` (P4-2
+  tests, on `main`). They searched the whole snapshot, header included, for the opcode byte `0xDD`,
+  and the header's `ctime` (`0x6ac3dd1e` at 17:23:42Z) put one at offset 65; `ctime`, `used-mem` and
+  `table-mem` are raw integer bytes. `RdbTest.NoTombstoneOpcodeWhenInactive` (P4-3) had the same bug
+  for `0xE1`. The searches now start past the header, and a `used-mem` value carrying both bytes is
+  swapped in while the header is written, so a revert fails every run: `6a28474` (the owner chose
+  to fix it in this PR). The fail-fast build matrix had cancelled the other five legs.
 
 ## P7-2 … P7-4
 
