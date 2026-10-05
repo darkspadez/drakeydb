@@ -244,8 +244,9 @@ case-sensitive; later tokens space-separated, unknown words ignored).
   Tasks 0.5, 0.6 and 0.9 as one P7-0 implementation commit.)
 
 **Done:** both halves pass against a real Redis master and `redis_replication_test.py` stays green
-(the stock-Redis handshake path is unchanged; a byte-level check needs the `Proxy` request capture
-that arrives with Task 1.4, so this task does not claim one).
+(the stock-Redis handshake path is unchanged; a byte-level check needs a request capture, which
+arrived with Task 1.4 as `FakeClassicMaster.requests` and not as a `Proxy` change, so this task
+does not claim one).
 
 ### Task 0.5: U-9 — null `conn()` in `EvalInternal`
 
@@ -479,7 +480,7 @@ author maps; `inner` views the stream buffer and must not outlive the loop itera
 `replication.cpp:5389-5433`: `argc >= 3`; uuid is `IsValidNodeUuid` (case-insensitive,
 returned/keyed normalized); inner is a string; optional db an integer with `0 <= db < FLAGS_dbnum`;
 optional mvcc a `u64`.
-- [ ] **Step 1: Failing tests** `ClassicReplayTest.ParseRreplayEnvelope*`: build `RespVec`s by
+- [x] **Step 1: Failing tests** `ClassicReplayTest.ParseRreplayEnvelope*`: build `RespVec`s by
   running `RedisParser` over the **golden captures** from Task 0.7
   (`tests/dragonfly/data/keydb_v6.3.4_rreplay_{stream,nested_stream}.bin`; its README gives each
   segment's offset and length and prints segment 1 and the nested segment 1 as literals, which the
@@ -489,10 +490,11 @@ optional mvcc a `u64`.
   and 1 args; `kBadUuid` (35 chars, bad dash position, non-hex; uppercase accepted and returned
   lowercase); `kBadDb` (`-1`, `16` with dbnum 16, `abc`, overflow); `kBadMvcc` (`-5`, `abc`,
   overflow).
-- [ ] **Step 2: Run, observe failure** (symbols absent). **Step 3: Implement.**
-- [ ] **Step 4: Falsify** by changing `db < dbnum` to `<=` (the `16` case fails) and by accepting
+- [x] **Step 2: Run, observe failure** (symbols absent). **Step 3: Implement.**
+- [x] **Step 4: Falsify** by changing `db < dbnum` to `<=` (the `16` case fails) and by accepting
   only lowercase (the uppercase case fails). Restore, record.
-- [ ] **Step 5:** pre-commit; commit `feat: parse KeyDB RREPLAY envelopes (P7)`.
+- [x] **Step 5:** pre-commit; commit `feat: parse KeyDB RREPLAY envelopes (P7)`. (Committed with
+  Task 1.2 as one commit, `c419ead`.)
 
 **Done:** all cases pass; vectors include real KeyDB bytes.
 
@@ -515,7 +517,7 @@ uuid, link uuid, `ClassicLinkStats*`, a `running()` callback, and **optional** s
 inner-command handling of spec D-3 (exactly one command per inner, parsed by a `RedisParser`
 local to each call).
 
-- [ ] **Step 1: Failing tests.** `ClassicApplyFamilyTest` (a `BaseFamilyTest` fixture, driving the
+- [x] **Step 1: Failing tests.** `ClassicApplyFamilyTest` (a `BaseFamilyTest` fixture, driving the
   applier on `pp_->at(0)->LaunchFiber(...).Join()`): `AppliesInnerCommandInEnvelopeDb`,
   `SkipsInnerControlCommands` (`PING`, `MULTI`, `EXEC`, `REPLCONF`, `SELECT`),
   `SelectSetsDbWithoutTouchingOffsets` (the synthetic `SELECT` for the envelope db),
@@ -539,9 +541,9 @@ local to each call).
   removed (and the two handshake tests', Step 4b). Fake master:
   `test_unwrap_flushes_raw_batch_before_envelope` (raw `SET a 1`, then envelope `SET a 2`, then
   wait for idle: `a == 2`).
-- [ ] **Step 2: Run, observe failure** (today the keys never arrive; offsets advance past
+- [x] **Step 2: Run, observe failure** (today the keys never arrive; offsets advance past
   dropped envelopes; with the marker removed the live-write tests fail).
-- [ ] **Step 3: Implement** `ClassicApplier` and the stream hook: refactor the batch-dispatch block
+- [x] **Step 3: Implement** `ClassicApplier` and the stream hook: refactor the batch-dispatch block
   (`replica.cc:1229-1270`) into a lambda; before queuing, if `ClassicApplier::IsRreplay(last_args[0])`:
   call the lambda to flush; `if (!exec_st_.IsRunning()) break;` (without touching the envelope:
   `repl_offs_` is then the first undispatched raw command, the right PSYNC resume point); call
@@ -554,7 +556,7 @@ local to each call).
   with `dfly_cntx->conn()->MarkForClose()` when `InvokeCmd` returns `ERROR` after catching an
   exception (`main_service.cc:1645-1647`, `:1744-1747`) — a null `conn()` on a replica apply context,
   the same family as U-9 and U-10.
-- [ ] **Step 4: Run; falsify** each of these, recording each: (a) drop the pre-envelope flush: the
+- [x] **Step 4: Run; falsify** each of these, recording each: (a) drop the pre-envelope flush: the
   fake master test ends with `a == 1`; (b) skip `repl_offs_ += total_read` on the envelope branch:
   `test_unwrap_keeps_offsets_exact` fails with the offsets apart; (c) remove the 65th-nesting
   refusal: `NestedUnwrapAllowedTo64AndRefuses65th` fails; (d) check `running()` after the first
@@ -562,7 +564,7 @@ local to each call).
   before every inner dispatch: `RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope` fails;
   (f) accept a second inner command: the two-commands case of `MalformedEnvelopeSkippedAndCounted`
   fails; (g) use the `NONE` builder: `KnownCommandErrorReplyCounted` fails.
-- [ ] **Step 4b: Remove the P7-0 interim refusal** (decision 23; the whole-branch review's I-1 and
+- [x] **Step 4b: Remove the P7-0 interim refusal** (decision 23; the whole-branch review's I-1 and
   the adversarial pass's C1). Until this task `Greet()` refuses a master whose capa reply advertises
   `active-replica`, because the stream it would then apply is RREPLAY-wrapped. Find every piece
   with `grep -rn "P7-0 interim" src tests` and remove it:
@@ -595,7 +597,7 @@ local to each call).
   - **Falsify:** with the refusal left in, the three formerly strict-xfail tests fail at their
     `REPLICAOF` (the reason in the reply, the ERROR in the log), and the active replies of the proxy
     test are refused. Record both.
-- [ ] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; run both suites; pre-commit; commit
+- [x] **Step 5:** `ninja -j4 classic_replay_test dragonfly`; run both suites; pre-commit; commit
   `feat: unwrap RREPLAY envelopes on classic replication links (P7)`.
 
 **Done:** every KeyDB-written key type reaches a plain replica; offsets exact; mixed streams
@@ -621,7 +623,7 @@ with 3 args; case-insensitive; `KEYDB.*` prefix for the five named commands only
 per-link fields; process-wide counters in `classic_replay.cc`. **Rendering rule** (spec D-13): a
 classic field renders only for a classic link whose master answered `active-replica` or whose own
 counter is nonzero; process-wide counters use the same predicate.
-- [ ] **Step 1: Failing tests.** `ClassicReplayTest.IsKeyDbOnlyCommand*` (table-driven, incl.
+- [x] **Step 1: Failing tests.** `ClassicReplayTest.IsKeyDbOnlyCommand*` (table-driven, incl.
   `PERSIST k` vs `PERSIST k m`, mixed case, `KEYDB.MVCCRESTORE` **not** matched);
   `ClassicApplyFamilyTest.KeyDbOnlyDroppedAndCounted`, `.UnknownInnerCommandCountedNotDispatched`;
   `MultiMasterFamilyTest.RenderPeerReplicationInfoShowsClassicFieldsOnlyForClassicLinks` and
@@ -639,8 +641,10 @@ counter is nonzero; process-wide counters use the same predicate.
   classic field in `INFO replication`, no classic series in `/metrics`);
   `test_active_replica_boot_warning_names_keydb_drops` (`find_in_logs` on an `--active_replica`
   node's boot log).
-- [ ] **Step 2: Run, observe failure. Step 3: Implement** (raw path: only the KeyDB-only check;
-  envelope path: KeyDB-only, then `FindCmd == nullptr`, each rate-limited with `LOG_EVERY_T`).
+- [x] **Step 2: Run, observe failure. Step 3: Implement** (raw path: only the KeyDB-only check;
+  envelope path: KeyDB-only, then no registry entry (`CommandRegistry::FindExtended`, the
+  dispatcher's own lookup, as spec D-7 says; not `FindCmd`), each rate-limited with
+  `LOG_EVERY_T`).
   Counters bump the per-link atomic and the process-wide total. Render per-link fields in the
   plain-replica block (`server_family.cc:3164-3192`) and the peer line (`multi_master.cc:195-216`);
   render process-wide counters in the active-node block beside `multimaster_lww_dropped`
@@ -649,11 +653,11 @@ counter is nonzero; process-wide counters use the same predicate.
   replica reaches) and the master-side branch beside `multimaster_lww_dropped_total` (`:511-518`),
   all behind the same predicate. Append "KeyDB member TTLs and cron jobs are dropped on onboarding"
   to the boot limitations warning (`multi_master.cc:144-151`). Do not touch `ServerState::Stats`.
-- [ ] **Step 4: Falsify:** make `IsKeyDbOnlyCommand` return false: the drop test fails (the command
+- [x] **Step 4: Falsify:** make `IsKeyDbOnlyCommand` return false: the drop test fails (the command
   lands in `classic_unknown_cmds_dropped`, `keydb_cmds_dropped` stays 0); omit the render branch:
   the INFO test fails; render unconditionally: `..._absent_for_stock_master` fails; omit the
   replica-side Prometheus branch: the plain-replica `/metrics` assertion fails. Restore, record.
-- [ ] **Step 5:** pre-commit; commit
+- [x] **Step 5:** pre-commit; commit
   `feat: drop and count KeyDB-only commands and expose classic-link counters (P7)`.
 
 **Done:** counters visible in INFO and Prometheus, on a plain replica as well; INFO and `/metrics`
@@ -671,7 +675,7 @@ request capture); Test `src/server/classic_replay_test.cc` (or `engine_shard_set
 `CapaReply::active_replica`, cleared at its top; it can be stale after a **failed** `Greet()`, so
 INFO and the `activeExpire` decision read it only once `R_GREETED` is set in `state_mask_`); `EngineShard::SetReplicaActiveExpiry(bool)` /
 `ReplicaActiveExpiry()`; `RetireExpiredAndEvict(bool expire_only = false)`.
-- [ ] **Step 1: Failing tests.** gtest `ReplicaActiveExpiryTest.ReapsExpiredKeysButNeverEvicts` (a
+- [x] **Step 1: Failing tests.** gtest `ReplicaActiveExpiryTest.ReapsExpiredKeysButNeverEvicts` (a
   fixture friended in `engine_shard.h` to reach `Heartbeat()`; shards in replica mode with the flag
   on: expired keys are reaped, eviction is never invoked — `--cache_mode` with a tiny `maxmemory`
   evicts nothing; flag off: nothing reaped) and `...BypassesReplicaDeleteExpiredFlag`
@@ -684,8 +688,8 @@ INFO and the `activeExpire` decision read it only once `R_GREETED` is set in `st
   line `does not support active expiration` (`replication.cpp:1800`) must be absent after sync;
   a Redis master behind a capturing proxy sees no `capa activeExpire`; an active KeyDB behind the
   proxy sees exactly one, as its own `REPLCONF`, after the first capa reply).
-- [ ] **Step 2: Run, observe failure** (no keys expire; the KeyDB warning is logged).
-- [ ] **Step 3: Implement** per spec D-9 and D-2: record `master_active_replica_` from both capa
+- [x] **Step 2: Run, observe failure** (no keys expire; the KeyDB warning is logged).
+- [x] **Step 3: Implement** per spec D-9 and D-2: record `master_active_replica_` from both capa
   replies (OR; the P7-0 refusal at that site is already gone, Task 1.2 Step 4b); send `REPLCONF capa
   activeExpire` right after the `:432` check when set, parse its
   reply leniently; `SetShardStates`'s sibling sets/clears the shard flag at `:272-273` / `:383-385`
@@ -695,10 +699,10 @@ INFO and the `activeExpire` decision read it only once `R_GREETED` is set in `st
   unsupported and documented; `Heartbeat` split with `expire_only` forcing `eviction_goal = 0` (so
   `db_slice.cc:2681`'s `DCHECK` stays untouched and unreachable on a replica); the one-line gate at
   `db_slice.cc:2097-2098` honours the flag; deletions journal when a journal exists.
-- [ ] **Step 4: Run; falsify:** do not set the shard flag: `DBSIZE` never reaches 0; do not send
+- [x] **Step 4: Run; falsify:** do not set the shard flag: `DBSIZE` never reaches 0; do not send
   `activeExpire`: the KeyDB warning appears; call eviction on the replica path: the `DCHECK` fires
   in the gtest. Restore, record each.
-- [ ] **Step 5:** pre-commit; commit
+- [x] **Step 5:** pre-commit; commit
   `feat: let a plain replica of an active KeyDB expire keys itself (P7)`.
 
 **Done:** control passes (Redis replica still never self-expires); non-KeyDB handshakes unchanged.
@@ -720,11 +724,11 @@ and `test_keydb_is_told_the_replica_expires_keys_itself` (the KeyDB log). Ledger
 **Goal:** Measure, on **release builds**, whether per-command dispatch keeps up; record the numbers
 either way (spec D-12).
 **Files:** Test `tests/dragonfly/keydb_onboarding_test.py`; ledger `task-1.5-report.md`.
-- [ ] **Step 1: Build for the measurement.** `./helio/blaze.sh -release -DWITH_AWS=OFF
+- [x] **Step 1: Build for the measurement.** `./helio/blaze.sh -release -DWITH_AWS=OFF
   -DWITH_GCP=OFF`, then only `CCACHE_DISABLE=1 ninja -C /home/user/drakeydb/build-opt -j4 dragonfly`
   (free disk first by deleting the non-gate debug test binaries under `build-dbg`; they relink from
   objects later).
-- [ ] **Step 2: The test.** `test_keydb_onboarding_keeps_up_under_load` (`slow`, `keydb`): KeyDB
+- [x] **Step 2: The test.** `test_keydb_onboarding_keeps_up_under_load` (`slow`, `keydb`): KeyDB
   active with `--server-threads 1`, drakeydb a plain replica with `--proactor_threads 2`, attached
   and idle-synced; each server pinned with `taskset` to its own cpuset and the load generator to a
   third; sustained pipelined writes over a fixed window (`redis-benchmark -P 100 -c 50 -t set,incr
@@ -736,24 +740,52 @@ either way (spec D-12).
   bar runs under `DRAKEYDB_PERF=1`; **by default** the test is a rate-capped (about 5k ops/s)
   functional smoke with loose bounds (ratio `>= 0.5`, lag `< 32 MB`, drain `< 10 s`), so CI and
   debug builds exercise the plumbing without claiming the bar.
-- [ ] **Step 3: Measure.** Three release runs, median, `DRAKEYDB_PERF=1`; also the **comparator**
+- [x] **Step 3: Measure.** Three release runs, median, `DRAKEYDB_PERF=1`; also the **comparator**
   (the same load with a second KeyDB attached as an active replica of the same master: drakeydb's
-  lag within 1.5x of its lag) and the raw squashed path (a non-active KeyDB or a Redis master) as
+  maximum lag within `max(1.5 c, c + max(1 MB, 40 ms x r))` of that replica's `c` at the master's
+  output `r`, spec D-12) and the raw squashed path (a non-active KeyDB or a Redis master) as
   the reference. Record offered ops/s, rates, the lag series and drain times in
   `task-1.5-report.md`.
-- [ ] **Step 4: Falsify** the test's sensitivity: add a 1 ms `ThisFiber::SleepFor` per inner
+- [x] **Step 4: Falsify** the test's sensitivity: add a 1 ms `ThisFiber::SleepFor` per inner
   command (temporary): the smoke's ratio assertion must fail (and the release one under
   `DRAKEYDB_PERF=1`). Restore.
-- [ ] **Step 5:** pre-commit; commit
+- [x] **Step 5:** pre-commit; commit
   `test: pin that the RREPLAY path keeps up with KeyDB under load (P7)`.
 
 **Done:** the release bar passes with recorded numbers — **or** it fails and Task 1.6 is opened.
+
+**As built (commits `6806524`, `f281564`, `8ad687f`; the method, numbers and falsifications are in
+the ledger's `task-1.5-report.md`, which wins over the steps above):** the release bar passed
+(median of three: apply/produce 1.0003, maximum lag 1.35 MB, drain 36 ms), so Task 1.6 stays
+closed. The load is **two `redis-benchmark` processes**, `-P 100 -c 25 -r 100000`, one `-t set`
+and one `-t incr` (50 connections), killed at the end of a 30 s window; one `-t set,incr -c 50`
+runs the two commands in turn and has no duration. The test pins the servers itself
+(`os.sched_setaffinity`, `pin_threads`), not with `taskset`. Assertion (1)'s "KeyDB `sync_full ==
+1`" reads KeyDB's three sync counters once the replica is idle-synced and requires that none moves
+(a KeyDB replica's first `PSYNC` counts as a failed partial sync on its master). **The comparator
+bound is `max(1.5 c, c + max(1 MB, 40 ms x r))`** (`comparator_bound`, `comparator_floor`;
+`COMPARATOR_FACTOR`, `COMPARATOR_FLOOR`, `COMPARATOR_SKEW_S`), `c` being the KeyDB replica's
+maximum lag and `r` the master's output rate: the floor stops two lags of a few hundred KB from
+comparing as a ratio of 2. Tests, all `slow` and `keydb`:
+`test_keydb_onboarding_keeps_up_under_load` (smoke by default, the absolute half of the bar under
+`DRAKEYDB_PERF=1`); `test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica` (perf-only, the
+**comparator test**: the KeyDB-replica leg, then drakeydb's, asserting the bound; Task 2.4 Step 5
+re-runs it); `test_keydb_throughput_reference_setups[keydb|drakeydb_raw]` (perf-only, no bounds,
+the **reference** setups); and the fast unit tests of the bound (`test_comparator_bound_*`,
+`test_comparator_floor_*`). Every drakeydb leg (the smoke, the release bar, the comparator test's
+second leg) also requires the replica's `rreplay_unwrapped` delta to reach 0.9 of KeyDB's `set` +
+`incr` + `incrby` delta (`ENVELOPE_SHARE`), judged on totals after the drain, so a replica that
+fell behind is caught by the ratio and not by this. Falsified: a 1 ms sleep per enveloped command
+fails the smoke (ratio 0.18 against 0.5) and the release run, a 3 us busy wait fails the release
+ratio (0.86 against 0.95), and each comparator and floor flip fails its test.
 
 ### Task 1.6: Squasher micro-batch fallback (conditional on Task 1.5 failing)
 
 Run **only if** the **release-build** bar of Task 1.5 fails (or Task 2.4's peer-mode re-run of it).
 A failure of the CI/debug smoke is a bug in the test or the plumbing, not a trigger. Owner decision
 12: "else optimize within P7".
+**Status: not opened.** Task 1.5's release bar passed (`task-1.5-report.md`); Task 2.4's peer-mode
+re-run can still open it.
 **Goal:** Recover throughput by micro-batching same-author, same-shard envelope commands through
 the squasher **with per-command mvcc**.
 **Files:** Modify `src/server/classic_replay.{h,cc}`, `src/server/replica.cc`, and — only after the
@@ -1080,7 +1112,8 @@ is the one that protects a resident key from ISSUE-REGISTER D-31. `GetRdbVersion
   == 3` (the other three), the link stays up, offsets exact.
 - [ ] **Step 2: Run, observe failure.** gtest: no symbol. Pytest: today the command reaches the
   unknown-command path, so D and D2 stay empty and `classic_unknown_cmds_dropped` rises.
-- [ ] **Step 3: Implement.** In the applier's inner loop, before the `FindCmd == nullptr` path: on
+- [ ] **Step 3: Implement.** In the applier's inner loop, before the unknown-command path (the
+  `FindExtended` lookup that finds no entry, Task 1.3): on
   `KEYDB.MVCCRESTORE` call `TranslateMvccRestore`; a non-`kOk` result bumps
   `keydb_mvccrestore_failed` — or, for `kCronPayload`, `keydb_cmds_dropped` — logs with
   `LOG_EVERY_T(WARNING, 60)` (key and reason), counts the envelope as consumed (`Advance` only) and

@@ -540,6 +540,12 @@ can, because the only writer is the stream the fiber has stopped reading. The li
 later command applies, and the paths that stop the link (`REPLICAOF NO ONE`, shutdown) do not
 complete. Where exactly they wait was not traced.
 
+It is not only `BLPOP`: every blocking command that waits on a key stalls the link the same way
+(the list under *How established*), **raw and inside an RREPLAY envelope**. The enveloped path is no
+safer: `ClassicApplier::Dispatch` (`classic_replay.cc`) runs the inner command with
+`DispatchCommand(..., ONLY_SYNC)`, and `HandleRreplay`'s one `running()` check (depth 1, before
+anything is dispatched, spec D-3 step 2) cannot interrupt a dispatch that is already parked.
+
 It needs a hostile or broken master: Redis and KeyDB propagate the effect of a satisfied blocking
 pop (`LPOP`, `RPOP`, ...), never the blocking command, so a conforming master does not send `BLPOP`.
 Pre-existing in upstream Dragonfly (the dispatch is upstream's), not specific to drakeydb's classic
@@ -548,12 +554,21 @@ support.
 **How established:** the P7-1 re-review's probe, `blpop_probe.py` (a scripted master: a valid diskless
 full sync, then `SET a 1`, `BLPOP q 0`, `SET b 2`): `a` arrives, `b` does not,
 `master_link_status` stays `up`, `REPLICAOF NO ONE` gets no reply within 10 s, and SIGTERM did not
-stop the process within about 40 s. Not re-run for this entry; only `BLPOP` was probed, not the
-other blocking commands.
+stop the process within about 40 s. The P7-1 adversarial pass widened it (a scripted master, a
+debug build): a sweep of every registered command with junk arguments and a unique key per case
+(4536 cases, raw and enveloped) hangs on **`BLPOP`, `BRPOP`, `BRPOPLPUSH`, `BZPOPMIN` and
+`BZPOPMAX`** and nothing else. A targeted run then confirmed, raw **and** enveloped, **`BLPOP`,
+`BRPOPLPUSH`, `BLMOVE`, `BZPOPMIN`, `BZMPOP`, `BLMPOP` and `XREAD BLOCK 0`**: the link stalls,
+`REPLICAOF NO ONE` never answers, and SIGTERM does not stop the process within 15 s. So the set is
+`BLPOP`, `BRPOP`, `BRPOPLPUSH`, `BLMOVE`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `BLMPOP` and `XREAD
+BLOCK 0` (`XREADGROUP .. BLOCK 0` was in neither run). The adversarial scripts are
+`adv-p71/fuzz_cmds.py` (with `UNIQUE=1`) and `adv-p71/targeted.py` in the orchestrator's
+scratchpad.
 
-**Status (2026-10-04): open, out of P7 scope.** Not fixed, not filed upstream, no code written.
-Candidate fix: refuse blocking commands (`CO::BLOCKING`) on replicated contexts, or give them zero
-timeout semantics (try once, never wait). **Owner:** after P7, with the upstream sync.
+**Status (2026-10-04, widened 2026-10-05): open, out of P7 scope.** Not fixed, not filed upstream,
+no code written. Candidate fix: refuse blocking commands (`CO::BLOCKING`) on replicated contexts,
+or give them zero timeout semantics (try once, never wait). **Owner:** after P7, with the upstream
+sync.
 
 ---
 
@@ -1709,3 +1724,57 @@ the cross-shard cases (`0 vs. 4`).
 
 **Owner:** none (resolved; the residual is journal noise, not divergence). **From:** P4-0
 (`1b6a2e82`); found by the Opus review of `2bdf3d7` (C1), fixed in P7-1.
+
+### D-34. `SORT` orders tied `BY` weights and a SET under `BY nosort` unlike Redis and KeyDB --
+fix in progress
+
+**Where:** `SortGeneric` and the ordering it sorts with (`src/server/generic_family.cc`; as read at
+`fb037bb`: the `BY` weight fill and comparison around `:1977-1987` and `:2615-2621`, and the
+`nosort` branch around `:2740`).
+
+Two differences from Redis and from KeyDB's `sort.cpp`, which follows it:
+
+1. **Ties under `BY`.** With `BY`, a `SortEntry`'s `key` holds the weight, so two elements with the
+   same weight compare equal and `std::sort` leaves them in the order the fetch produced them (a
+   set's iteration order, a list's position). Redis and KeyDB's `sortCompare` breaks a numeric tie
+   on the element itself (`compareStringObjects(so1->obj, so2->obj)`, `sort.cpp:153-156`: "this
+   way the result of SORT is deterministic"). Every `BY` form with ties is affected: shared
+   weights, a pattern whose keys do not exist (every weight is 0), and `DESC` of either.
+2. **`BY nosort` on a SET that is stored or scripted.** Redis and KeyDB sort such a set
+   alphabetically (`dontsort && type == OBJ_SET && (storekey || lua)`: "so the result is
+   consistent across scripting and replication", `sort.cpp:298-308`); a list and a sorted set keep
+   their native order. Dragonfly keeps the set's iteration order.
+
+**Why it matters:** a classic master replicates `SORT .. STORE` as the command, not as its result
+(an active KeyDB wraps it in RREPLAY, verbatim), so the replica re-runs it and must order exactly
+as the master did. Redis and KeyDB made both rules above precisely for that. A drakeydb replica of
+any classic master therefore ends up with the same members in a different order, silently: the
+link stays up, every counter is clean, and nothing ever corrects it. The difference is upstream
+Dragonfly's; P7-1 is what puts active KeyDB's RREPLAY stream, and so its verbatim `SORT .. STORE`,
+on every classic link. drakeydb to drakeydb did not diverge in the probes: both sides run the same
+code, and a cross-shard `STORE` journals its computed `RESTORE` (D-13 covers the same-shard
+recipe).
+
+**How established (live):** the P7-1 adversarial pass (`sort_keydb.py`, C1): an active KeyDB
+v6.3.4 master and three drakeydb plain replicas of 1, 2 and 4 shards. These converged: a missing
+source (`dst` deleted), `dst == src` (list and set), a wrong-type and a non-numeric source,
+`DESC LIMIT`, `GET nokey_*`, `MULTI`/`EXEC`, `EVAL`, and odd numerics (`0x10`, `" 5"`, `1e3`,
+`+-inf`, the empty string). These diverged on every replica, ten keys each, permanently:
+`SORT s BY nokey_* STORE d` (KeyDB `a .. j`, replica `f i h g j c e d b a`),
+`SORT s BY w_* STORE d` with tied weights (also inside `MULTI` and `EVAL`, and with
+`GET # GET h_*`), `SORT l BY w_* STORE d` on a list with missing weights (the replica keeps list
+order), `SORT s BY nosort [LIMIT 0 3] STORE d` on a set (KeyDB `a .. j` and `a b c`, the replica
+the set's iteration order), `SORT s BY nokey_* DESC STORE d` and `SORT s BY w_* ALPHA STORE d`.
+`SORT .. STORE` forms between drakeydb nodes (a meshed peer pair of 2 and 3 shards, and a DFLY
+master and replica of 1 and 4, 4 and 1, and 3 and 2 shards, 25 forms) converged
+(`sort_peers.py`, `sort_dfly.py`).
+
+**Status (2026-10-05): fix in progress, P7-1** (owner decision 34): drakeydb's `SORT` adopts both
+rules for every caller, matching Redis and KeyDB: a tie under `BY` breaks on the element, and a SET
+under `BY nosort` that is stored or scripted is sorted alphabetically. This is a client-visible
+change in reply order for tied and nosort-SET cases versus upstream Dragonfly, and an upstreamable
+Redis-compatibility fix; it changes no journal wire. **A documented limitation stays:** `ALPHA BY`
+ties. In Redis and KeyDB the order of two elements with the same `BY` value under `ALPHA` is the
+order the master's sort received them in (`pqsort` is not stable), which a replica cannot
+reproduce, so a master and a replica can still disagree on those ties. See `docs/differences.md`.
+**Owner:** P7-1. **From:** the P7-1 adversarial pass (C1); decision 34 in the ledger.

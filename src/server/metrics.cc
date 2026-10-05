@@ -14,7 +14,7 @@
 #include "facade/dragonfly_listener.h"
 #include "facade/reply_builder.h"
 #include "io/proc_reader.h"
-#include "server/classic_replay.h"
+#include "server/classic_replay.h"  // drakeydb: P7 -- ClassicTotalSeries, see Metrics::Print
 #include "server/cluster_support.h"
 #include "server/command_registry.h"
 #include "server/dflycmd.h"

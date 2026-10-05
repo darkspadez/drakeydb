@@ -53,12 +53,15 @@ mechanism (D-n).
   will occur" (`config.cpp:2705-2710`; the forward is skipped at `replication.cpp:5507`). With one
   KeyDB master there is nothing to forward. In any other topology forwarding stays on and the
   per-author dedup absorbs the duplicates. (Spec D-5, D-13.)
-- **Decision 12: "keep up" is a measurement.** On release builds of both servers (`taskset`-pinned,
+- **Decision 12: "keep up" is a measurement.** On release builds of both servers (pinned,
   KeyDB `--server-threads 1`, drakeydb `--proactor_threads 2`, `redis-benchmark -P 100 -c 50 -t
-  set,incr -r 100000`, `master_repl_offset` / `slave_repl_offset` sampled at 1 Hz):
+  set,incr -r 100000` run as two 25-connection processes, one `-t set` and one `-t incr`,
+  `master_repl_offset` / `slave_repl_offset` sampled at 1 Hz):
   `apply_rate / produce_rate >= 0.95` over the steady window; maximum lag `<= max(2 s x
   produce_rate, 8 MB)`; the lag drains within 2 s of the load stopping; a second KeyDB attached as
-  an active replica is the comparator (drakeydb within 1.5x of its lag); three runs, median; the
+  an active replica is the comparator (drakeydb's maximum lag within `max(1.5 c, c + max(1 MB, 40
+  ms x produce rate))` of that replica's `c`: the floor keeps the INFO sampling skew from deciding
+  the comparison, added in the Task 1.5 review rounds, spec D-12); three runs, median; the
   raw squashed path is recorded as a reference. The release bar runs under `DRAKEYDB_PERF=1`; CI
   and debug builds run a rate-capped (about 5k ops/s) functional smoke with loose bounds (ratio
   `>= 0.5`, lag `< 32 MB`, drain `< 10 s`). The conditional squasher micro-batching task is

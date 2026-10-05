@@ -13,7 +13,7 @@
 #include "facade/facade_types.h"
 #include "facade/redis_parser.h"
 #include "io/io_buf.h"
-#include "server/classic_replay.h"
+#include "server/classic_replay.h"  // drakeydb: P7 -- ClassicLinkStats (classic_stats_)
 #include "server/cluster/cluster_defs.h"
 #include "server/execution_state.h"
 #include "server/journal/tx_executor.h"

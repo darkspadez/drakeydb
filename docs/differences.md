@@ -87,3 +87,26 @@ Consequences:
   `DEL <dst>` alone, or nothing when there was no `dst`; upstream main journals the same `DEL`. A
   same-shard sorted `STORE` whose own fetch emptied the source journals `DEL <dst>` ahead of the
   verbatim `SORT`, and a partial lazy member expiry journals `SREM <key> <members>` ahead of it.
+
+## `SORT` tie order and `BY nosort` on a set (drakeydb fork)
+
+Redis and KeyDB give `SORT` a deterministic order, because a master replicates `SORT ... STORE` as
+the command and its replicas must reproduce the result. Upstream Dragonfly differs in two places,
+and so did this fork until P7-1 (owner decision 34, `docs/ISSUE-REGISTER.md` D-34, which tracks the
+fix):
+
+- **Ties under `BY`.** Redis breaks a tie between two elements with the same weight (or two
+  elements whose `BY` keys do not exist) on the element itself. Dragonfly left them in the order it
+  fetched them, which for a set is its iteration order.
+- **`BY nosort` on a set that is stored or scripted.** Redis sorts the set alphabetically when the
+  result is stored (`STORE`) or produced inside a script, so that replication and scripting are
+  consistent; a list and a sorted set keep their native order. Dragonfly kept the set's iteration
+  order.
+
+drakeydb's `SORT` follows Redis and KeyDB in both for every caller, not only for a replicated
+apply, so a client sees a different order than on upstream Dragonfly for tied weights and for a
+set under `nosort` with `STORE` or in a script.
+
+**Limitation:** with `ALPHA` and `BY`, the order of two elements that have the same `BY` value is
+the order Redis's own sort received them in (its sort is not stable), so a replica of a Redis or
+KeyDB master can still order such ties differently from its master.

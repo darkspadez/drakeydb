@@ -20,7 +20,7 @@ namespace dfly {
 
 class EngineShardSet;
 class Namespace;
-class ReplicaActiveExpiryTest;
+class ReplicaActiveExpiryTest;  // drakeydb: P7 -- the friend below
 class TieredStorage;
 class ShardDocIndices;
 

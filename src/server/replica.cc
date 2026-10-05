@@ -469,6 +469,7 @@ error_code Replica::Greet() {
   // Corresponds to server.repl_state == REPL_STATE_SEND_CAPA
   RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa eof capa psync2"));
   PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok);
+  // drakeydb: P7 -- see advertise_active_expire above (a no-op unless the master is active).
   RETURN_ON_ERR(advertise_active_expire());
 
   // drakeydb: node identity exchange (KeyDB-compatible; KeyDB sends uuid right after its capa
@@ -649,6 +650,7 @@ error_code Replica::Greet() {
 
   if (LastResponseArgs().size() == 1) {  // Redis
     PC_RETURN_ON_BAD_RESPONSE(read_capa_reply().ok);
+    // drakeydb: P7 -- as above, for a master that first says `active-replica` in this reply.
     RETURN_ON_ERR(advertise_active_expire());
   } else if (LastResponseArgs().size() >= 3) {  // it's dragonfly master.
     PC_RETURN_ON_BAD_RESPONSE(!HandleCapaDflyResp());
@@ -671,6 +673,8 @@ error_code Replica::Greet() {
   // mesh bring-up, not a race at all -- lost a 50/50 uuid coin flip. A no-op outside peer mode.
   if (peer_mode_ && peer_mode_->identity_claims)
     peer_mode_->identity_claims->MarkEstablished(client_id_);
+  // drakeydb: P7 -- recorded only once the handshake completed: the link's protocol, and whether
+  // its master said `active-replica` (INFO's sticky flag, and the process-wide one /metrics reads).
   classic_master_ = !HasDflyMaster();
   if (classic_master_ && master_active_replica_) {
     classic_master_was_active_ = true;
@@ -1254,8 +1258,10 @@ error_code Replica::ConsumeRedisStream() {
 
   std::vector<CommandContext> ctx_pool(max_batch);
 
-  // Dispatches what is queued, in order, and counts each command's bytes once it has run. A link
-  // that stops half way leaves the rest unapplied and uncounted.
+  // drakeydb: P7-1 -- upstream's batch-dispatch block, moved unchanged into a lambda (only its
+  // `!batch.empty()` test moved in with it) so an RREPLAY envelope can flush what is queued ahead
+  // of it. Dispatches what is queued, in order, and counts each command's bytes once it has run. A
+  // link that stops half way leaves the rest unapplied and uncounted.
   auto flush_batch = [&] {
     if (batch.empty())
       return;
@@ -1391,6 +1397,8 @@ error_code Replica::ConsumeRedisStream() {
 
     // Dispatch when the read buffer is drained or the batch is full, and drain the whole
     // batch before reading from the socket again.
+    // drakeydb: P7-1 -- upstream's dispatch block is flush_batch above; its `!batch.empty()` test
+    // moved there.
     if (io_buf.InputLen() == 0 || batch.size() >= max_batch)
       flush_batch();
   }
