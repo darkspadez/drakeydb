@@ -66,10 +66,12 @@ ABSL_FLAG(bool, unlink_experimental_async, true, "If true, runs unlink command a
 // drakeydb: P7-1 (decision 41) -- the intset limit SortTiesInFetchOrder emulates; see there.
 ABSL_FLAG(
     uint32_t, sort_set_max_intset_entries, 512,
-    "SORT orders an integer-only set of at most this many members as Redis/KeyDB hold it as an "
-    "intset (ascending numeric). Set it to the classic master's set-max-intset-entries when "
-    "replicating from KeyDB or Redis. 0 turns the emulation off: tied ALPHA BY members of a "
-    "set then break on the element.");
+    "Decides how SORT <set> BY ... ALPHA breaks ties between equal weights: an integer-only set of "
+    "at most this many members keeps its ascending numeric (fetch) order, as Redis/KeyDB hold such "
+    "a set as an intset; any other set breaks ties on the element. Set it to the classic master's "
+    "set-max-intset-entries when replicating from KeyDB or Redis, and run every drakeydb node with "
+    "the same value, or a replicated same-shard SORT .. STORE can store a different order on each. "
+    "0 turns the rule off: every set breaks ties on the element.");
 
 namespace dfly {
 using namespace std;
@@ -1940,8 +1942,8 @@ struct SortEntryBase {
   string key;
   const string* bound_value = nullptr;
   // Fetched GET pattern values. drakeydb: P7-1 (decision 36) -- nullopt where lookupKeyByPattern
-  // finds nothing (a missing or non-string key, or a pattern without '*'): nil in a reply, "" in
-  // STORE, as in Redis.
+  // finds nothing (a missing or non-string key, a pattern without '*', and under a `->` pattern a
+  // key that is not a hash or a missing field): nil in a reply, "" in STORE, as in Redis.
   vector<optional<string>> get_values;
 
   void BindValue(const std::string* value) {

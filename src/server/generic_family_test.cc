@@ -3797,10 +3797,10 @@ TEST_F(GenericSortOrderTest, HashFieldIsReadFromAListpackAndFromAStringMap) {
   ExpectGetStore(desc_case);
 }
 
-// Field expiry (HSETEX, a drakeydb hash-field TTL that KeyDB has not got): a field that has expired
-// is missing, as it is for HGET: weight 0 under numeric BY and a nil in GET. The hash of a field
-// TTL is a StringMap, so this is that encoding's read; when the read leaves the hash empty it is
-// deleted, as an HGET does.
+// Field expiry (HSETEX, drakeydb's hash-field TTL; KeyDB has its own, EXPIREMEMBER, which a
+// drakeydb replica drops, decision 8): a field that has expired is missing, as it is for HGET:
+// weight 0 under numeric BY and a nil in GET. The hash of a field TTL is a StringMap, so this is
+// that encoding's read; when the read leaves the hash empty it is deleted, as an HGET does.
 TEST_F(GenericSortOrderTest, HashFieldWithAnExpiredTtlIsMissing) {
   ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
   Run({"rpush", "tl2", "t", "u", "v"});
