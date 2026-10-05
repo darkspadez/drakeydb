@@ -2379,7 +2379,8 @@ upstream Dragonfly (which took the `->` as part of the key name; upstream main, 
 - **Cross-shard:** the key part (`prefix + element + suffix`), not the whole pattern, decides the shard
   the hash is read on, and the read is the same "read uncommitted" lookup the string weights use.
 - A field whose **TTL has passed** (`HSETEX`, `HEXPIRE`; tested against `HGET`) is missing, and a hash that lazy field expiry empties by this read is deleted,
-  as an `HGET` (or `HTTL`) deletes it (`HSetFamily::DeleteIfEmpty`, the derived `DEL`).
+  as an `HGET` (or `HTTL`) deletes it (`HSetFamily::DeleteIfEmpty`, the derived `DEL`), unless the guard of
+  residual 3 skips the delete.
 
 What changed (`generic_family.cc`, `// drakeydb: P7-1 (decision 35)`; `hset_family.{h,cc}`): `SortPattern`
 gains `field`; `ParseSortPattern` (C-string scan) and `IsSortElementPattern`; `OpFetchHashFieldValue` and
@@ -2389,8 +2390,11 @@ read `CmdHGet` does through `HMapWrap`, so the hash is read as an `HGET` reads i
 or a StringMap with field TTLs. The journal changes only as an `HGET` changes it: a hash that this read's
 lazy field expiry emptied is deleted and that derived `DEL` is journaled, from outside the SORT's
 transaction and from `SORT_RO` too (harmless on replicas; on peer links the derived flag keeps it off and it
-is stamped like an expiry). The weights and `GET` values are otherwise only read, and the SORT itself still
-journals as before (D-13 for a same-shard `STORE`).
+is stamped like an expiry). That delete is guarded (the review fix below): it runs only on a shard with no
+transaction callback in flight, no change callback registered (a snapshot, a full sync, a slot migration)
+and, in active mode, nothing armed, with the journal flush disabled for the call, as the heartbeat reaper's
+delete runs; otherwise it is skipped and the empty hash stays (residual 3). The weights and `GET` values are
+otherwise only read, and the SORT itself still journals as before (D-13 for a same-shard `STORE`).
 
 **Checked.** Live (`sort2b/probes/hf_table.py`, 156 forms: 28 `BY` and 22 `GET` shapes over a list and a set,
 reply and `STORE`, hash sets' unordered ties left out for KeyDB and Redis alike): KeyDB and Redis agree on
@@ -2423,6 +2427,45 @@ taken as a field marker, the pattern scanned past a NUL and `#` matched exactly 
 NUL table and both pytests; no delete of the hash a lazy expiry emptied, and the field TTL ignored, fail
 their gtests.
 
+**Review fix (PR #11, CodeRabbit, confirmed Critical): the delete of an emptied hash was unguarded.**
+`OpFetchHashFieldValue` called `HSetFamily::DeleteIfEmpty` from the pattern fetch, a
+`RunBlockingInParallel` fiber that is no transaction callback and never looked at
+`EngineShard::running_tx()`, so nothing ordered it against the shard's other callbacks. In active mode its derived `DEL` commits the hash's own
+tombstone arm (`CommitOwnTombstone`) and is journaled through `RecordEntry`, whose per-arm commit sweep
+takes every key still armed on the shard. A callback suspended between its `Arm` and its `Commit` (a
+journal write throttled on a stalled stream, `JournalStreamer::ThrottleIfNeeded`; a snapshot's `OnChange`)
+therefore lost its arm to the `DEL`'s stamp: a debug build aborted on `DeleteIfEmpty`'s `ArmedCount() == 0`
+DCHECK, a release build floored the other key's stamp (an MVCC divergence). Live (an `--active_replica` node,
+a plain replica stopped with `SIGSTOP`, 512 KB `SET`s on one shard until one blocked, a field TTL left to
+pass, then `SORT_RO src BY h_*->f` with the hash on that shard): the node aborted on that DCHECK; the same
+without `--active_replica` answered `[nil]`. Two more races of the same fiber: its own `DEL` could yield
+in the throttle before its sweep while the shard polled another write that armed a key and waited, and the
+sweep then took that write's arm (the DCHECK ran before the yield and cannot see it); and
+`DeleteIfEmpty` checked `Empty()` and then called `FindMutable`, which can yield in a change callback, while
+an `HSET` refilled the hash, so a non-empty hash was deleted (in any mode, and only for a caller outside a
+transaction, as `running_tx_` keeps a writer out of one).
+
+Fixed (`// drakeydb: P7-1 (decision 35)` in `OpFetchHashFieldValue`, `// drakeydb: P7-1` in
+`HSetFamily::DeleteIfEmpty`, the caller lists in `mvcc.h`): the fetch calls `DeleteIfEmpty` only when
+`running_tx() == nullptr`, no change callback is registered (`HasRegisteredCallbacks()`, so `FindMutable`
+cannot yield) and, in active mode, `ArmedCount() == 0`, and does so under `journal::DisableFlushGuard` (no
+yield, so the `DEL`'s `AddLogRecord` cannot throttle before its sweep): the heartbeat reaper's own
+preconditions (`engine_shard.cc`). `DeleteIfEmpty` checks again that the hash is empty on the entry
+`FindMutable` returned and cancels its updater if it is not (`Run` would arm the key with no entry to commit
+it). The comment that called this delete "unlocked, as `OpFetchStringValue`'s lazy expiry of a string weight
+is" was wrong, and is gone: that path is `RecordExpiryBlocking` (`kEntryFlagExpired`, no sweep). Tests
+(`MvccStoreTest`, `multi_master_test.cc`): `SortHashFieldFetchLeavesAForeignArmAndItsHashAlone`,
+`SortHashFieldFetchSkipsItsDeleteWhileAChangeCallbackIsRegistered`,
+`SortHashFieldFetchSkipsItsDeleteWhileATransactionCallbackIsSuspended`,
+`SortHashFieldDeleteDoesNotWaitInItsJournalWrite` and
+`DeleteIfEmptyKeepsAHashRefilledWhileItsFindMutableYielded`. Falsified (each mutation applied, rebuilt, its
+tests run, restored): the whole guard removed fails all four guard tests (the first aborts in the DCHECK);
+each of the three conditions, the `DisableFlushGuard` and the re-check fails its own test (without the
+`DisableFlushGuard` only `SortHashFieldDeleteDoesNotWaitInItsJournalWrite` fails), and `Cancel()` dropped
+fails the last test's `ArmedCount()` check. `DEBUG OBJHIST` and `STRINGS` call
+`DeleteIfEmpty` from their own traversal fibers and get the re-check only, not the guard (debug commands, a
+residual of the same class that this fix does not close).
+
 **Residuals, documented and not fixed:**
 
 1. **A hash that experimental hash offloading moved to disk** (`--tiered_experimental_hash_support`, off by
@@ -2432,8 +2475,16 @@ their gtests.
    `->` forms; numeric `BY` ties break on the element in both and agree.
 3. **A hash read by SORT is the same lock-free "read uncommitted" lookup the string weights are.** A
    concurrent writer to that hash can change a weight between two elements' reads, as for a string weight;
-   Redis has no such window (one thread). The lazy-expiry delete of an emptied hash runs on the shard that
-   owns it, outside the SORT's transaction, as `ExpireIfNeeded` does for a string weight with a TTL.
+   Redis has no such window (one thread). The delete of a hash that this read's lazy field expiry emptied
+   runs on the shard that owns it, outside the SORT's transaction, which is not what `ExpireIfNeeded` does
+   for a string weight with a TTL (that one is `RecordExpiryBlocking`, flagged `kEntryFlagExpired`, and
+   sweeps no arms): `DeleteIfEmpty`'s derived `DEL` runs `RecordEntry`'s per-arm commit sweep, so the delete
+   is guarded (the review fix above) and **skipped** while a transaction callback is in flight on the
+   shard, a change callback is registered or, in active mode, a key is armed. A zero-size hash then stays:
+   `EXISTS`, `TYPE` and `DBSIZE` see it and `SAVE` logs an error in `SaveEntry` and skips it, until the
+   heartbeat reaper (active mode only) or the next command that reads the hash (`HGET`, `HLEN`, ...) deletes
+   it. This happens only while a snapshot, a full sync or a slot migration runs on that shard, or a
+   callback is suspended there.
 4. **KeyDB's member TTLs are dropped.** KeyDB expires single hash fields with `EXPIREMEMBER` (and its
    family); a drakeydb replica drops those commands (decision 8, counted in `keydb_cmds_dropped`), and an
    active KeyDB never streams the field's expiry. So a field KeyDB expired lingers on the replica, and a

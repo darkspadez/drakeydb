@@ -10,6 +10,8 @@
 #include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_join.h>
+#include <absl/time/clock.h>
+#include <absl/time/time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -29,6 +31,7 @@
 #include "io/file_util.h"
 #include "server/dflycmd.h"
 #include "server/engine_shard_set.h"
+#include "server/hset_family.h"
 #include "server/journal/executor.h"
 #include "server/journal/journal.h"
 #include "server/journal/serializer.h"
@@ -8216,6 +8219,466 @@ TEST_F(MvccStoreTest, SetWithMemcacheFlagsJournalsCorrectValue) {
   EXPECT_EQ(args[3], "_MCFLAGS");
   EXPECT_EQ(args[4], "42") << "the journaled flags value must be exactly what was set";
   EXPECT_EQ(ClassifyJournaledCommand(args[0]), LwwClass::kSingleKey);
+}
+
+namespace {
+// A key `<prefix><n>` that lives on shard `sid`.
+std::string KeyOnShard(std::string_view prefix, ShardId sid) {
+  for (int i = 0; i < 10000; ++i) {
+    std::string candidate = absl::StrCat(prefix, i);
+    if (Shard(candidate, shard_set->size()) == sid)
+      return candidate;
+  }
+  LOG(FATAL) << "no '" << prefix << "' key on shard " << sid;
+  return {};
+}
+
+// An element `e<n>` for which the key `<key_prefix><e>` (what a SORT `BY <key_prefix>*->f` pattern
+// reads for that element) lives on shard `sid`.
+std::string ElementWithKeyOnShard(std::string_view key_prefix, ShardId sid) {
+  for (int i = 0; i < 10000; ++i) {
+    std::string element = absl::StrCat("e", i);
+    if (Shard(absl::StrCat(key_prefix, element), shard_set->size()) == sid)
+      return element;
+  }
+  LOG(FATAL) << "no element with a '" << key_prefix << "' key on shard " << sid;
+  return {};
+}
+
+// Pauses the background heartbeat's reaper for its scope: it would reap a hash whose field TTL a
+// test let pass before the command under test reads it. The reaper runs only while the flag is on,
+// and nothing the tests below run reads the flag (the same flip as
+// LocalOnlyReaperDoesNotJournalNamespaceBlindDelete, above).
+class ScopedReaperPause {
+ public:
+  ScopedReaperPause() : saved_(absl::GetFlag(FLAGS_active_replica)) {
+    absl::SetFlag(&FLAGS_active_replica, false);
+  }
+  ~ScopedReaperPause() {
+    absl::SetFlag(&FLAGS_active_replica, saved_);
+  }
+
+ private:
+  const bool saved_;
+};
+
+// Polls from the test thread, which is not a proactor thread, until `condition` holds; fails the
+// test after ten seconds.
+bool WaitForCondition(const std::function<bool()>& condition) {
+  const absl::Time deadline = absl::Now() + absl::Seconds(10);
+  while (!condition()) {
+    if (absl::Now() > deadline) {
+      ADD_FAILURE() << "timed out waiting for a condition";
+      return false;
+    }
+    absl::SleepFor(absl::Milliseconds(2));
+  }
+  return true;
+}
+
+// A journal consumer whose writers wait in ThrottleIfNeeded, as JournalStreamer's do on a stalled
+// stream, for the kinds of entry a test holds: after AddLogRecord consumed the entry and before
+// RecordEntry commits the stamps armed for it. Hold() a kind before the write, Release() it when
+// the test has run what it wants to run in that window; only the first writer of the kind waits.
+// Registered on one shard's journal for its lifetime; every writer it holds runs on that shard's
+// thread. It reaches that thread through the proactor, not shard_set->Await: that runs in the shard
+// queue, which a held transaction callback blocks.
+class JournalThrottleGate final : public journal::JournalConsumerInterface {
+ public:
+  enum Kind : unsigned { kDerivedDel, kSet, kOther, kNumKinds };
+
+  explicit JournalThrottleGate(ShardId sid) : sid_(sid) {
+    shard_set->pool()->at(sid_)->Await([this] { id_ = journal::RegisterConsumer(this); });
+  }
+
+  // Releases first: UnregisterConsumer waits for the writers still inside the journal slice.
+  ~JournalThrottleGate() {
+    ReleaseAll();
+    shard_set->pool()->at(sid_)->Await([this] { journal::UnregisterConsumer(id_); });
+  }
+
+  void Hold(Kind kind) {
+    held_[kind] = true;
+  }
+
+  void Release(Kind kind) {
+    held_[kind] = false;
+    shard_set->pool()->at(sid_)->Await([this] { ec_.notifyAll(); });
+  }
+
+  void ReleaseAll() {
+    for (unsigned kind = 0; kind < kNumKinds; ++kind)
+      Release(static_cast<Kind>(kind));
+  }
+
+  // Whether a writer of this kind has reached its wait (it stays true once it has).
+  bool Entered(Kind kind) const {
+    return entered_[kind];
+  }
+
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    // One write's ConsumeJournalChange and ThrottleIfNeeded run back to back on its own fiber
+    // (JournalSlice::CallOnChange), so the kind seen here is the kind that waits there.
+    if (item.cmd == "DEL" && (item.journal_item.entry_flags & journal::kEntryFlagDerived))
+      last_ = kDerivedDel;
+    else if (item.cmd == "SET")
+      last_ = kSet;
+    else
+      last_ = kOther;
+  }
+
+  void ThrottleIfNeeded() override {
+    const Kind kind = last_;
+    // Only the first writer of a held kind waits: a later one, such as the SORT's DEL in a build
+    // that no longer skips it, must fail the test, not hang it.
+    if (!held_[kind] || entered_[kind].exchange(true))
+      return;
+    ec_.await([this, kind] { return !held_[kind]; });
+  }
+
+ private:
+  const ShardId sid_;
+  uint32_t id_ = 0;
+  std::atomic<bool> held_[kNumKinds] = {};
+  std::atomic<bool> entered_[kNumKinds] = {};
+  Kind last_ = kOther;
+  util::fb2::EventCount ec_;
+};
+
+// A change callback, as a snapshot's OnChange is: DbSlice::PreUpdateBlocking calls it before every
+// mutation that FindMutable prepares. It counts its calls and, with `hold` set, waits inside the
+// first one until Release(). Register()/Unregister() it on the shard it watches.
+class WaitingChangeConsumer final : public DbSlice::ChangeConsumerInterface {
+ public:
+  explicit WaitingChangeConsumer(ShardId sid) : sid_(sid) {
+  }
+
+  ~WaitingChangeConsumer() {
+    if (registered_)
+      Unregister();
+  }
+
+  void Register() {
+    registered_ = true;
+    shard_set->pool()->at(sid_)->Await([this] {
+      EngineShard* shard = EngineShard::tlocal();
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+      // RegisterOnChange DCHECKs that the shard's intent lock is held.
+      shard->shard_lock()->Acquire(IntentLock::EXCLUSIVE);
+      db_slice.RegisterOnChange(this);
+      shard->shard_lock()->Release(IntentLock::EXCLUSIVE);
+    });
+  }
+
+  void Unregister() {
+    registered_ = false;
+    shard_set->pool()->at(sid_)->Await([this] {
+      EXPECT_TRUE(namespaces->GetDefaultNamespace().GetCurrentDbSlice().UnregisterOnChange(this));
+    });
+  }
+
+  void OnChange(DbIndex, const ChangeReq&) override {
+    ++calls;
+    if (!hold.exchange(false))
+      return;
+    waiting = true;
+    ec_.await([this] { return released.load(); });
+  }
+
+  void Release() {
+    released = true;
+    shard_set->pool()->at(sid_)->Await([this] { ec_.notifyAll(); });
+  }
+
+  std::atomic<unsigned> calls{0};
+  std::atomic<bool> hold{false};
+  std::atomic<bool> waiting{false};
+  std::atomic<bool> released{false};
+
+ private:
+  const ShardId sid_;
+  bool registered_ = false;
+  util::fb2::EventCount ec_;
+};
+}  // namespace
+
+// drakeydb: P7-1 (decision 35) -- SORT's BY/GET hash-field fetch deletes a hash its read emptied
+// (OpFetchHashFieldValue, generic_family.cc), but it runs in a RunBlockingInParallel fiber, outside
+// any transaction, so another callback on the shard can be suspended between its Arm and its
+// Commit when it does (a journal write throttled on a stalled stream, a snapshot's OnChange). The
+// derived DEL's journal entry runs RecordEntry's per-arm sweep, which would floor that callback's
+// key against the DEL's stamp instead of its own (and HSetFamily::DeleteIfEmpty DCHECKs it, so a
+// debug build aborted). The fetch now skips the delete while anything is armed.
+//
+// The suspended callback is its leftover: a sibling key armed directly on the hash's shard. The
+// source list lives on the other shard, so the fetch is a real cross-shard one.
+//
+// Falsifying: deleting unconditionally again (the guard of OpFetchHashFieldValue removed) aborts
+// the debug build in DeleteIfEmpty's `ArmedCount() == 0` DCHECK, and fails the sibling's stamp and
+// the hash's EXISTS checks in a release one.
+TEST_F(MvccStoreTest, SortHashFieldFetchLeavesAForeignArmAndItsHashAlone) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const std::string src = KeyOnShard("sh-src", 0);
+  const std::string elem = ElementWithKeyOnShard("h_", 1);
+  const std::string hash = absl::StrCat("h_", elem);
+  const std::string sib = KeyOnShard("sh-sib", 1);
+
+  ASSERT_EQ(Run({"rpush", src, elem}).GetInt(), 1);
+  ASSERT_EQ(Run({"set", sib, "v"}), "OK");
+  Run({"hsetex", hash, "1", "f", "1"});
+  ASSERT_THAT(Run({"exists", hash}), IntArg(1));
+  const std::optional<MvccStamp> sib_before = StampOf(sib);
+  ASSERT_TRUE(sib_before.has_value());
+
+  ScopedReaperPause reaper_pause;
+  AdvanceTime(2000);
+
+  size_t armed = 0;
+  std::optional<MvccStamp> sib_during;
+  shard_set->Await(1, [&] { MvccStamper::tlocal()->Arm(0, sib, *sib_before); });
+  EXPECT_THAT(Run({"sort_ro", src, "by", "h_*->f"}), RespElementsAre(elem));
+  shard_set->Await(1, [&] {
+    armed = MvccStamper::tlocal()->ArmedCount();
+    sib_during = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, sib);
+    // The leftover must not reach a later transaction's epoch end (EXISTS below is one).
+    MvccStamper::tlocal()->Disarm(0, sib);
+  });
+  EXPECT_EQ(armed, 1u) << "the sibling's arm must still be there: nothing may sweep it";
+  EXPECT_EQ(sib_during, sib_before) << "the sibling must keep its own stamp";
+  EXPECT_THAT(Run({"exists", hash}), IntArg(1))
+      << "the delete is skipped while a callback is suspended between its Arm and its Commit";
+
+  // Nothing armed any more: the same SORT now deletes the hash its read emptied.
+  EXPECT_THAT(Run({"sort_ro", src, "by", "h_*->f"}), RespElementsAre(elem));
+  EXPECT_THAT(Run({"exists", hash}), IntArg(0));
+  EXPECT_EQ(StampOf(sib), sib_before);
+}
+
+// drakeydb: P7-1 (decision 35) -- the same skip, for a change callback (a BGSAVE, a full sync, a
+// slot migration): with one registered, DeleteIfEmpty's FindMutable would run it
+// (PreUpdateBlocking) and it can wait on the snapshot's serialization of the bucket, which is a
+// yield the fetch must not make inside its journal::DisableFlushGuard.
+//
+// Falsifying: dropping `!db_slice.HasRegisteredCallbacks()` from the guard in OpFetchHashFieldValue
+// (generic_family.cc) makes the callback see one call (`consumer.calls`) and the hash go.
+TEST_F(MvccStoreTest, SortHashFieldFetchSkipsItsDeleteWhileAChangeCallbackIsRegistered) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const std::string src = KeyOnShard("sh-src", 0);
+  const std::string elem = ElementWithKeyOnShard("h_", 1);
+  const std::string hash = absl::StrCat("h_", elem);
+
+  ASSERT_EQ(Run({"rpush", src, elem}).GetInt(), 1);
+  Run({"hsetex", hash, "1", "f", "1"});
+  ASSERT_THAT(Run({"exists", hash}), IntArg(1));
+  ScopedReaperPause reaper_pause;
+  AdvanceTime(2000);
+
+  WaitingChangeConsumer consumer(1);  // never holds: it only counts
+  consumer.Register();
+  EXPECT_THAT(Run({"sort_ro", src, "by", "h_*->f"}), RespElementsAre(elem));
+  EXPECT_EQ(consumer.calls.load(), 0u) << "the fetch must not run FindMutable, hence no callback";
+  EXPECT_THAT(Run({"exists", hash}), IntArg(1))
+      << "the delete is skipped while a change callback is registered on the shard";
+  consumer.Unregister();
+
+  EXPECT_THAT(Run({"sort_ro", src, "by", "h_*->f"}), RespElementsAre(elem));
+  EXPECT_THAT(Run({"exists", hash}), IntArg(0));
+}
+
+// drakeydb: P7-1 (decision 35) -- the same skip, for a transaction callback suspended on the shard
+// with nothing armed: an HGET that found its hash emptied by lazy field expiry is held in the
+// throttle of its derived DEL (a stalled stream), where CommitOwnTombstone has already taken its
+// arm. The SORT's fetch runs meanwhile, outside any transaction, and must leave the other hash
+// alone: it is not ordered against a callback in flight.
+//
+// Falsifying: dropping `op_args.shard->running_tx() == nullptr` from the guard in
+// OpFetchHashFieldValue (generic_family.cc) deletes the hash while the HGET is suspended.
+TEST_F(MvccStoreTest, SortHashFieldFetchSkipsItsDeleteWhileATransactionCallbackIsSuspended) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  const std::string src = KeyOnShard("sh-src", 0);
+  const std::string elem = ElementWithKeyOnShard("h_", 1);
+  const std::string hash = absl::StrCat("h_", elem);
+  const std::string other = KeyOnShard("sh-other", 1);
+
+  ASSERT_EQ(Run({"rpush", src, elem}).GetInt(), 1);
+  Run({"hsetex", hash, "1", "f", "1"});
+  Run({"hsetex", other, "1", "f", "1"});
+  ASSERT_THAT(Run({"exists", hash, other}), IntArg(2));
+  ScopedReaperPause reaper_pause;
+  AdvanceTime(2000);
+
+  JournalThrottleGate gate(1);
+  gate.Hold(JournalThrottleGate::kDerivedDel);
+  util::fb2::Fiber hget_fiber;
+  // Releases the held HGET and joins it on every exit, a failed assertion included: the fixture's
+  // teardown would otherwise wait for it forever.
+  absl::Cleanup release_and_join = [&] {
+    gate.ReleaseAll();
+    if (hget_fiber.IsJoinable())
+      hget_fiber.Join();
+  };
+
+  hget_fiber = pp_->at(0)->LaunchFiber([&] { Run("hget-conn", {"hget", other, "f"}); });
+  ASSERT_TRUE(WaitForCondition([&] { return gate.Entered(JournalThrottleGate::kDerivedDel); }));
+
+  size_t armed = 1;
+  bool callback_in_flight = false;
+  bool hash_exists = false;
+  pp_->at(1)->Await([&] {
+    armed = MvccStamper::tlocal()->ArmedCount();
+    callback_in_flight = EngineShard::tlocal()->running_tx() != nullptr;
+  });
+  ASSERT_TRUE(callback_in_flight) << "the HGET must be suspended inside its transaction callback";
+  ASSERT_EQ(armed, 0u) << "and have nothing armed, or this test no longer isolates running_tx()";
+
+  EXPECT_THAT(Run({"sort_ro", src, "by", "h_*->f"}), RespElementsAre(elem));
+  pp_->at(1)->Await([&] {
+    PrimeTable* table = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetTables(0);
+    hash_exists = table->Find(hash) != table->end();
+  });
+  EXPECT_TRUE(hash_exists) << "the delete is skipped while a callback is in flight on the shard";
+
+  std::move(release_and_join).Invoke();
+  EXPECT_THAT(Run({"exists", other}), IntArg(0)) << "the HGET's own delete went through";
+  EXPECT_THAT(Run({"sort_ro", src, "by", "h_*->f"}), RespElementsAre(elem));
+  EXPECT_THAT(Run({"exists", hash}), IntArg(0)) << "with nothing in flight the SORT deletes it";
+}
+
+// drakeydb: P7-1 (decision 35) -- the SORT fiber's own derived DEL used to throttle in its journal
+// write (AddLogRecord -> ThrottleIfNeeded on a stalled stream) BEFORE RecordEntry's per-arm sweep,
+// and the fiber is no transaction, so the shard went on polling: a replicated write that arms a key
+// and waits in its own journal write meanwhile had its arm swept by the DEL's entry when the SORT
+// fiber resumed, and the key took the DEL's local stamp instead of its author's. The fetch now runs
+// the delete under journal::DisableFlushGuard, so the DEL never waits.
+//
+// The throttle gate holds the SORT's DEL (derived) and the replicated SET (a peer's author stamp)
+// on shard 1. With the guard the SORT never reaches its wait, finishes, and the SET commits its
+// author stamp.
+//
+// Falsifying: dropping the journal::DisableFlushGuard line in OpFetchHashFieldValue
+// (generic_family.cc) makes the sibling end with the DEL's stamp, not the author's.
+TEST_F(MvccStoreTest, SortHashFieldDeleteDoesNotWaitInItsJournalWrite) {
+  ASSERT_GT(shard_set->size(), 1u) << "the test needs more than one shard";
+  constexpr uint32_t kPeerIdx = 4;
+  constexpr uint64_t kAuthorMvcc = 0x4242'0000'1111ULL;
+  const uint64_t peer_hash = NodeUuidHash("a1b2c3d4-0000-4000-8000-0000000000aa");
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
+
+  const std::string src = KeyOnShard("sh-src", 0);
+  const std::string elem = ElementWithKeyOnShard("h_", 1);
+  const std::string hash = absl::StrCat("h_", elem);
+  const std::string sib = KeyOnShard("sh-sib", 1);
+
+  ASSERT_EQ(Run({"rpush", src, elem}).GetInt(), 1);
+  Run({"hsetex", hash, "1", "f", "1"});
+  ASSERT_THAT(Run({"exists", hash}), IntArg(1));
+  ScopedReaperPause reaper_pause;
+  AdvanceTime(2000);
+
+  JournalThrottleGate gate(1);
+  gate.Hold(JournalThrottleGate::kDerivedDel);
+  gate.Hold(JournalThrottleGate::kSet);
+  util::fb2::Fiber sort_fiber;
+  util::fb2::Fiber set_fiber;
+  std::atomic<bool> sort_done{false};
+  std::vector<std::string> sort_result;
+  // Releases both held writers and joins them on every exit, a failed assertion included: the
+  // fixture's teardown would otherwise wait for them forever.
+  absl::Cleanup release_and_join = [&] {
+    gate.ReleaseAll();
+    for (util::fb2::Fiber* fiber : {&sort_fiber, &set_fiber}) {
+      if (fiber->IsJoinable())
+        fiber->Join();
+    }
+  };
+
+  sort_fiber = pp_->at(0)->LaunchFiber([&] {
+    sort_result = StrArray(Run("sort-conn", {"sort_ro", src, "by", "h_*->f"}));
+    sort_done = true;
+  });
+  // The fixed fetch never waits, so the SORT is done; before the fix it waits in the throttle of
+  // its derived DEL, after that entry joined the journal and before its stamps are committed.
+  ASSERT_TRUE(WaitForCondition(
+      [&] { return sort_done.load() || gate.Entered(JournalThrottleGate::kDerivedDel); }));
+
+  // A replicated write on the same shard starts meanwhile (the SORT fiber is no transaction, so
+  // the shard polls), arms its key and waits in its own journal write.
+  set_fiber = pp_->at(0)->LaunchFiber([&] {
+    ApplyReplicatedCommand({"SET", sib, "v"}, kPeerIdx, kAuthorMvcc, /*lww_guard=*/false);
+  });
+  ASSERT_TRUE(WaitForCondition([&] { return gate.Entered(JournalThrottleGate::kSet); }));
+
+  gate.Release(JournalThrottleGate::kDerivedDel);
+  ASSERT_TRUE(WaitForCondition([&] { return sort_done.load(); }));
+  gate.Release(JournalThrottleGate::kSet);
+  std::move(release_and_join).Invoke();
+
+  EXPECT_THAT(sort_result, testing::ElementsAre(elem));
+  EXPECT_THAT(Run({"exists", hash}), IntArg(0)) << "the SORT's delete itself must have run";
+  auto stamp = StampOf(sib);
+  ASSERT_TRUE(stamp.has_value());
+  EXPECT_EQ(stamp->Mvcc(), kAuthorMvcc)
+      << "the replicated SET must commit its author's stamp, not be swept by the SORT's DEL";
+  EXPECT_EQ(stamp->origin_hash, peer_hash);
+}
+
+// drakeydb: P7-1 -- HSetFamily::DeleteIfEmpty checked that the hash was empty, then FindMutable,
+// which can yield (the change callbacks wait on a snapshot), so a caller outside a transaction
+// (SORT's fetch, DEBUG OBJHIST) could delete a hash that an HSET refilled meanwhile; inside a
+// transaction running_tx_ keeps the writer out. It checks again on the entry FindMutable returns,
+// and cancels the updater it holds (Run would arm the key with no journal entry to commit it).
+//
+// The fiber below is such a caller: its read empties the hash, its FindMutable waits in a change
+// callback, an HSET refills the hash, then it resumes.
+//
+// Falsifying: dropping the re-check in DeleteIfEmpty (hset_family.cc) deletes the refilled hash
+// (`deleted`, EXISTS, the HGET); `return false` without `Cancel()` leaves an arm (`armed`).
+TEST_F(MvccStoreTest, DeleteIfEmptyKeepsAHashRefilledWhileItsFindMutableYielded) {
+  const std::string key = "refilled-hash";
+  const ShardId sid = Shard(key, shard_set->size());
+
+  Run({"hsetex", key, "1", "f", "1"});
+  ASSERT_THAT(Run({"exists", key}), IntArg(1));
+  ScopedReaperPause reaper_pause;
+  AdvanceTime(2000);
+
+  WaitingChangeConsumer consumer(sid);
+  consumer.hold = true;
+  consumer.Register();
+  util::fb2::Fiber delete_fiber;
+  absl::Cleanup release_and_join = [&] {
+    consumer.Release();
+    if (delete_fiber.IsJoinable())
+      delete_fiber.Join();
+  };
+
+  bool deleted = true;
+  delete_fiber = pp_->at(sid)->LaunchFiber([&] {
+    Namespace& ns = namespaces->GetDefaultNamespace();
+    DbSlice& db_slice = ns.GetCurrentDbSlice();
+    DbContext db_cntx{&ns, 0, TEST_current_time_ms};
+    auto it = db_slice.FindReadOnly(db_cntx, key);
+    if (!IsValid(it)) {
+      ADD_FAILURE() << "the hash is gone";
+      return;
+    }
+    // The read that drops the expired field and leaves an empty StringMap, then the delete.
+    HSetFamily::GetFieldValue(db_cntx, it->second, "f");
+    deleted = HSetFamily::DeleteIfEmpty(db_slice, db_cntx, key, it->second);
+  });
+  ASSERT_TRUE(WaitForCondition([&] { return consumer.waiting.load(); }));
+
+  EXPECT_THAT(Run({"hset", key, "g", "1"}), IntArg(1));
+  std::move(release_and_join).Invoke();
+
+  EXPECT_FALSE(deleted) << "a hash refilled while FindMutable yielded must not be deleted";
+  size_t armed = 1;
+  shard_set->Await(sid, [&] { armed = MvccStamper::tlocal()->ArmedCount(); });
+  EXPECT_EQ(armed, 0u) << "bailing out must not leave the key armed";
+  consumer.Unregister();
+  EXPECT_THAT(Run({"exists", key}), IntArg(1));
+  EXPECT_EQ(Run({"hget", key, "g"}), "1");
 }
 
 // drakeydb: P4-4 -- "off means byte-identical to upstream" for every TTL-changing command: EXPIRE,

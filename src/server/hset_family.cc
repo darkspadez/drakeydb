@@ -1681,6 +1681,18 @@ bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std:
     return false;
 
   if (auto res = db_slice.FindMutable(db_cntx, key, OBJ_HASH); res) {
+    // drakeydb: P7-1 -- FindMutable can yield (its change callbacks may wait on a snapshot), and a
+    // caller outside a transaction (SORT's pattern fetch, DEBUG OBJHIST) is not ordered against
+    // a write that refills the hash meanwhile, so the emptiness checked above is checked again on
+    // the entry FindMutable returned (`pv` may not be that entry any more). Cancel, not the
+    // updater's Run on scope exit: nothing was changed, and Run would arm the key with no journal
+    // entry to commit it.
+    if (const PrimeValue& current = res->it->second;
+        current.Encoding() != kEncodingStrMap2 ||
+        !static_cast<StringMap*>(current.RObjPtr())->Empty()) {
+      res->post_updater.Cancel();
+      return false;
+    }
     db_slice.DelMutable(db_cntx, std::move(*res), DbSlice::DeleteReason::kExpired);
     if (db_slice.shard_owner()->journal()) {
       // drakeydb: Phase 3 -- db_cntx carries the causing transaction's replication-apply origin

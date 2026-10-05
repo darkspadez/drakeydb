@@ -448,6 +448,15 @@ class MvccStamper {
   // no sibling arm is ever pending there today -- but this call leaves one alone exactly the same
   // way if one ever were (ArmedCount(), below, lets each of them confirm that with a DCHECK).
   //
+  // drakeydb: P7-1 (decision 35) -- two of the DeleteIfEmpty callers are not inside a transaction
+  // callback at all. SORT's BY/GET hash-field fetch (OpFetchHashFieldValue, generic_family.cc) runs
+  // in a RunBlockingInParallel fiber, so another callback on the shard can be suspended between
+  // its Arm and its Commit (a stalled journal stream, a snapshot's OnChange) when it reads; it
+  // therefore calls DeleteIfEmpty only with no transaction callback in flight, no change callback
+  // registered and ArmedCount() == 0, under a journal::DisableFlushGuard (the heartbeat reaper's
+  // preconditions), and skips the delete otherwise. DEBUG OBJHIST/STRINGS (debugcmd.cc) call it
+  // from their own traversal fibers with no such guard.
+  //
   // When that arm's own prev_stamp carries no real authority (Mvcc() == 0: a value that never
   // received a stamp, or a slot PerformDeletionAtomic's own GetMvcc call found nothing for),
   // `ExpiryTombstoneFor` has nothing to advance from -- and its own {0,1}|tombstone result for a
@@ -500,6 +509,13 @@ class MvccStamper {
   // stamp instead of its real author stamp. No caller today ever arms a sibling before reaching
   // that point; this lets each one confirm that with a DCHECK rather than relying on it staying
   // true by accident as the callers around CommitOwnTombstone change.
+  //
+  // drakeydb: P7-1 (decision 35) -- also a production gate for SORT's hash-field fetch
+  // (OpFetchHashFieldValue, generic_family.cc), which runs outside a transaction: a nonzero count
+  // there means another callback is suspended between its Arm and its Commit, and the delete is
+  // skipped, not DCHECKed. The count alone does not make that delete safe: the derived DEL's own
+  // journal write can yield before its sweep, so that caller also disables the journal flush
+  // (journal::DisableFlushGuard).
   size_t ArmedCount() const {
     return armed_.size();
   }

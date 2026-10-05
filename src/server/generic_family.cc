@@ -45,6 +45,7 @@ extern "C" {
 #include "server/journal/journal.h"
 #include "server/multi_master.h"
 #include "server/multimaster_lww.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/rdb_extensions.h"
 #include "server/rdb_load.h"
@@ -2322,7 +2323,8 @@ string OpFetchStringValue(const OpArgs& op_args, std::string_view key, bool* fou
 // drakeydb: P7-1 (decision 35) -- the value of a BY or GET pattern's hash field, as
 // lookupKeyByPattern reads it: the field of the hash at `key`. `found` is false (and the result
 // empty) for a missing key, a key that is not a hash and a field the hash does not hold, an expired
-// one included. As HGET does, it deletes a hash whose lazy field expiry this read just emptied.
+// one included. As HGET does, it deletes a hash whose lazy field expiry this read just emptied,
+// unless a snapshot or a suspended callback makes that unsafe here (see below).
 // TODO: does not support tiering; a hash the experimental hash offloading moved to disk reads as
 // missing.
 string OpFetchHashFieldValue(const OpArgs& op_args, std::string_view key, std::string_view field,
@@ -2336,10 +2338,28 @@ string OpFetchHashFieldValue(const OpArgs& op_args, std::string_view key, std::s
   }
 
   optional<string> value = HSetFamily::GetFieldValue(op_args.db_cntx, it->second, field);
-  // The read's StringMap::Find drops expired fields lazily, as HGET does, so a hash it emptied must
-  // go now, or SAVE logs an error in SaveEntry for it (FieldExpireHashDeletesEmptyHash pins the
-  // delete for FIELDEXPIRE). Unlocked, as OpFetchStringValue's lazy expiry of a string weight is.
-  HSetFamily::DeleteIfEmpty(db_slice, op_args.db_cntx, key, it->second);
+  // drakeydb: P7-1 (decision 35) -- the read's StringMap::Find drops expired fields lazily, as
+  // HGET does, so a hash it emptied goes now: a zero-size hash would linger otherwise, seen by
+  // EXISTS, TYPE and DBSIZE, and SAVE logs an error in SaveEntry and skips it
+  // (FieldExpireHashDeletesEmptyHash pins the delete for FIELDEXPIRE).
+  //
+  // This runs in a RunBlockingInParallel fiber, outside any transaction, so nothing orders it
+  // against the shard's other callbacks, and DeleteIfEmpty can yield twice: FindMutable runs the
+  // change callbacks, and the derived DEL's journal write throttles on a stalled stream. A
+  // callback suspended between its Arm and its Commit would then have its keys floored by this
+  // DEL's journal entry (the per-arm sweep of RecordEntry, active mode), as would one that starts
+  // while this DEL waits to be swept; a write that refills the hash meanwhile would lose it. So
+  // the delete runs only where it cannot yield or meet an arm, the heartbeat reaper's
+  // preconditions (engine_shard.cc): no transaction callback in flight on the shard, no change
+  // callback registered (FindMutable cannot yield), nothing armed, and the journal flush disabled
+  // (the DEL's AddLogRecord cannot throttle before its sweep). It is skipped only while a snapshot,
+  // a full sync or a slot migration runs on the shard, or a callback is suspended there; the empty
+  // hash then stays until the reaper (active mode) or the next command that reads the hash.
+  if (op_args.shard->running_tx() == nullptr && !db_slice.HasRegisteredCallbacks() &&
+      (!db_slice.mvcc_enabled() || MvccStamper::tlocal()->ArmedCount() == 0)) {
+    journal::DisableFlushGuard no_preempt(op_args.shard->journal());
+    HSetFamily::DeleteIfEmpty(db_slice, op_args.db_cntx, key, it->second);
+  }
   if (!value)
     return {};
 
