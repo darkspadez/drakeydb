@@ -680,6 +680,27 @@ build re-runs it in the old order (tied `BY` weights, a stored `BY nosort` set, 
 newer node computed the new result, and no counter shows the difference; keep such `SORT ... STORE`
 forms out of the traffic until every node runs the new build (ISSUE-REGISTER D-13, D-34).
 
+## A classic master's stream is trusted
+
+A drakeydb replica of a classic master (Redis, Valkey, KeyDB, plain or active) applies whatever that
+master streams. Commands that would crash, stall or deadlock the replica, or rewire its own link
+(`INFO`, `CLIENT`, `REPLICAOF`, `REPLTAKEOVER`, `ROLE`, `DEBUG REPLICA`, `DFLYMIGRATE`, ...), are
+refused on the replication path (ISSUE-REGISTER U-15, U-17, U-19), but the stream is otherwise
+trusted, as it is on a KeyDB or Redis replica:
+
+- **`SHUTDOWN` stops the replica** (owner decision 39). A streamed `SHUTDOWN` makes the replica
+  exit cleanly with status **0**, so a supervisor that restarts only on failure leaves it down, and
+  `SHUTDOWN SAVE|NOSAVE` decides its exit snapshot. No conforming master sends it (KeyDB and Redis
+  never propagate `SHUTDOWN`); a KeyDB replica does the same with one it reads from its master.
+- Other commands a hostile or broken master could stream change or empty the replica's data or
+  files (`FLUSHALL`, `CONFIG SET dir` with `SAVE`, `DFLY LOAD`), as on any replica.
+- `SORT` re-run from the stream orders as Redis and KeyDB do (decisions 34–38); set
+  `--sort_set_max_intset_entries` to the master's `set-max-intset-entries` if it is not the default
+  512 (ISSUE-REGISTER D-34).
+
+Point drakeydb only at masters you control. The full KeyDB onboarding guide lands with Phase 7's
+last sub-PR.
+
 ## Known residual exposures
 
 Tracked in [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md), Part 2:

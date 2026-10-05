@@ -556,7 +556,11 @@ last two do not read the connection and are U-21; a client can send them too. Af
 runs survive and the 12 `SHUTDOWN` runs end the process (below); all 90 `DFLYMIGRATE` runs survive.
 The `DFLY` subcommands, `DFLYCLUSTER` (answered from the config; `CONFIG` hands
 `DispatchTracker` the null issuer it accepts), `GAT` (refuses a caller that is not memcache) and
-`_XGROUP_HELP` read no connection and survived throughout; `ROLE` and `DEBUG REPLICA|REPLDIAG`
+`_XGROUP_HELP` read no connection and survived throughout. (In `yes` mode the sweep's
+`DFLYCLUSTER CONFIG` case re-sends the config already pushed, which returns early; a streamed config
+that *differs* would replace the replica's cluster config, a side effect, after a bounded wait of up
+to 2 s on the null-issuer tracker. That path was established by reading only, as the guard
+round-2 review noted.) `ROLE` and `DEBUG REPLICA|REPLDIAG`
 survive a single command and deadlock a concurrent client's `REPLICAOF NO ONE` (U-19).
 `--cluster_mode=yes`, which the adversarial pass could not judge (its probe key got `MOVED`), is
 covered by pushing a config first.
@@ -577,10 +581,18 @@ exit with status 0, cleanly, within the probe's 5 s, in all three modes; the swe
 those runs as crashes because the process is gone, but the status is 0. By reading the code:
 `ShutdownCmd` only stops the listeners (`acceptor_->Stop()`), the main thread's `acceptor->Wait()`
 returns and runs `Service::Shutdown`, which stops the replica from there, so the replication fiber
-that ran the command is not joined by itself (U-17's abort does not apply). Unchanged, and a
-question for the owner: a master can still stop its replicas this way, and `SHUTDOWN
-SAVE|NOSAVE|FORCE` also sets `save_on_shutdown_` for that exit. No stock master streams it (it is
-not a write command).
+that ran the command is not joined by itself (U-17's abort does not apply). `SHUTDOWN
+SAVE|NOSAVE|FORCE` also sets `save_on_shutdown_` for that exit. No conforming master streams it
+(KeyDB registers it `noprop`, `server.cpp:782-784`), and a KeyDB replica runs one read from its
+master link the same way. **Owner decision 39 (2026-10-05): kept as is, documented** (operator note
+in `docs/multi-master.md`, KeyDB onboarding). A guard in the handler is not an option anyway:
+`DflyCmd::TakeOver` calls `ShutdownCmd` with a context that has no connection, so a null-connection
+guard would break every successful `DFLY TAKEOVER`. The exit status is 0, so a supervisor that
+restarts only on failure does not restart the node. A hostile master has other ways to stop or empty
+a replica (`CONFIG SET dir` with `SAVE`, `FLUSHALL`, `DFLY LOAD`), and one more on a replica that
+runs `--experimental_cascaded_partial_sync` with a downstream replica in stable sync: a streamed
+`DFLY TAKEOVER 1 SYNC<n>` (session ids count up from 1) passes the active-mode check, runs a real
+takeover and exits the node through `ShutdownCmd` (`dflycmd.cc`, the guard round-2 review's m2).
 
 Tests: `ClassicNoConnectionTest` case `DflymigrateFlow` (instantiation `U15`),
 `ClassicApplyFamilyTest.DflyFlowOfALiveSessionIsAnErrorNotACrash`, and
@@ -808,8 +820,9 @@ envelope). Falsified one guard at a time: without `Role`'s, its gtest fails and 
 pytest cases (both deadlock cases, which get no reply in 30 s, and the envelope case; the raw case
 cannot tell); without `DebugCmd::Replica`'s, its three gtests fail, and 11 of 14 pytest cases (all
 six deadlock cases, both strand cases, the three envelope cases); without `DebugCmd::ReplDiag`'s,
-its gtest and its envelope case fail (a single `REPLDIAG` holds the mutex only at its start, so
-nothing else pins it). Pre-existing in upstream Dragonfly; not filed upstream. On the byte-identity
+its gtest and its envelope case fail. `REPLDIAG` has no deadlock test: it spends its time dumping
+every fiber's stack on every thread, so a flood of it rarely parks the fiber on the mutex and would
+flood the logs; its guard is pinned by its reply alone. Pre-existing in upstream Dragonfly; not filed upstream. On the byte-identity
 exception list (spec, item 2).
 
 ### U-20. `SORT .. LIMIT` with an offset plus count beyond `uint32` replies garbage or crashes
@@ -849,7 +862,8 @@ in `--restricted_commands`, so any client the server takes commands from can kil
 in cluster mode. A classic master's stream can send it as well. Second, `DFLYMIGRATE` alone passes
 its arity check (-1), `DflyMigrate` reads a subcommand that is not there, and nobody takes the
 parser's error: in a debug build `~CmdArgParser` asserts (`Parsing error occured but not checked`),
-SIGABRT; a release build answers an unknown subcommand and is unaffected.
+SIGABRT; a release build answered an unknown subcommand (`Unknown subcommand ...`), and now answers
+`syntax error`, as in a debug build.
 
 **How established:** the P7-1 close's hidden-command sweep (U-15, "The sweep"): `DFLYMIGRATE ACK x
 1` and a bare `DFLYMIGRATE` in a classic stream, raw and in an envelope, killed the replica (`ACK`
