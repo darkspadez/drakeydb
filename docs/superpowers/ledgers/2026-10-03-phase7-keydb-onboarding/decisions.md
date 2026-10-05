@@ -80,7 +80,7 @@ mechanism (D-n).
 - **Decision 34: "everywhere" covers every ordering rule of KeyDB's `sort.cpp`** (lead, 2026-10-05,
   from reading `sort.cpp` for the brief). Two more rules fall under it besides the two the row
   names: `BY nosort DESC` on a list or a sorted set walks it from the tail or by descending rank,
-  with `LIMIT` taken from that walk (`sort.cpp:356-382`, `:401-430`); and under `ALPHA BY` a missing
+  with `LIMIT` taken from that walk (`sort.cpp:356-380`, `:401-439`); and under `ALPHA BY` a missing
   (or non-string) weight key sorts before every present weight, the empty string included
   (`:160-168`). Remaining `ALPHA BY` ties are broken on the element: KeyDB's order there follows its
   own input order, which no replica can reproduce, so breaking on the element at least keeps

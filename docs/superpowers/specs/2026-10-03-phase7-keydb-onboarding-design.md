@@ -1357,8 +1357,9 @@ the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE
 1. **Partial PSYNC** (flag-gated by `--classic_partial_psync`, default true): a reconnecting classic
    replica sends `PSYNC <id> <offset+1>` instead of `<id> -1`. The one real exception to the slogan;
    `=false` restores today's bytes.
-2. **Ungated crash, abort and refusal fixes** (P7-0). None changes a byte on the journal wire or in
-   RDB output; in each, upstream crashed, aborted or refused the link:
+2. **Ungated crash, abort, data-loss and refusal fixes** (P7-0 and P7-1). None changes a byte on the
+   journal wire or in RDB output, except the `SORT .. STORE` entry below, which says what it adds; in
+   each, upstream crashed, aborted, stalled, silently lost streamed writes (U-18) or refused the link:
    - **`+OK <suffix>` acceptance** (Task 0.4): a master that answers `REPLCONF capa` with `OK`, a
      space and words (`+OK keydb-fastsync-save`) is accepted. Upstream refused the link (`Bad
      response`, `REPLICAOF` failed). Any other reply is still refused. An active KeyDB's `+OK

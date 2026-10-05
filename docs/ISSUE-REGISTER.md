@@ -623,14 +623,20 @@ Three `// drakeydb: U-17` guards, all in `server_family.cc`. Unaffected: the `--
 (`ServerFamily::Replicate` calls `ReplicaOfInternal` directly; pinned by the `[boot_replicaof]` cases
 of `test_plain_replica_of_active_keydb_expires_keys` and
 `test_dfly_master_that_says_active_replica_never_turns_replica_expiry_on`) and every client-issued
-command (a client has a connection). `REPLICAOF` is not callable from a script. Tests
+command (a client has a connection). A script can call `REPLICAOF` only in global or non-atomic
+mode (`--!df flags=allow-undeclared-keys`, `disable-atomicity`, or `--default_lua_flags`;
+`VerifyCommandState`), and then runs it on its `EVAL`'s context, so the same guard covers a script
+in the stream. Tests
 `ClassicNoConnectionTest` instantiation `U17` (`ReplicaofNoOne`, `SlaveofNoOne`, `ReplicaofHost`,
 `SlaveofHost`, `ReplicaofRemove`, `Addreplicaof`, `ReplTakeover`, `ReplTakeoverSave`) and the pytest
 above (16 cases). Falsified: without the guards the 8 gtests and 15 of the 16 pytest cases fail; the
 raw `REPLTAKEOVER` case passes while U-18's refusal is in place, and with both removed both
-`REPLTAKEOVER 30` cases fail (`b` never arrives). So on a classic link the `ReplTakeOver` guard pins
-the reply, and covers contexts that are not a classic stream (`JournalExecutor`), rather than being
-the only thing between the stream and the stall. Pre-existing in upstream Dragonfly (the raw path);
+`REPLTAKEOVER 30` cases fail (`b` never arrives); the gtest and the `in_envelope` pytest fail with
+only the U-17 guard removed. The `ReplTakeOver` guard is not redundant with U-18: U-18 reads only the
+main link (`replica_`), so on a node whose main link is a Dragonfly master and whose `ADDREPLICAOF`
+link is classic, a `REPLTAKEOVER` streamed on the add-link would pass U-18 and run a real `DFLY
+TAKEOVER` against the Dragonfly master, promoting this node and shutting that master down. The U-17
+guard refuses it first. Pre-existing in upstream Dragonfly (the raw path);
 not filed upstream. On the byte-identity exception list (spec, item 2).
 
 ### U-18. A client `REPLTAKEOVER` on a replica of a classic master consumes replication stream bytes
@@ -640,7 +646,9 @@ not filed upstream. On the byte-identity exception list (spec, item 2).
 shared parser.
 
 On a classic link that socket is the replication stream, which `ConsumeRedisStream` reads too, and a
-classic master never answers a replica's command (KeyDB, Redis and Valkey discard them). So the
+current classic master does not answer a replica's command on it (KeyDB 6.3, Redis 7+ and Valkey
+feed a replica from the replication backlog, so a reply never reaches it; Redis 6.2 and older would
+put an error into the stream, which is no better). So the
 "reply" `TakeOver` reads is whatever the master streams next: that command is applied nowhere, the
 replica's offset stays behind by its bytes for good, the link stays `up`, and the master lists the
 replica `online lag 0`. Silent, permanent divergence; the client sees `Couldn't execute takeover: Bad
@@ -664,8 +672,9 @@ to the master. The check comes after `IsMaster()` (an idempotent `OK` on a maste
 (`replication_resilience_test.py` `test_take_over_*`, `test_double_take_over`,
 `multimaster_test.py::test_active_node_admits_fork_consumers_refuses_others_and_takeover`,
 `cluster_test.py::test_replica_takeover_moved`; 14 runs) pass. A link whose first `Greet()` never
-completed reads `classic_link` false and still gets upstream's `Full sync not done` (not reachable once
-`REPLICAOF` returned `OK`: `Start()` greets first). Test
+completed reads `classic_link` false and still gets upstream's `Full sync not done`, as before (a
+client `REPLICAOF` cannot leave such a link, since `Start()` greets before it returns `OK`; the
+`--replicaof` boot path can, harmlessly). Test
 `keydb_onboarding_test.py::test_client_repltakeover_on_a_replica_of_a_classic_master_is_refused` (a
 scripted master silent to `DFLY`, as KeyDB is: the error names `REPLTAKEOVER` and "classic", no `DFLY`
 request reaches the master, the later `SET b 2` applies, the ACK offset is exact, one connection, role
