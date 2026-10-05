@@ -1401,9 +1401,14 @@ the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE
      The P7-1 close (adversarial finding I3) adds a twelfth guard, in `cluster_family.cc`: under
      `--cluster_mode=emulated`, `CLUSTER INFO|SLOTS|NODES|SHARDS` on a context without a connection
      reply `No connection` (upstream died with SIGSEGV in `Connection::LocalBindAddress`). Other
-     subcommands and other cluster modes are untouched, and a client always has a connection.
-     ISSUE-REGISTER U-15 lists what was left (`DFLYCLUSTER FLOW`, `DFLY FLOW`) and why a filter at the
-     stream boundary was rejected.
+     subcommands and other cluster modes are untouched, and a client always has a connection. The
+     close's re-review (finding I-1) adds a thirteenth and a fourteenth, for hidden commands that
+     `COMMAND` does not list and the first fuzz therefore never sent: `DFLYMIGRATE FLOW`
+     (`cluster_family.cc`; upstream named its connection before it looked up the migration, SIGSEGV in
+     any cluster mode) and `DFLY FLOW` (`dflycmd.cc`; SIGSEGV once a live preparation session matches).
+     A sweep of every hidden command and subcommand (70 cases, raw and enveloped, three cluster modes)
+     found nothing else that reads the connection. ISSUE-REGISTER U-15 has its results, and why a
+     filter at the stream boundary was rejected.
    - **U-17** (P7-1 close): `REPLICAOF`, `SLAVEOF`, `ADDREPLICAOF` and `REPLTAKEOVER` in a classic
      master's stream, raw or inside an envelope, reply `No connection` and the stream carries on.
      Upstream joined the replication fiber from itself (`Check failed: active != this`, SIGABRT in
@@ -1414,6 +1419,17 @@ the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE
      sent to the master. Upstream sent `DFLY TAKEOVER` on the replication socket and read the next
      streamed command as its reply, losing that command for good. A takeover from a Dragonfly
      master, and `REPLTAKEOVER` on a master or an active node, are byte-identical.
+   - **U-19** (P7-1 close, re-review M-1): `ROLE`, `DEBUG REPLICA PAUSE|RESUME|OFFSET` and `DEBUG
+     REPLDIAG` in a classic master's stream, raw or inside an envelope, reply `No connection` and the
+     stream carries on. They take `replicaof_mu_` on the replication fiber, which a client's
+     `REPLICAOF NO ONE` holds while `Replica::Stop` waits for that fiber to end: upstream deadlocked
+     both (the client never got its reply, `ROLE`, `CLIENT LIST` and `REPLTAKEOVER` hung after it,
+     SIGTERM did not stop the process), and `DEBUG REPLICA PAUSE` from the stream left the link
+     unable to reconnect after a drop. Client-issued `ROLE` and `DEBUG` are unchanged.
+   - **U-21** (P7-1 close, found by the hidden-command sweep): `DFLYMIGRATE ACK` on a node without a
+     cluster config (every cluster mode until a config is pushed) read the config through a null
+     pointer, SIGSEGV for a client and for a stream alike, and a bare `DFLYMIGRATE` failed a debug
+     build's parser-destructor assert. They answer `UNKNOWN_MIGRATION` and `syntax error` now.
    - **`SORT` ordering and `LIMIT`** (P7-1, decision 34, ISSUE-REGISTER D-34 and U-20): `SORT` now
      orders as Redis and KeyDB do (a `BY` tie breaks on the element, a missing `ALPHA BY` weight
      sorts first, a SET under `BY nosort` that is stored or scripted is sorted, `BY nosort DESC`
@@ -1515,10 +1531,12 @@ REPLACE` onto a live destination found its source due (D-9, ISSUE-REGISTER D-32,
 | `src/server/generic_family.cc` | `SortGeneric`'s multi-shard fetch hop and its two `SortStoreNothing` call sites (P7-1 review round, decision 32); the read-path hide in `ScanCb` (2, Task 2.9, decision 33) | 1, 2 |
 | `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards (0); U-15 guards in `Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch` (1, review round and re-review); the `SetReplTime` copy beside `SetReplOrigin` in `PrepareTransaction` (2, Task 2.8) | 0, 1, 2 |
 | `src/server/conn_context.h` | `repl_time_ms`, the per-command envelope time beside `repl_origin_idx` (Task 2.8) | 2 |
-| `src/server/dflycmd.cc` | U-15 null-`conn()` guard in `DFLY THREAD` (review round) | 1 |
+| `src/server/dflycmd.cc` | U-15 null-`conn()` guards in `DFLY THREAD` (review round) and `DFLY FLOW` (P7-1 close) | 1 |
+| `src/server/debugcmd.cc` | U-19 null-`conn()` guards in `DebugCmd::Replica` and `DebugCmd::ReplDiag` (P7-1 close) | 1 |
+| `src/server/cluster/cluster_family.cc` | U-15 null-`conn()` guards in emulated `CLUSTER` and `DflyMigrateFlow`; U-21 null-config and parse-error fixes in `DflyMigrateAck` and `DflyMigrate` (P7-1 close) | 1 |
 | `src/server/transaction.cc`, `src/server/multimaster_lww.cc` | Comments only (`:1628-1648` tripwire; `ApplyLwwRewrites` contract); in `transaction.{h,cc}` also `repl_time_ms_`, `SetReplTime` and the `InitTxTime` read of it (Task 2.8) | 2 |
 | `src/server/rdb_load.{h,cc}` | First-read clamp (0); type 64 skip, subexpire/aux handling, counters (4) | 0, 4 |
-| `src/server/server_family.cc`, `multi_master.{h,cc}`, `metrics.cc` | INFO fields and gating, peer line, boot warning, Prometheus (incl. the replica-side branch); U-15 guards in `ServerFamily::Client`, `Auth`, `Info`, `Hello`, `ReplConf` (1); `replica_stream_clock_lag_ms` in the link block (2, Task 2.9) | 1, 2, 3, 4 |
+| `src/server/server_family.cc`, `multi_master.{h,cc}`, `metrics.cc` | INFO fields and gating, peer line, boot warning, Prometheus (incl. the replica-side branch); U-15 guards in `ServerFamily::Client`, `Auth`, `Info`, `Hello`, `ReplConf` (1); U-17, U-18 and U-19 guards in `ReplicaOf`, `AddReplicaOf`, `ReplTakeOver` and `Role` (1, P7-1 close); `replica_stream_clock_lag_ms` in the link block (2, Task 2.9) | 1, 2, 3, 4 |
 | `src/server/CMakeLists.txt` | `classic_replay.cc` in `dragonfly_lib` (`:109-125`); `classic_replay_test` (`:200`, `:202-207`) | 0 |
 | `src/server/dragonfly_test.cc` | `EvalReplicatedApplyNoConnNoCrash`, `ReplicatedApplyDuringTakeoverNoCrash`, `ReplicatedApplyHandlerThrowNoConnNoCrash` | 0 |
 | `tests/dragonfly/keydb_onboarding_test.py` **(new)**, `fake_classic_master.py` **(new)** | KeyDB and fake-master suites | 0-4 |

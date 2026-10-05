@@ -489,13 +489,14 @@ registration it leaves in `DbTable::watched_keys`, which the test counts across 
 the `CLIENT` consolidation in the re-review follow-up): each of the handlers above replies `No
 connection` (the error `CLIENT SETINFO` already gives) when its context has no connection, and
 `QUIT` replies `OK` and has nothing to close. The failed command is dropped and, inside an envelope,
-counted in `classic_apply_errors`; the link stays up and the commands around it apply. Twelve
+counted in `classic_apply_errors`; the link stays up and the commands around it apply. Fourteen
 `// drakeydb: U-15` guards, over a shared `ReplyIfNoConnection` in `server_family.cc`: five in
 `server_family.cc` (`ServerFamily::Client`, once for every subcommand, then `Auth`, `Info`, `Hello`
 and `ReplConf`), five in `main_service.cc` (`Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch`),
-one in `dflycmd.cc` (`DFLY THREAD`) and one in `cluster_family.cc` (emulated `CLUSTER`, below). The
-last three files are beyond what owner decision 26 named. The first fix had fourteen guards: the
-`CLIENT` consolidation removed the five per-subcommand ones and added one. Tests
+two in `dflycmd.cc` (`DFLY THREAD`, `DFLY FLOW`) and two in `cluster_family.cc` (emulated `CLUSTER`
+and `DFLYMIGRATE FLOW`, both below). The last three files are beyond what owner decision 26 named.
+The first fix had fourteen guards: the `CLIENT` consolidation removed the five per-subcommand ones
+and added one. Tests
 `ClassicNoConnectionTest.*` (one case per guarded handler, plus `Watch`, three `EVAL` cases,
 `REPLCONF GETACK` and the `CLIENT` subcommands that never crashed; `classic_replay_test.cc`),
 `ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver`,
@@ -525,13 +526,69 @@ Falsified: without the guard each gtest case dies with SIGSEGV in `Connection::L
 flipped to `conn() != nullptr` the control fails (a real client's `CLUSTER INFO` gets `ERR No
 connection`).
 
-**Not changed, follow-up:** `DFLYCLUSTER FLOW` (`ClusterFamily::DflyMigrateFlow`) dereferences
-`conn()` too, but only with cluster mode on; the adversarial pass saw `DFLYCLUSTER CONFIG|FLOW`
-survive in the stream. `--cluster_mode=yes` was inconclusive there (the probe key got `MOVED`), and
-its `CLUSTER` answers come from the config. `DFLY FLOW` (`SetupFlowConnection`) dereferences it only
-once the master replid matches and a sync session in the preparation state is found, which only a
-real replica connection of this node creates, so a stream could hit it only inside that window, with
-a replid and a session id it has to guess.
+**Hidden commands (P7-1 close, 2026-10-05, whole-branch re-review finding I-1).** The adversarial
+pass listed the commands to fuzz through `COMMAND`, which leaves out every `CO::HIDDEN` one
+(`Service::Command`), so five were never sent: `DFLY`, `DFLYCLUSTER`, `DFLYMIGRATE`, `GAT` and
+`_XGROUP_HELP` (a registry dump has no others; a `--command_alias` clone is hidden too and shares
+its source's handler). One of them was a further U-15: `DFLYMIGRATE FLOW <id> <shard>`
+(`ClusterFamily::DflyMigrateFlow`) names the connection it arrives on (`conn()->SetName`) before it
+looks up the migration, and `DFLYMIGRATE` is registered whatever the cluster mode, so the stream of
+any classic master, raw or in an envelope, killed the replica with SIGSEGV in `Connection::SetName`.
+An earlier version of this entry named `DFLYCLUSTER FLOW` and said "only with cluster mode on": that
+command has no `FLOW` (it answers `Cluster is disabled`), so the adversarial pass's probe of it
+could not have found this. `DFLYMIGRATE FLOW` goes on to `Migrate()` the connection and keep its
+`socket()`, so the guard is the first statement of `DflyMigrateFlow`; `INIT` and `ACK` never read
+the connection.
+
+**The sweep.** Each hidden command and each subcommand its handler dispatches on, with junk and with
+plausible arguments, plus `ROLE`, `DEBUG REPLICA PAUSE|RESUME|OFFSET`, `DEBUG REPLDIAG` and
+`SHUTDOWN`: 70 cases (`DFLY` 29, `DFLYCLUSTER` 16, `DFLYMIGRATE` 15, `GAT` 2, `_XGROUP_HELP` 1, the
+rest 7), raw and inside an envelope, one fresh process per case, streamed by a scripted active-KeyDB
+master with a probe write behind each, with `--cluster_mode` unset, `emulated`, and `yes` (a config
+pushed first): 420 runs per build. The outcome is survived (the probe applied, the settled ACK
+offset exact, one connection, link up, role, keys and cluster nodes unchanged), crash, stall or side
+effect. Before the fixes (`ac35f61`) 386 survived and 34 did not: 12 are `SHUTDOWN` (below); the
+other 22 are three crashes. `DFLYMIGRATE FLOW x 0` and with a shard number that parses (`x 99999`):
+SIGSEGV in `Connection::SetName`, 12 runs, every mode. `DFLYMIGRATE ACK x 1`: SIGSEGV in
+`ClusterConfig::GetIncomingMigrations`, 4 runs (every mode but `yes`, where a config exists). A bare
+`DFLYMIGRATE`: SIGABRT, an `assert` in the destructor of the command's argument parser, 6 runs. The
+last two do not read the connection and are U-21; a client can send them too. After the fixes 408
+runs survive and the 12 `SHUTDOWN` runs end the process (below); all 90 `DFLYMIGRATE` runs survive.
+The `DFLY` subcommands, `DFLYCLUSTER` (answered from the config; `CONFIG` hands
+`DispatchTracker` the null issuer it accepts), `GAT` (refuses a caller that is not memcache) and
+`_XGROUP_HELP` read no connection and survived throughout; `ROLE` and `DEBUG REPLICA|REPLDIAG`
+survive a single command and deadlock a concurrent client's `REPLICAOF NO ONE` (U-19).
+`--cluster_mode=yes`, which the adversarial pass could not judge (its probe key got `MOVED`), is
+covered by pushing a config first.
+
+`DFLY FLOW` is guarded too (`DflyCmd::Flow`). The junk arguments of the sweep
+stop at its replid and session checks, so it survived; but with a live session (`REPLCONF capa
+dragonfly` creates one, in the preparation state) and this node's replid, `DFLY FLOW <replid> <sync
+id> 0` on the apply context dies with SIGSEGV in `Connection::SetName` (`SetupFlowConnection`), as a
+gtest shows. A classic stream would need this node's replid and the id of a live session, and a
+replica refuses to create sessions (`REPLCONF` is refused on a replica) unless it is a peer-mode
+node or runs `--experimental_cascaded_partial_sync`; no way for a stream to learn the replid was
+found, so the guard closes a window nothing is known to open, instead of leaving it argued away.
+`DFLY SYNC`, `STARTSTABLE` and `TAKEOVER` with the same session do not crash (a session leaves the
+preparation state only through `FLOW`; `DFLY SYNC` replies `invalid state`).
+
+**`SHUTDOWN` in a stream.** Raw, in an envelope, and as `SHUTDOWN NOSAVE NOW`, it makes the replica
+exit with status 0, cleanly, within the probe's 5 s, in all three modes; the sweep's harness counts
+those runs as crashes because the process is gone, but the status is 0. By reading the code:
+`ShutdownCmd` only stops the listeners (`acceptor_->Stop()`), the main thread's `acceptor->Wait()`
+returns and runs `Service::Shutdown`, which stops the replica from there, so the replication fiber
+that ran the command is not joined by itself (U-17's abort does not apply). Unchanged, and a
+question for the owner: a master can still stop its replicas this way, and `SHUTDOWN
+SAVE|NOSAVE|FORCE` also sets `save_on_shutdown_` for that exit. No stock master streams it (it is
+not a write command).
+
+Tests: `ClassicNoConnectionTest` case `DflymigrateFlow` (instantiation `U15`),
+`ClassicApplyFamilyTest.DflyFlowOfALiveSessionIsAnErrorNotACrash`, and
+`keydb_onboarding_test.py::test_classic_stream_command_without_a_connection_does_not_abort`
+(`dflymigrate_flow`, each `raw` and `in_envelope`). Falsified guard by guard: without the one in
+`DflyMigrateFlow` the gtest dies with SIGSEGV in `Connection::SetName` and both pytest cases lose
+the replica (exit -11); without the one in `DflyCmd::Flow` its gtest dies with SIGSEGV in
+`Connection::SetName` (`SetupFlowConnection`).
 
 **A stream-boundary filter was considered and rejected.** The class could be closed once, by the
 dispatcher or `ConsumeRedisStream` refusing connection-bound commands for a context without a
@@ -623,10 +680,11 @@ Three `// drakeydb: U-17` guards, all in `server_family.cc`. Unaffected: the `--
 (`ServerFamily::Replicate` calls `ReplicaOfInternal` directly; pinned by the `[boot_replicaof]` cases
 of `test_plain_replica_of_active_keydb_expires_keys` and
 `test_dfly_master_that_says_active_replica_never_turns_replica_expiry_on`) and every client-issued
-command (a client has a connection). A script can call `REPLICAOF` only in global or non-atomic
-mode (`--!df flags=allow-undeclared-keys`, `disable-atomicity`, or `--default_lua_flags`;
-`VerifyCommandState`), and then runs it on its `EVAL`'s context, so the same guard covers a script
-in the stream. Tests
+command (a client has a connection). A script cannot call any of them, in any mode: `CO::ADMIN`
+implies `CO::NOSCRIPT` (the `CommandId` constructor), which `VerifyCommandState` refuses before it
+looks at a script's multi mode, so even a global script (`--!df flags=allow-undeclared-keys`) gets
+`This Redis command is not allowed from script` for `REPLICAOF` (tried against a real server), and
+there is no `EVAL` variant to guard or to test. Tests
 `ClassicNoConnectionTest` instantiation `U17` (`ReplicaofNoOne`, `SlaveofNoOne`, `ReplicaofHost`,
 `SlaveofHost`, `ReplicaofRemove`, `Addreplicaof`, `ReplTakeover`, `ReplTakeoverSave`) and the pytest
 above (16 cases). Falsified: without the guards the 8 gtests and 15 of the 16 pytest cases fail; the
@@ -682,6 +740,78 @@ request reaches the master, the later `SET b 2` applies, the ACK offset is exact
 against real KeyDB after the fix. Pre-existing in upstream Dragonfly; not filed upstream. On the
 byte-identity exception list (spec, item 2).
 
+### U-19. A command in a classic stream that takes `replicaof_mu_` can deadlock a client's `REPLICAOF NO ONE`
+
+**Where:** `ServerFamily::Role` (`src/server/server_family.cc`), `DebugCmd::Replica` (`DEBUG REPLICA
+PAUSE|RESUME|OFFSET`) and `DebugCmd::ReplDiag` (`DEBUG REPLDIAG`) (`src/server/debugcmd.cc`). Each
+takes `ServerFamily::replicaof_mu_`, directly or through `PauseReplication`, `GetReplicaOffsetInfo` and
+`GetReplicaMasterSocketUnreadBytes`, and is reached from `Replica::ConsumeRedisStream`'s dispatch of a
+raw command, or of the inner command of an RREPLAY envelope, on the apply context U-15 describes (no
+connection).
+
+A client's `REPLICAOF NO ONE` (and `REPLICAOF <host> <port>`) holds `replicaof_mu_` across
+`Replica::Stop`, which cancels the link and joins its replication fiber (`sync_fb_.JoinIfNeeded()`).
+A command streamed by a classic master runs on that fiber. If the fiber is parked on `replicaof_mu_`
+while the client holds it, neither goes on: the fiber never ends, the `REPLICAOF` never replies, and
+the mutex is never released. Measured (`deadlock_probe.py`) on a replica streamed `ROLE` without a
+pause: `REPLICAOF NO ONE` gets no reply, and neither do `ROLE`, `CLIENT LIST`, `REPLTAKEOVER` and
+`DEBUG REPLICA OFFSET` after it. `INFO replication` still answers, because `REPLICAOF NO ONE` flips
+the master flag before it waits and `INFO` takes the mutex only for a replica (a `REPLICAOF <host>
+<port>`, which leaves the node a replica throughout, would hang `INFO` too; read, not measured).
+`PING` and `SET` work, and SIGTERM does not stop the process within 20 s, because
+`ServerFamily::Shutdown` takes the same mutex: it takes SIGKILL. No stock master streams `ROLE` or
+`DEBUG` (neither is a write command), so only a hostile or broken one does, and a client's command
+has to arrive while the stream is busy with them.
+
+`DEBUG REPLICA PAUSE` has a second effect. It pauses the link it arrived on, and `MainReplicationFb`
+does not reconnect a paused link (`if (is_paused_) continue;` ahead of the connect), so when the master
+drops the connection the replica stays down until a client sends `DEBUG REPLICA RESUME`.
+
+**Every acquisition of `replicaof_mu_`** (`server_family.cc`, none elsewhere) and what reaches it:
+
+- `Shutdown`: `Service::Shutdown` on exit. `SHUTDOWN` itself only stops the listeners, so no command
+  runs it (see U-15, "`SHUTDOWN` in a stream").
+- `PauseReplication`, `GetReplicaOffsetInfo`: `DEBUG REPLICA ...`. Guarded here.
+  `GetReplicaMasterSocketUnreadBytes`: `DEBUG REPLDIAG`. Guarded here.
+- `Role`: guarded here.
+- `GetReplicaSummary`: `Info` and the `GetMetrics` it calls (U-15 guard first), the emulated
+  `CLUSTER` (`GetEmulatedShardInfo`, behind its U-15 guard), and `/metrics`, varz and memcached
+  `stats`, which run on their own fibers and do not come from a replication stream.
+- `GetMasterLinkClientInfo`, `IsMasterLinkClientId`: `CLIENT LIST|KILL`, behind the one `Client` guard.
+- `AddReplicaOf`, `ReplTakeOver`, and `ReplicaOfInternal` / `ReplicaOfNoOne` through `ReplicaOf`: the
+  U-17 guards come first. `Replicate()`, the `--replicaof` boot path, calls `ReplicaOfInternal` itself,
+  from the boot flow.
+- `ReplConf`: its U-15 guard is the first statement, ahead of its lock. `GetLineageId`: `ReplConf`, and
+  `DflyCmd::Flow`, which is guarded (U-15).
+- The peers' own mutex (`PeerReplicationManager::mu_`, also held across `Stop`) is taken by
+  `PauseReplication` (here), `INFO`'s peer summaries, `REPLICAOF` on a peer node and `REPLCONF`'s
+  reciprocal check: all behind a guard above.
+
+**How established:** the whole-branch re-review's M-1, by reading the code. For the fix: a scripted
+master floods the stream with the command while a client sends `REPLICAOF NO ONE`
+(`keydb_onboarding_test.py::test_classic_stream_replicaof_mutex_command_cannot_deadlock_replicaof_no_one`):
+without the guards all 8 cases (`ROLE`, `DEBUG REPLICA PAUSE|RESUME|OFFSET`, raw and in an envelope)
+get no reply in 30 s. `test_classic_stream_debug_replica_pause_does_not_strand_the_link`: without the
+guard both cases never see a second connection.
+
+**Status (2026-10-05): fixed in this fork** (P7-1 close, guards round 2): three `// drakeydb: U-19`
+guards, each before the lock and replying `No connection`: `ReplyIfNoConnection` at the top of
+`ServerFamily::Role`, and an inline null-connection check at the top of `DebugCmd::Replica` and of
+`DebugCmd::ReplDiag`. The command is dropped and, inside an envelope, counted in
+`classic_apply_errors`; the link stays up and the commands around it apply. A client has a
+connection, so `ROLE` and `DEBUG` answer it as before, and no script can call either (`ROLE` is
+`NOSCRIPT`, `DEBUG` is `ADMIN`). Tests `ClassicNoConnectionTest` instantiation `U19` (`Role`,
+`DebugReplicaPause`, `DebugReplicaResume`, `DebugReplicaOffset`, `DebugReplDiag`: the fixture's node
+is a master, so they pin the reply, and the deadlock is pinned by the pytests above), and
+`test_classic_stream_command_without_a_connection_does_not_abort` (the same five, raw and in an
+envelope). Falsified one guard at a time: without `Role`'s, its gtest fails and so do 3 of the 4
+pytest cases (both deadlock cases, which get no reply in 30 s, and the envelope case; the raw case
+cannot tell); without `DebugCmd::Replica`'s, its three gtests fail, and 11 of 14 pytest cases (all
+six deadlock cases, both strand cases, the three envelope cases); without `DebugCmd::ReplDiag`'s,
+its gtest and its envelope case fail (a single `REPLDIAG` holds the mutex only at its start, so
+nothing else pins it). Pre-existing in upstream Dragonfly; not filed upstream. On the byte-identity
+exception list (spec, item 2).
+
 ### U-20. `SORT .. LIMIT` with an offset plus count beyond `uint32` replies garbage or crashes
 
 **Where:** `GetSortRange` and the partial sort's end in `SortVisitor` (`src/server/generic_family.cc`).
@@ -699,6 +829,41 @@ back to 32 bits: the test binary dies with SIGSEGV, the server dies in all four 
 sort's alone: one gtest and four pytests fail). Negative or beyond-`uint32` `LIMIT` arguments are
 still an error here where Redis and KeyDB clamp them (D-34, "Left open"). Pre-existing in upstream
 Dragonfly; not filed upstream. On the byte-identity exception list (spec, item 2).
+
+### U-21. `DFLYMIGRATE ACK` on a node without a cluster config dereferences a null config; a bare `DFLYMIGRATE` fails a debug assert
+
+**Where:** `ClusterFamily::DflyMigrateAck` and `ClusterFamily::DflyMigrate`
+(`src/server/cluster/cluster_family.cc`).
+
+`DflyMigrateAck` read `ClusterConfig::Current()->GetIncomingMigrations()`, and `Current()` is null
+until a cluster config has been pushed: always with `--cluster_mode` unset or `emulated`, and in
+`yes` mode until the first `DFLYCLUSTER CONFIG`. `DFLYMIGRATE ACK <id> <attempt>` then dies with
+SIGSEGV in `ClusterConfig::GetIncomingMigrations`: a call through a null pointer, so a release build
+too, by reading (the sweep ran a debug build). The command is `CO::ADMIN | CO::HIDDEN` and
+registered in every cluster mode; an admin command is refused to a client only for a command named
+in `--restricted_commands`, so any client the server takes commands from can kill a node that is not
+in cluster mode. A classic master's stream can send it as well. Second, `DFLYMIGRATE` alone passes
+its arity check (-1), `DflyMigrate` reads a subcommand that is not there, and nobody takes the
+parser's error: in a debug build `~CmdArgParser` asserts (`Parsing error occured but not checked`),
+SIGABRT; a release build answers an unknown subcommand and is unaffected.
+
+**How established:** the P7-1 close's hidden-command sweep (U-15, "The sweep"): `DFLYMIGRATE ACK x
+1` and a bare `DFLYMIGRATE` in a classic stream, raw and in an envelope, killed the replica (`ACK`
+in every mode but `yes`). Both reproduce for a plain client too: the gtests below die in
+`BaseFamilyTest::Run`, before their stream half.
+
+**Status (2026-10-05): fixed in this fork** (P7-1 close, guards round 2): two `// drakeydb: U-21`
+hunks. `DflyMigrate` takes the parse error of the subcommand (`RETURN_ON_PARSE_ERROR`, a `syntax
+error` reply). `DflyMigrateAck` treats a missing config as no incoming migration, which it already
+answers `UNKNOWN_MIGRATION` (a simple string, not an error) for one that is not in the config. Tests
+`ClassicApplyFamilyTest.DflymigrateAckWithoutAClusterConfigIsUnknownMigration` and
+`.BareDflymigrateIsAnErrorNotAnAbort` (a client, then the stream's context), and
+`keydb_onboarding_test.py::test_classic_stream_dflymigrate_without_a_cluster_config_does_not_abort`
+(`ack`, `bare`, each `raw` and `in_envelope`). Falsified: with `RETURN_ON_PARSE_ERROR` removed the
+gtest aborts on the assert and both `bare` pytest cases lose the replica; with the config check
+removed (back to `Current()->`) the gtest dies with SIGSEGV and both `ack` pytest cases lose the
+replica. Pre-existing in upstream Dragonfly; not filed upstream, and worth filing (a remote crash of
+any non-cluster node). On the byte-identity exception list (spec, item 2).
 
 ---
 
