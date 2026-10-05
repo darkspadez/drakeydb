@@ -287,6 +287,12 @@ void DflyCmd::Thread(CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void DflyCmd::Flow(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- a flow is the connection it arrives on (SetupFlowConnection names, migrates
+  // and keeps it), and a replicated apply has none. Reached only for a live preparation session
+  // with a matching replid, but nothing past that check reads the connection safely.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
+
   string_view master_id = parser.Next<string_view>();
   string_view sync_id_str = parser.Next<string_view>();
   string_view flow_id_str = parser.Next<string_view>();

@@ -840,6 +840,9 @@ void ClusterFamily::DflySlotMigrationStatus(CmdArgParser parser, CommandContext*
 
 void ClusterFamily::DflyMigrate(CmdArgParser parser, CommandContext* cmd_cntx) {
   string sub_cmd = absl::AsciiStrToUpper(parser.Next());
+  // drakeydb: U-21 -- `DFLYMIGRATE` alone passes the arity check, and a parser error nobody took
+  // fails the parser's destructor assert in a debug build.
+  RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
 
   if (sub_cmd == "INIT") {
     InitMigration(parser, cmd_cntx);
@@ -1099,7 +1102,10 @@ void ClusterFamily::DflyMigrateAck(CmdArgParser parser, CommandContext* cmd_cntx
   RETURN_ON_PARSE_ERROR(parser, cmd_cntx);
 
   VLOG(1) << "DFLYMIGRATE ACK" << ack_args;
-  auto in_migrations = ClusterConfig::Current()->GetIncomingMigrations();
+  // drakeydb: U-21 -- no config yet (cluster mode off, or none pushed) is no incoming migration at
+  // all, answered as one that is not in the config.
+  auto config = ClusterConfig::Current();
+  auto in_migrations = config ? config->GetIncomingMigrations() : std::vector<MigrationInfo>{};
   auto m_it = rng::find_if(in_migrations, [source_id = source_id](const auto& m) {
     return m.node_info.id == source_id;
   });

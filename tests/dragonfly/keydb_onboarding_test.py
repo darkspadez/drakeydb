@@ -1008,11 +1008,14 @@ LINK_COMMAND_CASES = [
 ]
 
 
-async def assert_stream_command_is_survived(df_factory, tmp_path, scenario, peer_mode, command):
+async def assert_stream_command_is_survived(
+    df_factory, tmp_path, scenario, peer_mode, command, apply_errors=1, refusal="No connection"
+):
     """Streams `command` (`{port}` in a word: the scripted master's), raw or inside an RREPLAY
     envelope, between `SET a 1` and `SET b 2`, and checks that the replica came through it: both
     writes applied, the offset the master settles on the exact length of the stream, one connection,
-    the link up, the role unchanged, and inside an envelope exactly one `classic_apply_errors`."""
+    the link up, the role unchanged, and inside an envelope `apply_errors` `classic_apply_errors`
+    (1 for a command that is refused with `refusal`, 0 for one that replies without an error)."""
     async with FakeClassicMaster() as master:
         command = [word.format(port=master.port) for word in command]
         wrap = resp_command if scenario == "raw" else rreplay
@@ -1045,12 +1048,12 @@ async def assert_stream_command_is_survived(df_factory, tmp_path, scenario, peer
             assert info["role"] == "slave" and info["master_link_status"] == "up", info
         if scenario == "in_envelope":
             fields = classic_fields(info, peer_mode)
-            assert fields["classic_apply_errors"] == 1, info
+            assert fields.get("classic_apply_errors", 0) == apply_errors, info
             assert fields["rreplay_unwrapped"] == 1, info
 
     node.stop()
-    if scenario == "in_envelope":
-        assert node.find_in_logs(rf"did not apply and is skipped: {command[0]}: .*No connection")
+    if scenario == "in_envelope" and apply_errors:
+        assert node.find_in_logs(rf"did not apply and is skipped: {command[0]}: .*{refusal}")
 
 
 @pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
@@ -1113,6 +1116,32 @@ async def test_classic_stream_command_without_a_connection_does_not_abort(
     """
     await assert_stream_command_is_survived(
         df_factory, tmp_path, scenario, False, NO_CONNECTION_COMMANDS[name]
+    )
+
+
+@pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
+@pytest.mark.parametrize(
+    "command,apply_errors,refusal",
+    [
+        pytest.param(("DFLYMIGRATE", "ACK", "x", "1"), 0, "", id="ack"),
+        pytest.param(("DFLYMIGRATE",), 1, "syntax error", id="bare"),
+    ],
+)
+async def test_classic_stream_dflymigrate_without_a_cluster_config_does_not_abort(
+    df_factory: DflyInstanceFactory, tmp_path, scenario, command, apply_errors, refusal
+):
+    """`DFLYMIGRATE ACK x 1` on a node without a cluster config read the config through a null
+    pointer (SIGSEGV, in a release build too, for a client as for a classic master's stream), and a
+    bare `DFLYMIGRATE` failed the parser's destructor assert in a debug build (ISSUE-REGISTER
+    U-21). `ACK` answers `UNKNOWN_MIGRATION` now, a simple string and no error, and the bare
+    command a `syntax error`: the replica stays up on the one link, the offset the master settles
+    on is the exact length of the stream, and the commands around them apply.
+
+    Falsifying: with the null-config check removed (`ack`), or the parse error not taken (`bare`),
+    the replica process dies as it reads the command and `b` never arrives.
+    """
+    await assert_stream_command_is_survived(
+        df_factory, tmp_path, scenario, False, command, apply_errors, refusal
     )
 
 

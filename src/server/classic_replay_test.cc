@@ -1484,6 +1484,44 @@ INSTANTIATE_TEST_SUITE_P(
                     NoConnectionCase{"DebugReplDiag", Resp({"DEBUG", "REPLDIAG"})}),
     [](const testing::TestParamInfo<NoConnectionCase>& info) { return string(info.param.name); });
 
+// DFLYMIGRATE is hidden and registered in every cluster mode, so a node without a cluster config
+// answers it too (ISSUE-REGISTER U-21). `ACK` read the config through a null pointer, for a client
+// and for a classic master's stream alike: run each of these alone to tell which one crashed.
+TEST_F(ClassicApplyFamilyTest, DflymigrateAckWithoutAClusterConfigIsUnknownMigration) {
+  EXPECT_EQ(Run({"dflymigrate", "ack", "x", "1"}), "UNKNOWN_MIGRATION");
+
+  OnLink([&](Link& link) {
+    // Not an error: the migration source tells UNKNOWN_MIGRATION apart from the errors.
+    EXPECT_FALSE(DispatchRaw(link, Resp({"DFLYMIGRATE", "ACK", "x", "1"})).has_value());
+  });
+}
+
+// `DFLYMIGRATE` alone is allowed by its arity. The handler read a subcommand that is not there and
+// left the parser's error unchecked, which a debug build's parser destructor asserts on.
+TEST_F(ClassicApplyFamilyTest, BareDflymigrateIsAnErrorNotAnAbort) {
+  EXPECT_THAT(Run({"dflymigrate"}), ErrArg(""));
+
+  OnLink([&](Link& link) { EXPECT_TRUE(DispatchRaw(link, Resp({"DFLYMIGRATE"})).has_value()); });
+}
+
+// DFLY FLOW names, migrates and keeps the connection it arrives on, once the replid and the id of a
+// replica session in the preparation state match. `REPLCONF capa dragonfly` creates such a session,
+// and the fixture's node is a master, which takes it. A replica refuses that, so a classic stream
+// reaches this only on a peer-mode node or with --experimental_cascaded_partial_sync, and it has to
+// know the replid (ISSUE-REGISTER U-15): run alone, the case is a crash without the guard.
+TEST_F(ClassicApplyFamilyTest, DflyFlowOfALiveSessionIsAnErrorNotACrash) {
+  RespExpr capa = Run({"REPLCONF", "capa", "dragonfly"});
+  ASSERT_EQ(capa.type, RespExpr::ARRAY);
+  const string replid{capa.GetVec()[0].GetView()};
+  const string sync_id{capa.GetVec()[1].GetView()};
+
+  OnLink([&](Link& link) {
+    optional<string> error = DispatchRaw(link, Resp({"DFLY", "FLOW", replid, sync_id, "0"}));
+    ASSERT_TRUE(error.has_value());
+    EXPECT_THAT(*error, testing::HasSubstr("No connection"));
+  });
+}
+
 // The emulated cluster node answers CLUSTER INFO|SLOTS|NODES|SHARDS with the address its client
 // connected to (ClusterFamily::GetEmulatedShardInfo), so they read the connection of the context
 // they run on. The other cluster modes answer from the config.
