@@ -2193,7 +2193,8 @@ on every case; the tables are in `task-1.7b-sort-semantics-report.md`):
   for any other set and for a zset. The order is total (`SortEntryAlpha::seq`), so the partial sort
   under `LIMIT` agrees with a full sort. The integer-set predicate is decided on the **members**, not
   on drakeydb's encoding: every member a strict `int64` and at most 512 of them (KeyDB's default
-  `set-max-intset-entries`), in which case the fetched elements are put in ascending numeric order
+  `set-max-intset-entries`; since round 2b the limit is the flag `--sort_set_max_intset_entries`,
+  decision 41, below), in which case the fetched elements are put in ascending numeric order
   first, which is the order a KeyDB intset iterates in. drakeydb's own intset ends at 256 members
   (`kMaxIntSetEntries`, `set_family.cc`), so deciding by encoding would break the ties of a set of
   257 to 512 integers on the element where KeyDB keeps ascending order; deciding by content, sets of
@@ -2215,8 +2216,9 @@ on every case; the tables are in `task-1.7b-sort-semantics-report.md`):
    two KeyDB processes differ on string sets, mixed sets, sets of more than 512 integers and zsets);
    drakeydb breaks the ties on the element.
 3. **A set KeyDB holds as a hash set for its history.** Every member an integer now, but a non-integer
-   member was added and removed once, or its size once passed 512, or `set-max-intset-entries` is not
-   512: KeyDB never converts back, so its order is the dict's, and drakeydb's rule for the same
+   member was added and removed once, or its size once passed `set-max-intset-entries` (a limit that
+   differs from `--sort_set_max_intset_entries` is the operator's to match, below): KeyDB never
+   converts back, so its order is the dict's, and drakeydb's rule for the same
    members (ascending) differs. Measured with `SADD hist 30 2 10 1 200 9`, `SADD hist x`, `SREM hist x`.
 4. **Another libc.** This holds for a KeyDB whose libc `qsort` is a stable mergesort; the one on
    this box is (glibc 2.39, probed). A KeyDB on musl or on a glibc whose `qsort` is not a stable
@@ -2233,11 +2235,32 @@ on every case; the tables are in `task-1.7b-sort-semantics-report.md`):
    like the C locale (`docs/differences.md`). `STORE` is bytewise everywhere. The KeyDB fixture of the
    pytests starts keydb-server with `LC_ALL=C` for this reason.
 
-Not part of this entry and not changed: hash-field patterns (`BY w_*->field`, `GET h_*->field`),
-D-35 (round 2b). Also not a drakeydb difference, noted because it breaks naive probes: the `errno`
-note under "Numbers".
+**Round 2b (decision 41): the intset limit is a flag.** The 512 of the intset rule above is
+`--sort_set_max_intset_entries` (uint32, default 512, the Redis and KeyDB default), read once per
+`SORT` in `SortTiesInFetchOrder` (`generic_family.cc`, a `// drakeydb: P7-1 (decision 41)` hunk), not
+per element, and not changeable with `CONFIG SET` (boot-only, like the other fork flags). An operator
+sets it to the classic master's `set-max-intset-entries` (`docs/multi-master.md`); `0` turns the
+emulation off, so no set is ordered ascending and every set breaks its ties on the element. Measured
+live (`sort2b/logs/flag-live.txt`): a KeyDB and a Redis started with `set-max-intset-entries 100`
+and with `600` against drakeydb with the flag at the same value, at the default and at `0`, over
+`SORT <integer set> BY nokey_* ALPHA`: at limit 100, sets of 50 and 100 members are an intset in KeyDB
+(ascending) and answer alike on KeyDB, Redis and drakeydb; 101, 150 and 300 members are a hash set,
+whose order differs between two KeyDB processes and from Redis (so no replica can follow it), and
+drakeydb breaks their ties on the element with the flag at 100 (and keeps ascending with the default
+512). At limit 600, sets of 100, 512, 513, 550 and 600 members are an intset in KeyDB (ascending, the
+same on both KeyDB processes and on Redis) and equal drakeydb with the flag at 600, where drakeydb at
+the default 512 breaks the ties of 513, 550 and 600 on the element; 601 and 700 members are a hash set.
+With the flag at `0` every set is bytewise. A set above KeyDB's limit cannot be compared with a replica
+by construction, so the replication test (`test_sort_set_max_intset_entries_follows_the_masters_limit`)
+compares sets up to the limit by their ties and sets above it by distinct weights only; a 150-member
+set under a limit of 100 is therefore covered by `GenericSortOrderTest.
+SortSetMaxIntsetEntriesIsTheLimitOfTheIntsetOrder` (the rule, not a KeyDB answer), and falsified (the
+constant 512 back) by the 550- and 600-member runs of the 600 limit.
 
-**Found while testing round 2a, not SORT and not fixed:** `SADD` of more than 256 integers in one
+D-35 (hash-field patterns, round 2b) is fixed below. Also not a drakeydb difference, noted because it
+breaks naive probes: the `errno` note under "Numbers".
+
+**Found while testing round 2a, not SORT (now U-22, owner decision 40: fixed in P7-1):** `SADD` of more than 256 integers in one
 call on a new key replies a wrong count while the set is right (`SADD k <257 distinct integers>`
 replies 0, 300 replies 43, 512 replies 255, 600 replies 343, and `SCARD` is right): in `OpAdd`
 (`set_family.cc`), once the intset outgrows `kMaxIntSetEntries` the code converts it and then
@@ -2248,9 +2271,9 @@ base commit (`git log -S` finds it first in `05abfdd`). Not fixed here; the SORT
 that reply and say so.
 
 **Owner:** none (resolved; the residuals are documented). **From:** the P7-1 adversarial pass (C1);
-decisions 34, 36, 37 and 38 in the ledger; the SORT review (`I1`, `M1`-`M5`).
+decisions 34, 36, 37, 38 and 41 in the ledger; the SORT review (`I1`, `M1`-`M5`).
 
-### D-35. `SORT` hash-field patterns (`->`) are unsupported; a classic stream that uses them diverges silently
+### D-35. `SORT` hash-field patterns (`->`) were unsupported; a classic stream that used them diverged silently -- fixed in P7-1
 
 **Where:** `PopulateSortEntriesFromByPattern` and `FetchGetPatternValues`
 (`src/server/generic_family.cc`) build the weight or `GET` key by putting the element where the
@@ -2260,8 +2283,9 @@ through `ParseSortPattern` / `SortPattern::KeyFor`, one helper that splits a pat
 `lookupKeyByPattern` (`sort.cpp:61-137`) read a pattern `key_*->field` as "the hash at
 `key_<element>`, its field `field`", for `BY` and `GET` alike; a missing key, a key that is not a
 hash and a missing field are all NULL. The fakeredis test `test_sort_with_hash`
-(`tests/fakeredis/test/test_mixins/test_generic_commands.py`) is marked
-`unsupported_server_types("dragonfly")` for the same reason.
+(`tests/fakeredis/test/test_mixins/test_generic_commands.py`) was marked
+`unsupported_server_types("dragonfly")` for the same reason (round 2b removed that mark and two stale
+ones on `test_sort_with_store_option` and `test_sort_with_by_and_get_option`).
 
 **How established (live, standalone KeyDB v6.3.4 against the P7-1 build, 2 shards):** a set `s` of
 `a .. j` and a hash `hw_<c>` per element with `f` = the letter's code mod 3 and `g` = `G<c>`.
@@ -2272,8 +2296,94 @@ With `STORE d` the same two lists land in `d`. An active KeyDB master replicates
 STORE` verbatim, so a drakeydb replica of it ends with a different `d` and nothing says so: the link
 stays up and every counter is clean (the class of D-34, for a command D-34's fix does not cover).
 
-**Status:** open; owner decision pending. Not fixed in P7-1 (decision 34 covers orderings only).
-`SORT` is a command a classic stream carries, so a stream that uses `->` diverges until it is
-supported, or until the choice is made to document it as a limitation of onboarding from KeyDB.
-**Owner:** the owner's decision (pending). **From:** the P7-1 SORT-ordering work (decision 34),
-probe `probe.py` cases `hash_by_field*` and `hash_get_field*`.
+**Status (2026-10-05): fixed in P7-1** (round 2b, owner decision 35), a client-visible change versus
+upstream Dragonfly (which took the `->` as part of the key name; upstream main, read 2026-10-04, has no
+`->` support either) that changes no journal wire, and an upstreamable Redis-compatibility fix. `BY` and
+`GET` read a hash-field pattern as `lookupKeyByPattern` does, compared against live KeyDB 6.3.4 and Redis
+7.0.15 first (they agreed on every form checked):
+
+- `#` (exactly: `spat[0] == '#' && spat[1] == '\0'`) is the element. A pattern without `*` has no value
+  (a `BY` one means `nosort`, as before).
+- Otherwise the **first** `*` is replaced by the element and the **first `->` after that `*`** starts the
+  field, used only if at least one character follows it (`f[2] != '\0'`): the key is `prefix + element +
+  the text up to that "->"`, the field is everything after it. So `GET w_*->` is the string key
+  `w_<element>->` (a trailing arrow is no field), `w_*->->` reads the field named `->`, `w_*-->g` the key
+  `w_<element>-` and field `g`, `w_*->f->g` the field `f->g`, `w_*->f*` the field `f*`, and a `->` before
+  the `*` (`h->w_*`, `h->w_*->f`) is part of the key name. A second `*` is literal (round 2a).
+- The pattern is scanned as a **C string**, as Redis and KeyDB do (`strchr`, `strstr` and the `f[2]` test
+  stop at a NUL byte; the key and the field are cut by length): a NUL hides the `*` or the `->` after it
+  (`h\0v_*->g` has no `*`, so a `GET` of it is nil and a `BY` of it is `nosort`; `hn_*\0->g` is the string
+  key `hn_<e>\0->g`; `hn_*->\0g` is the string key `hn_<e>->\0g`), `GET "#\0x"` is `GET #`, and a field
+  keeps its NULs (`hn_*->g\0h` is the field `g\0h`). Measured on KeyDB, Redis and drakeydb (16 forms).
+- With a field the key must be a **hash** and hold the field; a missing key, a key of another type and a
+  missing field are all no value: nil in a reply, `""` in the list `STORE` leaves, weight 0 under a numeric
+  `BY` and a **missing** weight under `ALPHA BY` (first, before the empty string, decision 34). Without a
+  field the key must be a string (round 2a). A field value that is not a number is the same error as a
+  string weight that is not (`One or more scores can't be converted into double`, `STORE` leaves `dst`).
+- **Cross-shard:** the key part (`prefix + element + suffix`), not the whole pattern, decides the shard
+  the hash is read on, and the read is the same "read uncommitted" lookup the string weights use.
+- A field whose **TTL has passed** (`HSETEX`, `HEXPIRE`; KeyDB has no field TTLs, so this is drakeydb's
+  rule, tested against `HGET`) is missing, and a hash that lazy field expiry empties by this read is deleted,
+  as an `HGET` (or `HTTL`) deletes it (`HSetFamily::DeleteIfEmpty`, the derived `DEL`).
+
+What changed (`generic_family.cc`, `// drakeydb: P7-1 (decision 35)`; `hset_family.{h,cc}`): `SortPattern`
+gains `field`; `ParseSortPattern` (C-string scan) and `IsSortElementPattern`; `OpFetchHashFieldValue` and
+`OpFetchPatternValue` beside `OpFetchStringValue`; `FetchGetPatternValues` (each pattern parsed once) and
+`PopulateSortEntriesFromByPattern` read through `OpFetchPatternValue`; and `HSetFamily::GetFieldValue`, the
+read `CmdHGet` does through `HMapWrap`, so the hash is read as an `HGET` reads it whether it is a listpack
+or a StringMap with field TTLs. Nothing in the journal changes: the weights and `GET` values are read, never
+written, and the SORT itself still journals as before (D-13 for a same-shard `STORE`).
+
+**Checked.** Live (`sort2b/probes/hf_table.py`, 156 forms: 28 `BY` and 22 `GET` shapes over a list and a set,
+reply and `STORE`, hash sets' unordered ties left out for KeyDB and Redis alike): KeyDB and Redis agree on
+all of them; the build before this fix differed on 44; drakeydb on 1 and on 2 shards differs on one, `SORT
+l BY hw_*->f LIMIT 2 5 ALPHA`, the `pqsort` residual of D-34 (KeyDB and Redis agree with each other, not with
+drakeydb). The NUL forms (`nul_probe.py`, 16): 6 differed before, none now. The adversarial probe
+`sort_keydb.py` (an active KeyDB master, three plain replicas of 1, 2 and 4 shards) extended with 11 stored `->`
+sorts, one inside `MULTI` and one inside `EVAL` (`sort2b/adv/sort_keydb_hf.py`): every one converged; the build
+before this fix diverged on all 11 on every replica (`BAD 33`), this one on `dst16` only (`BAD 3`, the
+hash-set `ALPHA BY` tie of D-34's residuals). Tests:
+`GenericSortOrderTest.HashFieldPatternsAreReadAsRedisReadsThem` (93 rows from KeyDB and Redis, each as a
+reply, SORT_RO and a list `STORE` on the source's and on another shard),
+`.HashFieldPatternsWithNulBytesAreScannedAsCStrings` (18 rows), `.HashFieldNumericByOfATextFieldFailsAsOverAStringKey`,
+`.HashFieldIsReadFromAListpackAndFromAStringMap`, `.HashFieldWithAnExpiredTtlIsMissing`,
+`.HashFieldReadDeletesAHashItsLazyExpiryEmptied` and `.HashFieldIsReadOnTheShardOfTheKeyPart` (three
+shards: a source, a destination and hashes on each of the three); in `keydb_onboarding_test.py` the same
+forms (and the NUL ones, `\0` in a form) run in `test_plain_replica_of_active_keydb_orders_sort_store_as_keydb_does`
+(an active KeyDB master's stored sorts against a plain replica of one and of two shards: the replica ended
+with a different `dst` on every `->` form before) and `test_sort_replies_in_the_order_keydb_does` (replies,
+and inside `EVAL`). The three fakeredis SORT tests pass against this build with their marks removed
+(`-k sort -m real`: 14 passed; `test_sort_with_hash` failed on the build before).
+
+**Falsified**, each mutation applied, rebuilt, the gtests and the pytests run, and restored (the failing
+tests are in the task report): the field ignored (the pattern a plain string key) fails seven of the
+eight new gtests and both pytests; the shard taken from the whole pattern instead of the key part fails
+six gtests and both pytests on two shards; a string key read as a value for a field pattern, and a missing
+field made present-and-empty (so `ALPHA BY` stops sorting it first and `GET` stops being nil), fail the
+table and both pytests; the `->` found before the `*`, the last `->` instead of the first, a trailing `->`
+taken as a field marker, the pattern scanned past a NUL and `#` matched exactly each fail the table or the
+NUL table and both pytests; no delete of the hash a lazy expiry emptied, and the field TTL ignored, fail
+their gtests.
+
+**Residuals, documented and not fixed:**
+
+1. **A hash that experimental hash offloading moved to disk** (`--tiered_experimental_hash_support`, off by
+   default) reads as having no field: `OpFetchHashFieldValue` skips a value that is external and not cool
+   (`HMapWrap` needs it in memory), the way `OpFetchStringValue` does not support tiering (its `TODO`).
+2. **Ties under a `LIMIT` that cuts an `ALPHA BY` sort** are still `pqsort`'s (D-34 residual 1), also for
+   `->` forms; numeric `BY` ties break on the element in both and agree.
+3. **A hash read by SORT is the same lock-free "read uncommitted" lookup the string weights are.** A
+   concurrent writer to that hash can change a weight between two elements' reads, as for a string weight;
+   Redis has no such window (one thread). The lazy-expiry delete of an emptied hash runs on the shard that
+   owns it, outside the SORT's transaction, as `ExpireIfNeeded` does for a string weight with a TTL.
+4. **KeyDB has no hash-field TTLs**, so a field's expiry is drakeydb's rule (an expired field is missing,
+   as for `HGET`); a KeyDB master never sends one. Between drakeydb nodes a field TTL is read like the TTL
+   of a string weight key: a same-shard `SORT .. STORE` is journaled as the command and replayed at the
+   peer's clock, so a field that expired on one node and not yet on the other can give another list
+   (D-13: a `BY`/`GET` pattern key is not a transaction key); a cross-shard `STORE` journals its result.
+5. **Older builds.** A node on a build before this fix re-running a same-shard `SORT .. STORE` with a `->`
+   pattern reads it as a plain key name and stores another list, as D-13 describes for D-34 (one sentence
+   in `docs/multi-master.md`, "Upgrade a mesh in lockstep"). `kDrakeydbReplVersion` is not bumped.
+
+**Owner:** none (resolved; the residuals are documented). **From:** the P7-1 SORT-ordering work (decision
+34), probe `probe.py` cases `hash_by_field*` and `hash_get_field*`; decision 35 in the ledger.

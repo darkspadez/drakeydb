@@ -676,9 +676,10 @@ admit and be admitted by the others before traffic depends on it — there is no
 gets the full feature set, or it is refused at handshake. One thing the gate does not cover is
 `SORT`'s ordering: a same-shard `SORT ... STORE` is journaled as the command, so a node of an older
 build re-runs it in the old order (tied `BY` weights, a stored `BY nosort` set, a missing or tied
-`ALPHA BY` weight) or fails on a form the new build accepts (a negative `LIMIT`, several `*`) while a
-newer node computed the new result, and no counter shows the difference; keep such `SORT ... STORE`
-forms out of the traffic until every node runs the new build (ISSUE-REGISTER D-13, D-34).
+`ALPHA BY` weight), fails on a form the new build accepts (a negative `LIMIT`, several `*`) or reads
+a hash-field pattern (`BY w_*->f`, `GET h_*->f`) as a plain key name, while a newer node computed the
+new result, and no counter shows the difference; keep such `SORT ... STORE` forms out of the traffic
+until every node runs the new build (ISSUE-REGISTER D-13, D-34, D-35).
 
 ## A classic master's stream is trusted
 
@@ -694,9 +695,14 @@ trusted, as it is on a KeyDB or Redis replica:
   never propagate `SHUTDOWN`); a KeyDB replica does the same with one it reads from its master.
 - Other commands a hostile or broken master could stream change or empty the replica's data or
   files (`FLUSHALL`, `CONFIG SET dir` with `SAVE`, `DFLY LOAD`), as on any replica.
-- `SORT` re-run from the stream orders as Redis and KeyDB do (decisions 34–38); set
-  `--sort_set_max_intset_entries` to the master's `set-max-intset-entries` if it is not the default
-  512 (ISSUE-REGISTER D-34).
+- `SORT` re-run from the stream orders as Redis and KeyDB do (decisions 34–38) and reads `BY` and
+  `GET` hash-field patterns (`w_*->field`) as they do (decision 35). Set
+  `--sort_set_max_intset_entries` (default 512) to the master's `set-max-intset-entries` if that is
+  not 512: it is the size up to which Redis and KeyDB hold a set of integers as an intset, whose
+  ascending order decides the ties of `SORT <set> BY <weights> ALPHA`, and a replica with another
+  limit orders those ties differently for a set of a size in between (a master at 600 holds 550
+  integers as an intset, a replica at 512 breaks their ties on the element). It matters for no other
+  `SORT`, and for no set that is not all integers (ISSUE-REGISTER D-34, D-35).
 
 Point drakeydb only at masters you control. The full KeyDB onboarding guide lands with Phase 7's
 last sub-PR.

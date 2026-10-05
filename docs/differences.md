@@ -134,9 +134,12 @@ more places, all of them visible to a client and none of them a journal change:
   and `inf` are accepted. Upstream accepted trailing whitespace and out-of-range numbers and refused a
   NUL.
 - **`ALPHA BY` ties.** Elements with the same weight keep the order they were read in for a list and
-  for a set that Redis would hold as an intset (all members integers, at most 512 of them: then in
-  ascending numeric order), `DESC` included, as Redis's stable `qsort` does; for any other set and for
-  a sorted set they are ordered by the element. Upstream left them in the order the source iterated.
+  for a set that Redis would hold as an intset (all members integers, at most `set-max-intset-entries`
+  of them, 512 by default: then in ascending numeric order), `DESC` included, as Redis's stable `qsort`
+  does; for any other set and for a sorted set they are ordered by the element. Upstream left them in
+  the order the source iterated. The limit is the flag `--sort_set_max_intset_entries` (default 512, the
+  Redis and KeyDB default; `0` turns the emulation off, so that every set is ordered by the element):
+  set it to the `set-max-intset-entries` of the Redis or KeyDB master being replicated from.
 - **RESP3.** A `SORT` or `SORT_RO` of a set or sorted set replies an array, not the set type.
 
 **Limitations of `ALPHA BY` ties.** What a replica of a Redis or KeyDB master cannot follow is only
@@ -150,6 +153,26 @@ holds small string sets as listpacks, orders ties differently too. An `ALPHA` re
 byte is compared in full here and up to the NUL by Redis (its replies use `strcoll`; its `STORE`
 compares bytes, as drakeydb does). `docs/ISSUE-REGISTER.md` D-34 has the details.
 
-**Not supported:** hash-field patterns in `BY` and `GET` (`BY w_*->field`, `GET h_*->field`, which
-Redis and KeyDB read as a field of the hash at `w_<element>`) are taken as part of the key name, so
-they find nothing (`docs/ISSUE-REGISTER.md` D-35, owner decision pending).
+Round 2b (P7-1, owner decisions 35 and 41) adds hash-field patterns, which a KeyDB client uses and
+which a replica of a KeyDB master must follow, and the flag above:
+
+- **Hash fields in `BY` and `GET`.** `BY w_*->field` and `GET h_*->field` read field `field` of the
+  hash at the key the first `*` names (`w_<element>`), as Redis and KeyDB do; upstream Dragonfly took
+  the `->` as part of the key name and found nothing. The first `->` after the `*` starts the field,
+  and only if at least one character follows it (`GET w_*->` is the string key `w_<element>->`, and a
+  `->` before the `*` is part of the key name). The key must be a hash and hold the field: a missing
+  key, a key of another type and a missing field are all "no value", which is a nil in a reply (and
+  `""` in the list `STORE` leaves), a weight of 0 under a numeric `BY` and a missing weight under
+  `ALPHA BY`. Without a field the key must be a string, as before. A field whose TTL has passed
+  (`HSETEX`, `HEXPIRE`) is missing, as for `HGET`. The hash is read on the shard that owns the key
+  part (`w_<element>`), whatever shard the source or `STORE` destination is on. A pattern is scanned
+  as a C string, as Redis does: a NUL byte hides a `*` or `->` that follows it, so `GET "#\0x"` is
+  `GET #`. A `BY` pattern needs its `*` to sort; with only `->` it is `nosort`.
+- **`--sort_set_max_intset_entries`.** The integer-set limit of the `ALPHA BY` tie rule above (default
+  512). Set it to the master's `set-max-intset-entries` when replicating from Redis or KeyDB with
+  another value; a set of more members than the limit is a hash set there, which no replica can
+  follow, and is ordered by the element here.
+
+SORT's pattern lookups do not support offloaded values (the string lookup says so in a `TODO`): a
+hash that experimental hash offloading (`--tiered_experimental_hash_support`) has moved to disk is read
+as having no field (`docs/ISSUE-REGISTER.md` D-35).

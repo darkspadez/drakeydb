@@ -1445,7 +1445,13 @@ the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE
      `SORT .. STORE` is journaled as the command (D-13), so a replica on an older build re-runs it in
      the old order (or fails on a form it does not know). `LIMIT` sums beyond `uint32`, which replied
      garbage or crashed, are 64-bit. Upstream's `SortNegativeLimit`, `SortBy` and `SortGet` tests
-     changed with it.
+     changed with it. Round 2b (decisions 35 and 41, ISSUE-REGISTER D-35 and D-34): `BY w_*->field`
+     and `GET h_*->field` read a field of the hash at the key the first `*` names, as KeyDB's
+     `lookupKeyByPattern` does (upstream took the `->` as part of the key name), and the integer-set
+     limit of the `ALPHA BY` tie rule is the flag `--sort_set_max_intset_entries` (default 512, the
+     Redis and KeyDB `set-max-intset-entries` default). Both are client-visible and change no journal
+     or RDB byte; the older-build caveat above applies to a `->` form as well. One hunk in
+     `hset_family.{h,cc}` (`HSetFamily::GetFieldValue`, the `HGET` read of a field).
    - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
      migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
      a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a
@@ -1537,6 +1543,7 @@ REPLACE` onto a live destination found its source due (D-9, ISSUE-REGISTER D-32,
 | `src/server/engine_shard.{h,cc}` | `replica_active_expiry_` and the heartbeat gate, `eviction_goal` kept 0 on a replica (authorized exception to the "untouched" list; ~20 lines, no `expire_only` parameter); `friend class ReplicaActiveExpiryTest` (1); the sweep's clock on a flagged shard, `SweepClockMs(now)` in `RetireExpiredAndEvict` (2, Task 2.9) | 1, 2 |
 | `src/server/db_slice.cc` | One-expression `ExpireIfNeeded` gate (`!owner_->ReplicaActiveExpiry()`) (1); the read-path hide in `FindInternal` (2, Task 2.9) | 1, 2 |
 | `src/server/generic_family.cc` | `SortGeneric`'s multi-shard fetch hop and its two `SortStoreNothing` call sites (P7-1 review round, decision 32); the read-path hide in `ScanCb` (2, Task 2.9, decision 33) | 1, 2 |
+| `src/server/hset_family.{h,cc}` | `HSetFamily::GetFieldValue`, the `HGET` read of one field, for `SORT`'s hash-field patterns (P7-1, decision 35) | 1 |
 | `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards (0); U-15 guards in `Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch` (1, review round and re-review); the `SetReplTime` copy beside `SetReplOrigin` in `PrepareTransaction` (2, Task 2.8) | 0, 1, 2 |
 | `src/server/conn_context.h` | `repl_time_ms`, the per-command envelope time beside `repl_origin_idx` (Task 2.8) | 2 |
 | `src/server/dflycmd.cc` | U-15 null-`conn()` guards in `DFLY THREAD` (review round) and `DFLY FLOW` (P7-1 close) | 1 |
