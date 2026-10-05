@@ -2233,7 +2233,13 @@ on every case; the tables are in `task-1.7b-sort-semantics-report.md`):
   KeyDB and Redis agreed on all 77 spellings x 6 forms probed; drakeydb differed on 114 of 462 rows
   before and on none after. Not copied: KeyDB and Redis never clear `errno` before `strtod`, so
   after one `ERANGE` every later numeric `SORT` of a non-integer value fails until some syscall
-  changes it; a failing `SORT` is never replicated, so no replica depends on it.
+  changes it; a failing `SORT` is never replicated, so no replica depends on it. **A subnormal result
+  is refused on every libc** (PR darkspadez/drakeydb#11 CI): glibc's `strtod` sets `ERANGE` for every
+  decimal spelling that lands subnormal, but musl returned `4.9e-324` without it (the Alpine Release
+  leg failed), so a mixed musl/glibc drakeydb mesh would disagree on a same-shard `SORT .. STORE`.
+  `ParseSortScore` therefore also refuses `FP_SUBNORMAL`. It equals Redis and KeyDB on glibc for every
+  decimal spelling and differs only for an exact subnormal (a hex float such as `0x1p-1074`, or a
+  ~750-digit decimal), which glibc's `strtod` accepts without `ERANGE` and drakeydb refuses.
 - **`ALPHA BY` ties** (37). `ALPHA BY` compares `(weight missing, weight)`; a tie keeps the fetch
   order for a list and for an integer-only set, `ASC` and `DESC` alike, and breaks on the element
   for any other set and for a zset. The order is total (`SortEntryAlpha::seq`), so the partial sort

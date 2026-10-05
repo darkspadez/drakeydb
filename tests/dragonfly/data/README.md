@@ -2,8 +2,9 @@
 
 Raw bytes that a real KeyDB v6.3.4 sent to a classic replica, kept as test vectors for the RREPLAY
 parser and the classic-link applier (plan tasks 1.1 and 1.2). They were recorded by
-`tests/dragonfly/tools/capture_keydb_rreplay.py`, a hand-rolled replica that speaks what drakeydb's
-classic handshake speaks and keeps every byte the master sends after the full sync's RDB. Run the
+`tests/dragonfly/tools/capture_keydb_rreplay.py`, a hand-rolled replica that speaks drakeydb's
+classic handshake as it was before P7-1 Task 1.4 (without `REPLCONF capa activeExpire`) and keeps every
+byte the master sends after the full sync's RDB. Run the
 script from the repository root to record them again; KeyDB picks its node uuid and MVCC clock anew
 on every run, so a new capture has different uuids and numbers (the structure stays) and its segment
 table, printed by the script, replaces the ones below.
@@ -83,7 +84,8 @@ What the table shows:
   times it was given.
 - The writes of segment 0 were made after KeyDB forked its RDB child and before the transfer ended, so
   they are not in the RDB: they arrive first in the stream, wrapped like all the others.
-- KeyDB logs, for a replica that does not send `REPLCONF capa activeExpire` (as drakeydb does not):
+- KeyDB logs, for a replica that does not send `REPLCONF capa activeExpire` (as the capture script
+  does not; drakeydb sends it once the master's capa reply says `active-replica`):
   "replica ... does not support active expiration. This client may not correctly process key
   expirations" and "Connections between active replicas and traditional replicas is deprecated. This will
   be refused in future versions."
