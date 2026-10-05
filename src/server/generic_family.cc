@@ -2248,10 +2248,13 @@ string OpFetchStringValue(const OpArgs& op_args, std::string_view key) {
 // the recipe replay and the unchanged journal size (D-13's accepted exposure is unrelated).
 //
 // drakeydb: P7-1 (decision 32) -- SortStoreNothing (below) passes true as well, for a source that
-// is missing or that the unsorted fetch's lazy expiry emptied. A replay of the verbatim SORT on
-// that source now deletes its destination itself, so a replica of this build converges either way;
-// the hand-journaled DEL keeps a replica of an older build (empty array, stale destination)
-// converging too. OpStore journals a DEL only for a destination it actually deleted.
+// is missing or that the unsorted fetch's lazy expiry emptied. On one shard it also keeps the
+// verbatim SORT out of the journal (its hop returns SKIPPED), so this hand-journaled `DEL dst` is
+// that STORE's whole wire, as in upstream main: a peer applies it under the LWW guard, where a
+// replayed SORT would delete a newer dst unguarded (ISSUE-REGISTER D-18), and a replica of an older
+// build (whose SORT replay leaves the destination stale) converges too. OpStore journals a DEL only
+// for a destination it actually deleted, so a STORE with no destination journals nothing, as Redis
+// does.
 template <typename IteratorBegin, typename IteratorEnd>
 OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, IteratorBegin&& start_it,
                            IteratorEnd&& end_it, bool has_get_patterns,
@@ -2638,10 +2641,18 @@ OpStatus PopulateSortEntriesFromByPattern(const SortParams& params,
 // (see the fetch callbacks below). A wrong-type or unparsable source never gets here: that error is
 // raised before the destination is touched, as in Redis. Runs the concluding hop of the
 // transaction SortGeneric already opened, and passes source_deleted_by_fetch so the destination
-// delete is hand-journaled on the same-shard path too: a replica that replays the verbatim SORT
-// from an older build would otherwise leave its destination stale (OpStore's comment). Upstream
-// main has this function with the same two call sites; the difference is the
-// source_deleted_by_fetch argument, which only this fork's OpStore has.
+// delete is hand-journaled on the same-shard path too.
+//
+// The wire is `DEL dst` alone, when there was a dst to delete, and nothing when there was none --
+// as in upstream main (OpStore journals the delete) and in Redis (no dirty, no propagation). On one
+// shard SORT's auto-journal is revived, so the hop returns SKIPPED, which LogAutoJournalOnShard
+// treats as "do not journal": the verbatim SORT stays out of the journal, and the DEL that
+// source_deleted_by_fetch hand-journals is all of it (without that argument nothing would be). A
+// peer that holds a newer dst drops the LWW-guarded DEL, where a replayed SORT would delete that
+// dst regardless (ISSUE-REGISTER D-18). Across shards SORT is not revived and the hop must return
+// OK, as Transaction::RunCallback CHECK-fails on any other status there. Upstream main has this
+// function with the same two call sites; the differences are the source_deleted_by_fetch argument,
+// which only this fork's OpStore has, and the status.
 void SortStoreNothing(string_view store_key, CommandContext* cmd_cntx) {
   ShardId dest_sid = Shard(store_key, shard_set->size());
   OpResult<uint32_t> store_len;
@@ -2652,7 +2663,7 @@ void SortStoreNothing(string_view store_key, CommandContext* cmd_cntx) {
           store_len = OpStore(t->GetOpArgs(shard), store_key, none.begin(), none.end(),
                               /*has_get_patterns=*/false, /*source_deleted_by_fetch=*/true);
         }
-        return OpStatus::OK;
+        return t->GetUniqueShardCnt() == 1 ? OpStatus::SKIPPED : OpStatus::OK;
       },
       true);
   if (store_len)
@@ -2803,7 +2814,11 @@ void SortGeneric(CmdArgParser parser, CommandContext* cmd_cntx, bool is_read_onl
           // unparsable source plus a STORE destination on another shard aborted the server, release
           // builds included), and nothing there auto-journals anyway (SORT is NO_AUTOJOURNAL and
           // is revived only for a single shard). The failure reaches the code below through
-          // fetch_result either way.
+          // fetch_result either way. With STORE this hop is not the concluding one, so for a
+          // missing source the journal sees SortStoreNothing's hop instead (SKIPPED on one shard:
+          // the wire is `DEL dst` alone, or nothing when there was no dst); a wrong-type or
+          // unparsable source concludes through the empty Conclude() below and still journals the
+          // verbatim SORT on one shard (ISSUE-REGISTER D-33).
           return t->GetUniqueShardCnt() == 1 ? fetch_result.status() : OpStatus::OK;
         }
         return OpStatus::OK;

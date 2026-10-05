@@ -593,11 +593,22 @@ longer a second, separately-supplied origin index for `Commit()` to disagree wit
    oversight: upstream's per-shard auto-journal payload is built from `GetShardArgs(shard_id)` and
    dropped the destination effect entirely, so a **plain replica did not converge** on a
    cross-shard `SORT ... STORE` before P4-3. Gating the fix on `--active_replica` would re-open
-   that bug for plain replicas purely to preserve the slogan, so it stays on for everyone.
+   that bug for plain replicas purely to preserve the slogan, so it stays on for everyone. A
+   cross-shard `STORE` with an empty result journals `DEL <dst>`. The same code writes three more
+   `SORT` entries that the merge base does not, also ungated (listed in `docs/UPSTREAM-SYNC.md`): a
+   same-shard `SORT <missing source> STORE <existing dst>`, its `BY nosort` form and a source the
+   fetch's own member expiry emptied journal `DEL <dst>` alone (D-33, decision 32; the merge base
+   journals the verbatim `SORT`, upstream main `DEL <dst>`); a same-shard sorted `STORE` whose own
+   fetch emptied the source journals `DEL <dst>` ahead of the verbatim `SORT` (P4-3 review wave);
+   and a `SORT` that lazily expires some members of a set with member TTLs journals `SREM <key>
+   <members>` ahead of itself (P4-0). Upstream main has since changed SORT's journaling model
+   (`DEL` + `RPUSH` from `OpStore` on every `STORE`, no revived auto-journal), which fixes the
+   premise above in another shape: this exception inverts at the sync, and the `generic_family.cc`
+   row of `docs/UPSTREAM-SYNC.md` records the decision the sync must take.
 
-So "byte-identical with `--active_replica` off" is true for the journal wire *except* cross-shard
-`SORT ... STORE`, true for the RDB file and INFO memory, and not true for INFO as a whole. Stated
-that way in `docs/UPSTREAM-SYNC.md`, `docs/PLAN.md` and `docs/differences.md`.
+So "byte-identical with `--active_replica` off" is true for the journal wire *except* the
+`SORT ... STORE` entries of item 2, true for the RDB file and INFO memory, and not true for INFO as
+a whole. Stated that way in `docs/UPSTREAM-SYNC.md`, `docs/PLAN.md` and `docs/differences.md`.
 
 **Owner:** unassigned; (1) introduced in P1/P3, (2) ruled deliberate in P4-3. **From:** P4-1,
 restated P4-3 final review.
@@ -703,6 +714,11 @@ between two live nodes. The owner explicitly ruled against fixing it in Task 7: 
 the same-shard case too would be correct but changes the wire format for a path that works today
 under the pre-P4-3 contract, and the size/complexity trade-off of doing so for what is a narrow,
 pattern-key-dependent edge case was left for a future owner decision.
+
+Upstream main has dropped the recipe altogether: `SORT` is `CO::NO_AUTOJOURNAL` there with no
+revive, and `OpStore` journals `DEL <dst>` + `RPUSH <dst> ...` for every `STORE`. Taking that model
+at the sync closes this entry (and D-18's SORT part); `docs/UPSTREAM-SYNC.md`'s `generic_family.cc`
+row records the choice.
 
 **Owner:** unassigned; owner to decide whether the divergence-under-`BY`-pattern case is worth the
 added journal size. **From:** P4-3 Task 7.
@@ -1628,7 +1644,10 @@ shard than the source, a source that is missing (`KEY_NOTFOUND`), of the wrong t
 or holds elements a numeric sort cannot convert (`INVALID_NUMERIC_RESULT`) killed the server:
 `Check failed: OpStatus::OK == result (0 vs. 2)`, `0 vs. 8`, `0 vs. 17`. Reachable by any client, by
 any classic master's stream (raw or inside an RREPLAY envelope; the replica runs the SORT like a
-client does) and by the D-9 window, where a due source is a missing one on a flagged replica. With
+client does), by the D-9 window, where a due source is a missing one on a flagged replica, and by
+a DFLY-protocol replica or a peer whose shard count differs from its master's: a one-shard master
+journals its failing `SORT .. STORE` verbatim (see the residual below) and the replay runs on the
+replica's own shards, where the destination can be on another one than the source. With
 the destination on the source's shard there was no abort, but a missing source replied an empty
 array and left `dst` as it was, where Redis and KeyDB delete it and reply `:0`
 (`sort.cpp:575-586`).
@@ -1638,36 +1657,55 @@ array and left `dst` as it was, where Redis and KeyDB delete it and reply `:0`
 1. A multi-shard hop returns `OK` (`GetUniqueShardCnt() == 1 ? fetch_result.status() : OK`); the
    failure reaches `SortGeneric` through `fetch_result` either way. A single-shard SORT keeps
    returning it.
-2. `SortStoreNothing` (upstream main has the function with the same two call sites; only this
-   fork's `OpStore` takes the extra `source_deleted_by_fetch`): a missing source, or one the
-   unsorted fetch's own lazy member expiry emptied, with STORE deletes `dst`, whatever its type or
-   TTL, and replies `:0`, as Redis and KeyDB do. The delete is hand-journaled as `DEL dst`, on one
-   shard too, and only when there was a `dst`.
+2. `SortStoreNothing` (upstream main has the function with the same two call sites; only this fork's
+   `OpStore` takes the extra `source_deleted_by_fetch`): a missing source, or one the unsorted
+   fetch's own lazy member expiry emptied, with STORE deletes `dst`, whatever its type or TTL, and
+   replies `:0`, as Redis and KeyDB do. The delete is hand-journaled as `DEL dst`, on one shard too,
+   and only when there was a `dst`. On one shard that `DEL` is the whole wire (M-4 of the review of
+   `f281564`): the hop returns `OpStatus::SKIPPED`, which `LogAutoJournalOnShard` treats as "do not
+   journal", so the verbatim `SORT` that the revived auto-journal would record behind it is left
+   out. Before, a peer that held a newer `dst` dropped the LWW-guarded `DEL` and then deleted that
+   `dst` anyway by replaying the `SORT` (D-18's class). The wire is now upstream main's and Redis's:
+   `DEL dst`, or nothing when there was no `dst`. Across shards the hop still returns `OK` (a
+   `CHECK` there) and the wire is unchanged.
 3. A wrong-type or non-numeric source replies its error and leaves `dst` alone, as Redis and KeyDB
    do (both errors come before the destination is touched, `sort.cpp:278-285`, `:515`).
 
 **Residual, not fixed:** on one shard a failing STORE (WRONGTYPE, non-numeric) still journals its
 verbatim `SORT`. Measured on the P7-1 build (a one-shard master with one replica, the replica's
 `slave_repl_offset` before and after each command): `SORT <string> STORE dst`, the same with `BY
-nosort`, and `SORT <list of words> STORE dst` each advance it by 1, `SORT <missing> STORE dst`
-by 1 with no `dst` to delete and by 2 with one (`DEL dst`, then the `SORT`), while `GET` and the
-same two failing SORTs without STORE advance it by 0. By reading, the fetch hop is not the last hop
-of a STORE form: the empty concluding hop is `OK`, and that is the one whose result
-`LogAutoJournalOnShard` sees. A replica replays the entry, gets the same error and leaves `dst`
-alone, so nothing diverges; it costs one journal entry per failed command. Across shards SORT
-stays `CO::NO_AUTOJOURNAL` and the two failures journal nothing (pinned by
-`CrossShardStoreOfMissingSourceJournalsDestinationDelete`, `multi_master_test.cc`).
+nosort`, and `SORT <list of words> STORE dst` each advance it by 1, while `GET` and the same two
+failing SORTs without STORE advance it by 0; the two sorted STORE cases measured again after M-4,
+still 1 each. By reading, the fetch hop is not the last hop of a STORE form: the empty concluding
+hop (`Conclude()`) is `OK`, and that is the one whose result `LogAutoJournalOnShard` sees. A
+replica replays the entry, gets the same error and leaves `dst` alone, so nothing diverges; it
+costs one journal entry per failed command. Across shards SORT stays `CO::NO_AUTOJOURNAL` and the
+two failures journal nothing (pinned by `CrossShardStoreOfMissingSourceJournalsDestinationDelete`,
+`multi_master_test.cc`).
+
+The missing-source residual this entry first carried is closed by M-4: `SORT <missing> STORE dst`
+advances the replica by 1 with a `dst` (the `DEL dst`) and by 0 without one, where it advanced it by
+2 and 1 (the `DEL dst` and the `SORT`; the `SORT`); `BY nosort` likewise
+(`SameShardStoreOfMissingSourceJournalsOnlyTheDestinationDelete`). One neighbour keeps the old
+shape: a same-shard sorted `STORE` whose set the fetch itself emptied through member expiry (the
+fetch succeeded with nothing, so it is not `SortStoreNothing`'s) journals `DEL src`, `DEL dst` and
+then the verbatim `SORT` (3 entries measured; `FullExpirySortStoreJournalsDestinationDelete`). A
+peer that holds a newer `dst` drops the guarded `DEL dst` and its replay of the `SORT` deletes it:
+D-13's and D-18's same-shard exposure, not a new class, and left as it is.
 
 **How established:** the abort was reproduced on `main`'s binary by the Opus review of `2bdf3d7`
 (ledger decision 32; not re-run here). The fix is pinned by `GenericFamilyTest.SortStoreOf*`
 (2 shards, `dst` on and off the source's shard, seven option forms, `BY nosort` and `BY` pattern
 included), the journal tests `CrossShardStoreOfMissingSourceJournalsDestinationDelete` and
-`SameShardStoreOfMissingSourceJournalsDestinationDeleteBeforeSort` (`multi_master_test.cc`), and the
+`SameShardStoreOfMissingSourceJournalsOnlyTheDestinationDelete` (`multi_master_test.cc`), and the
 classic-stream pytest
 `test_classic_stream_sort_store_of_an_unsortable_source_does_not_abort`. Each of the fix's parts is
 falsified (`task-1.4b-report.md`, "Decision 32 (SORT .. STORE)"): the hop returning the failure
 aborts with the three statuses above, the empty-array reply fails every missing-source test, and
-`source_deleted_by_fetch=false` drops the same-shard `DEL dst`.
+`source_deleted_by_fetch=false` drops the same-shard `DEL dst`. The review round's change is
+falsified the same way (`task-1.4b-report.md`, "Review of f281564: M-4 and docs"): `OK` from the
+one-shard hop journals the verbatim `SORT` again, and `SKIPPED` without the one-shard gate aborts
+the cross-shard cases (`0 vs. 4`).
 
 **Owner:** none (resolved; the residual is journal noise, not divergence). **From:** P4-0
 (`1b6a2e82`); found by the Opus review of `2bdf3d7` (C1), fixed in P7-1.

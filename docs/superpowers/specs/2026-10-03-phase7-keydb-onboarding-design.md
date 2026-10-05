@@ -1022,11 +1022,15 @@ and that function interleaves expiry (`DeleteExpiredStep`) with eviction
       60 s edge, the advance seeing a stamp implausible that the apply then found plausible, so
       the command would run at a time past the clock and the hide would fire on its own read. It
       is taken after the self-author check and before the inner command is parsed or applied,
-      and **not** reset wherever the expiry flag is applied: only when the master's identity (its
-      node uuid or replication id) differs from the one the clock last advanced under, or the
-      flag is cleared. A reconnect to the same master, and a `+CONTINUE` resume (Task 3.1),
-      continue the same stream, whose last stamp is still the best known clock; the floor
-      bounds a long outage. The sweep of a flagged shard runs on `S = stream_ms ?
+      and **not** reset wherever the expiry flag is applied: only when the master's node **uuid**
+      differs from the one the clock last advanced under, or the flag is cleared. The replication
+      id is not part of the identity: `ApplyReplicaActiveExpiry` runs right after `Greet()`, before
+      the PSYNC reply sets `master_repl_id`, so at that point the id is the previous connection's
+      and could never differ, and a `+CONTINUE <newid>` from the same process must not reset the
+      clock anyway. A KeyDB process mints a new uuid at every start, which is the case the reset is
+      for. A reconnect to the same master, and a `+CONTINUE` resume (Task 3.1), continue the same
+      stream, whose last stamp is still the best known clock; the floor bounds a long outage.
+      The sweep of a flagged shard runs on `S = stream_ms ?
       max(stream_ms, now - 60 s) : now` (`now - 60 s` clamped at 0 on a small clock): the floor
       bounds how long a stalled stream can hold due keys, and a node that has seen no envelope
       since the flag was set keeps the local clock.
@@ -1312,8 +1316,9 @@ still pass under if the feature were removed.
 ## Byte-identity exceptions
 
 **`--active_replica` off stays byte-identical to upstream on the journal wire and RDB output.** P7
-changes neither (`kDrakeydbReplVersion` stays 68). What a *non-KeyDB* master or sub-replica can
-observe changes only here:
+changes neither (`kDrakeydbReplVersion` stays 68), apart from the `SORT .. STORE` entry of item 2;
+the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE-REGISTER D-5 and
+`docs/UPSTREAM-SYNC.md`. What a *non-KeyDB* master or sub-replica can observe changes only here:
 
 1. **Partial PSYNC** (flag-gated by `--classic_partial_psync`, default true): a reconnecting classic
    replica sends `PSYNC <id> <offset+1>` instead of `<id> -1`. The one real exception to the slogan;
@@ -1387,9 +1392,12 @@ observe changes only here:
      regression: a hop returned its failure status into a `CHECK`, and a wrong-type or non-numeric
      source aborted the same way) and to reply an empty array and keep the destination when it was
      not. It now deletes the destination and replies 0, as Redis does, and journals a `DEL <dst>`
-     for a destination that was there (upstream main's `OpStore` journals the same entry). A
-     wrong-type or non-numeric source replies the error it always did and leaves the destination
-     alone, and no line of the success path changes. Ungated.
+     for a destination that was there (upstream main's `OpStore` journals the same entry). On one
+     shard that `DEL` is all it journals, and with no destination nothing is: the verbatim `SORT`
+     stays out of the journal (M-4 of the review of `f281564`; the merge base journals the `SORT`
+     there, upstream main the `DEL`). A wrong-type or non-numeric source replies the error it
+     always did and leaves the destination alone, and no line of the success path changes.
+     Ungated.
 3. **Loader** accepts KeyDB type 64 and subexpire aux, quiets noisy aux: strictly more permissive.
 4. **Raw-path KeyDB-only drop** (ungated, D-7): `PEXPIREMEMBERAT` and the rest of
    `IsKeyDbOnlyCommand` are dropped and counted on the raw path instead of being dispatched as

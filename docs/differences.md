@@ -60,7 +60,8 @@ tombstone-wipe hazard, the `--cache_mode` interaction, and the current fork prot
 Since P4-3, a `SORT ... STORE dst` whose source key and `dst` land on **different shards**
 journals its *effect* — a `RESTORE dst <serialized list>` — instead of the `SORT` command itself.
 This applies on **every** node, including one running with `--active_replica=false`; it is the one
-journal-wire difference from upstream that is not flag-gated.
+main journal-wire difference from upstream that is not flag-gated (the same-shard entries at the end
+of this section are the others).
 
 It is a bug fix, not a fork feature. Upstream registers `SORT` as `CO::JOURNALED` and lets the
 dispatcher auto-journal it, but for a multi-shard transaction that auto-journal fires once per
@@ -69,8 +70,8 @@ this shard's own key slice only, dropping `BY`/`GET`/`LIMIT`/`STORE` and the oth
 The destination write was therefore **never replicated at all**, so a plain Dragonfly replica
 silently did not converge on a cross-shard `SORT ... STORE`. drakeydb marks `SORT`
 `CO::NO_AUTOJOURNAL` and has `SortGeneric` revive the auto-journal only when
-`GetUniqueShardCnt() == 1` (no `STORE`, or a `STORE` landing on the source's shard — every
-single-shard behavior is unchanged and still replays the `SORT` command verbatim).
+`GetUniqueShardCnt() == 1` (no `STORE`, or a `STORE` landing on the source's shard — those still
+replay the `SORT` command verbatim, apart from the same-shard entries at the end of this section).
 
 Consequences:
 
@@ -81,3 +82,8 @@ Consequences:
 - The same-shard case still journals the sort *recipe*, which leaves a narrow residual where a
   `BY`/`GET` pattern key (not a transaction key) differs between nodes — tracked as D-13 in
   [`docs/ISSUE-REGISTER.md`](ISSUE-REGISTER.md).
+- A same-shard `SORT <missing source> STORE <dst>` (also with `BY nosort`, and for a source that
+  lazy member expiry emptied during the fetch) deletes `dst`, replies 0 as Redis does, and journals
+  `DEL <dst>` alone, or nothing when there was no `dst`; upstream main journals the same `DEL`. A
+  same-shard sorted `STORE` whose own fetch emptied the source journals `DEL <dst>` ahead of the
+  verbatim `SORT`, and a partial lazy member expiry journals `SREM <key> <members>` ahead of it.

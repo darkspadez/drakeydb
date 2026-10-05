@@ -9,6 +9,7 @@
 #include <absl/strings/ascii.h>
 #include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
+#include <absl/strings/str_join.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -9206,8 +9207,9 @@ TEST_F(OriginJournalFamilyTest, SortDerivedDeleteReachesPeersButSortRoStaysSuppr
 
   // A set with one member whose TTL has already elapsed. "SORT ... BY nosort STORE" forces
   // OpFetchContainerElements to run (the fetch_unsorted branch), which lazily discovers "m"
-  // expired and, finding the set now empty, calls SetFamily::DeleteSetIfEmpty through SORT's own
-  // auto-journaling path.
+  // expired and, finding the set now empty, calls SetFamily::DeleteSetIfEmpty with SORT's own
+  // derived flag. That DEL is all this STORE journals (the emptied source then takes
+  // SortStoreNothing, and there is no destination to delete), so it is what a peer gets.
   EXPECT_EQ(Run({"sadd", "sort-s", "m"}).GetInt(), 1);
   Run({"fieldexpire", "sort-s", "1", "m"});
   AdvanceTime(1100);
@@ -9217,7 +9219,7 @@ TEST_F(OriginJournalFamilyTest, SortDerivedDeleteReachesPeersButSortRoStaysSuppr
   const CapturedEntry* sort_del = LastDel(consumer.entries);
   ASSERT_NE(nullptr, sort_del);
   EXPECT_FALSE(sort_del->entry_flags & journal::kEntryFlagDerived)
-      << "SORT auto-journals verbatim, so its derived DEL must reach peers";
+      << "SORT's source DEL is journaled for peers, so it must not be flagged derived";
 
   // Same call sites, SORT_RO this time (a fresh key -- the SORT above already deleted sort-s):
   // SORT_RO never auto-journals, so it must keep the suppressed default.
@@ -9732,15 +9734,18 @@ TEST_F(MultiShardOriginJournalFamilyTest, CrossShardStoreOfMissingSourceJournals
   EXPECT_EQ((std::vector<std::string>{"DEL", dst}), consumer.entries[0].args);
 }
 
-// drakeydb: P7-1 (decision 32) -- the same-shard form of the above: src and dst share the one
-// shard, so SORT auto-journals verbatim (revived) and the destination delete is journaled in front
-// of it. The explicit `DEL dst` is what keeps a replica of an older build, whose replay of
-// `SORT <missing> STORE dst` leaves the destination alone, converging with this node; a replica of
-// this build deletes it either way. When no destination existed there is no DEL entry.
+// drakeydb: P7-1 (decision 32), review round M-4 -- the same-shard form of the above: src and dst
+// share the one shard, where SORT's auto-journal is revived, and the journal of `SORT <missing>
+// STORE dst` is the destination delete alone: `DEL dst` when a dst was there, nothing when none
+// was (upstream main's and Redis' wire). SortStoreNothing's hop returns SKIPPED, so the verbatim
+// SORT is not auto-journaled behind the DEL. Before, a peer that held a newer dst dropped the
+// LWW-guarded DEL and then deleted that dst anyway by replaying the SORT (ISSUE-REGISTER D-18).
+// Both fetches end in SortStoreNothing: the sorted one (KEY_NOTFOUND) and BY nosort.
 //
-// Falsifying: passing source_deleted_by_fetch=false from SortStoreNothing (generic_family.cc)
-// drops the `DEL dst` entry -- only the verbatim SORT is left.
-TEST_F(OriginJournalFamilyTest, SameShardStoreOfMissingSourceJournalsDestinationDeleteBeforeSort) {
+// Falsifying: returning OK from SortStoreNothing's hop again (generic_family.cc) journals the
+// verbatim SORT after the DEL of a run that had a dst, and by itself in one that had none; passing
+// source_deleted_by_fetch=false from it leaves nothing journaled at all, the DEL included.
+TEST_F(OriginJournalFamilyTest, SameShardStoreOfMissingSourceJournalsOnlyTheDestinationDelete) {
   ASSERT_EQ(1u, shard_set->size()) << "this test pins the same-shard STORE path";
 
   const std::string src = "sort-gone-src";
@@ -9755,24 +9760,40 @@ TEST_F(OriginJournalFamilyTest, SameShardStoreOfMissingSourceJournalsDestination
     consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
   });
 
-  EXPECT_EQ(Run({"sort", src, "store", dst}).GetInt(), 0);
-  EXPECT_EQ(Run({"exists", dst}).GetInt(), 0);
-  size_t first_run = 0;
-  {
+  // The entries one `SORT <missing src> ... STORE dst` adds, each as its argument list.
+  auto journaled_by = [&](const std::vector<std::string>& cmd) {
+    size_t before = 0;
+    {
+      util::fb2::LockGuard lk(consumer.mu_);
+      before = consumer.entries.size();
+    }
+    EXPECT_EQ(Run(absl::MakeConstSpan(cmd)).GetInt(), 0) << absl::StrJoin(cmd, " ");
+    std::vector<std::vector<std::string>> added;
     util::fb2::LockGuard lk(consumer.mu_);
-    first_run = consumer.entries.size();
+    for (size_t i = before; i < consumer.entries.size(); ++i)
+      added.push_back(consumer.entries[i].args);
+    return added;
+  };
+
+  const std::vector<std::vector<std::string>> del_only{{"DEL", dst}};
+  const std::vector<std::vector<std::string>> nothing;
+
+  for (const char* fetch : {"sorted", "by nosort"}) {
+    SCOPED_TRACE(fetch);
+    std::vector<std::string> cmd{"sort", src};
+    if (std::string_view{fetch} == "by nosort")
+      cmd.insert(cmd.end(), {"by", "nosort"});
+    cmd.insert(cmd.end(), {"store", dst});
+
+    EXPECT_EQ(Run({"exists", dst}).GetInt(), 1);
+    EXPECT_EQ(journaled_by(cmd), del_only) << "a dst was there: its delete is the whole wire";
+    EXPECT_EQ(Run({"exists", dst}).GetInt(), 0);
+    EXPECT_EQ(journaled_by(cmd), nothing) << "no dst, nothing changed: nothing is journaled";
+    Run({"rpush", dst, "stale"});
   }
-  EXPECT_EQ(Run({"sort", src, "by", "nosort", "store", dst}).GetInt(), 0);
 
   shard_set->RunBriefInParallel(
       [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
-
-  util::fb2::LockGuard lk(consumer.mu_);
-  ASSERT_EQ(3u, consumer.entries.size()) << "DEL dst, SORT, then only the SORT of the second run";
-  EXPECT_EQ((std::vector<std::string>{"DEL", dst}), consumer.entries[0].args);
-  EXPECT_EQ("SORT", consumer.entries[1].args[0]);
-  EXPECT_EQ(2u, first_run);
-  EXPECT_EQ("SORT", consumer.entries[2].args[0]);
 }
 
 // drakeydb: P4-3 Task 7 fix round (C1/C2 review).

@@ -162,3 +162,163 @@ envelope).
   multi-shard server follows from the same revive condition (`GetUniqueShardCnt() == 1`) and was not
   measured.
 - `build-opt` was not touched.
+
+## Review of f281564: M-4 and docs
+
+Brief `brief-delta-fix-A.md`; review `review-delta-f281564.md` (M-4 is its MINOR-4; the docs items
+are IMPORTANT-1, MINOR-1, MINOR-5 and NIT-2). Not committed by the implementer. Scratch (the good
+copies of the two edited sources, each falsification's build log and raw output, the end-to-end
+probe) is in the orchestrator's scratchpad under `deltaA/`.
+
+### M-4: what changed
+
+On one shard `SortStoreNothing`'s hop now returns `OpStatus::SKIPPED`
+(`t->GetUniqueShardCnt() == 1 ? OpStatus::SKIPPED : OpStatus::OK`). `LogAutoJournalOnShard` returns
+before journaling on any non-OK result (`transaction.cc:1816`), so the verbatim `SORT` that the
+revived auto-journal would record behind the destination delete is no longer written. The `DEL dst`
+that `OpStore` hand-journals (`source_deleted_by_fetch=true`, unchanged) is the whole entry, and
+`OpStore` journals a `DEL` only for a destination it deleted, so with no `dst` nothing is journaled:
+upstream main's wire (`OpStore`, `generic_family_main.cc:1896`) and Redis's (no `dirty`, no
+propagation). The reply stays `:0` and the destination delete is untouched.
+
+Why the gate: `RunCallback` does `CHECK_EQ(OpStatus::OK, result)` on every hop of a multi-shard
+transaction (`transaction.cc:771`), so across shards the hop must keep returning `OK`. On one shard
+`RunCallback` stores the result in `local_result_` (`:762-764`); `Execute` returns void and
+`SortStoreNothing` replies from `store_len`, so nothing reads it. The fetch hop above it already
+returns a non-OK status on one shard, so a squashed stub (`RunSquashedMultiCb`, no `CHECK`) has the
+same precedent. Comments updated: `OpStore`'s `source_deleted_by_fetch` block, `SortStoreNothing`'s
+header and the fetch callback's (which now says what a STORE form's journal sees for a missing
+source and that a wrong-type or unparsable source still journals the verbatim `SORT`, D-33).
+
+### New wire
+
+Measured end to end on the real binary with a one-shard master and one replica (the replica's
+`slave_repl_offset` before and after each command; `deltaA/journal_probe.py`, output
+`journal_probe.fixed.out`), and pinned by the gtests below.
+
+| Case | Before (`1404897`) | Now |
+|---|---|---|
+| one shard, missing or emptied source, `dst` existed | `DEL dst`, `SORT ...` (2, measured) | `DEL dst` (1) |
+| one shard, missing or emptied source, no `dst` | `SORT ...` (1, measured) | nothing (0) |
+| `BY nosort` forms of the two rows above | as above, by reading | 1 and 0, measured |
+| several shards, `dst` existed | `DEL dst` on `dst`'s shard | the same (gtest) |
+| several shards, no `dst` | nothing | the same (gtest) |
+| one shard, sorted `STORE` whose own fetch emptied the set (not `SortStoreNothing`'s) | `DEL src`, `DEL dst`, `SORT` | the same (3, measured) |
+| one shard, wrong-type or non-numeric source | the verbatim `SORT` (D-33 residual) | the same (1, measured) |
+
+The fully-expired set with `BY nosort` and a `dst` advances the replica by 2 now (by reading `DEL
+src`, `DEL dst`); its value before the change was not measured (by reading: 3, with the `SORT`).
+The `dst` was `[]` on master and replica at the end of the probe.
+
+### Tests
+
+`OriginJournalFamilyTest.SameShardStoreOfMissingSourceJournalsDestinationDeleteBeforeSort` is
+renamed `SameShardStoreOfMissingSourceJournalsOnlyTheDestinationDelete` and rewritten: for the
+sorted fetch and for `BY nosort`, a run with a `dst` must journal exactly `[DEL dst]`, and the
+repeat with no `dst` must journal nothing. `SortDerivedDeleteReachesPeersButSortRoStaysSuppressed`
+keeps its assertion (the source `DEL` is still not derived); its comment and failure message now say
+that this DEL is all the STORE journals. `generic_family_test.cc` has no journal pin of the old wire
+(its fixture has no journal), so nothing changed there. `multi_master_test.cc` gained the
+`str_join.h` include.
+
+### Falsifications
+
+Each one: the good copy of `generic_family.cc` is in `deltaA/`, the line (2665 then) is changed,
+`cd /home/user/drakeydb/build-dbg && nice ninja -j3 generic_family_test multi_master_test
+dragonfly`, run, then the good copy goes back. The tree was clean against it after each.
+
+**F1, the hop returns `OK` again** (the change reverted). Built clean.
+
+```
+multi_master_test --gtest_filter='*StoreOfMissingSource*:*Sort*'   rc=1
+  OriginJournalFamilyTest.SameShardStoreOfMissingSourceJournalsOnlyTheDestinationDelete FAILED
+  multi_master_test.cc:9788  journaled_by(cmd)  Which is: { { "DEL", "sort-gone-dst" },
+      { "SORT", "sort-gone-src", "store", "sort-gone-dst" } }   vs  { { "DEL", "sort-gone-dst" } }
+      "a dst was there: its delete is the whole wire"                         (trace: sorted)
+  multi_master_test.cc:9790  journaled_by(cmd)  Which is: { { "SORT", "sort-gone-src", "store",
+      "sort-gone-dst" } }   vs  {}   "no dst, nothing changed: nothing is journaled"
+  the same two failures with { "SORT", ..., "by", "nosort", "store", ... }   (trace: by nosort)
+  the other four tests of the selection, the cross-shard one included: OK
+```
+
+**F2, `return OpStatus::SKIPPED;` without the one-shard gate.** Built clean. The gate is load
+bearing: every cross-shard case aborts (each gtest in its own process).
+
+```
+multi_master_test MultiShardOriginJournalFamilyTest.CrossShardStoreOfMissingSourceJournals\
+DestinationDelete
+  transaction.cc:771] Check failed: OpStatus::OK == result (0 vs. 4)               rc=134
+generic_family_test GenericFamilyTest.SortStoreOfMissingSourceDeletesDestination
+  Check failed: OpStatus::OK == result (0 vs. 4)                                   rc=134
+generic_family_test GenericFamilyTest.SortStoreOfFullyExpiredSetDeletesDestination
+  Check failed: OpStatus::OK == result (0 vs. 4)                                   rc=134
+generic_family_test ...SortStoreOfWrongTypeSource..., ...SortStoreOfUnparsableSource...: OK
+OriginJournalFamilyTest.SameShardStoreOfMissingSourceJournalsOnlyTheDestinationDelete: OK
+```
+
+**F3, `SortStoreNothing` passes `/*source_deleted_by_fetch=*/false`** (the register's earlier
+falsification, re-run against the new test). With the status `SKIPPED` the two parts are coupled:
+nothing at all is journaled and the destination delete never reaches a peer.
+
+```
+multi_master_test --gtest_filter='*StoreOfMissingSource*'   rc=1
+  SameShardStoreOfMissingSourceJournalsOnlyTheDestinationDelete FAILED, twice (sorted, by nosort):
+  multi_master_test.cc:9788  journaled_by(cmd)  Which is: {}   vs  { { "DEL", "sort-gone-dst" } }
+  the cross-shard test: OK;  generic_family_test SortStoreOf*: 4 passed
+```
+
+### Results on the final tree
+
+`build-dbg` rebuilt (`generic_family_test multi_master_test dragonfly`, `ninja -n` reports no work)
+after the last edit to `generic_family.cc`, which was a comment.
+
+| Selection | Result |
+|---|---|
+| `generic_family_test` | 88 of 88 passed |
+| `multi_master_test` | 224 passed, 225 ran, 1 skipped (`NodeIdentityFile.UnwritableDirIsEphemeral`) |
+| pytest `keydb_onboarding_test.py -k sort` | 6 passed, 107 deselected |
+| pytest `multimaster_test.py -k sort` | 2 passed (`test_sort_store_replicates_cross_shard_plain`, `..._stamped`), 75 deselected |
+
+pytest ran from the repo root under `flock /tmp/drakey-pytest.lock
+/root/drakey-venv-pinned/bin/python -m pytest ... -p no:cacheprovider` with `KEYDB_SERVER_PATH`
+(the scratchpad KeyDB), `KEYDB_REQUIRED=1` and
+`DRAGONFLY_PATH=/home/user/drakeydb/build-dbg/dragonfly`, after `cat drakeydb > /dev/null`. The 6
+onboarding cases are the classic-stream SORT scenarios; none of the 8 pytest cases asserts the
+same-shard wire, so only the gtests falsify M-4.
+
+### Docs
+
+- **I-1** (`docs/UPSTREAM-SYNC.md`, the `generic_family.cc` row): the three fork differences from
+  upstream main's `SortStoreNothing` now include the one-shard `SKIPPED`; a decision point records
+  that upstream main changed SORT's whole model (`CO::NO_AUTOJOURNAL`, no revive but RENAME's,
+  `OpStore` journals `DEL dst` + `RPUSH dst ...` (+ `STICK`) on every `STORE`, `:2984`, `:1215`,
+  `:1890-1912`), so the sync chooses between that model and the fork's single-entry `RESTORE`
+  hand-journal plus the single-shard verbatim revive, and "keep the extra argument" holds only under
+  the second. Not decided. ISSUE-REGISTER D-5 and D-13 point at it (D-5's cross-shard exception
+  inverts at the sync; D-13 closes if upstream's model is taken).
+- **M-1** (`docs/UPSTREAM-SYNC.md:7-19`, ISSUE-REGISTER D-5, `docs/PLAN.md` upstream-sync summary,
+  `docs/differences.md`, the spec's byte-identity section): the same-shard missing-source `DEL dst`,
+  P4-3's same-shard `DEL dst` ahead of the verbatim `SORT`, P4-0's `SREM` compensation and the
+  cross-shard empty-result `DEL dst` are listed with their merge-base and upstream-main wires.
+- **M-5** (spec, stream clock): the reset is on a master **uuid** change or the flag clearing only,
+  with the reason (`ApplyReplicaActiveExpiry` runs after `Greet()`, `replica.cc:279`, `:341`,
+  before the PSYNC reply sets `master_repl_id`, `:2025`; a `+CONTINUE <newid>` must not reset).
+- **D-33**: item 2 gives the new wire; the residual paragraph is rewritten (the missing-source
+  residual is closed, the failing-STORE one stays, the fully-expired sorted STORE keeps its old
+  shape and is named); test name and falsification sentence updated; the trigger list adds a
+  DFLY-protocol replica or peer whose shard count differs from its master's.
+
+### Not done, not verified
+
+- The nit "cite `ScanCb`'s `ExpireIfNeeded` at `:813`, not `:814`" was **not applied**: at HEAD
+  (and in the tree) `ScanCb` starts at `generic_family.cc:809`, `:813` is `if
+  (prime_it->first.HasExpire()) {` and the `ExpireIfNeeded` call is `:814`, so the citations in the
+  spec, the register's neighbours, `docs/UPSTREAM-SYNC.md` and the plan are right. The plan's cite
+  is in the other coder's file in any case.
+- The pre-change journal size of the fully-expired `BY nosort` case was not measured.
+- A peer holding a newer `dst` was not reproduced end to end (the old divergence is the reviewer's
+  reading plus D-18's mechanism); the wire is pinned, and the guarded `DEL` is covered by P4-4's
+  tests.
+- `classic_replay_test` and `ctest -L DFLY` as a whole were not run; `build-opt` was not touched.
+- The sorted-fetch same-shard STORE that the fetch itself emptied (not `SortStoreNothing`'s) still
+  journals `DEL src`, `DEL dst`, `SORT`: D-13/D-18's exposure, named in D-33, not changed.

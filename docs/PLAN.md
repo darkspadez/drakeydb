@@ -1019,12 +1019,16 @@ delivered in P4-3 and gains its "Onboarding from KeyDB" section in P7-4.
 
 See `docs/UPSTREAM-SYNC.md`. Summary: merge (not rebase) `upstream/main` monthly + after upstream
 releases; fork changes stay additive and flag-gated so `--active_replica`-off behavior is
-byte-identical to upstream **except** cross-shard `SORT ... STORE`, which journals its effect
+byte-identical to upstream **except** `SORT ... STORE`: a cross-shard one journals its effect
 (`RESTORE <dst>`) on every node since P4-3 — upstream's own per-shard auto-journal payload dropped
-that effect entirely, so a plain replica silently did not converge; the fix is deliberately
-ungated (see `docs/UPSTREAM-SYNC.md` and `docs/differences.md`). INFO replication's `node_uuid:`
-line is the other documented exception (D-5). Verification gate = build + `ctest -L DFLY` +
-replication pytest subset + multimaster suite.
+that effect entirely, so a plain replica silently did not converge; the fix is deliberately ungated
+(see `docs/UPSTREAM-SYNC.md` and `docs/differences.md`). The same code writes three more entries the
+merge base does not: a same-shard `STORE` of a missing or fetch-emptied source journals `DEL <dst>`
+alone (P7-1, decision 32), a same-shard sorted `STORE` whose fetch emptied the source journals `DEL
+<dst>` ahead of the verbatim `SORT` (P4-3), and a partial lazy member expiry journals `SREM <key>
+<members>` ahead of the `SORT` (P4-0); the exception list in `docs/UPSTREAM-SYNC.md` has them. INFO
+replication's `node_uuid:` line is the other documented exception (D-5). Verification gate = build +
+`ctest -L DFLY` + replication pytest subset + multimaster suite.
 
 ## Non-goals for v1
 
