@@ -2790,8 +2790,8 @@ const vector<SortGetCase> kGetCases = {
      {nullopt, "r", "", "s", "m", "q", "m", "p", "m", "t"}},
 };
 // Numeric elements and weights as Redis loads scores (decision 36): strtod over the bytes up to the
-// first NUL, refused on anything left, on ERANGE (denormals too) and on NaN. Both servers refuse
-// the same spellings, including "5 " and "1e-310", and accept "5\0x" as 5 and "\0" as 0.
+// first NUL, refused on anything left, on ERANGE, on a subnormal result and on NaN. Both servers
+// refuse the same spellings, including "5 " and "1e-310", and accept "5\0x" as 5 and "\0" as 0.
 const vector<SortNumberCase> kNumberCases = {
     {"0"s, true, {"0"s, "3"s}, {"a"s, "b"s}},
     {"-0"s, true, {"-0"s, "3"s}, {"a"s, "b"s}},
@@ -2860,6 +2860,10 @@ const vector<SortNumberCase> kNumberCases = {
     {"1e-400"s, false, {}, {}},
     {"1e-310"s, false, {}, {}},
     {"4.9e-324"s, false, {}, {}},
+    // The rule is libc-independent: a subnormal result is refused even where strtod sets no ERANGE
+    // (musl for 4.9e-324; glibc for these exact hex ones, which it alone would accept).
+    {"0x1p-1074"s, false, {}, {}},
+    {"-0x1p-1074"s, false, {}, {}},
     {"2.2250738585072014e-308"s, true, {"2.2250738585072014e-308"s, "3"s}, {"a"s, "b"s}},
     {"1.7976931348623157e308"s, true, {"3"s, "1.7976931348623157e308"s}, {"b"s, "a"s}},
     {"1.7976931348623159e308"s, false, {}, {}},

@@ -1977,16 +1977,21 @@ struct SortEntryAlpha : public SortEntryBase {
 
 // drakeydb: P7-1 (decision 36) -- a numeric weight or element as sortCommand loads it (sort.cpp:
 // 475-483): strtod over the bytes up to the first NUL, which is where c_str() ends for it ("5\0x"
-// is 5, "\0" is 0), refused when anything is left after the number, on ERANGE (overflow and
-// underflow, denormals included) and on NaN. Leading whitespace, hex and inf are strtod's to
-// accept. Redis and KeyDB never clear errno before the call, so after one ERANGE they refuse every
-// later non-integer value until a syscall changes it; this does not copy that, a failing SORT is
-// never replicated.
+// is 5, "\0" is 0). Refused: bytes left after the number, ERANGE, NaN, and a subnormal result.
+// Leading whitespace, hex and inf are strtod's to accept. The rule does not depend on the libc: on
+// glibc it equals Redis and KeyDB for every decimal spelling, and differs only for an exact
+// subnormal (a hex float such as 0x1p-1074, or a ~750-digit decimal), which glibc's strtod accepts
+// without ERANGE. musl skips ERANGE for some subnormals (4.9e-324), so the subnormal check cannot
+// be left to errno: a mixed mesh would disagree on a same-shard SORT .. STORE, which is journaled
+// as the command. Redis and KeyDB never clear errno before the call, so after one ERANGE they
+// refuse every later non-integer value until a syscall changes it; this does not copy that, a
+// failing SORT is never replicated.
 bool ParseSortScore(const string& item, double* score) {
   errno = 0;
   char* end = nullptr;
   *score = strtod(item.c_str(), &end);
-  return *end == '\0' && errno != ERANGE && !std::isnan(*score);
+  return *end == '\0' && errno != ERANGE && !std::isnan(*score) &&
+         std::fpclassify(*score) != FP_SUBNORMAL;
 }
 
 // SortEntry stores all data required for sorting
@@ -2331,6 +2336,9 @@ string OpFetchHashFieldValue(const OpArgs& op_args, std::string_view key, std::s
   }
 
   optional<string> value = HSetFamily::GetFieldValue(op_args.db_cntx, it->second, field);
+  // The read's StringMap::Find drops expired fields lazily, as HGET does, so a hash it emptied must
+  // go now, or SAVE logs an error in SaveEntry for it (FieldExpireHashDeletesEmptyHash pins the
+  // delete for FIELDEXPIRE). Unlocked, as OpFetchStringValue's lazy expiry of a string weight is.
   HSetFamily::DeleteIfEmpty(db_slice, op_args.db_cntx, key, it->second);
   if (!value)
     return {};
