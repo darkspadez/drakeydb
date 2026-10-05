@@ -1440,6 +1440,9 @@ INSTANTIATE_TEST_SUITE_P(
         NoConnectionCase{"Psubscribe", Resp({"PSUBSCRIBE", "c*"})},
         NoConnectionCase{"Watch", Resp({"WATCH", "k"})},
         NoConnectionCase{"DflyThread", Resp({"DFLY", "THREAD", "1"})},
+        // A hidden command (COMMAND does not list it). It names its connection before it looks up
+        // the migration, and is registered whatever the cluster mode.
+        NoConnectionCase{"DflymigrateFlow", Resp({"DFLYMIGRATE", "FLOW", "x", "0"})},
         // A script's redis.call runs the command on the context of the EVAL, a null one here
         // (CallFromScript). Its error is the script's error, which carries the handler's text.
         NoConnectionCase{"EvalInfo", Resp({"EVAL", "return redis.call('INFO')", "0"})},
@@ -1465,6 +1468,20 @@ INSTANTIATE_TEST_SUITE_P(
         NoConnectionCase{"Addreplicaof", Resp({"ADDREPLICAOF", "127.0.0.1", "1", "0", "16383"})},
         NoConnectionCase{"ReplTakeover", Resp({"REPLTAKEOVER", "0"})},
         NoConnectionCase{"ReplTakeoverSave", Resp({"REPLTAKEOVER", "1", "SAVE"})}),
+    [](const testing::TestParamInfo<NoConnectionCase>& info) { return string(info.param.name); });
+
+// The commands that take replicaof_mu_ (ISSUE-REGISTER U-19). A client's REPLICAOF NO ONE holds it
+// across Replica::Stop, which joins the replication fiber, and streamed by a classic master these
+// run on that fiber: parked on the mutex, the fiber never ends and neither does the command. The
+// fixture's node is a master, so what these cases pin is the reply (without the guard: ROLE's
+// array, OK, "I am master", OK), and the deadlock is pinned by the scripted-master pytests.
+INSTANTIATE_TEST_SUITE_P(
+    U19, ClassicNoConnectionTest,
+    testing::Values(NoConnectionCase{"Role", Resp({"ROLE"})},
+                    NoConnectionCase{"DebugReplicaPause", Resp({"DEBUG", "REPLICA", "PAUSE"})},
+                    NoConnectionCase{"DebugReplicaResume", Resp({"DEBUG", "REPLICA", "RESUME"})},
+                    NoConnectionCase{"DebugReplicaOffset", Resp({"DEBUG", "REPLICA", "OFFSET"})},
+                    NoConnectionCase{"DebugReplDiag", Resp({"DEBUG", "REPLDIAG"})}),
     [](const testing::TestParamInfo<NoConnectionCase>& info) { return string(info.param.name); });
 
 // The emulated cluster node answers CLUSTER INFO|SLOTS|NODES|SHARDS with the address its client

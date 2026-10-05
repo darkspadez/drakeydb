@@ -1002,6 +1002,12 @@ void ClusterFamily::InitMigration(CmdArgParser parser, CommandContext* cmd_cntx)
 }
 
 void ClusterFamily::DflyMigrateFlow(CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-15 -- a flow is the connection it arrives on: named here, migrated and handed to
+  // the migration below. A replicated apply has none, and DFLYMIGRATE is registered in every
+  // cluster mode, so a classic master can stream this. INIT and ACK never read the connection.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
+
   auto [source_id, shard_id] = parser.Next<std::string_view, uint32_t>();
 
   RETURN_ON_PARSE_ERROR(parser, cmd_cntx);

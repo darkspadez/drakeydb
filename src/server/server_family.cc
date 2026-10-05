@@ -4165,6 +4165,13 @@ void ServerFamily::Wait(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void ServerFamily::Role(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-19 -- a client's REPLICAOF holds replicaof_mu_ while Replica::Stop waits for the
+  // replication fiber to end, and a command streamed by a classic master runs on that fiber, in a
+  // context with no connection (ReplyIfNoConnection). Taking the mutex from there deadlocks both:
+  // the fiber never ends and the REPLICAOF never replies. Refused before the lock, as are DEBUG
+  // REPLICA and DEBUG REPLDIAG (debugcmd.cc), the other commands that take it.
+  if (ReplyIfNoConnection(cmd_cntx))
+    return;
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
   util::fb2::LockGuard lk(replicaof_mu_);
   // Thread local var is_master is updated under mutex replicaof_mu_ together with replica_,

@@ -1008,28 +1008,11 @@ LINK_COMMAND_CASES = [
 ]
 
 
-@pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
-@pytest.mark.parametrize("peer_mode,command", LINK_COMMAND_CASES)
-async def test_classic_stream_link_command_does_not_abort(
-    df_factory: DflyInstanceFactory, tmp_path, scenario, peer_mode, command
-):
-    """A command that rewires the replica's own link, in the replication stream, raw or inside an
-    RREPLAY envelope, used to kill or stall the replica (ISSUE-REGISTER U-17). The stream runs on
-    the replication fiber, in a context with no connection, and `REPLICAOF NO ONE` or `REPLICAOF
-    <host> <port>` (and on a peer node `REPLICAOF REMOVE <this link's master>`) makes
-    Replica::Stop join the fiber it runs on: SIGABRT, `Check failed: active != this`, release builds
-    too. A raw `REPLTAKEOVER` parked the fiber on its own socket (for its timeout and 10 s more:
-    the master never answers), the link `up` and nothing more applied; `ADDREPLICAOF` opened a
-    second link. They are an error reply now, which the stream
-    discards: the replica stays up on the one link, the offset the master settles on is the exact
-    length of the stream, and the commands around them apply. Inside an envelope the failure also
-    shows as a `classic_apply_errors`.
-
-    Falsifying: with the guard of a handler removed, its cases fail: the replica process dies as it
-    reads the command (`REPLICAOF`, `SLAVEOF`), `b` never arrives (raw `REPLTAKEOVER`, once the
-    refusal of a classic master's replica, test_client_repltakeover_..., is gone too), or the master
-    sees a second connection (`ADDREPLICAOF`).
-    """
+async def assert_stream_command_is_survived(df_factory, tmp_path, scenario, peer_mode, command):
+    """Streams `command` (`{port}` in a word: the scripted master's), raw or inside an RREPLAY
+    envelope, between `SET a 1` and `SET b 2`, and checks that the replica came through it: both
+    writes applied, the offset the master settles on the exact length of the stream, one connection,
+    the link up, the role unchanged, and inside an envelope exactly one `classic_apply_errors`."""
     async with FakeClassicMaster() as master:
         command = [word.format(port=master.port) for word in command]
         wrap = resp_command if scenario == "raw" else rreplay
@@ -1068,6 +1051,181 @@ async def test_classic_stream_link_command_does_not_abort(
     node.stop()
     if scenario == "in_envelope":
         assert node.find_in_logs(rf"did not apply and is skipped: {command[0]}: .*No connection")
+
+
+@pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
+@pytest.mark.parametrize("peer_mode,command", LINK_COMMAND_CASES)
+async def test_classic_stream_link_command_does_not_abort(
+    df_factory: DflyInstanceFactory, tmp_path, scenario, peer_mode, command
+):
+    """A command that rewires the replica's own link, in the replication stream, raw or inside an
+    RREPLAY envelope, used to kill or stall the replica (ISSUE-REGISTER U-17). The stream runs on
+    the replication fiber, in a context with no connection, and `REPLICAOF NO ONE` or `REPLICAOF
+    <host> <port>` (and on a peer node `REPLICAOF REMOVE <this link's master>`) makes
+    Replica::Stop join the fiber it runs on: SIGABRT, `Check failed: active != this`, release builds
+    too. A raw `REPLTAKEOVER` parked the fiber on its own socket (for its timeout and 10 s more:
+    the master never answers), the link `up` and nothing more applied; `ADDREPLICAOF` opened a
+    second link. They are an error reply now, which the stream
+    discards: the replica stays up on the one link, the offset the master settles on is the exact
+    length of the stream, and the commands around them apply. Inside an envelope the failure also
+    shows as a `classic_apply_errors`.
+
+    Falsifying: with the guard of a handler removed, its cases fail: the replica process dies as it
+    reads the command (`REPLICAOF`, `SLAVEOF`), `b` never arrives (raw `REPLTAKEOVER`, once the
+    refusal of a classic master's replica, test_client_repltakeover_..., is gone too), or the master
+    sees a second connection (`ADDREPLICAOF`).
+    """
+    await assert_stream_command_is_survived(df_factory, tmp_path, scenario, peer_mode, command)
+
+
+# What the stream can still reach on the replication fiber, in a context with no connection, besides
+# the commands above: DFLYMIGRATE, a hidden command that COMMAND does not list (ISSUE-REGISTER
+# U-15), and the commands whose handler takes replicaof_mu_ (U-19).
+NO_CONNECTION_COMMANDS = {
+    "dflymigrate_flow": ("DFLYMIGRATE", "FLOW", "x", "0"),
+    "role": ("ROLE",),
+    "debug_replica_pause": ("DEBUG", "REPLICA", "PAUSE"),
+    "debug_replica_resume": ("DEBUG", "REPLICA", "RESUME"),
+    "debug_replica_offset": ("DEBUG", "REPLICA", "OFFSET"),
+    "debug_repldiag": ("DEBUG", "REPLDIAG"),
+}
+MUTEX_COMMANDS = ["role", "debug_replica_pause", "debug_replica_resume", "debug_replica_offset"]
+
+
+@pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
+@pytest.mark.parametrize("name", list(NO_CONNECTION_COMMANDS))
+async def test_classic_stream_command_without_a_connection_does_not_abort(
+    df_factory: DflyInstanceFactory, tmp_path, scenario, name
+):
+    """`DFLYMIGRATE FLOW x 0` (any cluster mode) named its connection before it looked up the
+    migration, and a replicated apply has none: SIGSEGV, in the replica that read it from a classic
+    master's stream (ISSUE-REGISTER U-15, found by the P7-1 close's re-review: COMMAND does not list
+    hidden commands, so the fuzz never sent it). `ROLE` and `DEBUG REPLICA PAUSE|RESUME|OFFSET|
+    REPLDIAG` take replicaof_mu_ (U-19, the next test). They are an error reply now, which the
+    stream discards: the replica stays up on the one link, the offset the master settles on is the
+    exact length of the stream, and the commands around them apply. Inside an envelope the failure
+    also shows as a `classic_apply_errors`.
+
+    Falsifying: with the guard of `DflyMigrateFlow` removed the replica process dies as it reads the
+    command, so `b` never arrives; with that of `Role` or `DebugCmd::Replica`/`ReplDiag` removed,
+    the command applies and the case fails on the missing `classic_apply_errors` (in an envelope)
+    or passes (raw): what they guard against needs the next two tests.
+    """
+    await assert_stream_command_is_survived(
+        df_factory, tmp_path, scenario, False, NO_CONNECTION_COMMANDS[name]
+    )
+
+
+@pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
+@pytest.mark.parametrize("name", MUTEX_COMMANDS)
+async def test_classic_stream_replicaof_mutex_command_cannot_deadlock_replicaof_no_one(
+    df_factory: DflyInstanceFactory, tmp_path, scenario, name
+):
+    """A client's `REPLICAOF NO ONE` holds replicaof_mu_ while Replica::Stop waits for the
+    replication fiber to end. If that fiber is parked on replicaof_mu_ inside a streamed command
+    that takes it (`ROLE`, `DEBUG REPLICA ...`), neither goes on: the command never replies, the
+    mutex is never released, and every later `INFO`, `ROLE` or `REPLTAKEOVER` hangs too
+    (ISSUE-REGISTER U-19). A master that streams such commands without pause makes the fiber try
+    for the mutex all the time, so the client's `REPLICAOF NO ONE` finds it parked there.
+
+    Falsifying: with the guard of the command's handler removed `REPLICAOF NO ONE` gets no reply
+    within the timeout (the replica is killed then, as its shutdown would wait for the same mutex).
+    """
+    command = NO_CONNECTION_COMMANDS[name]
+    wrap = resp_command if scenario == "raw" else rreplay
+    burst = wrap(*command) * 400
+    async with FakeClassicMaster() as master:
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET), stream=SET_A, stream_delay=SECOND_WRITE_DELAY_S
+        )
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, False)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def synced():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("a") == "1"
+
+        await synced()
+
+        async def flood():
+            while True:
+                await master.send_stream(burst)
+                await asyncio.sleep(0.001)
+
+        flooder = asyncio.create_task(flood())
+        try:
+            await asyncio.sleep(0.5)
+            outcome = await asyncio.wait_for(c.execute_command("REPLICAOF NO ONE"), timeout=30)
+        except asyncio.TimeoutError:
+            node.stop(kill=True)
+            pytest.fail(f"REPLICAOF NO ONE did not return while {name} was streamed: deadlock")
+        finally:
+            flooder.cancel()
+            await asyncio.gather(flooder, return_exceptions=True)
+
+        assert outcome == "OK"
+        assert (await asyncio.wait_for(c.info("replication"), timeout=10))["role"] == "master"
+
+    node.stop()
+
+
+@pytest.mark.parametrize("scenario", ["raw", "in_envelope"])
+async def test_classic_stream_debug_replica_pause_does_not_strand_the_link(
+    df_factory: DflyInstanceFactory, tmp_path, scenario
+):
+    """`DEBUG REPLICA PAUSE` in the replication stream paused the replica's own link: the fiber
+    that applied it never reconnects while it is paused, so when the master dropped the connection
+    the replica stayed down for good, until a client sent `DEBUG REPLICA RESUME` (ISSUE-REGISTER
+    U-19). The command is refused now, so a dropped link is picked up again: a second connection,
+    a new full sync, and the stream that follows it applies.
+
+    Falsifying: with the guard of `DebugCmd::Replica` removed the master never sees a second
+    connection and the link stays down.
+    """
+    wrap = resp_command if scenario == "raw" else rreplay
+    set_c = resp_command("SET", "c", "3")
+    async with FakeClassicMaster() as master:
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET),
+            stream=SET_A + wrap("DEBUG", "REPLICA", "PAUSE") + SET_B,
+            stream_delay=SECOND_WRITE_DELAY_S,
+        )
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, False)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("b") == "2"
+
+        await applied()
+
+        # What the master answers the reconnect with: a full sync and nothing streamed behind it.
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET))
+        await master.drop_connections()
+        assert await master.wait_for_connections(2, timeout=30) == 2, "the replica never came back"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def streaming_again():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            info = await c.info("replication")
+            assert info["master_link_status"] == "up", info
+            assert master._stream_writer is not None
+
+        await streaming_again()
+        await master.send_stream(set_c)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied_again():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("c") == "3"
+
+        await applied_again()
+
+    node.stop()
 
 
 @pytest.mark.parametrize("scenario", ["raw", "in_envelope"])

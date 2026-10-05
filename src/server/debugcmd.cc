@@ -900,6 +900,11 @@ void DebugCmd::Reload(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
 }
 
 void DebugCmd::Replica(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
+  // drakeydb: U-19 -- see ServerFamily::Role: all three options take replicaof_mu_, and PAUSE
+  // would also stop the link a classic master streamed it on from reconnecting.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
+
   string opt = absl::AsciiStrToUpper(parser.Next());
 
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
@@ -1563,6 +1568,10 @@ void DebugCmd::Stacktrace(CommandContext* cmd_cntx) {
 // unread" (missed wakeup) from "genuinely nothing to read yet" at the moment of a stall. Remove
 // once the stalled-replica bug is closed.
 void DebugCmd::ReplDiag(CommandContext* cmd_cntx) {
+  // drakeydb: U-19 -- see ServerFamily::Role.
+  if (cmd_cntx->conn() == nullptr)
+    return cmd_cntx->SendError("No connection");
+
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
 
   if (auto unread = sf_.GetReplicaMasterSocketUnreadBytes(); unread) {
